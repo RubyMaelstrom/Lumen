@@ -2522,6 +2522,54 @@ impl Interp {
         self.ta_read_bytes(&info, 0, len)
     }
 
+    /// Copy the bytes held by a Web IDL `BufferSource` (`ArrayBuffer`, `DataView`, or any
+    /// `TypedArray`). View offsets and lengths are honored; detached and out-of-bounds buffers are
+    /// rejected. `allow_shared` must be true only for an IDL argument carrying `[AllowShared]`.
+    ///
+    /// Keeping this union conversion inside the engine prevents embedders from approximating a
+    /// `BufferSource` by enumerating JS properties, which loses byte offsets, detached state, and
+    /// the distinction between ordinary and shared backing stores.
+    pub fn buffer_source_bytes(&self, v: &Value, allow_shared: bool) -> Option<Vec<u8>> {
+        let obj = v.as_obj()?;
+        let ptr = Rc::as_ptr(obj) as usize;
+
+        if let Some(info) = self.typed_arrays.get(&ptr).copied() {
+            if !allow_shared && self.shared_buffers.contains_key(&info.buffer) {
+                return None;
+            }
+            let len = self.ta_len(&info)?;
+            return self.ta_read_bytes(&info, 0, len);
+        }
+
+        if let Some((buffer, offset, fixed_len, length_tracking)) =
+            self.data_views.get(&ptr).copied()
+        {
+            let shared = self.shared_buffers.get(&buffer).copied();
+            if shared.is_some() && !allow_shared {
+                return None;
+            }
+            let bytes = match shared {
+                Some(id) => shared_mem_get(id)?.lock().unwrap().clone(),
+                None => self.array_buffers.get(&buffer)?.clone(),
+            };
+            let len = if length_tracking {
+                bytes.len().checked_sub(offset)?
+            } else {
+                let end = offset.checked_add(fixed_len)?;
+                (end <= bytes.len()).then_some(fixed_len)?
+            };
+            return Some(bytes[offset..offset + len].to_vec());
+        }
+
+        if let Some(&id) = self.shared_buffers.get(&ptr) {
+            if !allow_shared {
+                return None;
+            }
+            return shared_mem_get(id).map(|bytes| bytes.lock().unwrap().clone());
+        }
+        self.array_buffers.get(&ptr).cloned()
+    }
+
     /// Overwrite a TypedArray's covered bytes from the start (a write past the view's end is
     /// a bounds-checked no-op, matching the engine's internal write semantics). `false` when
     /// `v` isn't a typed array.

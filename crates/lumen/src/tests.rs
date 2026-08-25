@@ -753,6 +753,76 @@ fn wall_clocks_are_mutable_and_realm_local() {
     assert_eq!(read_times(&mut first), "5678|5678|5678");
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_buffer_source_bytes_honor_views_detachment_and_shared_opt_in() {
+    let mut engine = Engine::new();
+    let evaluated = engine
+        .eval_value_interruptible(
+            "globalThis.ab = new ArrayBuffer(6);\
+             globalThis.dv = new DataView(ab, 1, 3);\
+             dv.setUint8(0, 11); dv.setUint8(1, 22); dv.setUint8(2, 33);\
+             globalThis.ta = new Uint8Array(ab, 2, 2);\
+             globalThis.sab = new SharedArrayBuffer(4);\
+             globalThis.sta = new Uint8Array(sab); sta.set([4, 5, 6, 7]);",
+        )
+        .expect("parse");
+    assert!(evaluated.is_ok(), "BufferSource setup threw");
+
+    let global = engine.global_this();
+    let ab = engine
+        .ctx()
+        .member_get(&global, "ab")
+        .unwrap_or_else(|_| panic!("read ab"));
+    let dv = engine
+        .ctx()
+        .member_get(&global, "dv")
+        .unwrap_or_else(|_| panic!("read dv"));
+    let ta = engine
+        .ctx()
+        .member_get(&global, "ta")
+        .unwrap_or_else(|_| panic!("read ta"));
+    let sab = engine
+        .ctx()
+        .member_get(&global, "sab")
+        .unwrap_or_else(|_| panic!("read sab"));
+    let sta = engine
+        .ctx()
+        .member_get(&global, "sta")
+        .unwrap_or_else(|_| panic!("read sta"));
+
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&ab, false),
+        Some(vec![0, 11, 22, 33, 0, 0])
+    );
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&dv, false),
+        Some(vec![11, 22, 33])
+    );
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&ta, false),
+        Some(vec![22, 33])
+    );
+    assert_eq!(engine.ctx().buffer_source_bytes(&sab, false), None);
+    assert_eq!(engine.ctx().buffer_source_bytes(&sta, false), None);
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&sab, true),
+        Some(vec![4, 5, 6, 7])
+    );
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&sta, true),
+        Some(vec![4, 5, 6, 7])
+    );
+
+    let transferred = engine
+        .eval_value_interruptible("ab.transfer()")
+        .expect("transfer parses");
+    assert!(transferred.is_ok(), "ArrayBuffer transfer threw");
+    assert_eq!(engine.ctx().buffer_source_bytes(&ab, false), None);
+    assert_eq!(engine.ctx().buffer_source_bytes(&dv, false), None);
+    assert_eq!(engine.ctx().buffer_source_bytes(&ta, false), None);
+}
+
 #[test]
 fn typed_arrays() {
     assert_eq!(run("var a = new Int8Array(3); a.length"), "3");
