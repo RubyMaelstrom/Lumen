@@ -59,7 +59,14 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
             .map_err(|e| i.make_error("SyntaxError", e.message))?;
         // A script runs with full GlobalDeclarationInstantiation (clash checks, global-object
         // own properties for var/function declarations).
-        i.run_program(&body)
+        match i.run_program(&body) {
+            Ok(value) => Ok(value),
+            Err(Abrupt::Throw(value)) => Err(value),
+            Err(Abrupt::Interrupt(reason)) => {
+                Err(i.make_error("QuotaExceededError", reason.message()))
+            }
+            Err(_) => Ok(Value::Undefined),
+        }
     });
     it.def_method(&host, "detachArrayBuffer", 1, |i, _t, args| {
         if let Value::Obj(o) = arg(args, 0) {

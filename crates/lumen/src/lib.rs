@@ -38,6 +38,7 @@ pub mod fastalloc;
 mod fasthash;
 mod host;
 mod interpreter;
+mod interrupt;
 #[cfg(feature = "intl")]
 mod intl;
 mod jit;
@@ -78,6 +79,8 @@ mod value;
 
 use interpreter::Interp;
 use value::Value;
+
+pub use interrupt::{InterruptReason, RuntimeInterrupt};
 
 /// Internal-stage entry points, exposed only for benchmarking (`bench` feature). These reach past
 /// the stable public API to time individual compilation stages (lex → parse → snapshot encode →
@@ -136,6 +139,17 @@ pub enum Completion {
     Throw { name: String, message: String },
 }
 
+/// The outcome returned by interruption-aware evaluation entry points.
+///
+/// This is separate from [`Completion`] so adding host control flow does not break embedders
+/// which exhaustively match the original public enum. An interruption is not a JavaScript throw:
+/// author `catch` and `finally` blocks do not observe it (HTML §8.1.4.5 "Killing scripts").
+pub enum ExecutionOutcome {
+    Value(String),
+    Throw { name: String, message: String },
+    Interrupted { reason: InterruptReason },
+}
+
 /// A JavaScript engine instance: one realm (global object + intrinsics) that persists across
 /// [`eval`](Engine::eval) calls.
 pub struct Engine {
@@ -150,10 +164,35 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Engine {
+        Self::new_with_interrupt(Default::default())
+    }
+
+    /// Build a realm around a host-created control handle.
+    ///
+    /// This closes the startup race for dedicated workers: their owner can cancel the handle
+    /// before the worker thread has finished constructing its realm or begun evaluating its
+    /// entry script.
+    pub fn new_with_interrupt(interrupt: std::sync::Arc<RuntimeInterrupt>) -> Engine {
         interpreter::sym_for_reset();
-        Engine {
-            interp: Interp::new(),
-        }
+        let mut interp = Interp::new();
+        interp.runtime_interrupt = interrupt;
+        Engine { interp }
+    }
+
+    /// A thread-safe handle for cancelling this realm, yielding to user navigation, or setting a
+    /// host execution deadline. The handle remains valid while JavaScript is running on another
+    /// thread (notably a dedicated worker).
+    pub fn interrupt_handle(&self) -> std::sync::Arc<RuntimeInterrupt> {
+        self.interp.runtime_interrupt.clone()
+    }
+
+    /// Replace the realm's control handle before evaluating author code.
+    ///
+    /// Runtime assemblers use this after their finite, trusted bootstrap has installed built-ins:
+    /// an owner may already have cancelled the supplied handle, in which case the first author
+    /// script entry observes that cancellation immediately.
+    pub fn set_interrupt_handle(&mut self, interrupt: std::sync::Arc<RuntimeInterrupt>) {
+        self.interp.runtime_interrupt = interrupt;
     }
 
     /// Run `src` as a spawned `$262.agent`: the agent may block in `Atomics.wait`, receives
@@ -182,6 +221,16 @@ impl Engine {
     /// Parse and run `src`. `strict` forces strict mode (used for the test262 strict variant); a
     /// `"use strict"` directive in the source also enables it.
     pub fn eval(&mut self, src: &str, strict: bool) -> Result<Completion, ParseError> {
+        self.eval_interruptible(src, strict)
+            .map(Self::legacy_completion)
+    }
+
+    /// [`Engine::eval`] with host interruption kept distinct from a JavaScript throw.
+    pub fn eval_interruptible(
+        &mut self,
+        src: &str,
+        strict: bool,
+    ) -> Result<ExecutionOutcome, ParseError> {
         let body = parser::parse_script(src, strict).map_err(|e| ParseError {
             message: e.message,
             line: e.line,
@@ -194,11 +243,27 @@ impl Engine {
         );
         self.interp.strict = strict || directive_strict;
         let result = self.interp.run_program(&body);
-        // Run queued promise reactions (the microtask checkpoint after the script).
-        self.interp.run_agent_event_loop();
         match result {
-            Ok(v) => Ok(Completion::Value(self.render(&v))),
-            Err(thrown) => Ok(self.describe_throw(thrown)),
+            Ok(v) => {
+                // Run queued promise reactions (the microtask checkpoint after the script).
+                if let Err(reason) = self.interp.run_agent_event_loop() {
+                    return Ok(ExecutionOutcome::Interrupted { reason });
+                }
+                Ok(ExecutionOutcome::Value(self.render(&v)))
+            }
+            Err(interpreter::Abrupt::Throw(thrown)) => {
+                if let Err(reason) = self.interp.run_agent_event_loop() {
+                    return Ok(ExecutionOutcome::Interrupted { reason });
+                }
+                let Completion::Throw { name, message } = self.describe_throw(thrown) else {
+                    unreachable!()
+                };
+                Ok(ExecutionOutcome::Throw { name, message })
+            }
+            Err(interpreter::Abrupt::Interrupt(reason)) => {
+                Ok(ExecutionOutcome::Interrupted { reason })
+            }
+            Err(_) => Ok(ExecutionOutcome::Value(String::new())),
         }
     }
 
@@ -209,6 +274,16 @@ impl Engine {
     /// original source; the resulting AST is otherwise identical to a parsed one, so execution
     /// is byte-for-byte the same.
     pub fn eval_snapshot(&mut self, bytes: &[u8], strict: bool) -> Result<Completion, ParseError> {
+        self.eval_snapshot_interruptible(bytes, strict)
+            .map(Self::legacy_completion)
+    }
+
+    /// [`Engine::eval_snapshot`] with host interruption kept distinct from a JavaScript throw.
+    pub fn eval_snapshot_interruptible(
+        &mut self,
+        bytes: &[u8],
+        strict: bool,
+    ) -> Result<ExecutionOutcome, ParseError> {
         let body = snapshot::decode(bytes).map_err(|message| ParseError {
             message,
             line: 0,
@@ -220,10 +295,26 @@ impl Engine {
         );
         self.interp.strict = strict || directive_strict;
         let result = self.interp.run_program(&body);
-        self.interp.run_agent_event_loop();
         match result {
-            Ok(v) => Ok(Completion::Value(self.render(&v))),
-            Err(thrown) => Ok(self.describe_throw(thrown)),
+            Ok(v) => {
+                if let Err(reason) = self.interp.run_agent_event_loop() {
+                    return Ok(ExecutionOutcome::Interrupted { reason });
+                }
+                Ok(ExecutionOutcome::Value(self.render(&v)))
+            }
+            Err(interpreter::Abrupt::Throw(thrown)) => {
+                if let Err(reason) = self.interp.run_agent_event_loop() {
+                    return Ok(ExecutionOutcome::Interrupted { reason });
+                }
+                let Completion::Throw { name, message } = self.describe_throw(thrown) else {
+                    unreachable!()
+                };
+                Ok(ExecutionOutcome::Throw { name, message })
+            }
+            Err(interpreter::Abrupt::Interrupt(reason)) => {
+                Ok(ExecutionOutcome::Interrupted { reason })
+            }
+            Err(_) => Ok(ExecutionOutcome::Value(String::new())),
         }
     }
 
@@ -275,12 +366,36 @@ impl Engine {
         key: &str,
         loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
     ) -> Result<Completion, ParseError> {
+        self.eval_module_attrs_interruptible(src, key, loader)
+            .map(Self::legacy_completion)
+    }
+
+    /// [`Engine::eval_module_attrs`] with host interruption kept distinct from a JavaScript
+    /// throw.
+    pub fn eval_module_attrs_interruptible(
+        &mut self,
+        src: &str,
+        key: &str,
+        loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
+    ) -> Result<ExecutionOutcome, ParseError> {
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
         let result = self.interp.load_module(key, src);
-        self.interp.run_agent_event_loop();
         Ok(match result {
-            Ok(_) => Completion::Value(String::new()),
-            Err(a) => self.describe_throw(interpreter::abrupt_value(a)),
+            Ok(_) => match self.interp.run_agent_event_loop() {
+                Ok(()) => ExecutionOutcome::Value(String::new()),
+                Err(reason) => ExecutionOutcome::Interrupted { reason },
+            },
+            Err(interpreter::Abrupt::Throw(value)) => {
+                if let Err(reason) = self.interp.run_agent_event_loop() {
+                    return Ok(ExecutionOutcome::Interrupted { reason });
+                }
+                let Completion::Throw { name, message } = self.describe_throw(value) else {
+                    unreachable!()
+                };
+                ExecutionOutcome::Throw { name, message }
+            }
+            Err(interpreter::Abrupt::Interrupt(reason)) => ExecutionOutcome::Interrupted { reason },
+            Err(_) => ExecutionOutcome::Value(String::new()),
         })
     }
 
@@ -332,6 +447,24 @@ impl Engine {
         };
         Completion::Throw { name, message }
     }
+
+    fn legacy_completion(outcome: ExecutionOutcome) -> Completion {
+        match outcome {
+            ExecutionOutcome::Value(value) => Completion::Value(value),
+            ExecutionOutcome::Throw { name, message } => Completion::Throw { name, message },
+            ExecutionOutcome::Interrupted { reason } => Completion::Throw {
+                name: Self::legacy_interrupt_name(reason).to_string(),
+                message: reason.message().to_string(),
+            },
+        }
+    }
+
+    fn legacy_interrupt_name(reason: InterruptReason) -> &'static str {
+        match reason {
+            InterruptReason::DeadlineExceeded => "QuotaExceededError",
+            InterruptReason::Cancelled | InterruptReason::UserNavigation => "AbortError",
+        }
+    }
 }
 
 /// The curated embedder surface (`feature = "embed"`), for runtime layers (event loop, host
@@ -348,6 +481,12 @@ pub mod embed {
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
     /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
     pub use crate::value::{NativeClosure, NativeFn, Value};
+
+    /// Non-parse failure from an interrupt-aware embedding entry point.
+    pub enum EvalError {
+        Throw(Value),
+        Interrupted(crate::InterruptReason),
+    }
 }
 
 /// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`
@@ -385,6 +524,21 @@ impl Engine {
         &mut self,
         src: &str,
     ) -> Result<Result<embed::Value, embed::Value>, ParseError> {
+        Ok(match self.eval_value_interruptible(src)? {
+            Ok(value) => Ok(value),
+            Err(embed::EvalError::Throw(value)) => Err(value),
+            Err(embed::EvalError::Interrupted(reason)) => Err(self
+                .interp
+                .make_error(Self::legacy_interrupt_name(reason), reason.message())),
+        })
+    }
+
+    /// [`Engine::eval_value`] with host interruption kept distinct from a catchable JavaScript
+    /// throw. Browser embedders should use this entry point.
+    pub fn eval_value_interruptible(
+        &mut self,
+        src: &str,
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
         let body = parser::parse_script(src, false).map_err(|e| ParseError {
             message: e.message,
             line: e.line,
@@ -397,7 +551,12 @@ impl Engine {
         self.interp.strict = directive_strict;
         Ok(match self.interp.run_program(&body) {
             Ok(Value::Empty) => Ok(Value::Undefined),
-            result => result,
+            Ok(value) => Ok(value),
+            Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
+            Err(interpreter::Abrupt::Interrupt(reason)) => {
+                Err(embed::EvalError::Interrupted(reason))
+            }
+            Err(_) => Ok(Value::Undefined),
         })
     }
 
@@ -430,14 +589,47 @@ impl Engine {
         this: embed::Value,
         args: &[embed::Value],
     ) -> Result<embed::Value, embed::Value> {
+        match self.call_function_interruptible(func, this, args) {
+            Ok(value) => Ok(value),
+            Err(embed::EvalError::Throw(value)) => Err(value),
+            Err(embed::EvalError::Interrupted(reason)) => Err(self
+                .interp
+                .make_error(Self::legacy_interrupt_name(reason), reason.message())),
+        }
+    }
+
+    /// [`Engine::call_function`] with a host interruption kept out of JavaScript exception flow.
+    pub fn call_function_interruptible(
+        &mut self,
+        func: &embed::Value,
+        this: embed::Value,
+        args: &[embed::Value],
+    ) -> Result<embed::Value, embed::EvalError> {
+        self.interp
+            .interrupt_poll_force()
+            .map_err(|abrupt| match abrupt {
+                interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
+                interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
+                _ => embed::EvalError::Throw(Value::Undefined),
+            })?;
         self.interp
             .call(func.clone(), this, args)
-            .map_err(interpreter::abrupt_value)
+            .map_err(|abrupt| match abrupt {
+                interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
+                interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
+                _ => embed::EvalError::Throw(Value::Undefined),
+            })
     }
 
     /// Drain the microtask (promise-reaction) queue to quiescence.
     pub fn run_microtasks(&mut self) {
         self.interp.drain_microtasks();
+    }
+
+    /// Run a microtask checkpoint while preserving host interruption as control flow. Pending jobs
+    /// are discarded when a running job is killed; they must not be resumed as a later task.
+    pub fn run_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
+        self.interp.drain_microtasks_interruptible()
     }
 
     /// Drain and return the reasons of promises rejected without a handler (after a microtask
@@ -469,12 +661,17 @@ impl Engine {
 
     /// Run a single queued job; `false` when the queue was empty.
     pub fn run_one_job(&mut self) -> bool {
+        self.run_one_job_interruptible().unwrap_or(false)
+    }
+
+    /// Run one queued job, preserving a host interruption from the job's JavaScript callback.
+    pub fn run_one_job_interruptible(&mut self) -> Result<bool, crate::InterruptReason> {
         match self.interp.microtasks.pop_front() {
             Some(job) => {
-                self.interp.run_job(job);
-                true
+                self.interp.run_job_interruptible(job)?;
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 }

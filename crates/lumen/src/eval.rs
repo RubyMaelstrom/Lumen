@@ -307,6 +307,12 @@ impl Interp {
         mut frame: Vec<Disposable>,
         result: Completion,
     ) -> Completion {
+        // Script termination is host control flow, not ECMAScript abrupt completion cleanup.
+        // Like `finally`, explicit-resource-management disposal must not run while HTML aborts
+        // the execution-context stack.
+        if matches!(result, Err(Abrupt::Interrupt(_))) {
+            return result;
+        }
         // A null/undefined `await using` resource left an await-only marker (no method): the
         // block's end still performs one Await even with nothing to dispose.
         let mut await_pending = false;
@@ -814,6 +820,7 @@ impl Interp {
         loop {
             // Safe point: run the cycle collector / enforce the live-object ceiling. Catches tight
             // loops (`for(;;){ x = {}; }`) that never call a function.
+            self.interrupt_poll()?;
             self.gc_check()?;
             match step(self, env) {
                 Ok(LoopStep::Continue(bv)) => keep(bv, &mut v),
@@ -1692,6 +1699,11 @@ impl Interp {
             }
             other => other,
         };
+        // HTML §8.1.4.5: aborting a running script empties the execution-context stack without
+        // triggering normal language mechanisms such as `finally`.
+        if matches!(after_catch, Err(Abrupt::Interrupt(_))) {
+            return after_catch;
+        }
         if let Some(fin) = finalizer {
             // An abrupt completion in `finally` overrides the try/catch completion; its normal
             // value is discarded (the try/catch completion stands). A pending tail call from the
@@ -3507,10 +3519,14 @@ impl Interp {
     /// Drain the microtask queue (called after the main script). Bounded to avoid an unbounded loop.
     /// Drive microtasks plus any pending `Atomics.waitAsync` operations to completion: resolve each
     /// async wait as its waiter thread reports, running the scheduled reactions in between.
-    pub(crate) fn run_agent_event_loop(&mut self) {
-        self.drain_microtasks();
+    pub(crate) fn run_agent_event_loop(&mut self) -> Result<(), crate::InterruptReason> {
+        self.drain_microtasks_interruptible()?;
         let mut spins = 0u32;
         while !self.pending_async_waits.is_empty() || !self.pending_timers.is_empty() {
+            self.interrupt_poll_force().map_err(|abrupt| match abrupt {
+                Abrupt::Interrupt(reason) => reason,
+                _ => unreachable!("a host-control poll only produces Interrupt"),
+            })?;
             let mut resolved_any = false;
             let mut i = 0;
             while i < self.pending_async_waits.len() {
@@ -3534,11 +3550,13 @@ impl Interp {
                 }
             });
             for f in due {
-                let _ = self.call(f, Value::Undefined, &[]);
+                if let Err(Abrupt::Interrupt(reason)) = self.call(f, Value::Undefined, &[]) {
+                    return Err(reason);
+                }
                 resolved_any = true;
             }
             if resolved_any {
-                self.drain_microtasks();
+                self.drain_microtasks_interruptible()?;
                 spins = 0;
             } else {
                 spins += 1;
@@ -3549,23 +3567,42 @@ impl Interp {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+        Ok(())
     }
 
     pub(crate) fn drain_microtasks(&mut self) {
+        let _ = self.drain_microtasks_interruptible();
+    }
+
+    pub(crate) fn drain_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
         let mut budget = 100_000u32;
         while let Some(job) = self.microtasks.pop_front() {
+            if let Err(abrupt) = self.interrupt_poll_force() {
+                self.microtasks.clear();
+                let Abrupt::Interrupt(reason) = abrupt else {
+                    unreachable!("a host-control poll only produces Interrupt")
+                };
+                return Err(reason);
+            }
             budget -= 1;
             if budget == 0 {
                 self.microtasks.clear();
                 break;
             }
-            self.run_job(job);
+            if let Err(reason) = self.run_job_interruptible(job) {
+                self.microtasks.clear();
+                return Err(reason);
+            }
         }
+        Ok(())
     }
 
     /// Run one promise-reaction job (settle `job.result` from the handler, or pass the
     /// settlement through when there is no handler).
-    pub(crate) fn run_job(&mut self, job: crate::interpreter::Job) {
+    pub(crate) fn run_job_interruptible(
+        &mut self,
+        job: crate::interpreter::Job,
+    ) -> Result<(), crate::InterruptReason> {
         if job.handler.is_callable() {
             match self.call(
                 job.handler.clone(),
@@ -3574,6 +3611,7 @@ impl Interp {
             ) {
                 Ok(r) => self.resolve_promise(&job.result, r),
                 Err(Abrupt::Throw(e)) => self.reject_promise(&job.result, e),
+                Err(Abrupt::Interrupt(reason)) => return Err(reason),
                 Err(_) => {}
             }
         } else if job.fulfilled {
@@ -3581,6 +3619,7 @@ impl Interp {
         } else {
             self.reject_promise(&job.result, job.value);
         }
+        Ok(())
     }
 
     /// Compile a regular expression and build a RegExp object (its metadata stored as own props,
@@ -4849,9 +4888,7 @@ impl Interp {
                 // constructors that require `new`. Run it, then graft its own props onto `this`.
                 let saved = self.constructing;
                 self.constructing = true;
-                let made = self
-                    .dispatch_native(&call, this.clone(), args)
-                    .map_err(Abrupt::Throw);
+                let made = self.dispatch_native(&call, this.clone(), args);
                 self.constructing = saved;
                 let made = made?;
                 if let (Value::Obj(src), Value::Obj(dst)) = (&made, this) {

@@ -1,7 +1,7 @@
 //! Smoke tests for the language core. These are the fast inner loop while growing the engine; the
 //! broad conformance signal comes from `crates/test262-runner`.
 
-use crate::{Completion, Engine};
+use crate::{Completion, Engine, ExecutionOutcome, InterruptReason};
 
 fn run(src: &str) -> String {
     match Engine::new().eval(src, false).expect("parse") {
@@ -87,6 +87,198 @@ fn errors_have_names() {
 fn syntax_error_is_parse_phase() {
     assert!(Engine::new().eval("function (", false).is_err());
     assert!(Engine::new().eval("1 +", false).is_err());
+}
+
+#[test]
+fn execution_deadlines_abort_without_running_catch_or_finally_on_every_tier() {
+    // HTML §8.1.4.5 "Killing scripts": abort empties the execution-context stack without the
+    // normal language mechanisms, including `finally`. Keep the declarations outside the try so
+    // the same realm can prove neither author handler observed the host control completion.
+    let source = r#"
+        var caught = 0, finalized = 0;
+        function spin() { while (true) {} }
+        try { spin(); }
+        catch (error) { caught = 1; }
+        finally { finalized = 1; }
+    "#;
+
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let interrupt = engine.interrupt_handle();
+        interrupt.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        ));
+        let started = std::time::Instant::now();
+        match engine
+            .eval_interruptible(source, false)
+            .expect("script parses")
+        {
+            ExecutionOutcome::Interrupted {
+                reason: InterruptReason::DeadlineExceeded,
+            } => {}
+            ExecutionOutcome::Interrupted { reason } => {
+                panic!("unexpected interruption on {tier:?}: {reason:?}")
+            }
+            ExecutionOutcome::Value(value) => {
+                panic!("deadline did not interrupt {tier:?}; returned {value}")
+            }
+            ExecutionOutcome::Throw { name, message } => {
+                panic!("deadline became a JavaScript throw on {tier:?}: {name}: {message}")
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{tier:?} did not honor the deadline promptly"
+        );
+
+        interrupt.set_deadline(None);
+        assert_eq!(
+            match engine
+                .eval("caught + ':' + finalized", false)
+                .expect("parse")
+            {
+                Completion::Value(value) => value,
+                Completion::Throw { name, message } => {
+                    panic!("realm did not recover after {tier:?} deadline: {name}: {message}")
+                }
+            },
+            "0:0",
+            "{tier:?} exposed host interruption to catch/finally"
+        );
+    }
+}
+
+#[test]
+fn cancellation_crosses_threads_and_interrupts_jit_code() {
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(0);
+    let interrupt = engine.interrupt_handle();
+    let canceller = std::thread::spawn({
+        let interrupt = interrupt.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            interrupt.cancel();
+        }
+    });
+    let started = std::time::Instant::now();
+    let outcome = engine
+        .eval_interruptible("function spin(){while(true){}} spin()", false)
+        .expect("script parses");
+    canceller.join().expect("canceller thread");
+    assert!(matches!(
+        outcome,
+        ExecutionOutcome::Interrupted {
+            reason: InterruptReason::Cancelled
+        }
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn interruption_aborts_a_running_microtask_checkpoint() {
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(0);
+    let interrupt = engine.interrupt_handle();
+    interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(20),
+    ));
+    let outcome = engine
+        .eval_interruptible(
+            r#"
+            var caught = 0, finalized = 0, later = 0;
+            function spin() { while (true) {} }
+            Promise.resolve().then(() => {
+                try { spin(); }
+                catch (error) { caught = 1; }
+                finally { finalized = 1; }
+            }).then(() => { later = 1; });
+            "#,
+            false,
+        )
+        .expect("script parses");
+    assert!(matches!(
+        outcome,
+        ExecutionOutcome::Interrupted {
+            reason: InterruptReason::DeadlineExceeded
+        }
+    ));
+    interrupt.set_deadline(None);
+    assert_eq!(
+        match engine
+            .eval("caught + ':' + finalized + ':' + later", false)
+            .expect("parse")
+        {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        },
+        "0:0:0"
+    );
+}
+
+#[test]
+fn interruption_escapes_native_nested_evaluation_without_becoming_a_throw() {
+    let mut engine = Engine::new();
+    let interrupt = engine.interrupt_handle();
+    interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(20),
+    ));
+    let outcome = engine
+        .eval_interruptible(
+            r#"
+            var caught = 0, finalized = 0;
+            try { $262.evalScript("while (true) {}"); }
+            catch (error) { caught = 1; }
+            finally { finalized = 1; }
+            "#,
+            false,
+        )
+        .expect("script parses");
+    assert!(matches!(
+        outcome,
+        ExecutionOutcome::Interrupted {
+            reason: InterruptReason::DeadlineExceeded
+        }
+    ));
+    interrupt.set_deadline(None);
+    assert_eq!(
+        match engine
+            .eval("caught + ':' + finalized", false)
+            .expect("parse")
+        {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        },
+        "0:0"
+    );
+}
+
+#[test]
+fn user_navigation_interrupt_is_rearmable_at_a_task_boundary() {
+    let mut engine = Engine::new();
+    let interrupt = engine.interrupt_handle();
+    interrupt.request_user_navigation();
+    assert!(matches!(
+        engine.eval_interruptible("1", false).expect("parse"),
+        ExecutionOutcome::Interrupted {
+            reason: InterruptReason::UserNavigation
+        }
+    ));
+    interrupt.begin_user_interaction();
+    assert_eq!(
+        match engine.eval("2", false).expect("parse") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        },
+        "2"
+    );
 }
 
 #[test]

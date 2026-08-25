@@ -6,7 +6,7 @@
 
 use super::{
     sys, JitCode, COND_PEEK_NOT_NULLISH, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COND, H_EXEC,
-    H_GET_PROP, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN, H_SET_PROP, H_UNWIND,
+    H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN, H_SET_PROP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 
@@ -210,6 +210,22 @@ impl Asm {
         self.bytes(&[0x48, 0x85, 0xd2]); // test rdx, rdx (throw flag)
         self.jcc(0x85, unwind); // jne
     }
+    fn interrupt_poll(&mut self, interp_offset: Option<i32>, unwind: usize) {
+        let Some(offset) = interp_offset else {
+            self.helper_spflag(H_INTERRUPT, 0, unwind);
+            return;
+        };
+        let done = self.label();
+        self.bytes(&[0x49, 0x8b, 0x44, 0x24, 0x48]); // rax = ctx.interp
+        self.bytes(&[0xff, 0x80]); // inc dword ptr [rax+offset]
+        self.bytes(&offset.to_le_bytes());
+        self.bytes(&[0xf7, 0x80]); // test dword ptr [rax+offset], 0x3fff
+        self.bytes(&offset.to_le_bytes());
+        self.bytes(&0x3fffu32.to_le_bytes());
+        self.jcc(0x85, done); // nonzero: skip the shared-state helper
+        self.helper_spflag(H_INTERRUPT, 0, unwind);
+        self.bind(done);
+    }
     fn finish(mut self) -> Vec<u8> {
         for (at, label) in self.patches {
             let target = self.labels[label].expect("unbound x64 JIT label");
@@ -360,7 +376,7 @@ fn emit_prop_num(
 pub(super) fn compile(
     chunk: &Chunk,
     layout: &crate::value::JitLayout,
-    _ilayout: &crate::interpreter::InterpLayout,
+    ilayout: &crate::interpreter::InterpLayout,
 ) -> Option<JitCode> {
     let ops = chunk.jit_ops();
     if ops.is_empty() || ops.len() > u32::MAX as usize || ops.iter().any(|o| matches!(o, Op::Await))
@@ -375,6 +391,23 @@ pub(super) fn compile(
     let ret_throw = a.label();
     let rc_ok = layout.valid && layout.rc_strong_off <= i32::MAX as usize;
     let rc_strong = layout.rc_strong_off as i32;
+    let interrupt_offset = (ilayout.valid && ilayout.interrupt_poll_tick <= i32::MAX as usize)
+        .then_some(ilayout.interrupt_poll_tick as i32);
+    let mut interrupt_targets = vec![false; ops.len()];
+    for (pc, op) in ops.iter().enumerate() {
+        match op {
+            Op::Jump(target)
+            | Op::JumpIfFalse(target)
+            | Op::JumpIfFalsePeek(target)
+            | Op::JumpIfTruePeek(target)
+            | Op::JumpIfNotNullishPeek(target)
+                if (*target as usize) <= pc =>
+            {
+                interrupt_targets[*target as usize] = true;
+            }
+            _ => {}
+        }
+    }
 
     // Preserve five registers so the stack is 16-byte aligned at every helper call.
     a.bytes(&[
@@ -399,6 +432,9 @@ pub(super) fn compile(
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pcs[pc]);
         pc_offsets.push(a.code.len() as u32);
+        if interrupt_targets[pc] {
+            a.interrupt_poll(interrupt_offset, unwind);
+        }
         match op {
             Op::Const(k) if chunk.jit_const_copyable(*k) => {
                 let (lo, hi) = chunk.jit_const_bits(*k);

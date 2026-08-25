@@ -5757,7 +5757,12 @@ fn run_vm(
                 pop!();
                 stack.push(Value::Undefined);
             }
-            Op::Jump(t) => *pc = t as usize,
+            Op::Jump(t) => {
+                if t as usize <= *pc {
+                    i.interrupt_poll()?;
+                }
+                *pc = t as usize;
+            }
             Op::InlineGuard(t, target) => {
                 let it = &chunk.inline_targets[t as usize];
                 let d = it.argc as usize + 1;
@@ -5780,16 +5785,25 @@ fn run_vm(
             Op::JumpIfFalse(t) => {
                 let a = pop!();
                 if !i.to_boolean(&a) {
+                    if t as usize <= *pc {
+                        i.interrupt_poll()?;
+                    }
                     *pc = t as usize;
                 }
             }
             Op::JumpIfFalsePeek(t) => {
                 if !i.to_boolean(stack.last().expect("vm stack underflow")) {
+                    if t as usize <= *pc {
+                        i.interrupt_poll()?;
+                    }
                     *pc = t as usize;
                 }
             }
             Op::JumpIfTruePeek(t) => {
                 if i.to_boolean(stack.last().expect("vm stack underflow")) {
+                    if t as usize <= *pc {
+                        i.interrupt_poll()?;
+                    }
                     *pc = t as usize;
                 }
             }
@@ -5798,6 +5812,9 @@ fn run_vm(
                     stack.last().expect("vm stack underflow"),
                     Value::Undefined | Value::Null
                 ) {
+                    if t as usize <= *pc {
+                        i.interrupt_poll()?;
+                    }
                     *pc = t as usize;
                 }
             }
@@ -9907,6 +9924,22 @@ pub(crate) unsafe extern "C" fn jit_unwind(
                 sp: addr as *mut Value,
                 flag: target.add(1) as u64,
             }
+        }
+    }
+}
+
+/// Full host-control poll reached by the generated tier's cheap loop divider.
+pub(crate) unsafe extern "C" fn jit_interrupt(
+    ctx: *mut crate::jit::JitCtx,
+    _imm: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    let ctx = unsafe { &mut *ctx };
+    match unsafe { &mut *ctx.interp }.interrupt_poll_force() {
+        Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+        Err(abrupt) => {
+            ctx.error = Some(abrupt);
+            crate::jit::SpFlag { sp, flag: 1 }
         }
     }
 }

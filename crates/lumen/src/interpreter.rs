@@ -661,6 +661,9 @@ pub fn nearest_var_env(env: &Env) -> Env {
 /// A non-local completion. Expressions only raise `Throw`; the rest flow out of statements.
 pub enum Abrupt {
     Throw(Value),
+    /// Host control completion. It is deliberately not a thrown Value: HTML script termination
+    /// bypasses author `catch` and `finally` blocks.
+    Interrupt(crate::InterruptReason),
     Return(Value),
     /// Break/Continue carry the completion value threaded so far by the enclosing statement list
     /// (`Value::Empty` when none), per the spec's UpdateEmpty bookkeeping.
@@ -902,6 +905,7 @@ pub(crate) struct InterpLayout {
     pub depth: usize,
     pub gc_tick: usize,
     pub gc_next: usize,
+    pub interrupt_poll_tick: usize,
     pub cur_coro: usize,
     pub constructing: usize,
     pub new_target: usize,
@@ -976,6 +980,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         depth: off(&i.depth as *const _ as usize),
         gc_tick: off(&i.gc_tick as *const _ as usize),
         gc_next: off(&i.gc_next as *const _ as usize),
+        interrupt_poll_tick: off(&i.interrupt_poll_tick as *const _ as usize),
         cur_coro: off(&i.cur_coro as *const _ as usize),
         constructing: off(&i.constructing as *const _ as usize),
         new_target: off(&i.new_target as *const _ as usize),
@@ -1028,6 +1033,10 @@ pub struct Interp {
     /// milliseconds for ECMAScript `Date`. Each Window/Worker realm owns its own time origin and
     /// virtual-time anchor; a process-global callback cannot model that.
     pub(crate) wall_clock: Option<Rc<dyn Fn() -> f64>>,
+    pub(crate) runtime_interrupt: std::sync::Arc<crate::RuntimeInterrupt>,
+    /// Hot-loop poll divider. Execution tiers increment this cheaply and consult the shared
+    /// atomics/deadline only once per bounded batch.
+    pub(crate) interrupt_poll_tick: u32,
     /// Current strict-mode flag (pushed/popped around function bodies).
     pub(crate) strict: bool,
     /// Execution tier (env `LUMEN_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
@@ -1662,6 +1671,8 @@ impl Interp {
             sym_registry: Default::default(),
             console: Vec::new(),
             wall_clock: None,
+            runtime_interrupt: Default::default(),
+            interrupt_poll_tick: 0,
             strict: false,
             depth: 0,
             class_info: Default::default(),
@@ -2149,6 +2160,24 @@ impl Interp {
             .unwrap_or(0.0)
     }
 
+    /// Poll the shared host control at a bounded hot-loop cadence.
+    #[inline]
+    pub(crate) fn interrupt_poll(&mut self) -> Result<(), Abrupt> {
+        self.interrupt_poll_tick = self.interrupt_poll_tick.wrapping_add(1);
+        if self.interrupt_poll_tick & 0x3fff != 0 {
+            return Ok(());
+        }
+        self.interrupt_poll_force()
+    }
+
+    /// Poll without the cadence divider (script/callback entry and JIT slow poll).
+    pub(crate) fn interrupt_poll_force(&self) -> Result<(), Abrupt> {
+        match self.runtime_interrupt.current_reason() {
+            Some(reason) => Err(Abrupt::Interrupt(reason)),
+            None => Ok(()),
+        }
+    }
+
     /// Execute all currently queued promise reaction jobs synchronously.
     pub fn drain_microtasks_for_host(&mut self) {
         self.drain_microtasks();
@@ -2340,15 +2369,20 @@ impl Interp {
         call: &Callable,
         this: Value,
         args: &[Value],
-    ) -> Result<Value, Value> {
-        match call {
+    ) -> Result<Value, Abrupt> {
+        self.interrupt_poll_force()?;
+        let result = match call {
             Callable::Native(f) => f(self, this, args),
             Callable::NativeData(data) => {
                 let f = data.func.clone();
                 f(self, this, args)
             }
             _ => unreachable!("dispatch_native on a non-native callable"),
-        }
+        };
+        // A native may run nested JavaScript (for example `$262.evalScript`). Host interruption
+        // from that execution must override its Value-shaped native error before author `catch`.
+        self.interrupt_poll_force()?;
+        result.map_err(Abrupt::Throw)
     }
 
     /// A function `Value` backed by a data-carrying native closure — the embedder API for host
@@ -5058,9 +5092,9 @@ impl Interp {
         }
         let r = match call {
             Callable::None => Err(self.throw("TypeError", "value is not a function")),
-            Callable::Native(_) | Callable::NativeData(_) => self
-                .dispatch_native(&call, this, args)
-                .map_err(Abrupt::Throw),
+            Callable::Native(_) | Callable::NativeData(_) => {
+                self.dispatch_native(&call, this, args)
+            }
             Callable::User(user) => {
                 // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
                 // single call, and most programs define no classes.)
@@ -5833,7 +5867,20 @@ impl Interp {
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
         let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
         let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
-        let mut r = nf(self, unsafe { &*this_slot }.clone(), args_ref).map_err(Abrupt::Throw);
+        let native_result = match self.interrupt_poll_force() {
+            Ok(()) => nf(self, unsafe { &*this_slot }.clone(), args_ref),
+            Err(interrupt) => {
+                self.constructing = saved_ctor;
+                self.new_target = saved_nt;
+                self.depth -= 1;
+                drop_operands();
+                return Err(interrupt);
+            }
+        };
+        let mut r = match self.interrupt_poll_force() {
+            Ok(()) => native_result.map_err(Abrupt::Throw),
+            Err(interrupt) => Err(interrupt),
+        };
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         while r.is_ok() {
@@ -6341,9 +6388,7 @@ impl Interp {
             let saved_ctor = std::mem::replace(&mut self.constructing, true);
             let saved_nt = std::mem::replace(&mut self.new_target, callee.clone());
             let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
-            let r = self
-                .dispatch_native(&call, Value::Undefined, args_ref)
-                .map_err(Abrupt::Throw);
+            let r = self.dispatch_native(&call, Value::Undefined, args_ref);
             self.constructing = saved_ctor;
             self.new_target = saved_nt;
             unsafe {
@@ -7983,9 +8028,7 @@ impl Interp {
                 let saved_nt = self.new_target.clone();
                 self.constructing = true;
                 self.new_target = new_target;
-                let r = self
-                    .dispatch_native(&call, Value::Undefined, args)
-                    .map_err(Abrupt::Throw);
+                let r = self.dispatch_native(&call, Value::Undefined, args);
                 self.constructing = saved;
                 self.new_target = saved_nt;
                 r
@@ -8132,7 +8175,8 @@ impl Interp {
         Ok(())
     }
 
-    pub(crate) fn run_program(&mut self, body: &[Stmt]) -> Result<Value, Value> {
+    pub(crate) fn run_program(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
+        self.interrupt_poll_force()?;
         // GlobalDeclarationInstantiation early checks, before any binding is created. A probe
         // hoist into a throwaway scope yields this script's VarDeclaredNames.
         let probe = new_scope(None);
@@ -8168,19 +8212,19 @@ impl Interp {
                 || self.global_var_names.contains(n)
                 || restricted
             {
-                return Err(self.make_error(
+                return Err(Abrupt::Throw(self.make_error(
                     "SyntaxError",
                     format!("Identifier '{n}' has already been declared"),
-                ));
+                )));
             }
         }
         let extensible = self.global.borrow().extensible;
         for (name, binding) in probe.borrow().vars.iter() {
             if self.global_env.borrow().vars.contains_key(name) {
-                return Err(self.make_error(
+                return Err(Abrupt::Throw(self.make_error(
                     "SyntaxError",
                     format!("Identifier '{name}' has already been declared"),
-                ));
+                )));
             }
             let existing = self
                 .global
@@ -8198,17 +8242,17 @@ impl Interp {
                     None => extensible,
                 };
                 if !ok {
-                    return Err(self.make_error(
+                    return Err(Abrupt::Throw(self.make_error(
                         "TypeError",
                         format!("cannot declare global function '{name}'"),
-                    ));
+                    )));
                 }
             } else if existing.is_none() && !extensible {
                 // CanDeclareGlobalVar.
-                return Err(self.make_error(
+                return Err(Abrupt::Throw(self.make_error(
                     "TypeError",
                     format!("cannot declare global variable '{name}'"),
-                ));
+                )));
             }
         }
         let new_vars: Vec<String> = probe.borrow().vars.keys().map(|k| k.to_string()).collect();
@@ -8263,7 +8307,8 @@ impl Interp {
                         last = v;
                     }
                 }
-                Err(Abrupt::Throw(v)) => return Err(v),
+                Err(Abrupt::Throw(v)) => return Err(Abrupt::Throw(v)),
+                Err(Abrupt::Interrupt(reason)) => return Err(Abrupt::Interrupt(reason)),
                 Err(_) => return Ok(last), // stray break/continue/return at top level: stop
             }
         }

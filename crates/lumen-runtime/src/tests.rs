@@ -1402,6 +1402,26 @@ fn worker_terminate_stops_a_running_worker() {
 }
 
 #[test]
+fn worker_terminate_aborts_current_synchronous_script() {
+    // HTML "terminate a worker": termination aborts the currently running script, not merely
+    // tasks which have not started yet. The worker announces `online` before evaluating its entry,
+    // so the main realm can terminate this otherwise non-returning top-level task.
+    let started = std::time::Instant::now();
+    let lines = worker_drive(
+        &[("spin.mjs", "while (true) {}")],
+        r#"
+        const w = new Worker("{DIR}/spin.mjs", { type: "module" });
+        setTimeout(() => { w.terminate(); console.log("terminated spin"); }, 25);
+        "#,
+    );
+    assert_eq!(lines, ["terminated spin"]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "terminating a running worker was not prompt"
+    );
+}
+
+#[test]
 fn worker_load_error_reports() {
     // A missing worker script surfaces as an error event, not a hang.
     let lines = worker_drive(

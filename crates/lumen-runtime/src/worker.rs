@@ -19,11 +19,10 @@
 //!   (`require.main === module`, `__filename`/`__dirname` in scope), like Node workers.
 //!
 //! ## What's intentionally v1
-//! - **Cooperative terminate**: `terminate()` (and the worker's `close()`/`process.exit()`) set a
-//!   shared stop flag the worker loop polls; a worker stuck in a long *synchronous* JS task
-//!   finishes it first (no preemption — the engine has no interrupt point). Pending timers are
-//!   dropped on stop. Likewise `process.exit()` in a worker stops at the next loop poll rather
-//!   than instantly.
+//! - Parent-side `terminate()` sets the worker's closing flag, discards pending loop work, and
+//!   requests an engine interrupt so a currently running script is aborted as required by HTML's
+//!   terminate-a-worker algorithm. Worker-side `close()` remains a closing-flag operation: the
+//!   task which called it is allowed to finish.
 //! - **No `SharedArrayBuffer` sharing, no transfer list** (messages are always copied).
 //! - Reuses the full [`Runtime`] per worker (own 4-thread pool). Heavy but correct.
 
@@ -32,7 +31,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-use lumen_host::{ops, CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
+use lumen_host::{
+    ops, CompletionSender, Ctx, Extension, RuntimeInterrupt, TaskId, TaskRegistry, Value,
+};
 
 use crate::Runtime;
 
@@ -66,6 +67,7 @@ struct WorkerEntry {
     to_worker: Option<Sender<ToWorker>>,
     dispatch: Value,
     stop: Arc<AtomicBool>,
+    interrupt: Arc<RuntimeInterrupt>,
     /// Whether this worker's main-side inbox keeps the main loop alive (`worker.unref()` clears).
     keep_alive: bool,
     /// The currently armed inbox task, so `setRef` can re-mark it in flight.
@@ -99,6 +101,7 @@ struct WorkerSpec {
     /// Structured-clone bytes of `{ workerData, argv, env, envData, entry }` (node mode).
     init: Option<Vec<u8>>,
     thread_id: u64,
+    interrupt: Arc<RuntimeInterrupt>,
 }
 
 /// `__worker.spawn(path, isModule, dispatch, opts?)` → `{ id, threadId }`. Spawns the worker
@@ -132,6 +135,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
     let (to_worker_tx, to_worker_rx) = channel::<ToWorker>();
     let (to_main_tx, to_main_rx) = channel::<ToMain>();
     let stop = Arc::new(AtomicBool::new(false));
+    let interrupt = Arc::new(RuntimeInterrupt::default());
     let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
 
     let id = {
@@ -144,6 +148,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
                 to_worker: Some(to_worker_tx),
                 dispatch: dispatch.clone(),
                 stop: Arc::clone(&stop),
+                interrupt: Arc::clone(&interrupt),
                 keep_alive: true,
                 inbox_task: None,
             },
@@ -158,6 +163,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         is_eval,
         init,
         thread_id,
+        interrupt,
     };
     let worker_stop = Arc::clone(&stop);
     std::thread::Builder::new()
@@ -203,6 +209,7 @@ pub(crate) fn op_worker_terminate(
     };
     if let Some(w) = registry(ctx).workers.get_mut(&id) {
         w.stop.store(true, Ordering::SeqCst);
+        w.interrupt.cancel();
         w.to_worker = None; // drops the sender, unblocking the worker's inbox receive
     }
     Ok(Value::Undefined)
@@ -275,6 +282,15 @@ fn decode_main_inbox(
     if let Some(inbox) = inbox {
         arm_main_inbox(ctx, inbox);
     }
+    let terminated = registry(ctx)
+        .workers
+        .get(&id)
+        .is_some_and(|worker| worker.stop.load(Ordering::Acquire));
+    if terminated && !matches!(&event, ToMain::Exited(_)) {
+        // Termination discards worker-originated tasks which were queued but not yet dispatched.
+        // Keep draining the channel until Exited removes the registry entry, but expose no event.
+        return Ok(vec![Value::from_string("discard".into())]);
+    }
     match event {
         ToMain::Online => Ok(vec![Value::from_string("online".into())]),
         ToMain::Message(bytes) => {
@@ -318,7 +334,7 @@ fn run_worker(
     to_main_tx: Sender<ToMain>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut rt = Runtime::new();
+    let mut rt = Runtime::new_with_interrupt(spec.interrupt);
     lumen_host::install(rt.engine(), &[worker_scope_extension()]);
     rt.engine().ctx().op_state().put(WorkerSelf {
         to_main: to_main_tx.clone(),
@@ -380,6 +396,12 @@ fn run_worker(
         }
     };
     if let Err(e) = entry_result {
+        // HTML termination is silent: it does not report the engine's host-control completion as
+        // an ErrorEvent or uncaught JavaScript exception.
+        if stop.load(Ordering::SeqCst) {
+            let _ = to_main_tx.send(ToMain::Exited(1));
+            return;
+        }
         let _ = to_main_tx.send(ToMain::Error(e));
         if spec.is_node {
             // Node: an entry that throws kills the worker ('error', then 'exit' with code 1).
@@ -620,6 +642,8 @@ const WORKER_JS: &str = r#"
       this.dispatchEvent(event);
     }
     #onEvent(kind, args) {
+      // A decoded event can race with terminate() between its native completion and this callback.
+      if (this.#terminated && kind !== "exit") return;
       if (kind === "message") {
         let data;
         try { data = deserialize(args[0]); }

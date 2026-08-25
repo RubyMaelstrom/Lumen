@@ -394,6 +394,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_drop_packed_at as *const () as usize,
         crate::bytecode::jit_strict_eq as *const () as usize,
         crate::bytecode::jit_make_regexp as *const () as usize,
+        crate::bytecode::jit_interrupt as *const () as usize,
     ]
 }
 
@@ -440,6 +441,8 @@ pub const H_DROP_PACKED_AT: usize = 23;
 pub const H_STRICT_EQ: usize = 24;
 /// Fresh RegExp-literal allocation using the chunk's immutable compiled-program cache.
 pub const H_MAKE_REGEXP: usize = 25;
+/// Amortized host cancellation/deadline poll at generated loop backedges.
+pub const H_INTERRUPT: usize = 26;
 
 /// One-time semantic guard for the numeric packed-array region. A keyless Empty slot is still a
 /// missing property, so filling it may be intercepted by an indexed setter on Array.prototype.
@@ -558,7 +561,7 @@ unsafe extern "C" fn jit_scheduler_trace_fail(stage: usize) {
         }
     }
 }
-pub const N_HELPERS: usize = 26;
+pub const N_HELPERS: usize = 27;
 
 /// ARM64 condition codes used by the inline templates.
 #[cfg(all(
@@ -1570,7 +1573,8 @@ pub fn compile(
     // Branch/catch targets: a fused compare+branch may only swallow a following JumpIfFalse if
     // nothing can land on the branch op itself.
     let mut targeted = vec![false; ops.len() + 1];
-    for op in ops {
+    let mut interrupt_targets = vec![false; ops.len() + 1];
+    for (pc, op) in ops.iter().enumerate() {
         match op {
             Op::Jump(t)
             | Op::JumpIfFalse(t)
@@ -1579,6 +1583,18 @@ pub fn compile(
             | Op::JumpIfNotNullishPeek(t)
             | Op::InlineGuard(_, t)
             | Op::PushHandler(t) => targeted[*t as usize] = true,
+            _ => {}
+        }
+        match op {
+            Op::Jump(target)
+            | Op::JumpIfFalse(target)
+            | Op::JumpIfFalsePeek(target)
+            | Op::JumpIfTruePeek(target)
+            | Op::JumpIfNotNullishPeek(target)
+                if (*target as usize) <= pc =>
+            {
+                interrupt_targets[*target as usize] = true;
+            }
             _ => {}
         }
     }
@@ -1591,6 +1607,9 @@ pub fn compile(
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pc_labels[pc]);
         pc_insn.push(a.here() as u32);
+        if interrupt_targets[pc] {
+            emit_interrupt_poll(&mut a, ilayout, l_unwind);
+        }
         if skip > 0 {
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
             // pc-offset still bind here (harmless: nothing jumps into a fused region — checked).
@@ -21795,6 +21814,35 @@ fn emit_op_helper(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
     a.blr(16);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
+}
+
+/// Cheap generated-loop divider plus the full shared host-control poll. The hot path is six
+/// integer instructions and no call; cancellation/deadline state is consulted every 16,384 loop
+/// headers, matching the interpreter/bytecode cadence.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_interrupt_poll(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
+    l_unwind: usize,
+) {
+    let offset = ilayout.interrupt_poll_tick;
+    if !ilayout.valid || !offset.is_multiple_of(4) || offset / 4 >= 4096 {
+        emit_op_helper(a, H_INTERRUPT, 0, l_unwind);
+        return;
+    }
+    let done = a.new_label();
+    a.ldr_imm(14, 19, 72); // ctx.interp
+    a.ldr_w_imm(9, 14, offset as u32);
+    a.add_imm(9, 9, 1);
+    a.str_w_imm(9, 14, offset as u32);
+    let mask = asm::logical_imm_w(0x3fff).expect("interrupt divider mask is encodable");
+    a.logic_imm_w(0, 10, 9, mask);
+    a.cbnz(10, false, done);
+    emit_op_helper(a, H_INTERRUPT, 0, l_unwind);
+    a.bind(done);
 }
 
 /// An infallible helper (returns the new sp): return/handler bookkeeping.

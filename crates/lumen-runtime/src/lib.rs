@@ -15,12 +15,12 @@
 //! reactor (epoll/kqueue) would need raw syscalls and stays out unless explicitly authorized;
 //! threadpool + completions is libuv's own fs strategy and covers everything we host today.
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use lumen_host::{
-    install, CallbackQueue, CompletionSender, Engine, TaskCompletion, TaskDecoder, TaskRegistry,
-    ThreadPool, Value,
+    install, CallbackQueue, CompletionSender, Engine, EvalError, RuntimeInterrupt, TaskCompletion,
+    TaskDecoder, TaskRegistry, ThreadPool, Value,
 };
 
 mod console;
@@ -55,8 +55,17 @@ impl Runtime {
     /// An engine with the runtime globals installed: timers, streaming `console`, minimal
     /// `process`, `queueMicrotask`.
     pub fn new() -> Runtime {
+        Self::new_with_interrupt(Default::default())
+    }
+
+    /// Construct a runtime with a control handle already shared with its owner. Dedicated workers
+    /// use this to make termination effective even during realm/bootstrap startup.
+    pub fn new_with_interrupt(interrupt: Arc<RuntimeInterrupt>) -> Runtime {
         let (tx, rx) = mpsc::channel();
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
+        // Install the runtime's finite trusted bootstrap before attaching the externally
+        // cancellable handle. Otherwise an early Worker.terminate() can interrupt an extension's
+        // own initialization and make the installer mistake host control flow for broken glue.
         let mut engine = Engine::new();
         // Substrate first: fs's js_init runs during install and its ops need these.
         engine.ctx().op_state().put(pool.handle());
@@ -165,6 +174,7 @@ impl Runtime {
                 false,
             )
             .expect("shim cleanup");
+        engine.set_interrupt_handle(interrupt);
         Runtime {
             engine,
             pool,
@@ -205,15 +215,19 @@ impl Runtime {
             .ctx()
             .get_member(&global, "__runMain")
             .map_err(|_| "node runtime not installed".to_string())?;
-        let result = self.engine.call_function(
+        let result = self.engine.call_function_interruptible(
             &run_main,
             Value::Undefined,
             &[Value::from_string(path.to_string())],
         );
-        self.engine.run_microtasks();
-        result
-            .map(|_| ())
-            .map_err(|e| describe_error(self.engine.ctx(), &e))
+        if let Err(reason) = self.engine.run_microtasks_interruptible() {
+            return Err(reason.message().to_string());
+        }
+        match result {
+            Ok(_) => Ok(()),
+            Err(EvalError::Throw(error)) => Err(describe_error(self.engine.ctx(), &error)),
+            Err(EvalError::Interrupted(reason)) => Err(reason.message().to_string()),
+        }
     }
 
     /// Run `path` as an ES module: its `import` graph resolves against disk + `node_modules`
@@ -266,7 +280,9 @@ impl Runtime {
             self.engine.eval(source, false)
         };
         // Drain the microtask checkpoint from top-level code, but not the macrotask loop.
-        self.engine.run_microtasks();
+        if let Err(reason) = self.engine.run_microtasks_interruptible() {
+            return Err(reason.message().to_string());
+        }
         match result {
             Ok(Completion::Value(_)) => Ok(()),
             Ok(Completion::Throw { name, message }) => Err(if name.is_empty() {
@@ -290,7 +306,9 @@ impl Runtime {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
-            self.engine.run_microtasks();
+            if self.engine.run_microtasks_interruptible().is_err() {
+                return;
+            }
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
@@ -390,7 +408,9 @@ impl Runtime {
         loop {
             // Run everything already runnable. Each JS entry is followed by a microtask
             // checkpoint, matching the "after every macrotask" model.
-            self.engine.run_microtasks();
+            if self.engine.run_microtasks_interruptible().is_err() {
+                return;
+            }
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
@@ -492,16 +512,25 @@ impl Runtime {
                 None => self.report_uncaught(&e),
             },
         }
-        self.engine.run_microtasks();
+        if self.engine.run_microtasks_interruptible().is_err() {
+            return;
+        }
         self.report_unhandled_rejections();
     }
 
     /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
     fn fire(&mut self, callback: &Value, args: &[Value]) {
-        if let Err(e) = self.engine.call_function(callback, Value::Undefined, args) {
-            self.report_uncaught(&e);
+        match self
+            .engine
+            .call_function_interruptible(callback, Value::Undefined, args)
+        {
+            Ok(_) => {}
+            Err(EvalError::Throw(error)) => self.report_uncaught(&error),
+            Err(EvalError::Interrupted(_)) => return,
         }
-        self.engine.run_microtasks();
+        if self.engine.run_microtasks_interruptible().is_err() {
+            return;
+        }
         self.report_unhandled_rejections();
     }
 
@@ -511,11 +540,13 @@ impl Runtime {
         // HTML "report an exception": the global `onerror` handler runs first; returning `true`
         // suppresses the default report.
         let fire = self.fire_error.clone();
-        if let Ok(Value::Bool(true)) =
-            self.engine
-                .call_function(&fire, Value::Undefined, std::slice::from_ref(error))
-        {
-            return;
+        match self.engine.call_function_interruptible(
+            &fire,
+            Value::Undefined,
+            std::slice::from_ref(error),
+        ) {
+            Ok(Value::Bool(true)) | Err(EvalError::Interrupted(_)) => return,
+            _ => {}
         }
         let text = console::describe_error(self.engine.ctx(), error);
         console::write_err_line(self.engine.ctx(), format!("Uncaught {text}"));
@@ -528,11 +559,14 @@ impl Runtime {
             // The global `onunhandledrejection` handler runs first; `event.preventDefault()`
             // suppresses the default report.
             let fire = self.fire_rejection.clone();
-            if let Ok(Value::Bool(true)) =
-                self.engine
-                    .call_function(&fire, Value::Undefined, &[promise, reason.clone()])
-            {
-                continue;
+            match self.engine.call_function_interruptible(
+                &fire,
+                Value::Undefined,
+                &[promise, reason.clone()],
+            ) {
+                Ok(Value::Bool(true)) => continue,
+                Err(EvalError::Interrupted(_)) => return,
+                _ => {}
             }
             let text = console::describe_error(self.engine.ctx(), &reason);
             console::write_err_line(self.engine.ctx(), format!("Uncaught (in promise) {text}"));
