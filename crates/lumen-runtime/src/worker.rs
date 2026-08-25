@@ -68,6 +68,9 @@ struct WorkerEntry {
     dispatch: Value,
     stop: Arc<AtomicBool>,
     interrupt: Arc<RuntimeInterrupt>,
+    /// Set only by parent-side `terminate()`. Worker-side `close()` shares `stop`, but messages
+    /// posted before close must still be delivered in FIFO order.
+    parent_terminated: bool,
     /// Whether this worker's main-side inbox keeps the main loop alive (`worker.unref()` clears).
     keep_alive: bool,
     /// The currently armed inbox task, so `setRef` can re-mark it in flight.
@@ -149,6 +152,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
                 dispatch: dispatch.clone(),
                 stop: Arc::clone(&stop),
                 interrupt: Arc::clone(&interrupt),
+                parent_terminated: false,
                 keep_alive: true,
                 inbox_task: None,
             },
@@ -208,6 +212,7 @@ pub(crate) fn op_worker_terminate(
         _ => return Err(ctx.make_error("TypeError", "terminate: bad worker id")),
     };
     if let Some(w) = registry(ctx).workers.get_mut(&id) {
+        w.parent_terminated = true;
         w.stop.store(true, Ordering::SeqCst);
         w.interrupt.cancel();
         w.to_worker = None; // drops the sender, unblocking the worker's inbox receive
@@ -282,11 +287,11 @@ fn decode_main_inbox(
     if let Some(inbox) = inbox {
         arm_main_inbox(ctx, inbox);
     }
-    let terminated = registry(ctx)
+    let terminated_by_parent = registry(ctx)
         .workers
         .get(&id)
-        .is_some_and(|worker| worker.stop.load(Ordering::Acquire));
-    if terminated && !matches!(&event, ToMain::Exited(_)) {
+        .is_some_and(|worker| worker.parent_terminated);
+    if terminated_by_parent && !matches!(&event, ToMain::Exited(_)) {
         // Termination discards worker-originated tasks which were queued but not yet dispatched.
         // Keep draining the channel until Exited removes the registry entry, but expose no event.
         return Ok(vec![Value::from_string("discard".into())]);
