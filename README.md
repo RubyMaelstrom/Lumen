@@ -28,6 +28,11 @@ unavailable it degrades to the bytecode VM). Functions tier up after a call-coun
 immediately if the body contains a loop. Force the reference tree-walker with `--tier=interp`
 (or `LUMEN_TIER=interp`).
 
+The base JIT is enabled by default. Its experimental second-stage whole-function inliner is not:
+current ARM64 testing found wrong results and native crashes in valid Test262 programs. Set
+`LUMEN_INLINE_AT=N` only to investigate that optimizer; `N` is the machine-code run count that
+triggers the speculative recompile.
+
 The language surface: generators and `async`/`await` running on stackful coroutines (async
 bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` and inline
 modifiers), typed arrays, `Proxy`/`Reflect`, ES modules (top-level await, `import defer`,
@@ -47,8 +52,12 @@ code meets the object graph (the JIT's executable pages and its templates' raw r
 baked offset is *measured at runtime* against the live types and fails closed to the checked
 helper if anything doesn't hold) and in the N-API addon loader's `dlopen` bridge.
 
-**Passes 100% of [tc39/test262](https://github.com/tc39/test262): 53,400/53,400** (including
-annexB, intl402, and staging) — on the default JIT tier and under `LUMEN_TIER=interp`.
+Measured on 2026-08-25 against [tc39/test262](https://github.com/tc39/test262) commit
+`d86b2294eb0a17eaa281ff12c73c473ec864c72f`: **53,418 passed, 156 failed, and 4 were skipped**
+(99.7% of executed tests, including annexB, intl402, and staging) on the default base-JIT tier.
+This is a reproducible baseline, not a permanent conformance claim; Test262 and the engine both
+change. See the commands under [Conformance](#conformance) and the generated
+`test262-report/summary.json` for current results.
 
 Extracted from — and used by — the [lucid-softworks/browser](https://github.com/lucid-softworks/browser)
 engine as its JS backend (`backend-lumen`), with full git history.

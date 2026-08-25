@@ -1,6 +1,6 @@
-//! Runtime values and the object model. Objects are `Rc<RefCell<Object>>` ([`Gc`]); there is no
-//! real garbage collector yet (reference counting, so cycles leak — acceptable for the test262
-//! loop). Properties are stored in insertion order in a small map.
+//! Runtime values and the object model. Objects are `Rc<RefCell<Object>>` ([`Gc`]) with a cycle
+//! collector for object/environment graphs. Properties are stored in insertion order in a small
+//! map.
 
 use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
@@ -34,8 +34,7 @@ pub enum Value {
     Null = 2,
     Bool(bool) = 3,
     Num(f64) = 4,
-    /// BigInt, approximated with `i128` (exact within ±2^127; tests beyond that range fail rather
-    /// than implementing arbitrary precision).
+    /// Arbitrary-precision BigInt (sign plus little-endian base-2^64 magnitude).
     BigInt(crate::bigint::JsBigInt) = 5,
     Str(crate::lstr::LStr) = 6,
     Sym(Rc<SymbolData>) = 7,
