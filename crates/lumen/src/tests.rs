@@ -527,6 +527,40 @@ fn dates() {
     assert_eq!(run("new Date(Date.UTC(2023,11,25)).getUTCDay()"), "1"); // Monday
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn wall_clocks_are_mutable_and_realm_local() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn read_times(engine: &mut Engine) -> String {
+        match engine
+            .eval(
+                "[Date.now(), +new Date(), Temporal.Now.instant().epochMilliseconds].join('|')",
+                false,
+            )
+            .expect("parse")
+        {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        }
+    }
+
+    let first_now = Rc::new(Cell::new(1_234.9));
+    let mut first = Engine::new();
+    let first_clock = first_now.clone();
+    first.set_wall_clock(move || first_clock.get());
+    assert_eq!(read_times(&mut first), "1234|1234|1234");
+
+    first_now.set(5_678.1);
+    assert_eq!(read_times(&mut first), "5678|5678|5678");
+
+    let mut second = Engine::new();
+    second.set_wall_clock(|| 42.0);
+    assert_eq!(read_times(&mut second), "42|42|42");
+    assert_eq!(read_times(&mut first), "5678|5678|5678");
+}
+
 #[test]
 fn typed_arrays() {
     assert_eq!(run("var a = new Int8Array(3); a.length"), "3");

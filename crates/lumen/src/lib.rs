@@ -90,9 +90,10 @@ pub mod bench_api {
     pub use crate::snapshot::{decode, encode};
 }
 
-/// Host wall-clock override: milliseconds since the Unix epoch. Targets without a usable
-/// `SystemTime` (wasm32-unknown-unknown) install one at startup; when unset, `Date`/`Temporal.Now`
-/// fall back to `SystemTime`.
+/// Legacy process-wide wall-clock fallback, retained for embedders which cannot use the `embed`
+/// feature. Browser/runtime embedders should prefer [`Engine::set_wall_clock`]: HTML's
+/// `HostSystemUTCEpochNanoseconds(global)` hook is global-sensitive, so unrelated realms must not
+/// compete for a first-call-wins process singleton.
 static HOST_CLOCK: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();
 
 /// Install a process-wide wall-clock source (first call wins). The embedder's `f` returns
@@ -358,6 +359,16 @@ impl Engine {
     /// [`embed::Ctx::op_state`]).
     pub fn ctx(&mut self) -> &mut embed::Ctx {
         &mut self.interp
+    }
+
+    /// Install this realm's wall-clock source, in milliseconds since the Unix epoch.
+    ///
+    /// The callback is realm-local and may capture mutable embedder state. `Date`, `Date.now`,
+    /// and `Temporal.Now` all read this same source. This is the engine side of HTML
+    /// `HostSystemUTCEpochNanoseconds(global)`; it deliberately takes precedence over the legacy
+    /// process-wide [`set_host_clock`] fallback.
+    pub fn set_wall_clock(&mut self, clock: impl Fn() -> f64 + 'static) {
+        self.interp.wall_clock = Some(std::rc::Rc::new(clock));
     }
 
     /// The realm's global object — the root from which an embedder reaches user-defined JS

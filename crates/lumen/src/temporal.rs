@@ -10616,14 +10616,8 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
 fn install_now(it: &mut Interp, ns: &Gc) {
     let now = Object::new(Some(it.object_proto.clone()));
     // The system clock, in epoch nanoseconds (millisecond resolution, like Date.now()).
-    fn now_ns() -> i128 {
-        if let Some(ms) = crate::host_now_ms() {
-            return ms.trunc() as i128 * 1_000_000;
-        }
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i128 * 1_000_000)
-            .unwrap_or(0)
+    fn now_ns(i: &Interp) -> i128 {
+        i.wall_now_ms().trunc() as i128 * 1_000_000
     }
     fn now_zone(i: &mut Interp, v: &Value) -> Result<Rc<str>, Value> {
         match v {
@@ -10632,12 +10626,12 @@ fn install_now(it: &mut Interp, ns: &Gc) {
         }
     }
     it.def_method(&now, "instant", 0, |i, _t, _| {
-        Ok(make(i, "Temporal.Instant", Temporal::Instant(now_ns())))
+        Ok(make(i, "Temporal.Instant", Temporal::Instant(now_ns(i))))
     });
     it.def_method(&now, "timeZoneId", 0, |_i, _t, _| Ok(Value::str("UTC")));
     it.def_method(&now, "zonedDateTimeISO", 0, |i, _t, a| {
         let tz = now_zone(i, &arg(a, 0))?;
-        let e = now_ns();
+        let e = now_ns(i);
         let off = zone_offset(&tz, e);
         Ok(make(
             i,
@@ -10651,19 +10645,19 @@ fn install_now(it: &mut Interp, ns: &Gc) {
     });
     it.def_method(&now, "plainDateISO", 0, |i, _t, a| {
         let tz = now_zone(i, &arg(a, 0))?;
-        let e = now_ns();
+        let e = now_ns(i);
         let (d, _) = zoned_local(e, zone_offset(&tz, e));
         Ok(make(i, "Temporal.PlainDate", Temporal::Date(d)))
     });
     it.def_method(&now, "plainTimeISO", 0, |i, _t, a| {
         let tz = now_zone(i, &arg(a, 0))?;
-        let e = now_ns();
+        let e = now_ns(i);
         let (_, tm) = zoned_local(e, zone_offset(&tz, e));
         Ok(make(i, "Temporal.PlainTime", Temporal::Time(tm)))
     });
     it.def_method(&now, "plainDateTimeISO", 0, |i, _t, a| {
         let tz = now_zone(i, &arg(a, 0))?;
-        let e = now_ns();
+        let e = now_ns(i);
         let (d, tm) = zoned_local(e, zone_offset(&tz, e));
         Ok(make(i, "Temporal.PlainDateTime", Temporal::DateTime(d, tm)))
     });

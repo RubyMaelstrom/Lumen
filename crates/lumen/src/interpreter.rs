@@ -1024,6 +1024,10 @@ pub struct Interp {
     pub(crate) sym_registry: crate::fasthash::FastMap<u64, Rc<SymbolData>>,
 
     pub(crate) console: Vec<String>,
+    /// Realm-local implementation of HTML `HostSystemUTCEpochNanoseconds(global)`, expressed in
+    /// milliseconds for ECMAScript `Date`. Each Window/Worker realm owns its own time origin and
+    /// virtual-time anchor; a process-global callback cannot model that.
+    pub(crate) wall_clock: Option<Rc<dyn Fn() -> f64>>,
     /// Current strict-mode flag (pushed/popped around function bodies).
     pub(crate) strict: bool,
     /// Execution tier (env `LUMEN_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
@@ -1657,6 +1661,7 @@ impl Interp {
             sym_counter: 0,
             sym_registry: Default::default(),
             console: Vec::new(),
+            wall_clock: None,
             strict: false,
             depth: 0,
             class_info: Default::default(),
@@ -2127,6 +2132,21 @@ impl Interp {
     /// Current number of heap objects tracked by the engine.
     pub fn live_object_count(&self) -> i64 {
         crate::value::live_objects()
+    }
+
+    /// Current UTC epoch time for this realm, with the legacy process callback and system clock
+    /// as fallbacks. Consumers apply their own precision rules (`Date` truncates to milliseconds).
+    pub(crate) fn wall_now_ms(&self) -> f64 {
+        if let Some(clock) = &self.wall_clock {
+            return clock();
+        }
+        if let Some(ms) = crate::host_now_ms() {
+            return ms;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
     }
 
     /// Execute all currently queued promise reaction jobs synchronously.

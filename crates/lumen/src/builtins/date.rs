@@ -2,14 +2,8 @@
 
 use super::*;
 
-fn now_ms() -> f64 {
-    if let Some(ms) = crate::host_now_ms() {
-        return ms.trunc();
-    }
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as f64)
-        .unwrap_or(0.0)
+fn now_ms(i: &Interp) -> f64 {
+    i.wall_now_ms().trunc()
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -467,10 +461,10 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
     // Called as a function (no `new`), Date ignores its arguments and returns the
     // current time as a string.
     if !matches!(i.new_target, Value::Obj(_)) {
-        return Ok(Value::from_string(date_to_string(now_ms())));
+        return Ok(Value::from_string(date_to_string(now_ms(i))));
     }
     let ms = match args.len() {
-        0 => now_ms(),
+        0 => now_ms(i),
         1 => match &args[0] {
             // A Date argument clones its time value directly (no valueOf call).
             Value::Obj(o) if o.borrow().props.contains("__date_ms") => {
@@ -781,7 +775,7 @@ pub(super) fn install_date(it: &mut Interp) {
         .borrow_mut()
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
-    it.def_method(&ctor, "now", 0, |_i, _t, _a| Ok(Value::Num(now_ms())));
+    it.def_method(&ctor, "now", 0, |i, _t, _a| Ok(Value::Num(now_ms(i))));
     it.def_method(&ctor, "parse", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
         let v = parse_iso(&s);
