@@ -1,7 +1,8 @@
 //! Bytecode tier v0: a per-function stack VM behind the tree-walking interpreter.
 //!
-//! The tree-walker is the reference oracle — it passes 100% of test262 and its semantics are
-//! never altered by this tier. A function is either compiled *whole* (its body contains only
+//! The tree-walker is the reference oracle: compiled tiers are expected to match its observable
+//! semantics and are checked against it by the differential test harness. A function is either
+//! compiled *whole* (its body contains only
 //! constructs this compiler fully understands) or it runs in the tree-walker; there is no partial
 //! compilation and no deoptimization. Every operation with observable semantics (property access,
 //! calls, coercions, name resolution outside the function) delegates to the interpreter's own
@@ -2274,15 +2275,19 @@ fn compile_inner(
     }))
 }
 
-/// How many machine-code runs of a chunk trigger the one-shot inline recompile
-/// (`LUMEN_INLINE_AT` overrides; 0 disables).
+/// How many machine-code runs of a chunk trigger the experimental one-shot inline recompile.
+///
+/// It remains opt-in in production: current ARM64 inlining can corrupt control flow for ordinary
+/// Test262 helper call graphs, producing wrong results or SIGBUS/SIGSEGV. `LUMEN_INLINE_AT`
+/// explicitly enables it for investigation; unit tests keep the historical threshold so the
+/// implementation itself does not silently lose coverage.
 pub(crate) fn inline_recompile_at() -> u32 {
     static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         std::env::var("LUMEN_INLINE_AT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(100)
+            .unwrap_or(if cfg!(test) { 100 } else { 0 })
     })
 }
 
@@ -6004,6 +6009,10 @@ impl VmCoro {
             Resume::Return(v) => {
                 self.done = true;
                 return Suspend::Done(v);
+            }
+            Resume::Terminate => {
+                self.done = true;
+                return Suspend::Done(Value::Undefined);
             }
         };
         self.started = true;
