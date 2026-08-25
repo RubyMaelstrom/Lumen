@@ -2163,6 +2163,18 @@ impl Interp {
         before.saturating_sub(live)
     }
 
+    /// Create a pending intrinsic Promise and its resolving functions for a host operation.
+    ///
+    /// This is the engine-facing form of ECMA-262 `CreateResolvingFunctions`: `resolve` and
+    /// `reject` share one `[[AlreadyResolved]]` record, so only the first call can settle the
+    /// promise. Hosts retain these values on the engine thread, call one when an external task
+    /// completes, and then perform their normal microtask checkpoint.
+    pub fn new_promise_with_resolvers(&mut self) -> (Value, Value, Value) {
+        let promise = self.new_promise();
+        let (resolve, reject) = self.make_resolver_pair(&promise);
+        (promise, resolve, reject)
+    }
+
     /// Current number of heap objects tracked by the engine.
     pub fn live_object_count(&self) -> i64 {
         crate::value::live_objects()

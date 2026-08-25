@@ -1154,6 +1154,66 @@ fn high_churn_task_collects_after_temporary_roots_are_released() {
     );
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_can_settle_a_host_promise_after_an_external_task() {
+    use crate::value::Value;
+
+    let mut engine = Engine::new();
+    let (promise, resolve, reject) = engine.ctx().new_promise_with_resolvers();
+    let then = engine
+        .ctx()
+        .member_get(&promise, "then")
+        .unwrap_or_else(|_| panic!("promise has then"));
+    let on_fulfilled = match engine
+        .eval_value("globalThis.hostResult = 'pending'; value => hostResult = 'ok:' + value")
+        .expect("handler parses")
+    {
+        Ok(value) => value,
+        Err(_) => panic!("fulfillment handler evaluates"),
+    };
+    let on_rejected = match engine
+        .eval_value("reason => hostResult = 'error:' + reason")
+        .expect("handler parses")
+    {
+        Ok(value) => value,
+        Err(_) => panic!("rejection handler evaluates"),
+    };
+    engine
+        .call_function(&then, promise, &[on_fulfilled, on_rejected])
+        .unwrap_or_else(|_| panic!("then registration succeeds"));
+
+    // The host-held resolver is a GC root and keeps its pending promise/reactions alive even after
+    // the promise itself leaves Rust scope. This models an I/O completion arriving on a later task.
+    engine.collect_garbage_at_idle();
+    engine
+        .call_function(&resolve, Value::Undefined, &[Value::str("done")])
+        .unwrap_or_else(|_| panic!("resolve succeeds"));
+    engine
+        .call_function(&reject, Value::Undefined, &[Value::str("too late")])
+        .unwrap_or_else(|_| panic!("second settlement is a no-op"));
+
+    match engine.eval("hostResult", false).expect("result parses") {
+        Completion::Value(value) => assert_eq!(
+            value, "pending",
+            "promise reactions wait for the host microtask checkpoint"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("reading pending result threw {name}: {message}")
+        }
+    }
+    engine.run_microtasks();
+    match engine.eval("hostResult", false).expect("result parses") {
+        Completion::Value(value) => assert_eq!(
+            value, "ok:done",
+            "the first resolving function wins and its reaction runs"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("reading fulfilled result threw {name}: {message}")
+        }
+    }
+}
+
 #[test]
 fn gc_keeps_reachable_cycles() {
     // A cycle still reachable from a live binding must survive collection unscathed.
