@@ -2529,6 +2529,16 @@ impl Interp {
         self.to_number(v).map_err(abrupt_value)
     }
 
+    /// ToBigInt followed by wrapping conversion to a signed 64-bit integer. This is the
+    /// embedder-facing form required by the WebAssembly JavaScript interface for `i64`: Numbers
+    /// are rejected, while booleans, strings, and objects run the language's observable ToBigInt
+    /// coercion before the low 64 bits are selected.
+    pub fn coerce_bigint_i64(&mut self, v: &Value) -> Result<i64, Value> {
+        self.to_bigint(v)
+            .map(|value| value.to_i128_wrapping() as i64)
+            .map_err(abrupt_value)
+    }
+
     /// ToString with the abrupt completion lowered to the thrown value (see [`invoke`]).
     pub fn coerce_string(&mut self, v: &Value) -> Result<Rc<str>, Value> {
         self.to_string(v).map(|s| (&s).into()).map_err(abrupt_value)
@@ -2593,6 +2603,54 @@ impl Interp {
             return shared_mem_get(id).map(|bytes| bytes.lock().unwrap().clone());
         }
         self.array_buffers.get(&ptr).cloned()
+    }
+
+    /// A fresh fixed-length `ArrayBuffer` initialized with `bytes`, constructed through the
+    /// realm's own intrinsic constructor. The returned buffer has ordinary ECMAScript storage;
+    /// embedders that mirror external memory can update it with [`Self::array_buffer_set_bytes`].
+    pub fn make_array_buffer(&mut self, bytes: &[u8]) -> Result<Value, Value> {
+        let global = Value::Obj(self.global.clone());
+        let ctor = self
+            .get_member(&global, "ArrayBuffer")
+            .map_err(abrupt_value)?;
+        let buffer = self
+            .construct(ctor, &[Value::Num(bytes.len() as f64)])
+            .map_err(abrupt_value)?;
+        if !self.array_buffer_set_bytes(&buffer, bytes) {
+            return Err(self.make_error(
+                "TypeError",
+                "ArrayBuffer constructor did not create an ordinary buffer",
+            ));
+        }
+        Ok(buffer)
+    }
+
+    /// Replace an ordinary, attached `ArrayBuffer`'s bytes without changing its identity. Returns
+    /// `false` for another value, a shared/detached buffer, or a length mismatch. Requiring an
+    /// exact length keeps existing DataView and TypedArray bounds invariant.
+    pub fn array_buffer_set_bytes(&mut self, v: &Value, bytes: &[u8]) -> bool {
+        let Some(obj) = v.as_obj() else {
+            return false;
+        };
+        let Some(buffer) = self.array_buffers.get_mut(&(Rc::as_ptr(obj) as usize)) else {
+            return false;
+        };
+        if buffer.len() != bytes.len() {
+            return false;
+        }
+        buffer.copy_from_slice(bytes);
+        true
+    }
+
+    /// Detach an ordinary `ArrayBuffer`, making its byte length zero and invalidating its views.
+    /// Returns `false` for another value, a shared buffer, or an already-detached buffer.
+    pub fn detach_array_buffer(&mut self, v: &Value) -> bool {
+        let Some(obj) = v.as_obj() else {
+            return false;
+        };
+        self.array_buffers
+            .remove(&(Rc::as_ptr(obj) as usize))
+            .is_some()
     }
 
     /// Overwrite a TypedArray's covered bytes from the start (a write past the view's end is

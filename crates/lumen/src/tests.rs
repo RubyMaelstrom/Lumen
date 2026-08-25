@@ -1,7 +1,7 @@
 //! Smoke tests for the language core. These are the fast inner loop while growing the engine; the
 //! broad conformance signal comes from `crates/test262-runner`.
 
-use crate::{Completion, Engine, ExecutionOutcome, InterruptReason};
+use crate::{Completion, Engine, ExecutionOutcome, InterruptReason, Value};
 
 fn run(src: &str) -> String {
     match Engine::new().eval(src, false).expect("parse") {
@@ -821,6 +821,67 @@ fn embedder_buffer_source_bytes_honor_views_detachment_and_shared_opt_in() {
     assert_eq!(engine.ctx().buffer_source_bytes(&ab, false), None);
     assert_eq!(engine.ctx().buffer_source_bytes(&dv, false), None);
     assert_eq!(engine.ctx().buffer_source_bytes(&ta, false), None);
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_can_mirror_and_detach_an_array_buffer() {
+    let mut engine = Engine::new();
+    let buffer = engine
+        .ctx()
+        .make_array_buffer(&[1, 2, 3, 4])
+        .unwrap_or_else(|_| panic!("make ArrayBuffer"));
+    let global = engine.global_this();
+    engine
+        .ctx()
+        .member_set(&global, "mirrored", buffer.clone())
+        .unwrap_or_else(|_| panic!("install ArrayBuffer"));
+
+    assert_eq!(
+        engine
+            .eval_value_interruptible("new Uint8Array(mirrored)[2]")
+            .expect("view parses")
+            .unwrap_or(Value::Undefined)
+            .as_num_opt(),
+        Some(3.0)
+    );
+    assert!(engine.ctx().array_buffer_set_bytes(&buffer, &[9, 8, 7, 6]));
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&buffer, false),
+        Some(vec![9, 8, 7, 6])
+    );
+    assert!(!engine.ctx().array_buffer_set_bytes(&buffer, &[1, 2]));
+    assert!(engine.ctx().detach_array_buffer(&buffer));
+    assert!(!engine.ctx().detach_array_buffer(&buffer));
+    assert_eq!(engine.ctx().buffer_source_bytes(&buffer, false), None);
+    assert_eq!(
+        engine
+            .eval_value_interruptible("mirrored.byteLength")
+            .expect("byteLength parses")
+            .unwrap_or(Value::Undefined)
+            .as_num_opt(),
+        Some(0.0)
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_bigint_i64_bridge_runs_to_bigint() {
+    let mut engine = Engine::new();
+    let global = engine.global_this();
+    let value = engine
+        .eval_value_interruptible("({ valueOf() { globalThis.coerced = true; return -2n; } })")
+        .expect("object parses")
+        .unwrap_or(Value::Undefined);
+    assert!(matches!(engine.ctx().coerce_bigint_i64(&value), Ok(-2)));
+    assert!(matches!(
+        engine
+            .ctx()
+            .member_get(&global, "coerced")
+            .unwrap_or(Value::Undefined),
+        Value::Bool(true)
+    ));
+    assert!(engine.ctx().coerce_bigint_i64(&Value::Num(2.0)).is_err());
 }
 
 #[cfg(feature = "embed")]
