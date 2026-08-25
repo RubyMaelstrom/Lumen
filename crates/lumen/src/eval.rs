@@ -337,6 +337,9 @@ impl Interp {
                                 crate::coroutine::Resume::Next(x) => Ok(x),
                                 crate::coroutine::Resume::Throw(e) => Err(Abrupt::Throw(e)),
                                 crate::coroutine::Resume::Return(rv) => Err(Abrupt::Return(rv)),
+                                crate::coroutine::Resume::Terminate => {
+                                    Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+                                }
                             }
                         } else {
                             self.await_value(p)
@@ -1214,6 +1217,9 @@ impl Interp {
                 crate::coroutine::Resume::Next(v) => v,
                 crate::coroutine::Resume::Throw(e) => return Err(Abrupt::Throw(e)),
                 crate::coroutine::Resume::Return(v) => return Err(Abrupt::Return(v)),
+                crate::coroutine::Resume::Terminate => {
+                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+                }
             }
         } else {
             value
@@ -1229,12 +1235,18 @@ impl Interp {
                             Err(Abrupt::Return(x))
                         }
                         crate::coroutine::Resume::Throw(e) => Err(Abrupt::Throw(e)),
+                        crate::coroutine::Resume::Terminate => {
+                            Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+                        }
                     }
                 } else {
                     Err(Abrupt::Return(v))
                 }
             }
             crate::coroutine::Resume::Throw(e) => Err(Abrupt::Throw(e)),
+            crate::coroutine::Resume::Terminate => {
+                Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+            }
         }
     }
 
@@ -1271,6 +1283,9 @@ impl Interp {
                         return Err(self.throw("TypeError", "iterator 'return' is not callable"));
                     }
                     (self.call(ret, iterator.clone(), &[v])?, true)
+                }
+                Resume::Terminate => {
+                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
                 }
             };
             if !matches!(result, Value::Obj(_)) {
@@ -1324,6 +1339,9 @@ impl Interp {
             crate::coroutine::Resume::Next(x) => Ok(x),
             crate::coroutine::Resume::Throw(e) => Err(Abrupt::Throw(e)),
             crate::coroutine::Resume::Return(rv) => Err(Abrupt::Return(rv)),
+            crate::coroutine::Resume::Terminate => {
+                Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+            }
         }
     }
 
@@ -1339,6 +1357,7 @@ impl Interp {
             Resume::Return(v) => match crate::coroutine::coroutine_await(self, v) {
                 Resume::Next(x) | Resume::Return(x) => Resume::Return(x),
                 Resume::Throw(e) => Resume::Throw(e),
+                Resume::Terminate => Resume::Terminate,
             },
             other => other,
         })
@@ -1441,6 +1460,9 @@ impl Interp {
                         return Err(Abrupt::Return(inner));
                     }
                     received = self.async_gen_yield_resume(inner)?;
+                }
+                Resume::Terminate => {
+                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
                 }
             }
         }
@@ -2415,6 +2437,9 @@ impl Interp {
                         crate::coroutine::Resume::Next(settled) => Ok(settled),
                         crate::coroutine::Resume::Throw(err) => Err(Abrupt::Throw(err)),
                         crate::coroutine::Resume::Return(rv) => Err(Abrupt::Return(rv)),
+                        crate::coroutine::Resume::Terminate => {
+                            Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+                        }
                     }
                 } else {
                     self.await_value(v)

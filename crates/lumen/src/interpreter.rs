@@ -157,7 +157,7 @@ pub struct FnFrame {
     /// `Rc::as_ptr` of the callee. No strong handle is kept: every frame is pushed while its
     /// caller holds the callee alive (the callee `Value` sits on the caller's operand stack or in
     /// the dispatch chain for the whole call — for frames owned by a parked coroutine, the
-    /// worker's frozen stack; a torn-down coroutine's worker parks forever rather than unwinding,
+    /// worker's frozen stack; realm teardown explicitly wakes and unwinds that stack,
     /// which this invariant depends on), so the rare reflective reads reconstruct one via
     /// [`FnFrame::callee`] instead of paying a refcount round-trip on every call.
     pub fn_ptr: usize,
@@ -1343,6 +1343,18 @@ pub struct Interp {
         HashMap<usize, std::collections::VecDeque<(Value, crate::coroutine::Resume)>>,
 }
 
+impl Drop for Interp {
+    fn drop(&mut self) {
+        // A suspended coroutine owns non-Send `Rc` values on its worker stack and retains a raw
+        // pointer back to this interpreter. Wake and unwind every such body while `self` is still
+        // valid, waiting for acknowledgement before normal field destruction begins.
+        let mut coroutines = std::mem::take(&mut self.generators);
+        for coroutine in coroutines.values_mut() {
+            coroutine.terminate(self);
+        }
+    }
+}
+
 /// A `using x = v` resource: the value plus its captured dispose method.
 pub struct Disposable {
     pub value: Value,
@@ -1393,8 +1405,8 @@ pub struct FieldInit {
     pub transforms: Vec<Value>,
 }
 
-/// Recursion ceiling for the interpreter. Paired with the large worker-thread stacks the runner
-/// uses; beyond this we raise "Maximum call stack size exceeded" (a RangeError).
+/// Recursion ceiling for the interpreter. Paired with the bounded native stack reserved by the
+/// coroutine runner; beyond this we raise "Maximum call stack size exceeded" (a RangeError).
 #[cfg(not(target_arch = "wasm32"))]
 pub const MAX_EVAL_DEPTH: u32 = 1500;
 /// On wasm32 the ceiling is the engine's *host* call stack (V8's, not raisable from content):
@@ -7725,6 +7737,11 @@ impl Interp {
                 // promise settles with { value, done: true }.
                 Resume::Return(v) => self.async_gen_await_return(key, r, v),
                 Resume::Next(_) => {
+                    let res = self.iter_result_obj(Value::Undefined, true);
+                    self.resolve_promise(&r, res);
+                    self.finish_async_gen_step(key);
+                }
+                Resume::Terminate => {
                     let res = self.iter_result_obj(Value::Undefined, true);
                     self.resolve_promise(&r, res);
                     self.finish_async_gen_step(key);

@@ -1,9 +1,7 @@
 //! lumen — a from-scratch JavaScript engine (std-only, no dependencies).
 //!
-//! lumen is the eventual in-house replacement for the V8 backend in the `js` crate. Today it is a
-//! tree-walking interpreter covering the ECMAScript language core, driven by the tc39/test262
-//! conformance suite (see `crates/test262-runner`). It deliberately implements a growing *subset* —
-//! the test262 score is the roadmap.
+//! The tree-walking interpreter is the semantic reference for bytecode and native JIT tiers. The
+//! tc39/test262 conformance suite drives language work (see `crates/test262-runner`).
 //!
 //! ## Shape
 //! - [`lexer`] tokenizes, [`parser`] builds the [`ast`], [`interpreter`] + `eval` walk it.
@@ -153,7 +151,9 @@ pub enum ExecutionOutcome {
 /// A JavaScript engine instance: one realm (global object + intrinsics) that persists across
 /// [`eval`](Engine::eval) calls.
 pub struct Engine {
-    interp: Interp,
+    // Thread-backed generator bodies hold a pointer to the interpreter while suspended. Boxing
+    // makes that address stable even when ordinary Rust code moves the public `Engine` value.
+    interp: Box<Interp>,
 }
 
 impl Default for Engine {
@@ -176,7 +176,9 @@ impl Engine {
         interpreter::sym_for_reset();
         let mut interp = Interp::new();
         interp.runtime_interrupt = interrupt;
-        Engine { interp }
+        Engine {
+            interp: Box::new(interp),
+        }
     }
 
     /// A thread-safe handle for cancelling this realm, yielding to user navigation, or setting a
@@ -420,9 +422,10 @@ impl Engine {
         })
     }
 
-    /// Select the execution tier (see [`bytecode::Tier`]). `Interp` — the default — never
-    /// touches any codegen path; `Bytecode` compiles eligible functions after
-    /// [`set_tier_threshold`](Engine::set_tier_threshold) calls.
+    /// Select the execution tier (see [`bytecode::Tier`]). `Interp` never touches any codegen
+    /// path; `Bytecode` compiles eligible functions after
+    /// [`set_tier_threshold`](Engine::set_tier_threshold) calls; `Jit` is the default and lowers
+    /// eligible bytecode to native code where the backend supports the host architecture.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
         self.interp.tier = tier;
     }

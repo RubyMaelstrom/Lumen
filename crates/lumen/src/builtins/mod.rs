@@ -1,6 +1,6 @@
 //! The built-in objects and global functions. This is the realm: a freshly-constructed [`Interp`]
 //! calls [`install`] to populate `globalThis`, the standard constructors/prototypes, `Math`, and
-//! the global functions. The set grows as the test262 score climbs — it is intentionally a subset.
+//! the global functions. test262 exercises this realm as the primary conformance oracle.
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
 use crate::value::*;
@@ -6841,6 +6841,9 @@ fn fa_await(i: &mut Interp, v: Value) -> Result<Value, Value> {
         crate::coroutine::Resume::Next(x) => Ok(x),
         crate::coroutine::Resume::Throw(e) => Err(e),
         crate::coroutine::Resume::Return(x) => Ok(x),
+        // Realm teardown drops the promise immediately after the worker acknowledges; this value
+        // is internal and cannot become a JavaScript rejection.
+        crate::coroutine::Resume::Terminate => Err(Value::Undefined),
     }
 }
 
@@ -8044,6 +8047,7 @@ fn drive_generator(
             Resume::Throw(e) => Err(e),
             Resume::Return(v) => Ok(iter_result(i, v, true)),
             Resume::Next(_) => Ok(iter_result(i, Value::Undefined, true)),
+            Resume::Terminate => Ok(iter_result(i, Value::Undefined, true)),
         };
     }
     let suspend = coro.resume(i, signal);

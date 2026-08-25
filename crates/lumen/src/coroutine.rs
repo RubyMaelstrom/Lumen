@@ -16,9 +16,9 @@
 //! eval finds the right channel and nested coroutines (each on their own worker) need no extra
 //! bookkeeping — every thread reads its own thread-local.
 //!
-//! Address stability: a coroutine never outlives the `Engine` that owns the interpreter, and that
-//! `Engine` is not moved between the `eval` calls that create and drive the coroutine, so the
-//! captured pointer stays valid for the coroutine's whole life.
+//! Address and teardown safety: `Engine` boxes the interpreter, so moving the public engine does
+//! not invalidate a captured pointer. `Interp::drop` wakes every suspended body and waits for its
+//! Rust stack to unwind before destroying the object graph the body references.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -35,6 +35,8 @@ pub enum Resume {
     Return(Value),
     /// `throw(e)` — inject a throw at the suspended `yield`.
     Throw(Value),
+    /// Host realm teardown — unwind through the engine's non-catchable interruption completion.
+    Terminate,
 }
 
 // `Resume`/`Suspend` carry `Value`s (which hold non-`Send` `Rc`s). Transferring them across the
@@ -127,6 +129,13 @@ impl Coroutine {
             Coroutine::Vm(c) => c.started,
         }
     }
+
+    /// Acknowledge teardown of a thread-backed suspended body before its interpreter disappears.
+    pub(crate) fn terminate(&mut self, i: &mut Interp) {
+        if let Coroutine::Thread(c) = self {
+            c.terminate(i);
+        }
+    }
 }
 
 /// An OS-thread-backed coroutine (a pooled worker runs the body; see [`spawn_coroutine`]).
@@ -188,6 +197,19 @@ impl ThreadCoro {
             }
         }
     }
+
+    /// Stop a suspended body before the interpreter which owns its raw pointer is dropped.
+    fn terminate(&mut self, i: &mut Interp) {
+        if self.done {
+            return;
+        }
+        // `resume` performs the normal scalar-context handoff and waits for the worker's unwind
+        // acknowledgement. `Terminate` becomes the same non-catchable control completion used by
+        // host script interruption, so this works under both panic=unwind and panic=abort builds.
+        let _ = self.resume(i, Resume::Terminate);
+        #[cfg(test)]
+        TERMINATION_ACKNOWLEDGEMENTS.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Park the running coroutine, hand `msg` (a `Yield` or `Await`) to the driver, and block until
@@ -207,13 +229,9 @@ fn park(i: &mut Interp, msg: Suspend) -> Resume {
             i.tco_ok = gen_tco;
             r
         }
-        // `recv` errors only when the driver's `resume_tx` was dropped — i.e. the `Coroutine` (and
-        // usually the owning `Engine`) is being torn down. Resuming the body here would run JS
-        // (`finally` blocks, iterator-close) that dereferences the shared `*mut Interp` from this
-        // thread while the main thread tears it down — a data race that surfaced as random
-        // `RefCell already borrowed` panics / SIGSEGV. Instead, never touch the interpreter again:
-        // park forever, holding only the captured `Rc`s. The detached thread is reaped at process
-        // exit (the generator never outlives its `Engine`).
+        // Normal engine teardown uses the acknowledged termination flag above. A disconnected
+        // driver here means an abnormal owner failure; never touch its potentially-destroyed
+        // interpreter again.
         Err(_) => loop {
             std::thread::park();
         },
@@ -233,7 +251,16 @@ pub fn coroutine_await(i: &mut Interp, value: Value) -> Resume {
 /// Thrown as a JS `Error` when a coroutine cannot start (wasm32 has no OS threads, so
 /// `std::thread::Builder::spawn` reports `Unsupported` there).
 pub const UNSUPPORTED_MSG: &str =
-    "generators and async functions require OS threads, which this WebAssembly build does not have";
+    "generators and async functions require an available OS coroutine thread";
+
+#[cfg(test)]
+static TERMINATION_ACKNOWLEDGEMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn termination_acknowledgements() -> usize {
+    TERMINATION_ACKNOWLEDGEMENTS.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// One unit of work for a pooled worker: the interpreter pointer, the body to run, and this
 /// coroutine's channel ends. All fields are `Send` (via the `unsafe impl`s above / channel `Send`),
@@ -251,6 +278,16 @@ struct Job {
 /// near-zero (a worker only pushes itself back *after* handing its final value to the driver).
 static IDLE: Mutex<Vec<Sender<Job>>> = Mutex::new(Vec::new());
 
+/// Native stack reserved for a tree-walked coroutine. Release builds need this headroom for
+/// standards-heavy async-generator and promise paths even before author recursion; smaller
+/// reservations pass simple depth probes but stack-overflow on those Test262 cases.
+const COROUTINE_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Keep enough warm workers for ordinary async bursts, but release excess high-water capacity.
+/// Live coroutines still retain their workers; this bound applies only after a body has completed
+/// or has been explicitly unwound during realm teardown.
+const MAX_IDLE_WORKERS: usize = 8;
+
 /// Grab an idle worker, or start a new one. `Err` when the platform cannot spawn threads (wasm32).
 fn get_worker() -> std::io::Result<Sender<Job>> {
     if let Some(tx) = IDLE.lock().unwrap().pop() {
@@ -259,19 +296,22 @@ fn get_worker() -> std::io::Result<Sender<Job>> {
     let (job_tx, job_rx) = channel::<Job>();
     let self_tx = job_tx.clone();
     std::thread::Builder::new()
-        // Generous stack: the tree-walker recurses up to MAX_EVAL_DEPTH (1500) frames.
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(COROUTINE_STACK_SIZE)
         .spawn(move || worker_loop(job_rx, self_tx))?;
     Ok(job_tx)
 }
 
-/// A pooled worker: run one coroutine to completion, return to the idle pool, repeat. A worker that
-/// parks forever (its `Engine` was torn down while it was suspended; see `park`) simply never comes
-/// back — the same leak-at-teardown as the pre-pool one-thread-per-coroutine design.
+/// A pooled worker: run one coroutine to completion, return to the idle pool, repeat. Normal engine
+/// teardown is an acknowledged unwind, so a worker is reusable even when its generator was still
+/// suspended.
 fn worker_loop(job_rx: Receiver<Job>, self_tx: Sender<Job>) {
     while let Ok(job) = job_rx.recv() {
         run_job(job);
-        IDLE.lock().unwrap().push(self_tx.clone());
+        let mut idle = IDLE.lock().unwrap();
+        if idle.len() >= MAX_IDLE_WORKERS {
+            return;
+        }
+        idle.push(self_tx.clone());
     }
 }
 
@@ -308,6 +348,7 @@ fn run_job(job: Job) {
         }
         Ok(Resume::Return(v)) => Suspend::Done(v),
         Ok(Resume::Throw(e)) => Suspend::Throw(e),
+        Ok(Resume::Terminate) => Suspend::Done(Value::Undefined),
     };
     let _ = suspend_tx.send(outcome);
     // Clear the TLS so the next job starts clean and `in_coroutine()` reads false between jobs.

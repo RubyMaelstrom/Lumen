@@ -1121,6 +1121,53 @@ fn gc_registry_remains_valid_across_repeated_sweeps() {
 }
 
 #[test]
+fn moving_and_dropping_an_engine_safely_stops_suspended_generators() {
+    let acknowledged_before = crate::coroutine::termination_acknowledgements();
+    let mut engine = Engine::new();
+    match engine
+        .eval(
+            "function* values(){ yield 1; yield 2; } globalThis.iterator=values(); iterator.next().value",
+            false,
+        )
+        .expect("generator setup parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "1"),
+        Completion::Throw { name, message } => panic!("generator setup threw {name}: {message}"),
+    }
+
+    // Public `Engine` values are freely movable Rust values. The interpreter allocation must stay
+    // pinned while the suspended coroutine retains its pointer.
+    let mut moved_engine = engine;
+    match moved_engine
+        .eval("iterator.next().value", false)
+        .expect("resume parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "2"),
+        Completion::Throw { name, message } => panic!("generator resume threw {name}: {message}"),
+    }
+    drop(moved_engine);
+    assert!(
+        crate::coroutine::termination_acknowledgements() > acknowledged_before,
+        "dropping the engine did not receive the suspended worker's unwind acknowledgement"
+    );
+}
+
+#[test]
+fn coroutine_stack_reaches_the_interpreter_recursion_guard() {
+    // Coroutine workers reserve a bounded native stack. Keep enough headroom for the documented
+    // interpreter limit, and verify that going beyond it becomes a catchable JS RangeError rather
+    // than a process-ending native stack overflow.
+    assert_eq!(
+        run("function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(1400)} g().next().value"),
+        "1400"
+    );
+    assert_eq!(
+        run("function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(1600)} var guarded=false; try{g().next()}catch(e){guarded=e instanceof RangeError && /Maximum call stack/.test(e.message)} guarded"),
+        "true"
+    );
+}
+
+#[test]
 fn unicode_ident_escapes() {
     assert_eq!(run("var \\u0061 = 5; a"), "5");
     assert_eq!(run("var a\\u0062c = 7; abc"), "7");
