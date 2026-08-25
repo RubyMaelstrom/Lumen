@@ -2460,6 +2460,19 @@ impl Interp {
         obj
     }
 
+    /// Create the callable `[[IsHTMLDDA]]` exotic used by the web platform's legacy
+    /// `document.all` object (ECMA-262 Annex B.3.6). The engine, rather than the embedder, must
+    /// mint this value because its falsiness, `typeof`, and loose-null equality are language-level
+    /// exceptions with dedicated interpreter and JIT handling.
+    pub fn make_html_dda(&mut self) -> Value {
+        let dda = self.make_native("IsHTMLDDA", 0, |_i, _this, _args| Ok(Value::Null));
+        self.htmldda.push(dda.clone());
+        // Every JIT object fast path assumes an ordinary object is truthy and not loosely equal to
+        // null. Force this exotic through the checked helpers that implement Annex B.3.6.
+        dda.borrow().ic_plain.set(false);
+        Value::Obj(dda)
+    }
+
     /// Define a native method on `target` (non-enumerable, as built-ins are).
     pub fn def_method(&self, target: &Gc, name: &str, len: usize, f: NativeFn) {
         let func = self.make_native(name, len, f);

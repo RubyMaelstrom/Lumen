@@ -22,21 +22,8 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         i.gc_collect();
         Ok(Value::Undefined)
     });
-    // $262.IsHTMLDDA: callable, returns null with no (or one string "") argument.
-    {
-        let ddda = it.make_native("IsHTMLDDA", 0, |_i, _t, a| match a.first() {
-            None => Ok(Value::Null),
-            Some(Value::Str(s)) if s.is_empty() => Ok(Value::Null),
-            _ => Ok(Value::Null),
-        });
-        it.htmldda.push(ddda.clone());
-        // An [[IsHTMLDDA]] object is falsy and compares loosely equal to undefined/null; the
-        // JIT's inline Not / loose-equality templates assume neither of an ordinary object, and
-        // gate on the receiver's `ic_plain` byte — clear it so this object always takes the
-        // checked helper.
-        ddda.borrow().ic_plain.set(false);
-        set_builtin(&host, "IsHTMLDDA", Value::Obj(ddda));
-    }
+    // $262.IsHTMLDDA: callable and recognized by the language-level Annex B.3.6 exceptions.
+    set_builtin(&host, "IsHTMLDDA", it.make_html_dda());
     it.def_method(&host, "createRealm", 0, |i, _t, _a| {
         let g = i.create_realm();
         Ok(make_262(i, Some(g)))

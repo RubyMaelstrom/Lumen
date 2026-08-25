@@ -823,6 +823,32 @@ fn embedder_buffer_source_bytes_honor_views_detachment_and_shared_opt_in() {
     assert_eq!(engine.ctx().buffer_source_bytes(&ta, false), None);
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_can_mint_the_web_platform_html_dda_exotic() {
+    let mut engine = Engine::new();
+    let dda = engine.ctx().make_html_dda();
+    let global = engine.global_this();
+    engine
+        .ctx()
+        .member_set(&global, "dda", dda)
+        .unwrap_or_else(|_| panic!("install HTMLDDA global"));
+
+    let result = engine
+        .eval(
+            "[typeof dda, Boolean(dda), dda == null, dda == undefined,\
+             dda === null, String(dda()), dda === dda].join('|')",
+            false,
+        )
+        .expect("parse");
+    match result {
+        Completion::Value(value) => {
+            assert_eq!(value, "undefined|false|true|true|false|null|true")
+        }
+        Completion::Throw { name, message } => panic!("HTMLDDA checks threw {name}: {message}"),
+    }
+}
+
 #[test]
 fn typed_arrays() {
     assert_eq!(run("var a = new Int8Array(3); a.length"), "3");
