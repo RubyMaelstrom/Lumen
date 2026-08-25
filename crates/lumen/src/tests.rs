@@ -866,6 +866,32 @@ fn embedder_can_mirror_and_detach_an_array_buffer() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn embedder_keyed_array_buffer_rejects_script_transfer() {
+    let mut engine = Engine::new();
+    let buffer = engine
+        .ctx()
+        .make_host_keyed_array_buffer(&[1, 2, 3, 4])
+        .unwrap_or_else(|_| panic!("make keyed ArrayBuffer"));
+    let global = engine.global_this();
+    engine
+        .ctx()
+        .member_set(&global, "keyed", buffer.clone())
+        .unwrap_or_else(|_| panic!("install keyed ArrayBuffer"));
+
+    let transfer = engine
+        .eval_value_interruptible("keyed.transfer()")
+        .expect("transfer parses");
+    assert!(transfer.is_err());
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&buffer, false),
+        Some(vec![1, 2, 3, 4])
+    );
+    assert!(engine.ctx().detach_array_buffer(&buffer));
+    assert_eq!(engine.ctx().buffer_source_bytes(&buffer, false), None);
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn embedder_bigint_i64_bridge_runs_to_bigint() {
     let mut engine = Engine::new();
     let global = engine.global_this();

@@ -237,6 +237,9 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     if i.immutable_buffers.contains(&ptr) {
         return Err(i.make_error("TypeError", "an immutable ArrayBuffer is not detachable"));
     }
+    if i.host_keyed_buffers.contains(&ptr) {
+        return Err(i.make_error("TypeError", "ArrayBuffer detach key does not match"));
+    }
     if !i.array_buffers.contains_key(&ptr) {
         return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
     }

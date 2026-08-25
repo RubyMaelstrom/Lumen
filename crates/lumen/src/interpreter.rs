@@ -1183,6 +1183,10 @@ pub struct Interp {
     /// Immutable ArrayBuffer pointers (created via `transferToImmutable`/`sliceToImmutable`): their
     /// bytes can be read but never written, resized, detached, or transferred.
     pub(crate) immutable_buffers: std::collections::HashSet<usize>,
+    /// ArrayBuffers carrying an embedder detach key. ECMAScript transfer operations do not know
+    /// that key and therefore cannot detach them; the embedder can still detach them explicitly
+    /// when the external resource changes identity (notably WebAssembly memory growth).
+    pub(crate) host_keyed_buffers: std::collections::HashSet<usize>,
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
@@ -1737,6 +1741,7 @@ impl Interp {
             array_buffers: Default::default(),
             shared_buffers: Default::default(),
             immutable_buffers: std::collections::HashSet::new(),
+            host_keyed_buffers: std::collections::HashSet::new(),
             can_block: true,
             pending_async_waits: Vec::new(),
             pending_timers: Vec::new(),
@@ -2625,6 +2630,18 @@ impl Interp {
         Ok(buffer)
     }
 
+    /// A fresh fixed-length `ArrayBuffer` with an embedder detach key. Author JavaScript cannot
+    /// transfer/detach it, while [`Self::detach_array_buffer`] retains the key-aware host path.
+    /// This models the `"WebAssembly.Memory"` key required for `Memory.buffer`.
+    pub fn make_host_keyed_array_buffer(&mut self, bytes: &[u8]) -> Result<Value, Value> {
+        let buffer = self.make_array_buffer(bytes)?;
+        let Some(obj) = buffer.as_obj() else {
+            return Err(self.make_error("TypeError", "ArrayBuffer construction failed"));
+        };
+        self.host_keyed_buffers.insert(Rc::as_ptr(obj) as usize);
+        Ok(buffer)
+    }
+
     /// Replace an ordinary, attached `ArrayBuffer`'s bytes without changing its identity. Returns
     /// `false` for another value, a shared/detached buffer, or a length mismatch. Requiring an
     /// exact length keeps existing DataView and TypedArray bounds invariant.
@@ -2648,9 +2665,9 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        self.array_buffers
-            .remove(&(Rc::as_ptr(obj) as usize))
-            .is_some()
+        let ptr = Rc::as_ptr(obj) as usize;
+        self.host_keyed_buffers.remove(&ptr);
+        self.array_buffers.remove(&ptr).is_some()
     }
 
     /// Overwrite a TypedArray's covered bytes from the start (a write past the view's end is
@@ -5022,6 +5039,7 @@ impl Interp {
                 self.ta_buffer.remove(&ptr);
                 self.shared_buffers.remove(&ptr);
                 self.immutable_buffers.remove(&ptr);
+                self.host_keyed_buffers.remove(&ptr);
                 self.generators.remove(&ptr);
                 self.async_gens.remove(&ptr);
                 self.async_gen_busy.remove(&ptr);
