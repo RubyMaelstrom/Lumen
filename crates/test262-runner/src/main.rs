@@ -46,8 +46,8 @@ enum Outcome {
     Skip(String),
 }
 
-/// Tests per worker child process. Small keeps the blast radius of a crash tiny AND recycles the
-/// worker often — since lumen has no GC, exiting the process is what reclaims any leaked memory.
+/// Tests per worker child process. Small keeps the blast radius of a crash tiny and periodically
+/// returns all per-engine allocator and OS resources to the process.
 const CHUNK: usize = 40;
 
 /// Max concurrent worker processes. lumen's per-op allocation caps keep each worker bounded (tens
@@ -102,10 +102,12 @@ unsafe impl GlobalAlloc for CapAlloc {
 #[global_allocator]
 static ALLOC: CapAlloc = CapAlloc;
 
-/// Per-worker address-space ceiling (passed to `ulimit -v`, in KiB) so a runaway allocation makes
-/// `malloc` fail (the worker aborts and is recorded as a crash) instead of eating all RAM. Enforced
-/// on Linux; macOS may not honor RLIMIT_AS, so lumen's in-engine caps are the primary defense.
-const WORKER_AS_LIMIT_KIB: u64 = 2 * 1024 * 1024; // 2 GiB
+/// Per-worker *virtual address-space* ceiling (passed to `ulimit -v`, in KiB). This must leave
+/// room above `MEM_CAP` for the runner's guarded native stack and lumen's lazily committed 64 MiB
+/// coroutine-stack reservations: a 2 GiB ceiling falsely rejected conforming tests before their
+/// resident allocation approached the counting allocator's 2.5 GiB cap. Enforced on Linux; macOS
+/// may not honor RLIMIT_AS, so the counting allocator remains the real resident-memory backstop.
+const WORKER_AS_LIMIT_KIB: u64 = 8 * 1024 * 1024; // 8 GiB virtual address space
 
 /// Wall-clock budget for one worker (a whole chunk). A normal chunk finishes in well under a
 /// second; this only fires for a genuinely pathological test (e.g. an O(n²) `s += x` loop run a
