@@ -5,7 +5,7 @@
 use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub type Gc = Rc<RefCell<Object>>;
 
@@ -796,7 +796,7 @@ pub struct Object {
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
     /// GC scratch: mark bit and internal-reference count while collection runs. Between
-    /// collections `gc_internal` holds this object's raw-registry slot; the collector restores
+    /// collections `gc_internal` holds this object's weak-registry slot; the collector restores
     /// every slot before sweeping can drop an object.
     pub(crate) gc_mark: Cell<bool>,
     pub(crate) gc_internal: Cell<u32>,
@@ -820,12 +820,13 @@ impl Object {
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
         GC_STATE.with(|state| {
             state.live.set(state.live.get() + 1);
+            state.allocated.set(state.allocated.get().wrapping_add(1));
             let mut reg = state.registry.borrow_mut();
             let slot = match reg.free.pop() {
                 Some(slot) => slot,
                 None => {
                     let slot = reg.entries.len();
-                    reg.entries.push(std::ptr::null());
+                    reg.entries.push(None);
                     slot
                 }
             };
@@ -841,7 +842,7 @@ impl Object {
                 gc_mark: Cell::new(false),
                 gc_internal: Cell::new(slot_u32),
             }));
-            reg.entries[slot] = Rc::as_ptr(&obj);
+            reg.entries[slot] = Some(Rc::downgrade(&obj));
             obj
         })
     }
@@ -849,14 +850,13 @@ impl Object {
 
 impl Drop for Object {
     fn drop(&mut self) {
-        // Remove the raw registry pointer before the surrounding RcBox is freed. Tombstone reuse
+        // Remove the weak registry entry before the surrounding RcBox is freed. Tombstone reuse
         // is O(1), does not touch another (possibly borrowed) object, and bounds registry memory
         // by peak simultaneously-live objects instead of cumulative allocation count.
         let slot = self.gc_internal.get() as usize;
         let _ = GC_STATE.try_with(|state| {
             let mut reg = state.registry.borrow_mut();
-            if slot < reg.entries.len() && !reg.entries[slot].is_null() {
-                reg.entries[slot] = std::ptr::null();
+            if slot < reg.entries.len() && reg.entries[slot].take().is_some() {
                 reg.free.push(slot);
             }
             drop(reg);
@@ -867,17 +867,19 @@ impl Drop for Object {
 }
 
 // The GC is a refcount-based cycle collector (lumen has no tracing GC). Every heap object is
-// registered through a non-owning raw slot and the live count is maintained via Object::new /
-// Drop. `Interp::gc_collect` reclaims objects referenced only by other (also-unreachable)
-// objects — see interpreter.rs.
+// registered through a non-owning weak slot and the live count is maintained via Object::new /
+// Drop. Weak handles make a stale registry entry harmless rather than allowing a freed address to
+// be reconstructed as an `Rc`. `Interp::gc_collect` reclaims objects referenced only by other
+// (also-unreachable) objects — see interpreter.rs.
 struct GcRegistry {
-    entries: Vec<*const RefCell<Object>>,
+    entries: Vec<Option<Weak<RefCell<Object>>>>,
     free: Vec<usize>,
 }
 
 struct GcState {
     registry: RefCell<GcRegistry>,
     live: Cell<i64>,
+    allocated: Cell<u64>,
 }
 
 thread_local! {
@@ -887,12 +889,18 @@ thread_local! {
             free: Vec::new(),
         }),
         live: Cell::new(0),
+        allocated: Cell::new(0),
     };
 }
 
 /// Number of live heap objects right now.
 pub fn live_objects() -> i64 {
     GC_STATE.with(|state| state.live.get())
+}
+
+/// Monotonic (wrapping) object-allocation count for task-boundary churn accounting.
+pub(crate) fn allocated_objects() -> u64 {
+    GC_STATE.with(|state| state.allocated.get())
 }
 
 /// Stable address of this thread's live-object counter. The Rc-based runtime and its compiled
@@ -905,20 +913,15 @@ pub(crate) fn live_objects_ptr() -> *const i64 {
     GC_STATE.with(|state| state.live.as_ptr())
 }
 
-/// Strong handles to every currently-live heap object. Registry slots are non-owning raw
-/// pointers tombstoned synchronously by `Object::drop`; while this thread-local borrow is held no
-/// object can disappear between reading a slot and incrementing its strong count.
+/// Strong handles to every currently-live heap object. Registry slots are non-owning weak
+/// references tombstoned synchronously by `Object::drop`.
 pub fn gc_snapshot() -> Vec<Gc> {
     GC_STATE.with(|state| {
         let reg = state.registry.borrow();
         let mut live = Vec::with_capacity(reg.entries.len() - reg.free.len());
-        for &ptr in &reg.entries {
-            if ptr.is_null() {
-                continue;
-            }
-            unsafe {
-                Rc::increment_strong_count(ptr);
-                live.push(Rc::from_raw(ptr));
+        for weak in reg.entries.iter().flatten() {
+            if let Some(object) = weak.upgrade() {
+                live.push(object);
             }
         }
         live
@@ -931,10 +934,10 @@ pub fn gc_snapshot() -> Vec<Gc> {
 pub(crate) fn gc_restore_registry_slots() {
     GC_STATE.with(|state| {
         let reg = state.registry.borrow();
-        for (slot, &ptr) in reg.entries.iter().enumerate() {
-            if !ptr.is_null() {
+        for (slot, weak) in reg.entries.iter().enumerate() {
+            if let Some(object) = weak.as_ref().and_then(Weak::upgrade) {
                 let slot: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-                unsafe { (*ptr).borrow().gc_internal.set(slot) };
+                object.borrow().gc_internal.set(slot);
             }
         }
     });

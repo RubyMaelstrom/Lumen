@@ -432,6 +432,7 @@ impl Runtime {
             }
 
             if self.idle() {
+                self.engine.collect_garbage_at_idle();
                 return;
             }
 

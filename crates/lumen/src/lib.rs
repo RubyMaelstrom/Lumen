@@ -7,8 +7,8 @@
 //!
 //! ## Shape
 //! - [`lexer`] tokenizes, [`parser`] builds the [`ast`], [`interpreter`] + `eval` walk it.
-//! - [`value`] is the prototype-based object model (`Rc<RefCell<Object>>`, reference-counted — no
-//!   real GC yet, so reference cycles leak; fine for the per-test runner).
+//! - [`value`] is the prototype-based object model (`Rc<RefCell<Object>>`) with a cycle collector
+//!   and bounded live-object pressure.
 //! - [`builtins`] installs the realm (`globalThis`, `Object`/`Array`/`Function`/`Math`, the error
 //!   constructors, global functions).
 //!
@@ -247,20 +247,25 @@ impl Engine {
             Ok(v) => {
                 // Run queued promise reactions (the microtask checkpoint after the script).
                 if let Err(reason) = self.interp.run_agent_event_loop() {
+                    self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
+                self.interp.gc_task_boundary();
                 Ok(ExecutionOutcome::Value(self.render(&v)))
             }
             Err(interpreter::Abrupt::Throw(thrown)) => {
                 if let Err(reason) = self.interp.run_agent_event_loop() {
+                    self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
+                self.interp.gc_task_boundary();
                 let Completion::Throw { name, message } = self.describe_throw(thrown) else {
                     unreachable!()
                 };
                 Ok(ExecutionOutcome::Throw { name, message })
             }
             Err(interpreter::Abrupt::Interrupt(reason)) => {
+                self.interp.gc_task_boundary();
                 Ok(ExecutionOutcome::Interrupted { reason })
             }
             Err(_) => Ok(ExecutionOutcome::Value(String::new())),
@@ -298,20 +303,25 @@ impl Engine {
         match result {
             Ok(v) => {
                 if let Err(reason) = self.interp.run_agent_event_loop() {
+                    self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
+                self.interp.gc_task_boundary();
                 Ok(ExecutionOutcome::Value(self.render(&v)))
             }
             Err(interpreter::Abrupt::Throw(thrown)) => {
                 if let Err(reason) = self.interp.run_agent_event_loop() {
+                    self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
+                self.interp.gc_task_boundary();
                 let Completion::Throw { name, message } = self.describe_throw(thrown) else {
                     unreachable!()
                 };
                 Ok(ExecutionOutcome::Throw { name, message })
             }
             Err(interpreter::Abrupt::Interrupt(reason)) => {
+                self.interp.gc_task_boundary();
                 Ok(ExecutionOutcome::Interrupted { reason })
             }
             Err(_) => Ok(ExecutionOutcome::Value(String::new())),
@@ -382,19 +392,30 @@ impl Engine {
         let result = self.interp.load_module(key, src);
         Ok(match result {
             Ok(_) => match self.interp.run_agent_event_loop() {
-                Ok(()) => ExecutionOutcome::Value(String::new()),
-                Err(reason) => ExecutionOutcome::Interrupted { reason },
+                Ok(()) => {
+                    self.interp.gc_task_boundary();
+                    ExecutionOutcome::Value(String::new())
+                }
+                Err(reason) => {
+                    self.interp.gc_task_boundary();
+                    ExecutionOutcome::Interrupted { reason }
+                }
             },
             Err(interpreter::Abrupt::Throw(value)) => {
                 if let Err(reason) = self.interp.run_agent_event_loop() {
+                    self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
+                self.interp.gc_task_boundary();
                 let Completion::Throw { name, message } = self.describe_throw(value) else {
                     unreachable!()
                 };
                 ExecutionOutcome::Throw { name, message }
             }
-            Err(interpreter::Abrupt::Interrupt(reason)) => ExecutionOutcome::Interrupted { reason },
+            Err(interpreter::Abrupt::Interrupt(reason)) => {
+                self.interp.gc_task_boundary();
+                ExecutionOutcome::Interrupted { reason }
+            }
             Err(_) => ExecutionOutcome::Value(String::new()),
         })
     }
@@ -554,6 +575,7 @@ impl Engine {
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
             Err(interpreter::Abrupt::Interrupt(reason)) => {
+                self.interp.gc_task_boundary();
                 Err(embed::EvalError::Interrupted(reason))
             }
             Err(_) => Ok(Value::Undefined),
@@ -605,31 +627,52 @@ impl Engine {
         this: embed::Value,
         args: &[embed::Value],
     ) -> Result<embed::Value, embed::EvalError> {
-        self.interp
-            .interrupt_poll_force()
-            .map_err(|abrupt| match abrupt {
+        if let Err(abrupt) = self.interp.interrupt_poll_force() {
+            let error = match abrupt {
                 interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
                 interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
                 _ => embed::EvalError::Throw(Value::Undefined),
-            })?;
-        self.interp
+            };
+            self.interp.gc_task_boundary();
+            return Err(error);
+        }
+        let result = self
+            .interp
             .call(func.clone(), this, args)
             .map_err(|abrupt| match abrupt {
                 interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
                 interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
                 _ => embed::EvalError::Throw(Value::Undefined),
-            })
+            });
+        if matches!(result, Err(embed::EvalError::Interrupted(_))) {
+            self.interp.gc_task_boundary();
+        }
+        result
     }
 
     /// Drain the microtask (promise-reaction) queue to quiescence.
     pub fn run_microtasks(&mut self) {
         self.interp.drain_microtasks();
+        self.interp.gc_task_boundary();
     }
 
     /// Run a microtask checkpoint while preserving host interruption as control flow. Pending jobs
     /// are discarded when a running job is killed; they must not be resumed as a later task.
     pub fn run_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
-        self.interp.drain_microtasks_interruptible()
+        if let Err(reason) = self.interp.drain_microtasks_interruptible() {
+            self.interp.gc_task_boundary();
+            return Err(reason);
+        }
+        self.interp.gc_task_boundary();
+        Ok(())
+    }
+
+    /// Collect cycles when the host event loop is about to block for external input.
+    ///
+    /// This complements allocation-triggered task checks: cyclic garbage spread across many
+    /// individually low-churn timer tasks is reclaimed once, at the natural idle boundary.
+    pub fn collect_garbage_at_idle(&mut self) -> i64 {
+        self.interp.collect_garbage_for_host()
     }
 
     /// Drain and return the reasons of promises rejected without a handler (after a microtask

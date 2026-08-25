@@ -1034,6 +1034,30 @@ fn gc_reclaims_cycles() {
     );
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn high_churn_task_collects_after_temporary_roots_are_released() {
+    let mut engine = Engine::new();
+    let before = engine.ctx().live_object_count();
+    let result = engine
+        .eval_value_interruptible(
+            "var retained=[]; for(var i=0;i<12000;i++){var o={};o.self=o;retained.push(o);} retained=null;",
+        )
+        .expect("parse");
+    assert!(result.is_ok(), "allocation task threw");
+    let before_boundary = engine.ctx().live_object_count();
+    assert!(before_boundary > before + 10_000);
+
+    engine
+        .run_microtasks_interruptible()
+        .expect("task-boundary checkpoint");
+    let after_boundary = engine.ctx().live_object_count();
+    assert!(
+        after_boundary + 10_000 < before_boundary,
+        "task boundary retained cyclic garbage: {before_boundary} -> {after_boundary}"
+    );
+}
+
 #[test]
 fn gc_keeps_reachable_cycles() {
     // A cycle still reachable from a live binding must survive collection unscathed.
@@ -1058,7 +1082,7 @@ fn gc_registry_reuses_dead_object_slots() {
     );
     assert!(free_after > 0);
 
-    // A live raw slot must become a strong snapshot handle, then tombstone synchronously when
+    // A live weak slot must become a strong snapshot handle, then tombstone synchronously when
     // the final owner disappears; the same slot can be reused without retaining the dead RcBox.
     let object = crate::value::Object::new(None);
     let ptr = Rc::as_ptr(&object);
@@ -1069,6 +1093,31 @@ fn gc_registry_reuses_dead_object_slots() {
     let (slots_final, free_final) = crate::value::gc_registry_stats();
     assert_eq!(slots_final, slots_after);
     assert_eq!(free_final, free_after);
+}
+
+#[test]
+fn gc_registry_remains_valid_across_repeated_sweeps() {
+    let mut engine = Engine::new();
+    for _ in 0..4 {
+        match engine
+            .eval(
+                "var roots=[]; for(var i=0;i<4000;i++){var o={};o.self=o;roots.push(o);} roots=null;",
+                false,
+            )
+            .expect("parse")
+        {
+            Completion::Value(_) => {}
+            Completion::Throw { name, message } => panic!("allocation task threw {name}: {message}"),
+        }
+        engine.interp.collect_garbage_for_host();
+        engine.interp.collect_garbage_for_host();
+        match engine.eval("1 + 1", false).expect("realm remains usable") {
+            Completion::Value(value) => assert_eq!(value, "2"),
+            Completion::Throw { name, message } => {
+                panic!("realm threw after repeated collection: {name}: {message}")
+            }
+        }
+    }
 }
 
 #[test]

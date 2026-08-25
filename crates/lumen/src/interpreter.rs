@@ -1268,6 +1268,8 @@ pub struct Interp {
     /// JIT calls compare live objects with `gc_next` exactly and use this only for sparse scope-
     /// registry maintenance.
     pub(crate) gc_tick: u32,
+    /// Allocation counter at the preceding host task boundary.
+    pub(crate) gc_task_allocated: u64,
     /// Prune the scope registry once its entry count passes this floating threshold.
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
@@ -1418,11 +1420,16 @@ pub(crate) const GC_DIRECT_MAINT_MASK: u32 = 4095;
 /// Scope-registry entry count that arms a registry prune.
 const SCOPE_GC_TRIGGER: usize = 65_536;
 
-/// Memory safety valves. lumen has no garbage collector and several built-ins iterate/allocate in
-/// proportion to a user-controlled `length`, so without these a single adversarial test (e.g.
-/// `Array(4e9).join()` or `s += s` doubling a string) can exhaust all RAM. Operations that would
-/// materialize more than these bounds raise a RangeError instead. They are generous relative to
-/// real test262 tests but small enough that one runaway test stays bounded.
+/// Per-task allocation volume which triggers an end-of-task cycle collection. This catches a
+/// large graph which remained reachable at allocation safepoints but became garbage when its task
+/// returned, without collecting after every low-churn browser task.
+const GC_TASK_ALLOCATION_TRIGGER: u64 = 10_000;
+
+/// Memory safety valves. Several built-ins iterate/allocate in proportion to a user-controlled
+/// `length`, so without these a single adversarial test (e.g. `Array(4e9).join()` or `s += s`
+/// doubling a string) can exhaust all RAM. Operations that would materialize more than these
+/// bounds raise a RangeError instead. They are generous relative to real test262 tests but small
+/// enough that one runaway test stays bounded.
 pub const MAX_ARRAY_OP_LEN: usize = 1 << 20; // ~1M elements
 
 /// Byte ceiling for a single ArrayBuffer/SharedArrayBuffer allocation (real programs allocate
@@ -1746,6 +1753,7 @@ impl Interp {
             generators: Default::default(),
             gc_next: GC_TRIGGER,
             gc_tick: 0,
+            gc_task_allocated: crate::value::allocated_objects(),
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
             super_call_ok: false,
@@ -2137,7 +2145,10 @@ impl Interp {
     pub fn collect_garbage_for_host(&mut self) -> i64 {
         let before = crate::value::live_objects();
         self.gc_collect();
-        before.saturating_sub(crate::value::live_objects())
+        let live = crate::value::live_objects();
+        self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
+        self.gc_task_allocated = crate::value::allocated_objects();
+        before.saturating_sub(live)
     }
 
     /// Current number of heap objects tracked by the engine.
@@ -4568,6 +4579,23 @@ impl Interp {
         Ok(())
     }
 
+    /// Collect after a high-churn host task, when temporary roots from that task have gone away.
+    /// Allocation safepoints alone cannot see this transition: a graph may be reachable during
+    /// every in-task collection and become cyclic garbage only as the callback returns.
+    pub(crate) fn gc_task_boundary(&mut self) -> i64 {
+        let allocated = crate::value::allocated_objects();
+        let churn = allocated.wrapping_sub(self.gc_task_allocated);
+        self.gc_task_allocated = allocated;
+        if churn < GC_TASK_ALLOCATION_TRIGGER {
+            return 0;
+        }
+        let before = crate::value::live_objects();
+        self.gc_collect();
+        let live = crate::value::live_objects();
+        self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
+        before.saturating_sub(live)
+    }
+
     /// Pin `o` for the lifetime of its side-table entries (see `gc_pins`).
     pub(crate) fn gc_pin(&mut self, o: &Gc) {
         self.gc_pins.insert(Rc::as_ptr(o) as usize, o.clone());
@@ -4823,7 +4851,7 @@ impl Interp {
             }
         }
 
-        // `gc_internal` doubles as the O(1) raw-registry slot outside collection. Restore it
+        // `gc_internal` doubles as the O(1) weak-registry slot outside collection. Restore it
         // before the sweep clears any property/side-table edge that could drop an object.
         crate::value::gc_restore_registry_slots();
 
