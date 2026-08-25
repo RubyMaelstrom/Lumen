@@ -2436,8 +2436,8 @@ impl ReInput for &[u8] {
         let repeated = u64::from_ne_bytes([byte; 8]);
         let low_bits = 0x0101_0101_0101_0101u64;
         let high_bits = 0x8080_8080_8080_8080u64;
-        let mut chunks = bytes.chunks_exact(8);
-        for (chunk_index, chunk) in chunks.by_ref().enumerate() {
+        let bulk_len = bytes.len() / 8 * 8;
+        for (chunk_index, chunk) in bytes[..bulk_len].chunks(8).enumerate() {
             let word = u64::from_ne_bytes(chunk.try_into().unwrap());
             let different = word ^ repeated;
             if different.wrapping_sub(low_bits) & !different & high_bits != 0 {
@@ -2446,9 +2446,8 @@ impl ReInput for &[u8] {
                 }
             }
         }
-        let tail_start = from + bytes.len() - chunks.remainder().len();
-        chunks
-            .remainder()
+        let tail_start = from + bulk_len;
+        bytes[bulk_len..]
             .iter()
             .position(|candidate| *candidate == byte)
             .map(|offset| tail_start + offset)

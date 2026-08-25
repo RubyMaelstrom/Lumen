@@ -41,6 +41,8 @@ fn kind_str(kind: ExportKind) -> &'static str {
     }
 }
 
+pub use parse::{decode, validate};
+
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -160,5 +162,3 @@ mod tests {
         assert!(!validate(&[0x00, 0x61, 0x73, 0x6d, 0x02, 0, 0, 0])); // bad version
     }
 }
-
-pub use parse::{decode, validate};

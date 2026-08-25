@@ -24,7 +24,6 @@ fn op_upgrade(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         .to_string();
     let alpn: Vec<String> = ctx
         .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
-        .to_string()
         .split(',')
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -127,7 +126,6 @@ fn op_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         .to_string();
     let alpn: Vec<String> = ctx
         .coerce_string(args.get(3).unwrap_or(&Value::Undefined))?
-        .to_string()
         .split(',')
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -240,7 +238,6 @@ fn op_listen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         .ok_or_else(|| ctx.make_error("TypeError", "TLS server private key must be bytes"))?;
     let alpn: Vec<String> = ctx
         .coerce_string(args.get(4).unwrap_or(&Value::Undefined))?
-        .to_string()
         .split(',')
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -276,7 +273,7 @@ fn op_listen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 }
 
 enum AcceptResult {
-    Connected(Connected),
+    Connected(Box<Connected>),
     Closed,
     Error(String),
 }
@@ -317,14 +314,14 @@ fn op_accept(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
                         let protocol = stream.protocol();
                         let cipher = stream.cipher();
                         let alpn = stream.alpn_protocol();
-                        AcceptResult::Connected(Connected {
+                        AcceptResult::Connected(Box::new(Connected {
                             stream,
                             local,
                             peer,
                             protocol,
                             cipher,
                             alpn,
-                        })
+                        }))
                     }
                     Err(error) => AcceptResult::Error(error),
                 }
@@ -344,7 +341,7 @@ fn decode_accept(
         .downcast::<AcceptResult>()
         .expect("TLS accept payload")
     {
-        AcceptResult::Connected(connected) => register_connected(ctx, connected),
+        AcceptResult::Connected(connected) => register_connected(ctx, *connected),
         AcceptResult::Closed => Ok(vec![Value::Null]),
         AcceptResult::Error(message) => Err(ctx.make_error("Error", message)),
     }

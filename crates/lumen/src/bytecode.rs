@@ -957,7 +957,7 @@ impl Chunk {
                         );
                     }
                     CapInit::Var(name) => {
-                        if !b.vars.contains_key(&**name) {
+                        if !b.vars.contains_key(name) {
                             b.vars.insert(
                                 name.clone(),
                                 crate::interpreter::Binding {
@@ -2733,7 +2733,7 @@ impl Compiler {
             .and_then(|(sites, cursor)| {
                 let site = sites.get(*cursor);
                 *cursor += 1;
-                site.filter(|(hot_name, _)| &**hot_name == &*self.names[name as usize])
+                site.filter(|(hot_name, _)| hot_name.as_ref() == self.names[name as usize].as_ref())
                     .map(|(_, states)| *states)
             });
         for way in 0..PROP_IC_WAYS {
@@ -2756,7 +2756,7 @@ impl Compiler {
         let seed = self.name_seed_stack.last_mut().and_then(|(sites, cursor)| {
             let site = sites.get(*cursor);
             *cursor += 1;
-            site.filter(|(hot_name, ..)| &**hot_name == &*self.names[name as usize])
+            site.filter(|(hot_name, ..)| hot_name.as_ref() == self.names[name as usize].as_ref())
                 .cloned()
         });
         let (ic, pin, number) = match seed {
@@ -5281,7 +5281,7 @@ fn run_vm(
                 let name = &chunk.names[n as usize];
                 let old = {
                     let b = env.borrow();
-                    let bd = b.vars.get(&**name).expect("captured binding missing");
+                    let bd = b.vars.get(name).expect("captured binding missing");
                     if !bd.initialized {
                         let msg = format!("cannot access '{name}' before initialization");
                         drop(b);
@@ -6394,7 +6394,7 @@ impl Chunk {
             if b.with_obj.is_some() {
                 return None;
             }
-            if let Some(bd) = b.vars.get(&*self.names[n as usize]) {
+            if let Some(bd) = b.vars.get(&self.names[n as usize]) {
                 if !bd.initialized || bd.import_ref.is_some() {
                     return None;
                 }
@@ -6421,7 +6421,7 @@ impl Chunk {
                 if let Some(p) = &b.parent {
                     let pb = p.borrow();
                     if pb.with_obj.is_none() {
-                        if let Some(bd) = pb.vars.get(&*self.names[n as usize]) {
+                        if let Some(bd) = pb.vars.get(&self.names[n as usize]) {
                             if bd.initialized && bd.import_ref.is_none() {
                                 let v = bd.value.clone();
                                 self.record_name_number(c as usize, &v);
@@ -6817,7 +6817,7 @@ impl Chunk {
             .get_or_init(|| {
                 if self.ops.len() < 3
                     || self.ops.len() > 17
-                    || self.ops.len() % 2 == 0
+                    || self.ops.len() & 1 == 0
                     || !matches!(self.ops.last(), Some(Op::ReturnUndef))
                     || !self.var_force_resets.is_empty()
                     || self.arguments_slot.is_some()
@@ -6828,7 +6828,9 @@ impl Chunk {
                 let count = self.ops.len() / 2;
                 let mut fields = Vec::with_capacity(count);
                 let mut used = 0u128;
-                for pair in self.ops[..count * 2].chunks_exact(2) {
+                for pair_index in 0..count {
+                    let start = pair_index * 2;
+                    let pair = &self.ops[start..start + 2];
                     let [Op::LoadLocal(slot), Op::SetPropThisDrop(name, cache)] = pair else {
                         return None;
                     };
@@ -8060,7 +8062,7 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     if i.frame_pool.len() < 64 {
         i.frame_pool.0.push(buf);
     } else {
-        drop(Box::from_raw(std::slice::from_raw_parts_mut(
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
             ctx.slots as *mut std::mem::MaybeUninit<Value>,
             crate::jit::FRAME_BUF,
         )));
@@ -8075,21 +8077,16 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     let mut threw = threw != 0;
     // Proper-tail-call trampoline, exactly like the layered paths.
     if !threw {
-        loop {
-            match i.pending_tail.take() {
-                Some(bx) => {
-                    let (f, t, a) = *bx;
-                    let r = i.gc_check_amortized().and_then(|()| i.call_inner(f, t, &a));
-                    match r {
-                        Ok(v) => ctx.ret = v,
-                        Err(e) => {
-                            ctx.error = Some(e);
-                            threw = true;
-                            break;
-                        }
-                    }
+        while let Some(bx) = i.pending_tail.take() {
+            let (f, t, a) = *bx;
+            let r = i.gc_check_amortized().and_then(|()| i.call_inner(f, t, &a));
+            match r {
+                Ok(v) => ctx.ret = v,
+                Err(e) => {
+                    ctx.error = Some(e);
+                    threw = true;
+                    break;
                 }
-                None => break,
             }
         }
     }
@@ -8875,7 +8872,7 @@ unsafe fn jit_callstat(
     impl Drop for NativeDump {
         fn drop(&mut self) {
             let mut v: Vec<_> = self.0.values().collect();
-            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             for (name, n) in v {
                 eprintln!("[jit-nativestat] {n:>12}  {name}");
             }
@@ -9103,7 +9100,7 @@ unsafe fn jit_exec_inner(
             let name = &chunk.names[n as usize];
             let old = {
                 let b = env.borrow();
-                let bd = b.vars.get(&**name).expect("captured binding missing");
+                let bd = b.vars.get(name).expect("captured binding missing");
                 if !bd.initialized {
                     let msg = format!("cannot access '{name}' before initialization");
                     drop(b);

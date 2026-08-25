@@ -408,13 +408,11 @@ pub mod testing {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let mut n = 0usize;
-            for _ in 0..conns {
+            for n in 0..conns {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
                 serve_one(stream, mode, n);
-                n += 1;
             }
         });
         port

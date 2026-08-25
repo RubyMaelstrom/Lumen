@@ -1253,7 +1253,7 @@ mod tests {
             associated_data: vec![4; 12],
         };
         assert_eq!(
-            hex(&argon2_hash(&vec![1; 32], &vec![2; 16], &params)),
+            hex(&argon2_hash(&[1; 32], &[2; 16], &params)),
             "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659"
         );
     }

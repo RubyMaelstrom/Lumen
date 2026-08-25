@@ -730,8 +730,7 @@ fn re_sym_replace_impl(
             if direct_exec {
                 loop {
                     let matched = regexp_exec_discard_fast(i, &this, &s)
-                        .expect("direct regexp discard guards")
-                        .map_err(|v| v)?;
+                        .expect("direct regexp discard guards")?;
                     if !matched || !global {
                         break;
                     }

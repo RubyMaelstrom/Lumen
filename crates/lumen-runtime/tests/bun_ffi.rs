@@ -40,17 +40,13 @@ fn c_compiler() -> Option<String> {
         Some("cc".into()),
         Some("clang".into()),
     ];
-    for c in candidates.into_iter().flatten() {
-        if Command::new(&c)
+    candidates.into_iter().flatten().find(|compiler| {
+        Command::new(compiler)
             .arg("--version")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-        {
-            return Some(c);
-        }
-    }
-    None
+    })
 }
 
 /// Compile the shared C fixture into the test's `OUT`/temp dir; returns its path.

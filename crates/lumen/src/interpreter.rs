@@ -217,7 +217,7 @@ impl Drop for FramePool {
     fn drop(&mut self) {
         for p in self.0.drain(..) {
             unsafe {
-                drop(Box::from_raw(std::slice::from_raw_parts_mut(
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                     p.as_ptr() as *mut std::mem::MaybeUninit<Value>,
                     crate::jit::FRAME_BUF,
                 )));
@@ -487,6 +487,7 @@ pub struct Scope {
 /// Keep the common empty case to one nullable pointer and materialize the Vec on first use.
 #[derive(Default)]
 #[repr(transparent)]
+#[allow(clippy::box_collection)] // Keeps the common empty scope to one nullable pointer.
 pub struct ScopeNames(Option<Box<Vec<String>>>);
 
 impl ScopeNames {
@@ -2950,10 +2951,7 @@ impl Interp {
         // Sequential growth is the common case and `try_append_element` only needs to
         // validate the dense frontier. Keep the more general hole/padding machinery as
         // the fallback for out-of-order writes.
-        let prop = match b.props.try_append_element(n, Property::plain(v)) {
-            Ok(()) => None,
-            Err(prop) => Some(prop),
-        };
+        let prop = b.props.try_append_element(n, Property::plain(v)).err();
         let result = match prop {
             None => Ok(()),
             Some(prop) => b.props.try_define_dense_element(n, prop),
@@ -3212,10 +3210,7 @@ impl Interp {
                         {
                             return None;
                         }
-                        match mb.proto.as_ref() {
-                            Some(p) => hp = Rc::as_ptr(p),
-                            None => return None,
-                        }
+                        hp = Rc::as_ptr(mb.proto.as_ref()?);
                     }
                     let hb = (*hp).borrow();
                     let holder_exotic_ok = matches!(hb.exotic, Exotic::None | Exotic::StrWrap(_))
@@ -6455,8 +6450,8 @@ impl Interp {
                 let (slot, default, name, _) = initializer_chunk.jit_initializer_field(plan, field);
                 let value = if slot < argc {
                     let arg = unsafe { args.add(slot) };
-                    if default.is_some() && !self.to_boolean(unsafe { &*arg }) {
-                        default.expect("default checked").clone()
+                    if let Some(default) = default.filter(|_| !self.to_boolean(unsafe { &*arg })) {
+                        default.clone()
                     } else {
                         let value = unsafe { arg.read() };
                         unsafe { arg.write(Value::Undefined) };
@@ -8424,7 +8419,7 @@ impl Interp {
                 .global
                 .borrow()
                 .props
-                .get(&**name)
+                .get(name)
                 .map(|p| (p.configurable(), p.accessor(), p.writable(), p.enumerable()));
             if !matches!(binding.value, Value::Undefined) {
                 // CanDeclareGlobalFunction.

@@ -241,9 +241,7 @@ fn fse_read_distribution(
             // A zero probability is followed by 2-bit runs of extra zeros; 3 means "keep going".
             loop {
                 let rep = fwd.read(2);
-                for _ in 0..rep {
-                    probs.push(0);
-                }
+                probs.extend(std::iter::repeat_n(0, rep as usize));
                 if rep < 3 {
                     break;
                 }
@@ -332,8 +330,7 @@ struct HufTable {
 fn huf_read_table(data: &[u8]) -> Result<(HufTable, usize), String> {
     let h = *data.first().ok_or("zstd: missing Huffman tree header")? as usize;
     let mut weights: Vec<u8> = Vec::new();
-    let consumed;
-    if h >= 128 {
+    let consumed = if h >= 128 {
         // Direct representation: (h - 127) weights, 4 bits each.
         let n = h - 127;
         let nbytes = n.div_ceil(2);
@@ -344,7 +341,7 @@ fn huf_read_table(data: &[u8]) -> Result<(HufTable, usize), String> {
             let b = data[1 + i / 2];
             weights.push(if i % 2 == 0 { b >> 4 } else { b & 0x0F });
         }
-        consumed = 1 + nbytes;
+        1 + nbytes
     } else {
         // FSE-compressed weights over an `h`-byte region.
         if 1 + h > data.len() {
@@ -385,8 +382,8 @@ fn huf_read_table(data: &[u8]) -> Result<(HufTable, usize), String> {
                 break;
             }
         }
-        consumed = 1 + h;
-    }
+        1 + h
+    };
     Ok((huf_from_weights(&weights)?, consumed))
 }
 

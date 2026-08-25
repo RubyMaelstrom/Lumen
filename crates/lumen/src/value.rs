@@ -882,14 +882,14 @@ struct GcState {
 }
 
 thread_local! {
-    static GC_STATE: GcState = GcState {
+    static GC_STATE: GcState = const { GcState {
         registry: RefCell::new(GcRegistry {
             entries: Vec::new(),
             free: Vec::new(),
         }),
         live: Cell::new(0),
         allocated: Cell::new(0),
-    };
+    } };
 }
 
 /// Number of live heap objects right now.
@@ -1143,9 +1143,9 @@ impl Property {
         enumerable: bool,
         configurable: bool,
     ) -> Property {
-        let meta = (writable as usize) * PROP_WRITABLE
-            | (enumerable as usize) * PROP_ENUMERABLE
-            | (configurable as usize) * PROP_CONFIGURABLE;
+        let meta = ((writable as usize) * PROP_WRITABLE)
+            | ((enumerable as usize) * PROP_ENUMERABLE)
+            | ((configurable as usize) * PROP_CONFIGURABLE);
         Property {
             packed: PackedValue::pack(value),
             meta,
@@ -1159,8 +1159,8 @@ impl Property {
         configurable: bool,
     ) -> Property {
         let flags = PROP_ACCESSOR
-            | (enumerable as usize) * PROP_ENUMERABLE
-            | (configurable as usize) * PROP_CONFIGURABLE;
+            | ((enumerable as usize) * PROP_ENUMERABLE)
+            | ((configurable as usize) * PROP_CONFIGURABLE);
         let ptr = Box::into_raw(Box::new(Accessors { get, set })) as usize;
         debug_assert_eq!(ptr & PROP_FLAG_MASK, 0);
         Property {
@@ -1356,11 +1356,17 @@ impl Drop for InlinePacked {
 #[derive(Clone, Default)]
 struct DenseBuffers {
     index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
-    packed: Option<Box<Vec<Property>>>,
+    packed: Option<PackedProperties>,
     inline_packed: InlinePacked,
     elems: Vec<u32>,
     mirror: Vec<f64>,
 }
+
+// DenseBuffers exists for every object that leaves the inline-property representation. The
+// extra indirection keeps this optional field pointer-sized instead of adding two words to each
+// allocation; the compact representation is more valuable here than Clippy's generic Vec advice.
+#[allow(clippy::box_collection)]
+type PackedProperties = Box<Vec<Property>>;
 
 struct EmptyDenseBuffers(DenseBuffers);
 // This one value contains only `None` and empty Vec dangling sentinels and is never mutated; no
@@ -1419,7 +1425,7 @@ impl DenseStorage {
             d.index = None;
         }
     }
-    fn set_packed(&mut self, packed: Option<Box<Vec<Property>>>) {
+    fn set_packed(&mut self, packed: Option<PackedProperties>) {
         if packed.is_some() {
             let dense = self.buffers_mut();
             dense.inline_packed = InlinePacked::default();
@@ -1989,27 +1995,6 @@ impl Props {
             return None;
         }
         Some(&self.entries[slot as usize].1)
-    }
-
-    /// Mutable [`get_index`].
-    #[inline]
-    pub(crate) fn get_index_mut(&mut self, n: u32) -> Option<&mut Property> {
-        // A raw &mut escape can rewrite the value behind the mirror's back.
-        self.mirror_invalidate();
-        if self.elems.packed_is_some() {
-            return self
-                .elems
-                .packed_mut()
-                .expect("packed storage checked")
-                .get_mut(n as usize)
-                .filter(|p| !matches!(p.value(), Value::Empty));
-        }
-        let dense = self.elems.buffers_mut();
-        let slot = *dense.elems.get(n as usize)?;
-        if slot == NO_SLOT {
-            return None;
-        }
-        Some(&mut self.entries[slot as usize].1)
     }
 
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).

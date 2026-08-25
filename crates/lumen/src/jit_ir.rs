@@ -1029,12 +1029,12 @@ fn normal_successor_pcs(op: &Op, pc: usize, len: usize, out: &mut Vec<usize>) {
         | Op::JumpIfNotNullishPeek(t)
         | Op::InlineGuard(_, t) => {
             out.push(*t as usize);
-            if pc + 1 <= len {
+            if pc < len {
                 out.push(pc + 1);
             }
         }
         Op::Return | Op::ReturnUndef | Op::Throw | Op::IterAbortL(_) | Op::Await => {}
-        _ if pc + 1 <= len => out.push(pc + 1),
+        _ if pc < len => out.push(pc + 1),
         _ => {}
     }
 }
@@ -1460,7 +1460,7 @@ mod tests {
         assert!(!g.dominates(entry, h.target));
     }
 
-    fn region<'a>(ops: &'a [Op], head: usize, n_slots: usize) -> (Cfg, RegionIr) {
+    fn region(ops: &[Op], head: usize, n_slots: usize) -> (Cfg, RegionIr) {
         let g = cfg(ops).unwrap();
         let lp = g.loop_at_header(head).unwrap();
         let ir = RegionIr::build_with(

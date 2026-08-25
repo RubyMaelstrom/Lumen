@@ -1731,13 +1731,8 @@ fn uri_encode(s: &str, keep: &str) -> Option<String> {
     while let Some(mut c) = chars.next() {
         if crate::jstr::smuggled(c).is_some() {
             // A smuggled pair encodes a real smuggle-range character; a lone one is malformed.
-            match chars.peek().and_then(|&n| crate::jstr::paired_char(c, n)) {
-                Some(real) => {
-                    chars.next();
-                    c = real;
-                }
-                None => return None,
-            }
+            c = chars.peek().and_then(|&n| crate::jstr::paired_char(c, n))?;
+            chars.next();
         }
         if c.is_ascii()
             && (c.is_ascii_alphanumeric() || "-_.!~*'()".contains(c) || keep.contains(c))
@@ -4849,7 +4844,7 @@ fn install_array(it: &mut Interp) {
 
     it.def_method(&ap, "push", 1, nf_array_push);
     it.def_method(&ap, "pop", 0, nf_array_pop);
-    install_array_rest(it, &ap);
+    install_array_rest(it, ap);
 }
 
 pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -5017,7 +5012,7 @@ pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
     Some(value)
 }
 
-fn install_array_rest(it: &mut Interp, ap: &Gc) {
+fn install_array_rest(it: &mut Interp, ap: Gc) {
     it.def_method(&ap, "shift", 0, |i, this, _args| {
         let o = arr_to_object(i, &this)?;
         let ov = Value::Obj(o.clone());

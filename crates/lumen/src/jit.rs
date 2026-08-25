@@ -1146,17 +1146,14 @@ mod asm {
             // Relax imm19 branches that cannot reach after final layout. Invert the local
             // condition over an imm26 B and update every later label/patch for the inserted word.
             // Iteration matters: one insertion can push another branch just over its limit.
-            loop {
-                let Some(k) = self.patches.iter().position(|(at, label, kind)| {
-                    if !matches!(kind, PatchKind::Cb) {
-                        return false;
-                    }
-                    let target = self.labels[*label].expect("unbound jit label");
-                    let delta = target as i64 - *at as i64;
-                    !(-(1 << 18)..(1 << 18)).contains(&delta)
-                }) else {
-                    break;
-                };
+            while let Some(k) = self.patches.iter().position(|(at, label, kind)| {
+                if !matches!(kind, PatchKind::Cb) {
+                    return false;
+                }
+                let target = self.labels[*label].expect("unbound jit label");
+                let delta = target as i64 - *at as i64;
+                !(-(1 << 18)..(1 << 18)).contains(&delta)
+            }) {
                 let (at, label, _) = self.patches[k];
                 let insn = self.buf[at];
                 self.buf[at] = if insn & 0xff00_0000 == 0x5400_0000 {
@@ -1297,7 +1294,7 @@ mod asm {
                     seen.entry(v).or_insert(field);
                 }
             }
-            for (&v, _) in &seen {
+            for &v in seen.keys() {
                 let enc = super::logical_imm_w(v).unwrap_or_else(|| {
                     panic!("0x{v:08x} should be encodable");
                 });
@@ -3807,7 +3804,7 @@ fn emit_prop_load_inline(
     // site cache with proto-based states (see get_prop_ic's primitive arm), so shapes align.
     let str_ok = method
         && il.valid
-        && il.string_proto % 8 == 0
+        && il.string_proto & 7 == 0
         && il.string_proto / 8 < 4096
         && name != "length"
         && name != "description"
@@ -4399,8 +4396,8 @@ fn emit_direct_call(
     if !ilayout.valid || argc > 64 || gc_data_off >= 4096 {
         return false;
     }
-    let fits8 = |o: usize| o % 8 == 0 && o / 8 < 4096;
-    let fits4 = |o: usize| o % 4 == 0 && o / 4 < 4096;
+    let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
+    let fits4 = |o: usize| o & 3 == 0 && o / 4 < 4096;
     let il = ilayout;
     if !(fits4(il.depth)
         && fits4(il.gc_tick)
@@ -4783,7 +4780,7 @@ fn emit_direct_finish_stub(
     let cx_slots = offset_of!(JitCtx, slots) as u32;
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
     let slow = a.new_label();
-    let fits8 = |o: usize| o % 8 == 0 && o / 8 < 4096;
+    let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
     let fast_ok = rc_dec_ok
         && il.valid
         && fits8(cx_this as usize)
@@ -4795,7 +4792,7 @@ fn emit_direct_finish_stub(
         && fits8(il.frame_pool + il.fp_ptr_word)
         && fits8(il.frame_pool + il.fp_len_word)
         && fits8(il.frame_pool + il.fp_cap_word)
-        && il.depth % 4 == 0
+        && il.depth & 3 == 0
         && il.depth / 4 < 4096;
     // The stub calls out (H_DROP_AT per last-reference Value, or the full helper), so lr is
     // spilled for the whole body; both exits share the epilogue.
@@ -11893,7 +11890,7 @@ fn plan_linked_scan(
         || peek != peek_read
         || next == peek
         || *back as usize != head
-        || *exit as usize <= end - 1
+        || (*exit as usize) < end
         || !chunk.jit_const_copyable(*null)
         || chunk.jit_const_bits(*null) != (2, 0)
     {
@@ -11992,7 +11989,7 @@ fn plan_numeric_diamond(
     }
     if *back as usize != head
         || *no_reset as usize != head + 12
-        || *exit as usize <= end - 1
+        || (*exit as usize) < end
         || index != index_read
         || index != index_update
         || counter_name != counter_name_read
@@ -13340,10 +13337,7 @@ fn plan_loop(
     let mut pc = head;
     while pc < jump_pc {
         let (cop, push, pop): (ChainOp, usize, usize) = match &ops[pc] {
-            Op::Const(k) => match chunk.jit_const_num(*k) {
-                Some(bits) => (ChainOp::ConstNum(bits), 1, 0),
-                None => return None,
-            },
+            Op::Const(k) => (ChainOp::ConstNum(chunk.jit_const_num(*k)?), 1, 0),
             Op::LoadLocal(s) if in_range(*s) => (ChainOp::Load(*s as u32 * 16), 1, 0),
             Op::UpdateLocal(s, kind) if in_range(*s) => {
                 let pushes = !matches!(kind, UpdKind::IncDiscard | UpdKind::DecDiscard);
@@ -13583,10 +13577,10 @@ fn plan_loop(
     }
 
     // Elem ops present require the inline layout; receivers must never be written in-region.
-    if !elem_nodes.is_empty() || !receivers.is_empty() {
-        if fast & 1024 == 0 || !get_elem_inlinable(layout) {
-            reject!("elem layout");
-        }
+    if (!elem_nodes.is_empty() || !receivers.is_empty())
+        && (fast & 1024 == 0 || !get_elem_inlinable(layout))
+    {
+        reject!("elem layout");
     }
     if receivers.len() > 4 {
         reject!("too many receivers");
@@ -13600,10 +13594,10 @@ fn plan_loop(
     let mut slot_offs: Vec<u32> = Vec::new();
     for (cop, _) in &chain {
         match *cop {
-            ChainOp::Load(off) | ChainOp::Update(off, _) | ChainOp::Store(off) => {
-                if !slot_offs.contains(&off) && !receivers.contains(&off) {
-                    slot_offs.push(off);
-                }
+            ChainOp::Load(off) | ChainOp::Update(off, _) | ChainOp::Store(off)
+                if !slot_offs.contains(&off) && !receivers.contains(&off) =>
+            {
+                slot_offs.push(off);
             }
             _ => {}
         }
@@ -16166,18 +16160,17 @@ fn emit_scheduler_handler_deliver_transaction(
     if matches!(
         source,
         SchedulerHandlerDeliverSource::ActiveNull | SchedulerHandlerDeliverSource::IncomingDevice
-    ) {
-        if fast_resume.is_some() {
-            // A one-node append leaves Scheduler.current and the active TCB untouched, and no
-            // call ran after the task-role epoch guards. Reuse those facts for the next scheduler
-            // iteration. Empty/preempting delivery publishes a different current and must
-            // rebuild from canonical pc2 instead.
-            let canonical = a.new_label();
-            a.cbz(12, true, canonical);
-            emit_scheduler_loop_continue(a, fast_resume, plan.loop_pc, pc_labels);
-            a.bind(canonical);
-            a.movz(28, 0, 0);
-        }
+    ) && fast_resume.is_some()
+    {
+        // A one-node append leaves Scheduler.current and the active TCB untouched, and no
+        // call ran after the task-role epoch guards. Reuse those facts for the next scheduler
+        // iteration. Empty/preempting delivery publishes a different current and must
+        // rebuild from canonical pc2 instead.
+        let canonical = a.new_label();
+        a.cbz(12, true, canonical);
+        emit_scheduler_loop_continue(a, fast_resume, plan.loop_pc, pc_labels);
+        a.bind(canonical);
+        a.movz(28, 0, 0);
     }
     a.b(pc_labels[plan.loop_pc]);
 
@@ -21477,7 +21470,7 @@ fn emit_loop_chain(
                             let wa = conv!(a_, 0, 9);
                             xt = free_i.pop().expect("loop i pool");
                             match code {
-                                0 | 1 | 2 => a.logic_imm_w(code, xt, wa, field),
+                                0..=2 => a.logic_imm_w(code, xt, wa, field),
                                 3 => a.lsl_imm_w(xt, wa, field),
                                 4 => a.lsr_imm_w(xt, wa, field),
                                 _ => a.asr_imm_w(xt, wa, field),
@@ -22272,7 +22265,7 @@ pub(crate) unsafe fn run_moved_shared(
                 i.frame_pool.push(buf);
             } else {
                 unsafe {
-                    drop(Box::from_raw(std::slice::from_raw_parts_mut(
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                         slots_ptr as *mut std::mem::MaybeUninit<Value>,
                         FRAME_BUF,
                     )));
@@ -22499,7 +22492,7 @@ unsafe fn run_moved_inner(
                 i.frame_pool.push(buf);
             } else {
                 unsafe {
-                    drop(Box::from_raw(std::slice::from_raw_parts_mut(
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                         slots_ptr as *mut std::mem::MaybeUninit<Value>,
                         FRAME_BUF,
                     )));

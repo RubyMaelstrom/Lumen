@@ -57,16 +57,16 @@ impl Drop for Cache {
 }
 
 thread_local! {
-    static CACHE: Cache = Cache {
+    static CACHE: Cache = const { Cache {
         heads: [const { Cell::new(std::ptr::null_mut()) }; NUM_CLASSES],
         counts: [const { Cell::new(0) }; NUM_CLASSES],
-    };
+    } };
 }
 
 #[inline]
 fn class_of(size: usize, align: usize) -> Option<usize> {
     if align <= STEP && size <= MAX_CLASS && size > 0 {
-        Some((size + STEP - 1) / STEP - 1)
+        Some(size.div_ceil(STEP) - 1)
     } else {
         None
     }

@@ -136,10 +136,12 @@ struct FfiState {
 
 fn ffi_state(ctx: &mut Ctx) -> &mut FfiState {
     if ctx.host_mut::<FfiState>().is_none() {
-        let mut st = FfiState::default();
-        st.callbacks = (0..=MAX_ARGS)
-            .map(|_| (0..JSCB_POOL).map(|_| None).collect())
-            .collect();
+        let st = FfiState {
+            callbacks: (0..=MAX_ARGS)
+                .map(|_| (0..JSCB_POOL).map(|_| None).collect())
+                .collect(),
+            ..FfiState::default()
+        };
         ctx.op_state().put(st);
     }
     ctx.host_mut::<FfiState>().unwrap()

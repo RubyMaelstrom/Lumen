@@ -885,7 +885,7 @@ fn plain_huffman_lengths(freqs: &[u64]) -> Vec<u8> {
         return lengths;
     }
     while nodes.len() > 1 {
-        nodes.sort_by(|a, b| b.0.cmp(&a.0)); // descending; the two lightest sit at the tail
+        nodes.sort_by_key(|node| std::cmp::Reverse(node.0)); // lightest nodes sit at the tail
         let (wa, mut ga) = nodes.pop().expect("len > 1");
         let (wb, gb) = nodes.pop().expect("len > 1");
         for &s in ga.iter().chain(gb.iter()) {
@@ -974,7 +974,7 @@ fn write_complex_code(w: &mut BitWriter, lengths: &[u8]) {
             )
         })
         .collect();
-    by_freq.sort_by(|a, b| b.0.cmp(&a.0));
+    by_freq.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let mut cl_len = [0u8; 18];
     for (i, &(_, l)) in by_freq.iter().enumerate() {
         cl_len[l as usize] = if (i as u32) < num_short {
@@ -1165,59 +1165,6 @@ pub fn brotli_compress(data: &[u8]) -> Vec<u8> {
     w.finish()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{brotli_compress, brotli_decompress};
-
-    fn unhex(s: &str) -> Vec<u8> {
-        s.as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let digit = |b: u8| match b {
-                    b'0'..=b'9' => b - b'0',
-                    b'a'..=b'f' => b - b'a' + 10,
-                    _ => panic!("invalid hex fixture"),
-                };
-                digit(pair[0]) << 4 | digit(pair[1])
-            })
-            .collect()
-    }
-
-    #[test]
-    fn decodes_reference_vectors() {
-        let vectors = [
-            ("06", Vec::new()),
-            ("0b028068656c6c6f03", b"hello".to_vec()),
-            (
-                "1b2a0000c4dc46a95e0d0b45712af29c4cfe1c4517a82a5b4956982fbcf174445e94d5c604b7da8131d5fd87c004",
-                b"The quick brown fox jumps over the lazy dog".to_vec(),
-            ),
-            (
-                "1b6f17000476c0e62e73216e8b03c90340770c",
-                b"abc123".repeat(1000),
-            ),
-        ];
-
-        for (encoded, expected) in vectors {
-            assert_eq!(brotli_decompress(&unhex(encoded)).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn roundtrips_representative_inputs() {
-        let binary: Vec<u8> = (0..=255).collect();
-        for input in [
-            Vec::new(),
-            b"hello".to_vec(),
-            b"abc123".repeat(1000),
-            binary,
-        ] {
-            let encoded = brotli_compress(&input);
-            assert_eq!(brotli_decompress(&encoded).unwrap(), input);
-        }
-    }
-}
-
 // ---- tables extracted from the reference implementation (brotli-1.2.0, MIT) --------------------
 
 static PREFIX_SUFFIX: [u8; 217] = [
@@ -1329,3 +1276,56 @@ static CONTEXT_LUT: [u8; 2048] = [
     5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
     6, 6, 6, 7,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{brotli_compress, brotli_decompress};
+
+    fn unhex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |b: u8| match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    _ => panic!("invalid hex fixture"),
+                };
+                digit(pair[0]) << 4 | digit(pair[1])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decodes_reference_vectors() {
+        let vectors = [
+            ("06", Vec::new()),
+            ("0b028068656c6c6f03", b"hello".to_vec()),
+            (
+                "1b2a0000c4dc46a95e0d0b45712af29c4cfe1c4517a82a5b4956982fbcf174445e94d5c604b7da8131d5fd87c004",
+                b"The quick brown fox jumps over the lazy dog".to_vec(),
+            ),
+            (
+                "1b6f17000476c0e62e73216e8b03c90340770c",
+                b"abc123".repeat(1000),
+            ),
+        ];
+
+        for (encoded, expected) in vectors {
+            assert_eq!(brotli_decompress(&unhex(encoded)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn roundtrips_representative_inputs() {
+        let binary: Vec<u8> = (0..=255).collect();
+        for input in [
+            Vec::new(),
+            b"hello".to_vec(),
+            b"abc123".repeat(1000),
+            binary,
+        ] {
+            let encoded = brotli_compress(&input);
+            assert_eq!(brotli_decompress(&encoded).unwrap(), input);
+        }
+    }
+}

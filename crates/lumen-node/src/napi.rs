@@ -137,7 +137,7 @@ unsafe fn read_utf8(s: *const c_char, len: usize) -> String {
     let bytes: &[u8] = if len == NAPI_AUTO_LENGTH {
         std::ffi::CStr::from_ptr(s).to_bytes()
     } else {
-        std::slice::from_raw_parts(s as *const u8, len)
+        std::slice::from_raw_parts(s.cast::<u8>(), len)
     };
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -601,7 +601,7 @@ pub unsafe extern "C" fn napi_get_value_string_utf8(
         return NAPI_OK;
     }
     let n = core::cmp::min(bytes.len(), bufsize - 1);
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), n);
     *buf.add(n) = 0;
     if !result.is_null() {
         *result = n;
