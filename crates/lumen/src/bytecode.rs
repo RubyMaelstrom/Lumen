@@ -2281,6 +2281,12 @@ fn compile_inner(
 /// Test262 helper call graphs, producing wrong results or SIGBUS/SIGSEGV. `LUMEN_INLINE_AT`
 /// explicitly enables it for investigation; unit tests keep the historical threshold so the
 /// implementation itself does not silently lose coverage.
+///
+/// TODO(TRust): repair and re-enable this optimizer. On the same fat-LTO TRust benchmark artifact,
+/// speculative inlining raised the score from 1,366 to 2,395 (about 75%). Do not delete the
+/// machinery merely because it is disabled: re-enable it once the full current Test262 suite,
+/// interpreter/bytecode/JIT differential coverage, and repeated release-mode native-crash stress
+/// runs all pass with it enabled.
 pub(crate) fn inline_recompile_at() -> u32 {
     static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
