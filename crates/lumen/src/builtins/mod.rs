@@ -5,6 +5,7 @@
 use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
 use crate::value::*;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 // Per-object modules split out of this file (behavior-preserving). Shared helpers remain here and
@@ -6251,6 +6252,14 @@ fn install_iterator(it: &mut Interp) {
     it.def_method(&proto, "drop", 1, |i, t, a| {
         make_iter_helper(i, t, "drop", arg(a, 0))
     });
+    it.def_method(&proto, "chunks", 1, |i, t, a| {
+        make_chunking_helper(i, t, arg(a, 0), None)
+    });
+    it.def_method(&proto, "windows", 1, |i, t, a| {
+        make_chunking_helper(i, t, arg(a, 0), Some(arg(a, 1)))
+    });
+    it.def_method(&proto, "includes", 1, iterator_includes);
+    it.def_method(&proto, "join", 1, iterator_join);
     it.def_method(&proto, "flatMap", 1, |i, t, a| {
         make_iter_helper(i, t, "flatMap", arg(a, 0))
     });
@@ -7063,6 +7072,80 @@ fn iter_some_every(i: &mut Interp, this: Value, a: &[Value], want: bool) -> Resu
     Ok(Value::Bool(!want))
 }
 
+/// Iterator.prototype.includes, from the TC39 stage-3 Iterator Includes proposal.
+///
+/// `skippedElements` deliberately is not coerced: the proposal accepts only an integral Number
+/// (or either infinity), and validates it before GetIteratorDirect observes `next`.
+fn iterator_includes(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    require_iterator_object(i, &this)?;
+    let search = arg(a, 0);
+    let to_skip = match arg(a, 1) {
+        Value::Undefined => 0.0,
+        Value::Num(n) if n.is_infinite() || (!n.is_nan() && n.fract() == 0.0) => n,
+        _ => {
+            i.iterator_close(&this);
+            return Err(i.make_error("TypeError", "skippedElements must be an integral number"));
+        }
+    };
+    if to_skip < 0.0 || (to_skip.is_finite() && to_skip > 9_007_199_254_740_991.0) {
+        i.iterator_close(&this);
+        return Err(i.make_error(
+            "RangeError",
+            "skippedElements is outside the permitted range",
+        ));
+    }
+    let next = ab(i.get_member(&this, "next"))?;
+    let mut skipped = 0.0;
+    while let Some(value) = step_iter_with(i, &this, &next)? {
+        if skipped < to_skip {
+            skipped += 1.0;
+        } else if same_value_zero(&value, &search) {
+            ab(i.iterator_close_normal(&this))?;
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+/// Iterator.prototype.join, from the TC39 stage-3 Iterator Join proposal.
+/// Separator conversion precedes GetIteratorDirect; conversion of an element closes the iterator
+/// on an abrupt completion, whereas iterator-protocol errors do not perform an additional close.
+fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    require_iterator_object(i, &this)?;
+    let separator = match arg(a, 0) {
+        Value::Undefined => ",".to_string(),
+        value => match i.to_string(&value) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                i.iterator_close(&this);
+                return Err(crate::interpreter::abrupt_value(e));
+            }
+        },
+    };
+    let next = ab(i.get_member(&this, "next"))?;
+    let mut result = String::new();
+    let mut first = true;
+    while let Some(value) = step_iter_with(i, &this, &next)? {
+        if first {
+            first = false;
+        } else {
+            result.push_str(&separator);
+        }
+        if !matches!(value, Value::Undefined | Value::Null) {
+            match i.to_string(&value) {
+                Ok(s) => result.push_str(&s),
+                Err(e) => {
+                    i.iterator_close(&this);
+                    return Err(crate::interpreter::abrupt_value(e));
+                }
+            }
+        }
+    }
+    Ok(Value::from_string(
+        crate::jstr::canonicalize(&result).unwrap_or(result),
+    ))
+}
+
 /// Step an iterator object (`this`) once: `Some(value)` or `None` when done.
 /// GetIteratorDirect's receiver check: an Iterator.prototype helper requires an Object `this`.
 fn require_iterator_object(i: &Interp, this: &Value) -> Result<(), Value> {
@@ -7102,8 +7185,9 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
         i.iterator_close(&source);
         return Err(i.make_error("TypeError", "Iterator helper argument is not callable"));
     }
-    // take/drop validate the limit (ToNumber → NaN or negative is a RangeError) before reading the
-    // source's `next`; any validation failure closes the underlying iterator (calls its `return`).
+    // ECMA-262 §27.1.3.3.2 / §27.1.3.3.11: validate the limit before GetIteratorDirect
+    // reads `next`. Argument conversion and every validation failure close the provisional
+    // Iterator Record, while +Infinity remains valid.
     let limit = if matches!(kind, "take" | "drop") {
         let raw = match i.to_number(&f) {
             Ok(n) => n,
@@ -7112,7 +7196,7 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
                 return Err(crate::interpreter::abrupt_value(e));
             }
         };
-        if raw.is_nan() || raw.trunc() < 0.0 {
+        if raw.is_nan() || (raw.is_finite() && raw > 9_007_199_254_740_991.0) || raw.trunc() < 0.0 {
             i.iterator_close(&source);
             return Err(i.make_error("RangeError", "limit must be a non-negative number"));
         }
@@ -7136,6 +7220,62 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
         set_builtin(&obj, "__ih_n", Value::Num(n));
         set_builtin(&obj, "__ih_started", Value::Bool(false));
     }
+    set_builtin(&obj, "__ih_count", Value::Num(0.0));
+    set_builtin(&obj, "__ih_source_done", Value::Bool(false));
+    set_builtin(&obj, "__ih_done", Value::Bool(false));
+    Ok(Value::Obj(obj))
+}
+
+/// Build the lazy helper specified by the TC39 stage-3 Iterator Chunking proposal.
+/// Validation is intentionally non-coercing and precedes GetIteratorDirect's observable `next`
+/// lookup. `undersized` is present only for `windows`.
+fn make_chunking_helper(
+    i: &mut Interp,
+    source: Value,
+    size: Value,
+    undersized: Option<Value>,
+) -> Result<Value, Value> {
+    require_iterator_object(i, &source)?;
+    let is_windows = undersized.is_some();
+    let size = match size {
+        Value::Num(n) if n.is_finite() && n.fract() == 0.0 => n,
+        _ => {
+            i.iterator_close(&source);
+            return Err(i.make_error("TypeError", "chunk size must be an integral number"));
+        }
+    };
+    if !(1.0..=4_294_967_295.0).contains(&size) {
+        i.iterator_close(&source);
+        return Err(i.make_error("RangeError", "chunk size is outside the permitted range"));
+    }
+    let mode = match undersized {
+        None | Some(Value::Undefined) => "only-full",
+        Some(Value::Str(s)) if s.to_string() == "only-full" => "only-full",
+        Some(Value::Str(s)) if s.to_string() == "allow-partial" => "allow-partial",
+        Some(_) => {
+            i.iterator_close(&source);
+            return Err(i.make_error("TypeError", "invalid undersized mode"));
+        }
+    };
+    let next = ab(i.get_member(&source, "next"))?;
+    let proto = i
+        .extra_protos
+        .get("%IteratorHelperPrototype%")
+        .or_else(|| i.extra_protos.get("%IteratorPrototype%"))
+        .cloned();
+    let obj = Object::new(proto);
+    set_builtin(&obj, "__ih_next", next);
+    set_builtin(&obj, "__ih_src", source);
+    set_builtin(
+        &obj,
+        "__ih_kind",
+        Value::str(if is_windows { "windows" } else { "chunks" }),
+    );
+    set_builtin(&obj, "__ih_fn", Value::Undefined);
+    set_builtin(&obj, "__ih_size", Value::Num(size));
+    set_builtin(&obj, "__ih_undersized", Value::str(mode));
+    set_builtin(&obj, "__ih_buf", i.make_array(Vec::new()));
+    set_builtin(&obj, "__ih_source_done", Value::Bool(false));
     set_builtin(&obj, "__ih_count", Value::Num(0.0));
     set_builtin(&obj, "__ih_done", Value::Bool(false));
     Ok(Value::Obj(obj))
@@ -7168,9 +7308,12 @@ fn iter_helper_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value
             if matches!(inner, Value::Obj(_)) {
                 ab(i.iterator_close_normal(&inner))?;
             }
-            let src = ab(i.get_member(&this, "__ih_src"))?;
-            // A normal return() propagates an error from the source's return method.
-            ab(i.iterator_close_normal(&src))?;
+            let source_done = ab(i.get_member(&this, "__ih_source_done"))?;
+            if !i.to_boolean(&source_done) {
+                let src = ab(i.get_member(&this, "__ih_src"))?;
+                // A normal return() propagates an error from the source's return method.
+                ab(i.iterator_close_normal(&src))?;
+            }
             Ok(())
         })(i);
         if started {
@@ -7883,8 +8026,9 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             let started = i.to_boolean(&started_v);
             if !started {
                 let nv = ab(i.get_member(&this, "__ih_n"))?;
-                let n = ab(i.to_number(&nv))? as usize;
-                for _ in 0..n {
+                let n = ab(i.to_number(&nv))?;
+                let mut skipped = 0.0;
+                while skipped < n {
                     if step_iter_with(i, &src, &inext)?.is_none() {
                         // Exhausted while skipping: the helper completes here — no further
                         // step of the underlying iterator.
@@ -7893,12 +8037,106 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                         set_internal(o, "__ih_done", Value::Bool(true));
                         return Ok(iter_result(i, Value::Undefined, true));
                     }
+                    skipped += 1.0;
                 }
                 set_internal(this.as_obj().unwrap(), "__ih_started", Value::Bool(true));
             }
             match step_iter_with(i, &src, &inext)? {
                 None => Ok(iter_result(i, Value::Undefined, true)),
                 Some(v) => Ok(iter_result(i, v, false)),
+            }
+        }
+        "chunks" => {
+            let source_done = ab(i.get_member(&this, "__ih_source_done"))?;
+            if i.to_boolean(&source_done) {
+                return Ok(iter_result(i, Value::Undefined, true));
+            }
+            let size = ab(i.get_member(&this, "__ih_size"))?;
+            let size = ab(i.to_number(&size))? as usize;
+            let mut buffer = Vec::with_capacity(size.min(1024));
+            loop {
+                match step_iter_with(i, &src, &inext)? {
+                    Some(value) => {
+                        buffer.push(value);
+                        if buffer.len() == size {
+                            return Ok(iter_result(i, i.make_array(buffer), false));
+                        }
+                    }
+                    None => {
+                        set_internal(
+                            this.as_obj().unwrap(),
+                            "__ih_source_done",
+                            Value::Bool(true),
+                        );
+                        return if buffer.is_empty() {
+                            Ok(iter_result(i, Value::Undefined, true))
+                        } else {
+                            Ok(iter_result(i, i.make_array(buffer), false))
+                        };
+                    }
+                }
+            }
+        }
+        "windows" => {
+            let source_done = ab(i.get_member(&this, "__ih_source_done"))?;
+            if i.to_boolean(&source_done) {
+                return Ok(iter_result(i, Value::Undefined, true));
+            }
+            let size = ab(i.get_member(&this, "__ih_size"))?;
+            let size = ab(i.to_number(&size))? as usize;
+            let stored = ab(i.get_member(&this, "__ih_buf"))?;
+            let mut buffer = match stored {
+                Value::Obj(o) => {
+                    let len = i.array_length(&o);
+                    (0..len)
+                        .map(|index| {
+                            o.borrow()
+                                .props
+                                .get(&index.to_string())
+                                .map(|p| p.value())
+                                .unwrap_or(Value::Undefined)
+                        })
+                        .collect::<VecDeque<_>>()
+                }
+                _ => VecDeque::new(),
+            };
+            loop {
+                match step_iter_with(i, &src, &inext)? {
+                    Some(value) => {
+                        if buffer.len() == size {
+                            buffer.pop_front();
+                        }
+                        buffer.push_back(value);
+                        if buffer.len() == size {
+                            let window = buffer.iter().cloned().collect::<Vec<_>>();
+                            set_internal(
+                                this.as_obj().unwrap(),
+                                "__ih_buf",
+                                i.make_array(window.clone()),
+                            );
+                            return Ok(iter_result(i, i.make_array(window), false));
+                        }
+                    }
+                    None => {
+                        set_internal(
+                            this.as_obj().unwrap(),
+                            "__ih_source_done",
+                            Value::Bool(true),
+                        );
+                        let mode = ab(i.get_member(&this, "__ih_undersized"))?;
+                        let allow_partial =
+                            matches!(mode, Value::Str(s) if s.to_string() == "allow-partial");
+                        return if allow_partial && !buffer.is_empty() && buffer.len() < size {
+                            Ok(iter_result(
+                                i,
+                                i.make_array(buffer.into_iter().collect()),
+                                false,
+                            ))
+                        } else {
+                            Ok(iter_result(i, Value::Undefined, true))
+                        };
+                    }
+                }
             }
         }
         "flatMap" => {

@@ -11163,6 +11163,51 @@ fn iterator_take_drop() {
 }
 
 #[test]
+fn iterator_includes_and_join() {
+    // Iterator Includes proposal: SameValueZero, skipping without coercion, and early close.
+    assert_eq!(run("[0,NaN,2].values().includes(NaN)"), "true");
+    assert_eq!(run("[1,2,3].values().includes(2,2)"), "false");
+    assert_eq!(throws("[1].values().includes(1,'0')"), "TypeError");
+    assert_eq!(
+        run("var c=0;var o={__proto__:Iterator.prototype,next(){return{value:1,done:false}},return(){c++;return{}}};[o.includes(1),c].join(',')"),
+        "true,1"
+    );
+
+    // Iterator Join proposal: nullish elements are empty strings and element conversion errors
+    // close the source, while ordinary exhaustion does not.
+    assert_eq!(run("[1,null,undefined,4].values().join('-')"), "1---4");
+    assert_eq!(
+        run("var c=0;var bad={toString(){throw 1}};var o={__proto__:Iterator.prototype,i:0,next(){return this.i++?{done:true}:{value:bad,done:false}},return(){c++;return{}}};try{o.join()}catch(e){}String(c)"),
+        "1"
+    );
+}
+
+#[test]
+fn iterator_chunks_and_windows() {
+    // Iterator Chunking proposal: chunks yield fresh arrays and preserve a final partial chunk.
+    assert_eq!(
+        run("[1,2,3,4,5].values().chunks(2).toArray().map(x=>x.join('')).join(',')"),
+        "12,34,5"
+    );
+    // Windows retain the previous window without sharing the yielded arrays with page code.
+    assert_eq!(
+        run("var w=[1,2,3,4].values().windows(2);var a=w.next().value;a[1]=9;a.join('')+';'+w.next().value.join('')"),
+        "19;23"
+    );
+    assert_eq!(
+        run("[1,2].values().windows(3,'allow-partial').next().value.join(',')"),
+        "1,2"
+    );
+    assert_eq!(throws("[1].values().chunks('1')"), "TypeError");
+    assert_eq!(throws("[1].values().windows(1,'bad')"), "TypeError");
+    // Once exhaustion has been observed, return() does not close the underlying iterator again.
+    assert_eq!(
+        run("var c=0;var o={__proto__:Iterator.prototype,next(){return{done:true}},return(){c++;return{}}};var h=o.chunks(2);h.next();h.return();String(c)"),
+        "0"
+    );
+}
+
+#[test]
 fn iterator_zip_basics() {
     assert_eq!(
         run("Iterator.zip([[1,2],[3,4]]).map(p=>p.join('')).toArray().join(',')"),
@@ -13899,6 +13944,12 @@ fn iterator_take_closes_on_bad_limit() {
     assert_eq!(run("var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};try{o.take(NaN)}catch(e){}String(c)"), "1");
     assert_eq!(run("var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};try{o.take(-1)}catch(e){}String(c)"), "1");
     assert_eq!(run("var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};var n='';try{o.take(NaN)}catch(e){n=e.constructor.name}n"), "RangeError");
+    // ECMA-262 §27.1.3.3.2 / §27.1.3.3.11: a finite limit above 2^53 - 1 is
+    // rejected and closes the provisional iterator without observing `next`.
+    assert_eq!(run("var c=0,n=0;var o={__proto__:Iterator.prototype,get next(){n++;throw 1},return(){c++;return{}}};var e='';try{o.take(Number.MAX_SAFE_INTEGER+1)}catch(x){e=x.constructor.name}[e,c,n].join(',')"), "RangeError,1,0");
+    assert_eq!(run("var c=0,n=0;var o={__proto__:Iterator.prototype,get next(){n++;throw 1},return(){c++;return{}}};var e='';try{o.drop(Number.MAX_SAFE_INTEGER+1)}catch(x){e=x.constructor.name}[e,c,n].join(',')"), "RangeError,1,0");
+    // +Infinity is valid. A finite source is consumed to exhaustion when the helper is stepped.
+    assert_eq!(run("[1,2,3].values().drop(Infinity).next().done"), "true");
 }
 
 #[test]
