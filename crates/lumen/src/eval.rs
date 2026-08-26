@@ -927,6 +927,12 @@ impl Interp {
                     let is_using = matches!(kind, DeclKind::Using | DeclKind::AwaitUsing);
                     let is_async = matches!(kind, DeclKind::AwaitUsing);
                     for (pat, e) in decls {
+                        // ECMA-262 §§14.7.4.2 and 14.3.2.1: evaluating a `var`
+                        // declaration without an initializer performs no assignment. In
+                        // particular, `for (var parameter; ... )` preserves the parameter.
+                        if matches!(kind, DeclKind::Var) && e.is_none() {
+                            continue;
+                        }
                         let v = match e {
                             Some(e) => self.eval(e, loop_env)?,
                             None => Value::Undefined,

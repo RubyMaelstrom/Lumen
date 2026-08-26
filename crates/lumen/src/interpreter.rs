@@ -8551,12 +8551,6 @@ impl Interp {
                             .insert(name.clone(), undef_var_binding());
                     }
                 }
-                HoistOp::VarForce(name) => {
-                    scope
-                        .borrow_mut()
-                        .vars
-                        .insert(name.clone(), undef_var_binding());
-                }
                 HoistOp::Fn(name, func) => {
                     let f = self.make_function(func.clone(), scope.clone());
                     if name == "*default*" {
@@ -8654,8 +8648,9 @@ pub(crate) fn collect_hoist_ops(
 }
 
 /// Hoist `var` declarations from one statement (function declarations and Annex B promotions are
-/// collected by the later phases). `for`/`for-in/of` heads bind unconditionally (VarForce),
-/// matching the runtime behavior this replaced.
+/// collected by the later phases). ECMA-262 §10.2.11 FunctionDeclarationInstantiation creates a
+/// var binding only when the name is not already a parameter/var binding; a `for` head does not
+/// get different instantiation semantics.
 fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
     match stmt {
         Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => collect_hoist_stmt(inner, out),
@@ -8694,7 +8689,7 @@ fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
                     for (pat, _) in decls {
                         let mut names = Vec::new();
                         pattern_idents(pat, &mut names);
-                        out.extend(names.into_iter().map(HoistOp::VarForce));
+                        out.extend(names.into_iter().map(HoistOp::Var));
                     }
                 }
             }
@@ -8708,7 +8703,7 @@ fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
         } => {
             let mut names = Vec::new();
             pattern_idents(left, &mut names);
-            out.extend(names.into_iter().map(HoistOp::VarForce));
+            out.extend(names.into_iter().map(HoistOp::Var));
             collect_hoist_stmt(body, out);
         }
         Stmt::ForInOf { body, .. } => collect_hoist_stmt(body, out),

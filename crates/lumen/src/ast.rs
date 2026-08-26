@@ -438,8 +438,6 @@ pub struct Function {
 pub enum HoistOp {
     /// Declare a `var` binding (undefined) unless the name is already bound.
     Var(String),
-    /// Declare a `var` binding (undefined) unconditionally (`for` / `for-in/of` heads).
-    VarForce(String),
     /// Bind a hoisted function declaration (`*default*` names as "default").
     Fn(String, Rc<Function>),
     /// Annex B.3.3: promote a sloppy block function to an (if-absent) var binding and register

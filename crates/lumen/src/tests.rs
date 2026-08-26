@@ -1225,6 +1225,54 @@ fn strict_var_hoisting_in_functions() {
 }
 
 #[test]
+fn for_var_heads_preserve_parameter_bindings_at_instantiation() {
+    // ECMA-262 §10.2.11 FunctionDeclarationInstantiation: a var name which is already a
+    // parameter does not replace that binding. The for head's declaration is still evaluated in
+    // source order (§§14.7.4.2 and 14.3.2.1), so an initializer assigns while no initializer is a
+    // no-op. Webpack relies on this when a deferred-work scheduler reuses its parameter names in a
+    // destructuring for head.
+    assert_eq!(
+        run("function preserve(value) {
+                 if (false) for (var [value] = []; false;) {}
+                 for (var value; false;) {}
+                 for (var value in {}) {}
+                 for (var value of []) {}
+                 return value;
+             }
+             preserve(7)"),
+        "7"
+    );
+    assert_eq!(
+        run("function assign(value) { for (var value = 3; false;) {} return value; } assign(7)"),
+        "3"
+    );
+    assert_eq!(
+        run("'use strict';
+             function preserve(value) { if (false) for (var [value] = []; false;) {} return value; }
+             preserve(9)"),
+        "9"
+    );
+
+    assert_eq!(
+        run("var pending = [];
+             function schedule(result, dependencies, task, priority) {
+                 if (!dependencies) {
+                     for (var [dependencies, task, priority] = pending[0]; false;) {}
+                     return result;
+                 }
+                 priority = priority || 0;
+                 for (var index = pending.length;
+                      index > 0 && pending[index - 1][2] > priority;
+                      index--) pending[index] = pending[index - 1];
+                 pending[index] = [dependencies, task, priority];
+             }
+             schedule(0, [1], function(){}, 0);
+             [pending.length, pending[0][0][0]].join(',')"),
+        "1,1"
+    );
+}
+
+#[test]
 fn gc_reclaims_cycles() {
     // Each iteration creates an unreachable reference cycle (o <-> a). Reference counting alone
     // never frees these; the cycle collector must, or live objects would climb without bound.

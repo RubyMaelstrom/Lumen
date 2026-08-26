@@ -229,9 +229,9 @@ pub struct CallIc {
     /// `Chunk::jit_frame()` at fill time: the callee frame shape without touching the chunk.
     pub n_params: u16,
     pub n_slots: u16,
-    /// Direct-call gates computed at fill: bit 0 = the chunk has NO `jit_var_force_resets`
-    /// (the asm sequence's tag-byte slot init suffices); bit 1 = the chunk needs the realm's
-    /// global body pointer (the sequence requires the caller's `ctx.global_body` to be live).
+    /// Direct-call gates computed at fill: bit 0 = a compiled user-code entry; bit 1 = the chunk
+    /// needs the realm's global body pointer (the sequence requires the caller's
+    /// `ctx.global_body` to be live).
     pub direct: u8,
     /// `Rc::as_ptr` of the callee's `ast::Function` (alive while the callee object is: `call`
     /// is never reassigned) — the inline-recompile trigger needs the AST.
@@ -651,9 +651,6 @@ pub struct Chunk {
     /// parameterless synchronous functions for now, avoiding mapped-parameter aliasing while
     /// covering common variadic helpers.
     arguments_slot: Option<u16>,
-    /// Slots reset to undefined after parameter seeding (the tree-walker's `for`-head var
-    /// hoisting overwrites same-named params; replicated bug-for-bug — it is the oracle).
-    var_force_resets: Vec<u16>,
     uses_this: bool,
     /// Distinct `this.name = …` stores before the body's first control-flow split, capped small.
     /// `new` uses this to reserve the instance property vector exactly once; it costs no bytes
@@ -2134,25 +2131,6 @@ fn compile_inner(
                     c.scope_bind(&name, slot, false);
                 }
             }
-            HoistOp::VarForce(name) => {
-                if captured.contains(&name) {
-                    return None; // for-head reset of a captured param — stay in the oracle
-                }
-                let slot = match c.lookup(&name) {
-                    Some((s, _)) => s,
-                    None => {
-                        let s = c.fresh_slot(&name);
-                        c.scope_bind(&name, s, false);
-                        s
-                    }
-                };
-                if (slot as usize) < func.params.len() {
-                    if func.params[slot as usize].default.is_some() {
-                        return None; // reset would clobber the default (oracle order differs)
-                    }
-                    c.var_force_resets.push(slot);
-                }
-            }
             HoistOp::Fn(name, f) => {
                 let fidx = c.funcs.len() as u16;
                 c.funcs.push(f.clone());
@@ -2242,7 +2220,6 @@ fn compile_inner(
         slot_names: c.slot_names,
         n_params: c.n_params,
         arguments_slot: c.arguments_slot,
-        var_force_resets: c.var_force_resets,
         uses_this: c.uses_this,
         instance_capacity_hint,
         forwarded_capacity_hint: std::cell::Cell::new(0),
@@ -2486,7 +2463,6 @@ struct Compiler {
     slot_names: Vec<Rc<str>>,
     n_params: usize,
     arguments_slot: Option<u16>,
-    var_force_resets: Vec<u16>,
     loops: Vec<LoopCtx>,
     /// Labels collected from an enclosing `Stmt::Labeled` chain, waiting to be attached to the next
     /// loop's `LoopCtx` (drained when that loop pushes its context).
@@ -3027,19 +3003,6 @@ impl Compiler {
                     if self.lookup(&name).is_none() {
                         let slot = self.fresh_slot(&name);
                         self.scope_bind(&name, slot, false);
-                        resets.push(slot);
-                    }
-                }
-                HoistOp::VarForce(name) => {
-                    let slot = match self.lookup(&name) {
-                        Some((s, _)) => s,
-                        None => {
-                            let s = self.fresh_slot(&name);
-                            self.scope_bind(&name, s, false);
-                            s
-                        }
-                    };
-                    if !resets.contains(&slot) {
                         resets.push(slot);
                     }
                 }
@@ -5086,9 +5049,6 @@ pub fn run(
     if let Some(s) = chunk.arguments_slot {
         slots[s as usize] = Value::Obj(i.make_compiled_arguments_object(args, &env));
     }
-    for &s in &chunk.var_force_resets {
-        slots[s as usize] = Value::Undefined;
-    }
     let mut pc = 0usize;
     let mut handlers: Vec<Handler> = Vec::new();
     let r = drive_vm(
@@ -5971,9 +5931,6 @@ impl VmCoro {
         for (k, a) in args.iter().take(chunk.n_params).enumerate() {
             slots[k] = a.clone();
         }
-        for &s in &chunk.var_force_resets {
-            slots[s as usize] = Value::Undefined;
-        }
         VmCoro {
             chunk,
             env,
@@ -6696,7 +6653,6 @@ impl Chunk {
 
     fn parse_initializer_plan(&self) -> Option<InitializerPlan> {
         if self.arguments_slot.is_some()
-            || !self.var_force_resets.is_empty()
             || self.needs_env()
             || self.n_params > 128
             || !matches!(self.ops.last(), Some(Op::ReturnUndef))
@@ -6809,8 +6765,8 @@ impl Chunk {
 
     /// Exact straight-line field constructor recognized without function or benchmark identity.
     /// Unique parameter slots let the construct path move owned values directly into the fresh
-    /// object. Any computed value, control flow, duplicate parameter use, forced `var` reset, or
-    /// materialized `arguments` object declines to ordinary execution.
+    /// object. Any computed value, control flow, duplicate parameter use, or materialized
+    /// `arguments` object declines to ordinary execution.
     pub(crate) fn jit_simple_constructor(&self) -> Option<SimpleConstructor<'_>> {
         let fields = self
             .simple_constructor_plan
@@ -6819,7 +6775,6 @@ impl Chunk {
                     || self.ops.len() > 17
                     || self.ops.len() & 1 == 0
                     || !matches!(self.ops.last(), Some(Op::ReturnUndef))
-                    || !self.var_force_resets.is_empty()
                     || self.arguments_slot.is_some()
                     || self.n_params > 128
                 {
@@ -6870,10 +6825,7 @@ impl Chunk {
     }
     /// [`CallIc::direct`] gates for this chunk (see its docs).
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
-        let mut f = 0u8;
-        if self.jit_var_force_resets().is_empty() {
-            f |= 1;
-        }
+        let mut f = 1u8;
         #[cfg(all(
             target_arch = "aarch64",
             any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -6896,9 +6848,6 @@ impl Chunk {
         )))]
         let _ = code;
         f
-    }
-    pub(crate) fn jit_var_force_resets(&self) -> &[u16] {
-        &self.var_force_resets
     }
     /// Whether const `k` is a trivially-copyable value the JIT may materialize inline.
     pub(crate) fn jit_const_copyable(&self, k: u32) -> bool {

@@ -22014,9 +22014,6 @@ pub fn run(
     if let Some(s) = chunk.jit_arguments_slot() {
         slots[s as usize] = Value::Obj(i.make_compiled_arguments_object(args, &env));
     }
-    for &s in chunk.jit_var_force_resets() {
-        slots[s as usize] = Value::Undefined;
-    }
     stack.clear();
     stack.reserve(code.max_stack);
 
@@ -22174,13 +22171,6 @@ pub(crate) unsafe fn run_moved_shared(
         }
         for k in seed..n_slots {
             *(slots_ptr.add(k) as *mut u8) = 0;
-        }
-        for &s in chunk.jit_var_force_resets() {
-            let s = s as usize;
-            if s < seed {
-                std::ptr::drop_in_place(slots_ptr.add(s));
-                slots_ptr.add(s).write(Value::Undefined);
-            }
         }
     }
 
@@ -22404,13 +22394,6 @@ unsafe fn run_moved_inner(
                 std::ptr::drop_in_place(slots_ptr.add(slot));
             }
             slots_ptr.add(slot).write(value);
-        }
-        for &s in chunk.jit_var_force_resets() {
-            let s = s as usize;
-            if s < seed {
-                std::ptr::drop_in_place(slots_ptr.add(s));
-                slots_ptr.add(s).write(Value::Undefined);
-            }
         }
     }
 
