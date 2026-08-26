@@ -2270,14 +2270,19 @@ pub(crate) fn inline_recompile_at() -> u32 {
     })
 }
 
-/// Whether to reproduce the known-unsafe combination of speculative inlining and ARM64 direct
-/// shared-context calls. This is a diagnostic only: AAPCS64 requires x19 (the generated-code
-/// [`crate::jit::JitCtx`] register) to survive every callee, and browser stress has observed the
-/// combined path restore a code address into x19. Production keeps the optimizations mutually
-/// exclusive until the failing frame transition is repaired.
-pub(crate) fn unsafe_inline_direct_diagnostic() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LUMEN_UNSAFE_INLINE_DIRECT").is_some())
+/// Diagnostic level for combining speculative inlining with ARM64 direct shared-context calls.
+/// `1` recreates the former per-chunk boundary (inlined bodies remain ineligible); `all` also
+/// permits direct entry to and calls from those bodies. Production remains at 0 until both levels
+/// complete native-crash, differential, and conformance stress after the cross-thread TLS fix.
+pub(crate) fn inline_direct_diagnostic_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(
+        || match std::env::var("LUMEN_UNSAFE_INLINE_DIRECT").as_deref() {
+            Ok("all") => 2,
+            Ok(_) => 1,
+            Err(_) => 0,
+        },
+    )
 }
 
 /// Build the speculative-inline plan for a hot chunk: for each monomorphic, filled call site,
@@ -6842,8 +6847,9 @@ impl Chunk {
         // ordinary committed-call helper, whose Rust/JIT boundary preserves the AAPCS64 frame
         // contract. `LUMEN_INLINE_AT=0` restores direct-call eligibility for diagnostics and
         // dedicated coverage.
+        let combined = inline_direct_diagnostic_level();
         if inline_recompile_at() != 0
-            && (!unsafe_inline_direct_diagnostic() || self.jit_has_inline_targets())
+            && (combined == 0 || (combined == 1 && self.jit_has_inline_targets()))
         {
             return 0;
         }

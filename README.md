@@ -34,8 +34,10 @@ shared-context calls are disabled while speculative inlining is active: combinin
 optimizations violated the platform's callee-saved-register contract, while ordinary JIT calls
 preserve nearly all of the inliner's performance gain. `LUMEN_INLINE_AT=N` changes the trigger;
 `LUMEN_INLINE_AT=0` disables inlining and restores direct-call eligibility. For ABI debugging,
-`LUMEN_UNSAFE_INLINE_DIRECT=1` recreates the earlier per-chunk exclusion; this knowingly enables
-a native-crash path and must not be used for production workloads.
+`LUMEN_UNSAFE_INLINE_DIRECT=1` recreates the earlier per-chunk exclusion, while `=all` additionally
+allows direct calls into and out of visibly inlined bodies. These are validation modes for the
+cross-thread JIT/TLS repair and must not be used for production workloads until the combined path
+has completed native-crash, differential, and conformance stress.
 
 The language surface: generators and `async`/`await` running on stackful coroutines (async
 bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` and inline

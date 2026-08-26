@@ -1488,10 +1488,11 @@ pub fn compile(
     // when neither side is itself an inlined body. Ordinary JIT calls preserve the inliner's
     // semantics, so make the optimizations process-wide alternatives. `LUMEN_INLINE_AT=0` selects
     // direct calls; a nonzero threshold selects speculative inlining.
+    let combined = crate::bytecode::inline_direct_diagnostic_level();
     let direct_on = fast & (1 << 20) != 0
         && (crate::bytecode::inline_recompile_at() == 0
-            || (crate::bytecode::unsafe_inline_direct_diagnostic()
-                && !chunk.jit_has_inline_targets()));
+            || combined == 2
+            || (combined == 1 && !chunk.jit_has_inline_targets()));
     // Whether the probed layout supports inline refcount bumps/decs (clone/drop of Str/Sym/Obj
     // without a helper call). All strong-count templates gate on this.
     let rc_ok = layout.valid && layout.rc_strong_off < 256;
