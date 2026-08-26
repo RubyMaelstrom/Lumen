@@ -9329,6 +9329,14 @@ fn map_getorinsert() {
 #[test]
 fn promise_try_regexp_escape() {
     assert_eq!(run("typeof Promise.try"), "function");
+    assert_eq!(
+        run("var p=Promise.resolve(1);Promise.try(()=>p)===p"),
+        "true"
+    );
+    assert_eq!(
+        run("var q=[];class P extends Promise{constructor(e){q.push('ctor');super(e)}}P.try(()=>{q.push('callback');return 1});q.join(',')"),
+        "callback,ctor"
+    );
     let mut e = Engine::new();
     e.eval("var r; Promise.try((a,b)=>a+b,2,3).then(v=>r=v)", false)
         .unwrap();
