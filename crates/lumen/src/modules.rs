@@ -105,7 +105,7 @@ impl Interp {
     /// returning its namespace object.
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
         // Phase 1: parse the whole graph (so every module's export tables exist before any linking).
-        self.parse_and_register(key, Some(src.to_string()))?;
+        self.load_requested_modules(key, Some(src.to_string()))?;
         // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first.
         self.link_module(key)?;
         // Phase 3: evaluate module bodies depth-first. A graph containing top-level await
@@ -208,6 +208,24 @@ impl Interp {
     }
 
     // --- Parse phase --------------------------------------------------------------------------
+
+    /// Parse and register a complete requested-module graph as one loading operation.
+    ///
+    /// ECMA-262 `LoadRequestedModules` only makes a graph linkable after every requested module
+    /// has loaded successfully. `parse_and_register` necessarily publishes records early to break
+    /// cycles, so an abrupt completion must discard records created by this attempt. Otherwise a
+    /// later load of the same entry mistakes that partial graph for a complete one and linking can
+    /// encounter a dependency for which no module record exists.
+    fn load_requested_modules(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
+        let existing: std::collections::HashSet<String> =
+            self.module_recs.keys().cloned().collect();
+        let result = self.parse_and_register(key, src);
+        if result.is_err() {
+            self.module_recs.retain(|key, _| existing.contains(key));
+            self.modules.retain(|key, _| existing.contains(key));
+        }
+        result
+    }
 
     /// Parse `key` and, transitively, every dependency — registering each module's environment,
     /// namespace object, and export tables. No user code runs and no linking happens yet, so a later
@@ -346,10 +364,34 @@ impl Interp {
     /// (functions initialized, lexicals in their temporal dead zone), wire imports to live cells,
     /// validate indirect exports, and build the namespace object.
     fn link_module(&mut self, key: &str) -> Result<(), Abrupt> {
-        if self.module_recs[key].linked {
+        let mut stack = Vec::new();
+        let result = self.inner_module_linking(key, &mut stack);
+        if result.is_err() {
+            // ECMA-262 Link step 4 resets every record which is still linking to unlinked. Records
+            // that completed linking before a parent failed have already left this stack.
+            for key in stack {
+                if let Some(rec) = self.module_recs.get_mut(&key) {
+                    rec.linked = false;
+                }
+            }
+        }
+        result
+    }
+
+    /// Recursive portion of `Link`. Entries remain in `stack` until their own initialization has
+    /// succeeded, which lets the outer operation restore precisely the in-progress records after
+    /// an abrupt completion.
+    fn inner_module_linking(&mut self, key: &str, stack: &mut Vec<String>) -> Result<(), Abrupt> {
+        let Some(rec) = self.module_recs.get(key) else {
+            // A host loading failure must have rejected LoadRequestedModules before Link. Keep the
+            // engine boundary total even if a corrupt/incomplete host graph reaches this point.
+            return Err(self.throw("TypeError", format!("module graph is incomplete: {key}")));
+        };
+        if rec.linked {
             return Ok(());
         }
         self.module_recs.get_mut(key).unwrap().linked = true;
+        stack.push(key.to_string());
 
         let (body, env, ns) = {
             let rec = &self.module_recs[key];
@@ -357,7 +399,7 @@ impl Interp {
         };
         let dep_keys = self.module_recs[key].dep_keys.clone();
         for dep in &dep_keys {
-            self.link_module(dep)?;
+            self.inner_module_linking(dep, stack)?;
         }
 
         self.hoist(&body, &env, &[]);
@@ -368,6 +410,8 @@ impl Interp {
         if let Value::Obj(ns_obj) = ns {
             self.build_namespace(key, &ns_obj)?;
         }
+        let completed = stack.pop();
+        debug_assert_eq!(completed.as_deref(), Some(key));
         Ok(())
     }
 
@@ -1444,7 +1488,7 @@ impl Interp {
                 _ => canon,
             };
             let src = typed_module_source(src, attr_type);
-            self.parse_and_register(&canon, Some(src))?;
+            self.load_requested_modules(&canon, Some(src))?;
             self.link_module(&canon)?;
             Ok(canon)
         })();

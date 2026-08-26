@@ -1,7 +1,9 @@
 //! Smoke tests for the language core. These are the fast inner loop while growing the engine; the
 //! broad conformance signal comes from `crates/test262-runner`.
 
-use crate::{Completion, Engine, ExecutionOutcome, InterruptReason, Value};
+#[cfg(feature = "embed")]
+use crate::Value;
+use crate::{Completion, Engine, ExecutionOutcome, InterruptReason};
 
 fn run(src: &str) -> String {
     match Engine::new().eval(src, false).expect("parse") {
@@ -12676,6 +12678,65 @@ fn module_missing_export_is_syntax_error() {
         ]),
         "SyntaxError"
     );
+}
+
+#[test]
+fn failed_module_graph_load_does_not_poison_a_retry() {
+    let mut engine = Engine::new();
+    let first = engine
+        .eval_module(
+            "import { value } from 'dep'; globalThis.loaded = value;",
+            "main",
+            |specifier, _| {
+                (specifier == "dep").then(|| (String::from("dep"), String::from("export {")))
+            },
+        )
+        .expect("entry parses");
+    assert!(matches!(
+        first,
+        Completion::Throw { ref name, .. } if name == "SyntaxError"
+    ));
+
+    let second = engine
+        .eval_module(
+            "import { value } from 'dep'; globalThis.loaded = value;",
+            "main",
+            |specifier, _| {
+                (specifier == "dep").then(|| {
+                    (
+                        String::from("dep"),
+                        String::from("export const value = 42;"),
+                    )
+                })
+            },
+        )
+        .expect("retry parses");
+    assert!(matches!(second, Completion::Value(_)));
+    match engine.eval("String(loaded)", false).expect("read result") {
+        Completion::Value(value) => assert_eq!(value, "42"),
+        Completion::Throw { name, message } => panic!("read threw {name}: {message}"),
+    }
+}
+
+#[test]
+fn failed_module_link_remains_retryable() {
+    let mut engine = Engine::new();
+    for _ in 0..2 {
+        let result = engine
+            .eval_module("import { missing } from 'dep';", "main", |specifier, _| {
+                (specifier == "dep").then(|| {
+                    (
+                        String::from("dep"),
+                        String::from("export const present = 1;"),
+                    )
+                })
+            })
+            .expect("module parses");
+        assert!(matches!(
+            result,
+            Completion::Throw { ref name, .. } if name == "SyntaxError"
+        ));
+    }
 }
 
 #[test]
