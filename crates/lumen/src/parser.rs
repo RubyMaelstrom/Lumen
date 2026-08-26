@@ -3002,7 +3002,17 @@ impl Parser {
         let mut proto_seen = false;
         while !self.is_punct("}") {
             if self.eat_punct("...") {
-                props.push(PropDef::Spread(self.parse_assign()?));
+                let inner = self.parse_assign()?;
+                // ObjectLiteral is the cover grammar for ObjectAssignmentPattern. A trailing
+                // comma is valid after a spread property in the literal, but ECMA-262
+                // §13.15.5 has no `AssignmentRestProperty , }` production. Preserve that
+                // distinction in a transparent Seq marker for assignment-pattern validation.
+                let followed = self.is_punct(",");
+                props.push(PropDef::Spread(if followed {
+                    Expr::Seq(vec![inner])
+                } else {
+                    inner
+                }));
                 if !self.eat_punct(",") {
                     break;
                 }
@@ -4012,7 +4022,7 @@ fn valid_assignment_pattern(e: &Expr) -> bool {
                 v => target_ok(v),
             },
             // AssignmentRestProperty: last, and a simple target (never a nested pattern).
-            PropDef::Spread(t) => idx == props.len() - 1 && simple(t),
+            PropDef::Spread(t) => idx == props.len() - 1 && !matches!(t, Expr::Seq(_)) && simple(t),
             _ => false,
         }),
         _ => false,
@@ -4161,7 +4171,7 @@ fn is_valid_assign_pattern(e: &Expr) -> bool {
             // Rest must be last and its target must not be a nested pattern.
             PropDef::Spread(t) => {
                 idx == props.len() - 1
-                    && !matches!(t, Expr::Array(_) | Expr::Object(_))
+                    && !matches!(t, Expr::Array(_) | Expr::Object(_) | Expr::Seq(_))
                     && is_valid_assign_pattern(t)
             }
             _ => false,

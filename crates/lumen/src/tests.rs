@@ -14701,6 +14701,9 @@ fn destructuring_and_for_head_early_errors() {
         "var x; [...x,] = [];",
         "var x; [...x, ,] = [];",
         "var x; for ([...x,] in [[]]) ;",
+        "var x; ({...x,} = {});",
+        "var x; for ({...x,} in [{}]) ;",
+        "var x; for ({...x,} of [{}]) ;",
         "'use strict'; [arguments] = [1];",
         "'use strict'; ({ a: eval } = { a: 1 });",
         "'use strict'; for ([arguments] of [[1]]) ;",
@@ -14713,6 +14716,7 @@ fn destructuring_and_for_head_early_errors() {
     // ...but stays a perfectly good spread in an array literal.
     assert_eq!(run("[...[1, 2],].join(',')"), "1,2");
     assert_eq!(run("[...[1], 3].join(',')"), "1,3");
+    assert_eq!(run("({...{a: 1},}).a"), "1");
     // A for-in head's right side is a full Expression (comma allowed).
     assert_eq!(
         run("var out = []; for (var k in ({a: 1}, {b: 2})) out.push(k); out.join(',')"),
@@ -14959,6 +14963,47 @@ fn dynamic_import_top_level_await() {
         Completion::Value(v) => assert_eq!(v, "true:ns"),
         Completion::Throw { name, message } => panic!("threw {name}: {message}"),
     }
+}
+
+#[test]
+fn dynamic_import_uses_errored_async_cycle_root() {
+    let mut engine = Engine::new();
+    let files = [
+        ("main".to_string(), "import 'b'; import 'x';".to_string()),
+        (
+            "a".to_string(),
+            "import 'b'; await Promise.resolve(0);".to_string(),
+        ),
+        (
+            "b".to_string(),
+            "import 'c'; await Promise.resolve(0); throw new Error('cycle error');".to_string(),
+        ),
+        (
+            "c".to_string(),
+            "import 'a'; await Promise.resolve(0);".to_string(),
+        ),
+        (
+            "x".to_string(),
+            "import 'a'; await Promise.resolve(0);".to_string(),
+        ),
+    ];
+    engine.set_module_loader(move |specifier: &str, _referrer: &str| {
+        files.iter().find(|(key, _)| key == specifier).cloned()
+    });
+    engine
+        .eval(
+            "var first, second;
+             import('main').catch(e => {
+               first = e;
+               return import('c').then(() => second = 'fulfilled', e2 => second = e2);
+             });",
+            false,
+        )
+        .expect("dynamic imports parse");
+    let result = engine
+        .eval("first.message + ':' + String(second === first)", false)
+        .expect("read result");
+    assert!(matches!(result, Completion::Value(ref value) if value == "cycle error:true"));
 }
 
 #[test]

@@ -1530,6 +1530,20 @@ impl Interp {
     /// (which may use top-level await) completes. Dependencies evaluate synchronously first; the
     /// module's own body runs in a coroutine so a top-level await parks it.
     fn evaluate_module_dynamic(&mut self, key: &str) -> Value {
+        // ECMA-262 §16.2.1.6.1.3 Evaluate: once a cyclic module is evaluating-async or
+        // evaluated, evaluation is redirected to its [[CycleRoot]] before consulting
+        // [[TopLevelCapability]] or [[EvaluationError]]. A fulfilled member of a subsequently
+        // errored async cycle must therefore observe the root's recorded error, not its own
+        // already-fulfilled per-module promise.
+        let evaluation_key = {
+            let rec = &self.module_recs[key];
+            if (rec.started || rec.evaluated || rec.evaluating) && rec.cycle_root.is_some() {
+                rec.cycle_root.clone().unwrap()
+            } else {
+                key.to_string()
+            }
+        };
+        let key = evaluation_key.as_str();
         let (top, err, settled) = {
             let rec = &self.module_recs[key];
             (
