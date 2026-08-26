@@ -14865,6 +14865,19 @@ fn module_bindings_and_source_phase() {
     );
     assert_eq!(
         run_mod(
+            &[(
+                "m",
+                "import source x from '<module source>';
+                 globalThis.out = Object.getPrototypeOf(Object.getPrototypeOf(x))
+                                  === $262.AbstractModuleSource.prototype;",
+            )],
+            "m",
+            "String(out)",
+        ),
+        "true"
+    );
+    assert_eq!(
+        run_mod(
             &[
                 ("m", "import source from 'dep'; globalThis.out = source;"),
                 ("dep", "export default 'dflt';"),
@@ -14896,6 +14909,26 @@ fn module_bindings_and_source_phase() {
             "out"
         ),
         "object"
+    );
+
+    // ContinueDynamicImport resolves a host module's source object without instantiating it.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.out = 'pending';
+             import.source('<module source>').then(x => {
+               out = String(Object.getPrototypeOf(Object.getPrototypeOf(x))
+                            === $262.AbstractModuleSource.prototype);
+             });",
+            false,
+        )
+        .expect("dynamic source import");
+    assert_eq!(
+        match engine.eval("out", false).expect("read dynamic result") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        },
+        "true"
     );
 }
 

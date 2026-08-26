@@ -85,8 +85,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
 
 /// The %AbstractModuleSource% intrinsic exposed as `$262.AbstractModuleSource`: an abstract
 /// constructor (throws when called), whose `.prototype` carries the `@@toStringTag` getter used by
-/// module-source objects. lumen has no concrete module-source objects, so the getter always yields
-/// `undefined`.
+/// module-source objects.
 fn make_abstract_module_source(it: &mut Interp) -> Value {
     let ctor = it.make_native("AbstractModuleSource", 0, |i, _t, _a| {
         Err(i.make_error(
@@ -109,10 +108,13 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
         "constructor",
         Property::data(Value::Obj(ctor.clone()), true, false, true),
     );
-    // `.prototype` is non-writable, non-enumerable, non-configurable — and the prototype of every
-    // source-phase ModuleSource object (see Interp::module_source_of).
+    // `.prototype` is non-writable, non-enumerable, non-configurable. A host-defined concrete
+    // module-source prototype inherits from it; ModuleSource instances inherit from that concrete
+    // prototype (Source Phase Imports §28.1).
     it.extra_protos
         .insert("%AbstractModuleSourceProto%", proto.clone());
+    it.extra_protos
+        .insert("%HostModuleSourceProto%", Object::new(Some(proto.clone())));
     ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(proto), false, false, false),

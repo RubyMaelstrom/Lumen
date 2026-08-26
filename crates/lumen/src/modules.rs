@@ -600,16 +600,14 @@ impl Interp {
         }
     }
 
-    /// The (cached, per canonical key) ModuleSource object a source-phase import binds: an
-    /// ordinary object whose prototype is %AbstractModuleSource%.prototype.
+    /// The (cached, per canonical key) ModuleSource object a source-phase import binds. Source
+    /// Phase Imports §28.1 requires its initial prototype to be a host-defined prototype whose own
+    /// initial prototype is `%AbstractModuleSource%.prototype`.
     pub(crate) fn module_source_of(&mut self, dep: &str) -> Value {
         if let Some(v) = self.module_source_objs.get(dep) {
             return v.clone();
         }
-        let proto = self
-            .extra_protos
-            .get("%AbstractModuleSourceProto%")
-            .cloned();
+        let proto = self.extra_protos.get("%HostModuleSourceProto%").cloned();
         let obj = Object::new(proto);
         let v = Value::Obj(obj);
         self.module_source_objs.insert(dep.to_string(), v.clone());

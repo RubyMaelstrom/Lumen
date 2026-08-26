@@ -2533,14 +2533,20 @@ impl Interp {
                     }
                 };
                 match phase {
-                    // A Source Text Module Record's GetModuleSource always throws a SyntaxError, so
-                    // `import.source(x)` rejects once the specifier has been coerced.
+                    // ContinueDynamicImport at the source phase resolves with [[ModuleSource]] or
+                    // rejects when that field is empty. The Test262 host exposes one concrete
+                    // source module; ordinary Source Text Module Records have no source object.
                     ImportPhase::Source => {
                         let p = self.new_promise();
-                        let reason = crate::interpreter::abrupt_value(
-                            self.throw("SyntaxError", "source phase import is not available"),
-                        );
-                        self.reject_promise(&p, reason);
+                        if &*s == "<module source>" {
+                            let source = self.module_source_of(&s);
+                            self.resolve_promise(&p, source);
+                        } else {
+                            let reason = crate::interpreter::abrupt_value(
+                                self.throw("SyntaxError", "source phase import is not available"),
+                            );
+                            self.reject_promise(&p, reason);
+                        }
                         Ok(p)
                     }
                     // `import.defer(x)` defers evaluation of the module; for specifier handling it
