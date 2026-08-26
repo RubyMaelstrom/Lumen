@@ -56,9 +56,9 @@ code meets the object graph (the JIT's executable pages and its templates' raw r
 baked offset is *measured at runtime* against the live types and fails closed to the checked
 helper if anything doesn't hold) and in the N-API addon loader's `dlopen` bridge.
 
-Measured on 2026-08-25 against [tc39/test262](https://github.com/tc39/test262) commit
-`d86b2294eb0a17eaa281ff12c73c473ec864c72f`: **53,418 passed, 156 failed, and 4 were skipped**
-(99.7% of executed tests, including annexB, intl402, and staging) on the default base-JIT tier.
+Measured on 2026-08-26 against [tc39/test262](https://github.com/tc39/test262) commit
+`d86b2294eb0a17eaa281ff12c73c473ec864c72f`: **53,574 passed, 0 failed, and 4 were skipped**
+(100% of executed tests, including annexB, intl402, and staging) on the default JIT tier.
 This is a reproducible baseline, not a permanent conformance claim; Test262 and the engine both
 change. See the commands under [Conformance](#conformance) and the generated
 `test262-report/summary.json` for current results.
