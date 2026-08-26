@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use lumen_runtime::{Completion, ConsoleOut, Runtime};
 
@@ -40,6 +41,24 @@ fn run(source: &str) -> Vec<String> {
         Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
     }
     out.lines()
+}
+
+fn wait_for_helper(mut child: std::process::Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("poll helper process") {
+            Some(status) => {
+                assert!(status.success(), "helper process exited with {status}");
+                return;
+            }
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("helper process did not exit within {timeout:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -200,8 +219,7 @@ fn redis_client_connects_over_tls() {
         }})();
     "#
     ));
-    let status = server.wait().unwrap();
+    wait_for_helper(server, Duration::from_secs(5));
     let _ = std::fs::remove_dir_all(directory);
-    assert!(status.success());
     assert_eq!(lines, ["secure PONG"]);
 }

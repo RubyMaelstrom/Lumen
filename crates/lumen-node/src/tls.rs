@@ -392,14 +392,21 @@ fn op_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
                 break Ok(Vec::new());
             }
             let mut bytes = vec![0u8; 65536];
-            match stream.lock().unwrap().read(&mut bytes) {
+            // Drop the stream lock before yielding on SSL_WANT_READ. Keeping the guard alive
+            // through the match arm lets the next read immediately reacquire it and can starve a
+            // concurrent write forever (for example, the first Redis command after TLS setup).
+            let read = {
+                let mut stream = stream.lock().unwrap();
+                stream.read(&mut bytes)
+            };
+            match read {
                 Ok(0) => break Ok(Vec::new()),
                 Ok(length) => {
                     bytes.truncate(length);
                     break Ok(bytes);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    std::thread::yield_now()
+                    std::thread::sleep(Duration::from_millis(1))
                 }
                 Err(error) => break Err(error.to_string()),
             }
