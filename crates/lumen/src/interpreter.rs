@@ -24,6 +24,26 @@ pub struct AgentChannels {
 /// Process-global backing store for SharedArrayBuffer memory, keyed by a unique id so it can be
 /// shared across agent threads (each agent runs its own single-threaded `Interp`).
 pub type SharedMem = Arc<Mutex<Vec<u8>>>;
+
+/// Hashable language identity for values accepted by CanBeHeldWeakly. ECMA-262 WeakMap and WeakSet
+/// operations compare keys with SameValue; for objects and symbols that is exactly pointer/id
+/// identity. Keeping this separate from `Value` avoids inventing hashes for unrelated primitives.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum WeakKey {
+    Object(usize),
+    Symbol(u64),
+}
+
+impl WeakKey {
+    pub(crate) fn of(value: &Value) -> Option<Self> {
+        match value {
+            Value::Obj(object) => Some(Self::Object(Rc::as_ptr(object) as usize)),
+            Value::Sym(symbol) => Some(Self::Symbol(symbol.id)),
+            _ => None,
+        }
+    }
+}
+
 pub fn shared_mem_registry() -> &'static Mutex<HashMap<u64, SharedMem>> {
     static R: OnceLock<Mutex<HashMap<u64, SharedMem>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(Default::default()))
@@ -1173,6 +1193,11 @@ pub struct Interp {
     /// Backing store for Map/Set/WeakMap/WeakSet instances (ordered entries), keyed by the object's
     /// pointer — the engine analogue of an internal `[[MapData]]` slot.
     pub(crate) map_data: crate::fasthash::FastMap<usize, Vec<(Value, Value)>>,
+    /// Object/symbol identity to entry offset for WeakMap/WeakSet. Their order is unobservable, and
+    /// ECMA-262 requires average access time sublinear in the collection size; the parallel index
+    /// makes get/set/has/delete average O(1) while `map_data` retains the internal-slot payload.
+    pub(crate) weak_collection_index:
+        crate::fasthash::FastMap<usize, crate::fasthash::FastMap<WeakKey, usize>>,
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
@@ -1738,6 +1763,7 @@ impl Interp {
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
             map_data: Default::default(),
+            weak_collection_index: Default::default(),
             extra_protos: Default::default(),
             array_buffers: Default::default(),
             shared_buffers: Default::default(),
@@ -5024,6 +5050,7 @@ impl Interp {
                 let ptr = Rc::as_ptr(o) as usize;
                 self.class_info.remove(&ptr);
                 self.map_data.remove(&ptr);
+                self.weak_collection_index.remove(&ptr);
                 self.typed_arrays.remove(&ptr);
                 self.data_views.remove(&ptr);
                 self.regexps.remove(&ptr);

@@ -405,6 +405,9 @@ fn collection_ctor(
     let ptr = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.map_data.insert(ptr, Vec::new());
+    if name.starts_with("Weak") {
+        i.weak_collection_index.insert(ptr, Default::default());
+    }
     // Brand the instance so prototype methods can reject cross-collection receivers.
     set_internal(&obj, "__ck", Value::str(name));
     let mv = Value::Obj(obj);
@@ -718,8 +721,9 @@ pub(super) fn install_map_like(
     set_builtin(&it.global, name, Value::Obj(ctor));
 }
 
-/// WeakMap/WeakSet: like Map/Set but keys must be objects and there is no iteration/size (we do not
-/// model weakness — entries simply persist, which is unobservable to non-GC tests).
+/// WeakMap/WeakSet: like Map/Set but keys must be objects or unregistered symbols and there is no
+/// iteration/size. ECMA-262 requires average sublinear access, so all operations use the parallel
+/// identity index instead of scanning the specification's conceptual List.
 /// Resolve the backing-store pointer for a weak-collection receiver, enforcing its brand: `want` is
 /// the exact kind ("WeakMap"/"WeakSet") for kind-specific methods, or "Weak" to accept either for
 /// the methods (has/delete) shared by both.
@@ -741,6 +745,67 @@ fn weak_brand_ptr(i: &mut Interp, this: &Value, want: &str) -> Result<usize, Val
     Ok(ptr)
 }
 
+fn weak_entry_index(i: &Interp, ptr: usize, key: &Value) -> Option<usize> {
+    let identity = crate::interpreter::WeakKey::of(key)?;
+    i.weak_collection_index.get(&ptr)?.get(&identity).copied()
+}
+
+fn weak_insert(i: &mut Interp, ptr: usize, key: Value, value: Value) {
+    let identity = crate::interpreter::WeakKey::of(&key)
+        .expect("WeakMap and WeakSet entries have weakly holdable keys");
+    if let Some(index) = i
+        .weak_collection_index
+        .get(&ptr)
+        .and_then(|index| index.get(&identity))
+        .copied()
+    {
+        i.map_data
+            .get_mut(&ptr)
+            .expect("a weak collection has backing data")[index]
+            .1 = value;
+        return;
+    }
+    let entries = i
+        .map_data
+        .get_mut(&ptr)
+        .expect("a weak collection has backing data");
+    let index = entries.len();
+    entries.push((key, value));
+    i.weak_collection_index
+        .entry(ptr)
+        .or_default()
+        .insert(identity, index);
+}
+
+fn weak_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
+    let Some(identity) = crate::interpreter::WeakKey::of(key) else {
+        return false;
+    };
+    let Some(index) = i
+        .weak_collection_index
+        .get_mut(&ptr)
+        .and_then(|entries| entries.remove(&identity))
+    else {
+        return false;
+    };
+    // Weak collection order cannot be observed, so compact immediately. Repair the moved entry's
+    // offset after swap_remove to keep all subsequent operations constant-time.
+    let entries = i
+        .map_data
+        .get_mut(&ptr)
+        .expect("a weak collection has backing data");
+    entries.swap_remove(index);
+    if let Some((moved_key, _)) = entries.get(index) {
+        let moved_identity = crate::interpreter::WeakKey::of(moved_key)
+            .expect("WeakMap and WeakSet entries have weakly holdable keys");
+        i.weak_collection_index
+            .get_mut(&ptr)
+            .expect("a weak collection has an identity index")
+            .insert(moved_identity, index);
+    }
+    true
+}
+
 pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ctor_fn: NativeFn) {
     let proto = Object::new(Some(it.object_proto.clone()));
     it.extra_protos.insert(name, proto.clone());
@@ -751,9 +816,8 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used in weak set"));
             }
-            let e = i.map_data.entry(ptr).or_default();
-            if !e.iter().any(|(k, _)| same_value_zero(k, &key)) {
-                e.push((key.clone(), key));
+            if weak_entry_index(i, ptr, &key).is_none() {
+                weak_insert(i, ptr, key.clone(), key);
             }
             Ok(this)
         }
@@ -764,12 +828,7 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
             }
-            let e = i.map_data.entry(ptr).or_default();
-            if let Some(slot) = e.iter_mut().find(|(k, _)| same_value_zero(k, &key)) {
-                slot.1 = val;
-            } else {
-                e.push((key, val));
-            }
+            weak_insert(i, ptr, key, val);
             Ok(this)
         }
     };
@@ -783,13 +842,9 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
         it.def_method(&proto, "get", 1, |i, this, a| {
             let ptr = weak_brand_ptr(i, &this, "WeakMap")?;
             let key = arg(a, 0);
-            Ok(i.map_data
-                .get(&ptr)
-                .and_then(|e| {
-                    e.iter()
-                        .find(|(k, _)| same_value_zero(k, &key))
-                        .map(|(_, v)| v.clone())
-                })
+            Ok(weak_entry_index(i, ptr, &key)
+                .and_then(|index| i.map_data.get(&ptr)?.get(index))
+                .map(|(_, value)| value.clone())
                 .unwrap_or(Value::Undefined))
         });
         // Upsert proposal: getOrInsert(key, value) / getOrInsertComputed(key, callbackfn).
@@ -799,17 +854,11 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
             }
-            if let Some((_, v)) = i.map_data[&ptr]
-                .iter()
-                .find(|(k, _)| same_value_zero(k, &key))
-            {
-                return Ok(v.clone());
+            if let Some(index) = weak_entry_index(i, ptr, &key) {
+                return Ok(i.map_data[&ptr][index].1.clone());
             }
             let value = arg(a, 1);
-            i.map_data
-                .entry(ptr)
-                .or_default()
-                .push((key, value.clone()));
+            weak_insert(i, ptr, key, value.clone());
             Ok(value)
         });
         it.def_method(&proto, "getOrInsertComputed", 2, |i, this, a| {
@@ -822,49 +871,24 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             if !cb.is_callable() {
                 return Err(i.make_error("TypeError", "callback is not callable"));
             }
-            if let Some((_, v)) = i.map_data[&ptr]
-                .iter()
-                .find(|(k, _)| same_value_zero(k, &key))
-            {
-                return Ok(v.clone());
+            if let Some(index) = weak_entry_index(i, ptr, &key) {
+                return Ok(i.map_data[&ptr][index].1.clone());
             }
             let value = ab(i.call(cb, Value::Undefined, std::slice::from_ref(&key)))?;
             // The callback may have inserted the key; the computed value overwrites that mutation.
-            if let Some(entry) = i
-                .map_data
-                .get_mut(&ptr)
-                .and_then(|d| d.iter_mut().find(|(k, _)| same_value_zero(k, &key)))
-            {
-                entry.1 = value.clone();
-            } else {
-                i.map_data
-                    .entry(ptr)
-                    .or_default()
-                    .push((key, value.clone()));
-            }
+            weak_insert(i, ptr, key, value.clone());
             Ok(value)
         });
     }
     it.def_method(&proto, "has", 1, |i, this, a| {
         let ptr = weak_brand_ptr(i, &this, "Weak")?;
         let key = arg(a, 0);
-        Ok(Value::Bool(
-            i.map_data
-                .get(&ptr)
-                .map(|e| e.iter().any(|(k, _)| same_value_zero(k, &key)))
-                .unwrap_or(false),
-        ))
+        Ok(Value::Bool(weak_entry_index(i, ptr, &key).is_some()))
     });
     it.def_method(&proto, "delete", 1, |i, this, a| {
         let ptr = weak_brand_ptr(i, &this, "Weak")?;
         let key = arg(a, 0);
-        let mut removed = false;
-        if let Some(e) = i.map_data.get_mut(&ptr) {
-            let before = e.len();
-            e.retain(|(k, _)| !same_value_zero(k, &key));
-            removed = e.len() < before;
-        }
-        Ok(Value::Bool(removed))
+        Ok(Value::Bool(weak_delete(i, ptr, &key)))
     });
     let ctor = it.make_native(name, 0, ctor_fn);
     ctor.borrow_mut().props.insert(

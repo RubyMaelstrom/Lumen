@@ -11601,6 +11601,40 @@ fn weakmap_get_or_insert() {
 }
 
 #[test]
+fn weakmap_deep_identity_chain_is_linear_and_intact() {
+    assert_eq!(
+        run("var map = new WeakMap(), head = {}, key = head;
+             for (var i = 0; i < 10000; i++) {
+               var next = {};
+               map.set(key, next);
+               key = next;
+             }
+             var count = 0;
+             for (key = head; key !== undefined; key = map.get(key)) count++;
+             count"),
+        "10001"
+    );
+}
+
+#[test]
+fn weak_collection_delete_repairs_swapped_identity_index() {
+    assert_eq!(
+        run(
+            "var a={}, b={}, c={}, map=new WeakMap([[a, 1], [b, 2], [c, 3]]);
+             [map.delete(b), map.get(a), map.get(c), map.has(b)].join(',')"
+        ),
+        "true,1,3,false"
+    );
+    assert_eq!(
+        run(
+            "var a=Symbol(), b=Symbol(), c=Symbol(), set=new WeakSet([a,b,c]);
+             [set.delete(a), set.has(b), set.has(c), set.has(a)].join(',')"
+        ),
+        "true,true,true,false"
+    );
+}
+
+#[test]
 fn set_operations_spec() {
     assert_eq!(
         run("[...new Set([1,2,3]).union(new Set([3,4]))].join(',')"),

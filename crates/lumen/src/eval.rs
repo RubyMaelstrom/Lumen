@@ -4961,6 +4961,9 @@ impl Interp {
                         if let Some(v) = self.map_data.remove(&sp) {
                             self.map_data.insert(dp, v);
                         }
+                        if let Some(v) = self.weak_collection_index.remove(&sp) {
+                            self.weak_collection_index.insert(dp, v);
+                        }
                         if let Some(v) = self.typed_arrays.remove(&sp) {
                             dst.borrow().ic_plain.set(false);
                             self.typed_arrays.insert(dp, v);
