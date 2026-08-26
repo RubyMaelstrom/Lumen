@@ -15033,6 +15033,129 @@ fn dynamic_import_top_level_await() {
 }
 
 #[test]
+fn asynchronous_dynamic_imports_start_before_either_host_load_finishes() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn read(engine: &mut Engine, source: &str) -> String {
+        match engine.eval(source, false).expect("read parses") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("read threw {name}: {message}"),
+        }
+    }
+
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let observed = requests.clone();
+    let mut engine = Engine::new();
+    engine.set_module_loader(|_, _| None);
+    engine.set_async_dynamic_module_loader(move |id, specifier, referrer, attr_type| {
+        observed.borrow_mut().push((
+            id,
+            specifier.to_string(),
+            referrer.to_string(),
+            attr_type.map(str::to_string),
+        ));
+        true
+    });
+    engine
+        .eval(
+            "globalThis.importResult = 'pending'; globalThis.importLog = [];
+             const pa = import('a'); const pb = import('b');
+             pa.then(() => importLog.push('a')); pb.then(() => importLog.push('b'));
+             Promise.all([pa, pb]).then(
+               ([a, b]) => importResult = String(a.default + b.default),
+               error => importResult = error.name + ':' + error.message);",
+            false,
+        )
+        .expect("dynamic imports start");
+
+    let requests = requests.borrow().clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "both HostLoadImportedModule calls started"
+    );
+    assert_eq!(requests[0].1, "a");
+    assert_eq!(requests[1].1, "b");
+    assert_eq!(read(&mut engine, "importResult"), "pending");
+
+    assert!(engine.finish_dynamic_module_load(
+        requests[0].0,
+        Some(("a".to_string(), "export default 1;".to_string())),
+    ));
+    read(&mut engine, "undefined");
+    assert_eq!(read(&mut engine, "importResult"), "pending");
+    assert_eq!(read(&mut engine, "importLog.join(',')"), "a");
+
+    assert!(engine.finish_dynamic_module_load(
+        requests[1].0,
+        Some(("b".to_string(), "export default 2;".to_string())),
+    ));
+    read(&mut engine, "undefined");
+    assert_eq!(read(&mut engine, "importLog.join(',')"), "a,b");
+    assert_eq!(read(&mut engine, "importResult"), "3");
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_can_observe_module_evaluation_through_top_level_await() {
+    fn read(engine: &mut Engine, source: &str) -> String {
+        match engine.eval(source, false).expect("read parses") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("read threw {name}: {message}"),
+        }
+    }
+
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.releaseModule = null; globalThis.moduleGate = new Promise(resolve => releaseModule = resolve);",
+            false,
+        )
+        .expect("gate setup");
+    engine
+        .eval_module(
+            "await moduleGate; globalThis.moduleFinished = true;",
+            "entry",
+            |_, _| None,
+        )
+        .expect("module parses and suspends");
+    let promise = engine
+        .module_evaluation_promise("entry")
+        .expect("module retains its evaluation promise");
+    let then = engine
+        .ctx()
+        .member_get(&promise, "then")
+        .unwrap_or_else(|_| panic!("evaluation promise has then"));
+    let handler = match engine
+        .eval_value("() => globalThis.moduleObserved = true")
+        .expect("handler parses")
+    {
+        Ok(handler) => handler,
+        Err(_) => panic!("handler evaluates"),
+    };
+    engine
+        .call_function(&then, promise, &[handler])
+        .unwrap_or_else(|_| panic!("handler attaches"));
+
+    assert_eq!(
+        read(&mut engine, "String(globalThis.moduleObserved)"),
+        "undefined"
+    );
+    engine
+        .eval("releaseModule(); undefined", false)
+        .expect("gate release");
+    assert_eq!(
+        read(&mut engine, "String(globalThis.moduleFinished)"),
+        "true"
+    );
+    assert_eq!(
+        read(&mut engine, "String(globalThis.moduleObserved)"),
+        "true"
+    );
+}
+
+#[test]
 fn dynamic_import_uses_errored_async_cycle_root() {
     let mut engine = Engine::new();
     let files = [

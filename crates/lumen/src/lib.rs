@@ -356,6 +356,26 @@ impl Engine {
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
     }
 
+    /// Install the asynchronous HostLoadImportedModule hook used by browser embedders. Returning
+    /// `true` accepts the request; the embedder must later call [`Engine::finish_dynamic_module_load`]
+    /// with the same id. Returning `false` lets the engine fall back to its synchronous loader.
+    pub fn set_async_dynamic_module_loader(
+        &mut self,
+        loader: impl Fn(u64, &str, &str, Option<&str>) -> bool + 'static,
+    ) {
+        self.interp.dynamic_module_loader = Some(std::rc::Rc::new(loader));
+    }
+
+    /// Complete a dynamic-import host request with `(canonical key, source)` or a loading failure.
+    /// The corresponding JavaScript promise settles through the normal module link/evaluate path.
+    pub fn finish_dynamic_module_load(
+        &mut self,
+        request_id: u64,
+        result: Option<(String, String)>,
+    ) -> bool {
+        self.interp.finish_dynamic_module_load(request_id, result)
+    }
+
     /// The default referrer for a bare `import()` in script code (so relative specifiers resolve).
     pub fn set_import_base(&mut self, base: &str) {
         self.interp.import_base = base.to_string();
@@ -540,6 +560,14 @@ impl Engine {
     /// (e.g. `ctx().get_member(&engine.global_this(), "myCallback")`).
     pub fn global_this(&self) -> embed::Value {
         Value::Obj(self.interp.global.clone())
+    }
+
+    /// Return the promise representing a loaded module's evaluation, including top-level await.
+    /// An embedder can attach its script-element completion steps after
+    /// [`Engine::eval_module_attrs_interruptible`] returns without mistaking suspension for
+    /// successful evaluation.
+    pub fn module_evaluation_promise(&self, key: &str) -> Option<embed::Value> {
+        self.interp.module_evaluation_promise(key)
     }
 
     /// [`eval`](Engine::eval), but the completion comes back as real values (`Err` = the

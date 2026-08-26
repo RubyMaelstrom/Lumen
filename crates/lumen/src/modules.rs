@@ -86,6 +86,16 @@ enum ImportOrigin {
     Named(String, String),
 }
 
+/// Promise capability and request metadata retained while an asynchronous host module fetch is in
+/// flight. This is the engine-side payload passed conceptually from HostLoadImportedModule to
+/// FinishLoadingImportedModule (ECMA-262 §16.2.1.10–11).
+pub(crate) struct PendingDynamicImport {
+    promise: Value,
+    specifier: String,
+    attr_type: Option<String>,
+    defer: bool,
+}
+
 /// The result of resolving an export name (spec ResolveExport).
 enum Resolution {
     /// A concrete binding: `local` in the given module scope.
@@ -101,6 +111,22 @@ enum Resolution {
 }
 
 impl Interp {
+    /// The evaluation promise for `key`, redirected to its cycle root once evaluation has begun.
+    /// Browser embedders use this to delay a module script's completion steps through top-level
+    /// await instead of treating the initial suspension as successful evaluation.
+    #[cfg(feature = "embed")]
+    pub(crate) fn module_evaluation_promise(&self, key: &str) -> Option<Value> {
+        let record = self.module_recs.get(key)?;
+        let evaluation_key = if (record.started || record.evaluated || record.evaluating)
+            && record.cycle_root.is_some()
+        {
+            record.cycle_root.as_deref().unwrap_or(key)
+        } else {
+            key
+        };
+        self.module_recs.get(evaluation_key)?.top_promise.clone()
+    }
+
     /// Load, link, and evaluate the module identified by canonical `key` (with initial `src`),
     /// returning its namespace object.
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
@@ -1458,8 +1484,9 @@ impl Interp {
         Some(Ok(Property::data(value, true, true, false)))
     }
 
-    /// `import(specifier)`: synchronously load the module and return an already-resolved promise of
-    /// its namespace (or a rejected promise if loading throws).
+    /// `import(specifier)`: ask an asynchronous embedder first, then retain the legacy synchronous
+    /// loader as a fallback for filesystem/test hosts. In either case the language operation
+    /// returns its promise immediately; a browser host finishes it from a later networking task.
     pub(crate) fn dynamic_import(
         &mut self,
         specifier: &str,
@@ -1479,6 +1506,22 @@ impl Interp {
             },
             None => self.import_base.clone(),
         };
+        if let Some(loader) = self.dynamic_module_loader.clone() {
+            let request_id = self.next_dynamic_import_id;
+            self.next_dynamic_import_id = self.next_dynamic_import_id.wrapping_add(1).max(1);
+            if loader(request_id, specifier, &referrer, attr_type) {
+                self.pending_dynamic_imports.insert(
+                    request_id,
+                    PendingDynamicImport {
+                        promise: promise.clone(),
+                        specifier: specifier.to_string(),
+                        attr_type: attr_type.map(str::to_string),
+                        defer,
+                    },
+                );
+                return promise;
+            }
+        }
         let result = (|| {
             let (canon, src) = self.fetch_module(specifier, &referrer, attr_type)?;
             let canon = match attr_type {
@@ -1490,6 +1533,53 @@ impl Interp {
             self.link_module(&canon)?;
             Ok(canon)
         })();
+        self.finish_dynamic_import(promise.clone(), attr_type, defer, result);
+        promise
+    }
+
+    /// Finish one asynchronous HostLoadImportedModule operation. Returning false means the id was
+    /// unknown or already completed; otherwise the associated import promise is resolved/rejected
+    /// using the same link/evaluate path as the synchronous loader.
+    pub(crate) fn finish_dynamic_module_load(
+        &mut self,
+        request_id: u64,
+        result: Option<(String, String)>,
+    ) -> bool {
+        let Some(pending) = self.pending_dynamic_imports.remove(&request_id) else {
+            return false;
+        };
+        let result = match result {
+            Some((canon, source)) => {
+                let canon = match pending.attr_type.as_deref() {
+                    Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
+                    _ => canon,
+                };
+                let source = typed_module_source(source, pending.attr_type.as_deref());
+                self.load_requested_modules(&canon, Some(source))
+                    .and_then(|()| self.link_module(&canon))
+                    .map(|()| canon)
+            }
+            None => Err(self.throw(
+                "TypeError",
+                format!("module not found: {}", pending.specifier),
+            )),
+        };
+        self.finish_dynamic_import(
+            pending.promise,
+            pending.attr_type.as_deref(),
+            pending.defer,
+            result,
+        );
+        true
+    }
+
+    fn finish_dynamic_import(
+        &mut self,
+        promise: Value,
+        _attr_type: Option<&str>,
+        defer: bool,
+        result: Result<String, Abrupt>,
+    ) {
         match result {
             Ok(canon) if defer => {
                 // import.defer: link only; resolve with the (shared) deferred namespace. The
@@ -1521,7 +1611,6 @@ impl Interp {
                 self.reject_promise(&promise, reason);
             }
         }
-        promise
     }
 
     /// Evaluate a dynamically-imported module, returning a promise that settles when its body

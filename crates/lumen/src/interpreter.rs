@@ -1183,6 +1183,14 @@ pub struct Interp {
     #[allow(clippy::type_complexity)]
     pub(crate) module_loader:
         Option<Rc<dyn Fn(&str, &str, Option<&str>) -> Option<(String, String)>>>,
+    /// Optional asynchronous host hook for dynamic `import()`. The hook accepts a stable request
+    /// id and starts HostLoadImportedModule; the embedder later calls
+    /// `Engine::finish_dynamic_module_load` with the fetched source or failure.
+    #[allow(clippy::type_complexity)]
+    pub(crate) dynamic_module_loader: Option<Rc<dyn Fn(u64, &str, &str, Option<&str>) -> bool>>,
+    pub(crate) pending_dynamic_imports:
+        std::collections::HashMap<u64, crate::modules::PendingDynamicImport>,
+    pub(crate) next_dynamic_import_id: u64,
     /// Live module-namespace state keyed by the namespace object's pointer: for each exported name,
     /// how to read its current value (a live binding in some module scope, or a static value for a
     /// star-as namespace re-export). Namespace property reads consult this so they stay live.
@@ -1738,6 +1746,9 @@ impl Interp {
             modules: Default::default(),
             module_recs: Default::default(),
             module_loader: None,
+            dynamic_module_loader: None,
+            pending_dynamic_imports: Default::default(),
+            next_dynamic_import_id: 1,
             module_ns: Default::default(),
             tier: match std::env::var("LUMEN_TIER").as_deref() {
                 Ok("interp") => crate::bytecode::Tier::Interp,
