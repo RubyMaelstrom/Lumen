@@ -335,6 +335,10 @@ pub struct JitCtx {
     pub opstat_enabled: bool,
     pub callstat_enabled: bool,
     pub inline_recompile_at: u32,
+    /// Address of the executing thread's live-object counter. Compiled chunks may cross thread
+    /// boundaries with generator/async interpreter handoff, so this TLS address must be captured
+    /// when an activation starts rather than embedded while machine code is compiled.
+    pub live_objects: *const i64,
 }
 
 impl JitCtx {
@@ -4458,7 +4462,8 @@ fn emit_direct_call(
     let cx_floor = offset_of!(JitCtx, handler_floor) as u32;
     let cx_this = offset_of!(JitCtx, this_val) as u32;
     let cx_ret = offset_of!(JitCtx, ret) as u32;
-    if !(fits8(cx_this as usize) && fits8(cx_ret as usize)) {
+    let cx_live_objects = offset_of!(JitCtx, live_objects) as u32;
+    if !(fits8(cx_this as usize) && fits8(cx_ret as usize) && fits8(cx_live_objects as usize)) {
         return false;
     }
     // rc strong at payload+0 — same contract as the templates (layout.valid checked upstream).
@@ -4533,8 +4538,7 @@ fn emit_direct_call(
     a.b_cond(C_HS, hit_slow);
     // Check actual allocation pressure in generated code. Collection-due calls take the full
     // cache-reprobing helper because a collection can invalidate validated raw call state.
-    a.mov_imm64(4, crate::value::live_objects_ptr() as u64);
-    a.ldr_imm(4, 4, 0);
+    emit_live_objects_load(a, cx_live_objects);
     a.ldr_imm(13, 14, il.gc_next as u32);
     let gc_due = a.new_label();
     a.cmp_reg_x(4, 13);
@@ -4762,6 +4766,37 @@ fn emit_direct_call(
     a.str_w_imm(13, 14, il.gc_tick as u32);
     a.b(gc_slow);
     true
+}
+
+/// Load the executing thread's live-object count into x4 through the current [`JitCtx`]. A JIT
+/// chunk can outlive or cross from the thread that compiled it, so this must remain a runtime
+/// activation-relative load rather than an absolute TLS address embedded in machine code.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_live_objects_load(a: &mut asm::Asm, cx_live_objects: u32) {
+    a.ldr_imm(4, 19, cx_live_objects);
+    a.ldr_imm(4, 4, 0);
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod direct_call_tests {
+    #[test]
+    fn live_object_count_is_loaded_through_the_execution_context() {
+        let offset = std::mem::offset_of!(super::JitCtx, live_objects) as u32;
+        let mut asm = super::asm::Asm::new();
+        super::emit_live_objects_load(&mut asm, offset);
+
+        let words = asm.finish();
+        let from_ctx = 0xF940_0000 | ((offset / 8) << 10) | (19 << 5) | 4;
+        let dereference = 0xF940_0000 | (4 << 5) | 4;
+        assert_eq!(words, [from_ctx, dereference]);
+    }
 }
 
 /// The direct-call teardown stub, emitted ONCE per chunk (sites reach it by `bl`; per-site
@@ -22041,6 +22076,7 @@ pub fn run(
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
+        live_objects: crate::value::live_objects_ptr(),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         this_val,
@@ -22421,6 +22457,7 @@ unsafe fn run_moved_inner(
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
+        live_objects: crate::value::live_objects_ptr(),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         this_val,

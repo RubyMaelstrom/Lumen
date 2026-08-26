@@ -902,8 +902,9 @@ pub(crate) fn allocated_objects() -> u64 {
     GC_STATE.with(|state| state.allocated.get())
 }
 
-/// Stable address of this thread's live-object counter. The Rc-based runtime and its compiled
-/// chunks are `!Send`, so generated code executes on the thread that baked this TLS address.
+/// Stable address of this thread's live-object counter for the lifetime of the thread. JIT
+/// activations capture it when execution starts; reusable compiled chunks must not embed it,
+/// because generator/async interpreter handoff can execute a chunk on a different thread.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
