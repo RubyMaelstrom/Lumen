@@ -33,7 +33,9 @@ chunk is considered for a one-shot inline recompile after 100 machine-code runs.
 shared-context calls are disabled while speculative inlining is active: combining the two
 optimizations violated the platform's callee-saved-register contract, while ordinary JIT calls
 preserve nearly all of the inliner's performance gain. `LUMEN_INLINE_AT=N` changes the trigger;
-`LUMEN_INLINE_AT=0` disables inlining and restores direct-call eligibility.
+`LUMEN_INLINE_AT=0` disables inlining and restores direct-call eligibility. For ABI debugging,
+`LUMEN_UNSAFE_INLINE_DIRECT=1` recreates the earlier per-chunk exclusion; this knowingly enables
+a native-crash path and must not be used for production workloads.
 
 The language surface: generators and `async`/`await` running on stackful coroutines (async
 bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` and inline

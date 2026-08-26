@@ -2270,6 +2270,16 @@ pub(crate) fn inline_recompile_at() -> u32 {
     })
 }
 
+/// Whether to reproduce the known-unsafe combination of speculative inlining and ARM64 direct
+/// shared-context calls. This is a diagnostic only: AAPCS64 requires x19 (the generated-code
+/// [`crate::jit::JitCtx`] register) to survive every callee, and browser stress has observed the
+/// combined path restore a code address into x19. Production keeps the optimizations mutually
+/// exclusive until the failing frame transition is repaired.
+pub(crate) fn unsafe_inline_direct_diagnostic() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LUMEN_UNSAFE_INLINE_DIRECT").is_some())
+}
+
 /// Build the speculative-inline plan for a hot chunk: for each monomorphic, filled call site,
 /// the callee qualifies when it is a plain same-strictness function whose compiled body is
 /// small, needs no activation environment, touches no free names, and hides no control-flow
@@ -6161,6 +6171,11 @@ impl Chunk {
         &self.inline_targets[t as usize]
     }
 
+    /// Whether this second-stage body contains speculative call-site splices.
+    pub(crate) fn jit_has_inline_targets(&self) -> bool {
+        !self.inline_targets.is_empty()
+    }
+
     /// The interned name a property op refers to (the emitter gates array-receiver inlining on
     /// whether it could be an element key).
     pub(crate) fn jit_name(&self, n: u32) -> &str {
@@ -6827,7 +6842,9 @@ impl Chunk {
         // ordinary committed-call helper, whose Rust/JIT boundary preserves the AAPCS64 frame
         // contract. `LUMEN_INLINE_AT=0` restores direct-call eligibility for diagnostics and
         // dedicated coverage.
-        if inline_recompile_at() != 0 {
+        if inline_recompile_at() != 0
+            && (!unsafe_inline_direct_diagnostic() || self.jit_has_inline_targets())
+        {
             return 0;
         }
         let mut f = 1u8;
