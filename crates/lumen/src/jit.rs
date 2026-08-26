@@ -368,6 +368,27 @@ fn jit_env_parent_raw(env: &Env) -> *const u8 {
         .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8)
 }
 
+/// Byte offset of the live-length word in `JitCtx::handlers`.
+///
+/// `Vec` does not expose a stable field layout, so the ARM64 direct-call emitter probes the
+/// monomorphized representation instead of assuming one. The three distinct values make the
+/// length word unambiguous for every supported Rust layout.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn jit_handlers_len_offset() -> Option<usize> {
+    use std::mem::offset_of;
+
+    let mut handlers: Vec<(u32, usize)> = Vec::with_capacity(5);
+    handlers.extend([(1, 1), (2, 2), (3, 3)]);
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&handlers) };
+    words
+        .iter()
+        .position(|word| *word == handlers.len())
+        .map(|word| offset_of!(JitCtx, handlers) + word * size_of::<usize>())
+}
+
 /// The helper function table the emitted code indexes (see `JitCtx::helpers`); built once per
 /// `Interp` (`Interp::jit_helpers`) so calls don't re-materialize it.
 pub(crate) fn helper_table() -> [usize; N_HELPERS] {
@@ -4429,17 +4450,8 @@ fn emit_direct_call(
         return false;
     }
     // The handlers Vec's length-word offset within JitCtx (per-instantiation, probed here).
-    let handlers_len_off = {
-        let mut v: Vec<(u32, usize)> = Vec::with_capacity(5);
-        v.push((1, 1));
-        v.push((2, 2));
-        v.push((3, 3));
-        let words: [usize; 3] =
-            unsafe { std::mem::transmute_copy::<Vec<(u32, usize)>, [usize; 3]>(&v) };
-        let Some(w) = words.iter().position(|w| *w == 3) else {
-            return false;
-        };
-        offset_of!(JitCtx, handlers) + w * 8
+    let Some(handlers_len_off) = jit_handlers_len_offset() else {
+        return false;
     };
     if !fits8(handlers_len_off) {
         return false;
@@ -4798,6 +4810,31 @@ mod direct_call_tests {
         let dereference = 0xF940_0000 | (4 << 5) | 4;
         assert_eq!(words, [from_ctx, dereference]);
     }
+
+    #[test]
+    fn direct_finish_truncates_callee_handlers_to_the_activation_floor() {
+        let floor = std::mem::offset_of!(super::JitCtx, handler_floor) as u32;
+        let handlers_len = super::jit_handlers_len_offset().expect("Vec length word") as u32;
+        let mut asm = super::asm::Asm::new();
+        super::emit_handler_truncate(&mut asm, floor, handlers_len);
+
+        let words = asm.finish();
+        let load_floor = 0xF940_0000 | ((floor / 8) << 10) | (19 << 5) | 9;
+        let store_len = 0xF900_0000 | ((handlers_len / 8) << 10) | (19 << 5) | 9;
+        assert_eq!(words, [load_floor, store_len]);
+    }
+}
+
+/// Remove handler records owned by the direct callee before restoring its caller's activation.
+/// A `return` is an abrupt completion that leaves its surrounding `try` (ECMA-262 14.10.1 and
+/// 14.15.3), so a direct callee may legitimately bypass its lexical `PopHandler` operation.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_handler_truncate(a: &mut asm::Asm, cx_handler_floor: u32, handlers_len_off: u32) {
+    a.ldr_imm(9, 19, cx_handler_floor);
+    a.str_imm(9, 19, handlers_len_off);
 }
 
 /// The direct-call teardown stub, emitted ONCE per chunk (sites reach it by `bl`; per-site
@@ -4824,6 +4861,7 @@ fn emit_direct_finish_stub(
     let cx_this = offset_of!(JitCtx, this_val) as u32;
     let cx_slots = offset_of!(JitCtx, slots) as u32;
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
+    let cx_handler_floor = offset_of!(JitCtx, handler_floor) as u32;
     let slow = a.new_label();
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
     let fast_ok = rc_dec_ok
@@ -4843,6 +4881,9 @@ fn emit_direct_finish_stub(
     // spilled for the whole body; both exits share the epilogue.
     let done = a.new_label();
     a.stp_pre(29, 30, -16);
+    if let Some(handlers_len_off) = jit_handlers_len_offset() {
+        emit_handler_truncate(a, cx_handler_floor, handlers_len_off as u32);
+    }
     if fast_ok {
         a.cbnz(1, false, slow); // threw → helper
         a.ldr_imm(14, 19, 72); // ctx.interp

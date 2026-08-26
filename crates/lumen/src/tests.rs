@@ -17106,10 +17106,10 @@ fn inline_throw_from_spliced_body() {
 
 #[test]
 fn speculative_inlining_keeps_direct_shared_context_calls_disabled() {
-    // Regression for the Test262 resizable-buffer crash cluster: once both functions gained
-    // second-stage bodies, combining direct calls with inlining could restore a generated-code
-    // address into ARM64's callee-saved x19 JitCtx register. Repeated typed-array mutation makes
-    // both sides hot and crosses the default inline threshold.
+    // Regression for the Test262 resizable-buffer crash cluster. A directly called assertion
+    // helper can return from inside `try`, bypassing its lexical PopHandler; its teardown must
+    // remove that stale handler before a later typed-array TypeError unwinds in the caller.
+    // Repeated typed-array mutation makes both sides hot and crosses the inline threshold.
     assert_eq!(
         run_jit(
             "function maybeBigInt(ta, value) {

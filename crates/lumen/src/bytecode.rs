@@ -8002,6 +8002,10 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     _sp: *mut Value,
 ) -> u64 {
     let ctx = &mut *ctx;
+    // Returning from inside a try bypasses the lexical PopHandler. Direct calls share their
+    // caller's handler allocation, so discard every record above this activation's watermark
+    // before the caller resumes (ECMA-262 14.10.1 and 14.15.3).
+    ctx.handlers.truncate(ctx.handler_floor);
     let caller_uses_packed_slots = ctx.slots_packed;
     // Expand the packed callee once for the existing destructor loop. Assembly restores the
     // caller's still-packed slot pointer immediately after this helper, so only the flag is
