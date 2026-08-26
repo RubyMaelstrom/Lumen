@@ -444,8 +444,16 @@ impl Parser {
     /// [`err_semantic`](Parser::err_semantic) instead: it may sit at Eof coincidentally, and a
     /// spurious `at_eof` traps a REPL in its continuation prompt.
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, ParseError> {
+        let msg = msg.into();
+        if std::env::var_os("LUMEN_PARSE_TRACE").is_some() {
+            let token = &self.toks[self.pos];
+            eprintln!(
+                "lumen parser: line {} chars {}..{} token {:?}: {}",
+                token.line, token.start, token.end, token.kind, msg
+            );
+        }
         Err(ParseError {
-            message: msg.into(),
+            message: msg,
             line: self.line(),
             at_eof: self.at_eof(),
         })
@@ -3221,8 +3229,14 @@ impl Parser {
         let scall = std::mem::replace(&mut self.super_call_ok, false);
         let ssb = std::mem::replace(&mut self.in_static_block, false);
         let sargs = std::mem::replace(&mut self.no_arguments_refs, false);
+        // `FunctionExpression` and `FunctionDeclaration` do not inherit the
+        // containing expression's [In] grammar parameter. In particular, a
+        // function nested in a `for` initializer parsed with [~In] still uses
+        // [+In] for its parameters and body (ECMA-262 §§14.7.4, 15.2).
+        let sno_in = std::mem::replace(&mut self.no_in, false);
         let params = self.parse_params_fn()?;
         let (body, is_strict) = self.parse_function_body(!params_complex(&params), false)?;
+        self.no_in = sno_in;
         self.super_prop_ok = ssuper;
         self.super_call_ok = scall;
         self.in_static_block = ssb;

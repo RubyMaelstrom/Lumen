@@ -995,9 +995,12 @@ impl<'a> Lexer<'a> {
                 self.push(Tok::BigInt(n));
                 return Ok(());
             }
-            let n = u64::from_str_radix(&digits, radix)
-                .map_err(|_| self.err("invalid numeric literal"))?;
-            self.push(Tok::Num(n as f64));
+            // ECMA-262 §12.9.3.2/3 defines a non-decimal literal's MV as an
+            // unbounded mathematical integer and only then applies the Number
+            // conversion. Do not impose the host machine word width here.
+            let n = crate::bigint::JsBigInt::parse_radix(&digits, radix)
+                .ok_or_else(|| self.err("invalid numeric literal"))?;
+            self.push(Tok::Num(n.to_f64()));
             return Ok(());
         }
         // Decimal: integer . fraction e exponent

@@ -9054,6 +9054,29 @@ fn for_head_no_in() {
     assert_eq!(run("var r=0; for (var i of [1,2,3]) r+=i; r"), "6");
     assert_eq!(run("var c=0; for (var k in {a:1,b:2,c:3}) c++; c"), "3");
     assert_eq!(run("'q' in {q:1}"), "true");
+    // [~In] applies to the for initializer, not to the parameters/body of a
+    // nested function. This is the minified jQuery shape used by erome.com.
+    assert_eq!(
+        run("var out; for (out = function(x = 'p' in {p:1}) { return x && 'q' in {q:1}; }(); false;); out"),
+        "true"
+    );
+}
+
+#[test]
+fn non_decimal_number_literals_are_not_machine_word_bounded() {
+    // ECMA-262 §12.9.3 computes the mathematical value without a u64-sized
+    // ceiling, then rounds it to Number. Steam ships the first literal below.
+    assert_eq!(run("0x10000000000000000 === 2 ** 64"), "true");
+    assert_eq!(
+        run("0b1_0000000000000000000000000000000000000000000000000000000000000000 === 2 ** 64"),
+        "true"
+    );
+    assert_eq!(run("0o2_000000000000000000000 === 2 ** 64"), "true");
+    // Round-to-nearest, ties-to-even around Number's 53-bit significand.
+    assert_eq!(
+        run("0x20000000000001 === 0x20000000000000 && 0x20000000000003 === 0x20000000000004"),
+        "true"
+    );
 }
 #[test]
 fn tagged_templates() {
