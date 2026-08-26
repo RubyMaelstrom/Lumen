@@ -2252,25 +2252,21 @@ fn compile_inner(
     }))
 }
 
-/// How many machine-code runs of a chunk trigger the experimental one-shot inline recompile.
+/// How many machine-code runs of a chunk trigger the one-shot speculative inline recompile.
 ///
-/// It remains opt-in in production: current ARM64 inlining can corrupt control flow for ordinary
-/// Test262 helper call graphs, producing wrong results or SIGBUS/SIGSEGV. `LUMEN_INLINE_AT`
-/// explicitly enables it for investigation; unit tests keep the historical threshold so the
-/// implementation itself does not silently lose coverage.
-///
-/// TODO(TRust): repair and re-enable this optimizer. On the same fat-LTO TRust benchmark artifact,
-/// speculative inlining raised the score from 1,366 to 2,395 (about 75%). Do not delete the
-/// machinery merely because it is disabled: re-enable it once the full current Test262 suite,
-/// interpreter/bytecode/JIT differential coverage, and repeated release-mode native-crash stress
-/// runs all pass with it enabled.
+/// ARM64 native-crash stress traced the former wrong-result/SIGBUS/SIGSEGV failures to combining
+/// speculative-inline bodies with direct shared-context JIT calls. Those transitions are excluded
+/// in both directions by `jit_has_inline_targets`/`jit_direct_flags`; ordinary JIT calls preserve
+/// the AAPCS64 frame boundary there. The mitigated inliner passed the full current Test262 checkout,
+/// differential coverage, and repeated native-crash stress before this production default was
+/// restored. `LUMEN_INLINE_AT=0` remains the diagnostic off switch.
 pub(crate) fn inline_recompile_at() -> u32 {
     static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         std::env::var("LUMEN_INLINE_AT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(if cfg!(test) { 100 } else { 0 })
+            .unwrap_or(100)
     })
 }
 
@@ -6164,6 +6160,17 @@ impl Chunk {
     pub(crate) fn jit_inline_target(&self, t: u32) -> &InlineTarget {
         &self.inline_targets[t as usize]
     }
+
+    /// Whether this is a second-stage body containing speculative call-site splices.
+    ///
+    /// ARM64 direct shared-context calls currently cannot safely run from these bodies: native
+    /// crash stress found their nested frame transition restoring a generated-code address into
+    /// `x19` instead of the caller's [`crate::jit::JitCtx`]. AAPCS64 makes `x19` callee-saved, so
+    /// the JIT must retain the ordinary call path until that combined frame transition is proven
+    /// to preserve it. First-stage chunks keep the independent direct-call optimization.
+    pub(crate) fn jit_has_inline_targets(&self) -> bool {
+        !self.inline_targets.is_empty()
+    }
     /// The interned name a property op refers to (the emitter gates array-receiver inlining on
     /// whether it could be an element key).
     pub(crate) fn jit_name(&self, n: u32) -> &str {
@@ -6825,6 +6832,13 @@ impl Chunk {
     }
     /// [`CallIc::direct`] gates for this chunk (see its docs).
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
+        // A normal first-stage caller can otherwise direct-enter a second-stage body. That is the
+        // other half of the unsafe direct-call/speculative-inline combination documented by
+        // `jit_has_inline_targets`: leave bit 0 clear so the generated caller takes its ordinary
+        // committed-call helper, whose Rust/JIT boundary preserves the AAPCS64 frame contract.
+        if self.jit_has_inline_targets() {
+            return 0;
+        }
         let mut f = 1u8;
         #[cfg(all(
             target_arch = "aarch64",

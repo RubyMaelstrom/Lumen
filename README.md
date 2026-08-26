@@ -28,10 +28,12 @@ unavailable it degrades to the bytecode VM). Functions tier up after a call-coun
 immediately if the body contains a loop. Force the reference tree-walker with `--tier=interp`
 (or `LUMEN_TIER=interp`).
 
-The base JIT is enabled by default. Its experimental second-stage whole-function inliner is not:
-current ARM64 testing found wrong results and native crashes in valid Test262 programs. Set
-`LUMEN_INLINE_AT=N` only to investigate that optimizer; `N` is the machine-code run count that
-triggers the speculative recompile.
+The base JIT and its second-stage speculative whole-function inliner are enabled by default. A hot
+chunk is considered for a one-shot inline recompile after 100 machine-code runs. ARM64 direct
+shared-context calls are deliberately excluded at the boundary of an inlined chunk: combining the
+two optimizations violated the platform's callee-saved-register contract, while retaining ordinary
+JIT calls at that boundary preserves the inliner's performance gain. `LUMEN_INLINE_AT=N` changes
+the trigger; use `LUMEN_INLINE_AT=0` as the diagnostic off switch.
 
 The language surface: generators and `async`/`await` running on stackful coroutines (async
 bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` and inline

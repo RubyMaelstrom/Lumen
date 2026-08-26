@@ -17082,6 +17082,53 @@ fn inline_throw_from_spliced_body() {
 }
 
 #[test]
+fn inline_chunks_do_not_enter_direct_shared_context_calls() {
+    // Regression for the Test262 resizable-buffer crash cluster: once both functions gained
+    // second-stage bodies, a first-stage caller could direct-enter an inlined callee and restore
+    // a generated-code address into ARM64's callee-saved x19 JitCtx register. Repeated typed-array
+    // mutation makes both sides hot and crosses the default inline threshold.
+    assert_eq!(
+        run_jit(
+            "function maybeBigInt(ta, value) {
+               if ((typeof BigInt64Array !== 'undefined' && ta instanceof BigInt64Array) ||
+                   (typeof BigUint64Array !== 'undefined' && ta instanceof BigUint64Array)) {
+                 return BigInt(value);
+               }
+               return value;
+             }
+             function defineIndex(ta, index, value) {
+               Object.defineProperty(ta, index, { value: maybeBigInt(ta, value) });
+             }
+             function callDefine(ta, index, value) {
+               defineIndex(ta, index, value);
+             }
+             var ctors = [Uint8Array, Int8Array, Uint16Array, Int16Array,
+                          Uint32Array, Int32Array, Float32Array, Float64Array,
+                          Uint8ClampedArray];
+             if (typeof BigUint64Array !== 'undefined') ctors.push(BigUint64Array);
+             if (typeof BigInt64Array !== 'undefined') ctors.push(BigInt64Array);
+             for (var c of ctors) {
+               var bpe = c.BYTES_PER_ELEMENT;
+               var rab = new ArrayBuffer(4 * bpe, { maxByteLength: 8 * bpe });
+               var fixed = new c(rab, 0, 4);
+               var tracking = new c(rab, 0);
+               for (var n = 0; n < 16; n++) callDefine(tracking, n & 3, n + 1);
+               rab.resize(bpe);
+               var threw = false;
+               try { callDefine(fixed, 0, 20); }
+               catch (e) { threw = e instanceof TypeError; }
+               if (!threw) throw new Error('out-of-bounds fixed view did not throw');
+               rab.resize(6 * bpe);
+               callDefine(tracking, 0, 21);
+               if (Number(tracking[0]) !== 21) throw new Error('grown view write failed');
+             }
+             'ok'"
+        ),
+        "ok"
+    );
+}
+
+#[test]
 fn inline_recompile_preserves_monomorphic_and_polymorphic_property_sites() {
     // The second-stage compiler seeds property ICs from the hot source chunks. Own-field reads
     // should remain monomorphic after splicing, while the shared virtual-call site must retain

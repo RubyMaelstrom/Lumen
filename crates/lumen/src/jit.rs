@@ -1478,7 +1478,12 @@ pub fn compile(
         std::env::var_os("LUMEN_JIT_NO_FUNCTION_CALL_INTRINSIC").is_none();
     // Direct shared-ctx calls, on by default like every other emitter feature (mask bit 20
     // off for debugging). Requires the inline call probe (bit 524288) to emit at all.
-    let direct_on = fast & (1 << 20) != 0;
+    // Keep two independently-correct optimizations from entering their currently-unsafe combined
+    // frame transition. AAPCS64 requires x19 (our JitCtx register) to survive every callee; native
+    // crash stress shows direct calls made by a speculative-inline body can restore a generated
+    // code address there. Ordinary JIT calls preserve the optimizer's semantics and contain the
+    // issue to this exact combination while first-stage chunks retain direct calls.
+    let direct_on = fast & (1 << 20) != 0 && !chunk.jit_has_inline_targets();
     // Whether the probed layout supports inline refcount bumps/decs (clone/drop of Str/Sym/Obj
     // without a helper call). All strong-count templates gate on this.
     let rc_ok = layout.valid && layout.rc_strong_off < 256;
