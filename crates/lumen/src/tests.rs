@@ -15989,6 +15989,69 @@ fn locale_canonicalization_and_likely_subtags() {
     );
 }
 
+#[cfg(feature = "intl")]
+#[test]
+fn locale_info_uses_cldr_region_preference() {
+    // ECMA-402 RegionPreference order: rg, explicit region, sd, likely-subtag region, then 001.
+    assert_eq!(
+        run("new Intl.Locale('fa-JP-u-sd-inka-rg-thzzzz').getCalendars().join(',')"),
+        "buddhist,gregory"
+    );
+    assert_eq!(
+        run("new Intl.Locale('fa-JP-u-sd-inka').getCalendars().join(',')"),
+        "gregory,japanese"
+    );
+    assert_eq!(
+        run("new Intl.Locale('fa-u-sd-inka').getCalendars().join(',')"),
+        "gregory,indian"
+    );
+    assert_eq!(
+        run("new Intl.Locale('fa').getCalendars().join(',')"),
+        "persian,gregory,islamic-civil,islamic-tbla"
+    );
+    assert_eq!(
+        run("new Intl.Locale('eo').getCalendars().join(',')"),
+        "gregory"
+    );
+
+    // UTS #35 language-region time data has priority over its region-only record.
+    assert_eq!(
+        run("new Intl.Locale('fr-CA').getHourCycles().join(',')"),
+        "h23,h12"
+    );
+    assert_eq!(
+        run("new Intl.Locale('und-CA').getHourCycles().join(',')"),
+        "h12,h23"
+    );
+
+    // Week data observes the same region preference and preserves non-standard weekends.
+    assert_eq!(
+        run("var w = new Intl.Locale('fa-JP-u-sd-inka-rg-afzzzz').getWeekInfo(); `${w.firstDay}:${w.weekend}`"),
+        "6:4,5"
+    );
+    assert_eq!(
+        run("var w = new Intl.Locale('fa-u-sd-inka').getWeekInfo(); `${w.firstDay}:${w.weekend}`"),
+        "7:7"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn locale_info_collations_and_default_locale() {
+    assert_eq!(
+        run("new Intl.Locale('und').getCollations().join(',')"),
+        "emoji,eor"
+    );
+    assert_eq!(
+        run("new Intl.Locale('de').getCollations().join(',')"),
+        "emoji,eor,phonebk"
+    );
+    assert_eq!(
+        run("new Intl.NumberFormat().resolvedOptions().locale"),
+        "en-US"
+    );
+}
+
 #[test]
 fn string_normalize_forms() {
     assert_eq!(run(r"'\u0041\u030A'.normalize('NFC')"), "\u{C5}");

@@ -6,8 +6,12 @@ use crate::interpreter::Interp;
 use crate::intl::tags;
 use crate::value::{Gc, Property, Value};
 
+/// ECMA-402 DefaultLocale is implementation-defined. Lumen deliberately favors US English when a
+/// caller supplies no supported locale, matching TRust's primary compatibility target.
+pub const DEFAULT_LOCALE: &str = "en-US";
+
 /// The languages we ship formatting data for (plus common ones the conformance tests negotiate).
-/// Unknown languages resolve to `en`.
+/// Unknown languages resolve to [`DEFAULT_LOCALE`].
 pub fn supported_language(lang: &str) -> bool {
     matches!(
         lang,
@@ -43,7 +47,8 @@ pub struct ResolvedLocale {
 }
 
 /// A minimal ResolveLocale (lookup matcher): the first requested locale whose language we service
-/// wins, preserving its script/region; otherwise `en`. Relevant `-u-` keywords are extracted.
+/// wins, preserving its script/region; otherwise [`DEFAULT_LOCALE`]. Relevant `-u-` keywords are
+/// extracted.
 pub fn resolve_locale(
     _i: &mut Interp,
     requested: &[String],
@@ -77,7 +82,7 @@ pub fn resolve_locale(
         }
     }
     ResolvedLocale {
-        locale: "en".to_string(),
+        locale: DEFAULT_LOCALE.to_string(),
         keywords: Vec::new(),
     }
 }
@@ -92,7 +97,7 @@ pub fn is_supported_nu(n: &str) -> bool {
 /// `-u-nu-` addition is kept only when the value came from the requested locale's extension; an
 /// options value that differs from it drops the addition (per ResolveLocale steps for `nu`).
 pub fn resolve_locale_nu(requested: &[String], option: Option<&str>) -> (String, String) {
-    let mut base = "en".to_string();
+    let mut base = DEFAULT_LOCALE.to_string();
     let mut ext_value: Option<String> = None;
     for tag in requested {
         if let Some(parsed) = tags::parse(tag) {

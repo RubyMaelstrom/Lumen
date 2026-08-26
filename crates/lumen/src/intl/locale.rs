@@ -109,16 +109,17 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         relocale(i, &this, false)
     });
 
-    // Intl.Locale-info: getX() return the locale's preferred values (the keyword override, if any,
-    // else a data default) as a fresh Array.
+    // ECMA-402 Intl.Locale-info methods. RegionPreference is shared so explicit regions,
+    // subdivision regions, likely-subtag regions, and region overrides retain their normative
+    // precedence across all three CLDR-backed operations.
     it.def_method(&proto, "getCalendars", 0, |i, this, _| {
-        info_list(i, &this, "__locale_ca", &["gregory"])
+        calendars_of_locale(i, &this)
     });
     it.def_method(&proto, "getCollations", 0, |i, this, _| {
-        info_list(i, &this, "__locale_co", &["default"])
+        collations_of_locale(i, &this)
     });
     it.def_method(&proto, "getHourCycles", 0, |i, this, _| {
-        info_list(i, &this, "__locale_hc", &["h23"])
+        hour_cycles_of_locale(i, &this)
     });
     it.def_method(&proto, "getNumberingSystems", 0, |i, this, _| {
         info_list(i, &this, "__locale_nu", &["latn"])
@@ -145,21 +146,174 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         Ok(Value::Obj(o))
     });
     it.def_method(&proto, "getWeekInfo", 0, |i, this, _| {
-        let _ = slot(i, &this, "__locale_tag")?;
-        // firstDay comes from the fw keyword (option or -u-fw-), defaulting to Monday.
-        let first = match opt_slot(i, &this, "__locale_fw")? {
-            Value::Str(s) => fw_to_num(&s).unwrap_or(1.0),
-            _ => 1.0,
-        };
-        let o = i.new_object();
-        set_data(&o, "firstDay", Value::Num(first));
-        set_data(
-            &o,
-            "weekend",
-            i.make_array(vec![Value::Num(6.0), Value::Num(7.0)]),
-        );
-        Ok(Value::Obj(o))
+        week_info_of_locale(i, &this)
     });
+}
+
+#[derive(Debug)]
+struct RegionPreference {
+    region: String,
+    region_override: Option<String>,
+}
+
+/// ECMA-402 CanonicalUnicodeSubdivision: accept one well-formed Unicode subdivision identifier,
+/// take its longest region-subtag prefix, then canonicalize that region through the language-tag
+/// alias table (for example, `ukzzzz` selects `GB`).
+fn canonical_unicode_subdivision(tag: &tags::LangTag, key: &str) -> Option<String> {
+    let (_, keywords) = tag.unicode.as_ref()?;
+    let types = &keywords.iter().find(|(candidate, _)| candidate == key)?.1;
+    if types.len() != 1 {
+        return None;
+    }
+    let subdivision = &types[0];
+    let bytes = subdivision.as_bytes();
+    let prefix_len = if bytes.len() >= 3
+        && bytes[0..2].iter().all(u8::is_ascii_alphabetic)
+        && bytes[2..].iter().all(u8::is_ascii_alphanumeric)
+    {
+        2
+    } else if bytes.len() >= 4
+        && bytes[0..3].iter().all(u8::is_ascii_digit)
+        && bytes[3..].iter().all(u8::is_ascii_alphanumeric)
+    {
+        3
+    } else {
+        return None;
+    };
+    if bytes.len() > 8 {
+        return None;
+    }
+    let region_tag = format!("und-{}", &subdivision[..prefix_len]);
+    let canonical = tags::canonicalize_language_tag(&region_tag)?;
+    let parsed = tags::parse(&canonical)?;
+    (!parsed.region.is_empty()).then_some(parsed.region)
+}
+
+/// ECMA-402 RegionPreference. An explicit region wins over `sd`; otherwise Add Likely Subtags is
+/// applied, with `001` as the final fallback. The independent `rg` result is returned for each
+/// locale-data operation to apply only when the relevant data exists.
+fn region_preference(tag: &str) -> RegionPreference {
+    let parsed = tags::parse(tag).expect("stored Intl.Locale tags are canonical and well-formed");
+    let region = if !parsed.region.is_empty() {
+        parsed.region.clone()
+    } else if let Some(subdivision) = canonical_unicode_subdivision(&parsed, "sd") {
+        subdivision
+    } else {
+        add_likely(&parsed.language, &parsed.script, "")
+            .map(|(_, _, region)| region)
+            .filter(|region| !region.is_empty())
+            .unwrap_or_else(|| "001".to_string())
+    };
+    let region_override = canonical_unicode_subdivision(&parsed, "rg");
+    RegionPreference {
+        region,
+        region_override,
+    }
+}
+
+fn locale_keyword(i: &mut Interp, this: &Value, name: &str) -> Result<Option<String>, Value> {
+    let object = this
+        .as_obj()
+        .ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
+    if !object.borrow().props.contains("__locale_tag") {
+        return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
+    }
+    Ok(match object.borrow().props.get(name).map(|p| p.value()) {
+        Some(Value::Str(value)) if !value.is_empty() => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn string_array<T: Into<crate::lstr::LStr>>(i: &mut Interp, values: Vec<T>) -> Value {
+    i.make_array(values.into_iter().map(Value::str).collect())
+}
+
+/// ECMA-402 CalendarsOfLocale, using UTS #35 Calendar Preference Data.
+fn calendars_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
+    let tag = slot(i, this, "__locale_tag")?;
+    if let Some(calendar) = locale_keyword(i, this, "__locale_ca")? {
+        return Ok(string_array(i, vec![calendar]));
+    }
+    let preference = region_preference(&tag);
+    for region in preference
+        .region_override
+        .iter()
+        .chain(std::iter::once(&preference.region))
+    {
+        if let Some(calendars) = crate::cldr_locale_info::calendar_preferences(region) {
+            if !calendars.is_empty() {
+                return Ok(string_array(i, calendars));
+            }
+        }
+    }
+    Ok(string_array(i, vec!["gregory"]))
+}
+
+/// ECMA-402 CollationsOfLocale. Locale data is shared with `Intl.Collator`; unavailable languages
+/// use the specification's fixed root list.
+fn collations_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
+    let tag = slot(i, this, "__locale_tag")?;
+    if let Some(collation) = locale_keyword(i, this, "__locale_co")? {
+        return Ok(string_array(i, vec![collation]));
+    }
+    let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
+    let collations = if super::service::supported_language(&parsed.language) {
+        super::collator::supported_collations(&parsed.language)
+    } else {
+        vec!["emoji", "eor"]
+    };
+    Ok(string_array(i, collations))
+}
+
+/// ECMA-402 HourCyclesOfLocale, using UTS #35 Time Data. Language-region entries take precedence
+/// over region-only entries, and the region override is attempted before the ordinary region.
+fn hour_cycles_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
+    let tag = slot(i, this, "__locale_tag")?;
+    if let Some(hour_cycle) = locale_keyword(i, this, "__locale_hc")? {
+        return Ok(string_array(i, vec![hour_cycle]));
+    }
+    let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
+    let preference = region_preference(&tag);
+    for region in preference
+        .region_override
+        .iter()
+        .chain(std::iter::once(&preference.region))
+    {
+        let locale_key = format!("{}_{}", parsed.language, region);
+        if let Some(cycles) = crate::cldr_locale_info::hour_cycles(&locale_key)
+            .or_else(|| crate::cldr_locale_info::hour_cycles(region))
+        {
+            if !cycles.is_empty() {
+                return Ok(string_array(i, cycles));
+            }
+        }
+    }
+    Ok(string_array(i, vec!["h23"]))
+}
+
+/// ECMA-402 WeekInfoOfLocale, using UTS #35 Week Data and applying an `fw` override only after the
+/// regional record has been selected.
+fn week_info_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
+    let tag = slot(i, this, "__locale_tag")?;
+    let preference = region_preference(&tag);
+    let lookup_region = preference
+        .region_override
+        .as_deref()
+        .unwrap_or(&preference.region);
+    let (mut first_day, weekend) = crate::cldr_locale_info::week_info(lookup_region);
+    if let Some(first_day_override) = locale_keyword(i, this, "__locale_fw")? {
+        if let Some(value) = fw_to_num(&first_day_override) {
+            first_day = value as u8;
+        }
+    }
+    let object = i.new_object();
+    set_data(&object, "firstDay", Value::Num(first_day.into()));
+    let weekend = weekend
+        .into_iter()
+        .map(|day| Value::Num(day.into()))
+        .collect();
+    set_data(&object, "weekend", i.make_array(weekend));
+    Ok(Value::Obj(object))
 }
 
 /// The value list for a `getX` info method: `[keyword]` if the locale carries that keyword, else the

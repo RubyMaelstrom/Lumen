@@ -62,6 +62,8 @@ mod umalqura;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_likely;
+#[cfg(feature = "intl")]
+mod cldr_locale_info;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_dates;

@@ -8,6 +8,11 @@ use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, set_data, Gc, Value};
 
+const COLLATIONS: [&str; 15] = [
+    "compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "reformed", "searchjl",
+    "stroke", "trad", "unihan", "zhuyin", "big5han", "gb2312",
+];
+
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "Collator", 0, construct);
     install_supported_locales(it, &ctor);
@@ -90,10 +95,6 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         .unwrap_or_else(|| "false".to_string());
     // The `-u-co-` value must be a known collation type (never the reserved standard/search); an
     // unknown one falls back to "default".
-    const COLLATIONS: [&str; 15] = [
-        "compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "reformed", "searchjl",
-        "stroke", "trad", "unihan", "zhuyin", "big5han", "gb2312",
-    ];
     // A collation is *supported* per locale (phonebk for German; eor broadly). The `collation`
     // option overrides the -u-co extension when supported; an unsupported value is ignored.
     let res_lang = resolved
@@ -389,4 +390,16 @@ fn supported_collation(lang: &str, c: &str) -> bool {
         "pinyin" | "stroke" | "zhuyin" | "big5han" | "gb2312" | "unihan" => lang == "zh",
         _ => false,
     }
+}
+
+/// The non-default entries in this locale's `%Intl.Collator%.[[SortLocaleData]].[[co]]`, sorted as
+/// required by ECMA-402 CollationsOfLocale.
+pub(super) fn supported_collations(lang: &str) -> Vec<&'static str> {
+    let mut collations = COLLATIONS
+        .iter()
+        .copied()
+        .filter(|collation| supported_collation(lang, collation))
+        .collect::<Vec<_>>();
+    collations.sort_unstable();
+    collations
 }
