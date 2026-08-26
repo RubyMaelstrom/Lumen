@@ -7569,8 +7569,9 @@ impl Interp {
         result
     }
 
-    /// Start a generator: spawn its coroutine (parked until the first `next`) and return the
-    /// generator object. The body runs lazily on its own thread, suspending at each `yield`.
+    /// Start a generator in suspended-start and return its object. The native coroutine is itself
+    /// allocated lazily on the first `next`; a never-resumed generator therefore consumes no OS
+    /// thread or native stack, matching ECMA-262 GeneratorStart/GeneratorResume.
     fn run_generator(
         &mut self,
         func: &Rc<Function>,
@@ -7630,15 +7631,7 @@ impl Interp {
             i.tco_ok = saved_tco;
             outcome
         });
-        let ptr = self as *mut Interp;
-        let coro = match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)) {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(Abrupt::Throw(
-                    self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG),
-                ))
-            }
-        };
+        let coro = crate::coroutine::lazy_coroutine(crate::coroutine::SendBody(body));
         let obj = self.make_generator(is_async, gen_proto);
         if let Value::Obj(o) = &obj {
             self.gc_pin(o);

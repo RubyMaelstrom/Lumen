@@ -101,6 +101,9 @@ pub fn in_async_gen() -> bool {
 /// bytecode [`VmCoro`](crate::bytecode::VmCoro) (async bodies that compile) — both drive the same
 /// way, so `drive_async`/`drive_generator` are agnostic.
 pub enum Coroutine {
+    /// A generator in the ECMA-262 suspended-start state. Its execution context is represented by
+    /// the captured body, but no native stack is reserved until the first actual resumption.
+    Lazy(LazyCoro),
     Thread(ThreadCoro),
     Vm(crate::bytecode::VmCoro),
 }
@@ -109,14 +112,54 @@ impl Coroutine {
     #[inline]
     pub(crate) fn resume(&mut self, i: &mut Interp, signal: Resume) -> Suspend {
         match self {
+            Coroutine::Lazy(_) => self.resume_lazy(i, signal),
             Coroutine::Thread(c) => c.resume(i, signal),
             Coroutine::Vm(c) => c.resume(i, signal),
         }
     }
+
+    /// Materialize a suspended-start generator's native execution context only when GeneratorResume
+    /// actually runs it. GeneratorResumeAbrupt with return/throw completes it without allocating or
+    /// evaluating the body (ECMA-262 GeneratorResumeAbrupt).
+    fn resume_lazy(&mut self, i: &mut Interp, signal: Resume) -> Suspend {
+        let placeholder = Coroutine::Lazy(LazyCoro {
+            body: None,
+            done: true,
+            started: false,
+        });
+        let Coroutine::Lazy(mut lazy) = std::mem::replace(self, placeholder) else {
+            unreachable!()
+        };
+        let result = match signal {
+            Resume::Next(value) => {
+                lazy.started = true;
+                let body = lazy
+                    .body
+                    .take()
+                    .expect("a suspended-start coroutine retains its body");
+                match spawn_coroutine(i as *mut Interp, body) {
+                    Ok(mut running) => {
+                        let result = running.resume(i, Resume::Next(value));
+                        *self = running;
+                        return result;
+                    }
+                    Err(_) => Suspend::Throw(i.make_error("Error", UNSUPPORTED_MSG)),
+                }
+            }
+            Resume::Return(value) => Suspend::Done(value),
+            Resume::Throw(error) => Suspend::Throw(error),
+            Resume::Terminate => Suspend::Done(Value::Undefined),
+        };
+        lazy.done = true;
+        *self = Coroutine::Lazy(lazy);
+        result
+    }
+
     /// Whether the body has finished (further resumes are no-ops).
     #[inline]
     pub fn done(&self) -> bool {
         match self {
+            Coroutine::Lazy(c) => c.done,
             Coroutine::Thread(c) => c.done,
             Coroutine::Vm(c) => c.done,
         }
@@ -125,6 +168,7 @@ impl Coroutine {
     #[inline]
     pub fn started(&self) -> bool {
         match self {
+            Coroutine::Lazy(c) => c.started,
             Coroutine::Thread(c) => c.started,
             Coroutine::Vm(c) => c.started,
         }
@@ -132,10 +176,33 @@ impl Coroutine {
 
     /// Acknowledge teardown of a thread-backed suspended body before its interpreter disappears.
     pub(crate) fn terminate(&mut self, i: &mut Interp) {
-        if let Coroutine::Thread(c) = self {
-            c.terminate(i);
+        match self {
+            Coroutine::Lazy(c) => {
+                c.body.take();
+                c.done = true;
+            }
+            Coroutine::Thread(c) => c.terminate(i),
+            Coroutine::Vm(_) => {}
         }
     }
+}
+
+/// A generator's not-yet-resumed execution state. Keeping this closure is equivalent to the
+/// specification's suspended execution context while avoiding one large native stack per inert
+/// generator object.
+pub struct LazyCoro {
+    body: Option<SendBody>,
+    done: bool,
+    started: bool,
+}
+
+/// Create a suspended-start coroutine without allocating an OS worker.
+pub fn lazy_coroutine(body: SendBody) -> Coroutine {
+    Coroutine::Lazy(LazyCoro {
+        body: Some(body),
+        done: false,
+        started: false,
+    })
 }
 
 /// An OS-thread-backed coroutine (a pooled worker runs the body; see [`spawn_coroutine`]).
