@@ -17082,11 +17082,11 @@ fn inline_throw_from_spliced_body() {
 }
 
 #[test]
-fn inline_chunks_do_not_enter_direct_shared_context_calls() {
+fn speculative_inlining_keeps_direct_shared_context_calls_disabled() {
     // Regression for the Test262 resizable-buffer crash cluster: once both functions gained
-    // second-stage bodies, a first-stage caller could direct-enter an inlined callee and restore
-    // a generated-code address into ARM64's callee-saved x19 JitCtx register. Repeated typed-array
-    // mutation makes both sides hot and crosses the default inline threshold.
+    // second-stage bodies, combining direct calls with inlining could restore a generated-code
+    // address into ARM64's callee-saved x19 JitCtx register. Repeated typed-array mutation makes
+    // both sides hot and crosses the default inline threshold.
     assert_eq!(
         run_jit(
             "function maybeBigInt(ta, value) {

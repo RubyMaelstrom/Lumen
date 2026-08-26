@@ -2255,11 +2255,11 @@ fn compile_inner(
 /// How many machine-code runs of a chunk trigger the one-shot speculative inline recompile.
 ///
 /// ARM64 native-crash stress traced the former wrong-result/SIGBUS/SIGSEGV failures to combining
-/// speculative-inline bodies with direct shared-context JIT calls. Those transitions are excluded
-/// in both directions by `jit_has_inline_targets`/`jit_direct_flags`; ordinary JIT calls preserve
-/// the AAPCS64 frame boundary there. The mitigated inliner passed the full current Test262 checkout,
-/// differential coverage, and repeated native-crash stress before this production default was
-/// restored. `LUMEN_INLINE_AT=0` remains the diagnostic off switch.
+/// speculative inlining with direct shared-context JIT calls. The two optimizations are therefore
+/// mutually exclusive process-wide: ordinary JIT calls preserve the AAPCS64 frame boundary while
+/// inlining is active. The mitigated inliner passed the full current Test262 checkout, differential
+/// coverage, and repeated native-crash stress before this production default was restored.
+/// `LUMEN_INLINE_AT=0` disables inlining and makes direct calls eligible again.
 pub(crate) fn inline_recompile_at() -> u32 {
     static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
@@ -6161,16 +6161,6 @@ impl Chunk {
         &self.inline_targets[t as usize]
     }
 
-    /// Whether this is a second-stage body containing speculative call-site splices.
-    ///
-    /// ARM64 direct shared-context calls currently cannot safely run from these bodies: native
-    /// crash stress found their nested frame transition restoring a generated-code address into
-    /// `x19` instead of the caller's [`crate::jit::JitCtx`]. AAPCS64 makes `x19` callee-saved, so
-    /// the JIT must retain the ordinary call path until that combined frame transition is proven
-    /// to preserve it. First-stage chunks keep the independent direct-call optimization.
-    pub(crate) fn jit_has_inline_targets(&self) -> bool {
-        !self.inline_targets.is_empty()
-    }
     /// The interned name a property op refers to (the emitter gates array-receiver inlining on
     /// whether it could be an element key).
     pub(crate) fn jit_name(&self, n: u32) -> &str {
@@ -6832,11 +6822,12 @@ impl Chunk {
     }
     /// [`CallIc::direct`] gates for this chunk (see its docs).
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
-        // A normal first-stage caller can otherwise direct-enter a second-stage body. That is the
-        // other half of the unsafe direct-call/speculative-inline combination documented by
-        // `jit_has_inline_targets`: leave bit 0 clear so the generated caller takes its ordinary
-        // committed-call helper, whose Rust/JIT boundary preserves the AAPCS64 frame contract.
-        if self.jit_has_inline_targets() {
+        // Direct shared-context calls and speculative inlining are process-wide alternatives.
+        // Leave bit 0 clear while inlining is eligible so every generated caller takes the
+        // ordinary committed-call helper, whose Rust/JIT boundary preserves the AAPCS64 frame
+        // contract. `LUMEN_INLINE_AT=0` restores direct-call eligibility for diagnostics and
+        // dedicated coverage.
+        if inline_recompile_at() != 0 {
             return 0;
         }
         let mut f = 1u8;
