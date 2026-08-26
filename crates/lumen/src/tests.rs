@@ -17105,7 +17105,7 @@ fn inline_throw_from_spliced_body() {
 }
 
 #[test]
-fn speculative_inlining_keeps_direct_shared_context_calls_disabled() {
+fn speculative_inlining_and_direct_calls_discard_callee_handlers() {
     // Regression for the Test262 resizable-buffer crash cluster. A directly called assertion
     // helper can return from inside `try`, bypassing its lexical PopHandler; its teardown must
     // remove that stale handler before a later typed-array TypeError unwinds in the caller.

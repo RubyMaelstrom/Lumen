@@ -2253,13 +2253,6 @@ fn compile_inner(
 }
 
 /// How many machine-code runs of a chunk trigger the one-shot speculative inline recompile.
-///
-/// ARM64 native-crash stress traced the former wrong-result/SIGBUS/SIGSEGV failures to combining
-/// speculative inlining with direct shared-context JIT calls. The two optimizations are therefore
-/// mutually exclusive process-wide: ordinary JIT calls preserve the AAPCS64 frame boundary while
-/// inlining is active. The mitigated inliner passed the full current Test262 checkout, differential
-/// coverage, and repeated native-crash stress before this production default was restored.
-/// `LUMEN_INLINE_AT=0` disables inlining and makes direct calls eligible again.
 pub(crate) fn inline_recompile_at() -> u32 {
     static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
@@ -2270,19 +2263,12 @@ pub(crate) fn inline_recompile_at() -> u32 {
     })
 }
 
-/// Diagnostic level for combining speculative inlining with ARM64 direct shared-context calls.
-/// `1` recreates the former per-chunk boundary (inlined bodies remain ineligible); `all` also
-/// permits direct entry to and calls from those bodies. Production remains at 0 until both levels
-/// complete native-crash, differential, and conformance stress after the cross-thread TLS fix.
-pub(crate) fn inline_direct_diagnostic_level() -> u8 {
-    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(
-        || match std::env::var("LUMEN_UNSAFE_INLINE_DIRECT").as_deref() {
-            Ok("all") => 2,
-            Ok(_) => 1,
-            Err(_) => 0,
-        },
-    )
+/// Whether the ARM64 JIT may enter another compiled function through the shared activation.
+/// This is a diagnostic kill switch, not a tier choice: ordinary layered JIT calls remain active
+/// when it is disabled.
+pub(crate) fn direct_shared_context_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LUMEN_JIT_NO_DIRECT_CALLS").is_none())
 }
 
 /// Build the speculative-inline plan for a hot chunk: for each monomorphic, filled call site,
@@ -6176,11 +6162,6 @@ impl Chunk {
         &self.inline_targets[t as usize]
     }
 
-    /// Whether this second-stage body contains speculative call-site splices.
-    pub(crate) fn jit_has_inline_targets(&self) -> bool {
-        !self.inline_targets.is_empty()
-    }
-
     /// The interned name a property op refers to (the emitter gates array-receiver inlining on
     /// whether it could be an element key).
     pub(crate) fn jit_name(&self, n: u32) -> &str {
@@ -6842,15 +6823,7 @@ impl Chunk {
     }
     /// [`CallIc::direct`] gates for this chunk (see its docs).
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
-        // Direct shared-context calls and speculative inlining are process-wide alternatives.
-        // Leave bit 0 clear while inlining is eligible so every generated caller takes the
-        // ordinary committed-call helper, whose Rust/JIT boundary preserves the AAPCS64 frame
-        // contract. `LUMEN_INLINE_AT=0` restores direct-call eligibility for diagnostics and
-        // dedicated coverage.
-        let combined = inline_direct_diagnostic_level();
-        if inline_recompile_at() != 0
-            && (combined == 0 || (combined == 1 && self.jit_has_inline_targets()))
-        {
+        if !direct_shared_context_enabled() {
             return 0;
         }
         let mut f = 1u8;

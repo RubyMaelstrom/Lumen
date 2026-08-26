@@ -30,14 +30,12 @@ immediately if the body contains a loop. Force the reference tree-walker with `-
 
 The base JIT and its second-stage speculative whole-function inliner are enabled by default. A hot
 chunk is considered for a one-shot inline recompile after 100 machine-code runs. ARM64 direct
-shared-context calls are disabled while speculative inlining is active: combining the two
-optimizations violated the platform's callee-saved-register contract, while ordinary JIT calls
-preserve nearly all of the inliner's performance gain. `LUMEN_INLINE_AT=N` changes the trigger;
-`LUMEN_INLINE_AT=0` disables inlining and restores direct-call eligibility. For ABI debugging,
-`LUMEN_UNSAFE_INLINE_DIRECT=1` recreates the earlier per-chunk exclusion, while `=all` additionally
-allows direct calls into and out of visibly inlined bodies. These are validation modes for the
-cross-thread JIT/TLS repair and must not be used for production workloads until the combined path
-has completed native-crash, differential, and conformance stress.
+shared-context calls and speculative inlining compose by default. Direct activations bind
+thread-local GC state at execution time and discard callee-owned exception handlers before
+restoring the caller; these boundaries keep reusable generated code and early returns from leaking
+activation state across calls. `LUMEN_INLINE_AT=N` changes the inlining trigger, and
+`LUMEN_INLINE_AT=0` disables inlining. `LUMEN_JIT_NO_DIRECT_CALLS=1` retains ordinary layered JIT
+calls while disabling only the shared-context fast path for diagnostics.
 
 The language surface: generators and `async`/`await` running on stackful coroutines (async
 bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` and inline

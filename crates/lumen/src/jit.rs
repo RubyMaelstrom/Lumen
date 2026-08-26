@@ -1501,19 +1501,10 @@ pub fn compile(
     let array_intrinsics_on = std::env::var_os("LUMEN_JIT_NO_ARRAY_INTRINSICS").is_none();
     let function_call_intrinsic_on =
         std::env::var_os("LUMEN_JIT_NO_FUNCTION_CALL_INTRINSIC").is_none();
-    // Direct shared-ctx calls, on by default like every other emitter feature (mask bit 20
-    // off for debugging). Requires the inline call probe (bit 524288) to emit at all.
-    // Keep two independently-correct optimizations out of their unsafe combined frame transition.
-    // AAPCS64 requires x19 (our JitCtx register) to survive every callee; native browser and
-    // Test262 crash cores show the combination can restore a generated-code address there even
-    // when neither side is itself an inlined body. Ordinary JIT calls preserve the inliner's
-    // semantics, so make the optimizations process-wide alternatives. `LUMEN_INLINE_AT=0` selects
-    // direct calls; a nonzero threshold selects speculative inlining.
-    let combined = crate::bytecode::inline_direct_diagnostic_level();
-    let direct_on = fast & (1 << 20) != 0
-        && (crate::bytecode::inline_recompile_at() == 0
-            || combined == 2
-            || (combined == 1 && !chunk.jit_has_inline_targets()));
+    // Direct shared-ctx calls, on by default like every other emitter feature (mask bit 20 off
+    // for debugging). Requires the inline call probe (bit 524288) to emit at all. The readable
+    // kill switch preserves an emergency layered-call path independently of the numeric mask.
+    let direct_on = fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled();
     // Whether the probed layout supports inline refcount bumps/decs (clone/drop of Str/Sym/Obj
     // without a helper call). All strong-count templates gate on this.
     let rc_ok = layout.valid && layout.rc_strong_off < 256;
