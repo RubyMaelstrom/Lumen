@@ -40,6 +40,12 @@ struct Lexer<'a> {
     /// Set when a `class` keyword is pushed: the next `{` is the class body, classified by
     /// whether the class was a declaration (statement position) or an expression.
     pending_class: Option<bool>,
+    /// One entry per open `(`: `true` when it begins the head of a control statement whose
+    /// matching `)` is followed by a Statement. ECMA-262 selects the `InputElementRegExp` lexical
+    /// goal there, unlike an ordinary grouping/call close where `/` is division.
+    control_paren_stack: Vec<bool>,
+    /// Classification of the most recently closed `)`, used until the next significant token.
+    last_close_control: bool,
 }
 
 /// Tokenize `src`. A lex error is reported as a SyntaxError by the caller.
@@ -65,6 +71,8 @@ pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexEr
         last_close_block: false,
         pending_fn: Vec::new(),
         pending_class: None,
+        control_paren_stack: Vec::new(),
+        last_close_control: false,
     };
     lx.run()?;
     Ok(lx.out)
@@ -113,10 +121,12 @@ impl<'a> Lexer<'a> {
             // division right after a bare `await`/`yield` *identifier* is vanishingly rare.
             Some(Tok::Ident(w)) => matches!(w.as_str(), "await" | "yield"),
             Some(Tok::Keyword(k)) => !matches!(*k, "this" | "super" | "true" | "false" | "null"),
-            // A `/` after `)` or `]` is division; after `}` it depends on whether the `}` closed a
-            // block (statement → regex) or an object literal (value → division).
+            // A `/` after an ordinary grouping/call `)` or a `]` is division. A control-statement
+            // head `)` is followed by a Statement and therefore admits a regex literal. After `}`
+            // it depends on whether the brace closed a block or an object literal.
             Some(Tok::Punct(p)) => match *p {
-                ")" | "]" => false,
+                ")" => self.last_close_control,
+                "]" => false,
                 "}" => self.last_close_block,
                 _ => true,
             },
@@ -180,6 +190,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn push(&mut self, kind: Tok) {
+        let closes_control = matches!(&kind, Tok::Punct(")"))
+            && self.control_paren_stack.last().copied().unwrap_or(false);
         match &kind {
             Tok::Keyword(k) if *k == "function" => {
                 let is_expr = !self.function_is_declaration();
@@ -200,8 +212,34 @@ impl<'a> Lexer<'a> {
             Tok::Punct(p) if *p == "}" => {
                 self.last_close_block = self.brace_stack.pop().unwrap_or(false);
             }
+            Tok::Punct(p) if *p == "(" => {
+                let before_keyword = self
+                    .out
+                    .get(self.out.len().saturating_sub(2))
+                    .map(|token| &token.kind);
+                // Reserved words are valid property names (`promise.catch(...)`). Such a call
+                // closes in value position and must not be mistaken for a control head.
+                let keyword_is_member = matches!(before_keyword, Some(Tok::Punct("." | "?.")));
+                let starts_control = match self.out.last().map(|token| &token.kind) {
+                    Some(Tok::Keyword(keyword)) => {
+                        (!keyword_is_member
+                            && matches!(
+                                *keyword,
+                                "if" | "while" | "for" | "with" | "switch" | "catch"
+                            ))
+                            || (*keyword == "await"
+                                && matches!(before_keyword, Some(Tok::Keyword("for"))))
+                    }
+                    _ => false,
+                };
+                self.control_paren_stack.push(starts_control);
+            }
+            Tok::Punct(p) if *p == ")" => {
+                let _ = self.control_paren_stack.pop();
+            }
             _ => {}
         }
+        self.last_close_control = closes_control;
         let nl = self.nl_pending;
         self.nl_pending = false;
         self.out.push(Token {

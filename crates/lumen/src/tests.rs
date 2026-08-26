@@ -1006,6 +1006,34 @@ fn regex() {
 }
 
 #[test]
+fn regex_literal_can_begin_a_control_statement_body() {
+    // ECMA-262 uses the InputElementRegExp lexical goal after a control-statement head. This exact
+    // brace-free for-of shape is emitted by Archive.org's production bundle.
+    assert_eq!(
+        run("let found = 0;
+             for (let [key, value] of [['and[4]', 1]])
+                 /and\\[\\d+\\]/.test(key) ? found += value : 0;
+             String(found)"),
+        "1"
+    );
+    assert_eq!(
+        run("let count = 0;
+             if (true) /x/.test('x') && count++;
+             while (count < 2) /x/.test('x') && count++;
+             for (; count < 3;) /x/.test('x') && count++;
+             String(count)"),
+        "3"
+    );
+    // An ordinary grouping close remains a value position: this slash is division.
+    assert_eq!(run("String((12) / 3)"), "4");
+    // A control keyword used as a property name is also an ordinary call, not a control head.
+    assert_eq!(
+        run("let promise = { catch() { return 12; } }; String(promise.catch() / 3)"),
+        "4"
+    );
+}
+
+#[test]
 fn bigint() {
     assert_eq!(run("typeof 10n"), "bigint");
     assert_eq!(run("(10n + 20n).toString()"), "30");
