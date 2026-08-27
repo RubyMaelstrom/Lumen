@@ -544,6 +544,10 @@ fn template_literals() {
         "name: q, up: Q"
     );
     assert_eq!(run("`nested ${`a${1}b`} end`"), "nested a1b end");
+    assert_eq!(
+        run("`${[1, 2].map(x => `a${`b${x}`}c`).join('|')}`"),
+        "ab1c|ab2c"
+    );
     assert_eq!(run("`${[1,2,3].map(x=>x*2).join(',')}`"), "2,4,6");
 }
 

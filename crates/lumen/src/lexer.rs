@@ -633,23 +633,7 @@ impl<'a> Lexer<'a> {
                 }
                 Some('`') => {
                     src.push('`');
-                    // Nested template: copy verbatim to its closing backtick (one level).
-                    loop {
-                        match self.bump() {
-                            None => return Err(self.err("unterminated nested template")),
-                            Some('\\') => {
-                                src.push('\\');
-                                if let Some(c) = self.bump() {
-                                    src.push(c);
-                                }
-                            }
-                            Some('`') => {
-                                src.push('`');
-                                break;
-                            }
-                            Some(c) => src.push(c),
-                        }
-                    }
+                    self.copy_template_tail(&mut src)?;
                     last_sig = Some(')');
                 }
                 Some(c) => {
@@ -658,6 +642,39 @@ impl<'a> Lexer<'a> {
                         last_sig = Some(c);
                     }
                 }
+            }
+        }
+    }
+
+    /// Copy the remainder of a nested template literal after its opening backtick.
+    ///
+    /// ECMA-262 §12.9.6 switches from TemplateCharacters to ordinary expression tokens at `${`,
+    /// then uses the TemplateSubstitutionTail lexical goal after the matching `}`. Recursing
+    /// through [`read_template_sub`](Self::read_template_sub) preserves that goal transition for
+    /// arbitrarily nested templates instead of mistaking an inner template's backtick for the end
+    /// of its parent.
+    fn copy_template_tail(&mut self, out: &mut String) -> Result<(), LexError> {
+        loop {
+            match self.bump() {
+                None => return Err(self.err("unterminated nested template")),
+                Some('\\') => {
+                    out.push('\\');
+                    let c = self
+                        .bump()
+                        .ok_or_else(|| self.err("unterminated nested template"))?;
+                    out.push(c);
+                }
+                Some('$') if self.peek() == Some('{') => {
+                    out.push_str("${");
+                    self.bump(); // '{'
+                    out.push_str(&self.read_template_sub()?);
+                    out.push('}');
+                }
+                Some('`') => {
+                    out.push('`');
+                    return Ok(());
+                }
+                Some(c) => out.push(c),
             }
         }
     }
