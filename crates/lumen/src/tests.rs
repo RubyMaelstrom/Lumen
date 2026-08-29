@@ -6078,6 +6078,217 @@ fn class_definitions_do_not_force_native_coroutines() {
         }
     }
 }
+
+#[test]
+fn suspending_class_heritage_and_computed_names_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "class StagedClassParent{base(){return 2}}
+             globalThis.stagedClassLog=[];
+             globalThis.StagedClassParentProxy=new Proxy(StagedClassParent,{
+               get(target,key,receiver){
+                 if(key==='prototype')stagedClassLog.push('prototype');
+                 return Reflect.get(target,key,receiver);
+               }
+             });
+             function* stagedClass(){
+               let heritageClosure,privateReader;
+               class C extends (heritageClosure=()=>C,yield 'heritage'){
+                 #value=7;
+                 [(stagedClassLog.push('key'),privateReader=value=>value.#value,yield 'method')](){
+                   return super.base();
+                 }
+               }
+               return [Object.getPrototypeOf(C)===StagedClassParentProxy,
+                 heritageClosure()===C,privateReader(new C()),new C().method(),C.name,
+                 stagedClassLog.join(',')].join('|');
+             }
+             globalThis.stagedClassIterator=stagedClass();",
+            false,
+        )
+        .expect("staged class continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var iterator=stagedClassIterator,
+                 first=iterator.next(),second=iterator.next(StagedClassParentProxy),
+                 third=iterator.next('method');
+             [first.value,second.value,third.value,third.done].join('~')",
+            false,
+        )
+        .expect("staged class continuation drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "heritage~method~true|true|7|2|C|prototype,key~true")
+        }
+        Completion::Throw { name, message } => {
+            panic!("staged class continuation drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn suspending_class_abrupt_completion_restores_the_vm_environment() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* inferredClass(){
+               const Named=class extends (yield 'parent'){};
+               return Named.name;
+             }
+             function* abandonedClass(){
+               class NeverDefined extends (yield 'abandon'){}
+               return 'unreachable';
+             }
+             globalThis.inferredClassIterator=inferredClass();
+             globalThis.abandonedClassIterator=abandonedClass();",
+            false,
+        )
+        .expect("class cleanup setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var inferred=inferredClassIterator,abandoned=abandonedClassIterator,
+                 a=inferred.next(),b=inferred.next(class {}),
+                 c=abandoned.next(),d=abandoned.return(9);
+             [a.value,b.value,b.done,c.value,d.value,d.done].join('|')",
+            false,
+        )
+        .expect("class cleanup drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "parent|Named|true|abandon|9|true")
+        }
+        Completion::Throw { name, message } => {
+            panic!("class cleanup drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn suspending_classes_preserve_strict_tdz_and_heritage_abrupt_order() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.classAbruptLog=[];
+             function* classTdz(){
+               try{class Self extends (yield Self){}}
+               catch(error){return error.name}
+             }
+             function* classStrict(){
+               try{class Strict extends (yield 'parent'){
+                 [(classContinuationUndeclared=1,yield 'key')](){}
+               }}catch(error){return error.name}
+             }
+             function* classPrototypeAbrupt(){
+               try{class Broken extends (yield 'parent'){
+                 [(classAbruptLog.push('key'),'method')](){}
+               }}catch(error){return error.message}
+             }
+             function* classStaticPrototype(){
+               try{class Invalid extends (yield 'parent'){
+                 static [(yield 'static-key')](){}
+                 [(classAbruptLog.push('later-key'),'later')](){}
+               }}catch(error){return error.name}
+             }
+             globalThis.classTdzIterator=classTdz();
+             globalThis.classStrictIterator=classStrict();
+             globalThis.classPrototypeIterator=classPrototypeAbrupt();
+             globalThis.classStaticPrototypeIterator=classStaticPrototype();",
+            false,
+        )
+        .expect("class abrupt-order setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var t=classTdzIterator,s=classStrictIterator,p=classPrototypeIterator,
+                 x=classStaticPrototypeIterator,
+                 ta=t.next(),sa=s.next(),sb=s.next(class {}),pa=p.next(),
+                 throwingParent=new Proxy(class {},{get(target,key,receiver){
+                   if(key==='prototype')throw new Error('prototype boom');
+                   return Reflect.get(target,key,receiver)
+                 }}),pb=p.next(throwingParent),xa=x.next(),xb=x.next(class {}),
+                 xc=x.next('prototype');
+             [ta.value,ta.done,sa.value,sb.value,sb.done,pa.value,pb.value,pb.done,
+              xa.value,xb.value,xc.value,xc.done,classAbruptLog.join(','),
+              typeof classContinuationUndeclared].join('|')",
+            false,
+        )
+        .expect("class abrupt-order drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "ReferenceError|true|parent|ReferenceError|true|parent|prototype boom|true|parent|static-key|TypeError|true||undefined"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("class abrupt-order drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn async_class_heritage_and_keys_park_in_vm_state() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var releaseClassHeritage,releaseClassKey,classAsyncResult='pending',
+                 classHeritageGate=new Promise(resolve=>releaseClassHeritage=resolve),
+                 classKeyGate=new Promise(resolve=>releaseClassKey=resolve);
+             class AsyncClassParent{base(){return 3}}
+             (async()=>{
+               const Named=class extends (await classHeritageGate){
+                 [(await classKeyGate)](){return super.base()+4}
+               };
+               return [Named.name,new Named().method()].join('|');
+             })().then(value=>classAsyncResult=value);",
+            false,
+        )
+        .expect("async class setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    engine
+        .eval("releaseClassHeritage(AsyncClassParent)", false)
+        .expect("async class heritage release parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    engine
+        .eval("releaseClassKey('method')", false)
+        .expect("async class key release parses");
+    match engine
+        .eval("classAsyncResult", false)
+        .expect("async class result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "Named|7"),
+        Completion::Throw { name, message } => {
+            panic!("async class drive threw {name}: {message}")
+        }
+    }
+}
+
 #[test]
 fn interleaved_call_and_construct_spreads_use_vm_continuations() {
     let mut engine = Engine::new();
@@ -8863,6 +9074,20 @@ fn decorators_runtime() {
             String(new C().x)
         "#),
         "105"
+    );
+    // The decorator extension evaluates a member's decorators after that member's key and before
+    // the following key. Class continuation staging must not reorder ordinary decorated classes.
+    assert_eq!(
+        run(r#"
+            let order = [];
+            function dec(value, context) {}
+            class C {
+                @(order.push("decorator"), dec) [(order.push("key1"), "a")]() {}
+                [(order.push("key2"), "b")]() {}
+            }
+            order.join(",")
+        "#),
+        "key1,decorator,key2"
     );
 }
 

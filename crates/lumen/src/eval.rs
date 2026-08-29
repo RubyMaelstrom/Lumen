@@ -6,6 +6,18 @@ use crate::interpreter::*;
 use crate::value::*;
 use std::rc::Rc;
 
+/// Partially evaluated ClassDefinitionEvaluation retained by a heap VM continuation while a
+/// heritage or computed-name expression is suspended. ECMA-262 §15.7.14 creates both class
+/// environments before heritage evaluation, then retains them through every class element.
+pub(crate) struct PreparedClassEvaluation {
+    pub(crate) outer_class_env: Env,
+    pub(crate) class_env: Env,
+    proto_parent: Option<Gc>,
+    ctor_parent: Option<Value>,
+    derived: bool,
+    keys: Vec<Option<crate::value::PropertyKey>>,
+}
+
 impl Interp {
     // ----- statements -------------------------------------------------------------------------
 
@@ -4327,6 +4339,41 @@ impl Interp {
     }
 
     fn eval_class_strict(&mut self, class: &Rc<Class>, env: &Env) -> Result<Value, Abrupt> {
+        let mut prepared = self.begin_class_evaluation(class, env);
+        let parent = match &class.superclass {
+            Some(expression) => Some(self.eval(expression, &prepared.outer_class_env)?),
+            None => None,
+        };
+        self.prepare_class_heritage(&mut prepared, parent)?;
+        // Lumen's decorator syntax is an extension while the TC39 proposal remains separate from
+        // ECMA-262. Preserve its established key/decorator interleaving here. Standards classes
+        // have all ClassElementNames evaluated before their definitions are installed, so their
+        // keys can be prepared up front (and suspending classes use the same staged boundary).
+        let decorated = !class.decorators.is_empty()
+            || class
+                .members
+                .iter()
+                .any(|member| !member.decorators.is_empty());
+        if !decorated {
+            for (index, member) in class.members.iter().enumerate() {
+                if member.kind == MemberKind::Constructor {
+                    continue;
+                }
+                if let PropKey::Computed(expression) = &member.key {
+                    let value = self.eval(expression, &prepared.class_env)?;
+                    self.prepare_class_key(&mut prepared, class, index, value)?;
+                }
+            }
+        }
+        self.finish_class_evaluation(class, prepared)
+    }
+
+    /// Create the lexical and private environments that precede heritage evaluation.
+    pub(crate) fn begin_class_evaluation(
+        &mut self,
+        class: &Rc<Class>,
+        env: &Env,
+    ) -> PreparedClassEvaluation {
         // The class scope opens before the heritage evaluates: a named class's own name is in
         // scope there — uninitialized (TDZ) until the constructor exists, and immutable.
         let outer_class_env = new_scope(Some(env.clone()));
@@ -4343,12 +4390,38 @@ impl Interp {
                 },
             );
         }
-        let env = &outer_class_env;
-        // Superclass and the prototype / static parents it implies.
-        let parent = match &class.superclass {
-            Some(e) => Some(self.eval(e, env)?),
-            None => None,
-        };
+        // The spec's PrivateEnvironment is also allocated before heritage but becomes active only
+        // for class elements. Lumen represents it as a child lexical record carrying unforgeable
+        // runtime private-name keys.
+        let class_env = new_scope(Some(outer_class_env.clone()));
+        for member in &class.members {
+            let source = match &member.key {
+                PropKey::Ident(name) if name.starts_with('#') => name.clone(),
+                _ => continue,
+            };
+            if !class_env.borrow().vars.contains_key(source.as_str()) {
+                self.accessor_seq += 1;
+                let runtime = format!("{}\u{1}{}", source, self.accessor_seq);
+                bind(&class_env, &source, Value::str(runtime.as_str()));
+            }
+        }
+        PreparedClassEvaluation {
+            outer_class_env,
+            class_env,
+            proto_parent: Some(self.object_proto.clone()),
+            ctor_parent: None,
+            derived: false,
+            keys: (0..class.members.len()).map(|_| None).collect(),
+        }
+    }
+
+    /// Complete the heritage portion through Get(superclass, "prototype") before any computed
+    /// member name is evaluated.
+    pub(crate) fn prepare_class_heritage(
+        &mut self,
+        prepared: &mut PreparedClassEvaluation,
+        parent: Option<Value>,
+    ) -> Result<(), Abrupt> {
         // (IsConstructor runs BEFORE any `prototype` read; a callable non-constructor like
         // %IsHTMLDDA% is a TypeError without observable gets.)
         let (proto_parent, ctor_parent): (Option<Gc>, Option<Value>) = match &parent {
@@ -4375,7 +4448,44 @@ impl Interp {
                 ));
             }
         };
-        let derived = parent.is_some();
+        prepared.proto_parent = proto_parent;
+        prepared.ctor_parent = ctor_parent;
+        prepared.derived = parent.is_some();
+        Ok(())
+    }
+
+    /// Record one already-evaluated computed ClassElementName after its single ToPropertyKey.
+    pub(crate) fn prepare_class_key(
+        &mut self,
+        prepared: &mut PreparedClassEvaluation,
+        class: &Class,
+        member: usize,
+        value: Value,
+    ) -> Result<(), Abrupt> {
+        let key = self.to_property_key(&value)?;
+        if class.members[member].is_static && key == "prototype" {
+            return Err(self.throw(
+                "TypeError",
+                "classes may not have a static property named 'prototype'",
+            ));
+        }
+        prepared.keys[member] = Some(key);
+        Ok(())
+    }
+
+    /// Finish the atomic portion of ClassDefinitionEvaluation from retained environments,
+    /// validated heritage, and precomputed keys. No expression which can suspend remains here.
+    pub(crate) fn finish_class_evaluation(
+        &mut self,
+        class: &Rc<Class>,
+        mut prepared: PreparedClassEvaluation,
+    ) -> Result<Value, Abrupt> {
+        let outer_class_env = prepared.outer_class_env;
+        let class_env = prepared.class_env;
+        let proto_parent = prepared.proto_parent;
+        let ctor_parent = prepared.ctor_parent;
+        let derived = prepared.derived;
+        let env = &outer_class_env;
 
         let proto = Object::new(proto_parent.clone());
 
@@ -4395,24 +4505,8 @@ impl Interp {
             ctor_func
         };
 
-        // Environments that carry the `super` bindings into methods/fields.
-        let class_env = new_scope(Some(env.clone()));
-        // The spec's PrivateEnvironment: each class *evaluation* mints fresh runtime keys for its
-        // private names and binds source name -> key in the class scope. `#x` in this class's code
-        // resolves through the scope chain, so an instance of a different evaluation of the same
-        // class source fails the brand check (and nested classes shadow outer private names).
-        for m in &class.members {
-            let src = match &m.key {
-                PropKey::Ident(n) if n.starts_with('#') => n.clone(),
-                _ => continue,
-            };
-            let seen = class_env.borrow().vars.contains_key(src.as_str());
-            if !seen {
-                self.accessor_seq += 1;
-                let runtime = format!("{}\u{1}{}", src, self.accessor_seq);
-                bind(&class_env, &src, Value::str(runtime.as_str()));
-            }
-        }
+        // Environments that carry the `super` and already-minted private-name bindings into
+        // methods/fields.
         let inst_env = new_scope(Some(class_env.clone()));
         // Instance members' [[HomeObject]] is the prototype: `super.x` resolves against its
         // *live* [[GetPrototypeOf]].
@@ -4501,13 +4595,16 @@ impl Interp {
         let mut static_els: Vec<StaticEl> = Vec::new();
         let mut instance_inits: Vec<Value> = Vec::new();
         let mut static_inits: Vec<Value> = Vec::new();
-        for m in &class.members {
+        for (member_index, m) in class.members.iter().enumerate() {
             if m.kind == MemberKind::Constructor {
                 continue;
             }
             // Computed keys evaluate with the class's PrivateEnvironment active: an arrow made
             // inside one may capture `A.#x` (class_env holds the runtime private-name bindings).
-            let key = self.eval_prop_key(&m.key, &class_env)?;
+            let key = match prepared.keys[member_index].take() {
+                Some(key) => key,
+                None => self.eval_prop_key(&m.key, &class_env)?,
+            };
             // A *computed* static member key evaluating to "prototype" is a runtime TypeError
             // (the syntactic form is already an early error).
             if m.is_static && key == "prototype" && matches!(m.key, PropKey::Computed(_)) {

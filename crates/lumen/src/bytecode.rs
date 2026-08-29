@@ -716,6 +716,18 @@ pub enum Op {
     /// Retained uncommon expression evaluated through the normative tree-walker against a
     /// projected view of this VM frame. Direct yield/await never enters this bridge.
     EvalExpr(u32),
+    /// Staged ECMA-262 ClassDefinitionEvaluation for a heritage or computed name which suspends.
+    /// The plan index also selects one continuation-local in-progress state slot.
+    ClassStart(u32),
+    /// Consume the evaluated heritage (the bool says it was syntactically present), validate it,
+    /// perform the observable `prototype` read, and activate the retained private environment.
+    ClassHeritage(u32, bool),
+    /// Consume and ToPropertyKey one computed member name in source order.
+    ClassKey(u32, u16),
+    /// Finish the non-suspending class body and push its constructor value.
+    ClassFinish(u32),
+    /// Abandon a partially evaluated class on any abrupt completion and restore the outer env.
+    ClassAbort(u32),
     /// Pop a value, perform ToObject, and install a `with` Object Environment Record above the
     /// continuation's current lexical environment. `PopEnv` restores its parent on every normal
     /// or abrupt exit through the compiler's completion-aware cleanup pads.
@@ -865,6 +877,7 @@ pub struct Chunk {
     /// GetTemplateObject site identity used by the realm cache.
     templates: Vec<Vec<(Option<String>, String)>>,
     eval_exprs: Vec<EvalExprPlan>,
+    class_plans: Vec<ClassPlan>,
     /// AssignmentPattern expression trees retained only for generic [`Op::AssignTarget`] sites.
     /// These sites replace whole-function/native-coroutine fallback while uncommon pattern work
     /// stays off the hot scalar bytecode path.
@@ -974,6 +987,11 @@ struct EvalExprPlan {
     locals: Vec<AssignmentLocal>,
     strict: bool,
     name: Option<String>,
+}
+
+struct ClassPlan {
+    class: Rc<Class>,
+    inferred_name: Option<String>,
 }
 
 pub(crate) struct InitializerPlan {
@@ -2690,6 +2708,7 @@ fn compile_inner(
         funcs: c.funcs,
         templates: c.templates,
         eval_exprs: c.eval_exprs,
+        class_plans: c.class_plans,
         assignment_targets: c.assignment_targets,
         lexical_scopes: c.lexical_scopes,
         cap_inits: c.cap_inits,
@@ -3007,6 +3026,7 @@ struct Compiler {
     funcs: Vec<Rc<Function>>,
     templates: Vec<Vec<(Option<String>, String)>>,
     eval_exprs: Vec<EvalExprPlan>,
+    class_plans: Vec<ClassPlan>,
     assignment_targets: Vec<AssignmentTargetPlan>,
     lexical_scopes: Vec<Vec<LexicalBinding>>,
     cap_inits: Vec<CapInit>,
@@ -3403,6 +3423,7 @@ impl Compiler {
             self.funcs.len(),
             self.templates.len(),
             self.eval_exprs.len(),
+            self.class_plans.len(),
             self.assignment_targets.len(),
         );
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
@@ -3420,7 +3441,8 @@ impl Compiler {
             self.funcs.truncate(snap.8);
             self.templates.truncate(snap.9);
             self.eval_exprs.truncate(snap.10);
-            self.assignment_targets.truncate(snap.11);
+            self.class_plans.truncate(snap.11);
+            self.assignment_targets.truncate(snap.12);
             if has_this {
                 self.emit(Op::CallWithThis(argc, cc));
             } else {
@@ -6727,16 +6749,121 @@ impl Compiler {
             self.emit_closure(f, Some(name));
             return Ok(());
         }
-        if matches!(e, Expr::Class(class) if class.name.is_none()) {
-            if crate::eval::expr_contains(e, |expr| {
-                matches!(expr, Expr::Yield { .. } | Expr::Await(_))
-            }) {
-                return Err(Bail);
+        if let Expr::Class(class) = e {
+            if class.name.is_none() {
+                if crate::eval::expr_contains(e, |expr| {
+                    matches!(expr, Expr::Yield { .. } | Expr::Await(_))
+                }) {
+                    return self.staged_class(class, Some(name));
+                }
+                self.retain_named_eval_expr(e, Some(name));
+                return Ok(());
             }
-            self.retain_named_eval_expr(e, Some(name));
-            return Ok(());
         }
         self.expr(e)
+    }
+
+    /// Lower the suspendable prefix of ClassDefinitionEvaluation while retaining its lexical and
+    /// private environments in the VM frame. The existing evaluator finishes the atomic suffix
+    /// after heritage and every computed key have completed exactly once.
+    fn staged_class(&mut self, class: &Rc<Class>, inferred_name: Option<&str>) -> CResult {
+        if !self.is_coroutine
+            || !class.decorators.is_empty()
+            || class
+                .members
+                .iter()
+                .any(|member| !member.decorators.is_empty())
+        {
+            // Decorator evaluation is interleaved with element definition in Lumen's current
+            // proposal implementation; keep that rarer shape on the compatibility path until it
+            // has its own explicit continuation records.
+            return Err(Bail);
+        }
+        if class.members.len() > u16::MAX as usize {
+            return Err(Bail);
+        }
+        let plan = self.class_plans.len() as u32;
+        self.class_plans.push(ClassPlan {
+            class: class.clone(),
+            inferred_name: inferred_name.map(str::to_string),
+        });
+        self.emit(Op::ClassStart(plan));
+
+        let cleanup = self.emit(Op::PushFinally(0, 0, 0, 0, 0));
+        self.try_depth += 1;
+        self.finally_depths.push(self.try_depth);
+
+        // ClassDefinitionEvaluation is strict code and resolves the class's self-name through the
+        // newly created (TDZ) class environment rather than any outer declaration slot.
+        let saved_strict = std::mem::replace(&mut self.strict, true);
+        self.scopes.push(Vec::new());
+        let mut class_names = std::collections::HashMap::new();
+        if let Some(name) = &class.name {
+            class_names.insert(name.clone(), true);
+        }
+        self.lexical_env_names.push(class_names);
+        let compile_result = (|| {
+            if let Some(superclass) = &class.superclass {
+                self.expr(superclass)?;
+                self.emit(Op::ClassHeritage(plan, true));
+            } else {
+                self.emit(Op::ClassHeritage(plan, false));
+            }
+            for (index, member) in class.members.iter().enumerate() {
+                if member.kind == MemberKind::Constructor {
+                    continue;
+                }
+                if let PropKey::Computed(key) = &member.key {
+                    self.expr(key)?;
+                    self.emit(Op::ClassKey(plan, index as u16));
+                }
+            }
+            Ok(())
+        })();
+        self.lexical_env_names.pop();
+        self.scopes.pop();
+        self.strict = saved_strict;
+        compile_result?;
+
+        self.emit(Op::ClassFinish(plan));
+        self.emit(Op::PopHandler);
+        self.try_depth -= 1;
+        self.finally_depths.pop();
+        let normal_exit = self.emit(Op::Jump(0));
+
+        let throw_pc = self.ops.len() as u32;
+        self.emit(Op::ClassAbort(plan));
+        self.emit(Op::Throw);
+        let return_pc = self.ops.len() as u32;
+        self.emit(Op::ClassAbort(plan));
+        self.emit(Op::Return);
+        let bare_return_pc = self.ops.len() as u32;
+        self.emit(Op::ClassAbort(plan));
+        self.emit(Op::ReturnBare);
+        let resume_return_pc = self.ops.len() as u32;
+        self.emit(Op::ClassAbort(plan));
+        self.emit(Op::ResumeReturn);
+        let jump_pc = self.ops.len() as u32;
+        self.emit(Op::ClassAbort(plan));
+        self.emit(Op::ResumeJump);
+        match &mut self.ops[cleanup] {
+            Op::PushFinally(
+                throw_target,
+                return_target,
+                bare_return_target,
+                resume_return_target,
+                jump_target,
+            ) => {
+                *throw_target = throw_pc;
+                *return_target = return_pc;
+                *bare_return_target = bare_return_pc;
+                *resume_return_target = resume_return_pc;
+                *jump_target = jump_pc;
+            }
+            _ => unreachable!("class environment handler changed kind"),
+        }
+        self.patch(normal_exit);
+        Ok(())
     }
 
     /// Evaluate an ObjectLiteral property name while the fresh object remains immediately below
@@ -6791,6 +6918,13 @@ impl Compiler {
             Expr::Func(f) => {
                 self.emit_closure(f, None);
                 Ok(())
+            }
+            Expr::Class(class)
+                if crate::eval::expr_contains(e, |expression| {
+                    matches!(expression, Expr::Yield { .. } | Expr::Await(_))
+                }) =>
+            {
+                self.staged_class(class, None)
             }
             Expr::Num(n) => {
                 let i = self.const_idx(Value::Num(*n));
@@ -8018,6 +8152,9 @@ pub fn run(
     let mut pc = 0usize;
     let mut handlers: Vec<Handler> = Vec::new();
     let mut disposal_frames: Vec<Vec<crate::interpreter::Disposable>> = Vec::new();
+    let mut class_states = (0..chunk.class_plans.len())
+        .map(|_| None)
+        .collect::<Vec<_>>();
     let mut references = (0..chunk.n_refs).map(|_| None).collect::<Vec<_>>();
     let r = drive_vm(
         i,
@@ -8031,6 +8168,7 @@ pub fn run(
         &this_val,
         &mut handlers,
         &mut disposal_frames,
+        &mut class_states,
         None,
         false,
     );
@@ -8070,6 +8208,7 @@ fn drive_vm(
     this_val: &Value,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
+    class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
     mut pending: Option<PendingCompletion>,
     defer_source_return: bool,
 ) -> Result<VmStep, Abrupt> {
@@ -8098,6 +8237,7 @@ fn drive_vm(
                 this_val,
                 handlers,
                 disposal_frames,
+                class_states,
             ),
         };
         match outcome {
@@ -8418,6 +8558,7 @@ fn run_vm(
     this_val: &Value,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
+    class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
 ) -> Result<VmStep, Abrupt> {
     macro_rules! pop {
         () => {
@@ -8748,6 +8889,72 @@ fn run_vm(
             Op::EvalExpr(plan) => {
                 let value = eval_expr_with_slots(i, &chunk.eval_exprs[plan as usize], env, slots)?;
                 stack.push(value);
+            }
+            Op::ClassStart(plan) => {
+                let state = i.begin_class_evaluation(&chunk.class_plans[plan as usize].class, env);
+                *env = state.outer_class_env.clone();
+                assert!(
+                    class_states[plan as usize].replace(state).is_none(),
+                    "class plan re-entered before its previous evaluation completed"
+                );
+                i.strict = true;
+            }
+            Op::ClassHeritage(plan, present) => {
+                let parent = present.then(|| pop!());
+                let state = class_states[plan as usize]
+                    .as_mut()
+                    .expect("ClassStart precedes heritage evaluation");
+                i.prepare_class_heritage(state, parent)?;
+                *env = state.class_env.clone();
+            }
+            Op::ClassKey(plan, member) => {
+                let value = pop!();
+                let state = class_states[plan as usize]
+                    .as_mut()
+                    .expect("ClassStart precedes computed-name evaluation");
+                i.prepare_class_key(
+                    state,
+                    &chunk.class_plans[plan as usize].class,
+                    member as usize,
+                    value,
+                )?;
+            }
+            Op::ClassFinish(plan) => {
+                let state = class_states[plan as usize]
+                    .take()
+                    .expect("ClassStart precedes class completion");
+                *env = state
+                    .outer_class_env
+                    .borrow()
+                    .parent
+                    .clone()
+                    .expect("class environment retains its outer environment");
+                let class_plan = &chunk.class_plans[plan as usize];
+                let saved_name =
+                    std::mem::replace(&mut i.pending_fn_name, class_plan.inferred_name.clone());
+                let result = i.finish_class_evaluation(&class_plan.class, state);
+                i.pending_fn_name = saved_name;
+                i.strict = if class_states.iter().any(Option::is_some) {
+                    true
+                } else {
+                    chunk.strict
+                };
+                stack.push(result?);
+            }
+            Op::ClassAbort(plan) => {
+                if let Some(state) = class_states[plan as usize].take() {
+                    *env = state
+                        .outer_class_env
+                        .borrow()
+                        .parent
+                        .clone()
+                        .expect("class environment retains its outer environment");
+                }
+                i.strict = if class_states.iter().any(Option::is_some) {
+                    true
+                } else {
+                    chunk.strict
+                };
             }
             Op::PushWith => {
                 let value = pop!();
@@ -10556,6 +10763,9 @@ pub struct VmCoro {
     /// One DisposableResource list per active `using` statement-list boundary. Unlike the
     /// tree-walker's ambient stack, this storage belongs to the suspended continuation.
     disposal_frames: Vec<Vec<crate::interpreter::Disposable>>,
+    /// In-progress class definitions keyed by immutable class-plan site. A state exists only from
+    /// ClassStart until ClassFinish or its abrupt-completion cleanup pad.
+    class_states: Vec<Option<crate::eval::PreparedClassEvaluation>>,
     is_generator: bool,
     is_async_generator: bool,
     awaiting_yield_value: bool,
@@ -10589,6 +10799,7 @@ impl VmCoro {
         if let Some(slot) = chunk.arguments_slot {
             slots[slot as usize] = Value::Obj(i.make_compiled_arguments_object(arguments, &env));
         }
+        let class_states = (0..chunk.class_plans.len()).map(|_| None).collect();
         VmCoro {
             chunk,
             cap_env: env.clone(),
@@ -10600,6 +10811,7 @@ impl VmCoro {
             pc: 0,
             handlers: Vec::new(),
             disposal_frames: Vec::new(),
+            class_states,
             is_generator: false,
             is_async_generator: false,
             awaiting_yield_value: false,
@@ -10823,7 +11035,12 @@ impl VmCoro {
             // In particular, PutValue must use this function code's strictness rather than the
             // host job/script that happened to resume it. Ordinary compiled calls establish this
             // in `run_compiled_chunk`; heap continuations must do the same on every VM slice.
-            let saved_strict = std::mem::replace(&mut i.strict, self.chunk.strict);
+            let effective_strict = if self.class_states.iter().any(Option::is_some) {
+                true
+            } else {
+                self.chunk.strict
+            };
+            let saved_strict = std::mem::replace(&mut i.strict, effective_strict);
             let step = drive_vm(
                 i,
                 &self.chunk,
@@ -10836,6 +11053,7 @@ impl VmCoro {
                 &self.this_val,
                 &mut self.handlers,
                 &mut self.disposal_frames,
+                &mut self.class_states,
                 pending,
                 self.is_async_generator,
             );
@@ -11880,6 +12098,11 @@ impl Chunk {
                 | Op::SuperUpdate(_)
                 | Op::TemplateObject(_)
                 | Op::RequireCallable
+                | Op::ClassStart(_)
+                | Op::ClassHeritage(..)
+                | Op::ClassKey(..)
+                | Op::ClassFinish(_)
+                | Op::ClassAbort(_)
         ) {
             return None;
         }
@@ -11926,6 +12149,10 @@ impl Chunk {
             Op::DestructureArr(n) => (1, *n as usize),
             Op::AssignTarget(_) => (1, 0),
             Op::EvalExpr(_) => (0, 1),
+            Op::ClassStart(_) | Op::ClassAbort(_) => (0, 0),
+            Op::ClassHeritage(_, present) => (usize::from(*present), 0),
+            Op::ClassKey(..) => (1, 0),
+            Op::ClassFinish(_) => (0, 1),
             Op::ResolveNameRef(..) => (0, 0),
             Op::LoadRef(_) => (0, 1),
             Op::StoreRef(_) => (1, 0),
@@ -14865,6 +15092,11 @@ unsafe fn jit_exec_inner(
         | Op::SuperUpdate(_)
         | Op::TemplateObject(_)
         | Op::RequireCallable
+        | Op::ClassStart(_)
+        | Op::ClassHeritage(..)
+        | Op::ClassKey(..)
+        | Op::ClassFinish(_)
+        | Op::ClassAbort(_)
         | Op::AbruptJump(..)
         | Op::JumpIfFalse(_)
         | Op::JumpIfFalsePeek(_)

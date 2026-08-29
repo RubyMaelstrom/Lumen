@@ -156,9 +156,14 @@ conformance-style tests and the broader affected suite pass.
       - [x] Lower tagged templates, `import.meta`, dynamic/import-source calls, private references,
         and `new.target` through suspension, preserving tag receiver/early-callability ordering,
         template-object identity, import option order, and private/super Reference state.
-      - [x] Evaluate non-suspending class definitions atomically inside heap continuations,
-        retaining class-name/private environments, heritage, fields, static blocks, and method
-        `super` semantics. Heritage or computed-name evaluation that itself suspends remains.
+      - [x] Evaluate ordinary class definitions atomically and stage suspending heritage and
+        computed ClassElementName evaluation in continuation-owned class/private environments.
+        Preserve strict mode, class-name TDZ, superclass validation and prototype access,
+        ToPropertyKey, private-name captures, inferred names, abrupt cleanup, and computed static
+        `prototype` error ordering.
+      - [ ] Model suspending proposal-decorator expressions and application with explicit
+        continuation records. Decorated coroutine classes remain on the bounded native
+        compatibility path.
       - [x] Lower arbitrary/interleaved spread argument lists for calls, optional calls, and
         constructors while preserving receiver binding, short-circuiting, and evaluation order.
       - [x] Lower delete references, including optional-chain short-circuiting, environment
@@ -183,7 +188,11 @@ conformance-style tests and the broader affected suite pass.
         dynamically visible per-block lexical environments, assignments spanning suspension, and
         destructuring defaults whose direct eval can change a previously resolved free-name target
         by retaining opaque Environment References directly in the heap continuation.
-    - [ ] Model `using`/`await using`, `with`, and switch lexical environments in resumable frames.
+    - [ ] Move Source Text Module top-level-await evaluation from the bounded native compatibility
+      path into continuation-owned module execution state.
+    - [ ] Replace the native `Array.fromAsync` iterator worker with an explicit job/continuation
+      state machine that preserves async-iterator closing and promise rejection ordering.
+    - [x] Model `using`/`await using`, `with`, and switch lexical environments in resumable frames.
       - [x] Keep synchronous and asynchronous DisposableResource stacks on each heap continuation
         and lower function-body/block, classic-`for`, and per-iteration `for…of` declarations
         through completion-aware disposal pads. Preserve registration-before-initialization,
