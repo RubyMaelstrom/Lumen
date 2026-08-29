@@ -24,12 +24,18 @@ encoding/textencoder-utf16-surrogates.any.js
 html/webappapis/atob/base64.any.js
 
 # WHATWG URL
+url/IdnaTestV2.any.js
+url/IdnaTestV2-removed.any.js
+url/historical.any.js
 url/url-constructor.any.js
 url/url-origin.any.js
+url/url-searchparams.any.js
 url/url-setters.any.js
+url/url-setters-stripping.any.js
 url/url-statics-canparse.any.js
 url/url-statics-parse.any.js
 url/url-tojson.any.js
+url/urlencoded-parser.any.js
 url/urlsearchparams-append.any.js
 url/urlsearchparams-constructor.any.js
 url/urlsearchparams-delete.any.js

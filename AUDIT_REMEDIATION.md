@@ -46,15 +46,17 @@ conformance-style tests and the broader affected suite pass.
 
 ## Web-platform conformance
 
-- [ ] Complete URL parsing/serialization, setter state overrides, and IDNA behavior against the
+- [x] Complete URL parsing/serialization, setter state overrides, and IDNA behavior against the
   current URL Standard and its full data-driven WPT corpus.
   - [x] Implement URLSearchParams' Web IDL union/record conversion order, USVString collision
     behavior, optional-undefined semantics, and live list operations.
   - [x] Enforce the host-state empty-buffer failure before Servo `url` 2.5.8 can construct an
     invalid component record for a non-special URL with a port or credentials.
-  - [ ] Replace the remaining version-lagging Servo parser behavior for file URLs, non-special
-    paths, opaque-path spaces, IDNA edge cases, origins, and component state overrides. The pinned
-    WPT setter dataset currently completes without aborting and passes 201/279 subtests.
+  - [x] Adapt the remaining version-lagging Servo parser behavior for file URLs, non-special
+    paths, opaque-path spaces, ASCII-domain compatibility, origins, and component state overrides;
+    use Unicode 17 ICU4X data for current UTS #46 processing. The 23 runner-compatible URL WPT
+    files pass 4,756/4,756 subtests at pinned revision
+    `54078e9ec9d5c73f8815ff38b42b8fcbf1f3200b`.
 - [x] Implement stateful Encoding Standard decoders and decoder streams.
 - [x] Port the Streams Standard controller, backpressure, BYOB, tee, and piping
   state machines with focused WPT coverage.
@@ -312,13 +314,15 @@ conformance-style tests and the broader affected suite pass.
 - [x] Run the current full Test262 checkout and record its exact revision.
   - [x] Revision `d86b2294eb0a17eaa281ff12c73c473ec864c72f` (2026-08-25):
     53,574 passed, 0 failed, and 4 documented upstream skips.
-- [ ] Add/run focused WPT subsets for every implemented web API.
+- [x] Add/run focused WPT subsets for every implemented web API.
   - [x] Add a pinned, sparse-checkout WPT runner with JavaScript-shell harness support and bounded
     same-origin fixture loading.
   - [x] Pass the focused DOM Events, Encoding/base64, URLSearchParams, High Resolution Time,
     WebCrypto, Fetch value/body, and Streams slices.
-  - [ ] Bring the URL parser and component setters through their complete focused WPT files, then
-    run the combined manifest at one recorded revision.
+  - [x] Bring the URL parser, component setters, URLSearchParams, URL-encoded parser, and Unicode
+    17 IDNA processing through every runner-compatible URL WPT file. The combined 64-file manifest
+    passes 6,306/6,306 subtests at revision
+    `54078e9ec9d5c73f8815ff38b42b8fcbf1f3200b`.
 - [ ] Run the WebAssembly core specification tests for the supported feature
   set and add malformed-binary/validation fuzzing.
 - [ ] Run Autobahn WebSocket tests and adversarial RFC 9112 framing tests.

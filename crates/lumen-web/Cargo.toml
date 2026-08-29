@@ -18,9 +18,9 @@ lumen-tls = { path = "../lumen-tls" }
 # URL-profiled UTS #46 implementation in `idna`. Keeping this as one audited implementation also
 # prevents fetch/WebSocket/EventSource and the JavaScript URL API from drifting apart.
 whatwg-url = { package = "url", version = "2.5.8" }
-# `idna_adapter` 1.2.x selects ICU4X releases whose MSRV is newer than Lumen's Rust 1.82.
-# The 1.1 backend implements the same UTS #46 contract using unicode-rs data.
-idna-adapter = { package = "idna_adapter", version = "=1.1.0" }
+# ICU4X 2.1 carries the Unicode 17 mapping, normalization, and property data required by the
+# current UTS #46 corpus. Pin the adapter stream because 1.2.2 raises its MSRV beyond Lumen's.
+idna-adapter = { package = "idna_adapter", version = "=1.2.1" }
 # Firefox's pure-Rust implementation of the WHATWG Encoding algorithms and canonical label table.
 encoding_rs = "0.8.35"
 

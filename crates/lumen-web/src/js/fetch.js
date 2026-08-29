@@ -254,8 +254,11 @@ function bodyMixin(proto) {
   proto.formData = async function () {
     const ct = (this.headers && this.headers.get("content-type")) || "";
     if (ct.startsWith("application/x-www-form-urlencoded")) {
+      // Fetch's Body.formData branch parses the consumed bytes with the URL-encoded parser. It
+      // does not pass through Body.text's BOM-removing UTF-8 decoder.
+      const input = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await this._consume());
       const form = new FormData();
-      for (const [k, v] of new URLSearchParams(await this.text())) form.append(k, v);
+      for (const [k, v] of new URLSearchParams(input)) form.append(k, v);
       return form;
     }
     const m = /boundary=([^;]+)/i.exec(ct);

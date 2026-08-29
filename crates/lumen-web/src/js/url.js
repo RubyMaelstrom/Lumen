@@ -30,7 +30,9 @@ function percentDecode(input) {
       output[length++] = bytes[i];
     }
   }
-  return new TextDecoder().decode(output.subarray(0, length));
+  // URL Standard §5 uses Infra's UTF-8 decode without BOM handling: U+FEFF is data here,
+  // unlike the default TextDecoder BOM-removal behavior.
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(output.subarray(0, length));
 }
 
 function formDecode(s) {
