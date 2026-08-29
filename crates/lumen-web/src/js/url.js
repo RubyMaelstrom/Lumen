@@ -73,21 +73,33 @@ class URLSearchParams {
     this._onchange = null;
     if (typeof init === "string") {
       this._list = formDecode(toUSVString(init));
-    } else if (init instanceof URLSearchParams) {
-      this._list = init._list.map((p) => [...p]);
-    } else if (init != null && typeof init[Symbol.iterator] === "function") {
-      for (const pair of init) {
-        if (pair == null || typeof pair[Symbol.iterator] !== "function") {
-          throw new TypeError("URLSearchParams: each init pair needs exactly two items");
+    } else if ((typeof init === "object" && init !== null) || typeof init === "function") {
+      // Web IDL union conversion selects the sequence branch whenever @@iterator is present,
+      // including for platform objects whose iterator has been overridden by script.
+      const iterator = init[Symbol.iterator];
+      if (iterator !== undefined) {
+        if (typeof iterator !== "function") {
+          throw new TypeError("URLSearchParams: init iterator is not callable");
         }
-        const values = [...pair];
-        if (values.length !== 2) {
-          throw new TypeError("URLSearchParams: each init pair needs exactly two items");
+        const sequence = { [Symbol.iterator]() { return Reflect.apply(iterator, init, []); } };
+        for (const pair of sequence) {
+          if (pair == null || typeof pair[Symbol.iterator] !== "function") {
+            throw new TypeError("URLSearchParams: each init pair needs exactly two items");
+          }
+          const values = [...pair];
+          if (values.length !== 2) {
+            throw new TypeError("URLSearchParams: each init pair needs exactly two items");
+          }
+          this._list.push([toUSVString(values[0]), toUSVString(values[1])]);
         }
-        this._list.push([toUSVString(values[0]), toUSVString(values[1])]);
+      } else {
+        // A record converts its keys to USVString before insertion. Distinct ECMAScript keys can
+        // therefore collide (for example, different lone surrogates); the later value replaces
+        // the earlier one without moving the record entry.
+        const record = new Map();
+        for (const key of Object.keys(init)) record.set(toUSVString(key), toUSVString(init[key]));
+        this._list = [...record];
       }
-    } else if (init && typeof init === "object") {
-      for (const k of Object.keys(init)) this._list.push([toUSVString(k), toUSVString(init[k])]);
     } else if (init !== undefined) {
       this._list = formDecode(toUSVString(init));
     }
@@ -106,7 +118,8 @@ class URLSearchParams {
   delete(name, value = undefined) {
     requireArguments(arguments.length, 1, "URLSearchParams.delete");
     name = toUSVString(name);
-    if (arguments.length > 1) {
+    // In Web IDL an optional argument whose ECMAScript value is undefined is not given.
+    if (value !== undefined) {
       value = toUSVString(value);
       this._list = this._list.filter(([k, v]) => k !== name || v !== value);
     } else {
@@ -128,7 +141,7 @@ class URLSearchParams {
   has(name, value = undefined) {
     requireArguments(arguments.length, 1, "URLSearchParams.has");
     name = toUSVString(name);
-    if (arguments.length > 1) {
+    if (value !== undefined) {
       value = toUSVString(value);
       return this._list.some(([k, v]) => k === name && v === value);
     }

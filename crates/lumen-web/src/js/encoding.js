@@ -121,8 +121,14 @@ class TextDecoder {
   decode(input = undefined, options = {}) {
     const state = TEXT_DECODER_STATE.get(this);
     if (!state) throw new TypeError("TextDecoder.decode called on incompatible receiver");
+    // Web IDL converts the BufferSource reference before the options dictionary. WHATWG Encoding
+    // §7.2 copies its bytes only after those conversions, so a `stream` getter may detach it first;
+    // a detached view then contributes the empty byte sequence.
+    let bytes = decoderInput(input);
     options = options && typeof options === "object" ? options : {};
-    return __encoding.decoderPush(state.id, decoderInput(input), !!options.stream);
+    const stream = !!options.stream;
+    if (bytes.byteLength === 0) bytes = EMPTY_ENCODING_INPUT;
+    return __encoding.decoderPush(state.id, bytes, stream);
   }
 }
 

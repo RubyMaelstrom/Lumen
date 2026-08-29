@@ -201,7 +201,10 @@ function encodeFormData(form) {
       push(`${value}\r\n`);
     }
   }
-  push(`--${boundary}--\r\n`);
+  // HTML's multipart/form-data encoding delegates an empty entry list to RFC 7578. There are no
+  // body parts (and therefore no delimiter lines) in that case, although the generated boundary
+  // remains part of the MIME type.
+  if (form[kEntries].length !== 0) push(`--${boundary}--\r\n`);
   let size = 0;
   for (const c of chunks) size += c.length;
   const out = new Uint8Array(size);
@@ -233,16 +236,23 @@ function decodeMultipart(bytes, boundary) {
   const marker = enc.encode(`--${boundary}`);
   const headerSep = enc.encode("\r\n\r\n");
   let pos = indexOfBytes(bytes, marker, 0);
+  if (pos !== 0) throw new TypeError("malformed multipart/form-data body");
+  let closed = false;
   while (pos !== -1) {
     let start = pos + marker.length;
-    if (bytes[start] === 0x2d && bytes[start + 1] === 0x2d) break; // closing "--boundary--"
+    if (bytes[start] === 0x2d && bytes[start + 1] === 0x2d) {
+      closed = true;
+      break; // closing "--boundary--"
+    }
     if (bytes[start] === 0x0d && bytes[start + 1] === 0x0a) start += 2; // skip CRLF after boundary
     const headerEnd = indexOfBytes(bytes, headerSep, start);
-    if (headerEnd === -1) break;
+    if (headerEnd === -1) throw new TypeError("malformed multipart/form-data headers");
     const headerText = dec.decode(bytes.subarray(start, headerEnd));
     const bodyStart = headerEnd + 4;
     const next = indexOfBytes(bytes, marker, bodyStart);
-    if (next === -1) break;
+    if (next < bodyStart + 2 || bytes[next - 2] !== 0x0d || bytes[next - 1] !== 0x0a) {
+      throw new TypeError("malformed multipart/form-data delimiter");
+    }
     const body = bytes.subarray(bodyStart, next - 2); // drop the CRLF before the next boundary
 
     let name = null;
@@ -264,6 +274,7 @@ function decodeMultipart(bytes, boundary) {
     }
     pos = next;
   }
+  if (!closed) throw new TypeError("multipart/form-data body has no closing delimiter");
   return fd;
 }
 

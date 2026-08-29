@@ -342,7 +342,9 @@ fn op_time_origin(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value,
 // ---- encoding ----
 
 fn op_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
+    // WHATWG Encoding §7.4 declares the input as USVString: valid surrogate pairs become their
+    // scalar value and every unpaired surrogate becomes U+FFFD before UTF-8 encoding.
+    let s = ctx.coerce_usv_string(args.first().unwrap_or(&Value::Undefined))?;
     let bytes = s.as_bytes().to_vec();
     ctx.make_uint8array(&bytes)
 }
@@ -409,7 +411,7 @@ fn op_decoder_push(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         .decoders
         .insert(id, decoder);
     result
-        .map(Value::from_string)
+        .map(|value| ctx.string_from_utf8(value))
         .map_err(|error| ctx.make_error("TypeError", error))
 }
 

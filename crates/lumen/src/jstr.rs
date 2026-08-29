@@ -150,6 +150,42 @@ pub struct UnitIter<'a> {
     trail: Option<u16>,
 }
 
+/// Iterator over `s`'s ECMAScript code points. A valid leading/trailing surrogate pair is one
+/// item; an unpaired surrogate is returned as its code-unit value. This is the sequence consumed
+/// by ECMA-262 `CodePointAt` users such as the String iterator.
+pub struct CodePointIter<'a> {
+    units: UnitIter<'a>,
+    pending: Option<u16>,
+}
+
+impl<'a> CodePointIter<'a> {
+    pub fn new(s: &'a str) -> Self {
+        Self {
+            units: UnitIter::new(s),
+            pending: None,
+        }
+    }
+}
+
+impl Iterator for CodePointIter<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        let first = self.pending.take().or_else(|| self.units.next())?;
+        if (0xD800..0xDC00).contains(&(first as u32)) {
+            if let Some(second) = self.units.next() {
+                if (0xDC00..0xE000).contains(&(second as u32)) {
+                    return Some(
+                        0x10000 + ((first as u32 - 0xD800) << 10) + (second as u32 - 0xDC00),
+                    );
+                }
+                self.pending = Some(second);
+            }
+        }
+        Some(first as u32)
+    }
+}
+
 impl<'a> UnitIter<'a> {
     pub fn new(s: &'a str) -> Self {
         UnitIter {
@@ -266,26 +302,13 @@ pub fn canonicalize(s: &str) -> Option<String> {
 /// The code points of `s`, with lone surrogates as their surrogate values (paired smuggled
 /// high+low decode to the real character they canonically encode — see module docs).
 pub fn code_points(s: &str) -> Vec<u32> {
-    if s.is_ascii() {
-        return s.as_bytes().iter().map(|&b| b as u32).collect();
-    }
-    let units = units(s);
-    let mut out = Vec::with_capacity(units.len());
-    let mut i = 0;
-    while i < units.len() {
-        let u = units[i] as u32;
-        if (0xD800..0xDC00).contains(&u)
-            && i + 1 < units.len()
-            && (0xDC00..0xE000).contains(&(units[i + 1] as u32))
-        {
-            out.push(0x10000 + ((u - 0xD800) << 10) + (units[i + 1] as u32 - 0xDC00));
-            i += 2;
-        } else {
-            out.push(u);
-            i += 1;
-        }
-    }
-    out
+    CodePointIter::new(s).collect()
+}
+
+/// Rebuild the engine representation of one ECMAScript code point. Surrogate values remain lone
+/// code units and real characters in the smuggling range retain the canonical two-scalar form.
+pub fn from_code_point(cp: u32) -> String {
+    from_code_points(&[cp])
 }
 
 /// Rebuild a string from code points (surrogate values become lone surrogates).

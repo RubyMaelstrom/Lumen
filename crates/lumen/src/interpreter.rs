@@ -2774,6 +2774,33 @@ impl Interp {
         self.to_string(v).map(|s| (&s).into()).map_err(abrupt_value)
     }
 
+    /// Web IDL `USVString`: run ECMAScript ToString, combine valid surrogate pairs, and replace
+    /// every unpaired surrogate with U+FFFD. WHATWG Encoding's `TextEncoder` consumes exactly this
+    /// scalar-value sequence rather than the engine's internal surrogate-smuggling UTF-8.
+    pub fn coerce_usv_string(&mut self, v: &Value) -> Result<String, Value> {
+        let value = self.to_string(v).map_err(abrupt_value)?;
+        if value.is_ascii() {
+            return Ok(value.to_string());
+        }
+        let mut result = String::with_capacity(value.len());
+        for point in crate::jstr::CodePointIter::new(&value) {
+            result.push(char::from_u32(point).unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+        Ok(result)
+    }
+
+    /// Convert a Rust UTF-8 string into Lumen's canonical ECMAScript string representation.
+    /// Plane-16 private-use scalars overlap the internal lone-surrogate encoding and therefore
+    /// need an explicit UTF-16 round trip at host boundaries.
+    pub fn string_from_utf8(&self, value: String) -> Value {
+        if value.chars().any(|c| crate::jstr::smuggled(c).is_some()) {
+            let points: Vec<u32> = value.chars().map(|c| c as u32).collect();
+            Value::from_string(crate::jstr::from_code_points(&points))
+        } else {
+            Value::from_string(value)
+        }
+    }
+
     /// The bytes a TypedArray view covers (`None` when `v` isn't a typed array or its buffer
     /// is detached). The embedder's binary bridge: encoders/crypto/fetch move bytes through
     /// this.

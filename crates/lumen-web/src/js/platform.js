@@ -3,7 +3,11 @@
 
 globalThis.self = globalThis;
 
-class Performance {
+// High Resolution Time §7 declares Performance as an EventTarget-derived interface.
+class Performance extends EventTarget {
+  constructor() {
+    super();
+  }
   now() {
     return __perf.now();
   }

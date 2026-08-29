@@ -191,6 +191,7 @@ cargo build --release -p lumen --bin lumen
 scripts/test262-clone.sh    # one-time: clone the suite into ./test262
 scripts/run-test262.sh      # run it (see crates/test262-runner for env knobs)
 LUMEN_TIER=jit scripts/run-test262.sh    # same suite against the compiled tiers
+scripts/run-wpt.py          # focused shell-compatible web-platform-tests slices
 ```
 
 The execution tiers are also held together by a differential fuzzer: every generated program

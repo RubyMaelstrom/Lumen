@@ -7,6 +7,32 @@
 
 use whatwg_url::Url as ParsedUrl;
 
+/// Servo `url` 2.5.8 predates the URL Standard's opaque-path trailing-space rule. In the opaque
+/// path state, only the last space immediately before `?` or `#` is percent-encoded; preceding
+/// spaces remain literal. Normalize that one parser transition before handing input to the crate.
+fn normalize_opaque_path_space(input: &str) -> Option<String> {
+    let colon = input.find(':')?;
+    let scheme = &input[..colon];
+    if matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "ftp" | "file" | "http" | "https" | "ws" | "wss"
+    ) || input.as_bytes().get(colon + 1) == Some(&b'/')
+    {
+        return None;
+    }
+    let delimiter = input[colon + 1..]
+        .find(['?', '#'])
+        .map(|offset| colon + 1 + offset)?;
+    if delimiter == 0 || input.as_bytes()[delimiter - 1] != b' ' {
+        return None;
+    }
+    let mut normalized = String::with_capacity(input.len() + 2);
+    normalized.push_str(&input[..delimiter - 1]);
+    normalized.push_str("%20");
+    normalized.push_str(&input[delimiter..]);
+    Some(normalized)
+}
+
 /// Parsed components. `port` is `None` when absent or equal to the scheme's default port.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Url {
@@ -71,6 +97,10 @@ impl Url {
 
 /// Parse `input` on its own, or against `base` when it is relative.
 pub(crate) fn parse(input: &str, base: Option<&str>) -> Result<Url, String> {
+    let normalized_input = normalize_opaque_path_space(input);
+    let input = normalized_input.as_deref().unwrap_or(input);
+    let normalized_base = base.and_then(normalize_opaque_path_space);
+    let base = normalized_base.as_deref().or(base);
     let parsed = match base {
         Some(base) => ParsedUrl::parse(base)
             .map_err(|error| format!("invalid base URL '{base}': {error}"))?
@@ -109,6 +139,17 @@ pub(crate) fn mutate(href: &str, component: &str, value: &str) -> Result<Url, St
             let _ = parsed.set_password((!value.is_empty()).then_some(value));
         }
         "host" => {
+            // URL Standard host state: with a state override, an empty host is a parse failure
+            // when credentials or a port are present. `url` 2.5.8 accepts that mutation but
+            // leaves its internal component offsets inconsistent, so enforce the normative
+            // early return before calling into it.
+            if value.is_empty()
+                && (!parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.port().is_some())
+            {
+                return Ok(Url::from_parsed(parsed));
+            }
             // `Url::set_host` deliberately excludes a port. Parse the setter input as an
             // authority so host and port are changed atomically and malformed values are ignored.
             if !value
@@ -124,7 +165,16 @@ pub(crate) fn mutate(href: &str, component: &str, value: &str) -> Result<Url, St
             }
         }
         "hostname" => {
-            let _ = parsed.set_host(Some(value));
+            // URL Standard host/hostname state, step 3.2: this empty-buffer state override is a
+            // failure when credentials or a port are present. Guarding it also prevents Servo
+            // `url` 2.5.8 from constructing an invalid record whose accessors assert.
+            if !value.is_empty()
+                || (parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.port().is_none())
+            {
+                let _ = parsed.set_host(Some(value));
+            }
         }
         "port" => {
             if value.is_empty() {
@@ -202,6 +252,11 @@ mod tests {
             "mailto:some one@example.org?q=hello%20world#fragment"
         );
         assert_eq!(url.origin(), "null");
+        let url = p("data:space    ?test#fragment");
+        assert_eq!(url.href(), "data:space   %20?test#fragment");
+        assert_eq!(url.path, "space   %20");
+        let cleared = mutate(&url.href(), "search", "").unwrap();
+        assert_eq!(cleared.href(), "data:space   %20#fragment");
     }
 
     #[test]
@@ -213,5 +268,12 @@ mod tests {
         assert_eq!(url.port, Some(443));
         let unchanged = mutate(&url.href(), "port", "70000").unwrap();
         assert_eq!(unchanged.href(), url.href());
+
+        // URL Standard host state step 3.2: an empty hostname setter is a parse failure while a
+        // port is present. Servo `url` 2.5.8 otherwise creates an internally invalid URL here.
+        let unchanged = mutate("sc://test:12/", "hostname", "").unwrap();
+        assert_eq!(unchanged.href(), "sc://test:12/");
+        assert_eq!(unchanged.host, "test");
+        assert_eq!(unchanged.port, Some(12));
     }
 }

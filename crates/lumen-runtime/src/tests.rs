@@ -690,12 +690,26 @@ fn web_encoding_and_base64() {
         r#"
         const enc = new TextEncoder().encode("hi \u{1F600}");
         console.log(enc.length, new TextDecoder().decode(enc));
+        const edge = "\uDBFF\uDFFD";
+        const edgeBytes = new TextEncoder().encode(edge);
+        const decodedEdge = new TextDecoder().decode(edgeBytes);
+        console.log(Array.from(edgeBytes).join(","), Array.from(new TextEncoder().encode("\uD800")).join(","));
+        console.log(decodedEdge.length, decodedEdge.codePointAt(0).toString(16), decodedEdge === edge);
         console.log(btoa("Man"), atob("TWFu"));
         try { new TextDecoder().decode(new Uint8Array([0xff]), undefined) } catch { console.log("nonfatal-ok") }
         console.log(new TextDecoder("utf-8", { fatal: true }).constructor.name);
         "#,
     );
-    assert_eq!(out.lines(), ["7 hi \u{1F600}", "TWFu Man", "TextDecoder"]);
+    assert_eq!(
+        out.lines(),
+        [
+            "7 hi \u{1F600}",
+            "244,143,191,189 239,191,189",
+            "2 10fffd true",
+            "TWFu Man",
+            "TextDecoder"
+        ]
+    );
 }
 
 #[test]
@@ -713,6 +727,19 @@ fn web_url_and_search_params() {
         console.log(URL.canParse("nope"), URL.canParse("http://ok.com"));
         const sp = new URLSearchParams("a=1&a=2&b=3");
         console.log([...sp.keys()].join(","), sp.toString());
+        const overridden = new URLSearchParams("ignored=1");
+        overridden[Symbol.iterator] = function* () { yield ["from", "iterator"]; };
+        console.log(new URLSearchParams(overridden).toString());
+        const collisions = { ["\uD800"]: "first", ["\uD801"]: "last" };
+        console.log(new URLSearchParams(collisions).toString());
+        const optional = new URLSearchParams("a=1&a=2");
+        console.log(optional.has("a", undefined));
+        optional.delete("a", undefined);
+        console.log(optional.toString());
+        console.log(new URL("data:space    ?test#fragment").href);
+        const ported = new URL("sc://test:12/");
+        ported.hostname = "";
+        console.log(ported.href);
         "#,
     );
     assert_eq!(
@@ -724,6 +751,12 @@ fn web_url_and_search_params() {
             "http://ex.com/a/c",
             "false true",
             "a,a,b a=1&a=2&b=3",
+            "from=iterator",
+            "%EF%BF%BD=last",
+            "true",
+            "",
+            "data:space   %20?test#fragment",
+            "sc://test:12/",
         ]
     );
 }
@@ -770,12 +803,30 @@ fn web_readable_stream_body() {
             console.log(acc);
             const us = new ReadableStream({ start(ctrl) { ctrl.enqueue(new TextEncoder().encode("strm")); ctrl.close(); } });
             console.log(await new Response(us).text());
+            const empty = new Response(null);
+            console.log(JSON.stringify(await empty.text()), JSON.stringify(await empty.text()), empty.bodyUsed);
+            const form = new Response(new FormData());
+            console.log((await form.arrayBuffer()).byteLength, form.headers.get("content-type").startsWith("multipart/form-data; boundary="));
+            try {
+              await new Response(null, { headers: { "content-type": "multipart/form-data; boundary=x" } }).formData();
+            } catch (error) {
+              console.log(error.name);
+            }
         })();
         "#,
     );
     assert_eq!(
         out.lines(),
-        ["{\"x\":1}", "true null", "hello true", "abc", "strm"]
+        [
+            "{\"x\":1}",
+            "true null",
+            "hello true",
+            "abc",
+            "strm",
+            "\"\" \"\" false",
+            "0 true",
+            "TypeError"
+        ]
     );
 }
 
@@ -808,6 +859,18 @@ fn web_events_and_abort() {
         ac.abort();
         console.log("post", ac.signal.aborted, aborted, ac.signal.reason.name);
         console.log("static", AbortSignal.abort().aborted);
+        console.log("domex", DOMException.INVALID_CHARACTER_ERR, new DOMException("", "AbortError").code);
+        let perfEvents = 0;
+        performance.addEventListener("tick", () => perfEvents++);
+        performance.dispatchEvent(new Event("tick"));
+        console.log("performance", performance instanceof EventTarget, perfEvents);
+        const optionOrder = [];
+        const quota = new QuotaExceededError("full", {
+          get requested() { optionOrder.push("requested"); return 2; },
+          get quota() { optionOrder.push("quota"); return 1; },
+        });
+        console.log("quota", quota.quota, quota.requested, optionOrder.join(","));
+        try { new QuotaExceededError("", 1); } catch (error) { console.log(error.name); }
         "#,
     );
     assert_eq!(
@@ -817,7 +880,11 @@ fn web_events_and_abort() {
             "once 1",
             "pre false",
             "post true true AbortError",
-            "static true"
+            "static true",
+            "domex 5 20",
+            "performance true 1",
+            "quota 1 2 quota,requested",
+            "TypeError"
         ]
     );
 }
@@ -853,7 +920,11 @@ fn web_crypto() {
         // Astronomically unlikely to be equal: a real randomness source.
         console.log(a.some((v, i) => v !== b[i]));
         console.log(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID()));
-        try { crypto.getRandomValues(new Uint8Array(70000)); } catch (e) { console.log("quota", e.name); }
+        try { crypto.getRandomValues(new Float32Array(1)); } catch (e) { console.log("type", e.name, e.code); }
+        try { crypto.getRandomValues(new Uint8Array(70000)); } catch (e) {
+            console.log("quota", e.name, e.code, e instanceof QuotaExceededError,
+              e instanceof DOMException, e.quota, e.requested);
+        }
         crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc")).then((d) => {
             const hex = [...new Uint8Array(d)].map((x) => x.toString(16).padStart(2, "0")).join("");
             console.log(hex);
@@ -865,7 +936,8 @@ fn web_crypto() {
         [
             "true",
             "true",
-            "quota QuotaExceededError",
+            "type TypeMismatchError 17",
+            "quota QuotaExceededError 22 true true null null",
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         ]
     );
@@ -928,6 +1000,19 @@ fn fetch_headers_methods_and_response_initialization_follow_fetch() {
         ]));
         console.log([...headers].map((pair) => pair.join("=")).join("|"));
         console.log(headers.get("x-b"), headers.getSetCookie().join("|"));
+        const live = new Headers([["a", "1"], ["c", "3"]]);
+        const iterator = live.entries();
+        console.log(iterator.next().value.join("="));
+        live.set("b", "2");
+        console.log(iterator.next().value.join("="), iterator.next().value.join("="), iterator.next().done);
+        const overridden = new Headers({
+          *[Symbol.iterator]() { yield ["from", "iterator"]; },
+          ignored: "record",
+        });
+        console.log(overridden.get("from"), overridden.get("ignored"));
+        for (const invalid of [null, 1]) {
+          try { new Headers(invalid); } catch (error) { console.log(error.name); }
+        }
 
         for (const pair of [["Bad Name", "x"], ["X", "a\r\nb"], ["X", "\u0100"]]) {
           try { new Headers([pair]); } catch (error) { console.log(error.name); }
@@ -961,6 +1046,11 @@ fn fetch_headers_methods_and_response_initialization_follow_fetch() {
         [
             "set-cookie=a=1|set-cookie=b=2|x-a=one|x-b=two",
             "two a=1|b=2",
+            "a=1",
+            "b=2 c=3 true",
+            "iterator null",
+            "TypeError",
+            "TypeError",
             "TypeError",
             "TypeError",
             "TypeError",
@@ -1049,6 +1139,7 @@ const WINTERTC_NOT_YET: &[&str] = &[];
 /// Web-platform interfaces the runtime ships *beyond* the WinterTC Minimum Common API. Not part
 /// of the tracked 56/56 score, but presence-guarded the same way so they can't silently regress.
 const BEYOND_MINIMUM: &[&str] = &[
+    "QuotaExceededError",
     "Worker",
     "WebSocket",
     "EventSource",

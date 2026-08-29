@@ -16800,6 +16800,16 @@ fn utf16_semantics() {
     );
     assert_eq!(run("'x'.codePointAt(-1) + ''"), "undefined");
     assert_eq!(run("('\\uD834\\uDF06').split('').length + ''"), "2");
+    // ECMA-262 String.prototype[@@iterator] advances by CodePointAt's CodeUnitCount even when a
+    // real character lies in Lumen's internal lone-surrogate smuggling range. Optimized iterable
+    // consumers must agree with the intrinsic String iterator.
+    assert_eq!(
+        run("const edge='\\uDBFF\\uDFFD', lone='\\uDBFFx\\uDFFD';
+             [edge[Symbol.iterator]().next().value.codePointAt(0).toString(16),
+              [...edge].length,Array.from(edge).length,
+              [...lone].map(x=>x.charCodeAt(0).toString(16)).join(',')].join(':')"),
+        "10fffd:1:1:dbff,78,dffd"
+    );
     assert_eq!(
         run("String.prototype.isWellFormed.call(String.fromCharCode(0xD800)) + ''"),
         "false"

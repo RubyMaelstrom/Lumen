@@ -28,6 +28,48 @@ function normalizeHeaderValue(value) {
   return value;
 }
 
+const HEADER_ITERATOR_STATE = new WeakMap();
+const HEADER_ITERATOR_PROTOTYPE = Object.create(
+  Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()))
+);
+
+function headerPairsToIterate(headers) {
+  const pairs = [];
+  for (const name of [...headers._map.keys()].sort()) {
+    const values = headers._map.get(name).values;
+    if (name === "set-cookie") {
+      for (const value of values) pairs.push([name, value]);
+    } else {
+      pairs.push([name, values.join(", ")]);
+    }
+  }
+  return pairs;
+}
+
+Object.defineProperty(HEADER_ITERATOR_PROTOTYPE, "next", {
+  configurable: true,
+  enumerable: true,
+  writable: true,
+  value: function next() {
+    const state = HEADER_ITERATOR_STATE.get(this);
+    if (!state) throw new TypeError("Headers iterator next called on an incompatible receiver");
+    // Web IDL iterable objects expose the current value-pair list at each step. Recomputing the
+    // sorted-and-combined view gives mutations their specified live indexed-iteration behavior.
+    const pairs = headerPairsToIterate(state.headers);
+    if (state.index >= pairs.length) return { value: undefined, done: true };
+    const pair = pairs[state.index++];
+    if (state.kind === "key") return { value: pair[0], done: false };
+    if (state.kind === "value") return { value: pair[1], done: false };
+    return { value: pair, done: false };
+  },
+});
+
+function createHeaderIterator(headers, kind) {
+  const iterator = Object.create(HEADER_ITERATOR_PROTOTYPE);
+  HEADER_ITERATOR_STATE.set(iterator, { headers, kind, index: 0 });
+  return iterator;
+}
+
 class Headers {
   constructor(init) {
     this._map = new Map(); // lower-name -> { name, values }
@@ -35,12 +77,16 @@ class Headers {
     if (init !== undefined) this._fill(init);
   }
   _fill(init) {
-    if (init instanceof Headers) {
-      for (const [name, entry] of init._map) {
-        for (const value of entry.values) this.append(name, value);
-      }
-    } else if (init != null && typeof init[Symbol.iterator] === "function") {
-      for (const member of init) {
+    if ((typeof init !== "object" || init === null) && typeof init !== "function") {
+      throw new TypeError("Headers init must be a sequence or record");
+    }
+    // HeadersInit union conversion selects sequence before record. Do not special-case a Headers
+    // instance: an author-provided @@iterator on it is observable and controls conversion.
+    const iterator = init[Symbol.iterator];
+    if (iterator !== undefined) {
+      if (typeof iterator !== "function") throw new TypeError("Headers init iterator is not callable");
+      const sequence = { [Symbol.iterator]() { return Reflect.apply(iterator, init, []); } };
+      for (const member of sequence) {
         if (member == null || typeof member[Symbol.iterator] !== "function") {
           throw new TypeError("Headers: init member is not a sequence");
         }
@@ -48,7 +94,7 @@ class Headers {
         if (pair.length !== 2) throw new TypeError("Headers: init pair needs two items");
         this.append(pair[0], pair[1]);
       }
-    } else if (init && typeof init === "object") {
+    } else {
       for (const k of Object.keys(init)) this.append(k, init[k]);
     }
   }
@@ -91,23 +137,14 @@ class Headers {
   forEach(fn, thisArg) {
     for (const [k, v] of this) fn.call(thisArg, v, k, this);
   }
-  *entries() {
-    // Fetch's "sort and combine" preserves each Set-Cookie value but joins all other names.
-    const keys = [...this._map.keys()].sort();
-    for (const k of keys) {
-      const values = this._map.get(k).values;
-      if (k === "set-cookie") {
-        for (const value of values) yield [k, value];
-      } else {
-        yield [k, values.join(", ")];
-      }
-    }
+  entries() {
+    return createHeaderIterator(this, "entry");
   }
-  *keys() {
-    for (const [k] of this) yield k;
+  keys() {
+    return createHeaderIterator(this, "key");
   }
-  *values() {
-    for (const [, v] of this) yield v;
+  values() {
+    return createHeaderIterator(this, "value");
   }
   [Symbol.iterator]() {
     return this.entries();
@@ -230,6 +267,11 @@ function bodyMixin(proto) {
   proto._consume = async function () {
     const stream = this[kSourceStream] ?? this[kBodyStream];
     if (this.bodyUsed || (stream && stream.locked)) throw new TypeError("body already consumed");
+    // Fetch §5.3 consumes a null body as an empty byte sequence without disturbing a stream;
+    // bodyUsed therefore remains false and repeated null-body conversions are allowed.
+    if (this._bodyBytes === undefined && this[kSourceStream] === undefined) {
+      return new Uint8Array(0);
+    }
     this[kConsumed] = true;
     this._materialize();
     // If the lazily-created stream was not the source just drained, discard its queued copy.
@@ -343,7 +385,11 @@ class Request {
       }
       this.signal = init.signal || input.signal || null;
     } else {
-      const parsedURL = new URL(String(input));
+      const base = typeof globalThis.location === "object" &&
+        globalThis.location !== null && typeof globalThis.location.href === "string"
+        ? globalThis.location.href
+        : undefined;
+      const parsedURL = new URL(String(input), base);
       if (parsedURL.username !== "" || parsedURL.password !== "") {
         throw new TypeError("Request URL cannot include credentials");
       }
@@ -447,6 +493,52 @@ function toUnsignedShort(value) {
   return ((number % 65536) + 65536) % 65536;
 }
 
+function percentDecodeBytes(input) {
+  const bytes = new TextEncoder().encode(input);
+  const output = new Uint8Array(bytes.length);
+  let length = 0;
+  for (let i = 0; i < bytes.length; ++i) {
+    if (bytes[i] === 0x25 && i + 2 < bytes.length && isHex(bytes[i + 1]) && isHex(bytes[i + 2])) {
+      output[length++] = parseInt(String.fromCharCode(bytes[i + 1], bytes[i + 2]), 16);
+      i += 2;
+    } else {
+      output[length++] = bytes[i];
+    }
+  }
+  return output.subarray(0, length);
+}
+
+// Fetch §6 data: URL processor. This is a scheme fetch, not an HTTP request: percent-decoding
+// happens at the byte level and forgiving base64 decoding is applied only to the terminal marker.
+function fetchDataURL(request) {
+  const serialized = request.url.split("#", 1)[0].slice(5);
+  const comma = serialized.indexOf(",");
+  if (comma < 0) throw new TypeError("invalid data URL");
+  let mimeType = serialized.slice(0, comma).replace(/^ +| +$/g, "");
+  let body = percentDecodeBytes(serialized.slice(comma + 1));
+  if (/; *base64$/i.test(mimeType)) {
+    let encoded = "";
+    for (const byte of body) encoded += String.fromCharCode(byte);
+    let decoded;
+    try {
+      decoded = atob(encoded);
+    } catch (_) {
+      throw new TypeError("invalid base64 data URL");
+    }
+    body = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; ++i) body[i] = decoded.charCodeAt(i);
+    mimeType = mimeType.replace(/; *base64$/i, "").replace(/ +$/g, "");
+  }
+  if (mimeType.startsWith(";")) mimeType = `text/plain${mimeType}`;
+  if (!/^[^/;\s]+\/[^;\s]+(?:;.*)?$/.test(mimeType)) {
+    mimeType = "text/plain;charset=US-ASCII";
+  }
+  const response = new Response(body, { headers: { "content-type": mimeType } });
+  response.url = request.url;
+  response.headers._guard = "immutable";
+  return response;
+}
+
 function fetch(input, init = {}) {
   return new Promise((resolve, reject) => {
     let request;
@@ -461,11 +553,21 @@ function fetch(input, init = {}) {
       reject(signal.reason || new DOMException("The operation was aborted", "AbortError"));
       return;
     }
+    if (request.url.startsWith("data:")) {
+      try {
+        resolve(fetchDataURL(request));
+      } catch (error) {
+        reject(error);
+      }
+      return;
+    }
     const headerPairs = request.headers._pairs();
     let bodyBytes;
     try {
       if (request.bodyUsed) throw new TypeError("body already consumed");
-      request[kConsumed] = true;
+      if (request._bodyBytes !== undefined || request[kSourceStream] !== undefined) {
+        request[kConsumed] = true;
+      }
       request._materialize(); // drain a deferred stream body now that we're actually sending
       bodyBytes = request._bodyBytes;
     } catch (e) {

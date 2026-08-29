@@ -2,40 +2,120 @@
 // has no parent; DOM/host objects defined in this glue can install their standard "get the parent"
 // algorithm through setEventTargetParent().
 
-const DOM_EXCEPTION_CODES = {
-  IndexSizeError: 1,
-  HierarchyRequestError: 3,
-  WrongDocumentError: 4,
-  InvalidCharacterError: 5,
-  NoModificationAllowedError: 7,
-  NotFoundError: 8,
-  NotSupportedError: 9,
-  InUseAttributeError: 10,
-  InvalidStateError: 11,
-  SyntaxError: 12,
-  InvalidModificationError: 13,
-  NamespaceError: 14,
-  InvalidAccessError: 15,
-  TypeMismatchError: 17,
-  SecurityError: 18,
-  NetworkError: 19,
-  AbortError: 20,
-  URLMismatchError: 21,
-  QuotaExceededError: 22,
-  TimeoutError: 23,
-  InvalidNodeTypeError: 24,
-  DataCloneError: 25,
-};
+const DOM_EXCEPTION_CONSTANTS = [
+  ["INDEX_SIZE_ERR", "IndexSizeError", 1],
+  ["DOMSTRING_SIZE_ERR", null, 2],
+  ["HIERARCHY_REQUEST_ERR", "HierarchyRequestError", 3],
+  ["WRONG_DOCUMENT_ERR", "WrongDocumentError", 4],
+  ["INVALID_CHARACTER_ERR", "InvalidCharacterError", 5],
+  ["NO_DATA_ALLOWED_ERR", null, 6],
+  ["NO_MODIFICATION_ALLOWED_ERR", "NoModificationAllowedError", 7],
+  ["NOT_FOUND_ERR", "NotFoundError", 8],
+  ["NOT_SUPPORTED_ERR", "NotSupportedError", 9],
+  ["INUSE_ATTRIBUTE_ERR", "InUseAttributeError", 10],
+  ["INVALID_STATE_ERR", "InvalidStateError", 11],
+  ["SYNTAX_ERR", "SyntaxError", 12],
+  ["INVALID_MODIFICATION_ERR", "InvalidModificationError", 13],
+  ["NAMESPACE_ERR", "NamespaceError", 14],
+  ["INVALID_ACCESS_ERR", "InvalidAccessError", 15],
+  ["VALIDATION_ERR", null, 16],
+  ["TYPE_MISMATCH_ERR", "TypeMismatchError", 17],
+  ["SECURITY_ERR", "SecurityError", 18],
+  ["NETWORK_ERR", "NetworkError", 19],
+  ["ABORT_ERR", "AbortError", 20],
+  ["URL_MISMATCH_ERR", "URLMismatchError", 21],
+  ["QUOTA_EXCEEDED_ERR", "QuotaExceededError", 22],
+  ["TIMEOUT_ERR", "TimeoutError", 23],
+  ["INVALID_NODE_TYPE_ERR", "InvalidNodeTypeError", 24],
+  ["DATA_CLONE_ERR", "DataCloneError", 25],
+];
+const DOM_EXCEPTION_CODES = Object.fromEntries(
+  DOM_EXCEPTION_CONSTANTS.filter(([, name]) => name !== null).map(([, name, code]) => [name, code])
+);
+const DOM_EXCEPTION_STATE = new WeakMap();
 
 class DOMException extends Error {
   constructor(message = "", name = "Error") {
-    super(String(message));
-    this.name = String(name);
+    super();
+    DOM_EXCEPTION_STATE.set(this, { message: String(message), name: String(name) });
+  }
+  get message() {
+    const state = DOM_EXCEPTION_STATE.get(this);
+    if (!state) throw new TypeError("DOMException.message called on an incompatible receiver");
+    return state.message;
+  }
+  get name() {
+    const state = DOM_EXCEPTION_STATE.get(this);
+    if (!state) throw new TypeError("DOMException.name called on an incompatible receiver");
+    return state.name;
   }
   get code() {
-    return DOM_EXCEPTION_CODES[this.name] ?? 0;
+    const state = DOM_EXCEPTION_STATE.get(this);
+    if (!state) throw new TypeError("DOMException.code called on an incompatible receiver");
+    return DOM_EXCEPTION_CODES[state.name] ?? 0;
   }
 }
+
+// Web IDL §3.14 exposes legacy constants on the interface object and prototype. Keep the
+// platform accessors enumerable and branded: record conversion of DOMException.prototype must
+// observe their incompatible-receiver TypeError instead of treating it as an ordinary record.
+for (const name of ["message", "name", "code"]) {
+  const descriptor = Object.getOwnPropertyDescriptor(DOMException.prototype, name);
+  Object.defineProperty(DOMException.prototype, name, { ...descriptor, enumerable: true });
+}
+for (const [legacyName, , code] of DOM_EXCEPTION_CONSTANTS) {
+  Object.defineProperty(DOMException, legacyName, { value: code, enumerable: true });
+  Object.defineProperty(DOMException.prototype, legacyName, { value: code, enumerable: true });
+}
+Object.defineProperty(DOMException.prototype, Symbol.toStringTag, {
+  value: "DOMException", configurable: true,
+});
+
+const QUOTA_EXCEEDED_STATE = new WeakMap();
+
+// Web IDL §2.8.3: the derived exception carries nullable quota/requested details while retaining
+// the legacy QuotaExceededError name/code for compatibility.
+class QuotaExceededError extends DOMException {
+  constructor(message = "", options = {}) {
+    super(message, "QuotaExceededError");
+    if (options === null || options === undefined) options = {};
+    if ((typeof options !== "object" || options === null) && typeof options !== "function") {
+      throw new TypeError("QuotaExceededError options must be a dictionary");
+    }
+    // Web IDL dictionary conversion reads members in lexicographic order. An undefined member is
+    // absent even when a property with that value exists; nullable result attributes remain null.
+    const quotaValue = options.quota;
+    const requestedValue = options.requested;
+    const quota = quotaValue === undefined ? null : Number(quotaValue);
+    const requested = requestedValue === undefined ? null : Number(requestedValue);
+    if ((quota !== null && !Number.isFinite(quota)) ||
+        (requested !== null && !Number.isFinite(requested))) {
+      throw new TypeError("QuotaExceededError quota and requested must be finite numbers");
+    }
+    if ((quota !== null && quota < 0) || (requested !== null && requested < 0) ||
+        (quota !== null && requested !== null && requested < quota)) {
+      throw new RangeError("QuotaExceededError requested must be at least quota");
+    }
+    QUOTA_EXCEEDED_STATE.set(this, { quota, requested });
+  }
+  get quota() {
+    const state = QUOTA_EXCEEDED_STATE.get(this);
+    if (!state) throw new TypeError("QuotaExceededError.quota called on an incompatible receiver");
+    return state.quota;
+  }
+  get requested() {
+    const state = QUOTA_EXCEEDED_STATE.get(this);
+    if (!state) throw new TypeError("QuotaExceededError.requested called on an incompatible receiver");
+    return state.requested;
+  }
+}
+for (const name of ["quota", "requested"]) {
+  const descriptor = Object.getOwnPropertyDescriptor(QuotaExceededError.prototype, name);
+  Object.defineProperty(QuotaExceededError.prototype, name, { ...descriptor, enumerable: true });
+}
+Object.defineProperty(QuotaExceededError.prototype, Symbol.toStringTag, {
+  value: "QuotaExceededError", configurable: true,
+});
 
 const EVENT_STATE = new WeakMap();
 const EVENT_TARGET_STATE = new WeakMap();
@@ -190,11 +270,9 @@ class EventTarget {
   }
   addEventListener(type, callback, options = {}) {
     const target = eventTargetState(this, "EventTarget.addEventListener");
-    if (callback === null || callback === undefined) return;
-    if (typeof callback !== "function" && (typeof callback !== "object" || callback === null)) {
-      throw new TypeError("Event listener must be a function or callback object");
-    }
-
+    // DOM §2.7 addEventListener first runs "flatten more options", including observable Gets and
+    // Web IDL's non-null AbortSignal conversion, before the add-listener algorithm ignores a null
+    // callback. Keep the specified capture → once → passive → signal order.
     let capture;
     let once = false;
     let passive = false;
@@ -206,7 +284,17 @@ class EventTarget {
       capture = !!options.capture;
       once = !!options.once;
       passive = !!options.passive;
-      signal = options.signal ?? null;
+      if ("signal" in options) {
+        signal = options.signal;
+        if (!(signal instanceof AbortSignal)) {
+          throw new TypeError("options.signal must be an AbortSignal");
+        }
+      }
+    }
+
+    if (callback === null || callback === undefined) return;
+    if (typeof callback !== "function" && (typeof callback !== "object" || callback === null)) {
+      throw new TypeError("Event listener must be a function or callback object");
     }
 
     const key = String(type);
@@ -219,7 +307,6 @@ class EventTarget {
       return;
     }
     if (signal !== null) {
-      if (!(signal instanceof AbortSignal)) throw new TypeError("options.signal must be an AbortSignal");
       if (signal.aborted) return;
     }
 
@@ -458,6 +545,7 @@ class AbortController {
 }
 
 globalThis.DOMException = DOMException;
+globalThis.QuotaExceededError = QuotaExceededError;
 globalThis.Event = Event;
 globalThis.CustomEvent = CustomEvent;
 globalThis.EventTarget = EventTarget;

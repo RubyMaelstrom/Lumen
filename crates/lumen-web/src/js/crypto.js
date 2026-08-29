@@ -31,10 +31,12 @@ const subtle = new SubtleCrypto();
 class Crypto {
   getRandomValues(view) {
     if (!ArrayBuffer.isView(view) || !INTEGER_VIEWS.some((T) => view instanceof T)) {
-      throw new TypeError("getRandomValues expects an integer typed array");
+      // Web Cryptography §10.1.1 uses the legacy TypeMismatchError DOMException for a view
+      // outside the IntegerArray union.
+      throw new DOMException("getRandomValues expects an integer typed array", "TypeMismatchError");
     }
     if (view.byteLength > 65536) {
-      throw new DOMException("getRandomValues: quota (65536 bytes) exceeded", "QuotaExceededError");
+      throw new QuotaExceededError("getRandomValues: quota (65536 bytes) exceeded");
     }
     // Fill by bytes over a Uint8Array sharing the same buffer region.
     const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);

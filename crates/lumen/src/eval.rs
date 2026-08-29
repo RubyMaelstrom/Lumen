@@ -1528,9 +1528,8 @@ impl Interp {
     pub(crate) fn get_iterator(&mut self, v: &Value) -> Result<(Value, Value), Abrupt> {
         // A primitive string iterates by code point (it has no own @@iterator method here).
         if let Value::Str(s) = v {
-            let chars: Vec<Value> = s
-                .chars()
-                .map(|c| Value::from_string(c.to_string()))
+            let chars: Vec<Value> = crate::jstr::CodePointIter::new(s)
+                .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
                 .collect();
             let arr = self.make_array(chars);
             return self.get_iterator(&arr);
@@ -1600,9 +1599,8 @@ impl Interp {
     pub(crate) fn iterate(&mut self, v: &Value) -> Result<Vec<Value>, Abrupt> {
         match v {
             Value::Str(s) => {
-                return Ok(s
-                    .chars()
-                    .map(|c| Value::from_string(c.to_string()))
+                return Ok(crate::jstr::CodePointIter::new(s)
+                    .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
                     .collect());
             }
             Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {

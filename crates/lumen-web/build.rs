@@ -21,6 +21,7 @@ const JS_FILES: &[&str] = &[
     "url.js",
     "urlpattern.js",
     "streams.js",
+    "streams-webidl.js",
     "writable.js",
     "compression.js",
     "blob.js",
