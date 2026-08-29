@@ -165,6 +165,9 @@ conformance-style tests and the broader affected suite pass.
         class expressions run before heritage, member expressions interleave with computed names,
         reverse application retains natural receivers, and every stage may suspend without a
         native worker. Focused official decorator syntax/staging coverage passes 23/23.
+      - [x] Keep named-class self bindings in the distinct ClassDefinitionEvaluation `classEnv`
+        during capture analysis, so methods and initializers can close over their own class without
+        misclassifying that engine-owned environment as a coroutine activation scope.
       - [x] Lower arbitrary/interleaved spread argument lists for calls, optional calls, and
         constructors while preserving receiver binding, short-circuiting, and evaluation order.
       - [x] Lower delete references, including optional-chain short-circuiting, environment

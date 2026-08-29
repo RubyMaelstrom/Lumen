@@ -6048,10 +6048,17 @@ fn class_definitions_do_not_force_native_coroutines() {
                  static value=5;
                  static{this.block=6}
                  read(){return this.#private+this.field+super.base()}
+                 static self(){return Declared}
                }
-               yield [Declared.value,Declared.block,new Declared().read(),Declared.name].join(',');
-               const Named=class extends BaseCtor{field=7};
-               return [Named.name,new Named().field,new Named().base()].join(',');
+               yield [Declared.value,Declared.block,new Declared().read(),Declared.name,
+                 Declared.self()===Declared].join(',');
+               const Named=class Inner extends BaseCtor{
+                 field=7;
+                 static self(){return Inner}
+                 outer(){return captured}
+               };
+               return [Named.name,new Named().field,new Named().base(),Named.self()===Named,
+                 new Named().outer()].join(',');
              }
              globalThis.classIterator=classes(Base);",
             false,
@@ -6071,7 +6078,10 @@ fn class_definitions_do_not_force_native_coroutines() {
         .expect("class continuation drive parses")
     {
         Completion::Value(value) => {
-            assert_eq!(value, "before-declaration|5,6,9,Declared|Named,7,2|true")
+            assert_eq!(
+                value,
+                "before-declaration|5,6,9,Declared,true|Inner,7,2,true,3|true"
+            )
         }
         Completion::Throw { name, message } => {
             panic!("class continuation drive threw {name}: {message}")

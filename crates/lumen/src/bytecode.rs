@@ -2056,20 +2056,26 @@ impl CaptureScan {
     }
 
     fn class(&mut self, c: &Class) -> Option<()> {
-        // Heritage, decorators, and computed keys evaluate at definition time (current depth);
-        // method bodies / field initializers / static blocks run later (inner-function depth).
+        // Class decorator expressions evaluate outside the class environment. Heritage, member
+        // decorators, and computed keys then evaluate in the distinct `classEnv` created by
+        // ECMA-262 ClassDefinitionEvaluation; methods and initializers retain that environment.
+        // Tag the self-name scope as owned by the latter implicit function-like depth so it is
+        // never mistaken for a coroutine activation binding. References can still walk through
+        // it to capture genuine locals from the function being compiled.
         for d in &c.decorators {
             self.expr(d)?;
-        }
-        if let Some(sc) = &c.superclass {
-            self.expr(sc)?;
         }
         let mut names = std::collections::HashSet::new();
         if let Some(n) = &c.name {
             names.insert(n.clone());
         }
+        self.fn_depth += 1;
         self.push_scope(names);
+        self.fn_depth -= 1;
         let r = (|| {
+            if let Some(sc) = &c.superclass {
+                self.expr(sc)?;
+            }
             for m in &c.members {
                 for d in &m.decorators {
                     self.expr(d)?;
