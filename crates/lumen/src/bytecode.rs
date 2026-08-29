@@ -12905,264 +12905,271 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     let mut push_arg_moved = false;
     let mut call_args_moved = 0usize;
     i.depth += 1;
-    let r: Result<Value, Abrupt> = if i.depth > i.max_eval_depth {
+    #[cfg(target_arch = "wasm32")]
+    let exhausted = i.depth > crate::interpreter::WASM_EXECUTION_DEPTH_GUARD;
+    #[cfg(not(target_arch = "wasm32"))]
+    let exhausted = false;
+    let r: Result<Value, Abrupt> = if exhausted {
         Err(i.throw("RangeError", "Maximum call stack size exceeded"))
     } else {
-        i.gc_check_amortized().and_then(|()| {
-            // Match `call_native_committed`: native code and any observable fallback it invokes
-            // run outside a pending construction. Dense push/pop themselves cannot observe
-            // these fields, but a prototype setter or unusual array-like on the miss path can.
-            let saved_ctor = std::mem::replace(&mut i.constructing, false);
-            let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
-            let r = match intrinsic {
-                INTRINSIC_CHAR_AT => {
-                    let Value::Str(s) = &*base else {
-                        unreachable!("charAt intrinsic receiver guard")
-                    };
-                    let Value::Num(n) = &*base.add(2) else {
-                        unreachable!("charAt intrinsic index guard")
-                    };
-                    let idx = if n.is_nan() { 0.0 } else { n.trunc() };
-                    Ok(if idx < 0.0 || !idx.is_finite() {
-                        Value::str("")
-                    } else {
-                        match i.unit_at(s, idx as usize) {
-                            Some(unit) => Value::Str(crate::jstr::unit_lstr(unit)),
-                            None => Value::str(""),
-                        }
-                    })
-                }
-                INTRINSIC_STRING_SLICE => {
-                    let Value::Str(s) = &*base else {
-                        unreachable!("slice intrinsic receiver guard")
-                    };
-                    let Value::Num(start) = &*base.add(2) else {
-                        unreachable!("slice intrinsic start guard")
-                    };
-                    let Value::Num(end) = &*base.add(3) else {
-                        unreachable!("slice intrinsic end guard")
-                    };
-                    debug_assert!(s.ascii_hint());
-                    let len = s.len() as i64;
-                    let norm = |n: f64| {
-                        if n.is_nan() {
-                            return 0;
-                        }
-                        let n = if n.is_infinite() {
-                            if n > 0.0 {
-                                len
-                            } else {
-                                -len - 1
-                            }
-                        } else {
-                            n as i64
+        crate::interpreter::with_execution_stack(i.depth, || {
+            i.gc_check_amortized().and_then(|()| {
+                // Match `call_native_committed`: native code and any observable fallback it invokes
+                // run outside a pending construction. Dense push/pop themselves cannot observe
+                // these fields, but a prototype setter or unusual array-like on the miss path can.
+                let saved_ctor = std::mem::replace(&mut i.constructing, false);
+                let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
+                let r = match intrinsic {
+                    INTRINSIC_CHAR_AT => {
+                        let Value::Str(s) = &*base else {
+                            unreachable!("charAt intrinsic receiver guard")
                         };
-                        if n < 0 {
-                            (len + n).max(0)
+                        let Value::Num(n) = &*base.add(2) else {
+                            unreachable!("charAt intrinsic index guard")
+                        };
+                        let idx = if n.is_nan() { 0.0 } else { n.trunc() };
+                        Ok(if idx < 0.0 || !idx.is_finite() {
+                            Value::str("")
                         } else {
-                            n.min(len)
-                        }
-                    };
-                    let (start, end) = (norm(*start), norm(*end));
-                    Ok(if start < end {
-                        Value::str(&s[start as usize..end as usize])
-                    } else {
-                        Value::str("")
-                    })
-                }
-                INTRINSIC_OBJECT_HAS_OWN => {
-                    let Value::Obj(o) = &*base.add(2) else {
-                        unreachable!("hasOwn intrinsic object guard")
-                    };
-                    let Value::Str(key) = &*base.add(3) else {
-                        unreachable!("hasOwn intrinsic key guard")
-                    };
-                    Ok(Value::Bool(o.borrow().props.contains(key.as_str())))
-                }
-                INTRINSIC_FUNCTION_CALL => {
-                    // `target.call(thisArg, arg)`: transfer thisArg + the single forwarded argument
-                    // directly into a compiled target frame. A failed applicability probe has no
-                    // side effects, so proxies, native targets, and unusual closures invoke the
-                    // exact Function.prototype.call builtin.
-                    debug_assert!(call_argc >= 1);
-                    let forwarded = call_argc - 1;
-                    match i.call_jit_fast(&*base, base.add(2), base.add(3), forwarded, None) {
-                        Some(r) => {
-                            this_moved = true;
-                            call_args_moved = forwarded;
-                            r
-                        }
-                        None => crate::builtins::nf_function_call(
-                            i,
-                            (*base).clone(),
-                            std::slice::from_raw_parts(base.add(2), call_argc),
-                        )
-                        .map_err(Abrupt::Throw),
+                            match i.unit_at(s, idx as usize) {
+                                Some(unit) => Value::Str(crate::jstr::unit_lstr(unit)),
+                                None => Value::str(""),
+                            }
+                        })
                     }
-                }
-                INTRINSIC_FUNCTION_APPLY => {
-                    // The dominant `initialize.apply(this, arguments)` shape has an unmapped,
-                    // own-dense arguments object. Clone its entries once, then move them straight
-                    // into an already-JIT-compiled target frame. No observable operation occurs
-                    // before every list guard has passed; unusual array-likes and non-JIT targets
-                    // execute the named builtin unchanged.
-                    let dense = match (&*base, &*base.add(3)) {
-                        (Value::Obj(_), Value::Obj(list))
-                            if i.ordinary_get_ptr(Rc::as_ptr(list) as usize)
-                                && !i
-                                    .mapped_arguments
-                                    .contains_key(&(Rc::as_ptr(list) as usize)) =>
-                        {
-                            let b = list.borrow();
-                            let len = match b.props.get("length") {
-                                Some(p) if !p.accessor() => match p.value() {
-                                    Value::Num(n)
-                                        if n >= 0.0
-                                            && n.is_finite()
-                                            && n.fract() == 0.0
-                                            && n <= crate::interpreter::MAX_ARRAY_OP_LEN as f64 =>
-                                    {
-                                        Some(n as usize)
-                                    }
-                                    _ => None,
-                                },
-                                _ => None,
-                            };
-                            len.and_then(|len| {
-                                let mut values = Vec::with_capacity(len);
-                                for k in 0..len {
-                                    let value = b
-                                        .props
-                                        .get_index(k as u32)
-                                        .filter(|p| !p.accessor())
-                                        .map(|p| p.value())?;
-                                    values.push(value);
+                    INTRINSIC_STRING_SLICE => {
+                        let Value::Str(s) = &*base else {
+                            unreachable!("slice intrinsic receiver guard")
+                        };
+                        let Value::Num(start) = &*base.add(2) else {
+                            unreachable!("slice intrinsic start guard")
+                        };
+                        let Value::Num(end) = &*base.add(3) else {
+                            unreachable!("slice intrinsic end guard")
+                        };
+                        debug_assert!(s.ascii_hint());
+                        let len = s.len() as i64;
+                        let norm = |n: f64| {
+                            if n.is_nan() {
+                                return 0;
+                            }
+                            let n = if n.is_infinite() {
+                                if n > 0.0 {
+                                    len
+                                } else {
+                                    -len - 1
                                 }
-                                Some(values)
-                            })
-                        }
-                        _ => None,
-                    };
-                    if let Some(mut values) = dense {
-                        match i.call_jit_fast(
-                            &*base,
-                            base.add(2),
-                            values.as_mut_ptr(),
-                            values.len(),
-                            None,
-                        ) {
+                            } else {
+                                n as i64
+                            };
+                            if n < 0 {
+                                (len + n).max(0)
+                            } else {
+                                n.min(len)
+                            }
+                        };
+                        let (start, end) = (norm(*start), norm(*end));
+                        Ok(if start < end {
+                            Value::str(&s[start as usize..end as usize])
+                        } else {
+                            Value::str("")
+                        })
+                    }
+                    INTRINSIC_OBJECT_HAS_OWN => {
+                        let Value::Obj(o) = &*base.add(2) else {
+                            unreachable!("hasOwn intrinsic object guard")
+                        };
+                        let Value::Str(key) = &*base.add(3) else {
+                            unreachable!("hasOwn intrinsic key guard")
+                        };
+                        Ok(Value::Bool(o.borrow().props.contains(key.as_str())))
+                    }
+                    INTRINSIC_FUNCTION_CALL => {
+                        // `target.call(thisArg, arg)`: transfer thisArg + the single forwarded argument
+                        // directly into a compiled target frame. A failed applicability probe has no
+                        // side effects, so proxies, native targets, and unusual closures invoke the
+                        // exact Function.prototype.call builtin.
+                        debug_assert!(call_argc >= 1);
+                        let forwarded = call_argc - 1;
+                        match i.call_jit_fast(&*base, base.add(2), base.add(3), forwarded, None) {
                             Some(r) => {
-                                // `call_jit_fast` moved every Vec element and the original thisArg.
-                                values.set_len(0);
                                 this_moved = true;
+                                call_args_moved = forwarded;
                                 r
                             }
-                            None => crate::builtins::nf_function_apply(
+                            None => crate::builtins::nf_function_call(
+                                i,
+                                (*base).clone(),
+                                std::slice::from_raw_parts(base.add(2), call_argc),
+                            )
+                            .map_err(Abrupt::Throw),
+                        }
+                    }
+                    INTRINSIC_FUNCTION_APPLY => {
+                        // The dominant `initialize.apply(this, arguments)` shape has an unmapped,
+                        // own-dense arguments object. Clone its entries once, then move them straight
+                        // into an already-JIT-compiled target frame. No observable operation occurs
+                        // before every list guard has passed; unusual array-likes and non-JIT targets
+                        // execute the named builtin unchanged.
+                        let dense = match (&*base, &*base.add(3)) {
+                            (Value::Obj(_), Value::Obj(list))
+                                if i.ordinary_get_ptr(Rc::as_ptr(list) as usize)
+                                    && !i
+                                        .mapped_arguments
+                                        .contains_key(&(Rc::as_ptr(list) as usize)) =>
+                            {
+                                let b = list.borrow();
+                                let len = match b.props.get("length") {
+                                    Some(p) if !p.accessor() => match p.value() {
+                                        Value::Num(n)
+                                            if n >= 0.0
+                                                && n.is_finite()
+                                                && n.fract() == 0.0
+                                                && n <= crate::interpreter::MAX_ARRAY_OP_LEN
+                                                    as f64 =>
+                                        {
+                                            Some(n as usize)
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                };
+                                len.and_then(|len| {
+                                    let mut values = Vec::with_capacity(len);
+                                    for k in 0..len {
+                                        let value = b
+                                            .props
+                                            .get_index(k as u32)
+                                            .filter(|p| !p.accessor())
+                                            .map(|p| p.value())?;
+                                        values.push(value);
+                                    }
+                                    Some(values)
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(mut values) = dense {
+                            match i.call_jit_fast(
+                                &*base,
+                                base.add(2),
+                                values.as_mut_ptr(),
+                                values.len(),
+                                None,
+                            ) {
+                                Some(r) => {
+                                    // `call_jit_fast` moved every Vec element and the original thisArg.
+                                    values.set_len(0);
+                                    this_moved = true;
+                                    r
+                                }
+                                None => crate::builtins::nf_function_apply(
+                                    i,
+                                    (*base).clone(),
+                                    std::slice::from_raw_parts(base.add(2), 2),
+                                )
+                                .map_err(Abrupt::Throw),
+                            }
+                        } else {
+                            crate::builtins::nf_function_apply(
+                                i,
+                                (*base).clone(),
+                                std::slice::from_raw_parts(base.add(2), 2),
+                            )
+                            .map_err(Abrupt::Throw)
+                        }
+                    }
+                    INTRINSIC_ARRAY_PUSH => {
+                        let Value::Obj(o) = &*base else {
+                            unreachable!("push intrinsic receiver guard")
+                        };
+                        let arg = base.add(2).read();
+                        push_arg_moved = true;
+                        match crate::builtins::jit_array_push_one(i, o, arg) {
+                            Ok(v) => Ok(v),
+                            Err(arg) => {
+                                // The transfer helper promises a guard miss has no side effects and
+                                // returns the original owner, so the generic builtin sees the exact
+                                // operand stack it would have seen without specialization.
+                                base.add(2).write(arg);
+                                push_arg_moved = false;
+                                crate::builtins::nf_array_push(
+                                    i,
+                                    (*base).clone(),
+                                    std::slice::from_raw_parts(base.add(2), 1),
+                                )
+                                .map_err(Abrupt::Throw)
+                            }
+                        }
+                    }
+                    INTRINSIC_ARRAY_POP => {
+                        let Value::Obj(o) = &*base else {
+                            unreachable!("pop intrinsic receiver guard")
+                        };
+                        match crate::builtins::jit_array_pop(i, o) {
+                            Some(v) => Ok(v),
+                            None => crate::builtins::nf_array_pop(i, (*base).clone(), &[])
+                                .map_err(Abrupt::Throw),
+                        }
+                    }
+                    INTRINSIC_REGEXP_EXEC_DISCARD => {
+                        let (Value::Obj(_), Value::Str(input)) = (&*base, &*base.add(2)) else {
+                            unreachable!("regexp exec intrinsic guards")
+                        };
+                        match crate::builtins::regexp_exec_discard_fast(i, &*base, input) {
+                            Some(r) => {
+                                i.interrupt_poll_force()?;
+                                r.map(|_| Value::Undefined).map_err(Abrupt::Throw)
+                            }
+                            None => crate::builtins::regexp_exec(
+                                i,
+                                (*base).clone(),
+                                std::slice::from_raw_parts(base.add(2), 1),
+                            )
+                            .map_err(Abrupt::Throw),
+                        }
+                    }
+                    INTRINSIC_STRING_REPLACE_DISCARD => {
+                        match crate::builtins::string_replace_discard_fast(
+                            i,
+                            &*base,
+                            &*base.add(2),
+                            &*base.add(3),
+                        ) {
+                            Some(r) => {
+                                i.interrupt_poll_force()?;
+                                r.map_err(Abrupt::Throw)
+                            }
+                            None => crate::builtins::nf_string_replace(
                                 i,
                                 (*base).clone(),
                                 std::slice::from_raw_parts(base.add(2), 2),
                             )
                             .map_err(Abrupt::Throw),
                         }
-                    } else {
-                        crate::builtins::nf_function_apply(
-                            i,
-                            (*base).clone(),
-                            std::slice::from_raw_parts(base.add(2), 2),
-                        )
-                        .map_err(Abrupt::Throw)
                     }
-                }
-                INTRINSIC_ARRAY_PUSH => {
-                    let Value::Obj(o) = &*base else {
-                        unreachable!("push intrinsic receiver guard")
-                    };
-                    let arg = base.add(2).read();
-                    push_arg_moved = true;
-                    match crate::builtins::jit_array_push_one(i, o, arg) {
-                        Ok(v) => Ok(v),
-                        Err(arg) => {
-                            // The transfer helper promises a guard miss has no side effects and
-                            // returns the original owner, so the generic builtin sees the exact
-                            // operand stack it would have seen without specialization.
-                            base.add(2).write(arg);
-                            push_arg_moved = false;
-                            crate::builtins::nf_array_push(
+                    INTRINSIC_STRING_SPLIT_DISCARD => {
+                        match crate::builtins::string_split_discard_fast(
+                            i,
+                            &*base,
+                            &*base.add(2),
+                            &Value::Undefined,
+                        ) {
+                            Some(r) => r.map_err(Abrupt::Throw),
+                            None => crate::builtins::nf_string_split(
                                 i,
                                 (*base).clone(),
                                 std::slice::from_raw_parts(base.add(2), 1),
                             )
-                            .map_err(Abrupt::Throw)
-                        }
-                    }
-                }
-                INTRINSIC_ARRAY_POP => {
-                    let Value::Obj(o) = &*base else {
-                        unreachable!("pop intrinsic receiver guard")
-                    };
-                    match crate::builtins::jit_array_pop(i, o) {
-                        Some(v) => Ok(v),
-                        None => crate::builtins::nf_array_pop(i, (*base).clone(), &[])
                             .map_err(Abrupt::Throw),
-                    }
-                }
-                INTRINSIC_REGEXP_EXEC_DISCARD => {
-                    let (Value::Obj(_), Value::Str(input)) = (&*base, &*base.add(2)) else {
-                        unreachable!("regexp exec intrinsic guards")
-                    };
-                    match crate::builtins::regexp_exec_discard_fast(i, &*base, input) {
-                        Some(r) => {
-                            i.interrupt_poll_force()?;
-                            r.map(|_| Value::Undefined).map_err(Abrupt::Throw)
                         }
-                        None => crate::builtins::regexp_exec(
-                            i,
-                            (*base).clone(),
-                            std::slice::from_raw_parts(base.add(2), 1),
-                        )
-                        .map_err(Abrupt::Throw),
                     }
-                }
-                INTRINSIC_STRING_REPLACE_DISCARD => {
-                    match crate::builtins::string_replace_discard_fast(
-                        i,
-                        &*base,
-                        &*base.add(2),
-                        &*base.add(3),
-                    ) {
-                        Some(r) => {
-                            i.interrupt_poll_force()?;
-                            r.map_err(Abrupt::Throw)
-                        }
-                        None => crate::builtins::nf_string_replace(
-                            i,
-                            (*base).clone(),
-                            std::slice::from_raw_parts(base.add(2), 2),
-                        )
-                        .map_err(Abrupt::Throw),
-                    }
-                }
-                INTRINSIC_STRING_SPLIT_DISCARD => {
-                    match crate::builtins::string_split_discard_fast(
-                        i,
-                        &*base,
-                        &*base.add(2),
-                        &Value::Undefined,
-                    ) {
-                        Some(r) => r.map_err(Abrupt::Throw),
-                        None => crate::builtins::nf_string_split(
-                            i,
-                            (*base).clone(),
-                            std::slice::from_raw_parts(base.add(2), 1),
-                        )
-                        .map_err(Abrupt::Throw),
-                    }
-                }
-                _ => unreachable!("unknown JIT intrinsic"),
-            };
-            i.constructing = saved_ctor;
-            i.new_target = saved_nt;
-            r
+                    _ => unreachable!("unknown JIT intrinsic"),
+                };
+                i.constructing = saved_ctor;
+                i.new_target = saved_nt;
+                r
+            })
         })
     };
     i.depth -= 1;
@@ -14597,7 +14604,7 @@ unsafe fn jit_callstat(
                 break 'r "gate: callee refcount <= 1";
             }
         }
-        if i.depth >= i.max_eval_depth {
+        if i.depth >= i.direct_call_depth {
             break 'r "gate: depth";
         }
         if (i.gc_tick + 1) & crate::interpreter::GC_CALL_POLL_MASK == 0 {

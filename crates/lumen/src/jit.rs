@@ -4131,7 +4131,7 @@ fn emit_direct_call(
     let fits4 = |o: usize| o & 3 == 0 && o / 4 < 4096;
     let il = ilayout;
     if !(fits4(il.depth)
-        && fits4(il.max_eval_depth)
+        && fits4(il.direct_call_depth)
         && fits4(il.gc_tick)
         && fits8(il.gc_next)
         && fits4(il.cur_coro)
@@ -4243,7 +4243,7 @@ fn emit_direct_call(
     // interp-side room: depth, gc tick, fn_frames capacity, frame pool
     a.ldr_imm(14, 19, 72); // ctx.interp
     a.ldr_w_imm(11, 14, il.depth as u32);
-    a.ldr_w_imm(13, 14, il.max_eval_depth as u32);
+    a.ldr_w_imm(13, 14, il.direct_call_depth as u32);
     a.cmp_reg_x(11, 13); // w-load zero-extends; the compare stays 64-bit
     a.b_cond(C_HS, hit_slow);
     // Check actual allocation pressure in generated code. Collection-due calls take the full

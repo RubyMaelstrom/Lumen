@@ -20,8 +20,7 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
         // The realm lives in a pointer-keyed internal-slot table. Pin the owner against allocator
         // address reuse; the cycle collector evicts the Box before releasing the pin.
         i.gc_pin(&obj);
-        let mut realm = Interp::new_with_symbol_agent(i.symbol_agent.clone());
-        realm.max_eval_depth = i.max_eval_depth;
+        let realm = Interp::new_with_symbol_agent(i.symbol_agent.clone());
         i.shadow_realms.insert(p, Box::new(realm));
         Ok(Value::Obj(obj))
     });

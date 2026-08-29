@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# A from-scratch JavaScript engine. No dependencies — std only — and no native libraries. The
-# engine is exercised by the Test262 runner and exposes an optional embedding API for independent
-# runtimes; it does not assume a particular downstream JavaScript host.
+# A from-scratch JavaScript engine. The implementation is std-only except for native segmented
+# stack switching: ordinary ECMAScript execution contexts must not be limited by the Rust thread
+# stack. The engine is exercised by the Test262 runner and exposes an optional embedding API for
+# independent runtimes; it does not assume a particular downstream JavaScript host.
 
 [dependencies]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+stacker = "0.1.24"
 
 [features]
 default = ["intl"]

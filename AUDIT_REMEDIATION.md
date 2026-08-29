@@ -5,6 +5,69 @@ ordered by correctness and containment first, standards coverage second, and
 measured performance improvements third. An item is complete only after focused
 conformance-style tests and the broader affected suite pass.
 
+The checked audit entries below record work completed during the original audit;
+they are not an acceptance statement for the resulting engine. Production-
+differential browser testing on 2026-08-29 exposed regressions that the original
+verification gates did not detect. The following acceptance blockers therefore
+take precedence over every historical checkmark in this document.
+
+## Post-audit regression remediation
+
+- [ ] Replace arbitrary execution-depth rejection with an implementation that
+  supports ECMAScript execution contexts up to actual resource exhaustion.
+  - [x] Remove TRust's embedder-selected depth budget and Lumen's native
+    browser-visible depth guard.
+  - [x] Cover interpreter, bytecode, JIT, captured/native calls, and construction
+    with focused deep-recursion tests using native segmented-stack checkpoints.
+  - [ ] Move wasm32 ordinary calls to heap-owned VM frames so that target does
+    not retain a temporary fixed execution-depth guard.
+  - [x] Pass the broader Lumen suite and optimized real-browser gate. The full
+    workspace suite passes, and Steam, Twitch, and YouTube pass the semantic,
+    scheduler-responsive browser matrix plus real terminal loading checks.
+- [x] Establish a fast, optimized, non-LTO browser-workload gate for development
+  iterations, while reserving the full release profile for acceptance milestones.
+  - [x] Make fatal JavaScript errors and minimum DOM progress test failures rather
+    than diagnostic output that always passes.
+  - [x] Replace raw node-count acceptance with site-semantic landmarks, require a
+    real frontend-command acknowledgement within ten seconds, and force the
+    ignored gate through the release-equivalent complete typed-render path.
+  - [x] Expose terminal loading components (navigation, image fetch/decode,
+    image encode, and command acknowledgement) in the frame diagnostic so a
+    perpetual standards-valid animation cannot be mistaken for an unfinished
+    page.
+  - [x] Record a passing production-differential baseline for Twitch, YouTube,
+    and Steam. Paired 200x50 pseudo-terminal runs against the installed release
+    and current optimized browser-check artifact retain the same YouTube Home/
+    Subscriptions/search surface, Twitch login/signup/live-channel surface (the
+    current build additionally exposes Browse/Search), and Steam featured
+    storefront surface (the current build additionally exposes its search).
+- [x] Restore Twitch loading and verify that no JavaScript stack failure or
+  framework abort prevents production-equivalent DOM progress. The optimized
+  gate reaches search, carousel, and live-channel landmarks; a real terminal
+  run reaches a populated 165-row live region with every loading component
+  false.
+- [x] Restore YouTube's search control and production-equivalent DOM progress.
+  The optimized gate reaches the visible `search_query` control after the real
+  viewport correction, with the resident actor still responsive to browser
+  commands; a real terminal run also reaches an idle loading state.
+- [x] Restore Steam's finite initial loading state without reinstating the
+  non-standard Promise failure that happened to abort its animation path. The
+  gate reaches search, featured-carousel, offers, and catalog landmarks; a real
+  terminal run clears every loading component about eight seconds after first
+  content while the valid marquee animation continues independently.
+- [x] Preserve HTML lazy-image classification through the terminal presentation
+  adapter and resume deferred resources only near their retained CSS-pixel
+  viewport boxes. Cover eager dynamic mounts, off-screen deferral, scroll
+  resumption, and fixed-position descendants with focused frontend tests.
+- [ ] Audit every audit-introduced numeric cap, fallback, unsupported branch,
+  and watchdog against its governing standard and real-browser workloads.
+- [x] Run the full Lumen and TRust suites, optimized release builds, browser
+  acceptance matrix, and system `js-engine-benchmark` before promotion. The
+  Lumen workspace is green; TRust passes 949 active library tests; release
+  `trust` and `trust-desktop` build; all three browser gates and terminal runs
+  pass; three official benchmark samples score 1812, 1811, and 1810 (34.659--
+  34.701 s). The built artifacts remain uninstalled pending explicit approval.
+
 ## Correctness and containment
 
 - [x] Implement normative WebAssembly binary/module/instruction validation,

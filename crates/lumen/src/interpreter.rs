@@ -926,7 +926,7 @@ fn stub_slot(shape: u32, name: &str) -> usize {
 #[allow(dead_code)] // consumed incrementally as the asm thunk lands
 pub(crate) struct InterpLayout {
     pub depth: usize,
-    pub max_eval_depth: usize,
+    pub direct_call_depth: usize,
     pub gc_tick: usize,
     pub gc_next: usize,
     pub interrupt_poll_tick: usize,
@@ -1002,7 +1002,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
     };
     InterpLayout {
         depth: off(&i.depth as *const _ as usize),
-        max_eval_depth: off(&i.max_eval_depth as *const _ as usize),
+        direct_call_depth: off(&i.direct_call_depth as *const _ as usize),
         gc_tick: off(&i.gc_tick as *const _ as usize),
         gc_next: off(&i.gc_next as *const _ as usize),
         interrupt_poll_tick: off(&i.interrupt_poll_tick as *const _ as usize),
@@ -1131,13 +1131,12 @@ pub struct Interp {
     /// the 14 strings materialize into the constructor's hidden props only when an accessor
     /// actually reads them (see `builtins::flush_regexp_legacy`), not on every match.
     pub(crate) regexp_last: Option<RegexpLastMatch>,
-    /// Live interpreter recursion depth (expression eval + calls). Bounded by
-    /// [`max_eval_depth`](Self::max_eval_depth) so runaway recursion throws a RangeError instead
-    /// of overflowing the native stack.
+    /// Live ECMAScript execution depth. Native builds use it to decide when direct JIT calls must
+    /// return to a stack-growth checkpoint; it is bookkeeping, not a language-visible budget.
     pub(crate) depth: u32,
-    /// Realm-local recursion budget. The conservative default fits small host threads; embedders
-    /// which provision a larger native stack may explicitly raise it through `Engine`.
-    pub(crate) max_eval_depth: u32,
+    /// Deep direct JIT calls return to Rust before this point so the next committed call can move
+    /// to a heap-backed native stack segment when necessary.
+    pub(crate) direct_call_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
@@ -1479,17 +1478,37 @@ pub struct FieldInit {
     pub transforms: Vec<Value>,
 }
 
-/// Default recursion ceiling for interpreter and bytecode calls. ECMA-262 §9.4 models each call by
-/// pushing an execution context but does not prescribe a finite implementation's native-stack
-/// capacity. Keep this below the smallest supported host thread stack (Rust test and Web Worker
-/// threads commonly reserve 2 MiB) so resource exhaustion becomes a catchable RangeError instead
-/// of aborting the Agent. This also fits wasm32's smaller host call stack; heap-owned coroutine
-/// continuations do not provide a larger native stack.
-pub const DEFAULT_MAX_EVAL_DEPTH: u32 = 128;
+/// Direct machine-code calls return to the committed Rust path at this depth. That path is a
+/// stack-growth checkpoint, so this threshold changes dispatch strategy without rejecting work.
+const MAX_DIRECT_CALL_DEPTH: u32 = 128;
 
-/// Hard ceiling for an embedder override. Raising the budget is safe only when every thread which
-/// may enter the realm has a correspondingly provisioned native stack.
-pub const MAX_CONFIGURED_EVAL_DEPTH: u32 = 1_024;
+/// wasm32 cannot switch native stacks. This temporary containment guard remains until ordinary
+/// calls join coroutine execution on heap-owned VM frames; it must not be confused with the
+/// native engine's execution semantics.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const WASM_EXECUTION_DEPTH_GUARD: u32 = 128;
+
+/// Native execution is allowed to use the current thread stack while it has comfortable
+/// headroom. Once a call chain becomes deep, `stacker` moves the next Rust continuation to a
+/// heap-backed stack segment. This is an implementation detail: unlike the former eval-depth
+/// budget, it does not reject an ECMAScript execution context.
+#[cfg(not(target_arch = "wasm32"))]
+const EXECUTION_STACK_RED_ZONE: usize = 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const EXECUTION_STACK_SEGMENT: usize = 8 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const FIRST_DEEP_STACK_CHECK: u32 = 32;
+
+#[inline]
+pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if depth == 1 || depth >= FIRST_DEEP_STACK_CHECK {
+            return stacker::maybe_grow(EXECUTION_STACK_RED_ZONE, EXECUTION_STACK_SEGMENT, f);
+        }
+    }
+    f()
+}
 
 /// Live-object ceiling (≈ a few hundred MB). When a safe point sees this many *live* objects, the
 /// cycle collector runs; if it can't get back under, a RangeError is thrown rather than exhausting
@@ -1787,7 +1806,7 @@ impl Interp {
             interrupt_poll_tick: 0,
             strict: false,
             depth: 0,
-            max_eval_depth: DEFAULT_MAX_EVAL_DEPTH,
+            direct_call_depth: MAX_DIRECT_CALL_DEPTH,
             class_info: Default::default(),
             eval_fn: None,
             eval_realm_fns: Default::default(),
@@ -5819,7 +5838,8 @@ impl Interp {
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
         self.activate_gc_heap();
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -5827,7 +5847,7 @@ impl Interp {
             self.depth -= 1;
             return Err(e);
         }
-        let mut r = self.call_inner(callee, this, args);
+        let mut r = with_execution_stack(self.depth, || self.call_inner(callee, this, args));
         // Trampoline: a proper tail call unwound out of the callee re-dispatches here, in the
         // same stack frame, so mutual tail recursion runs in constant stack space.
         while r.is_ok() {
@@ -6688,7 +6708,8 @@ impl Interp {
             }
         };
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             drop_args();
             unsafe { std::ptr::drop_in_place(this_slot as *mut Value) };
@@ -6728,7 +6749,7 @@ impl Interp {
                 prim => crate::builtins::box_primitive_pub(self, prim),
             }
         };
-        let mut r = unsafe {
+        let mut r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved_env(
                 self,
                 chunk,
@@ -6739,7 +6760,7 @@ impl Interp {
                 argc,
                 (ic.n_params as usize, ic.n_slots as usize),
             )
-        };
+        });
         self.fn_frames.pop();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
@@ -6783,7 +6804,8 @@ impl Interp {
             std::ptr::drop_in_place(this_slot as *mut Value);
         };
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             drop_operands();
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
@@ -6797,7 +6819,9 @@ impl Interp {
         let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
         let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
         let native_result = match self.interrupt_poll_force() {
-            Ok(()) => nf(self, unsafe { &*this_slot }.clone(), args_ref),
+            Ok(()) => with_execution_stack(self.depth, || {
+                nf(self, unsafe { &*this_slot }.clone(), args_ref)
+            }),
             Err(interrupt) => {
                 self.constructing = saved_ctor;
                 self.new_target = saved_nt;
@@ -6850,7 +6874,8 @@ impl Interp {
         }
         // --- committed: identical to call_jit_fast's committed path ---
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             unsafe {
                 for k in 0..argc {
@@ -6900,7 +6925,7 @@ impl Interp {
                 prim => crate::builtins::box_primitive_pub(self, prim),
             }
         };
-        let mut r = unsafe {
+        let mut r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved(
                 self,
                 chunk,
@@ -6911,7 +6936,7 @@ impl Interp {
                 argc,
                 (ic.n_params as usize, ic.n_slots as usize),
             )
-        };
+        });
         self.fn_frames.pop();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
@@ -7179,7 +7204,8 @@ impl Interp {
             // Account for both elided calls in the recursion limit. The plan contains no calls,
             // allocation, coercion, or other user-code boundary, so it needs neither physical
             // reflection frames nor separate GC polls.
-            if self.depth > self.max_eval_depth.saturating_sub(2) {
+            #[cfg(target_arch = "wasm32")]
+            if self.depth > WASM_EXECUTION_DEPTH_GUARD.saturating_sub(2) {
                 drop_args();
                 return Some(Err(
                     self.throw("RangeError", "Maximum call stack size exceeded")
@@ -7220,7 +7246,8 @@ impl Interp {
         // The original body calls the native apply function here. Preserve its depth and GC
         // boundary even though the argument-list object and native dispatch are elided.
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             drop_args();
             return Some(Err(
@@ -7303,7 +7330,8 @@ impl Interp {
         };
         if let Some(call) = native {
             self.depth += 1;
-            if self.depth > self.max_eval_depth {
+            #[cfg(target_arch = "wasm32")]
+            if self.depth > WASM_EXECUTION_DEPTH_GUARD {
                 self.depth -= 1;
                 unsafe {
                     for k in 0..argc {
@@ -7317,7 +7345,9 @@ impl Interp {
             let saved_ctor = std::mem::replace(&mut self.constructing, true);
             let saved_nt = std::mem::replace(&mut self.new_target, callee.clone());
             let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
-            let r = self.dispatch_native(&call, Value::Undefined, args_ref);
+            let r = with_execution_stack(self.depth, || {
+                self.dispatch_native(&call, Value::Undefined, args_ref)
+            });
             self.constructing = saved_ctor;
             self.new_target = saved_nt;
             unsafe {
@@ -7400,7 +7430,8 @@ impl Interp {
         let this_val = Value::Obj(this.clone());
         // --- committed: identical shape to call_jit_cached's committed path ---
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             unsafe {
                 for k in 0..argc {
@@ -7520,43 +7551,17 @@ impl Interp {
         } else {
             Value::Undefined
         };
-        let forwarded = arguments_apply_forwarder
-            .then(|| unsafe {
-                self.construct_arguments_apply_forwarder(chunk, &this, &this_val, args, argc)
-            })
-            .flatten();
-        let mut r = if let Some(r) = forwarded {
-            r
-        } else if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
-            unsafe {
-                crate::jit::run_moved_env(
-                    self,
-                    chunk,
-                    code,
-                    &*env as *const Env,
-                    tv,
-                    args,
-                    argc,
-                    (ic.n_params as usize, ic.n_slots as usize),
-                )
-            }
-        } else {
-            match caller_ctx {
-                Some(caller_ctx) => unsafe {
-                    crate::jit::run_moved_shared(
-                        self,
-                        &mut *caller_ctx,
-                        chunk,
-                        code,
-                        &*env as *const Env,
-                        tv,
-                        args,
-                        argc,
-                        (ic.n_params as usize, ic.n_slots as usize),
-                    )
-                },
-                None => unsafe {
-                    crate::jit::run_moved(
+        let mut r = with_execution_stack(self.depth, || {
+            let forwarded = arguments_apply_forwarder
+                .then(|| unsafe {
+                    self.construct_arguments_apply_forwarder(chunk, &this, &this_val, args, argc)
+                })
+                .flatten();
+            if let Some(r) = forwarded {
+                r
+            } else if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
+                unsafe {
+                    crate::jit::run_moved_env(
                         self,
                         chunk,
                         code,
@@ -7566,9 +7571,37 @@ impl Interp {
                         argc,
                         (ic.n_params as usize, ic.n_slots as usize),
                     )
-                },
+                }
+            } else {
+                match caller_ctx {
+                    Some(caller_ctx) => unsafe {
+                        crate::jit::run_moved_shared(
+                            self,
+                            &mut *caller_ctx,
+                            chunk,
+                            code,
+                            &*env as *const Env,
+                            tv,
+                            args,
+                            argc,
+                            (ic.n_params as usize, ic.n_slots as usize),
+                        )
+                    },
+                    None => unsafe {
+                        crate::jit::run_moved(
+                            self,
+                            chunk,
+                            code,
+                            &*env as *const Env,
+                            tv,
+                            args,
+                            argc,
+                            (ic.n_params as usize, ic.n_slots as usize),
+                        )
+                    },
+                }
             }
-        };
+        });
         self.fn_frames.pop();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
@@ -7841,7 +7874,8 @@ impl Interp {
         }
         // --- committed: from here the arguments and `*this_slot` are ours ---
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             // Ownership contract: consume the arguments and `this` even on the early throw.
             unsafe {
@@ -7873,33 +7907,35 @@ impl Interp {
             extra: None,
         });
         let this_val = self.bind_compiled_this(&func, chunk, unsafe { this_slot.read() }, false);
-        let mut r = if needs_env {
-            unsafe {
-                crate::jit::run_moved_env(
-                    self,
-                    chunk,
-                    code,
-                    &env as *const Env,
-                    this_val,
-                    args,
-                    argc,
-                    chunk.jit_frame(),
-                )
+        let mut r = with_execution_stack(self.depth, || {
+            if needs_env {
+                unsafe {
+                    crate::jit::run_moved_env(
+                        self,
+                        chunk,
+                        code,
+                        &env as *const Env,
+                        this_val,
+                        args,
+                        argc,
+                        chunk.jit_frame(),
+                    )
+                }
+            } else {
+                unsafe {
+                    crate::jit::run_moved(
+                        self,
+                        chunk,
+                        code,
+                        &env as *const Env,
+                        this_val,
+                        args,
+                        argc,
+                        chunk.jit_frame(),
+                    )
+                }
             }
-        } else {
-            unsafe {
-                crate::jit::run_moved(
-                    self,
-                    chunk,
-                    code,
-                    &env as *const Env,
-                    this_val,
-                    args,
-                    argc,
-                    chunk.jit_frame(),
-                )
-            }
-        };
+        });
         self.fn_frames.pop();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
@@ -8807,11 +8843,14 @@ impl Interp {
         new_target: Value,
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > self.max_eval_depth {
+        #[cfg(target_arch = "wasm32")]
+        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
-        let r = self.construct_inner(callee, args, new_target);
+        let r = with_execution_stack(self.depth, || {
+            self.construct_inner(callee, args, new_target)
+        });
         self.depth -= 1;
         r
     }

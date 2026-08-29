@@ -1879,60 +1879,167 @@ fn moving_and_dropping_an_engine_safely_stops_suspended_generators() {
 }
 
 #[test]
-fn recursive_calls_reach_the_interpreter_guard_on_every_continuation() {
-    // Generator VM continuations and ordinary execution share the conservative native recursion
-    // limit: useful recursion succeeds, while crossing the limit is a catchable JS RangeError
-    // rather than a process-ending native stack overflow on a 2 MiB host thread.
+fn recursive_calls_cross_generator_continuations_without_an_artificial_budget() {
     assert_eq!(
         run(
-            "function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(64)} g().next().value"
+            "function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(512)} g().next().value"
         ),
-        "64"
-    );
-    assert_eq!(
-        run(
-            "function recurse(n){return n ? 1+recurse(n-1) : 0} var guarded=false; try{recurse(180)}catch(e){guarded=e instanceof RangeError && /Maximum call stack/.test(e.message)} guarded"
-        ),
-        "true"
-    );
-    assert_eq!(
-        run(
-            "function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(180)} var guarded=false; try{g().next()}catch(e){guarded=e instanceof RangeError && /Maximum call stack/.test(e.message)} guarded"
-        ),
-        "true"
+        "512"
     );
 }
 
-#[test]
-fn embedder_recursion_budget_preserves_the_default_and_supports_large_host_stacks() {
-    // ECMA-262 §9.4 specifies execution-context stacking without prescribing a finite native
-    // capacity. Keep the default safe for ordinary test threads, while proving that an embedder
-    // which provisions a larger stack can raise the realm-local guard on every execution tier.
+fn assert_deep_execution_contexts(tier: crate::bytecode::Tier) {
+    // ECMA-262 §9.4 and §10.2.1 push a new execution context for an ECMAScript function
+    // call; they do not insert an implementation-defined depth check into [[Call]]. Exercise
+    // substantially more contexts than fit on this deliberately small native thread stack so
+    // every execution tier has to keep the language stack independently of that host stack.
+    const DEPTH: usize = 4_096;
     let value = std::thread::Builder::new()
-        .name(String::from("lumen-depth-budget-test"))
+        .name(format!("lumen-deep-execution-contexts-{tier:?}"))
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            match engine
+                .eval(
+                    &format!(
+                        "function recurse(n){{return n===0 ? 0 : 1+recurse(n-1)}} recurse({DEPTH})"
+                    ),
+                    false,
+                )
+                .expect("deep-recursion fixture parses")
+            {
+                Completion::Value(value) => value,
+                Completion::Throw { name, message } => {
+                    panic!("{tier:?} rejected a valid call sequence: {name}: {message}")
+                }
+            }
+        })
+        .expect("spawn deep-execution-context test")
+        .join()
+        .expect("deep-execution-context test completes");
+    assert_eq!(value, DEPTH.to_string(), "tier {tier:?}");
+}
+
+#[test]
+fn interpreter_execution_contexts_outgrow_the_native_thread_stack() {
+    assert_deep_execution_contexts(crate::bytecode::Tier::Interp);
+}
+
+#[test]
+fn bytecode_execution_contexts_outgrow_the_native_thread_stack() {
+    assert_deep_execution_contexts(crate::bytecode::Tier::Bytecode);
+}
+
+#[test]
+fn jit_execution_contexts_outgrow_the_native_thread_stack() {
+    assert_deep_execution_contexts(crate::bytecode::Tier::Jit);
+}
+
+#[test]
+fn jit_execution_contexts_cross_activation_and_native_call_boundaries() {
+    let value = std::thread::Builder::new()
+        .name(String::from("lumen-deep-mixed-jit-calls"))
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let mut engine = Engine::new();
             engine.set_tier(crate::bytecode::Tier::Jit);
             engine.set_tier_threshold(0);
-            engine.set_max_eval_depth(256);
+            let cases = [
+                (
+                    "captured closure",
+                    r#"
+                    function makeCaptured() {
+                        let step = 1;
+                        return function recurse(n) {
+                            return n === 0 ? 0 : step + recurse(n - 1);
+                        };
+                    }
+                    makeCaptured()(512)
+                    "#,
+                ),
+                (
+                    "native Function.prototype.call",
+                    r#"
+                    function throughCall(n) {
+                        return n === 0 ? 0 : 1 + throughCall.call(undefined, n - 1);
+                    }
+                    throughCall(512)
+                    "#,
+                ),
+            ];
+            let mut values = Vec::new();
+            for (label, source) in cases {
+                match engine
+                    .eval(source, false)
+                    .expect("mixed deep-call fixture parses")
+                {
+                    Completion::Value(value) => values.push(value),
+                    Completion::Throw { name, message } => {
+                        panic!("{label} was rejected: {name}: {message}")
+                    }
+                }
+            }
+            values.join(",")
+        })
+        .expect("spawn mixed deep-call test")
+        .join()
+        .expect("mixed deep-call test completes");
+    assert_eq!(value, "512,512");
+}
+
+fn assert_deep_construct_contexts(tier: crate::bytecode::Tier) {
+    let value = std::thread::Builder::new()
+        .name(format!("lumen-deep-construct-contexts-{tier:?}"))
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
             match engine
                 .eval(
-                    "function recurse(n){return n ? 1+recurse(n-1) : 0} recurse(180)",
+                    r#"
+                    function RecursiveConstructor(n) {
+                        if (n === 0) {
+                            this.depth = 0;
+                            return;
+                        }
+                        const inner = new RecursiveConstructor(n - 1);
+                        inner.depth++;
+                        return inner;
+                    }
+                    new RecursiveConstructor(512).depth
+                    "#,
                     false,
                 )
-                .expect("configured recursion fixture parses")
+                .expect("deep-construction fixture parses")
             {
                 Completion::Value(value) => value,
                 Completion::Throw { name, message } => {
-                    panic!("configured recursion fixture threw {name}: {message}")
+                    panic!("{tier:?} construction was rejected: {name}: {message}")
                 }
             }
         })
-        .expect("spawn configured recursion test")
+        .expect("spawn deep-construction test")
         .join()
-        .expect("configured recursion thread");
-    assert_eq!(value, "180");
+        .expect("deep-construction test completes");
+    assert_eq!(value, "512", "tier {tier:?}");
+}
+
+#[test]
+fn interpreter_construct_contexts_outgrow_the_native_thread_stack() {
+    assert_deep_construct_contexts(crate::bytecode::Tier::Interp);
+}
+
+#[test]
+fn bytecode_construct_contexts_outgrow_the_native_thread_stack() {
+    assert_deep_construct_contexts(crate::bytecode::Tier::Bytecode);
+}
+
+#[test]
+fn jit_construct_contexts_outgrow_the_native_thread_stack() {
+    assert_deep_construct_contexts(crate::bytecode::Tier::Jit);
 }
 
 #[test]

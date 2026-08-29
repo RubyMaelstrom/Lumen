@@ -482,16 +482,6 @@ impl Engine {
         self.interp.tier_threshold = threshold;
     }
 
-    /// Set this realm's bounded interpreter/JIT recursion budget.
-    ///
-    /// The default is deliberately conservative for 2 MiB test and worker threads. An embedder
-    /// may raise it only when every thread entering this realm has a larger native stack; values
-    /// are clamped to the engine's hard ceiling. ECMA-262 §9.4 defines execution-context stacking
-    /// but leaves the finite implementation capacity to the engine and host.
-    pub fn set_max_eval_depth(&mut self, depth: u32) {
-        self.interp.max_eval_depth = depth.clamp(1, interpreter::MAX_CONFIGURED_EVAL_DEPTH);
-    }
-
     /// Drain anything written to `console.*` since the last call.
     pub fn take_console(&mut self) -> Vec<String> {
         std::mem::take(&mut self.interp.console)
