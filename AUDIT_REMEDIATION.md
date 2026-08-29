@@ -188,8 +188,12 @@ conformance-style tests and the broader affected suite pass.
         dynamically visible per-block lexical environments, assignments spanning suspension, and
         destructuring defaults whose direct eval can change a previously resolved free-name target
         by retaining opaque Environment References directly in the heap continuation.
-    - [ ] Move Source Text Module top-level-await evaluation from the bounded native compatibility
-      path into continuation-owned module execution state.
+    - [x] Move compiler-supported Source Text Module top-level-await evaluation into a strict,
+      continuation-owned AsyncBlock over the already-instantiated module environment. Preserve
+      live imports/exports, TDZ and immutable cells, default-export naming, module completion
+      cascades, and the bounded native fallback only for the same explicitly unlowered syntax
+      (currently proposal decorators). The focused Test262 `language/module-code/top-level-await`
+      suite passes 251/251.
     - [x] Replace the native `Array.fromAsync` iterator worker with an explicit heap continuation
       that preserves normative Await boundaries, async-from-sync wrapping, iterator closing, and
       promise rejection ordering. The focused Test262 `built-ins/Array/fromAsync` suite passes

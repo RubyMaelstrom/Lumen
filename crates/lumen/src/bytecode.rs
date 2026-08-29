@@ -1407,6 +1407,9 @@ fn hoisted_vars_stmt(
     out: &mut std::collections::HashSet<String>,
 ) -> bool {
     match s {
+        Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => {
+            hoisted_vars_stmt(inner, top, strict, out)
+        }
         Stmt::VarDecl {
             kind: DeclKind::Var,
             decls,
@@ -1686,6 +1689,7 @@ impl CaptureScan {
         homable: &mut std::collections::HashMap<String, bool>,
     ) {
         for s in stmts {
+            let s = crate::interpreter::unwrap_export(s);
             match s {
                 Stmt::VarDecl {
                     kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
@@ -2029,8 +2033,10 @@ impl CaptureScan {
                 result
             }
             Stmt::ClassDecl(c) => self.class(c),
-            // Modules and anything else unrecognized: unanalyzable.
-            _ => None,
+            // Module declarations carry link-time metadata. Their executable declarations and
+            // default expressions are walked in the same lexical context as the module body.
+            Stmt::Import(_) | Stmt::ExportNamed { .. } | Stmt::ExportAll { .. } => Some(()),
+            Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => self.stmt(inner),
         }
     }
 
@@ -2243,7 +2249,34 @@ impl CaptureScan {
 
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
-    compile_inner(func, &Default::default(), None)
+    compile_inner(func, &Default::default(), None, None)
+}
+
+/// Compile a Source Text Module's already-instantiated body as a strict heap continuation.
+/// `bindings` are the module environment's own, non-import bindings; unlike an ordinary async
+/// function, the chunk must read and initialize those exact cells so exports stay live and TDZ
+/// state established during ModuleDeclarationInstantiation remains authoritative.
+pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Option<Rc<Chunk>> {
+    let function = Function {
+        name: None,
+        params: Vec::new(),
+        body: body.to_vec(),
+        is_arrow: false,
+        is_strict: true,
+        expr_body: false,
+        is_generator: false,
+        is_async: true,
+        is_method: false,
+        is_fn_expr: false,
+        source: None,
+        scan: std::cell::Cell::new(0),
+        hoist: std::cell::OnceCell::new(),
+        calls: std::cell::Cell::new(0),
+        code: std::cell::OnceCell::new(),
+        code2: std::cell::OnceCell::new(),
+        fn_maps: std::cell::OnceCell::new(),
+    };
+    compile_inner(&function, &Default::default(), None, Some(bindings))
 }
 
 /// Second-stage compile: same as [`compile`], with hot monomorphic callees from `plan` spliced
@@ -2256,7 +2289,7 @@ pub(crate) fn compile_with_inlines(
     let seed = std::env::var_os("LUMEN_JIT_NO_CACHE_SEED")
         .is_none()
         .then_some(hot);
-    compile_inner(func, plan, seed)
+    compile_inner(func, plan, seed, None)
 }
 
 fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])> {
@@ -2360,6 +2393,7 @@ fn compile_inner(
     func: &Function,
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
     hot: Option<&Chunk>,
+    module_bindings: Option<&[(String, bool)]>,
 ) -> Option<Rc<Chunk>> {
     // Body facts the scanner already knows: `new.target` is an observation channel into the
     // activation that slots do not provide; `this` / `arguments` in an ordinary arrow are free
@@ -2436,9 +2470,12 @@ fn compile_inner(
     };
 
     let mut c = Compiler {
-        env_this,
+        // A module already has its own `this` binding, initialized to undefined. Reuse that
+        // environment for nested arrows instead of synthesizing a function activation.
+        env_this: env_this && module_bindings.is_none(),
         strict: func.is_strict,
         is_coroutine,
+        module_body: module_bindings.is_some(),
         direct_eval,
         runtime_lexicals,
         reuse_activation: has_mapped_parameter_aliases,
@@ -2454,6 +2491,15 @@ fn compile_inner(
             .unwrap_or_default(),
         ..Compiler::default()
     };
+    if let Some(bindings) = module_bindings {
+        for (name, is_const) in bindings {
+            c.env_bind(name, *is_const);
+        }
+        // Any compiler-homed block captures may safely use the once-only module environment.
+        // More importantly, a fresh function activation would put pre-instantiated module cells
+        // in the parent while `LoadCap`/`StoreCap` intentionally address the fixed home directly.
+        c.reuse_activation = true;
+    }
     if uses_arguments {
         if has_mapped_parameter_aliases {
             c.env_bind("arguments", false);
@@ -2569,6 +2615,12 @@ fn compile_inner(
                 }
             }
             HoistOp::Fn(name, f) => {
+                if c.module_body && c.env_has(&name) {
+                    // ModuleDeclarationInstantiation already created the closure in this exact
+                    // environment. Replaying FunctionDeclarationInstantiation would replace the
+                    // live export cell and, for cycles, expose the wrong function identity.
+                    continue;
+                }
                 let fidx = c.funcs.len() as u16;
                 c.funcs.push(f.clone());
                 if c.env_has(&name) || captured.contains(&name) {
@@ -2955,6 +3007,9 @@ struct Compiler {
     /// Generator/async chunks use the VM as their resumable execution context, not merely as an
     /// optimization tier. Some completion-aware lowerings are intentionally coroutine-only.
     is_coroutine: bool,
+    /// Source Text Module execution uses bindings instantiated by the link phase rather than a
+    /// fresh FunctionDeclarationInstantiation environment.
+    module_body: bool,
     /// This coroutine contains direct eval and CaptureScan proved every dynamically visible
     /// depth-0 binding can live in the retained function activation.
     direct_eval: bool,
@@ -4369,6 +4424,18 @@ impl Compiler {
         captured: &std::collections::HashSet<String>,
     ) -> CResult {
         for s in stmts {
+            let s = match s {
+                Stmt::ExportDecl(inner) => &**inner,
+                Stmt::ExportDefault(inner)
+                    if matches!(&**inner, Stmt::Expr(_))
+                        || matches!(&**inner, Stmt::FuncDecl(function) if function.name.is_none())
+                        || matches!(&**inner, Stmt::ClassDecl(class) if class.name.is_none()) =>
+                {
+                    continue;
+                }
+                Stmt::ExportDefault(inner) => &**inner,
+                other => other,
+            };
             match s {
                 Stmt::VarDecl {
                     kind:
@@ -4386,7 +4453,9 @@ impl Compiler {
                 }
                 Stmt::ClassDecl(class) => {
                     let name = class.name.as_ref().ok_or(Bail)?;
-                    if captured.contains(name) {
+                    if self.module_body && self.env_has(name) {
+                        // ModuleDeclarationInstantiation created the mutable TDZ binding.
+                    } else if captured.contains(name) {
                         self.cap_inits
                             .push(CapInit::Lexical(Rc::from(name.as_str()), false));
                         self.env_bind(name, false);
@@ -4415,6 +4484,7 @@ impl Compiler {
         captured: &std::collections::HashSet<String>,
     ) -> CResult {
         match pattern {
+            Pattern::Ident(name) if self.module_body && self.env_has(name) => Ok(()),
             Pattern::Ident(name) if captured.contains(name) => {
                 self.cap_inits
                     .push(CapInit::Lexical(Rc::from(name.as_str()), is_const));
@@ -5433,6 +5503,31 @@ impl Compiler {
                 }
                 Ok(())
             }
+            // Source Text Module declarations are link-time metadata. Exported declarations still
+            // execute normally against the module environment; default expressions and anonymous
+            // classes initialize the synthetic `*default*` live binding using NamedEvaluation.
+            Stmt::Import(_) | Stmt::ExportNamed { .. } | Stmt::ExportAll { .. }
+                if self.module_body =>
+            {
+                Ok(())
+            }
+            Stmt::ExportDecl(inner) if self.module_body => self.stmt(inner),
+            Stmt::ExportDefault(inner) if self.module_body => match &**inner {
+                Stmt::Expr(expression) => {
+                    self.named_expr(expression, "default")?;
+                    let name = self.name_idx("*default*");
+                    self.emit(Op::StoreCapInit(name));
+                    Ok(())
+                }
+                Stmt::FuncDecl(function) if function.name.is_none() => Ok(()),
+                Stmt::ClassDecl(class) if class.name.is_none() => {
+                    self.named_expr(&Expr::Class(class.clone()), "default")?;
+                    let name = self.name_idx("*default*");
+                    self.emit(Op::StoreCapInit(name));
+                    Ok(())
+                }
+                declaration => self.stmt(declaration),
+            },
             Stmt::With { obj, body } if self.is_coroutine => self.with_scope(obj, body),
             other => {
                 log_bail("stmt", &format!("{:.60}", format!("{other:?}")));

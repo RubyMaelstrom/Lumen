@@ -76,6 +76,48 @@ pub(crate) struct ModuleRec {
     cycle_root: Option<String>,
 }
 
+/// Heap-owned execution context for the AsyncBlock started by Source Text Module
+/// ExecuteModule. The bytecode continuation owns every suspended stack/handler/resource frame;
+/// this thin wrapper performs the module-record completion algorithms when that context ends.
+pub(crate) struct ModuleCoro {
+    body: crate::bytecode::VmCoro,
+    key: String,
+}
+
+impl ModuleCoro {
+    fn new(body: crate::bytecode::VmCoro, key: String) -> ModuleCoro {
+        ModuleCoro { body, key }
+    }
+
+    pub(crate) fn resume(
+        &mut self,
+        i: &mut Interp,
+        signal: crate::coroutine::Resume,
+    ) -> crate::coroutine::Suspend {
+        let result = self.body.resume(i, signal);
+        match &result {
+            crate::coroutine::Suspend::Done(_) => i.finish_dynamic_module(&self.key, None),
+            crate::coroutine::Suspend::Throw(error) => {
+                i.finish_dynamic_module(&self.key, Some(error.clone()))
+            }
+            crate::coroutine::Suspend::Await(_) | crate::coroutine::Suspend::Yield(_) => {}
+        }
+        result
+    }
+
+    pub(crate) fn done(&self) -> bool {
+        self.body.done
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        self.body.started
+    }
+
+    pub(crate) fn terminate(&mut self, i: &mut Interp) {
+        let _ = self.body.resume(i, crate::coroutine::Resume::Terminate);
+    }
+}
+
 /// The origin of a local name that is an import binding (so re-exports resolve to the source).
 enum ImportOrigin {
     /// `import * as x from 'dep'` — resolves to `dep`'s namespace object.
@@ -1283,42 +1325,69 @@ impl Interp {
         if body_has_tla(&body) {
             self.module_recs.get_mut(key).unwrap().evaluating = true;
             let module_key = key.to_string();
-            let closure: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> =
-                Box::new(move |i| {
-                    let saved_meta = i.import_meta.take();
-                    let saved_strict = i.strict;
-                    i.import_meta = Some(meta);
-                    i.strict = true;
-                    let result = i.run_stmt_list(&body, &env);
-                    i.import_meta = saved_meta;
-                    i.strict = saved_strict;
-                    match result {
-                        Ok(_) => {
-                            i.finish_dynamic_module(&module_key, None);
-                            crate::coroutine::Suspend::Done(Value::Undefined)
-                        }
-                        Err(a) => {
-                            let v = crate::interpreter::abrupt_value(a);
-                            i.finish_dynamic_module(&module_key, Some(v.clone()));
-                            crate::coroutine::Suspend::Throw(v)
-                        }
-                    }
-                });
-            let ptr = self as *mut Interp;
             let top = match top {
                 Some(t) => t,
                 None => self.new_promise(),
             };
-            let coro =
+            // ExecuteModule receives the environment created during linking. Imports remain free
+            // name operations so their live redirects are followed; all other own bindings map
+            // directly to the pre-instantiated cells (ECMA-262 §16.2.1.7.3.2).
+            let bindings: Vec<(String, bool)> = env
+                .borrow()
+                .vars
+                .iter()
+                .filter(|(name, binding)| {
+                    binding.import_ref.is_none()
+                        && name.as_ref() != "this"
+                        && name.as_ref() != "%importmeta%"
+                })
+                .map(|(name, binding)| (name.to_string(), !binding.mutable))
+                .collect();
+            let coro = if let Some(chunk) = crate::bytecode::compile_module(&body, &bindings) {
+                let vm = crate::bytecode::VmCoro::new(
+                    self,
+                    chunk,
+                    env.clone(),
+                    Value::Undefined,
+                    &[],
+                    &[],
+                );
+                crate::coroutine::Coroutine::Module(Box::new(ModuleCoro::new(vm, module_key)))
+            } else {
+                // Decorated classes and any still-unlowered syntax retain the bounded native
+                // compatibility path until their dedicated continuation work lands.
+                let closure: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> =
+                    Box::new(move |i| {
+                        let saved_meta = i.import_meta.take();
+                        let saved_strict = i.strict;
+                        i.import_meta = Some(meta);
+                        i.strict = true;
+                        let result = i.run_stmt_list(&body, &env);
+                        i.import_meta = saved_meta;
+                        i.strict = saved_strict;
+                        match result {
+                            Ok(_) => {
+                                i.finish_dynamic_module(&module_key, None);
+                                crate::coroutine::Suspend::Done(Value::Undefined)
+                            }
+                            Err(a) => {
+                                let value = crate::interpreter::abrupt_value(a);
+                                i.finish_dynamic_module(&module_key, Some(value.clone()));
+                                crate::coroutine::Suspend::Throw(value)
+                            }
+                        }
+                    });
+                let ptr = self as *mut Interp;
                 match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(closure)) {
-                    Ok(c) => c,
+                    Ok(coroutine) => coroutine,
                     Err(_) => {
-                        let e = self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG);
-                        self.finish_dynamic_module(key, Some(e.clone()));
-                        self.reject_promise(&top, e);
+                        let error = self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG);
+                        self.finish_dynamic_module(key, Some(error.clone()));
+                        self.reject_promise(&top, error);
                         return;
                     }
-                };
+                }
+            };
             if let Value::Obj(o) = &top {
                 self.generators.insert(Rc::as_ptr(o) as usize, coro);
             }

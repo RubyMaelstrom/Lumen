@@ -480,10 +480,19 @@ impl Interp {
                 s = body;
             }
             match s {
-                Stmt::VarDecl {
-                    kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
-                    decls,
-                } => {
+                Stmt::VarDecl { kind, decls }
+                    if matches!(
+                        kind,
+                        DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing
+                    ) =>
+                {
+                    // ECMA-262 BlockDeclarationInstantiation creates immutable bindings for
+                    // `const` and resource declarations before evaluation; initialization clears
+                    // TDZ state but does not change that mutability.
+                    let immutable = matches!(
+                        kind,
+                        DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing
+                    );
                     for (pat, _) in decls {
                         let mut names = Vec::new();
                         pattern_idents(pat, &mut names);
@@ -494,8 +503,8 @@ impl Interp {
                                 name,
                                 Binding {
                                     value: Value::Undefined,
-                                    mutable: true,
-                                    strict_immutable: false,
+                                    mutable: !immutable,
+                                    strict_immutable: immutable,
                                     initialized: false,
                                     import_ref: None,
                                     deletable: false,

@@ -14780,6 +14780,75 @@ fn dynamic_import_top_level_await() {
 }
 
 #[test]
+fn top_level_await_uses_module_continuation_and_live_environment() {
+    let mut engine = Engine::new();
+    let files: Vec<(String, String)> = vec![
+        (
+            "dep".to_string(),
+            "export let value = 2; globalThis.bumpModuleValue = () => value++;".to_string(),
+        ),
+        (
+            "tla-env".to_string(),
+            r#"
+                import { value } from 'dep';
+                export let live = value;
+                export const fixed = 3;
+                export const read = () => live;
+                export default function() { return live; }
+                globalThis.moduleBefore = String(live) + ':' + String(value);
+                await globalThis.moduleGate;
+                live += value;
+                try { fixed = 4; } catch (error) { globalThis.moduleConstError = error.name; }
+            "#
+            .to_string(),
+        ),
+    ];
+    engine.set_module_loader(move |specifier, _| {
+        files
+            .iter()
+            .find(|(key, _)| key == specifier)
+            .map(|(key, source)| (key.clone(), source.clone()))
+    });
+    engine
+        .eval(
+            "var releaseModuleGate; globalThis.moduleGate = new Promise(resolve => releaseModuleGate = resolve);
+             globalThis.moduleResult = 'pending';
+             import('tla-env').then(ns => moduleResult = [ns.live, ns.fixed, ns.read(), ns.default(), ns.default.name].join(':'));",
+            false,
+        )
+        .expect("module setup parses");
+
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Module(_))));
+    match engine
+        .eval("moduleBefore", false)
+        .expect("pending state reads")
+    {
+        Completion::Value(value) => assert_eq!(value, "2:2"),
+        Completion::Throw { name, message } => panic!("pending read threw {name}: {message}"),
+    }
+
+    engine
+        .eval("bumpModuleValue(); releaseModuleGate(); undefined", false)
+        .expect("module resumes");
+    match engine
+        .eval("moduleResult + ':' + moduleConstError", false)
+        .expect("module result reads")
+    {
+        Completion::Value(value) => assert_eq!(value, "5:3:5:5:default:TypeError"),
+        Completion::Throw { name, message } => panic!("module result threw {name}: {message}"),
+    }
+}
+
+#[test]
 fn asynchronous_dynamic_imports_start_before_either_host_load_finishes() {
     use std::cell::RefCell;
     use std::rc::Rc;
