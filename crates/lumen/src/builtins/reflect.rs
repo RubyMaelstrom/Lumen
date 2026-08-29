@@ -43,7 +43,8 @@ pub(super) fn install_reflect(it: &mut Interp) {
                     handler,
                     &[
                         ptarget.clone(),
-                        Value::from_string(key.clone()),
+                        i.sym_from_key(&key)
+                            .unwrap_or_else(|| Value::from_string(key.to_string())),
                         value.clone(),
                         receiver,
                     ],

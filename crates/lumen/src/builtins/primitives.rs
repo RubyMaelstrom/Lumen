@@ -413,20 +413,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
         "asyncDispose",
         "metadata",
     ] {
-        // Reuse the descriptor if this Interp already minted it (a secondary realm): well-known
-        // symbols are shared across realms.
-        let sym = match it.wk_syms.iter().find(|(n, _, _)| *n == name) {
-            Some((_, v, _)) => v.clone(),
-            None => {
-                let s = it.new_symbol(Some(Rc::from(format!("Symbol.{name}").as_str())));
-                let Value::Sym(data) = &s else {
-                    unreachable!("new_symbol must return a symbol")
-                };
-                let key: Rc<str> = Rc::from(Interp::sym_key(data));
-                it.wk_syms.push((name, s.clone(), key));
-                s
-            }
-        };
+        let sym = it.well_known_symbol(name);
         if name == "iterator" {
             if let Value::Sym(d) = &sym {
                 it.iterator_sym = Some(d.clone());
@@ -439,20 +426,13 @@ pub(super) fn install_symbol(it: &mut Interp) {
 
     it.def_method(&ctor, "for", 1, |i, _this, args| {
         let key = ab(i.to_string(&arg(args, 0)))?.to_string();
-        if let Some(d) = crate::interpreter::sym_for_get(&key) {
-            return Ok(Value::Sym(d));
-        }
-        let sym = i.new_symbol(Some(Rc::from(key.as_str())));
-        if let Value::Sym(d) = &sym {
-            crate::interpreter::sym_for_insert(key, d.clone());
-        }
-        Ok(sym)
+        Ok(Value::Sym(i.symbol_for(key)))
     });
     it.def_method(&ctor, "keyFor", 1, |i, _this, args| {
         let Value::Sym(s) = arg(args, 0) else {
             return Err(i.make_error("TypeError", "Symbol.keyFor: argument is not a Symbol"));
         };
-        Ok(crate::interpreter::sym_for_key_of(&s)
+        Ok(i.symbol_key_for(&s)
             .map(Value::from_string)
             .unwrap_or(Value::Undefined))
     });

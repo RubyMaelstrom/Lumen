@@ -63,3 +63,58 @@ fn worker_threads_exchange_structured_messages() {
         ["message {\"answer\":42,\"worker\":true}", "exit 0"]
     );
 }
+
+#[test]
+fn worker_threads_transfer_worker_data_and_reply_arraybuffers() {
+    let mut runtime = Runtime::new();
+    let out = Captured::default();
+    runtime.engine().ctx().op_state().put(ConsoleOut {
+        out: Box::new(out.clone()),
+        err: Box::new(Captured::default()),
+    });
+
+    let source = r#"
+        const { Worker } = require("node:worker_threads");
+        const buffer = new ArrayBuffer(4);
+        new Uint8Array(buffer).set([1, 2, 3, 4]);
+        const worker = new Worker(`
+            const { parentPort, workerData } = require("node:worker_threads");
+            const buffer = workerData.buffer;
+            const inputIdentity = workerData.view.buffer === buffer;
+            new Uint8Array(buffer)[2] = 8;
+            parentPort.postMessage({
+                buffer,
+                view: new Uint8Array(buffer, 1, 2),
+                inputIdentity,
+            }, [buffer]);
+            parentPort.postMessage({ detached: buffer.detached });
+            parentPort.close();
+        `, {
+            eval: true,
+            workerData: { buffer, view: new Uint8Array(buffer, 1, 2) },
+            transferList: [buffer],
+        });
+        console.log("main-detached", buffer.detached, buffer.byteLength);
+        worker.on("message", message => {
+            if (message.buffer) {
+                console.log("reply", message.inputIdentity,
+                    message.view.buffer === message.buffer, message.view.join(","));
+            } else {
+                console.log("worker-detached", message.detached);
+            }
+        });
+    "#;
+    match runtime.eval(source).expect("source parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+
+    assert_eq!(
+        out.lines(),
+        [
+            "main-detached true 0",
+            "reply true true 2,8",
+            "worker-detached true"
+        ]
+    );
+}

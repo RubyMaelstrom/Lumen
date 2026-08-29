@@ -145,3 +145,57 @@ pub fn normalize(cps: &[u32], form: &str) -> Vec<u32> {
         d
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NORMALIZATION_TEST: &str = include_str!("../tests/unicode-17.0.0/NormalizationTest.txt");
+
+    fn code_points(field: &str) -> Vec<u32> {
+        field
+            .split_ascii_whitespace()
+            .map(|value| u32::from_str_radix(value, 16).expect("normalization-test code point"))
+            .collect()
+    }
+
+    #[test]
+    fn unicode_17_normalization_conformance() {
+        // UAX #15, Conformance Testing: every row must satisfy all five NFC/NFD and
+        // NFKC/NFKD invariants.  This is the unmodified Unicode 17 test corpus.
+        for (line_number, raw_line) in NORMALIZATION_TEST.lines().enumerate() {
+            let line = raw_line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() || line.starts_with('@') {
+                continue;
+            }
+            let columns: Vec<_> = line.split(';').take(5).map(code_points).collect();
+            assert_eq!(columns.len(), 5, "line {}", line_number + 1);
+            let [c1, c2, c3, c4, c5] = columns.as_slice() else {
+                unreachable!()
+            };
+
+            for input in [c1, c2, c3] {
+                assert_eq!(normalize(input, "NFC"), *c2, "NFC line {}", line_number + 1);
+                assert_eq!(normalize(input, "NFD"), *c3, "NFD line {}", line_number + 1);
+            }
+            for input in [c4, c5] {
+                assert_eq!(normalize(input, "NFC"), *c4, "NFC line {}", line_number + 1);
+                assert_eq!(normalize(input, "NFD"), *c5, "NFD line {}", line_number + 1);
+            }
+            for input in [c1, c2, c3, c4, c5] {
+                assert_eq!(
+                    normalize(input, "NFKC"),
+                    *c4,
+                    "NFKC line {}",
+                    line_number + 1
+                );
+                assert_eq!(
+                    normalize(input, "NFKD"),
+                    *c5,
+                    "NFKD line {}",
+                    line_number + 1
+                );
+            }
+        }
+    }
+}

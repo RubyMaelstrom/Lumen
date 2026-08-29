@@ -312,6 +312,17 @@ mod packed_value_tests {
         }
         assert_eq!(Rc::strong_count(&obj), before);
     }
+
+    #[test]
+    fn shape_identity_exhaustion_never_wraps_or_reuses_an_id() {
+        let mut shapes = ShapeTable {
+            transitions: Default::default(),
+            next: u32::MAX - 1,
+        };
+        assert_eq!(shapes.fresh(), u32::MAX - 1);
+        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shapes.fresh()));
+        assert!(exhausted.is_err(), "shape ids wrapped after exhaustion");
+    }
 }
 
 /// A unique Symbol. Identity is the `id` (every `Symbol()` call gets a fresh one); `description` is
@@ -319,6 +330,94 @@ mod packed_value_tests {
 pub struct SymbolData {
     pub id: u64,
     pub description: Option<Rc<str>>,
+}
+
+/// An ECMAScript Property Key produced by `ToPropertyKey`. Lumen's object maps use a compact
+/// encoded string for Symbol keys, but the key itself must keep the Symbol identity alive until
+/// an object property map can take ownership of it. This mirrors the specification's actual
+/// String-or-Symbol result instead of temporarily reducing a Symbol to an unowned integer.
+#[derive(Clone)]
+pub(crate) struct PropertyKey {
+    text: String,
+    symbol: Option<Rc<SymbolData>>,
+}
+
+impl PropertyKey {
+    pub(crate) fn string(text: String) -> Self {
+        Self { text, symbol: None }
+    }
+
+    pub(crate) fn symbol(symbol: Rc<SymbolData>) -> Self {
+        Self {
+            text: Interp::sym_key(&symbol),
+            symbol: Some(symbol),
+        }
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.text
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        match self.symbol {
+            Some(symbol) => Value::Sym(symbol),
+            None => Value::from_string(self.text),
+        }
+    }
+}
+
+impl std::ops::Deref for PropertyKey {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for PropertyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.text.fmt(f)
+    }
+}
+
+impl PartialEq<str> for PropertyKey {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for PropertyKey {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+/// Symbol state owned by one ECMAScript Agent. ECMA-262 §9.9.2 and §20.4 put the global symbol
+/// registry on the surrounding Agent, shared by all of its realms but not by unrelated Agents.
+/// `symbols` is only an identity lookup for encoded property keys and therefore holds ordinary
+/// Symbols weakly; global-registry and well-known Symbols have their normative strong owners.
+pub(crate) struct SymbolAgentState {
+    pub(crate) next_id: u64,
+    pub(crate) symbols: crate::fasthash::FastMap<u64, Weak<SymbolData>>,
+    pub(crate) global_by_key: crate::fasthash::FastMap<Rc<str>, Rc<SymbolData>>,
+    pub(crate) global_key_by_id: crate::fasthash::FastMap<u64, Rc<str>>,
+    pub(crate) well_known: crate::fasthash::FastMap<&'static str, Rc<SymbolData>>,
+}
+
+pub(crate) type SymbolAgent = Rc<RefCell<SymbolAgentState>>;
+
+pub(crate) fn new_symbol_agent() -> SymbolAgent {
+    Rc::new(RefCell::new(SymbolAgentState {
+        next_id: 0,
+        symbols: Default::default(),
+        global_by_key: Default::default(),
+        global_key_by_id: Default::default(),
+        well_known: Default::default(),
+    }))
 }
 
 /// Byte offsets the JIT's inline property-cache templates read directly out of the object graph.
@@ -781,6 +880,10 @@ impl Exotic {
 }
 
 pub struct Object {
+    /// Agent-owned collector state. Objects can be created while a suspended execution context is
+    /// running on a coroutine worker and later die on the driver thread; carrying the owner makes
+    /// registry removal independent of whichever native thread happens to execute `Drop`.
+    pub(crate) gc_heap: GcHeap,
     pub(crate) proto: Option<Gc>,
     pub(crate) props: Props,
     pub(crate) extensible: bool,
@@ -817,10 +920,14 @@ impl Object {
     /// the map from moved stack values before allocation, avoiding an empty map plus RefCell
     /// replacement on every object.
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
-        GC_STATE.with(|state| {
-            state.live.set(state.live.get() + 1);
-            state.allocated.set(state.allocated.get().wrapping_add(1));
-            let mut reg = state.registry.borrow_mut();
+        let heap = proto
+            .as_ref()
+            .map(|prototype| prototype.borrow().gc_heap.clone())
+            .unwrap_or_else(active_gc_heap);
+        {
+            heap.live.set(heap.live.get() + 1);
+            heap.allocated.set(heap.allocated.get().wrapping_add(1));
+            let mut reg = heap.registry.borrow_mut();
             let slot = match reg.free.pop() {
                 Some(slot) => slot,
                 None => {
@@ -831,6 +938,7 @@ impl Object {
             };
             let slot_u32: u32 = slot.try_into().expect("object registry exceeded u32 slots");
             let obj = Rc::new(RefCell::new(Object {
+                gc_heap: heap.clone(),
                 proto,
                 props,
                 extensible: true,
@@ -843,7 +951,7 @@ impl Object {
             }));
             reg.entries[slot] = Some(Rc::downgrade(&obj));
             obj
-        })
+        }
     }
 }
 
@@ -853,15 +961,12 @@ impl Drop for Object {
         // is O(1), does not touch another (possibly borrowed) object, and bounds registry memory
         // by peak simultaneously-live objects instead of cumulative allocation count.
         let slot = self.gc_internal.get() as usize;
-        let _ = GC_STATE.try_with(|state| {
-            let mut reg = state.registry.borrow_mut();
-            if slot < reg.entries.len() && reg.entries[slot].take().is_some() {
-                reg.free.push(slot);
-            }
-            drop(reg);
-            state.live.set(state.live.get() - 1);
-        });
-        // `try_with` so a drop during thread-local teardown at process exit can't panic.
+        let mut reg = self.gc_heap.registry.borrow_mut();
+        if slot < reg.entries.len() && reg.entries[slot].take().is_some() {
+            reg.free.push(slot);
+        }
+        drop(reg);
+        self.gc_heap.live.set(self.gc_heap.live.get() - 1);
     }
 }
 
@@ -875,80 +980,227 @@ struct GcRegistry {
     free: Vec<usize>,
 }
 
-struct GcState {
+pub(crate) struct GcState {
     registry: RefCell<GcRegistry>,
+    scope_registry: RefCell<Vec<Weak<RefCell<crate::interpreter::Scope>>>>,
+    shapes: RefCell<ShapeTable>,
+    array_length_shape: Cell<u32>,
     live: Cell<i64>,
     allocated: Cell<u64>,
 }
 
+pub(crate) type GcHeap = Rc<GcState>;
+
 thread_local! {
-    static GC_STATE: GcState = const { GcState {
+    /// The ECMAScript Agent surrounding the code currently running on this native thread. This is
+    /// an activation pointer, not collector ownership: each object carries its Agent's heap, and
+    /// `Interp` restores this pointer whenever execution moves between the driver and a coroutine
+    /// worker. See ECMA-262, Agents and GeneratorResume/RunSuspendedContext.
+    static ACTIVE_GC_HEAP: RefCell<Option<GcHeap>> = const { RefCell::new(None) };
+    /// Symbol identity/registry state for the surrounding Agent. It is separate from `GcHeap`
+    /// because Lumen currently isolates a ShadowRealm's object heap while the specification still
+    /// requires the ShadowRealm to share its Agent's Symbols.
+    static ACTIVE_SYMBOL_AGENT: RefCell<Option<SymbolAgent>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn new_gc_heap() -> GcHeap {
+    Rc::new(GcState {
         registry: RefCell::new(GcRegistry {
             entries: Vec::new(),
             free: Vec::new(),
         }),
+        scope_registry: RefCell::new(Vec::new()),
+        shapes: RefCell::new(ShapeTable::new()),
+        array_length_shape: Cell::new(SHAPE_EMPTY),
         live: Cell::new(0),
         allocated: Cell::new(0),
-    } };
+    })
 }
 
-/// Number of live heap objects right now.
+pub(crate) fn activate_gc_heap(heap: &GcHeap) {
+    ACTIVE_GC_HEAP.with(|active| {
+        let mut active = active.borrow_mut();
+        if active
+            .as_ref()
+            .is_none_or(|current| !Rc::ptr_eq(current, heap))
+        {
+            *active = Some(heap.clone());
+        }
+    });
+}
+
+pub(crate) fn activate_symbol_agent(agent: &SymbolAgent) {
+    ACTIVE_SYMBOL_AGENT.with(|active| {
+        let mut active = active.borrow_mut();
+        if active
+            .as_ref()
+            .is_none_or(|current| !Rc::ptr_eq(current, agent))
+        {
+            *active = Some(agent.clone());
+        }
+    });
+}
+
+fn active_symbol(id: u64) -> Option<Rc<SymbolData>> {
+    ACTIVE_SYMBOL_AGENT.with(|active| {
+        active
+            .borrow()
+            .as_ref()?
+            .borrow()
+            .symbols
+            .get(&id)?
+            .upgrade()
+    })
+}
+
+/// Release a worker thread's last surrounding Agent after a coroutine job. Objects retain their
+/// own heap handle, so this only prevents an idle pooled worker from retaining a dead Agent's weak
+/// registries indefinitely.
+pub(crate) fn deactivate_gc_heap() {
+    ACTIVE_GC_HEAP.with(|active| {
+        active.borrow_mut().take();
+    });
+    ACTIVE_SYMBOL_AGENT.with(|active| {
+        active.borrow_mut().take();
+    });
+}
+
+pub(crate) fn deactivate_gc_heap_if(heap: &GcHeap) {
+    ACTIVE_GC_HEAP.with(|active| {
+        let mut active = active.borrow_mut();
+        if active
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, heap))
+        {
+            active.take();
+        }
+    });
+}
+
+pub(crate) fn deactivate_symbol_agent_if(agent: &SymbolAgent) {
+    ACTIVE_SYMBOL_AGENT.with(|active| {
+        let mut active = active.borrow_mut();
+        if active
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, agent))
+        {
+            active.take();
+        }
+    });
+}
+
+fn active_gc_heap() -> GcHeap {
+    ACTIVE_GC_HEAP.with(|active| {
+        let mut active = active.borrow_mut();
+        active.get_or_insert_with(new_gc_heap).clone()
+    })
+}
+
+fn with_active_gc_heap<R>(f: impl FnOnce(&GcState) -> R) -> R {
+    ACTIVE_GC_HEAP.with(|active| {
+        if active.borrow().is_none() {
+            *active.borrow_mut() = Some(new_gc_heap());
+        }
+        let active = active.borrow();
+        f(active
+            .as_ref()
+            .expect("active GC heap was just initialized"))
+    })
+}
+
+/// Number of live heap objects in the surrounding Agent.
+#[cfg(test)]
 pub fn live_objects() -> i64 {
-    GC_STATE.with(|state| state.live.get())
+    heap_live_objects(&active_gc_heap())
 }
 
-/// Monotonic (wrapping) object-allocation count for task-boundary churn accounting.
-pub(crate) fn allocated_objects() -> u64 {
-    GC_STATE.with(|state| state.allocated.get())
+pub(crate) fn heap_live_objects(heap: &GcHeap) -> i64 {
+    heap.live.get()
 }
 
-/// Stable address of this thread's live-object counter for the lifetime of the thread. JIT
-/// activations capture it when execution starts; reusable compiled chunks must not embed it,
-/// because generator/async interpreter handoff can execute a chunk on a different thread.
+pub(crate) fn heap_allocated_objects(heap: &GcHeap) -> u64 {
+    heap.allocated.get()
+}
+
+/// Stable address of this Agent's live-object counter. JIT activations capture it when execution
+/// starts; reusable compiled chunks must not embed it because a chunk can be shared across Agents.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-pub(crate) fn live_objects_ptr() -> *const i64 {
-    GC_STATE.with(|state| state.live.as_ptr())
+pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
+    heap.live.as_ptr()
 }
 
 /// Strong handles to every currently-live heap object. Registry slots are non-owning weak
 /// references tombstoned synchronously by `Object::drop`.
+#[cfg(test)]
 pub fn gc_snapshot() -> Vec<Gc> {
-    GC_STATE.with(|state| {
-        let reg = state.registry.borrow();
-        let mut live = Vec::with_capacity(reg.entries.len() - reg.free.len());
-        for weak in reg.entries.iter().flatten() {
-            if let Some(object) = weak.upgrade() {
-                live.push(object);
-            }
+    heap_gc_snapshot(&active_gc_heap())
+}
+
+pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
+    let reg = heap.registry.borrow();
+    let mut live = Vec::with_capacity(reg.entries.len() - reg.free.len());
+    for weak in reg.entries.iter().flatten() {
+        if let Some(object) = weak.upgrade() {
+            live.push(object);
         }
-        live
-    })
+    }
+    live
 }
 
 /// Restore `gc_internal` from scratch reference counts to registry-slot ids. Collection calls
 /// this after marking and before sweeping side tables/properties can release the final owner of
 /// any object, so `Object::drop` always sees its stable slot.
-pub(crate) fn gc_restore_registry_slots() {
-    GC_STATE.with(|state| {
-        let reg = state.registry.borrow();
-        for (slot, weak) in reg.entries.iter().enumerate() {
-            if let Some(object) = weak.as_ref().and_then(Weak::upgrade) {
-                let slot: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-                object.borrow().gc_internal.set(slot);
-            }
+pub(crate) fn gc_restore_registry_slots(heap: &GcHeap) {
+    let reg = heap.registry.borrow();
+    for (slot, weak) in reg.entries.iter().enumerate() {
+        if let Some(object) = weak.as_ref().and_then(Weak::upgrade) {
+            let slot: u32 = slot.try_into().expect("object registry exceeded u32 slots");
+            object.borrow().gc_internal.set(slot);
         }
+    }
+}
+
+pub(crate) fn gc_register_scope(scope: &Env) {
+    active_gc_heap()
+        .scope_registry
+        .borrow_mut()
+        .push(Rc::downgrade(scope));
+}
+
+pub(crate) fn gc_scope_registry_len(heap: &GcHeap) -> usize {
+    heap.scope_registry.borrow().len()
+}
+
+/// Purge dead weak entries, returning the live count. A dead `Weak` still pins its `RcBox`
+/// allocation, so scope-heavy programs prune independently of the object allocation trigger.
+pub(crate) fn gc_scope_registry_prune(heap: &GcHeap) -> usize {
+    let mut registry = heap.scope_registry.borrow_mut();
+    registry.retain(|scope| scope.strong_count() > 0);
+    registry.len()
+}
+
+/// The live scopes owned by `heap`, purging dead weak entries as it goes.
+pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
+    let mut registry = heap.scope_registry.borrow_mut();
+    let mut live = Vec::with_capacity(registry.len());
+    registry.retain(|weak| match weak.upgrade() {
+        Some(scope) => {
+            live.push(scope);
+            true
+        }
+        None => false,
     });
+    live
 }
 
 #[cfg(test)]
 pub(crate) fn gc_registry_stats() -> (usize, usize) {
-    GC_STATE.with(|state| {
-        let reg = state.registry.borrow();
-        (reg.entries.len(), reg.free.len())
-    })
+    let heap = active_gc_heap();
+    let reg = heap.registry.borrow();
+    (reg.entries.len(), reg.free.len())
 }
 
 /// The element type of a TypedArray.
@@ -1361,6 +1613,9 @@ struct DenseBuffers {
     inline_packed: InlinePacked,
     elems: Vec<u32>,
     mirror: Vec<f64>,
+    /// Strong ownership for Symbol-valued property keys. String keys stay inline in `entries`;
+    /// this cold sidecar exists only for objects that actually acquire a Symbol key.
+    symbols: Option<Box<crate::fasthash::FastMap<u64, Rc<SymbolData>>>>,
 }
 
 // DenseBuffers exists for every object that leaves the inline-property representation. The
@@ -1380,6 +1635,7 @@ static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
     inline_packed: InlinePacked::EMPTY,
     elems: Vec::new(),
     mirror: Vec::new(),
+    symbols: None,
 });
 
 #[derive(Clone, Default)]
@@ -1397,6 +1653,30 @@ impl DenseStorage {
     #[inline]
     fn buffers_mut(&mut self) -> &mut DenseBuffers {
         self.0.get_or_insert_with(Default::default)
+    }
+    fn retain_symbol_key(&mut self, key: &str) {
+        let Some(id) = encoded_symbol_id(key) else {
+            return;
+        };
+        let Some(symbol) = active_symbol(id) else {
+            return;
+        };
+        self.buffers_mut()
+            .symbols
+            .get_or_insert_with(Default::default)
+            .insert(id, symbol);
+    }
+    fn release_symbol_key(&mut self, key: &str) {
+        let Some(id) = encoded_symbol_id(key) else {
+            return;
+        };
+        if let Some(symbols) = self
+            .0
+            .as_deref_mut()
+            .and_then(|buffers| buffers.symbols.as_deref_mut())
+        {
+            symbols.remove(&id);
+        }
     }
     fn index_mut(&mut self) -> Option<&mut crate::fasthash::FastMap<Rc<str>, usize>> {
         self.0.as_deref_mut()?.index.as_deref_mut()
@@ -1586,6 +1866,12 @@ pub(crate) const MIRROR_ALL_I32: u8 = 4;
 /// never stored as data, which is what makes reading it back as "absent" sound.
 pub(crate) const MIRROR_HOLE: u64 = 0x7FF8_DEAD_0000_0001;
 
+/// Decode Lumen's internal representation of a Symbol-valued property key. Internal NUL-prefixed
+/// markers deliberately do not parse as integers and therefore never enter Symbol ownership.
+fn encoded_symbol_id(key: &str) -> Option<u64> {
+    key.strip_prefix('\0')?.parse().ok()
+}
+
 /// Exact-i32 (and not -0.0): the value survives an i32 round trip bit-identically.
 #[inline]
 pub(crate) fn f64_exact_i32(f: f64) -> bool {
@@ -1642,57 +1928,46 @@ pub(crate) fn bump_proto_epoch() {
 struct ShapeTable {
     transitions: crate::fasthash::FastMap<(u32, Rc<str>), u32>,
     next: u32,
-    /// This thread's id-range base (see `SHAPE_ORDINAL`).
-    base: u32,
-}
-
-/// Allocates each thread's shape-id range. The table itself is thread-local (its `Rc<str>` keys
-/// can't cross threads), but generator/async bodies run JS on pooled *worker* threads sharing
-/// the same `Interp` and object graph — so ids minted on different threads flow through the same
-/// inline caches and MUST NOT collide. Each thread takes a disjoint `ordinal << 24` range
-/// (16.7M shapes per thread; the coroutine pool keeps the thread count small — past 256 threads
-/// ordinals recycle, restoring the pre-partitioning collision odds rather than failing).
-static SHAPE_ORDINAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-thread_local! {
-    static SHAPES: RefCell<ShapeTable> = RefCell::new({
-        let ord = SHAPE_ORDINAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xFF;
-        let base = ord << 24;
-        ShapeTable {
-            transitions: Default::default(),
-            next: base | 1, // low id 0 is skipped everywhere (SHAPE_EMPTY is the global 0)
-            base,
-        }
-    });
 }
 
 impl ShapeTable {
+    fn new() -> ShapeTable {
+        ShapeTable {
+            transitions: Default::default(),
+            next: 1, // 0 is reserved for SHAPE_EMPTY.
+        }
+    }
+
     fn fresh(&mut self) -> u32 {
         let id = self.next;
-        // Wrap within this thread's 24-bit range, skipping low-word 0 (SHAPE_EMPTY must stay
-        // the empty object's id alone).
-        let low = (id.wrapping_add(1)) & 0x00FF_FFFF;
-        self.next = self.base | if low == 0 { 1 } else { low };
+        // Reusing an id can turn an inline-cache hit into a wrong [[Get]]/[[Set]]. Exhaustion is
+        // therefore a hard implementation limit instead of an ABA wrap. The engine's live-object
+        // and execution limits make reaching ~4.3 billion structural shapes unrealistic, while
+        // keeping the hot guard at one 32-bit compare.
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("ECMAScript Agent exhausted its object-shape identity space");
         id
     }
 }
 
 /// The child shape reached by adding `key` to shape `parent` (memoized so it is shared).
 fn shape_transition(parent: u32, key: &Rc<str>) -> u32 {
-    SHAPES.with(|t| {
-        let mut t = t.borrow_mut();
-        if let Some(&c) = t.transitions.get(&(parent, key.clone())) {
-            return c;
+    with_active_gc_heap(|heap| {
+        let mut shapes = heap.shapes.borrow_mut();
+        if let Some(&child) = shapes.transitions.get(&(parent, key.clone())) {
+            return child;
         }
-        let child = t.fresh();
-        t.transitions.insert((parent, key.clone()), child);
+        let child = shapes.fresh();
+        shapes.transitions.insert((parent, key.clone()), child);
         child
     })
 }
 
 /// A fresh unique shape id (a structural removal / deopt — no cache should still match).
 fn shape_fresh() -> u32 {
-    SHAPES.with(|t| t.borrow_mut().fresh())
+    with_active_gc_heap(|heap| heap.shapes.borrow_mut().fresh())
 }
 
 /// Entry count up to which a `Props` runs without a hash index (linear-scan lookups, no hash
@@ -1712,9 +1987,30 @@ thread_local! {
         Rc::from("prototype"),
         Rc::from("constructor"),
     ];
-    /// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals
-    /// create this same one-property named map constantly.
-    static ARRAY_LENGTH_SHAPE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals create
+/// this same one-property named map constantly. The memo belongs to the Agent: a pooled coroutine
+/// worker can successively run unrelated Agents whose shape tables assign the same integer to
+/// different key sequences.
+fn array_length_shape(length_key: &Rc<str>) -> u32 {
+    with_active_gc_heap(|heap| {
+        let cached = heap.array_length_shape.get();
+        if cached != SHAPE_EMPTY {
+            return cached;
+        }
+        let mut shapes = heap.shapes.borrow_mut();
+        let key = (SHAPE_EMPTY, length_key.clone());
+        let shape = if let Some(&shape) = shapes.transitions.get(&key) {
+            shape
+        } else {
+            let shape = shapes.fresh();
+            shapes.transitions.insert(key, shape);
+            shape
+        };
+        heap.array_length_shape.set(shape);
+        shape
+    })
 }
 
 /// The property key for array index `n`, interned for small `n`.
@@ -1785,16 +2081,7 @@ impl Props {
             }
         }
         let length_key = fn_key(0);
-        let shape = ARRAY_LENGTH_SHAPE.with(|cached| {
-            let shape = cached.get();
-            if shape != 0 {
-                shape
-            } else {
-                let shape = shape_transition(SHAPE_EMPTY, &length_key);
-                cached.set(shape);
-                shape
-            }
-        });
+        let shape = array_length_shape(&length_key);
         Props {
             entries: vec![(
                 length_key,
@@ -1811,6 +2098,7 @@ impl Props {
                 },
                 elems: Vec::new(),
                 mirror: Vec::new(),
+                symbols: None,
             }))),
             mirror_flags: 0,
             mirror_holes: 0,
@@ -2465,6 +2753,7 @@ impl Props {
     /// [`Props::insert`] pays. `new_shape` must be the memoized `shape_transition(shape, key)`
     /// result recorded when this (shape, key) pair was first inserted the slow way.
     pub(crate) fn append_new(&mut self, key: Rc<str>, prop: Property, new_shape: u32) {
+        self.elems.retain_symbol_key(&key);
         self.note_structural();
         let slot = self.entries.len();
         if let Some(index) = self.elems.index_mut() {
@@ -2484,6 +2773,7 @@ impl Props {
     /// threshold no dense/index sidecar or special-slot memo can be required, so the whole batch
     /// is just entry appends followed by its already-known final shape.
     pub(crate) fn append_proven_plain(&mut self, key: Rc<str>, prop: Property) {
+        self.elems.retain_symbol_key(&key);
         debug_assert!(self.entries.len() < INDEX_THRESHOLD);
         debug_assert!(canonical_index(&key).is_none());
         debug_assert!(self.elems.0.is_none());
@@ -2499,6 +2789,7 @@ impl Props {
 
     pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
         let key = key.into();
+        self.elems.retain_symbol_key(&key);
         if let (Some(n), Some(packed)) = (canonical_index(&key), self.elems.packed_ref()) {
             let n = n as usize;
             if n < packed.len() {
@@ -2642,6 +2933,7 @@ impl Props {
                 std::cmp::Ordering::Less => {}
             }
         }
+        self.elems.release_symbol_key(key);
         true
     }
     /// Keys in insertion order. Private-name slots (`#x`) are never enumerable/observable, so they

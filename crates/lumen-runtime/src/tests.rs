@@ -94,6 +94,63 @@ fn interval_fires_until_cleared_and_loop_exits() {
 }
 
 #[test]
+fn zero_delay_interval_reinitializes_once_per_task_and_can_be_cleared() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        let n = 0;
+        const id = setInterval(() => {
+            console.log("zero", ++n);
+            if (n === 3) clearInterval(id);
+        }, 0);
+        "#,
+    );
+    assert_eq!(out.lines(), ["zero 1", "zero 2", "zero 3"]);
+}
+
+#[test]
+fn html_timer_handler_conversion_string_code_and_this_value() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const conversionOrder = [];
+        const handler = {
+            toString() {
+                conversionOrder.push("handler");
+                return "console.log('code', conversionOrder.join(','))";
+            }
+        };
+        const timeout = {
+            valueOf() { conversionOrder.push("timeout"); return 0; }
+        };
+        setTimeout(handler, timeout);
+        setTimeout(function () {
+            "use strict";
+            console.log("this", this === globalThis);
+        }, 0);
+        "#,
+    );
+    assert_eq!(out.lines(), ["code handler,timeout", "this true"]);
+}
+
+#[test]
+fn timer_ids_and_clear_arguments_use_webidl_long_conversion() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const first = setTimeout(() => console.log("cancelled"), 0);
+        console.log("id", first);
+        clearTimeout(4294967296 + first);
+        setTimeout(() => console.log("kept"), 0);
+        "#,
+    );
+    assert_eq!(out.lines(), ["id 1", "kept"]);
+}
+
+#[test]
 fn clear_timeout_cancels() {
     let (mut rt, out, _err) = test_runtime();
     eval_ok(
@@ -178,6 +235,38 @@ fn spawn_blocking_completion_settles_on_the_loop() {
     // The in-flight task must hold the loop open until its completion arrives.
     rt.run_to_completion();
     assert_eq!(out.lines(), ["got 42"]);
+}
+
+#[test]
+fn panicking_blocking_task_reports_failure_without_stranding_the_loop() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        "globalThis.onDone = (n) => console.log('after panic', n); 0",
+    );
+    let global = rt.engine().global_this();
+    let callback = rt
+        .engine()
+        .ctx()
+        .get_member(&global, "onDone")
+        .map_err(|_| ())
+        .expect("callback exists");
+    rt.spawn_blocking(
+        || panic!("native boom"),
+        callback.clone(),
+        |_ctx, _payload| Ok(vec![]),
+    );
+    rt.spawn_blocking(
+        || Box::new(7u64),
+        callback,
+        |_ctx, payload| Ok(vec![Value::Num(*payload.downcast::<u64>().unwrap() as f64)]),
+    );
+    rt.run_to_completion();
+    assert_eq!(out.lines(), ["after panic 7"]);
+    assert_eq!(
+        err.lines(),
+        ["Uncaught Error: blocking task panicked: native boom"]
+    );
 }
 
 #[test]
@@ -811,6 +900,7 @@ fn web_fetch_roundtrip_over_local_http() {
             (async () => {{
                 const r = await fetch("http://{addr}/data");
                 console.log(r.status, r.ok, r.headers.get("x-test"));
+                try {{ r.headers.set("x-test", "changed"); }} catch (error) {{ console.log("headers", error.name); }}
                 const j = await r.json();
                 console.log(j.ok, j.n);
             }})();
@@ -818,7 +908,76 @@ fn web_fetch_roundtrip_over_local_http() {
         ),
     );
     server.join().ok();
-    assert_eq!(out.lines(), ["200 true yes", "true 42"]);
+    assert_eq!(
+        out.lines(),
+        ["200 true yes", "headers TypeError", "true 42"]
+    );
+}
+
+#[test]
+fn fetch_headers_methods_and_response_initialization_follow_fetch() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const headers = new Headers(new Set([
+          ["X-B", "\r\n two \t"],
+          ["X-A", "one"],
+          ["Set-Cookie", "a=1"],
+          ["Set-Cookie", "b=2"],
+        ]));
+        console.log([...headers].map((pair) => pair.join("=")).join("|"));
+        console.log(headers.get("x-b"), headers.getSetCookie().join("|"));
+
+        for (const pair of [["Bad Name", "x"], ["X", "a\r\nb"], ["X", "\u0100"]]) {
+          try { new Headers([pair]); } catch (error) { console.log(error.name); }
+        }
+
+        console.log(new Request("http://example.test", { method: "get" }).method);
+        console.log(new Request("http://example.test", { method: "cUsToM" }).method);
+        for (const method of ["CONNECT", "trace", "bad method"]) {
+          try { new Request("http://example.test", { method }); } catch (error) { console.log(error.name); }
+        }
+        try { new Request("http://user:pass@example.test/"); } catch (error) { console.log(error.name); }
+        const guardedRequest = new Request("http://example.test", {
+          headers: [["Host", "attacker.test"], ["Cookie", "secret=1"], ["X-Ok", "yes"]],
+        });
+        console.log(guardedRequest.headers.get("host"), guardedRequest.headers.get("cookie"), guardedRequest.headers.get("x-ok"));
+        const guardedResponse = new Response(null, { headers: [["Set-Cookie", "secret=1"], ["X-Ok", "yes"]] });
+        console.log(guardedResponse.headers.getSetCookie().length, guardedResponse.headers.get("x-ok"));
+
+        console.log(new Response(null, { status: 65736 }).status);
+        for (const make of [
+          () => new Response("", { status: 204 }),
+          () => new Response(null, { statusText: "ok\r\nbad" }),
+          () => new Response(null, { status: NaN }),
+        ]) {
+          try { make(); } catch (error) { console.log(error.name); }
+        }
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "set-cookie=a=1|set-cookie=b=2|x-a=one|x-b=two",
+            "two a=1|b=2",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "GET",
+            "cUsToM",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "null null yes",
+            "0 yes",
+            "200",
+            "TypeError",
+            "TypeError",
+            "RangeError",
+        ]
+    );
 }
 
 // ---- WinterTC Minimum Common API conformance ----
@@ -1324,6 +1483,55 @@ fn worker_message_round_trip_and_structured_clone() {
 }
 
 #[test]
+fn worker_arraybuffer_transfer_detaches_sender_and_preserves_views() {
+    let lines = worker_drive(
+        &[(
+            "transfer.mjs",
+            r#"
+            onmessage = (event) => {
+                const buffer = event.data.buffer;
+                const inputIdentity = event.data.view.buffer === buffer;
+                new Uint8Array(buffer)[1] = 9;
+                postMessage({
+                    buffer,
+                    view: new Uint8Array(buffer, 1, 2),
+                    inputIdentity,
+                }, [buffer]);
+                postMessage({ detached: buffer.detached });
+                close();
+            };
+            "#,
+        )],
+        r#"
+        const worker = new Worker("{DIR}/transfer.mjs", { type: "module" });
+        let messages = 0;
+        worker.onmessage = (event) => {
+            messages++;
+            if (messages === 1) {
+                console.log("reply", event.data.inputIdentity,
+                    event.data.view.buffer === event.data.buffer,
+                    event.data.view.join(","));
+            } else {
+                console.log("worker-detached", event.data.detached);
+            }
+        };
+        const buffer = new ArrayBuffer(4);
+        new Uint8Array(buffer).set([1, 2, 3, 4]);
+        worker.postMessage({ buffer, view: new Uint8Array(buffer, 1, 2) }, [buffer]);
+        console.log("main-detached", buffer.detached, buffer.byteLength);
+        "#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "main-detached true 0",
+            "reply true true 9,3",
+            "worker-detached true"
+        ]
+    );
+}
+
+#[test]
 fn worker_bidirectional_conversation() {
     // Several messages each way, in order; the worker closes after the third.
     let lines = worker_drive(
@@ -1487,10 +1695,10 @@ fn websocket_text_and_binary_round_trip() {
     );
     let port = lines[0].is_empty();
     let _ = port;
-    // The message-event origin is the socket URL (host:port varies), so match it structurally.
+    // MessageEvent.origin is the serialization of the socket URL's origin, not its full path.
     assert_eq!(lines[0], "open 1 chat");
     assert!(
-        lines[1].starts_with("text hello true ws://127.0.0.1:") && lines[1].ends_with('/'),
+        lines[1].starts_with("text hello true ws://127.0.0.1:") && !lines[1].ends_with('/'),
         "message event shape/origin: {}",
         lines[1]
     );
@@ -1564,7 +1772,7 @@ fn websocket_constructor_validation() {
         &mut rt,
         r#"
         const bad = (fn) => { try { fn(); console.log("no throw"); } catch (e) { console.log(e.name); } };
-        bad(() => new WebSocket("http://x/"));
+        bad(() => new WebSocket("ftp://x/"));
         bad(() => new WebSocket("ws://x/#frag"));
         bad(() => new WebSocket("ws://x/", ["a", "a"]));
         bad(() => new WebSocket("ws://x/", ["bad proto"]));
@@ -1581,6 +1789,61 @@ fn websocket_constructor_validation() {
             "0 1 2 3"
         ]
     );
+}
+
+#[test]
+fn websocket_http_url_iterable_protocols_and_webidl_close_conversion() {
+    let lines = ws_drive(
+        WsMode::Echo,
+        r#"
+        const ws = new WebSocket("http://127.0.0.1:{PORT}/", new Set(["chat"]));
+        ws.onopen = () => {
+            console.log(ws.url.startsWith("ws://"), ws.protocol);
+            ws.close("1000", "converted");
+        };
+        ws.onclose = (event) => console.log(event.code, event.reason, event.wasClean);
+        "#,
+    );
+    assert_eq!(lines, ["true chat", "1000 converted true"]);
+}
+
+#[test]
+fn websocket_close_without_arguments_sends_an_empty_body() {
+    let lines = ws_drive(
+        WsMode::Echo,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:{PORT}/");
+        ws.onopen = () => ws.close();
+        ws.onclose = (event) => console.log(event.code, event.reason === "", event.wasClean);
+        "#,
+    );
+    assert_eq!(lines, ["1005 true true"]);
+}
+
+#[test]
+fn websocket_blob_send_preserves_call_order() {
+    let lines = ws_drive(
+        WsMode::Echo,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:{PORT}/");
+        ws.binaryType = "arraybuffer";
+        const received = [];
+        ws.onopen = () => {
+            ws.send(new Blob(["first"]));
+            ws.send("second");
+        };
+        ws.onmessage = (event) => {
+            received.push(typeof event.data === "string"
+                ? event.data
+                : new TextDecoder().decode(event.data));
+            if (received.length === 2) {
+                console.log(received.join(","));
+                ws.close();
+            }
+        };
+        "#,
+    );
+    assert_eq!(lines, ["first,second"]);
 }
 
 #[test]
@@ -1700,6 +1963,58 @@ fn web_serve_roundtrip_over_loopback() {
         out.lines(),
         ["200 hi pong", "200 true 42", "200 got:hey", "closed"]
     );
+}
+
+#[test]
+fn dropping_runtime_with_live_listener_is_bounded() {
+    let mut runtime = Runtime::new();
+    match runtime
+        .engine()
+        .eval(
+            "globalThis.liveServer = Lumen.serve(() => new Response('ok'), { hostname: '127.0.0.1', port: 0 });",
+            false,
+        )
+        .expect("server source parses")
+    {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("server setup threw {name}: {message}"),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let start = std::time::Instant::now();
+    drop(runtime);
+    assert!(start.elapsed() < std::time::Duration::from_millis(750));
+}
+
+#[test]
+fn websocket_server_can_send_while_its_reader_is_idle() {
+    // Regression for shared read/write ownership: the server reader is armed as soon as the
+    // upgrade completes, but an immediate send must never wait for that blocking read.
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        (async () => {
+            const server = Lumen.serve((request) => {
+                const socket = Lumen.upgradeWebSocket(request);
+                if (!socket) return new Response("upgrade required", { status: 426 });
+                socket.onmessage = (data) => socket.send("echo:" + data);
+                socket.send("welcome");
+            }, { hostname: "127.0.0.1", port: 0 });
+
+            const client = new WebSocket(`ws://127.0.0.1:${server.port}/socket`);
+            client.onmessage = (event) => {
+                console.log(event.data);
+                if (event.data === "welcome") client.send("hello");
+                else client.close();
+            };
+            client.onclose = async (event) => {
+                console.log("closed", event.code, event.wasClean);
+                await server.shutdown();
+            };
+        })();
+        "#,
+    );
+    assert_eq!(out.lines(), ["welcome", "echo:hello", "closed 1005 true"]);
 }
 
 // ---- lumen-node (node: compat; the runtime assembles it) ----

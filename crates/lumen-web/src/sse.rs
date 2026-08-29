@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lumen_host::{Ctx, SpawnHandle, TaskRegistry, Value};
+use lumen_host::{CompletionSender, Ctx, TaskRegistry, Value};
 
 use crate::url;
 
@@ -32,8 +32,23 @@ pub(crate) struct SseRegistry {
 
 struct SseEntry {
     closed: Arc<AtomicBool>,
+    cancel: Arc<Mutex<Option<Arc<TcpStream>>>>,
     dispatch: Value,
     dead: bool,
+}
+
+impl Drop for SseEntry {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        if let Some(socket) = self
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 /// The connect task result: the open stream + the response status, or an error.
@@ -71,7 +86,8 @@ fn sse_registry(ctx: &mut Ctx) -> &mut SseRegistry {
         .expect("web installs SseRegistry")
 }
 
-/// `__sse.connect(url, lastEventId, dispatch)` → id. Opens the stream on the pool; the JS side
+/// `__sse.connect(url, lastEventId, dispatch)` → id. Opens the stream on the bounded dedicated
+/// executor; the JS side
 /// then receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect), or
 /// `("drop", message)` (reconnect per the retry interval).
 pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -97,6 +113,8 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         }
     }
 
+    let closed = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(Mutex::new(None));
     let id = {
         let reg = sse_registry(ctx);
         let id = reg.next;
@@ -104,7 +122,8 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         reg.conns.insert(
             id,
             SseEntry {
-                closed: Arc::new(AtomicBool::new(false)),
+                closed: Arc::clone(&closed),
+                cancel: Arc::clone(&cancel),
                 dispatch: dispatch.clone(),
                 dead: false,
             },
@@ -118,13 +137,13 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         .register(dispatch, None, decode_connect);
     let spawn = ctx
         .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
+        .get::<CompletionSender>()
+        .expect("runtime installs the dedicated executor")
         .clone();
-    spawn.spawn_blocking(task, move || {
+    spawn.run_blocking(task, move || {
         Box::new(ConnectResult {
             id,
-            outcome: open_stream(&target, &last_event_id),
+            outcome: open_stream(&target, &last_event_id, &closed, &cancel),
         })
     });
     Ok(Value::Num(id as f64))
@@ -132,7 +151,12 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
 
 /// GET `target` with the SSE request headers, following redirects, and validate the response is
 /// a `text/event-stream` 200 — returning the still-open stream positioned at the body start.
-fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, ConnectError> {
+fn open_stream(
+    target: &str,
+    last_event_id: &str,
+    closed: &AtomicBool,
+    cancel: &Mutex<Option<Arc<TcpStream>>>,
+) -> Result<Box<dyn SseStream>, ConnectError> {
     let mut target = target.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let u = url::parse(&target, None).map_err(ConnectError::Fatal)?;
@@ -146,6 +170,17 @@ fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, 
         let host = u.host.trim_matches(['[', ']']);
         let tcp = TcpStream::connect((host, port))
             .map_err(|e| ConnectError::Retriable(format!("connect: {e}")))?;
+        let cancel_socket = Arc::new(
+            tcp.try_clone()
+                .map_err(|error| ConnectError::Retriable(format!("clone socket: {error}")))?,
+        );
+        *cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&cancel_socket));
+        if closed.load(Ordering::Acquire) {
+            let _ = cancel_socket.shutdown(std::net::Shutdown::Both);
+            return Err(ConnectError::Retriable("connection was cancelled".into()));
+        }
         tcp.set_nodelay(true).ok();
         tcp.set_read_timeout(Some(READ_TIMEOUT)).ok();
         let mut stream: Box<dyn SseStream> = if u.scheme == "https" {
@@ -297,10 +332,10 @@ fn arm_read(ctx: &mut Ctx, id: u64, reader: StreamReader) {
         .register(dispatch, None, decode_read);
     let spawn = ctx
         .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
+        .get::<CompletionSender>()
+        .expect("runtime installs the dedicated executor")
         .clone();
-    spawn.spawn_blocking(task, move || {
+    spawn.run_blocking(task, move || {
         let mut reader = reader;
         let mut buf = vec![0u8; CHUNK];
         let outcome = if reader.closed.load(Ordering::SeqCst) {
@@ -375,6 +410,14 @@ pub(crate) fn op_sse_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resul
     if let Some(e) = sse_registry(ctx).conns.get_mut(&id) {
         e.dead = true;
         e.closed.store(true, Ordering::SeqCst);
+        if let Some(socket) = e
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
     }
     Ok(Value::Undefined)
 }

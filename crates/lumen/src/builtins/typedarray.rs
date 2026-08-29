@@ -31,7 +31,10 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))?;
         Ok(Value::Num(
-            i.array_buffers.get(&p).map(|b| b.len()).unwrap_or(0) as f64,
+            i.array_buffers
+                .get(&p)
+                .map(|b| b.borrow().len())
+                .unwrap_or(0) as f64,
         ))
     });
     sab_getter(it, &proto, "maxByteLength", |i, this, _| {
@@ -60,12 +63,17 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         let max = ab(i.to_number(&mv))? as usize;
         let new_len = ab(i.to_number(&arg(a, 0)))?;
         let ptr = Rc::as_ptr(&o) as usize;
-        let cur = i.array_buffers.get(&ptr).map(|b| b.len()).unwrap_or(0);
+        let cur = i
+            .array_buffers
+            .get(&ptr)
+            .map(|b| b.borrow().len())
+            .unwrap_or(0);
         if !new_len.is_finite() || new_len < cur as f64 || new_len as usize > max {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
-        if let Some(buf) = i.array_buffers.get_mut(&ptr) {
-            buf.resize(new_len as usize, 0);
+        if let Some(buf) = i.array_buffers.get(&ptr) {
+            buf.borrow_mut().resize(new_len as usize, 0);
+            i.mark_array_buffer_dirty(ptr);
         }
         Ok(Value::Undefined)
     });
@@ -87,7 +95,11 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
                 )
             })?;
         let ptr = Rc::as_ptr(o) as usize;
-        let len = i.array_buffers.get(&ptr).map(|b| b.len()).unwrap_or(0) as i64;
+        let len = i
+            .array_buffers
+            .get(&ptr)
+            .map(|b| b.borrow().len())
+            .unwrap_or(0) as i64;
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
             Value::Undefined => len,
@@ -123,7 +135,11 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             ));
         }
         // The new buffer must be at least `new_len` bytes.
-        let dst_byte_len = i.array_buffers.get(&nptr).map(|b| b.len()).unwrap_or(0);
+        let dst_byte_len = i
+            .array_buffers
+            .get(&nptr)
+            .map(|b| b.borrow().len())
+            .unwrap_or(0);
         if dst_byte_len < new_len {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
@@ -181,7 +197,8 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(bp, vec![0u8; len]);
+        i.array_buffers
+            .insert(bp, Rc::new(RefCell::new(vec![0u8; len])));
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "__abResizable", Value::Bool(max.is_some()));
         let id = crate::interpreter::alloc_shared_mem(len);
@@ -243,27 +260,29 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     if !i.array_buffers.contains_key(&ptr) {
         return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
     }
-    let new_len = new_len.unwrap_or_else(|| i.array_buffers[&ptr].len());
+    let new_len = new_len.unwrap_or_else(|| i.array_buffers[&ptr].borrow().len());
     // transfer() preserves the source's resizability; transferToFixedLength() is always fixed.
     let src_resizable = matches!(i.get_member(&this, "resizable"), Ok(Value::Bool(true)));
     let src_max = match i.get_member(&this, "maxByteLength") {
         Ok(Value::Num(n)) => n as usize,
         _ => new_len,
     };
-    let bytes = i.array_buffers[&ptr].clone();
+    // Transfer ownership of the Vec rather than cloning it. This is the engine primitive behind
+    // HTML structured transfer; same-length transfers must remain O(1) in backing-store bytes.
+    let bytes = i
+        .array_buffers
+        .remove(&ptr)
+        .expect("the detached check above established a backing store");
+    bytes.borrow_mut().resize(new_len, 0);
     let (bv, bp) = make_array_buffer(i, new_len);
-    if let Some(buf) = i.array_buffers.get_mut(&bp) {
-        let n = bytes.len().min(new_len);
-        buf[..n].copy_from_slice(&bytes[..n]);
-    }
+    i.array_buffers.insert(bp, bytes);
     if !fixed && src_resizable {
         if let Value::Obj(nb) = &bv {
             set_internal(nb, "__abMaxByteLength", Value::Num(src_max as f64));
             set_internal(nb, "__abResizable", Value::Bool(true));
         }
     }
-    // Detach the source (drop its backing store; detached/byteLength derive from the side table).
-    i.array_buffers.remove(&ptr);
+    // Removing the source backing above detached it; byteLength/detached derive from this table.
     Ok(bv)
 }
 
@@ -271,7 +290,8 @@ fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, vec![0u8; byte_len]);
+    i.array_buffers
+        .insert(p, Rc::new(RefCell::new(vec![0u8; byte_len])));
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
     // behind the `__ab*` prefix and surfaced through prototype accessor getters.
     set_internal(&obj, "__abMaxByteLength", Value::Num(byte_len as f64));
@@ -310,7 +330,10 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         // Detached (absent from the side table) → 0.
         Ok(Value::Num(
-            i.array_buffers.get(&p).map(|b| b.len()).unwrap_or(0) as f64,
+            i.array_buffers
+                .get(&p)
+                .map(|b| b.borrow().len())
+                .unwrap_or(0) as f64,
         ))
     });
     ab_getter(it, &proto, "maxByteLength", |i, this, _| {
@@ -378,7 +401,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if !i.array_buffers.contains_key(&ptr) {
             return Err(i.make_error("TypeError", "Cannot slice a detached ArrayBuffer"));
         }
-        let len = i.array_buffers[&ptr].len() as i64;
+        let len = i.array_buffers[&ptr].borrow().len() as i64;
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
             Value::Undefined => len,
@@ -415,19 +438,19 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if i.immutable_buffers.contains(&nptr) {
             return Err(i.make_error("TypeError", "slice species returned an immutable buffer"));
         }
-        if i.array_buffers[&nptr].len() < new_len {
+        if i.array_buffers[&nptr].borrow().len() < new_len {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
         // The species constructor may have detached or shrunk the source.
         if !i.array_buffers.contains_key(&ptr) {
             return Err(i.make_error("TypeError", "source ArrayBuffer was detached during slice"));
         }
-        let src = i.array_buffers[&ptr].clone();
+        let src = i.array_buffers[&ptr].borrow().clone();
         let (begin, end) = (begin.min(src.len() as i64), end.min(src.len() as i64));
         if begin < end {
             let slice = src[begin as usize..end as usize].to_vec();
-            if let Some(buf) = i.array_buffers.get_mut(&nptr) {
-                buf[..slice.len()].copy_from_slice(&slice);
+            if let Some(buf) = i.array_buffers.get(&nptr) {
+                buf.borrow_mut()[..slice.len()].copy_from_slice(&slice);
             }
         }
         Ok(new_buf)
@@ -464,8 +487,9 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if i.immutable_buffers.contains(&(Rc::as_ptr(&o) as usize)) {
             return Err(i.make_error("TypeError", "ArrayBuffer is immutable"));
         }
-        if let Some(buf) = i.array_buffers.get_mut(&(Rc::as_ptr(&o) as usize)) {
-            buf.resize(n, 0);
+        if let Some(buf) = i.array_buffers.get(&(Rc::as_ptr(&o) as usize)) {
+            buf.borrow_mut().resize(n, 0);
+            i.mark_array_buffer_dirty(Rc::as_ptr(&o) as usize);
         }
         // byteLength derives from the backing store length, which the resize above updated.
         Ok(Value::Undefined)
@@ -491,7 +515,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if !i.array_buffers.contains_key(&ptr) {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
         }
-        let len = i.array_buffers[&ptr].len() as i64;
+        let len = i.array_buffers[&ptr].borrow().len() as i64;
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
             Value::Undefined => len,
@@ -499,10 +523,12 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         };
         // Coercing start/end may have detached or shrunk the source buffer: detachment is a
         // TypeError, and a resolved range past the current length is a RangeError.
-        let bytes = i
+        let storage = i
             .array_buffers
             .get(&ptr)
+            .cloned()
             .ok_or_else(|| i.make_error("TypeError", "ArrayBuffer is detached"))?;
+        let bytes = storage.borrow();
         let cur = bytes.len() as i64;
         if begin < end && end > cur {
             return Err(i.make_error(
@@ -516,8 +542,8 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             Vec::new()
         };
         let (bv, bp) = make_array_buffer(i, slice.len());
-        if let Some(buf) = i.array_buffers.get_mut(&bp) {
-            buf.copy_from_slice(&slice);
+        if let Some(buf) = i.array_buffers.get(&bp) {
+            buf.borrow_mut().copy_from_slice(&slice);
         }
         i.immutable_buffers.insert(bp);
         Ok(bv)
@@ -562,7 +588,8 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let len = n as usize;
         let p = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(p, vec![0u8; len]);
+        i.array_buffers
+            .insert(p, Rc::new(RefCell::new(vec![0u8; len])));
         set_internal(&obj, "__abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "__abResizable", Value::Bool(max.is_some()));
         Ok(Value::Obj(obj))
@@ -1422,7 +1449,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             if !i.array_buffers.contains_key(&bp) {
                 return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
             }
-            let buflen = i.array_buffers[&bp].len();
+            let buflen = i.array_buffers[&bp].borrow().len();
             // A resizable ArrayBuffer or a growable SharedArrayBuffer makes an auto-length view
             // length-tracking.
             let resizable = matches!(
@@ -1477,7 +1504,20 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 return Err(i.make_error("TypeError", "@@iterator is not callable"));
             }
             let items = if iter_method.is_callable() {
-                ab(i.iterate_with(other, iter_method))?
+                // InitializeTypedArrayFromList is observably identical to intrinsic Array
+                // iteration when every indexed value is an own data property. Avoid allocating
+                // one iterator-result object and one decimal property key per element in that
+                // common case; patched iterators, holes, and accessors retain the full algorithm.
+                if is_native_function(&iter_method, nf_array_values)
+                    && intrinsic_array_iterator_is_unmodified(i)
+                {
+                    match dense_array_snapshot(i, other) {
+                        Some(items) => items,
+                        None => ab(i.iterate_with(other, iter_method))?,
+                    }
+                } else {
+                    ab(i.iterate_with(other, iter_method))?
+                }
             } else {
                 let lenv = ab(i.get_member(other, "length"))?;
                 let n = ab(i.to_number(&lenv))?.max(0.0) as usize;
@@ -1486,7 +1526,13 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 }
                 let mut v = Vec::with_capacity(n.min(1024));
                 for k in 0..n {
-                    v.push(ab(i.get_member(other, &k.to_string()))?);
+                    let own = other
+                        .as_obj()
+                        .and_then(|object| i.fast_get_elem(object, k as f64));
+                    v.push(match own {
+                        Some(value) => value,
+                        None => ab(i.get_member(other, &k.to_string()))?,
+                    });
                 }
                 v
             };
@@ -2011,10 +2057,12 @@ fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
     if !matches!(info.kind, TaKind::U8) {
         return Err(i.make_error("TypeError", "method requires a Uint8Array"));
     }
-    let buf = i
+    let storage = i
         .array_buffers
         .get(&info.buffer)
+        .cloned()
         .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
+    let buf = storage.borrow();
     Ok(buf[info.offset..info.offset + info.len].to_vec())
 }
 fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
@@ -2022,8 +2070,8 @@ fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
     let ta = ab(i.construct(ctor, &[Value::Num(bytes.len() as f64)]))?;
     if let Some(ptr) = map_ptr(&ta) {
         if let Some(info) = i.typed_arrays.get(&ptr).copied() {
-            if let Some(buf) = i.array_buffers.get_mut(&info.buffer) {
-                buf[info.offset..info.offset + bytes.len()].copy_from_slice(&bytes);
+            if let Some(buf) = i.array_buffers.get(&info.buffer) {
+                buf.borrow_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(&bytes);
             }
         }
     }
@@ -2192,8 +2240,9 @@ fn u8_set_bytes(i: &mut Interp, info: &TaInfo, read: usize, bytes: &[u8]) -> Res
             "cannot write into a view over an immutable ArrayBuffer",
         ));
     }
-    if let Some(buf) = i.array_buffers.get_mut(&info.buffer) {
-        buf[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
+    if let Some(buf) = i.array_buffers.get(&info.buffer) {
+        buf.borrow_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
+        i.mark_array_buffer_dirty_range(info.buffer, info.offset, bytes.len());
     }
     let result = i.new_object();
     set_data(&result, "read", Value::Num(read as f64));

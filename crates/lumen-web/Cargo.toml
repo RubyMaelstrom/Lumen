@@ -14,6 +14,15 @@ publish = false
 [dependencies]
 lumen-host = { path = "../lumen-host" }
 lumen-tls = { path = "../lumen-tls" }
+# The Servo parser tracks the WHATWG URL state machine and delegates domain processing to the
+# URL-profiled UTS #46 implementation in `idna`. Keeping this as one audited implementation also
+# prevents fetch/WebSocket/EventSource and the JavaScript URL API from drifting apart.
+whatwg-url = { package = "url", version = "2.5.8" }
+# `idna_adapter` 1.2.x selects ICU4X releases whose MSRV is newer than Lumen's Rust 1.82.
+# The 1.1 backend implements the same UTS #46 contract using unicode-rs data.
+idna-adapter = { package = "idna_adapter", version = "=1.1.0" }
+# Firefox's pure-Rust implementation of the WHATWG Encoding algorithms and canonical label table.
+encoding_rs = "0.8.35"
 
 # Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
 [build-dependencies]

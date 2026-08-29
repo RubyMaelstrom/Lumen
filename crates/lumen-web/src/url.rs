@@ -1,11 +1,14 @@
-//! A pragmatic WHATWG-URL subset: absolute parsing, relative resolution, special-scheme
-//! default ports, path normalization. Deliberately NOT implemented yet (each is a visible
-//! error, not a wrong answer): IDNA/punycode hosts (non-ASCII hosts are rejected), full
-//! percent-encode sets (existing escapes pass through untouched), file-URL windows drive
-//! quirks.
+//! WHATWG URL parsing and serialization shared by the JavaScript API and every network client.
+//!
+//! The state machine comes from the pure-Rust Servo `url` implementation. Its IDNA path uses
+//! non-transitional UTS #46 processing with the URL Standard's forbidden-domain-code-point list.
+//! Keeping the parsed record here prevents fetch, WebSocket, EventSource, and `URL` from applying
+//! subtly different authority, IPv4/IPv6, percent-encoding, or relative-resolution rules.
 
-/// Parsed components. `port` is `None` when absent or the scheme default.
-#[derive(Debug, PartialEq, Eq)]
+use whatwg_url::Url as ParsedUrl;
+
+/// Parsed components. `port` is `None` when absent or equal to the scheme's default port.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Url {
     pub scheme: String,
     pub username: String,
@@ -13,311 +16,202 @@ pub(crate) struct Url {
     pub host: String,
     pub port: Option<u16>,
     pub path: String,
-    pub query: String,    // includes leading '?' when non-empty
-    pub fragment: String, // includes leading '#' when non-empty
+    pub query: String,    // includes leading '?' when present
+    pub fragment: String, // includes leading '#' when present
+    parsed: ParsedUrl,
+}
+
+impl Url {
+    fn from_parsed(parsed: ParsedUrl) -> Self {
+        let query = parsed.query().map_or_else(String::new, |value| {
+            let mut output = String::with_capacity(value.len() + 1);
+            output.push('?');
+            output.push_str(value);
+            output
+        });
+        let fragment = parsed.fragment().map_or_else(String::new, |value| {
+            let mut output = String::with_capacity(value.len() + 1);
+            output.push('#');
+            output.push_str(value);
+            output
+        });
+        Self {
+            scheme: parsed.scheme().to_string(),
+            username: parsed.username().to_string(),
+            password: parsed.password().unwrap_or_default().to_string(),
+            host: parsed.host_str().unwrap_or_default().to_string(),
+            port: parsed.port(),
+            path: parsed.path().to_string(),
+            query,
+            fragment,
+            parsed,
+        }
+    }
+
+    pub fn href(&self) -> String {
+        self.parsed.as_str().to_string()
+    }
+
+    pub fn origin(&self) -> String {
+        self.parsed.origin().ascii_serialization()
+    }
+
+    pub fn set_fragment(&mut self, fragment: &str) {
+        let fragment = fragment.strip_prefix('#').unwrap_or(fragment);
+        self.parsed
+            .set_fragment((!fragment.is_empty()).then_some(fragment));
+        self.fragment = self.parsed.fragment().map_or_else(String::new, |value| {
+            let mut output = String::with_capacity(value.len() + 1);
+            output.push('#');
+            output.push_str(value);
+            output
+        });
+    }
+}
+
+/// Parse `input` on its own, or against `base` when it is relative.
+pub(crate) fn parse(input: &str, base: Option<&str>) -> Result<Url, String> {
+    let parsed = match base {
+        Some(base) => ParsedUrl::parse(base)
+            .map_err(|error| format!("invalid base URL '{base}': {error}"))?
+            .join(input)
+            .map_err(|error| format!("invalid URL '{input}': {error}"))?,
+        None => {
+            ParsedUrl::parse(input).map_err(|error| format!("invalid URL '{input}': {error}"))?
+        }
+    };
+    Ok(Url::from_parsed(parsed))
 }
 
 fn default_port(scheme: &str) -> Option<u16> {
     match scheme {
+        "ftp" => Some(21),
         "http" | "ws" => Some(80),
         "https" | "wss" => Some(443),
-        "ftp" => Some(21),
         _ => None,
     }
 }
 
-fn is_special(scheme: &str) -> bool {
-    matches!(scheme, "http" | "https" | "ws" | "wss" | "ftp" | "file")
-}
-
-impl Url {
-    pub fn href(&self) -> String {
-        let mut out = format!("{}:", self.scheme);
-        if !self.host.is_empty() || self.scheme == "file" {
-            out.push_str("//");
-            if !self.username.is_empty() || !self.password.is_empty() {
-                out.push_str(&self.username);
-                if !self.password.is_empty() {
-                    out.push(':');
-                    out.push_str(&self.password);
+/// Apply one URL API setter using a parsed URL record. Setter parse failures are ignored, as the
+/// URL Standard requires, while the `href` setter continues to use `parse` and throw on failure.
+pub(crate) fn mutate(href: &str, component: &str, value: &str) -> Result<Url, String> {
+    let mut parsed =
+        ParsedUrl::parse(href).map_err(|error| format!("invalid current URL '{href}': {error}"))?;
+    match component {
+        "protocol" => {
+            let scheme = value.strip_suffix(':').unwrap_or(value);
+            let _ = parsed.set_scheme(scheme);
+        }
+        "username" => {
+            let _ = parsed.set_username(value);
+        }
+        "password" => {
+            let _ = parsed.set_password((!value.is_empty()).then_some(value));
+        }
+        "host" => {
+            // `Url::set_host` deliberately excludes a port. Parse the setter input as an
+            // authority so host and port are changed atomically and malformed values are ignored.
+            if !value
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | '?' | '#' | '@'))
+            {
+                let candidate = format!("{}://{value}/", parsed.scheme());
+                if let Ok(authority) = ParsedUrl::parse(&candidate) {
+                    if parsed.set_host(authority.host_str()).is_ok() {
+                        let _ = parsed.set_port(authority.port());
+                    }
                 }
-                out.push('@');
-            }
-            out.push_str(&self.host);
-            if let Some(p) = self.port {
-                out.push_str(&format!(":{p}"));
             }
         }
-        out.push_str(&self.path);
-        out.push_str(&self.query);
-        out.push_str(&self.fragment);
-        out
-    }
-
-    pub fn origin(&self) -> String {
-        match self.port {
-            Some(p) => format!("{}://{}:{}", self.scheme, self.host, p),
-            None => format!("{}://{}", self.scheme, self.host),
+        "hostname" => {
+            let _ = parsed.set_host(Some(value));
         }
-    }
-}
-
-/// `input` parsed on its own, or resolved against `base` when relative.
-pub(crate) fn parse(input: &str, base: Option<&str>) -> Result<Url, String> {
-    let input = input.trim_matches(|c: char| c.is_ascii_whitespace() || c.is_control());
-    if let Some(url) = try_parse_absolute(input)? {
-        return Ok(url);
-    }
-    let Some(base) = base else {
-        return Err(format!(
-            "invalid URL '{input}' (relative, and no base given)"
-        ));
-    };
-    let base =
-        try_parse_absolute(base.trim())?.ok_or_else(|| format!("invalid base URL '{base}'"))?;
-    resolve(input, base)
-}
-
-/// `Some(url)` when input has a scheme, `None` when it's relative.
-fn try_parse_absolute(input: &str) -> Result<Option<Url>, String> {
-    let Some(colon) = input.find(':') else {
-        return Ok(None);
-    };
-    let scheme = &input[..colon];
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic())
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    {
-        return Ok(None); // "a/b:c" style — not a scheme, treat as relative
-    }
-    let scheme = scheme.to_ascii_lowercase();
-    let rest = &input[colon + 1..];
-
-    if let Some(rest) = rest.strip_prefix("//") {
-        let (authority_and_path, query, fragment) = split_query_fragment(rest);
-        let (authority, path) = match authority_and_path.find('/') {
-            Some(i) => (&authority_and_path[..i], &authority_and_path[i..]),
-            None => (authority_and_path, ""),
-        };
-        let (userinfo, hostport) = match authority.rfind('@') {
-            Some(i) => (&authority[..i], &authority[i + 1..]),
-            None => ("", authority),
-        };
-        let (username, password) = match userinfo.find(':') {
-            Some(i) => (&userinfo[..i], &userinfo[i + 1..]),
-            None => (userinfo, ""),
-        };
-        let (host, port) = parse_hostport(hostport, &scheme)?;
-        if is_special(&scheme) && host.is_empty() && scheme != "file" {
-            return Err(format!("invalid URL '{input}': missing host"));
-        }
-        let path = if path.is_empty() && is_special(&scheme) {
-            "/".to_string()
-        } else {
-            normalize_path(path)
-        };
-        Ok(Some(Url {
-            scheme,
-            username: username.to_string(),
-            password: password.to_string(),
-            host,
-            port,
-            path,
-            query: query.to_string(),
-            fragment: fragment.to_string(),
-        }))
-    } else if is_special(&scheme) {
-        Err(format!("invalid URL '{input}': special scheme without //"))
-    } else {
-        // Opaque path (mailto:, data:, javascript:); kept verbatim.
-        let (path, query, fragment) = split_query_fragment(rest);
-        Ok(Some(Url {
-            scheme,
-            username: String::new(),
-            password: String::new(),
-            host: String::new(),
-            port: None,
-            path: path.to_string(),
-            query: query.to_string(),
-            fragment: fragment.to_string(),
-        }))
-    }
-}
-
-fn parse_hostport(hostport: &str, scheme: &str) -> Result<(String, Option<u16>), String> {
-    // [v6::addr]:port — the bracket form is the only place ':' is part of a host.
-    let (host, port_str) = if let Some(rest) = hostport.strip_prefix('[') {
-        let Some(end) = rest.find(']') else {
-            return Err(format!("invalid host '{hostport}'"));
-        };
-        let after = &rest[end + 1..];
-        let port = after.strip_prefix(':').unwrap_or("");
-        (format!("[{}]", &rest[..end]), port)
-    } else {
-        match hostport.find(':') {
-            Some(i) => (hostport[..i].to_string(), &hostport[i + 1..]),
-            None => (hostport.to_string(), ""),
-        }
-    };
-    if !host.is_ascii() {
-        return Err(format!(
-            "non-ASCII host '{host}' (IDNA is not implemented yet)"
-        ));
-    }
-    let host = host.to_ascii_lowercase();
-    let port = if port_str.is_empty() {
-        None
-    } else {
-        let p: u16 = port_str
-            .parse()
-            .map_err(|_| format!("invalid port '{port_str}'"))?;
-        (Some(p) != default_port(scheme)).then_some(p)
-    };
-    Ok((host, port))
-}
-
-fn split_query_fragment(s: &str) -> (&str, &str, &str) {
-    let (before_frag, fragment) = match s.find('#') {
-        Some(i) => (&s[..i], &s[i..]),
-        None => (s, ""),
-    };
-    let (path, query) = match before_frag.find('?') {
-        Some(i) => (&before_frag[..i], &before_frag[i..]),
-        None => (before_frag, ""),
-    };
-    (path, query, fragment)
-}
-
-/// Resolve `.`/`..` segments; preserves a trailing slash.
-fn normalize_path(path: &str) -> String {
-    if path.is_empty() {
-        return String::new();
-    }
-    let trailing_slash = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..");
-    let mut out: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                out.pop();
+        "port" => {
+            if value.is_empty() {
+                let _ = parsed.set_port(None);
+            } else if value.bytes().all(|byte| byte.is_ascii_digit()) {
+                if let Ok(port) = value.parse::<u16>() {
+                    let port = (Some(port) != default_port(parsed.scheme())).then_some(port);
+                    let _ = parsed.set_port(port);
+                }
             }
-            s => out.push(s),
         }
+        "pathname" => parsed.set_path(value),
+        "search" => {
+            if value.is_empty() {
+                parsed.set_query(None);
+            } else {
+                parsed.set_query(Some(value.strip_prefix('?').unwrap_or(value)));
+            }
+        }
+        "hash" => {
+            if value.is_empty() {
+                parsed.set_fragment(None);
+            } else {
+                parsed.set_fragment(Some(value.strip_prefix('#').unwrap_or(value)));
+            }
+        }
+        _ => return Err(format!("unknown URL component '{component}'")),
     }
-    let mut s = String::from("/");
-    s.push_str(&out.join("/"));
-    if trailing_slash && s.len() > 1 {
-        s.push('/');
-    }
-    s
-}
-
-/// RFC 3986-style relative resolution against an already-parsed base.
-fn resolve(input: &str, base: Url) -> Result<Url, String> {
-    if let Some(rest) = input.strip_prefix("//") {
-        // Protocol-relative: keep the scheme, reparse the rest as authority.
-        return try_parse_absolute(&format!("{}://{}", base.scheme, rest))?
-            .ok_or_else(|| format!("invalid URL '//{rest}'"));
-    }
-    let (path_part, query, fragment) = split_query_fragment(input);
-    let (path, query) = if path_part.is_empty() && query.is_empty() {
-        // Fragment-only (or empty): keep base path AND query.
-        (base.path.clone(), base.query.clone())
-    } else if path_part.is_empty() {
-        (base.path.clone(), query.to_string())
-    } else if path_part.starts_with('/') {
-        (normalize_path(path_part), query.to_string())
-    } else {
-        let dir = match base.path.rfind('/') {
-            Some(i) => &base.path[..=i],
-            None => "/",
-        };
-        (
-            normalize_path(&format!("{dir}{path_part}")),
-            query.to_string(),
-        )
-    };
-    Ok(Url {
-        path,
-        query,
-        fragment: fragment.to_string(),
-        ..base
-    })
+    Ok(Url::from_parsed(parsed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn p(s: &str) -> Url {
-        parse(s, None).unwrap()
+    fn p(input: &str) -> Url {
+        parse(input, None).unwrap()
     }
 
     #[test]
-    fn absolute_basics() {
-        let u = p("HTTP://User:Pw@Example.COM:8080/a/b?q=1#frag");
-        assert_eq!(u.scheme, "http");
-        assert_eq!(u.username, "User");
-        assert_eq!(u.password, "Pw");
-        assert_eq!(u.host, "example.com");
-        assert_eq!(u.port, Some(8080));
-        assert_eq!(u.path, "/a/b");
-        assert_eq!(u.query, "?q=1");
-        assert_eq!(u.fragment, "#frag");
-        assert_eq!(u.href(), "http://User:Pw@example.com:8080/a/b?q=1#frag");
-    }
-
-    #[test]
-    fn default_port_dropped_and_path_added() {
-        assert_eq!(p("http://x.com:80").href(), "http://x.com/");
-        assert_eq!(p("https://x.com:443/a").href(), "https://x.com/a");
-        assert_eq!(p("http://x.com:8080").port, Some(8080));
-    }
-
-    #[test]
-    fn path_normalization() {
-        assert_eq!(p("http://x.com/a/b/../c/./d").path, "/a/c/d");
-        assert_eq!(p("http://x.com/a/..").path, "/");
-        assert_eq!(p("http://x.com/a/b/").path, "/a/b/");
-    }
-
-    #[test]
-    fn relative_resolution() {
-        let base = Some("http://x.com/a/b/c?old#f");
-        assert_eq!(parse("d", base).unwrap().href(), "http://x.com/a/b/d");
-        assert_eq!(parse("../d", base).unwrap().href(), "http://x.com/a/d");
-        assert_eq!(parse("/d", base).unwrap().href(), "http://x.com/d");
+    fn parses_serializes_and_resolves_special_urls() {
+        let url = p("HTTP://User:Pw@Example.COM:8080/a/b/../c?q=1#frag");
+        assert_eq!(url.href(), "http://User:Pw@example.com:8080/a/c?q=1#frag");
+        assert_eq!(url.origin(), "http://example.com:8080");
+        assert_eq!(url.username, "User");
+        assert_eq!(url.password, "Pw");
+        assert_eq!(url.host, "example.com");
+        assert_eq!(url.port, Some(8080));
+        assert_eq!(url.path, "/a/c");
         assert_eq!(
-            parse("?q=2", base).unwrap().href(),
-            "http://x.com/a/b/c?q=2"
+            parse("../d", Some("http://example.com/a/b/c?old#f"))
+                .unwrap()
+                .href(),
+            "http://example.com/a/d"
         );
+        assert_eq!(p("https:example.org").href(), "https://example.org/");
+        assert_eq!(p("https://example.org\\a").path, "/a");
+    }
+
+    #[test]
+    fn implements_uts46_ipv4_and_ipv6_host_algorithms() {
+        assert_eq!(p("https://faß.example/").host, "xn--fa-hia.example");
+        assert_eq!(p("https://①.②.③.④/").host, "1.2.3.4");
+        assert_eq!(p("http://0x7f.1/").host, "127.0.0.1");
+        assert_eq!(p("http://[2001:0db8::1]/").host, "[2001:db8::1]");
+        assert!(parse("https://exa%23mple.org/", None).is_err());
+        assert!(parse("http://[1::1::1]/", None).is_err());
+    }
+
+    #[test]
+    fn preserves_opaque_paths_and_opaque_origins() {
+        let url = p("mailto:some one@example.org?q=hello world#fragment");
         assert_eq!(
-            parse("#g", base).unwrap().href(),
-            "http://x.com/a/b/c?old#g"
+            url.href(),
+            "mailto:some one@example.org?q=hello%20world#fragment"
         );
-        assert_eq!(parse("//y.com/z", base).unwrap().href(), "http://y.com/z");
+        assert_eq!(url.origin(), "null");
     }
 
     #[test]
-    fn ipv6_and_errors() {
-        let u = p("http://[::1]:9000/x");
-        assert_eq!(u.host, "[::1]");
-        assert_eq!(u.port, Some(9000));
-        assert!(parse("http://", None).is_err());
-        assert!(parse("nobase", None).is_err());
-        assert!(parse("http://bücher.de/", None).is_err(), "IDNA flagged");
-    }
-
-    #[test]
-    fn opaque_schemes() {
-        let u = p("mailto:a@b.c");
-        assert_eq!(u.scheme, "mailto");
-        assert_eq!(u.path, "a@b.c");
-        assert_eq!(u.href(), "mailto:a@b.c");
+    fn setters_use_component_state_overrides_and_ignore_invalid_input() {
+        let url = mutate("http://example.com/a", "pathname", "next value").unwrap();
+        assert_eq!(url.href(), "http://example.com/next%20value");
+        let url = mutate(&url.href(), "host", "bücher.example:443").unwrap();
+        assert_eq!(url.host, "xn--bcher-kva.example");
+        assert_eq!(url.port, Some(443));
+        let unchanged = mutate(&url.href(), "port", "70000").unwrap();
+        assert_eq!(unchanged.href(), url.href());
     }
 }

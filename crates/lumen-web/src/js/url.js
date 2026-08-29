@@ -1,5 +1,37 @@
-// URL + URLSearchParams over the native parser. Setters recompose + reparse, so every
-// mutation goes through the same validation as the constructor.
+// URL + URLSearchParams over the native WHATWG parser. Component setters use parser state
+// overrides, and form encoding follows URL Standard §5 rather than encodeURIComponent's
+// different escape set.
+
+function toUSVString(value) {
+  return encodingUSVString(value);
+}
+
+function requireArguments(actual, required, operation) {
+  if (actual < required) {
+    throw new TypeError(`${operation} requires at least ${required} argument${required === 1 ? "" : "s"}`);
+  }
+}
+
+function isHex(byte) {
+  return (byte >= 0x30 && byte <= 0x39) ||
+    (byte >= 0x41 && byte <= 0x46) ||
+    (byte >= 0x61 && byte <= 0x66);
+}
+
+function percentDecode(input) {
+  const bytes = new TextEncoder().encode(input.replace(/\+/g, " "));
+  const output = new Uint8Array(bytes.length);
+  let length = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] === 0x25 && i + 2 < bytes.length && isHex(bytes[i + 1]) && isHex(bytes[i + 2])) {
+      output[length++] = parseInt(String.fromCharCode(bytes[i + 1], bytes[i + 2]), 16);
+      i += 2;
+    } else {
+      output[length++] = bytes[i];
+    }
+  }
+  return new TextDecoder().decode(output.subarray(0, length));
+}
 
 function formDecode(s) {
   const out = [];
@@ -10,21 +42,28 @@ function formDecode(s) {
     const eq = part.indexOf("=");
     const rawK = eq >= 0 ? part.slice(0, eq) : part;
     const rawV = eq >= 0 ? part.slice(eq + 1) : "";
-    const dec = (x) => {
-      x = x.replace(/\+/g, " ");
-      try {
-        return decodeURIComponent(x);
-      } catch {
-        return x; // stray %: keep verbatim rather than throw (form parsing never throws)
-      }
-    };
-    out.push([dec(rawK), dec(rawV)]);
+    out.push([percentDecode(rawK), percentDecode(rawV)]);
   }
   return out;
 }
 
 function formEncode(list) {
-  const enc = (x) => encodeURIComponent(x).replace(/%20/g, "+");
+  const enc = (value) => {
+    const bytes = new TextEncoder().encode(toUSVString(value));
+    let output = "";
+    for (const byte of bytes) {
+      if ((byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a) ||
+          (byte >= 0x30 && byte <= 0x39) || byte === 0x2a || byte === 0x2d ||
+          byte === 0x2e || byte === 0x5f) {
+        output += String.fromCharCode(byte);
+      } else if (byte === 0x20) {
+        output += "+";
+      } else {
+        output += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+      }
+    }
+    return output;
+  };
   return list.map(([k, v]) => `${enc(k)}=${enc(v)}`).join("&");
 }
 
@@ -33,18 +72,24 @@ class URLSearchParams {
     this._list = [];
     this._onchange = null;
     if (typeof init === "string") {
-      this._list = formDecode(init);
+      this._list = formDecode(toUSVString(init));
     } else if (init instanceof URLSearchParams) {
       this._list = init._list.map((p) => [...p]);
-    } else if (Array.isArray(init)) {
+    } else if (init != null && typeof init[Symbol.iterator] === "function") {
       for (const pair of init) {
-        if (!pair || pair.length !== 2) {
+        if (pair == null || typeof pair[Symbol.iterator] !== "function") {
           throw new TypeError("URLSearchParams: each init pair needs exactly two items");
         }
-        this._list.push([String(pair[0]), String(pair[1])]);
+        const values = [...pair];
+        if (values.length !== 2) {
+          throw new TypeError("URLSearchParams: each init pair needs exactly two items");
+        }
+        this._list.push([toUSVString(values[0]), toUSVString(values[1])]);
       }
     } else if (init && typeof init === "object") {
-      for (const k of Object.keys(init)) this._list.push([k, String(init[k])]);
+      for (const k of Object.keys(init)) this._list.push([toUSVString(k), toUSVString(init[k])]);
+    } else if (init !== undefined) {
+      this._list = formDecode(toUSVString(init));
     }
   }
   _changed() {
@@ -54,35 +99,51 @@ class URLSearchParams {
     this._list = formDecode(search);
   }
   append(name, value) {
-    this._list.push([String(name), String(value)]);
+    requireArguments(arguments.length, 2, "URLSearchParams.append");
+    this._list.push([toUSVString(name), toUSVString(value)]);
     this._changed();
   }
-  delete(name) {
-    name = String(name);
-    this._list = this._list.filter(([k]) => k !== name);
+  delete(name, value = undefined) {
+    requireArguments(arguments.length, 1, "URLSearchParams.delete");
+    name = toUSVString(name);
+    if (arguments.length > 1) {
+      value = toUSVString(value);
+      this._list = this._list.filter(([k, v]) => k !== name || v !== value);
+    } else {
+      this._list = this._list.filter(([k]) => k !== name);
+    }
     this._changed();
   }
   get(name) {
-    name = String(name);
+    requireArguments(arguments.length, 1, "URLSearchParams.get");
+    name = toUSVString(name);
     const hit = this._list.find(([k]) => k === name);
     return hit ? hit[1] : null;
   }
   getAll(name) {
-    name = String(name);
+    requireArguments(arguments.length, 1, "URLSearchParams.getAll");
+    name = toUSVString(name);
     return this._list.filter(([k]) => k === name).map(([, v]) => v);
   }
-  has(name) {
-    name = String(name);
+  has(name, value = undefined) {
+    requireArguments(arguments.length, 1, "URLSearchParams.has");
+    name = toUSVString(name);
+    if (arguments.length > 1) {
+      value = toUSVString(value);
+      return this._list.some(([k, v]) => k === name && v === value);
+    }
     return this._list.some(([k]) => k === name);
   }
   set(name, value) {
-    name = String(name);
+    requireArguments(arguments.length, 2, "URLSearchParams.set");
+    name = toUSVString(name);
+    value = toUSVString(value);
     const i = this._list.findIndex(([k]) => k === name);
     if (i >= 0) {
-      this._list[i][1] = String(value);
+      this._list[i][1] = value;
       this._list = this._list.filter(([k], j) => k !== name || j <= i);
     } else {
-      this._list.push([name, String(value)]);
+      this._list.push([name, value]);
     }
     this._changed();
   }
@@ -92,10 +153,14 @@ class URLSearchParams {
     this._changed();
   }
   forEach(fn, thisArg) {
-    for (const [k, v] of [...this._list]) fn.call(thisArg, v, k, this);
+    requireArguments(arguments.length, 1, "URLSearchParams.forEach");
+    for (let i = 0; i < this._list.length; i++) {
+      const [k, v] = this._list[i];
+      fn.call(thisArg, v, k, this);
+    }
   }
   *entries() {
-    yield* this._list.map((p) => [...p]);
+    for (let i = 0; i < this._list.length; i++) yield [...this._list[i]];
   }
   *keys() {
     for (const [k] of this._list) yield k;
@@ -115,32 +180,19 @@ class URLSearchParams {
 }
 
 class URL {
-  constructor(input, base) {
-    this._c = __url.parse(String(input), base === undefined ? undefined : String(base));
+  constructor(input, base = undefined) {
+    this._c = __url.parse(toUSVString(input), base === undefined ? undefined : toUSVString(base));
     this._searchParams = null;
   }
-  _recompose(patch) {
-    const c = { ...this._c, ...patch };
-    let href = `${c.scheme}:`;
-    if (c.host !== "" || c.scheme === "file") {
-      href += "//";
-      if (c.username !== "" || c.password !== "") {
-        href += c.username;
-        if (c.password !== "") href += `:${c.password}`;
-        href += "@";
-      }
-      href += c.host;
-      if (c.port !== "") href += `:${c.port}`;
-    }
-    href += c.path + c.query + c.fragment;
-    this._c = __url.parse(href, undefined);
+  _mutate(component, value) {
+    this._c = __url.mutate(this._c.href, component, toUSVString(value));
     if (this._searchParams) this._searchParams._reset(this._c.query);
   }
   get href() {
     return this._c.href;
   }
   set href(v) {
-    this._c = __url.parse(String(v), undefined);
+    this._c = __url.parse(toUSVString(v), undefined);
     if (this._searchParams) this._searchParams._reset(this._c.query);
   }
   get origin() {
@@ -149,11 +201,20 @@ class URL {
   get protocol() {
     return `${this._c.scheme}:`;
   }
+  set protocol(v) {
+    this._mutate("protocol", v);
+  }
   get username() {
     return this._c.username;
   }
+  set username(v) {
+    this._mutate("username", v);
+  }
   get password() {
     return this._c.password;
+  }
+  set password(v) {
+    this._mutate("password", v);
   }
   get host() {
     return this._c.port === "" ? this._c.host : `${this._c.host}:${this._c.port}`;
@@ -161,44 +222,45 @@ class URL {
   get hostname() {
     return this._c.host;
   }
+  set host(v) {
+    this._mutate("host", v);
+  }
   set hostname(v) {
-    this._recompose({ host: String(v) });
+    this._mutate("hostname", v);
   }
   get port() {
     return this._c.port;
   }
   set port(v) {
-    this._recompose({ port: String(v) });
+    this._mutate("port", v);
   }
   get pathname() {
     return this._c.path;
   }
   set pathname(v) {
-    this._recompose({ path: String(v) });
+    this._mutate("pathname", v);
   }
   get search() {
     return this._c.query;
   }
   set search(v) {
-    v = String(v);
-    this._recompose({ query: v === "" || v.startsWith("?") ? v : `?${v}` });
+    this._mutate("search", v);
   }
   get hash() {
     return this._c.fragment;
   }
   set hash(v) {
-    v = String(v);
-    this._recompose({ fragment: v === "" || v.startsWith("#") ? v : `#${v}` });
+    this._mutate("hash", v);
   }
   get searchParams() {
     if (!this._searchParams) {
       const sp = new URLSearchParams(this._c.query);
       sp._onchange = () => {
         const q = sp.toString();
-        // Bypass _recompose's param reset: the list is already current.
+        // Keep this list live while the URL query is updated through its parser override.
         const saved = this._searchParams;
         this._searchParams = null;
-        this._recompose({ query: q === "" ? "" : `?${q}` });
+        this._mutate("search", q === "" ? "" : `?${q}`);
         this._searchParams = saved;
       };
       this._searchParams = sp;
@@ -211,7 +273,8 @@ class URL {
   toJSON() {
     return this.href;
   }
-  static canParse(input, base) {
+  static canParse(input, base = undefined) {
+    requireArguments(arguments.length, 1, "URL.canParse");
     try {
       new URL(input, base);
       return true;
@@ -219,7 +282,8 @@ class URL {
       return false;
     }
   }
-  static parse(input, base) {
+  static parse(input, base = undefined) {
+    requireArguments(arguments.length, 1, "URL.parse");
     try {
       return new URL(input, base);
     } catch {
@@ -227,6 +291,12 @@ class URL {
     }
   }
 }
+
+Object.defineProperty(URL.prototype, Symbol.toStringTag, { value: "URL", configurable: true });
+Object.defineProperty(URLSearchParams.prototype, Symbol.toStringTag, {
+  value: "URLSearchParams",
+  configurable: true,
+});
 
 globalThis.URLSearchParams = URLSearchParams;
 globalThis.URL = URL;

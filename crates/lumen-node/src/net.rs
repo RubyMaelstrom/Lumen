@@ -229,6 +229,49 @@ pub struct DgramRegistry {
     sockets: HashMap<u64, UdpEntry>,
 }
 
+impl Drop for NetRegistry {
+    fn drop(&mut self) {
+        for entry in self.sockets.values() {
+            let _ = entry.stream.shutdown(Shutdown::Both);
+        }
+        for entry in self.servers.values() {
+            entry.closed.store(true, Ordering::Release);
+            wake_server(&entry.local_addr);
+        }
+    }
+}
+
+impl Drop for DgramRegistry {
+    fn drop(&mut self) {
+        for entry in self.sockets.values() {
+            entry.closed.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn wake_server(local_addr: &ServerAddress) {
+    match local_addr {
+        ServerAddress::Tcp(local_addr) => {
+            let wake = if local_addr.ip().is_unspecified() {
+                let ip = if local_addr.is_ipv6() {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                } else {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                };
+                SocketAddr::new(ip, local_addr.port())
+            } else {
+                *local_addr
+            };
+            let _ = TcpStream::connect(wake);
+        }
+        #[cfg(unix)]
+        ServerAddress::Unix(path) => {
+            let _ = UnixStream::connect(path);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 // ---- shared error/value helpers -----------------------------------------------------------------
 
 /// A `Send` socket error carried back to the loop thread, with the errno `code` Node users switch
@@ -873,26 +916,7 @@ fn op_close_server(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
         .map(|e| (e.closed, e.local_addr));
     if let Some((closed, local_addr)) = target {
         closed.store(true, Ordering::SeqCst);
-        match local_addr {
-            ServerAddress::Tcp(local_addr) => {
-                let wake = if local_addr.ip().is_unspecified() {
-                    let ip = if local_addr.is_ipv6() {
-                        IpAddr::V6(Ipv6Addr::LOCALHOST)
-                    } else {
-                        IpAddr::V4(Ipv4Addr::LOCALHOST)
-                    };
-                    SocketAddr::new(ip, local_addr.port())
-                } else {
-                    local_addr
-                };
-                let _ = TcpStream::connect(wake);
-            }
-            #[cfg(unix)]
-            ServerAddress::Unix(path) => {
-                let _ = UnixStream::connect(&path);
-                let _ = std::fs::remove_file(path);
-            }
-        }
+        wake_server(&local_addr);
     }
     Ok(Value::Undefined)
 }

@@ -1,33 +1,137 @@
-// TextEncoder/TextDecoder over the native utf-8 ops, base64 globals, structuredClone.
+// Encoding Standard TextEncoder/TextDecoder over native, stateful WHATWG codecs, plus base64.
+
+const EMPTY_ENCODING_INPUT = new Uint8Array(0);
+const TEXT_DECODER_FINALIZER = new FinalizationRegistry((id) => __encoding.decoderDrop(id));
+const TEXT_DECODER_STATE = new WeakMap();
+
+function encodingUSVString(value) {
+  const input = String(value);
+  let output = null;
+  let copiedThrough = 0;
+  for (let i = 0; i < input.length; i++) {
+    const first = input.charCodeAt(i);
+    if (first >= 0xd800 && first <= 0xdbff) {
+      const second = input.charCodeAt(i + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) {
+        i++;
+      } else {
+        if (output === null) output = [];
+        output.push(input.slice(copiedThrough, i), "\ufffd");
+        copiedThrough = i + 1;
+      }
+    } else if (first >= 0xdc00 && first <= 0xdfff) {
+      if (output === null) output = [];
+      output.push(input.slice(copiedThrough, i), "\ufffd");
+      copiedThrough = i + 1;
+    }
+  }
+  if (output === null) return input;
+  output.push(input.slice(copiedThrough));
+  return output.join("");
+}
+
+function decoderInput(value) {
+  if (value === undefined) return EMPTY_ENCODING_INPUT;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  throw new TypeError("TextDecoder.decode expects a BufferSource");
+}
 
 class TextEncoder {
   get encoding() {
     return "utf-8";
   }
   encode(input = "") {
-    return __encoding.encode(String(input));
+    return __encoding.encode(encodingUSVString(input));
+  }
+  encodeInto(source, destination) {
+    if (arguments.length < 2) throw new TypeError("TextEncoder.encodeInto requires 2 arguments");
+    if (!(destination instanceof Uint8Array)) {
+      throw new TypeError("TextEncoder.encodeInto destination must be a Uint8Array");
+    }
+    source = String(source);
+    let read = 0;
+    let written = 0;
+    while (read < source.length) {
+      const first = source.charCodeAt(read);
+      let codePoint;
+      let codeUnits = 1;
+      if (first >= 0xd800 && first <= 0xdbff) {
+        const second = source.charCodeAt(read + 1);
+        if (second >= 0xdc00 && second <= 0xdfff) {
+          codePoint = 0x10000 + ((first - 0xd800) << 10) + second - 0xdc00;
+          codeUnits = 2;
+        } else {
+          codePoint = 0xfffd;
+        }
+      } else if (first >= 0xdc00 && first <= 0xdfff) {
+        codePoint = 0xfffd;
+      } else {
+        codePoint = first;
+      }
+      const needed = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+      if (written + needed > destination.length) break;
+      if (needed === 1) {
+        destination[written++] = codePoint;
+      } else if (needed === 2) {
+        destination[written++] = 0xc0 | (codePoint >> 6);
+        destination[written++] = 0x80 | (codePoint & 0x3f);
+      } else if (needed === 3) {
+        destination[written++] = 0xe0 | (codePoint >> 12);
+        destination[written++] = 0x80 | ((codePoint >> 6) & 0x3f);
+        destination[written++] = 0x80 | (codePoint & 0x3f);
+      } else {
+        destination[written++] = 0xf0 | (codePoint >> 18);
+        destination[written++] = 0x80 | ((codePoint >> 12) & 0x3f);
+        destination[written++] = 0x80 | ((codePoint >> 6) & 0x3f);
+        destination[written++] = 0x80 | (codePoint & 0x3f);
+      }
+      read += codeUnits;
+    }
+    return { read, written };
   }
 }
 
 class TextDecoder {
   constructor(label = "utf-8", options = {}) {
-    const l = String(label).toLowerCase();
-    if (l !== "utf-8" && l !== "utf8" && l !== "unicode-1-1-utf-8") {
-      throw new RangeError(`TextDecoder: unsupported encoding '${label}' (utf-8 only for now)`);
-    }
     options = options && typeof options === "object" ? options : {};
-    this.encoding = "utf-8";
-    this.fatal = !!options.fatal;
-    this.ignoreBOM = !!options.ignoreBOM;
+    const fatal = !!options.fatal;
+    const ignoreBOM = !!options.ignoreBOM;
+    const [id, encoding] = __encoding.decoderStart(String(label), fatal, ignoreBOM);
+    TEXT_DECODER_STATE.set(this, { id, encoding, fatal, ignoreBOM });
+    TEXT_DECODER_FINALIZER.register(this, id);
   }
-  decode(input) {
-    if (input === undefined) return "";
-    if (input instanceof ArrayBuffer) input = new Uint8Array(input);
-    let s = __encoding.decode(input, this.fatal);
-    if (!this.ignoreBOM && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
-    return s;
+  get encoding() {
+    const state = TEXT_DECODER_STATE.get(this);
+    if (!state) throw new TypeError("TextDecoder getter called on incompatible receiver");
+    return state.encoding;
+  }
+  get fatal() {
+    const state = TEXT_DECODER_STATE.get(this);
+    if (!state) throw new TypeError("TextDecoder getter called on incompatible receiver");
+    return state.fatal;
+  }
+  get ignoreBOM() {
+    const state = TEXT_DECODER_STATE.get(this);
+    if (!state) throw new TypeError("TextDecoder getter called on incompatible receiver");
+    return state.ignoreBOM;
+  }
+  decode(input = undefined, options = {}) {
+    const state = TEXT_DECODER_STATE.get(this);
+    if (!state) throw new TypeError("TextDecoder.decode called on incompatible receiver");
+    options = options && typeof options === "object" ? options : {};
+    return __encoding.decoderPush(state.id, decoderInput(input), !!options.stream);
   }
 }
+
+Object.defineProperty(TextEncoder.prototype, Symbol.toStringTag, {
+  value: "TextEncoder", configurable: true,
+});
+Object.defineProperty(TextDecoder.prototype, Symbol.toStringTag, {
+  value: "TextDecoder", configurable: true,
+});
 
 const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -67,61 +171,11 @@ function atob(data) {
   return out;
 }
 
-function structuredClone(value) {
-  // No transfer list yet; throws DataCloneError exactly where the spec does.
-  const seen = new Map();
-  const clone = (v) => {
-    if (typeof v === "function" || typeof v === "symbol") {
-      throw new DOMException("value could not be cloned", "DataCloneError");
-    }
-    if (v === null || typeof v !== "object") return v;
-    if (seen.has(v)) return seen.get(v);
-    if (v instanceof Date) return new Date(v.getTime());
-    if (v instanceof RegExp) return new RegExp(v.source, v.flags);
-    if (v instanceof Promise) {
-      throw new DOMException("a Promise cannot be cloned", "DataCloneError");
-    }
-    if (v instanceof ArrayBuffer) {
-      const c = v.slice(0);
-      seen.set(v, c);
-      return c;
-    }
-    if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
-      const c = new v.constructor(v);
-      seen.set(v, c);
-      return c;
-    }
-    if (v instanceof Map) {
-      const m = new Map();
-      seen.set(v, m);
-      for (const [k, val] of v) m.set(clone(k), clone(val));
-      return m;
-    }
-    if (v instanceof Set) {
-      const s = new Set();
-      seen.set(v, s);
-      for (const item of v) s.add(clone(item));
-      return s;
-    }
-    if (v instanceof Error) {
-      const ctor = typeof v.constructor === "function" ? v.constructor : Error;
-      const e = new ctor(v.message);
-      e.name = v.name;
-      seen.set(v, e);
-      return e;
-    }
-    if (Array.isArray(v)) {
-      const a = [];
-      seen.set(v, a);
-      for (let i = 0; i < v.length; i++) if (i in v) a[i] = clone(v[i]);
-      return a;
-    }
-    const o = {};
-    seen.set(v, o);
-    for (const k of Object.keys(v)) o[k] = clone(v[k]);
-    return o;
-  };
-  return clone(value);
+function structuredClone(value, options = undefined) {
+  // HTML StructuredSerializeWithTransfer/StructuredDeserializeWithTransfer. The implementation
+  // lives beside the Worker wire codec in serialize.js so both paths share one serialization
+  // memory, property algorithm, and transfer ordering.
+  return structuredCloneValue(value, options);
 }
 
 globalThis.TextEncoder = TextEncoder;

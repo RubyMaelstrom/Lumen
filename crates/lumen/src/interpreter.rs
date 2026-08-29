@@ -8,9 +8,29 @@ use crate::ast::*;
 use crate::value::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+/// Agent-local byte storage shared by an ECMAScript `ArrayBuffer` and an embedder resource.
+///
+/// The single-threaded interpreter uses `RefCell` rather than a lock. WebAssembly keeps another
+/// `Rc` to the same storage, so JS typed-array accesses and wasm loads/stores identify one Data
+/// Block as required by the WebAssembly JavaScript Interface, without copying at call boundaries.
+pub type ArrayBufferBytes = Rc<RefCell<Vec<u8>>>;
+
+/// An embedder-held weak reference to a JavaScript object. Native resource graphs use this for
+/// callbacks whose strong lifetime is represented by a reachable JavaScript wrapper; retaining a
+/// strong `Value` in both graphs would turn otherwise collectable cross-boundary cycles immortal.
+#[derive(Clone)]
+pub struct WeakValue(std::rc::Weak<RefCell<crate::value::Object>>);
+
+impl WeakValue {
+    pub fn upgrade(&self) -> Option<Value> {
+        self.0.upgrade().map(Value::Obj)
+    }
+}
 
 /// `$262.agent` wiring. The main agent holds a broadcast sender per spawned agent plus the report
 /// receiver; a spawned agent holds its broadcast receiver and a clone of the report sender.
@@ -42,6 +62,58 @@ impl WeakKey {
             _ => None,
         }
     }
+}
+
+/// A weakly held ECMAScript value. `Weak` keeps an object's allocation header alive, so the raw
+/// identity used by the O(1) weak-collection index cannot be recycled while an entry still exists.
+/// ECMA-262 §9.9 requires these edges not to contribute to liveness.
+#[derive(Clone)]
+pub(crate) enum WeakTarget {
+    Object(std::rc::Weak<RefCell<crate::value::Object>>),
+    Symbol(std::rc::Weak<SymbolData>, u64),
+}
+
+impl WeakTarget {
+    pub(crate) fn of(value: &Value) -> Option<Self> {
+        match value {
+            Value::Obj(object) => Some(Self::Object(Rc::downgrade(object))),
+            Value::Sym(symbol) => Some(Self::Symbol(Rc::downgrade(symbol), symbol.id)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn key(&self) -> WeakKey {
+        match self {
+            Self::Object(object) => WeakKey::Object(object.as_ptr() as usize),
+            Self::Symbol(_, id) => WeakKey::Symbol(*id),
+        }
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<Value> {
+        match self {
+            Self::Object(object) => object.upgrade().map(Value::Obj),
+            Self::Symbol(symbol, _) => symbol.upgrade().map(Value::Sym),
+        }
+    }
+
+    fn object_is_in(&self, objects: &crate::fasthash::FastSet<usize>) -> bool {
+        matches!(self, Self::Object(object) if objects.contains(&(object.as_ptr() as usize)))
+    }
+}
+
+/// One FinalizationRegistry Cell record. The held value is the cell's sole strong edge; target and
+/// unregister token use ECMA-262's weak retention semantics.
+pub(crate) struct FinalizationCell {
+    pub(crate) target: Option<WeakTarget>,
+    pub(crate) held_value: Value,
+    pub(crate) unregister_token: Option<WeakTarget>,
+}
+
+/// Internal slots of a FinalizationRegistry instance (ECMA-262 §26.2).
+pub(crate) struct FinalizationState {
+    pub(crate) cleanup_callback: Value,
+    pub(crate) cells: Vec<FinalizationCell>,
+    pub(crate) cleanup_scheduled: bool,
 }
 
 pub fn shared_mem_registry() -> &'static Mutex<HashMap<u64, SharedMem>> {
@@ -256,6 +328,16 @@ pub(crate) enum StrUnits {
     Ascii,
     /// The materialized code units.
     Units(Rc<[u16]>),
+}
+
+fn retained_str_units_bytes(s: &crate::lstr::LStr, units: &StrUnits) -> usize {
+    let materialized = match units {
+        StrUnits::Ascii => 0,
+        StrUnits::Units(units) => units.len().saturating_mul(std::mem::size_of::<u16>()),
+    };
+    s.len()
+        .saturating_add(materialized)
+        .saturating_add(std::mem::size_of::<(usize, crate::lstr::LStr, StrUnits)>())
 }
 
 /// Raw state of the last successful regex match, deferred for the legacy `RegExp.$1` statics.
@@ -552,47 +634,8 @@ impl Binding {
     }
 }
 
-thread_local! {
-    /// Every Scope created on this thread, weakly — the cycle collector's scope snapshot
-    /// (mirrors `value::GC_REGISTRY` for objects).
-    static SCOPE_REGISTRY: RefCell<Vec<std::rc::Weak<RefCell<Scope>>>> =
-        const { RefCell::new(Vec::new()) };
-}
-
 fn register_scope(e: &Env) {
-    SCOPE_REGISTRY.with(|r| r.borrow_mut().push(Rc::downgrade(e)));
-}
-
-/// Registered scope entries (live + not-yet-purged dead weaks) on this thread.
-fn scope_registry_len() -> usize {
-    SCOPE_REGISTRY.with(|r| r.borrow().len())
-}
-
-/// Purge dead weak entries, returning the live count. A dead `Weak` still pins its `RcBox`
-/// allocation, so an interpreter that churns through scopes without allocating many objects
-/// (which is what arms the main GC) must prune on scope volume too — see `gc_check`.
-fn scope_registry_prune() -> usize {
-    SCOPE_REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        reg.retain(|w| w.strong_count() > 0);
-        reg.len()
-    })
-}
-
-/// The live scopes on this thread (purging dead weak entries as it goes).
-fn scope_snapshot() -> Vec<Env> {
-    SCOPE_REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        let mut live = Vec::with_capacity(reg.len());
-        reg.retain(|w| match w.upgrade() {
-            Some(e) => {
-                live.push(e);
-                true
-            }
-            None => false,
-        });
-        live
-    })
+    crate::value::gc_register_scope(e);
 }
 
 pub fn new_scope(parent: Option<Env>) -> Env {
@@ -709,45 +752,6 @@ pub(crate) fn update_abrupt_empty(a: Abrupt, v: Value) -> Abrupt {
         Abrupt::Continue(l, Value::Empty) => Abrupt::Continue(l, v),
         other => other,
     }
-}
-
-thread_local! {
-    /// The GlobalSymbolRegistry (`Symbol.for`): shared by every realm (incl. ShadowRealms).
-    static SYM_FOR: std::cell::RefCell<HashMap<String, Rc<crate::value::SymbolData>>> =
-        RefCell::new(Default::default());
-}
-
-/// Reset the `Symbol.for` registry (a fresh Engine starts a fresh agent, but ShadowRealms and
-/// synthesized realms inside one engine keep sharing it).
-pub(crate) fn sym_for_reset() {
-    SYM_FOR.with(|m| m.borrow_mut().clear());
-}
-
-/// Look up a `Symbol.for` registry entry.
-pub(crate) fn sym_for_get(key: &str) -> Option<Rc<crate::value::SymbolData>> {
-    SYM_FOR.with(|m| m.borrow().get(key).cloned())
-}
-
-/// Register a `Symbol.for` symbol.
-pub(crate) fn sym_for_insert(key: String, sym: Rc<crate::value::SymbolData>) {
-    SYM_FOR.with(|m| {
-        m.borrow_mut().insert(key, sym);
-    });
-}
-
-/// Whether `sym` is a registered `Symbol.for` symbol (Symbol.keyFor's check).
-pub(crate) fn sym_for_contains(sym: &Rc<crate::value::SymbolData>) -> bool {
-    SYM_FOR.with(|m| m.borrow().values().any(|r| Rc::ptr_eq(r, sym)))
-}
-
-/// The registry key of a registered symbol, if any.
-pub(crate) fn sym_for_key_of(sym: &Rc<crate::value::SymbolData>) -> Option<String> {
-    SYM_FOR.with(|m| {
-        m.borrow()
-            .iter()
-            .find(|(_, r)| Rc::ptr_eq(r, sym))
-            .map(|(k, _)| k.clone())
-    })
 }
 
 /// Extract the thrown value from an abrupt completion (non-throw completions surface as undefined).
@@ -924,6 +928,7 @@ fn stub_slot(shape: u32, name: &str) -> usize {
 #[allow(dead_code)] // consumed incrementally as the asm thunk lands
 pub(crate) struct InterpLayout {
     pub depth: usize,
+    pub max_eval_depth: usize,
     pub gc_tick: usize,
     pub gc_next: usize,
     pub interrupt_poll_tick: usize,
@@ -999,6 +1004,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
     };
     InterpLayout {
         depth: off(&i.depth as *const _ as usize),
+        max_eval_depth: off(&i.max_eval_depth as *const _ as usize),
         gc_tick: off(&i.gc_tick as *const _ as usize),
         gc_next: off(&i.gc_next as *const _ as usize),
         interrupt_poll_tick: off(&i.interrupt_poll_tick as *const _ as usize),
@@ -1034,21 +1040,24 @@ struct ConstructIc {
 }
 
 pub struct Interp {
+    /// Collector ownership follows the ECMAScript Agent, not the native thread currently running
+    /// one of its suspended execution contexts. All realms in this interpreter share this heap.
+    pub(crate) gc_heap: crate::value::GcHeap,
+    /// ECMA-262 Agent Record symbol state, shared by all realms including ShadowRealms.
+    pub(crate) symbol_agent: crate::value::SymbolAgent,
     pub(crate) global: Gc,
     pub(crate) global_env: Env,
     pub(crate) object_proto: Gc,
     pub(crate) function_proto: Gc,
     pub(crate) array_proto: Gc,
+    /// This realm's intrinsic `%Array%` constructor. Kept separately from mutable public
+    /// properties so cross-realm fast paths can prove the constructor's actual realm identity.
+    pub(crate) array_ctor: Option<Gc>,
     pub(crate) string_proto: Gc,
     pub(crate) number_proto: Gc,
     pub(crate) boolean_proto: Gc,
     pub(crate) symbol_proto: Gc,
     pub(crate) error_protos: crate::fasthash::FastMap<&'static str, Gc>,
-    /// Monotonic id source + registry for live symbols (so a symbol used as a property key can be
-    /// recovered for `Object.getOwnPropertySymbols`). `sym_for` backs the `Symbol.for` registry.
-    pub(crate) sym_counter: u64,
-    pub(crate) sym_registry: crate::fasthash::FastMap<u64, Rc<SymbolData>>,
-
     pub(crate) console: Vec<String>,
     /// Realm-local implementation of HTML `HostSystemUTCEpochNanoseconds(global)`, expressed in
     /// milliseconds for ECMAScript `Date`. Each Window/Worker realm owns its own time origin and
@@ -1087,11 +1096,11 @@ pub struct Interp {
     /// cached state compares the encoded raw prototype address.
     pub(crate) creation_pins:
         crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>,
-    /// Strong pins for every global scope a call cache has ever recorded (see
+    /// Weak allocation pins for every global scope a call cache has recorded (see
     /// [`crate::bytecode::CallIc::global_env`]): the cached same-realm proof compares the scope
-    /// address raw, so those addresses must never be recycled. Bounded by the number of realms
-    /// (which the engine keeps alive anyway).
-    pub(crate) global_env_pins: Vec<Env>,
+    /// address raw, so its allocation header must not be recycled while the cache survives. A
+    /// strong `Env` here would make every realm touched by JIT code immortal.
+    pub(crate) global_env_pins: Vec<std::rc::Weak<RefCell<Scope>>>,
     /// The coroutine body currently executing through this interpreter (0 = the main driver);
     /// stamps `FnFrame::coro` so a dead worker's frames can be evicted precisely.
     pub(crate) cur_coro: u32,
@@ -1108,15 +1117,15 @@ pub struct Interp {
     /// side-table exotics are guarded per receiver by `Object::ic_plain`.
     pub(crate) inline_ic_safe: std::cell::Cell<bool>,
     /// Recently indexed strings' UTF-16 views, keyed by string identity (the held `Rc` pins the
-    /// pointer) — see [`StrUnits`]. Small LRU: the hot case is one big source string being
-    /// scanned a unit at a time.
-    pub(crate) str_units: Vec<(crate::lstr::LStr, StrUnits)>,
+    /// pointer) — see [`StrUnits`]. Bounded by retained bytes as well as entry count, so one large
+    /// source cannot escape the cache budget.
+    pub(crate) str_units: crate::cache::ByteLru<usize, (crate::lstr::LStr, StrUnits)>,
     /// Prepared regex subjects keyed by string identity and Unicode mode. The retained `LStr`
     /// pins each pointer, making the integer key ABA-safe. This cache is deliberately larger
     /// than the tiny UTF-16 indexing LRU: web workloads commonly prepare thousands of immutable
     /// strings once and run several regexp passes over the same working set.
     pub(crate) re_texts:
-        crate::fasthash::FastMap<(usize, bool), (crate::lstr::LStr, Rc<crate::regex::ReText>)>,
+        crate::cache::ByteLru<(usize, bool), (crate::lstr::LStr, Rc<crate::regex::ReText>)>,
     /// Shape-validated entry slots for the ten RegExp prototype dependencies checked by
     /// dead-result specializations. Values/accessors remain live-checked on every operation.
     pub(crate) regexp_dependency_cache: std::cell::Cell<RegexpDependencyCache>,
@@ -1124,9 +1133,13 @@ pub struct Interp {
     /// the 14 strings materialize into the constructor's hidden props only when an accessor
     /// actually reads them (see `builtins::flush_regexp_legacy`), not on every match.
     pub(crate) regexp_last: Option<RegexpLastMatch>,
-    /// Live interpreter recursion depth (expression eval + calls). Bounded by [`MAX_EVAL_DEPTH`]
-    /// so runaway recursion throws a RangeError instead of overflowing the native stack.
+    /// Live interpreter recursion depth (expression eval + calls). Bounded by
+    /// [`max_eval_depth`](Self::max_eval_depth) so runaway recursion throws a RangeError instead
+    /// of overflowing the native stack.
     pub(crate) depth: u32,
+    /// Realm-local recursion budget. The conservative default fits small host threads; embedders
+    /// which provision a larger native stack may explicitly raise it through `Engine`.
+    pub(crate) max_eval_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
@@ -1201,6 +1214,9 @@ pub struct Interp {
     /// Backing store for Map/Set/WeakMap/WeakSet instances (ordered entries), keyed by the object's
     /// pointer — the engine analogue of an internal `[[MapData]]` slot.
     pub(crate) map_data: crate::fasthash::FastMap<usize, Vec<(Value, Value)>>,
+    /// WeakMap/WeakSet cells. Keys are real weak handles; only WeakMap values are strong, and then
+    /// only ephemerally while both the collection and key are live.
+    pub(crate) weak_collection_data: crate::fasthash::FastMap<usize, Vec<(WeakTarget, Value)>>,
     /// Object/symbol identity to entry offset for WeakMap/WeakSet. Their order is unobservable, and
     /// ECMA-262 requires average access time sublinear in the collection size; the parallel index
     /// makes get/set/has/delete average O(1) while `map_data` retains the internal-slot payload.
@@ -1209,8 +1225,14 @@ pub struct Interp {
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
-    /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer.
-    pub(crate) array_buffers: crate::fasthash::FastMap<usize, Vec<u8>>,
+    /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer. The indirection lets an
+    /// embedder identify the same Data Block with an external resource such as wasm linear memory.
+    pub(crate) array_buffers: crate::fasthash::FastMap<usize, ArrayBufferBytes>,
+    /// Monotonic mutation generations for ArrayBuffer byte storage. Host embedders use these
+    /// generations to avoid copying an unchanged external mirror across a synchronous boundary.
+    pub(crate) array_buffer_versions: crate::fasthash::FastMap<usize, u64>,
+    /// Coalesced byte ranges written by JavaScript since the last embedder synchronization.
+    pub(crate) array_buffer_dirty_ranges: crate::fasthash::FastMap<usize, Vec<Range<usize>>>,
     /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
     /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
     pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
@@ -1261,17 +1283,18 @@ pub struct Interp {
     /// `lastIndex`) each time it is evaluated, but recompiling its parser/bytecode and first-set
     /// table is pure duplicate work. The outer map is bounded in `compiled_regexp` so code that
     /// constructs unbounded dynamic patterns cannot retain them forever.
-    pub(crate) regexp_programs:
-        crate::fasthash::FastMap<String, crate::fasthash::FastMap<String, Rc<crate::regex::Regex>>>,
+    pub(crate) regexp_programs: crate::cache::RegexpProgramCache,
     /// Proxy `(target, handler)` pairs, keyed by the proxy object's pointer.
     pub(crate) proxies: crate::fasthash::FastMap<usize, (Value, Value)>,
     /// The active `new.target` for the function currently executing (Undefined outside a `new`).
     pub(crate) new_target: Value,
     /// The `new.target` to install for the next constructor invocation (set by `construct`).
     pub(crate) pending_new_target: Value,
-    /// The `$262.IsHTMLDDA` objects, one per realm (emulate `document.all`): typeof "undefined",
-    /// falsy, and loosely equal to undefined/null, despite being callable Objects.
-    pub(crate) htmldda: Vec<Gc>,
+    /// The `$262.IsHTMLDDA` objects (emulate `document.all`), indexed weakly by identity: typeof
+    /// "undefined", falsy, and loosely equal to undefined/null, despite being callable Objects.
+    /// The realm/global property is the real owner; this language-level brand must not retain it.
+    pub(crate) htmldda:
+        crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>,
     /// The caller's realm during a cross-realm [[Construct]]: the spec pops the callee context
     /// before throwing a derived constructor's return/`this` validation errors, so those errors
     /// belong to the caller's realm.
@@ -1294,6 +1317,9 @@ pub struct Interp {
     pub(crate) temporal_cal: crate::fasthash::FastMap<usize, std::rc::Rc<str>>,
     /// The microtask queue (drained after the main script by [`crate::Engine::eval`]).
     pub(crate) microtasks: std::collections::VecDeque<Job>,
+    /// The Agent Record's [[KeptAlive]] list (ECMA-262 §9.10–9.11). WeakRef construction and
+    /// successful dereference append here; the host clears it between synchronous jobs.
+    pub(crate) kept_alive: Vec<Value>,
     /// Embedder host state (typed slots + resource table); see [`crate::host`]. Reached from
     /// native fns via [`Interp::op_state`] — the only way, since `NativeFn` cannot capture.
     pub(crate) host_state: crate::host::OpState,
@@ -1372,8 +1398,12 @@ pub struct Interp {
     pub(crate) mapped_arguments: crate::fasthash::FastMap<usize, (Env, Vec<Option<String>>)>,
     /// Source-phase imports: canonical module key → its (cached) ModuleSource object.
     pub(crate) module_source_objs: crate::fasthash::FastMap<String, Value>,
-    /// FinalizationRegistry registrations (ptr → unregister tokens), for `unregister`'s result.
-    pub(crate) fr_tokens: crate::fasthash::FastMap<usize, Vec<Value>>,
+    /// WeakRef [[WeakRefTarget]] slots, keyed by the WeakRef instance.
+    pub(crate) weak_refs: crate::fasthash::FastMap<usize, Option<WeakTarget>>,
+    /// FinalizationRegistry internal slots, keyed by the registry instance.
+    pub(crate) finalization_registries: crate::fasthash::FastMap<usize, FinalizationState>,
+    /// HostEnqueueFinalizationRegistryCleanupJob captures registries strongly until a later job.
+    pub(crate) pending_finalization_cleanup: std::collections::VecDeque<Value>,
     /// Async generators mid-step (running or parked at an `await`): further next/return/throw
     /// requests queue here (the spec's AsyncGeneratorRequest queue) until the step completes.
     pub(crate) async_gen_busy: std::collections::HashSet<usize>,
@@ -1390,6 +1420,10 @@ impl Drop for Interp {
         for coroutine in coroutines.values_mut() {
             coroutine.terminate(self);
         }
+        // Do not let a driver thread retain this Agent's weak object/scope registries after its
+        // interpreter dies. Objects already carry their own owner through the ensuing field drops.
+        crate::value::deactivate_gc_heap_if(&self.gc_heap);
+        crate::value::deactivate_symbol_agent_if(&self.symbol_agent);
     }
 }
 
@@ -1397,7 +1431,11 @@ impl Drop for Interp {
 pub struct Disposable {
     pub value: Value,
     pub method: Value,
-    /// The method came from `@@asyncDispose` — its result is awaited during disposal.
+    /// The declaration/resource kind is async-dispose. This remains true for the synthesized
+    /// async wrapper around a synchronous `@@dispose` method and for null/undefined markers.
+    pub kind_is_async: bool,
+    /// The captured method itself came from `@@asyncDispose`. When false but `kind_is_async` is
+    /// true, DisposeResources must translate the sync call into a promise and await that wrapper.
     pub method_is_async: bool,
 }
 
@@ -1438,21 +1476,22 @@ pub struct ClassInfo {
 /// One instance field: its key, optional initializer expression, and any decorator-supplied
 /// initializer functions (each maps the current value to a new one during construction).
 pub struct FieldInit {
-    pub key: String,
+    pub key: crate::value::PropertyKey,
     pub init: Option<Expr>,
     pub transforms: Vec<Value>,
 }
 
-/// Recursion ceiling for the interpreter. Paired with the bounded native stack reserved by the
-/// coroutine runner; beyond this we raise "Maximum call stack size exceeded" (a RangeError).
-#[cfg(not(target_arch = "wasm32"))]
-pub const MAX_EVAL_DEPTH: u32 = 1500;
-/// On wasm32 the ceiling is the engine's *host* call stack (V8's, not raisable from content):
-/// measured in Chrome, the simplest interpreted frame overflows it near depth ~220, and heavier
-/// frames die sooner — 128 keeps the guard firing as a clean RangeError before the host stack
-/// does.
-#[cfg(target_arch = "wasm32")]
-pub const MAX_EVAL_DEPTH: u32 = 128;
+/// Default recursion ceiling for interpreter and bytecode calls. ECMA-262 §9.4 models each call by
+/// pushing an execution context but does not prescribe a finite implementation's native-stack
+/// capacity. Keep this below the smallest supported host thread stack (Rust test and Web Worker
+/// threads commonly reserve 2 MiB) so resource exhaustion becomes a catchable RangeError instead
+/// of aborting the Agent. This also fits wasm32's smaller host call stack; heap-owned coroutine
+/// continuations do not provide a larger native stack.
+pub const DEFAULT_MAX_EVAL_DEPTH: u32 = 128;
+
+/// Hard ceiling for an embedder override. Raising the budget is safe only when every thread which
+/// may enter the realm has a correspondingly provisioned native stack.
+pub const MAX_CONFIGURED_EVAL_DEPTH: u32 = 1_024;
 
 /// Live-object ceiling (≈ a few hundred MB). When a safe point sees this many *live* objects, the
 /// cycle collector runs; if it can't get back under, a RangeError is thrown rather than exhausting
@@ -1497,6 +1536,7 @@ pub struct RealmState {
     pub object_proto: Gc,
     pub function_proto: Gc,
     pub array_proto: Gc,
+    pub array_ctor: Option<Gc>,
     pub string_proto: Gc,
     pub number_proto: Gc,
     pub boolean_proto: Gc,
@@ -1515,6 +1555,7 @@ impl Interp {
             object_proto: self.object_proto.clone(),
             function_proto: self.function_proto.clone(),
             array_proto: self.array_proto.clone(),
+            array_ctor: self.array_ctor.clone(),
             string_proto: self.string_proto.clone(),
             number_proto: self.number_proto.clone(),
             boolean_proto: self.boolean_proto.clone(),
@@ -1532,6 +1573,7 @@ impl Interp {
         self.object_proto = r.object_proto.clone();
         self.function_proto = r.function_proto.clone();
         self.array_proto = r.array_proto.clone();
+        self.array_ctor = r.array_ctor.clone();
         self.string_proto = r.string_proto.clone();
         self.number_proto = r.number_proto.clone();
         self.boolean_proto = r.boolean_proto.clone();
@@ -1545,8 +1587,8 @@ impl Interp {
     /// well-known symbols are shared with the creating realm so `@@iterator` etc. match cross-realm.
     /// Whether a SECOND realm exists (`$262.createRealm`). `Interp::new` always registers the
     /// main realm, so `realms.is_empty()` never distinguishes anything — cross-realm dispatch
-    /// only becomes possible once another realm joins, and realms are never removed. Every
-    /// single-realm fast-path gate keys on this.
+    /// only becomes possible once another live realm joins. The collector removes an unreachable
+    /// realm as one intrinsic group, so single-realm fast paths recover after temporary realms die.
     #[inline]
     pub(crate) fn multi_realm(&self) -> bool {
         self.realms.len() > 1
@@ -1557,6 +1599,7 @@ impl Interp {
         // and resolve its intrinsics like any other realm's.
         if self.realms.is_empty() {
             let main = self.snapshot_realm();
+            self.gc_pin(&main.global);
             self.realms.insert(Rc::as_ptr(&main.global) as usize, main);
         }
         let saved = self.snapshot_realm();
@@ -1588,6 +1631,7 @@ impl Interp {
         self.object_proto = object_proto;
         self.function_proto = function_proto;
         self.array_proto = array_proto;
+        self.array_ctor = None;
         self.string_proto = string_proto;
         self.number_proto = number_proto;
         self.boolean_proto = boolean_proto;
@@ -1633,6 +1677,7 @@ impl Interp {
 
         let realm_state = self.snapshot_realm();
         let ptr = Rc::as_ptr(&global) as usize;
+        self.gc_pin(&global);
         self.realms.insert(ptr, realm_state);
         self.restore_realm(&saved);
         Value::Obj(global)
@@ -1666,6 +1711,7 @@ impl RealmState {
             object_proto: self.object_proto.clone(),
             function_proto: self.function_proto.clone(),
             array_proto: self.array_proto.clone(),
+            array_ctor: self.array_ctor.clone(),
             string_proto: self.string_proto.clone(),
             number_proto: self.number_proto.clone(),
             boolean_proto: self.boolean_proto.clone(),
@@ -1699,6 +1745,16 @@ const WELL_KNOWN_SYMBOLS: &[&str] = &[
 
 impl Interp {
     pub(crate) fn new() -> Interp {
+        Self::new_with_symbol_agent(crate::value::new_symbol_agent())
+    }
+
+    /// Construct another realm implementation within the same ECMAScript Agent. ShadowRealm has
+    /// an isolated global/object heap, but ECMA-262 §20.4 requires its global and well-known
+    /// Symbols to retain Agent-wide identity.
+    pub(crate) fn new_with_symbol_agent(symbol_agent: crate::value::SymbolAgent) -> Interp {
+        let gc_heap = crate::value::new_gc_heap();
+        crate::value::activate_gc_heap(&gc_heap);
+        crate::value::activate_symbol_agent(&symbol_agent);
         let object_proto = Object::new(None);
         let function_proto = Object::new(Some(object_proto.clone()));
         let array_proto = Object::new(Some(object_proto.clone()));
@@ -1714,24 +1770,26 @@ impl Interp {
         let global = Object::new(Some(object_proto.clone()));
         let global_env = new_var_scope(None);
         let mut interp = Interp {
+            gc_heap: gc_heap.clone(),
+            symbol_agent,
             global,
             global_env,
             object_proto,
             function_proto,
             array_proto,
+            array_ctor: None,
             string_proto,
             number_proto,
             boolean_proto,
             symbol_proto,
             error_protos: Default::default(),
-            sym_counter: 0,
-            sym_registry: Default::default(),
             console: Vec::new(),
             wall_clock: None,
             runtime_interrupt: Default::default(),
             interrupt_poll_tick: 0,
             strict: false,
             depth: 0,
+            max_eval_depth: DEFAULT_MAX_EVAL_DEPTH,
             class_info: Default::default(),
             eval_fn: None,
             eval_realm_fns: Default::default(),
@@ -1769,14 +1827,17 @@ impl Interp {
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
             inline_ic_safe: std::cell::Cell::new(true),
-            str_units: Vec::new(),
-            re_texts: Default::default(),
+            str_units: crate::cache::ByteLru::new(16 << 20, 64),
+            re_texts: crate::cache::ByteLru::new(32 << 20, 8_192),
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
             map_data: Default::default(),
+            weak_collection_data: Default::default(),
             weak_collection_index: Default::default(),
             extra_protos: Default::default(),
             array_buffers: Default::default(),
+            array_buffer_versions: Default::default(),
+            array_buffer_dirty_ranges: Default::default(),
             shared_buffers: Default::default(),
             immutable_buffers: std::collections::HashSet::new(),
             host_keyed_buffers: std::collections::HashSet::new(),
@@ -1792,11 +1853,11 @@ impl Interp {
             shadow_realms: Default::default(),
             data_views: Default::default(),
             regexps: Default::default(),
-            regexp_programs: Default::default(),
+            regexp_programs: crate::cache::RegexpProgramCache::new(16 << 20, 512),
             proxies: Default::default(),
             new_target: Value::Undefined,
             pending_new_target: Value::Undefined,
-            htmldda: Vec::new(),
+            htmldda: Default::default(),
             ctor_caller_realm: None,
             realms: Default::default(),
             promises: Default::default(),
@@ -1804,11 +1865,12 @@ impl Interp {
             temporal: Default::default(),
             temporal_cal: Default::default(),
             microtasks: std::collections::VecDeque::new(),
+            kept_alive: Vec::new(),
             host_state: Default::default(),
             generators: Default::default(),
             gc_next: GC_TRIGGER,
             gc_tick: 0,
-            gc_task_allocated: crate::value::allocated_objects(),
+            gc_task_allocated: crate::value::heap_allocated_objects(&gc_heap),
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
             super_call_ok: false,
@@ -1830,7 +1892,9 @@ impl Interp {
             promise_forward: Default::default(),
             mapped_arguments: Default::default(),
             module_source_objs: Default::default(),
-            fr_tokens: Default::default(),
+            weak_refs: Default::default(),
+            finalization_registries: Default::default(),
+            pending_finalization_cleanup: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
         };
@@ -1851,10 +1915,21 @@ impl Interp {
         // Register the main realm so a call back into main-realm code from inside another realm
         // swaps the main intrinsics back in (see `callee_realm_global`).
         let main = interp.snapshot_realm();
+        let main_global = interp.global.clone();
+        interp.gc_pin(&main_global);
         interp
             .realms
             .insert(Rc::as_ptr(&interp.global) as usize, main);
         interp
+    }
+
+    /// Make this interpreter's Agent the surrounding Agent on the current native thread. This is
+    /// required at every execution entry because generator and async bodies may resume on a pooled
+    /// worker, while embedders may alternate independent engines on one driver thread.
+    #[inline]
+    pub(crate) fn activate_gc_heap(&self) {
+        crate::value::activate_gc_heap(&self.gc_heap);
+        crate::value::activate_symbol_agent(&self.symbol_agent);
     }
 
     // ----- error helpers ----------------------------------------------------------------------
@@ -1933,7 +2008,7 @@ impl Interp {
             return Value::Undefined;
         }
         match self.array_buffers.get(&info.buffer) {
-            Some(buf) => decode(buf),
+            Some(buf) => decode(&buf.borrow()),
             _ => Value::Undefined,
         }
     }
@@ -1959,7 +2034,9 @@ impl Interp {
         if let Some(&id) = self.shared_buffers.get(&info.buffer) {
             return shared_mem_get(id).and_then(|mem| take(&mem.lock().unwrap()));
         }
-        self.array_buffers.get(&info.buffer).and_then(|b| take(b))
+        self.array_buffers
+            .get(&info.buffer)
+            .and_then(|b| take(&b.borrow()))
     }
 
     /// Write raw bytes at element `elem_start` (bounds-checked; silently drops what doesn't fit).
@@ -1973,11 +2050,20 @@ impl Interp {
         if let Some(&id) = self.shared_buffers.get(&info.buffer) {
             if let Some(mem) = shared_mem_get(id) {
                 put(&mut mem.lock().unwrap());
+                self.mark_array_buffer_dirty(info.buffer);
             }
             return;
         }
-        if let Some(b) = self.array_buffers.get_mut(&info.buffer) {
-            put(b);
+        if let Some(storage) = self.array_buffers.get(&info.buffer).cloned() {
+            let mut b = storage.borrow_mut();
+            if start
+                .checked_add(bytes.len())
+                .is_some_and(|end| end <= b.len())
+            {
+                put(&mut b);
+                drop(b);
+                self.mark_array_buffer_dirty_range(info.buffer, start, bytes.len());
+            }
         }
     }
 
@@ -1997,6 +2083,7 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
+        self.mark_array_buffer_dirty_range(info.buffer, start, es);
         let apply = |buf: &mut [u8]| -> Option<i128> {
             if start + es > buf.len() {
                 return None;
@@ -2024,8 +2111,8 @@ impl Interp {
             }
             return None;
         }
-        match self.array_buffers.get_mut(&info.buffer) {
-            Some(buf) => apply(buf),
+        match self.array_buffers.get(&info.buffer) {
+            Some(buf) => apply(&mut buf.borrow_mut()),
             None => None,
         }
     }
@@ -2075,10 +2162,16 @@ impl Interp {
             }
             return;
         }
-        if let Some(buf) = self.array_buffers.get_mut(&info.buffer) {
+        let mut wrote = false;
+        if let Some(storage) = self.array_buffers.get(&info.buffer) {
+            let mut buf = storage.borrow_mut();
             if start + es <= buf.len() {
                 buf[start..start + es].copy_from_slice(&bytes);
+                wrote = true;
             }
+        }
+        if wrote {
+            self.mark_array_buffer_dirty_range(info.buffer, start, es);
         }
     }
 
@@ -2099,24 +2192,105 @@ impl Interp {
             }
             return;
         }
-        if let Some(buf) = self.array_buffers.get_mut(&info.buffer) {
+        let mut wrote = false;
+        if let Some(storage) = self.array_buffers.get(&info.buffer) {
+            let mut buf = storage.borrow_mut();
             if start + es <= buf.len() {
                 buf[start..start + es].copy_from_slice(&bytes);
+                wrote = true;
             }
+        }
+        if wrote {
+            self.mark_array_buffer_dirty_range(info.buffer, start, es);
         }
     }
 
     // ----- symbols ----------------------------------------------------------------------------
 
-    /// Mint a fresh symbol and register it (so it can be recovered from a property key later).
+    /// Mint a fresh Symbol in the surrounding Agent. The identity lookup is weak: an ordinary
+    /// Symbol is retained by actual Values and Symbol-valued property keys, never by this index.
     pub fn new_symbol(&mut self, description: Option<Rc<str>>) -> Value {
-        self.sym_counter += 1;
+        let mut agent = self.symbol_agent.borrow_mut();
+        agent.next_id = agent
+            .next_id
+            .checked_add(1)
+            .expect("ECMAScript Agent exhausted its Symbol identity space");
         let data = Rc::new(SymbolData {
-            id: self.sym_counter,
+            id: agent.next_id,
             description,
         });
-        self.sym_registry.insert(data.id, data.clone());
+        agent.symbols.insert(data.id, Rc::downgrade(&data));
+        // Symbol-only churn does not advance the object collector's allocation trigger. Prune
+        // expired identity entries geometrically so a script that repeatedly calls Symbol()
+        // remains bounded without making an all-live workload quadratic.
+        if agent.symbols.len() >= 4096 && agent.symbols.len().is_power_of_two() {
+            agent.symbols.retain(|_, symbol| symbol.strong_count() != 0);
+        }
         Value::Sym(data)
+    }
+
+    /// ECMA-262 §20.4.2.2 Symbol.for, backed by the surrounding Agent Record.
+    pub(crate) fn symbol_for(&mut self, key: String) -> Rc<SymbolData> {
+        if let Some(symbol) = self
+            .symbol_agent
+            .borrow()
+            .global_by_key
+            .get(key.as_str())
+            .cloned()
+        {
+            return symbol;
+        }
+        let key: Rc<str> = Rc::from(key);
+        let Value::Sym(symbol) = self.new_symbol(Some(key.clone())) else {
+            unreachable!("new_symbol must return a symbol")
+        };
+        let mut agent = self.symbol_agent.borrow_mut();
+        agent.global_key_by_id.insert(symbol.id, key.clone());
+        agent.global_by_key.insert(key, symbol.clone());
+        symbol
+    }
+
+    /// ECMA-262 §20.4.5.2 KeyForSymbol. The reverse Agent index makes the normative registry
+    /// identity lookup O(1), with a pointer check guarding values from an unrelated Agent.
+    pub(crate) fn symbol_key_for(&self, symbol: &Rc<SymbolData>) -> Option<String> {
+        let agent = self.symbol_agent.borrow();
+        let key = agent.global_key_by_id.get(&symbol.id)?;
+        agent
+            .global_by_key
+            .get(key)
+            .is_some_and(|registered| Rc::ptr_eq(registered, symbol))
+            .then(|| key.to_string())
+    }
+
+    pub(crate) fn symbol_is_registered(&self, symbol: &Rc<SymbolData>) -> bool {
+        self.symbol_key_for(symbol).is_some()
+    }
+
+    /// Return one Agent-wide well-known Symbol and populate this realm implementation's compact
+    /// name/key cache. ECMA-262 §6.1.5.1 requires these identities to be shared by all realms.
+    pub(crate) fn well_known_symbol(&mut self, name: &'static str) -> Value {
+        let existing = self.symbol_agent.borrow().well_known.get(name).cloned();
+        let symbol = match existing {
+            Some(symbol) => symbol,
+            None => {
+                let Value::Sym(symbol) =
+                    self.new_symbol(Some(Rc::from(format!("Symbol.{name}").as_str())))
+                else {
+                    unreachable!("new_symbol must return a symbol")
+                };
+                self.symbol_agent
+                    .borrow_mut()
+                    .well_known
+                    .insert(name, symbol.clone());
+                symbol
+            }
+        };
+        if !self.wk_syms.iter().any(|(cached, _, _)| *cached == name) {
+            let value = Value::Sym(symbol.clone());
+            let key: Rc<str> = Rc::from(Self::sym_key(&symbol));
+            self.wk_syms.push((name, value, key));
+        }
+        Value::Sym(symbol)
     }
 
     /// The internal property-map key a symbol maps to. A leading NUL never appears in a real
@@ -2142,7 +2316,12 @@ impl Interp {
     /// Recover the symbol `Value` behind an internal symbol key (for `getOwnPropertySymbols`).
     pub(crate) fn sym_from_key(&self, key: &str) -> Option<Value> {
         let id: u64 = key.strip_prefix('\u{0}')?.parse().ok()?;
-        self.sym_registry.get(&id).map(|d| Value::Sym(d.clone()))
+        self.symbol_agent
+            .borrow()
+            .symbols
+            .get(&id)?
+            .upgrade()
+            .map(Value::Sym)
     }
 
     // ----- object construction ----------------------------------------------------------------
@@ -2189,6 +2368,12 @@ impl Interp {
         v.as_obj().map(|o| Rc::as_ptr(o) as usize)
     }
 
+    /// Downgrade an object Value for a native graph whose owner is already represented in the JS
+    /// heap. The weak handle preserves identity without independently keeping the object alive.
+    pub fn downgrade_object_value(&self, v: &Value) -> Option<WeakValue> {
+        v.as_obj().map(|object| WeakValue(Rc::downgrade(object)))
+    }
+
     /// Whether `v` has Proxy exotic behavior. Hosts need this for Node's
     /// `util.types.isProxy()`; exposing the predicate avoids leaking proxy targets or handlers.
     pub fn is_proxy_value(&self, v: &Value) -> bool {
@@ -2198,11 +2383,12 @@ impl Interp {
 
     /// Run lumen's cycle collector and return the number of reclaimed heap objects.
     pub fn collect_garbage_for_host(&mut self) -> i64 {
-        let before = crate::value::live_objects();
+        self.activate_gc_heap();
+        let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect();
-        let live = crate::value::live_objects();
+        let live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
-        self.gc_task_allocated = crate::value::allocated_objects();
+        self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         before.saturating_sub(live)
     }
 
@@ -2220,7 +2406,7 @@ impl Interp {
 
     /// Current number of heap objects tracked by the engine.
     pub fn live_object_count(&self) -> i64 {
-        crate::value::live_objects()
+        crate::value::heap_live_objects(&self.gc_heap)
     }
 
     /// Current UTC epoch time for this realm, with the legacy process callback and system clock
@@ -2360,8 +2546,10 @@ impl Interp {
             crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
         };
         let byte_len = len * elem;
-        let buf = self.array_buffers.get_mut(&info.buffer)?;
-        let ptr = unsafe { buf.as_mut_ptr().add(info.offset) };
+        // N-API receives a live mutable pointer and may write through it after this call returns.
+        self.mark_array_buffer_dirty(info.buffer);
+        let storage = self.array_buffers.get(&info.buffer)?;
+        let ptr = unsafe { storage.borrow_mut().as_mut_ptr().add(info.offset) };
         Some((code, byte_len, ptr))
     }
 
@@ -2521,7 +2709,8 @@ impl Interp {
     /// exceptions with dedicated interpreter and JIT handling.
     pub fn make_html_dda(&mut self) -> Value {
         let dda = self.make_native("IsHTMLDDA", 0, |_i, _this, _args| Ok(Value::Null));
-        self.htmldda.push(dda.clone());
+        self.htmldda
+            .insert(Rc::as_ptr(&dda) as usize, Rc::downgrade(&dda));
         // Every JIT object fast path assumes an ordinary object is truthy and not loosely equal to
         // null. Force this exotic through the checked helpers that implement Annex B.3.6.
         dda.borrow().ic_plain.set(false);
@@ -2628,7 +2817,7 @@ impl Interp {
             }
             let bytes = match shared {
                 Some(id) => shared_mem_get(id)?.lock().unwrap().clone(),
-                None => self.array_buffers.get(&buffer)?.clone(),
+                None => self.array_buffers.get(&buffer)?.borrow().clone(),
             };
             let len = if length_tracking {
                 bytes.len().checked_sub(offset)?
@@ -2645,7 +2834,9 @@ impl Interp {
             }
             return shared_mem_get(id).map(|bytes| bytes.lock().unwrap().clone());
         }
-        self.array_buffers.get(&ptr).cloned()
+        self.array_buffers
+            .get(&ptr)
+            .map(|buffer| buffer.borrow().clone())
     }
 
     /// A fresh fixed-length `ArrayBuffer` initialized with `bytes`, constructed through the
@@ -2672,11 +2863,30 @@ impl Interp {
     /// transfer/detach it, while [`Self::detach_array_buffer`] retains the key-aware host path.
     /// This models the `"WebAssembly.Memory"` key required for `Memory.buffer`.
     pub fn make_host_keyed_array_buffer(&mut self, bytes: &[u8]) -> Result<Value, Value> {
-        let buffer = self.make_array_buffer(bytes)?;
+        self.make_host_keyed_array_buffer_from_storage(Rc::new(RefCell::new(bytes.to_vec())))
+    }
+
+    /// Create a fixed-length host-keyed `ArrayBuffer` identified with an existing Data Block.
+    /// The WebAssembly JS API §4.1 requires writes through either side to update the other side;
+    /// retaining the `Rc` here implements that identity without a mirror or synchronization pass.
+    pub fn make_host_keyed_array_buffer_from_storage(
+        &mut self,
+        storage: ArrayBufferBytes,
+    ) -> Result<Value, Value> {
+        let len = storage.borrow().len();
+        let global = Value::Obj(self.global.clone());
+        let ctor = self
+            .get_member(&global, "ArrayBuffer")
+            .map_err(abrupt_value)?;
+        let buffer = self
+            .construct(ctor, &[Value::Num(len as f64)])
+            .map_err(abrupt_value)?;
         let Some(obj) = buffer.as_obj() else {
             return Err(self.make_error("TypeError", "ArrayBuffer construction failed"));
         };
-        self.host_keyed_buffers.insert(Rc::as_ptr(obj) as usize);
+        let ptr = Rc::as_ptr(obj) as usize;
+        self.array_buffers.insert(ptr, storage);
+        self.host_keyed_buffers.insert(ptr);
         Ok(buffer)
     }
 
@@ -2687,14 +2897,137 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let Some(buffer) = self.array_buffers.get_mut(&(Rc::as_ptr(obj) as usize)) else {
+        let ptr = Rc::as_ptr(obj) as usize;
+        let Some(storage) = self.array_buffers.get(&ptr) else {
             return false;
         };
+        let mut buffer = storage.borrow_mut();
         if buffer.len() != bytes.len() {
             return false;
         }
         buffer.copy_from_slice(bytes);
+        // This is an embedder-side replacement, not a JavaScript mutation.
+        // Keep the mutation generation reserved for writes performed by the
+        // JS engine so host synchronization does not immediately echo the
+        // same bytes back to the embedder on the next callback.
         true
+    }
+
+    /// Replace a range of an ordinary, attached `ArrayBuffer` without changing its identity or
+    /// JavaScript mutation generation. This is the range-aware counterpart to
+    /// [`Self::array_buffer_set_bytes`] for embedders mirroring a host-owned data block.
+    pub fn array_buffer_set_range(&mut self, v: &Value, start: usize, bytes: &[u8]) -> bool {
+        let Some(obj) = v.as_obj() else {
+            return false;
+        };
+        let ptr = Rc::as_ptr(obj) as usize;
+        let Some(storage) = self.array_buffers.get(&ptr) else {
+            return false;
+        };
+        let mut buffer = storage.borrow_mut();
+        let Some(end) = start.checked_add(bytes.len()) else {
+            return false;
+        };
+        if end > buffer.len() {
+            return false;
+        }
+        buffer[start..end].copy_from_slice(bytes);
+        true
+    }
+
+    /// Copies a range from an ordinary, attached `ArrayBuffer` into an embedder-owned buffer.
+    pub fn array_buffer_copy_range(
+        &self,
+        v: &Value,
+        start: usize,
+        len: usize,
+        destination: &mut [u8],
+    ) -> bool {
+        let Some(obj) = v.as_obj() else {
+            return false;
+        };
+        let ptr = Rc::as_ptr(obj) as usize;
+        let Some(storage) = self.array_buffers.get(&ptr) else {
+            return false;
+        };
+        let buffer = storage.borrow();
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if destination.len() != len || end > buffer.len() {
+            return false;
+        }
+        destination.copy_from_slice(&buffer[start..end]);
+        true
+    }
+
+    /// Takes byte ranges written by JavaScript since the previous call. The ranges are coalesced
+    /// and are intended for embedders that mirror the buffer into another storage.
+    pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
+        let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
+        self.array_buffers.contains_key(&ptr).then(|| {
+            self.array_buffer_dirty_ranges
+                .remove(&ptr)
+                .unwrap_or_default()
+        })
+    }
+
+    /// Returns the mutation generation of an attached ordinary ArrayBuffer. The generation is
+    /// intended for embedders that mirror an ArrayBuffer into another storage; it is not an
+    /// observable JavaScript value and may wrap after `u64::MAX` mutations.
+    pub fn array_buffer_version(&self, v: &Value) -> Option<u64> {
+        let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
+        self.array_buffers
+            .contains_key(&ptr)
+            .then_some(self.array_buffer_versions.get(&ptr).copied().unwrap_or(0))
+    }
+
+    /// Marks bytes in an ArrayBuffer as changed by an engine-owned view or host pointer. This is
+    /// deliberately conservative: callers may mark a no-op or failed write, causing one extra
+    /// mirror check but never allowing a stale external view to remain visible.
+    pub(crate) fn mark_array_buffer_dirty(&mut self, ptr: usize) {
+        let len = self
+            .array_buffers
+            .get(&ptr)
+            .map_or(0, |buffer| buffer.borrow().len());
+        self.mark_array_buffer_dirty_range(ptr, 0, len);
+    }
+
+    /// Marks a byte range as changed by an engine-owned view or host pointer.
+    pub(crate) fn mark_array_buffer_dirty_range(&mut self, ptr: usize, start: usize, len: usize) {
+        let Some(buffer_len) = self
+            .array_buffers
+            .get(&ptr)
+            .map(|buffer| buffer.borrow().len())
+        else {
+            return;
+        };
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
+        if len == 0 || end > buffer_len {
+            return;
+        }
+        let ranges = self.array_buffer_dirty_ranges.entry(ptr).or_default();
+        let mut start = start;
+        let mut end = end;
+        let mut index = 0;
+        while index < ranges.len() {
+            let range = &ranges[index];
+            if range.end < start {
+                index += 1;
+                continue;
+            }
+            if range.start > end {
+                break;
+            }
+            start = start.min(range.start);
+            end = end.max(range.end);
+            ranges.remove(index);
+        }
+        ranges.insert(index, start..end);
+        let version = self.array_buffer_versions.entry(ptr).or_default();
+        *version = version.wrapping_add(1);
     }
 
     /// Detach an ordinary `ArrayBuffer`, making its byte length zero and invalidating its views.
@@ -2705,7 +3038,10 @@ impl Interp {
         };
         let ptr = Rc::as_ptr(obj) as usize;
         self.host_keyed_buffers.remove(&ptr);
-        self.array_buffers.remove(&ptr).is_some()
+        let removed = self.array_buffers.remove(&ptr).is_some();
+        self.array_buffer_versions.remove(&ptr);
+        self.array_buffer_dirty_ranges.remove(&ptr);
+        removed
     }
 
     /// Overwrite a TypedArray's covered bytes from the start (a write past the view's end is
@@ -4011,7 +4347,10 @@ impl Interp {
     /// Whether `v` is the [[IsHTMLDDA]] object.
     pub(crate) fn is_htmldda(&self, v: &Value) -> bool {
         match v {
-            Value::Obj(o) => self.htmldda.iter().any(|d| Rc::ptr_eq(o, d)),
+            Value::Obj(o) => self
+                .htmldda
+                .get(&(Rc::as_ptr(o) as usize))
+                .is_some_and(|dda| std::rc::Weak::ptr_eq(dda, &Rc::downgrade(o))),
             _ => false,
         }
     }
@@ -4568,7 +4907,7 @@ impl Interp {
     /// whose resizable buffer shrank below its range) or its buffer is detached. A length-tracking
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
-        let buflen = self.array_buffers.get(&info.buffer)?.len();
+        let buflen = self.array_buffers.get(&info.buffer)?.borrow().len();
         let es = info.kind.elsize();
         if info.track {
             if info.offset > buflen {
@@ -4671,15 +5010,9 @@ impl Interp {
                 StrUnits::Units(crate::jstr::units(s).into())
             };
         }
-        if let Some(k) = self
-            .str_units
-            .iter()
-            .position(|(k, _)| crate::lstr::LStr::ptr_eq(k, s))
-        {
-            let hit = self.str_units[k].1.clone();
-            // Keep the hot entry last (evictions pop from the front).
-            let n = self.str_units.len();
-            self.str_units.swap(k, n - 1);
+        let key = s.as_ptr() as usize;
+        if let Some((cached, hit)) = self.str_units.get_cloned(&key) {
+            debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
             return hit;
         }
         let u = if s.is_ascii() {
@@ -4687,10 +5020,8 @@ impl Interp {
         } else {
             StrUnits::Units(crate::jstr::units(s).into())
         };
-        if self.str_units.len() >= 8 {
-            self.str_units.remove(0);
-        }
-        self.str_units.push((s.clone(), u.clone()));
+        let bytes = retained_str_units_bytes(s, &u);
+        self.str_units.insert(key, (s.clone(), u.clone()), bytes);
         u
     }
 
@@ -4708,23 +5039,22 @@ impl Interp {
         if s.len() < 64 {
             return crate::jstr::units(s).into();
         }
-        if let Some(k) = self
-            .str_units
-            .iter()
-            .position(|(k, _)| crate::lstr::LStr::ptr_eq(k, s))
-        {
-            if let StrUnits::Units(u) = &self.str_units[k].1 {
+        let key = s.as_ptr() as usize;
+        if let Some((cached, hit)) = self.str_units.get_cloned(&key) {
+            debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
+            if let StrUnits::Units(u) = hit {
                 return u.clone();
             }
             let u: Rc<[u16]> = crate::jstr::units(s).into();
-            self.str_units[k].1 = StrUnits::Units(u.clone());
+            let cached = StrUnits::Units(u.clone());
+            let bytes = retained_str_units_bytes(s, &cached);
+            self.str_units.insert(key, (s.clone(), cached), bytes);
             return u;
         }
         let u: Rc<[u16]> = crate::jstr::units(s).into();
-        if self.str_units.len() >= 8 {
-            self.str_units.remove(0);
-        }
-        self.str_units.push((s.clone(), StrUnits::Units(u.clone())));
+        let cached = StrUnits::Units(u.clone());
+        let bytes = retained_str_units_bytes(s, &cached);
+        self.str_units.insert(key, (s.clone(), cached), bytes);
         u
     }
 
@@ -4751,15 +5081,15 @@ impl Interp {
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
         // Scope churn is tracked separately: call-heavy code can retire millions of scopes while
         // allocating few objects, and each dead weak registry entry pins its allocation.
-        if scope_registry_len() > self.scope_gc_next {
-            let live = scope_registry_prune();
+        if crate::value::gc_scope_registry_len(&self.gc_heap) > self.scope_gc_next {
+            let live = crate::value::gc_scope_registry_prune(&self.gc_heap);
             self.scope_gc_next = live.saturating_mul(2).max(SCOPE_GC_TRIGGER);
         }
-        if crate::value::live_objects() <= self.gc_next {
+        if crate::value::heap_live_objects(&self.gc_heap) <= self.gc_next {
             return Ok(());
         }
         self.gc_collect();
-        let live = crate::value::live_objects();
+        let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!("[gc] live={live}");
         }
@@ -4775,15 +5105,18 @@ impl Interp {
     /// Allocation safepoints alone cannot see this transition: a graph may be reachable during
     /// every in-task collection and become cyclic garbage only as the callback returns.
     pub(crate) fn gc_task_boundary(&mut self) -> i64 {
-        let allocated = crate::value::allocated_objects();
+        // ClearKeptObjects (ECMA-262 §9.10): the synchronous job that established WeakRef
+        // read consistency has ended before a host task-boundary collection may run.
+        self.kept_alive.clear();
+        let allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         let churn = allocated.wrapping_sub(self.gc_task_allocated);
         self.gc_task_allocated = allocated;
         if churn < GC_TASK_ALLOCATION_TRIGGER {
             return 0;
         }
-        let before = crate::value::live_objects();
+        let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect();
-        let live = crate::value::live_objects();
+        let live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
         before.saturating_sub(live)
     }
@@ -4802,18 +5135,21 @@ impl Interp {
         unicode: bool,
         s: &crate::lstr::LStr,
     ) -> Rc<crate::regex::ReText> {
-        const RE_TEXT_CACHE_CAPACITY: usize = 32_768;
         let key = (s.as_ptr() as usize, unicode);
-        if let Some((_, t)) = self.re_texts.get(&key) {
-            return t.clone();
+        if let Some((cached, text)) = self.re_texts.get_cloned(&key) {
+            debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
+            return text;
         }
         let t = Rc::new(crate::regex::ReText::new_rc(unicode, s));
-        if self.re_texts.len() >= RE_TEXT_CACHE_CAPACITY {
-            // A bulk reset keeps the hot lookup one hash probe and strictly bounds retained
-            // subject memory. Long-lived streaming workloads rebuild at most once per epoch.
-            self.re_texts.clear();
-        }
-        self.re_texts.insert(key, (s.clone(), t.clone()));
+        let bytes = s
+            .len()
+            .saturating_add(t.heap_bytes())
+            .saturating_add(std::mem::size_of::<(
+                (usize, bool),
+                crate::lstr::LStr,
+                Rc<crate::regex::ReText>,
+            )>());
+        self.re_texts.insert(key, (s.clone(), t.clone()), bytes);
         t
     }
 
@@ -4821,7 +5157,23 @@ impl Interp {
     /// borrow is released before callers follow the collected edges, which remains essential for
     /// self-referential objects; reusing the allocation avoids one fresh Vec per object per GC
     /// pass.
-    fn obj_refs_into(o: &Gc, refs: &mut Vec<Gc>) {
+    fn push_value_object(value: &Value, refs: &mut Vec<Gc>) {
+        if let Value::Obj(object) = value {
+            refs.push(object.clone());
+        }
+    }
+
+    fn push_property_objects(property: &Property, refs: &mut Vec<Gc>) {
+        Self::push_value_object(&property.value(), refs);
+        if let Some(getter) = property.getter() {
+            Self::push_value_object(getter, refs);
+        }
+        if let Some(setter) = property.setter() {
+            Self::push_value_object(setter, refs);
+        }
+    }
+
+    fn obj_refs_into(&self, o: &Gc, refs: &mut Vec<Gc>) {
         refs.clear();
         let b = o.borrow();
         if let Some(p) = &b.proto {
@@ -4849,6 +5201,74 @@ impl Interp {
                 }
             }
         }
+        drop(b);
+
+        // Pointer-keyed tables implement internal slots. Their strong values are graph edges from
+        // the owner object, not collector roots merely because Rust stores them in `Interp`.
+        let ptr = Rc::as_ptr(o) as usize;
+        if let Some(class) = self.class_info.get(&ptr) {
+            for field in &class.fields {
+                for transform in &field.transforms {
+                    Self::push_value_object(transform, refs);
+                }
+            }
+            for initializer in &class.instance_initializers {
+                Self::push_value_object(initializer, refs);
+            }
+            for (_, property) in &class.private_members {
+                Self::push_property_objects(property, refs);
+            }
+        }
+        if let Some(bindings) = self.module_ns.get(&ptr) {
+            for binding in bindings.values() {
+                if let crate::modules::NsBinding::Static(value) = binding {
+                    Self::push_value_object(value, refs);
+                }
+            }
+        }
+        if let Some(entries) = self.map_data.get(&ptr) {
+            for (key, value) in entries {
+                Self::push_value_object(key, refs);
+                Self::push_value_object(value, refs);
+            }
+        }
+        if let Some(value) = self.ta_buffer.get(&ptr) {
+            Self::push_value_object(value, refs);
+        }
+        if let Some((target, handler)) = self.proxies.get(&ptr) {
+            Self::push_value_object(target, refs);
+            Self::push_value_object(handler, refs);
+        }
+        if let Some(promise) = self.promises.get(&ptr) {
+            Self::push_value_object(&promise.value, refs);
+            for (fulfilled, rejected, result) in &promise.reactions {
+                Self::push_value_object(fulfilled, refs);
+                Self::push_value_object(rejected, refs);
+                Self::push_value_object(result, refs);
+            }
+        }
+        if let Some(value) = self.promise_forward.get(&ptr) {
+            Self::push_value_object(value, refs);
+        }
+        if let Some(queue) = self.async_gen_queue.get(&ptr) {
+            for (promise, resume) in queue {
+                Self::push_value_object(promise, refs);
+                match resume {
+                    crate::coroutine::Resume::Next(value)
+                    | crate::coroutine::Resume::Return(value)
+                    | crate::coroutine::Resume::Throw(value) => {
+                        Self::push_value_object(value, refs)
+                    }
+                    crate::coroutine::Resume::Terminate => {}
+                }
+            }
+        }
+        if let Some(registry) = self.finalization_registries.get(&ptr) {
+            Self::push_value_object(&registry.cleanup_callback, refs);
+            for cell in &registry.cells {
+                Self::push_value_object(&cell.held_value, refs);
+            }
+        }
     }
 
     /// Refcount-based cycle collector. An object whose `Rc::strong_count` exceeds the references it
@@ -4870,13 +5290,20 @@ impl Interp {
         if let Some(ci) = self.class_info.get(&ptr) {
             out.push(ci.field_env.clone());
         }
+        if let Some(bindings) = self.module_ns.get(&ptr) {
+            for binding in bindings.values() {
+                if let crate::modules::NsBinding::Live(env, _) = binding {
+                    out.push(env.clone());
+                }
+            }
+        }
     }
 
     pub(crate) fn gc_collect(&mut self) {
-        let live = crate::value::gc_snapshot();
+        let live = crate::value::heap_gc_snapshot(&self.gc_heap);
         // Scopes are graph nodes too: a closure's captured environment references objects (its
         // bindings) and vice versa (`Callable::User`), so cycles routinely pass through them.
-        let scopes = scope_snapshot();
+        let scopes = crate::value::gc_scope_snapshot(&self.gc_heap);
         let sidx: crate::fasthash::FastMap<usize, usize> = scopes
             .iter()
             .enumerate()
@@ -4894,7 +5321,7 @@ impl Interp {
         let mut object_refs = Vec::new();
         let mut scope_refs = Vec::new();
         for o in &live {
-            Self::obj_refs_into(o, &mut object_refs);
+            self.obj_refs_into(o, &mut object_refs);
             for p in object_refs.drain(..) {
                 let pb = p.borrow();
                 pb.gc_internal.set(pb.gc_internal.get() + 1);
@@ -4930,11 +5357,59 @@ impl Interp {
             }
         }
 
+        // RealmState is a pointer-keyed internal-slot group, not an immortal root. Count each of
+        // its Rust handles as an internal edge and remember every intrinsic/scope that can prove
+        // the realm live. Marking any member activates the whole group; when no member is live the
+        // realm global (the table key) is swept with the rest of the group.
+        let mut realm_members: crate::fasthash::FastMap<usize, usize> = Default::default();
+        let mut realm_scope_members: crate::fasthash::FastMap<usize, usize> = Default::default();
+        for (realm_key, realm) in &self.realms {
+            let fixed = [
+                &realm.global,
+                &realm.object_proto,
+                &realm.function_proto,
+                &realm.array_proto,
+                &realm.string_proto,
+                &realm.number_proto,
+                &realm.boolean_proto,
+                &realm.symbol_proto,
+            ];
+            for object in fixed
+                .into_iter()
+                .chain(realm.array_ctor.iter())
+                .chain(realm.error_protos.values())
+                .chain(realm.eval_fn.iter())
+                .chain(realm.extra_protos.values())
+            {
+                let ptr = Rc::as_ptr(object) as usize;
+                realm_members.insert(ptr, *realm_key);
+                let borrowed = object.borrow();
+                borrowed
+                    .gc_internal
+                    .set(borrowed.gc_internal.get().saturating_add(1));
+            }
+            let scope_ptr = Rc::as_ptr(&realm.global_env) as usize;
+            realm_scope_members.insert(scope_ptr, *realm_key);
+            if let Some(&index) = sidx.get(&scope_ptr) {
+                s_internal[index] = s_internal[index].saturating_add(1);
+            }
+        }
+
         // A pin is bookkeeping, not a real holder: count it like an internal reference so a
         // pinned-but-unreachable object is still collectable (the sweep evicts its entries).
         for o in self.gc_pins.values() {
             let b = o.borrow();
             b.gc_internal.set(b.gc_internal.get() + 1);
+        }
+        // WeakMap values are ephemeron edges: their Rust handles must not look like external
+        // roots, but marking them is deferred until both their owner and weak key are live.
+        for entries in self.weak_collection_data.values() {
+            for (_, value) in entries {
+                if let Value::Obj(object) = value {
+                    let b = object.borrow();
+                    b.gc_internal.set(b.gc_internal.get() + 1);
+                }
+            }
         }
         // Roots: nodes with a reference from outside the heap graph (the Rust call stack, the
         // Interp's own fields, module/realm registries, coroutine threads). `strong_count`
@@ -4988,10 +5463,68 @@ impl Interp {
                 }
             }
         }
-        // Mark everything reachable from the roots, across both node types.
+
+        // Root classification is complete, so temporary clones can no longer distort it. These
+        // compact groups let either an intrinsic object or its global scope activate the realm in
+        // time proportional to that realm's intrinsic set.
+        let mut realm_groups: crate::fasthash::FastMap<usize, (Vec<Gc>, Env)> = Default::default();
+        for (realm_key, realm) in &self.realms {
+            let mut objects = vec![
+                realm.global.clone(),
+                realm.object_proto.clone(),
+                realm.function_proto.clone(),
+                realm.array_proto.clone(),
+                realm.string_proto.clone(),
+                realm.number_proto.clone(),
+                realm.boolean_proto.clone(),
+                realm.symbol_proto.clone(),
+            ];
+            objects.extend(realm.array_ctor.iter().cloned());
+            objects.extend(realm.error_protos.values().cloned());
+            objects.extend(realm.eval_fn.iter().cloned());
+            objects.extend(realm.extra_protos.values().cloned());
+            realm_groups.insert(*realm_key, (objects, realm.global_env.clone()));
+        }
+        let mut activated_realms: crate::fasthash::FastSet<usize> = Default::default();
+
+        // Index the two-input ephemeron condition in both directions. When either an owner or an
+        // object key is marked, the second condition is one O(1) mark-bit test; every WeakMap edge
+        // is considered at most twice rather than rescanning every collection to a fixed point.
+        let mut ephemerons_by_owner: crate::fasthash::FastMap<usize, Vec<(Option<Gc>, Gc)>> =
+            Default::default();
+        let mut ephemerons_by_key: crate::fasthash::FastMap<usize, Vec<(usize, Gc)>> =
+            Default::default();
+        for (owner, entries) in &self.weak_collection_data {
+            for (key, value) in entries {
+                let Value::Obj(value) = value else { continue };
+                match key.upgrade() {
+                    Some(Value::Obj(key)) => {
+                        ephemerons_by_owner
+                            .entry(*owner)
+                            .or_default()
+                            .push((Some(key.clone()), value.clone()));
+                        ephemerons_by_key
+                            .entry(Rc::as_ptr(&key) as usize)
+                            .or_default()
+                            .push((*owner, value.clone()));
+                    }
+                    // Symbol collection is conservative until the Agent-owned symbol-registry
+                    // sweep. A live collection therefore activates a still-existing symbol key.
+                    Some(Value::Sym(_)) => ephemerons_by_owner
+                        .entry(*owner)
+                        .or_default()
+                        .push((None, value.clone())),
+                    _ => {}
+                }
+            }
+        }
+
+        // Mark everything reachable from roots across object/scope nodes and ephemeron edges. A
+        // value->key cycle cannot bootstrap itself because neither directional index activates
+        // until the owner and key have independently acquired a mark.
         loop {
             if let Some(o) = stack.pop() {
-                Self::obj_refs_into(&o, &mut object_refs);
+                self.obj_refs_into(&o, &mut object_refs);
                 for p in object_refs.drain(..) {
                     if !p.borrow().gc_mark.get() {
                         p.borrow().gc_mark.set(true);
@@ -5007,9 +5540,68 @@ impl Interp {
                         }
                     }
                 }
+
+                let ptr = Rc::as_ptr(&o) as usize;
+                if let Some(&realm_key) = realm_members.get(&ptr) {
+                    if activated_realms.insert(realm_key) {
+                        if let Some((objects, env)) = realm_groups.get(&realm_key) {
+                            for object in objects {
+                                if !object.borrow().gc_mark.get() {
+                                    object.borrow().gc_mark.set(true);
+                                    stack.push(object.clone());
+                                }
+                            }
+                            if let Some(&index) = sidx.get(&(Rc::as_ptr(env) as usize)) {
+                                if !s_mark[index] {
+                                    s_mark[index] = true;
+                                    sstack.push(env.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(entries) = ephemerons_by_owner.get(&ptr) {
+                    for (key, value) in entries {
+                        let key_live = key.as_ref().is_none_or(|key| key.borrow().gc_mark.get());
+                        if key_live && !value.borrow().gc_mark.get() {
+                            value.borrow().gc_mark.set(true);
+                            stack.push(value.clone());
+                        }
+                    }
+                }
+                if let Some(entries) = ephemerons_by_key.get(&ptr) {
+                    for (owner, value) in entries {
+                        let owner_live = self
+                            .gc_pins
+                            .get(owner)
+                            .is_some_and(|owner| owner.borrow().gc_mark.get());
+                        if owner_live && !value.borrow().gc_mark.get() {
+                            value.borrow().gc_mark.set(true);
+                            stack.push(value.clone());
+                        }
+                    }
+                }
                 continue;
             }
             let Some(e) = sstack.pop() else { break };
+            if let Some(&realm_key) = realm_scope_members.get(&(Rc::as_ptr(&e) as usize)) {
+                if activated_realms.insert(realm_key) {
+                    if let Some((objects, env)) = realm_groups.get(&realm_key) {
+                        for object in objects {
+                            if !object.borrow().gc_mark.get() {
+                                object.borrow().gc_mark.set(true);
+                                stack.push(object.clone());
+                            }
+                        }
+                        if let Some(&index) = sidx.get(&(Rc::as_ptr(env) as usize)) {
+                            if !s_mark[index] {
+                                s_mark[index] = true;
+                                sstack.push(env.clone());
+                            }
+                        }
+                    }
+                }
+            }
             let b = e.borrow();
             if let Some(p) = &b.parent {
                 if let Some(&k) = sidx.get(&(Rc::as_ptr(p) as usize)) {
@@ -5045,7 +5637,69 @@ impl Interp {
 
         // `gc_internal` doubles as the O(1) weak-registry slot outside collection. Restore it
         // before the sweep clears any property/side-table edge that could drop an object.
-        crate::value::gc_restore_registry_slots();
+        crate::value::gc_restore_registry_slots(&self.gc_heap);
+
+        let garbage_objects: crate::fasthash::FastSet<usize> = live
+            .iter()
+            .filter(|object| !object.borrow().gc_mark.get())
+            .map(|object| Rc::as_ptr(object) as usize)
+            .collect();
+
+        // ECMA-262 §9.9 performs all weak-target clearing atomically for the chosen non-live set.
+        // Do this before any strong side-table edge is released, while every identity is stable.
+        for target in self.weak_refs.values_mut() {
+            let clear = target.as_ref().is_some_and(|target| {
+                target.object_is_in(&garbage_objects) || target.upgrade().is_none()
+            });
+            if clear {
+                *target = None;
+            }
+        }
+
+        // Dead weak-collection keys and their ephemeron values disappear together. Rebuild the
+        // parallel identity index after compaction so pointer lookup remains O(1).
+        for (owner, entries) in &mut self.weak_collection_data {
+            entries.retain(|(target, _)| {
+                !target.object_is_in(&garbage_objects) && target.upgrade().is_some()
+            });
+            let index = self.weak_collection_index.entry(*owner).or_default();
+            index.clear();
+            index.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (target, _))| (target.key(), offset)),
+            );
+        }
+
+        let mut cleanup_jobs = Vec::new();
+        for (owner, registry) in &mut self.finalization_registries {
+            for cell in &mut registry.cells {
+                let clear = cell.target.as_ref().is_some_and(|target| {
+                    target.object_is_in(&garbage_objects) || target.upgrade().is_none()
+                });
+                if clear {
+                    cell.target = None;
+                }
+            }
+            let owner_live = self
+                .gc_pins
+                .get(owner)
+                .is_some_and(|object| object.borrow().gc_mark.get());
+            if owner_live
+                && !registry.cleanup_scheduled
+                && registry.cells.iter().any(|cell| cell.target.is_none())
+            {
+                registry.cleanup_scheduled = true;
+                cleanup_jobs.push(*owner);
+            }
+        }
+        for owner in cleanup_jobs {
+            if let Some(registry) = self.gc_pins.get(&owner) {
+                self.pending_finalization_cleanup
+                    .push_back(Value::Obj(registry.clone()));
+            }
+        }
 
         // Sweep: clear unmarked (garbage) objects to break their cycles; once `live` drops, their
         // refcounts hit zero and they are freed. Also evict them from pointer-keyed side tables so a
@@ -5060,7 +5714,11 @@ impl Interp {
                 }
                 let ptr = Rc::as_ptr(o) as usize;
                 self.class_info.remove(&ptr);
+                self.eval_realm_fns.remove(&ptr);
+                self.module_ns.remove(&ptr);
+                self.realms.remove(&ptr);
                 self.map_data.remove(&ptr);
+                self.weak_collection_data.remove(&ptr);
                 self.weak_collection_index.remove(&ptr);
                 self.typed_arrays.remove(&ptr);
                 self.data_views.remove(&ptr);
@@ -5069,7 +5727,10 @@ impl Interp {
                 self.promises.remove(&ptr);
                 self.temporal.remove(&ptr);
                 self.array_buffers.remove(&ptr);
+                self.array_buffer_versions.remove(&ptr);
+                self.array_buffer_dirty_ranges.remove(&ptr);
                 self.ta_buffer.remove(&ptr);
+                self.shadow_realms.remove(&ptr);
                 self.shared_buffers.remove(&ptr);
                 self.immutable_buffers.remove(&ptr);
                 self.host_keyed_buffers.remove(&ptr);
@@ -5080,6 +5741,9 @@ impl Interp {
                 self.mapped_arguments.remove(&ptr);
                 self.deferred_ns.remove(&ptr);
                 self.promise_forward.remove(&ptr);
+                self.temporal_cal.remove(&ptr);
+                self.weak_refs.remove(&ptr);
+                self.finalization_registries.remove(&ptr);
                 self.gc_pins.remove(&ptr);
                 let mut b = o.borrow_mut();
                 b.props.clear();
@@ -5097,9 +5761,26 @@ impl Interp {
                 b.with_obj = None;
             }
         }
+        // Raw-address inline-cache maps carry Weak allocation pins. Prune expired entries so the
+        // Weak itself does not retain allocator headers forever; a live cache identity remains
+        // ABA-safe because its Weak still owns that header.
+        self.creation_pins.retain(|_, pin| pin.strong_count() != 0);
+        self.construct_ics
+            .retain(|_, entry| entry.pin.strong_count() != 0);
+        self.construct_capacity_hints
+            .retain(|_, (pin, _)| pin.strong_count() != 0);
+        self.global_env_pins.retain(|pin| pin.strong_count() != 0);
+        self.htmldda.retain(|_, pin| pin.strong_count() != 0);
+        self.symbol_agent
+            .borrow_mut()
+            .symbols
+            .retain(|_, symbol| symbol.strong_count() != 0);
         // Release the snapshot handles first: only then do swept objects and their property
         // buffers reach the allocator's free lists. A high threshold confines the expensive
         // platform pressure-relief call to phase changes, not ordinary generational churn.
+        drop(ephemerons_by_owner);
+        drop(ephemerons_by_key);
+        drop(realm_groups);
         drop(live);
         drop(scopes);
         #[cfg(not(target_arch = "wasm32"))]
@@ -5111,8 +5792,9 @@ impl Interp {
     // ----- calling ----------------------------------------------------------------------------
 
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
+        self.activate_gc_heap();
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -5981,7 +6663,7 @@ impl Interp {
             }
         };
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             drop_args();
             unsafe { std::ptr::drop_in_place(this_slot as *mut Value) };
@@ -6076,7 +6758,7 @@ impl Interp {
             std::ptr::drop_in_place(this_slot as *mut Value);
         };
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             drop_operands();
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
@@ -6143,7 +6825,7 @@ impl Interp {
         }
         // --- committed: identical to call_jit_fast's committed path ---
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             unsafe {
                 for k in 0..argc {
@@ -6472,7 +7154,7 @@ impl Interp {
             // Account for both elided calls in the recursion limit. The plan contains no calls,
             // allocation, coercion, or other user-code boundary, so it needs neither physical
             // reflection frames nor separate GC polls.
-            if self.depth > MAX_EVAL_DEPTH - 2 {
+            if self.depth > self.max_eval_depth.saturating_sub(2) {
                 drop_args();
                 return Some(Err(
                     self.throw("RangeError", "Maximum call stack size exceeded")
@@ -6513,7 +7195,7 @@ impl Interp {
         // The original body calls the native apply function here. Preserve its depth and GC
         // boundary even though the argument-list object and native dispatch are elided.
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             drop_args();
             return Some(Err(
@@ -6596,7 +7278,7 @@ impl Interp {
         };
         if let Some(call) = native {
             self.depth += 1;
-            if self.depth > MAX_EVAL_DEPTH {
+            if self.depth > self.max_eval_depth {
                 self.depth -= 1;
                 unsafe {
                     for k in 0..argc {
@@ -6693,7 +7375,7 @@ impl Interp {
         let this_val = Value::Obj(this.clone());
         // --- committed: identical shape to call_jit_cached's committed path ---
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             unsafe {
                 for k in 0..argc {
@@ -6959,9 +7641,9 @@ impl Interp {
         if !self
             .global_env_pins
             .iter()
-            .any(|g| Rc::ptr_eq(g, &self.global_env))
+            .any(|g| g.as_ptr() == Rc::as_ptr(&self.global_env))
         {
-            let g = self.global_env.clone();
+            let g = Rc::downgrade(&self.global_env);
             self.global_env_pins.push(g);
         }
         let ic = crate::bytecode::CallIc {
@@ -7095,9 +7777,9 @@ impl Interp {
                 if !self
                     .global_env_pins
                     .iter()
-                    .any(|g| Rc::ptr_eq(g, &self.global_env))
+                    .any(|g| g.as_ptr() == Rc::as_ptr(&self.global_env))
                 {
-                    let genv = self.global_env.clone();
+                    let genv = Rc::downgrade(&self.global_env);
                     self.global_env_pins.push(genv);
                 }
                 let (n_params, n_slots) = chunk.jit_frame();
@@ -7134,7 +7816,7 @@ impl Interp {
         }
         // --- committed: from here the arguments and `*this_slot` are ours ---
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             // Ownership contract: consume the arguments and `this` even on the early throw.
             unsafe {
@@ -7503,7 +8185,7 @@ impl Interp {
         if func.is_generator {
             // The generator object's [[Prototype]] comes from the function's own `.prototype`.
             let gen_proto = fn_obj.borrow().props.get("prototype").map(|p| p.value());
-            let gen = self.run_generator(func, &body, param_seed, gen_proto);
+            let gen = self.run_generator(func, &body, param_seed, gen_proto, args);
             self.strict = saved_strict;
             self.new_target = saved_new_target;
             self.in_field_init_code = saved_field_init;
@@ -7607,16 +8289,61 @@ impl Interp {
         result
     }
 
-    /// Start a generator in suspended-start and return its object. The native coroutine is itself
-    /// allocated lazily on the first `next`; a never-resumed generator therefore consumes no OS
-    /// thread or native stack, matching ECMA-262 GeneratorStart/GeneratorResume.
+    /// Start a generator in suspended-start and return its object. Its continuation is allocated
+    /// lazily on the first `next`; a never-resumed generator therefore consumes no VM or native
+    /// stack, matching ECMA-262 GeneratorStart/GeneratorResume.
     fn run_generator(
         &mut self,
         func: &Rc<Function>,
         scope: &Env,
         param_seed: Option<Env>,
         gen_proto: Option<Value>,
+        args: &[Value],
     ) -> Result<Value, Abrupt> {
+        // Compiler-supported generators, including delegated `yield*`, use the same explicit VM
+        // continuation as async `await`. Other uncompilable bodies use the bounded fallback below.
+        if func.code.get().is_none() {
+            let _ = func.code.set(crate::bytecode::compile(func));
+        }
+        if let Some(Some(chunk)) = func.code.get() {
+            let this_val = if chunk.uses_this() {
+                self.get_var("this", scope)?
+            } else {
+                Value::Undefined
+            };
+            let params = self.coroutine_parameter_values(func, scope)?;
+            let continuation = if func.is_async {
+                crate::bytecode::VmCoro::new_async_generator(
+                    self,
+                    chunk.clone(),
+                    scope.clone(),
+                    this_val,
+                    &params,
+                    args,
+                )
+            } else {
+                crate::bytecode::VmCoro::new_generator(
+                    self,
+                    chunk.clone(),
+                    scope.clone(),
+                    this_val,
+                    &params,
+                    args,
+                )
+            };
+            let obj = self.make_generator(func.is_async, gen_proto);
+            if let Value::Obj(object) = &obj {
+                self.gc_pin(object);
+                self.generators.insert(
+                    Rc::as_ptr(object) as usize,
+                    crate::coroutine::Coroutine::Vm(Box::new(continuation)),
+                );
+                if func.is_async {
+                    self.async_gens.insert(Rc::as_ptr(object) as usize);
+                }
+            }
+            return Ok(obj);
+        }
         let func = func.clone();
         let scope = scope.clone();
         let is_async = func.is_async;
@@ -7681,23 +8408,34 @@ impl Interp {
         Ok(obj)
     }
 
+    /// Read the already-instantiated formal parameter bindings for a generator/async VM frame.
+    /// FunctionDeclarationInstantiation ran before the resumable execution context was created;
+    /// seeding raw call arguments would make the chunk repeat default initialization on resume.
+    fn coroutine_parameter_values(
+        &mut self,
+        func: &Function,
+        scope: &Env,
+    ) -> Result<Vec<Value>, Abrupt> {
+        param_bound_names(&func.params)
+            .into_iter()
+            .map(|name| self.get_var(&name, scope))
+            .collect()
+    }
+
     /// Start an async function: spawn its coroutine, return a promise that settles when the body
     /// finishes. Each `await` parks the coroutine; a microtask resumes it once the awaited value
     /// settles.
-    /// The compiled chunk for an async function if it should run on the bytecode VM: the bytecode
-    /// tier is on and the body has been called past the tier threshold and fits the VM subset.
-    /// Mirrors the sync-call tiering in `call_inner`.
+    /// The compiled chunk for an async function if it fits the VM subset. Coroutine bytecode is
+    /// also the continuation representation, not merely an optimization tier, so compile on the
+    /// first call instead of reserving a native worker until an arbitrary hotness threshold.
     fn async_vm_chunk(&self, func: &Rc<Function>) -> Option<Rc<crate::bytecode::Chunk>> {
-        if matches!(self.tier, crate::bytecode::Tier::Interp) {
-            return None;
-        }
+        // `Tier::Interp` disables bytecode as an ordinary optimization, but an async function's
+        // chunk is also its heap-owned execution context. Use it whenever available so selecting
+        // the reference tier never silently reintroduces an OS-thread continuation.
         if func.code.get().is_none() {
             let n = func.calls.get().saturating_add(1);
             func.calls.set(n);
-            // Loop-bearing bodies compile on first call, like the sync path.
-            if n > self.tier_threshold || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0 {
-                let _ = func.code.set(crate::bytecode::compile(func));
-            }
+            let _ = func.code.set(crate::bytecode::compile(func));
         }
         match func.code2.get().or_else(|| func.code.get()) {
             Some(Some(chunk)) => Some(chunk.clone()),
@@ -7713,21 +8451,23 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         // Fast path: an async body that compiles runs on the bytecode VM, suspending at each `await`
-        // without an OS-thread coroutine (see `bytecode::VmCoro`). Params seed straight into slots
-        // from `args`; the activation scope is only the root for free-name resolution.
+        // without an OS-thread coroutine (see `bytecode::VmCoro`). Already-instantiated parameter
+        // values seed its slots; the original `args` are retained only for the arguments object.
         let coro = if let Some(chunk) = self.async_vm_chunk(func) {
             let this_val = if chunk.uses_this() {
                 self.get_var("this", scope)?
             } else {
                 Value::Undefined
             };
-            crate::coroutine::Coroutine::Vm(crate::bytecode::VmCoro::new(
+            let params = self.coroutine_parameter_values(func, scope)?;
+            crate::coroutine::Coroutine::Vm(Box::new(crate::bytecode::VmCoro::new(
                 self,
                 chunk,
                 scope.clone(),
                 this_val,
+                &params,
                 args,
-            ))
+            )))
         } else {
             self.spawn_async_thread(func, scope, param_seed)?
         };
@@ -8148,7 +8888,7 @@ impl Interp {
         new_target: Value,
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > MAX_EVAL_DEPTH {
+        if self.depth > self.max_eval_depth {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -8396,6 +9136,7 @@ impl Interp {
     }
 
     pub(crate) fn run_program(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
+        self.activate_gc_heap();
         self.interrupt_poll_force()?;
         // GlobalDeclarationInstantiation early checks, before any binding is created. A probe
         // hoist into a throwaway scope yields this script's VarDeclaredNames.

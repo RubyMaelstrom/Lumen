@@ -352,9 +352,30 @@
     return options;
   }
 
-  // Punycode-backed domain converters. Node's use full IDNA/UTS46; lowercasing first covers the
-  // mapping step that matters in practice.
+  // Node's converters use the URL-profiled, non-transitional UTS #46 processing rather than raw
+  // Punycode. Reuse the web URL parser for validation/mapping; Punycode is only the final display
+  // conversion after a canonical ASCII domain has been obtained.
   const punycode = __builtins.get("punycode");
+  function domainToASCII(domain) {
+    domain = String(domain);
+    if (domain === "" || (!domain.startsWith("[") && domain.includes(":"))) return "";
+    try {
+      const parsed = new URL(`http://${domain}`);
+      if (parsed.username || parsed.password || parsed.port) return "";
+      return parsed.hostname;
+    } catch {
+      return "";
+    }
+  }
+  function domainToUnicode(domain) {
+    const ascii = domainToASCII(domain);
+    if (ascii === "") return "";
+    try {
+      return punycode.toUnicode(ascii);
+    } catch {
+      return "";
+    }
+  }
 
   __builtins.set("url", {
     parse: legacyParse,
@@ -365,8 +386,8 @@
     URL,
     URLSearchParams,
     Url: function Url() {},
-    domainToASCII: (d) => punycode.toASCII(String(d).toLowerCase()),
-    domainToUnicode: (d) => punycode.toUnicode(String(d).toLowerCase()),
+    domainToASCII,
+    domainToUnicode,
     fileURLToPath: (u) => (typeof u === "string" ? u : u.pathname).replace(/^file:\/\//, ""),
     pathToFileURL: (p) => new URL("file://" + p),
   });

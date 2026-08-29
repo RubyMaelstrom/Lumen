@@ -2,7 +2,7 @@
 //! tree. Any failure is a [`ParseError`], which the engine reports as a SyntaxError (parse phase).
 
 use crate::ast::*;
-use crate::lexer::tokenize;
+use crate::lexer::tokenize_with_source;
 use crate::token::{Tok, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
 
@@ -29,15 +29,15 @@ pub fn parse_script_eval(
     allow_super: bool,
     private_names: &[String],
 ) -> Result<Vec<Stmt>, ParseError> {
-    let tokens = tokenize(src).map_err(|e| ParseError {
+    let lexed = tokenize_with_source(src).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
         at_eof: e.at_eof,
     })?;
     let mut p = Parser {
-        toks: tokens,
+        toks: lexed.tokens,
         pos: 0,
-        src_chars: Rc::new(src.chars().collect()),
+        src_chars: lexed.chars,
         strict,
         depth: 0,
         in_generator: false,
@@ -99,15 +99,15 @@ pub fn parse_script_eval(
 /// Parse a module (always strict; `import`/`export` are allowed only here). Modules permit top-level
 /// `await`, so `await` is treated as a keyword at the module's top level.
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
-    let tokens = crate::lexer::tokenize_goal(src, false).map_err(|e| ParseError {
+    let lexed = crate::lexer::tokenize_goal_with_source(src, false).map_err(|e| ParseError {
         at_eof: e.at_eof,
         message: e.message,
         line: e.line,
     })?;
     let mut p = Parser {
-        toks: tokens,
+        toks: lexed.tokens,
         pos: 0,
-        src_chars: Rc::new(src.chars().collect()),
+        src_chars: lexed.chars,
         strict: true,
         depth: 0,
         in_generator: false,
@@ -2825,17 +2825,16 @@ impl Parser {
                     }
                 },
                 TplPart::Sub(src) => {
-                    let tokens = crate::lexer::tokenize_goal(&src, !self.module).map_err(|e| {
-                        ParseError {
+                    let lexed = crate::lexer::tokenize_goal_with_source(&src, !self.module)
+                        .map_err(|e| ParseError {
                             at_eof: false,
                             message: e.message,
                             line: e.line,
-                        }
-                    })?;
+                        })?;
                     let mut sub = Parser {
-                        toks: tokens,
+                        toks: lexed.tokens,
                         pos: 0,
-                        src_chars: Rc::new(src.chars().collect()),
+                        src_chars: lexed.chars,
                         strict: self.strict,
                         depth: self.depth,
                         in_generator: self.in_generator,
@@ -2896,17 +2895,16 @@ impl Parser {
             match part {
                 TplPart::Str { cooked, raw } => quasis.push((cooked, raw)),
                 TplPart::Sub(src) => {
-                    let tokens = crate::lexer::tokenize_goal(&src, !self.module).map_err(|e| {
-                        ParseError {
+                    let lexed = crate::lexer::tokenize_goal_with_source(&src, !self.module)
+                        .map_err(|e| ParseError {
                             at_eof: false,
                             message: e.message,
                             line: e.line,
-                        }
-                    })?;
+                        })?;
                     let mut sub = Parser {
-                        toks: tokens,
+                        toks: lexed.tokens,
                         pos: 0,
-                        src_chars: Rc::new(src.chars().collect()),
+                        src_chars: lexed.chars,
                         strict: self.strict,
                         depth: self.depth,
                         in_generator: self.in_generator,

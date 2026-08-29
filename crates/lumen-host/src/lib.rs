@@ -15,12 +15,49 @@
 //!   callback by [`TaskId`]).
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Hard ceiling for one-shot codec output. The JavaScript engine uses the same 256 MiB backing-
+/// store ceiling, so decoding beyond this point could never be exposed as a Uint8Array and would
+/// only let compressed input consume unbounded native memory first.
+pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
+pub(crate) fn checked_decompressed_len(
+    current: usize,
+    additional: usize,
+    limit: usize,
+    codec: &str,
+) -> Result<usize, String> {
+    current
+        .checked_add(additional)
+        .filter(|&total| total <= limit)
+        .ok_or_else(|| format!("{codec}: decompressed output exceeds byte limit"))
+}
+
+thread_local! {
+    static TASK_PANIC_IS_CONTAINED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn install_task_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |information| {
+            if !TASK_PANIC_IS_CONTAINED.get() {
+                previous(information);
+            }
+        }));
+    });
+}
 
 pub use lumen::bytecode::Tier;
 pub use lumen::embed::{
-    Ctx, EvalError, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value,
+    ArrayBufferBytes, Ctx, EvalError, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable,
+    Value, WeakValue,
 };
 pub use lumen::{
     Completion, Engine, ExecutionOutcome, InterruptReason, ParseError, RuntimeInterrupt,
@@ -134,7 +171,21 @@ pub type TaskId = u64;
 /// the spawning op chose; that op downcasts it when the loop hands the completion over.
 pub struct TaskCompletion {
     pub task: TaskId,
-    pub result: Box<dyn Any + Send>,
+    pub result: Result<Box<dyn Any + Send>, TaskFailure>,
+}
+
+/// Scheduler-level failure that occurs before an op-specific payload can be decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskFailure {
+    pub message: String,
+}
+
+impl TaskFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 /// JS callbacks queued (on the loop thread) to run on the next loop turn — the
@@ -161,45 +212,113 @@ impl CallbackQueue {
 struct Task {
     id: TaskId,
     work: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+    cancelled: Arc<AtomicBool>,
 }
 
-/// A fixed pool of std worker threads running blocking work (`std::fs`, blocking
-/// `std::net`); completions come back over the `mpsc` channel given at construction. This is
-/// the whole async-I/O story until (if ever) a hand-rolled readiness reactor on raw platform
-/// syscalls is explicitly authorized — never via a crate.
-pub struct ThreadPool {
-    work_tx: Option<mpsc::Sender<Task>>,
-    workers: Vec<std::thread::JoinHandle<()>>,
+/// Shared cancellation index used by the task registry and both blocking executors. Cancellation
+/// prevents queued work from starting; resource-specific cancellation (socket shutdown, process
+/// kill, etc.) remains responsible for waking work that is already inside an OS call.
+#[derive(Clone, Default)]
+pub struct TaskCanceller {
+    tasks: Arc<Mutex<std::collections::HashMap<TaskId, Arc<AtomicBool>>>>,
 }
+
+impl TaskCanceller {
+    fn register(&self, id: TaskId) -> Arc<AtomicBool> {
+        let token = Arc::new(AtomicBool::new(false));
+        let previous = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, Arc::clone(&token));
+        if let Some(previous) = previous {
+            previous.store(true, Ordering::Release);
+        }
+        token
+    }
+
+    fn finish(&self, id: TaskId) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    fn cancel(&self, id: TaskId) {
+        if let Some(token) = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id)
+        {
+            token.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// A fixed pool of std worker threads running finite blocking work (`std::fs`, bounded network
+/// setup); completions come back over the channel given at construction. Its work queue and native
+/// stacks are bounded, panics become failed completions, and shutdown has a fixed grace period.
+pub struct ThreadPool {
+    work_tx: Option<mpsc::SyncSender<Task>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    state: Arc<PoolState>,
+}
+
+struct PoolState {
+    shutting_down: AtomicBool,
+    available: AtomicBool,
+    completions: mpsc::Sender<TaskCompletion>,
+    canceller: TaskCanceller,
+}
+
+const WORKER_POLL: Duration = Duration::from_millis(50);
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const DEFAULT_WORKER_STACK: usize = 1 << 20;
 
 impl ThreadPool {
     /// `size` worker threads sending [`TaskCompletion`]s to `completions` (the loop thread
     /// holds the receiving end).
     pub fn new(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
-        let (work_tx, work_rx) = mpsc::channel::<Task>();
+        Self::with_limits(size, size.max(1) * 64, DEFAULT_WORKER_STACK, completions)
+    }
+
+    /// Construct a pool with explicit queue and native-stack bounds. A queue limit caps retained
+    /// closures and their buffers; a failed worker spawn degrades capacity instead of panicking.
+    pub fn with_limits(
+        size: usize,
+        queue_capacity: usize,
+        stack_size: usize,
+        completions: mpsc::Sender<TaskCompletion>,
+    ) -> ThreadPool {
+        let (work_tx, work_rx) = mpsc::sync_channel::<Task>(queue_capacity.max(1));
         // std's mpsc receiver is single-consumer: share it across workers behind a mutex.
-        let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
-        let workers = (0..size.max(1))
-            .map(|_| {
-                let work_rx = std::sync::Arc::clone(&work_rx);
-                let completions = completions.clone();
-                std::thread::spawn(move || loop {
-                    let task = match work_rx.lock().expect("worker queue poisoned").recv() {
-                        Ok(t) => t,
-                        Err(_) => return, // pool dropped: no more work
-                    };
-                    let result = (task.work)();
-                    // The loop shutting down first is fine; the result just has nowhere to go.
-                    let _ = completions.send(TaskCompletion {
-                        task: task.id,
-                        result,
-                    });
-                })
-            })
-            .collect();
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let state = Arc::new(PoolState {
+            shutting_down: AtomicBool::new(false),
+            available: AtomicBool::new(false),
+            completions,
+            canceller: TaskCanceller::default(),
+        });
+        let mut workers = Vec::with_capacity(size.max(1));
+        for index in 0..size.max(1) {
+            let work_rx = Arc::clone(&work_rx);
+            let state = Arc::clone(&state);
+            let spawn = std::thread::Builder::new()
+                .name(format!("lumen-blocking-{index}"))
+                .stack_size(stack_size.max(64 << 10))
+                .spawn(move || worker_loop(&work_rx, &state));
+            if let Ok(worker) = spawn {
+                workers.push(worker);
+            }
+        }
+        state
+            .available
+            .store(!workers.is_empty(), Ordering::Release);
         ThreadPool {
             work_tx: Some(work_tx),
             workers,
+            state,
         }
     }
 
@@ -210,14 +329,7 @@ impl ThreadPool {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        self.work_tx
-            .as_ref()
-            .expect("pool shut down")
-            .send(Task {
-                id,
-                work: Box::new(work),
-            })
-            .expect("worker threads gone");
+        self.handle().spawn_blocking(id, work);
     }
 
     /// A cloneable spawn handle. The runtime puts one in [`OpState`], which is how a native fn
@@ -225,15 +337,65 @@ impl ThreadPool {
     pub fn handle(&self) -> SpawnHandle {
         SpawnHandle {
             work_tx: self.work_tx.clone().expect("pool shut down"),
+            state: Arc::clone(&self.state),
         }
     }
+
+    pub fn canceller(&self) -> TaskCanceller {
+        self.state.canceller.clone()
+    }
+}
+
+fn worker_loop(work_rx: &Mutex<mpsc::Receiver<Task>>, state: &PoolState) {
+    loop {
+        if state.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let received = work_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(WORKER_POLL);
+        let task = match received {
+            Ok(task) => task,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        if task.cancelled.load(Ordering::Acquire) {
+            state.canceller.finish(task.id);
+            continue;
+        }
+        let result = run_task(task.work);
+        state.canceller.finish(task.id);
+        let _ = state.completions.send(TaskCompletion {
+            task: task.id,
+            result,
+        });
+    }
+}
+
+fn run_task(
+    work: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+) -> Result<Box<dyn Any + Send>, TaskFailure> {
+    install_task_panic_hook();
+    TASK_PANIC_IS_CONTAINED.set(true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    TASK_PANIC_IS_CONTAINED.set(false);
+    result.map_err(|panic| {
+        let detail = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        TaskFailure::new(format!("blocking task panicked: {detail}"))
+    })
 }
 
 /// [`ThreadPool::spawn_blocking`] as an [`OpState`]-storable handle, so op crates can spawn
 /// blocking work from inside a native fn.
 #[derive(Clone)]
 pub struct SpawnHandle {
-    work_tx: mpsc::Sender<Task>,
+    work_tx: mpsc::SyncSender<Task>,
+    state: Arc<PoolState>,
 }
 
 impl SpawnHandle {
@@ -242,12 +404,40 @@ impl SpawnHandle {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        self.work_tx
-            .send(Task {
-                id,
-                work: Box::new(work),
-            })
-            .expect("worker threads gone");
+        let cancelled = self.state.canceller.register(id);
+        let task = Task {
+            id,
+            work: Box::new(work),
+            cancelled,
+        };
+        let failure = if self.state.shutting_down.load(Ordering::Acquire) {
+            Some((task, TaskFailure::new("blocking executor is shutting down")))
+        } else if self.state.workers_unavailable() {
+            Some((task, TaskFailure::new("blocking executor has no workers")))
+        } else {
+            match self.work_tx.try_send(task) {
+                Ok(()) => None,
+                Err(mpsc::TrySendError::Full(task)) => {
+                    Some((task, TaskFailure::new("blocking executor queue is full")))
+                }
+                Err(mpsc::TrySendError::Disconnected(task)) => {
+                    Some((task, TaskFailure::new("blocking executor is unavailable")))
+                }
+            }
+        };
+        if let Some((task, failure)) = failure {
+            self.state.canceller.finish(task.id);
+            let _ = self.state.completions.send(TaskCompletion {
+                task: task.id,
+                result: Err(failure),
+            });
+        }
+    }
+}
+
+impl PoolState {
+    fn workers_unavailable(&self) -> bool {
+        !self.available.load(Ordering::Acquire)
     }
 }
 
@@ -255,16 +445,60 @@ impl SpawnHandle {
 /// [`ThreadPool`]. For work that blocks for an unbounded time — a subprocess's stdout read, waiting
 /// on a child to exit — where occupying a shared pool worker for the whole duration would starve
 /// everything else. The runtime stores one in [`OpState`]. `run_blocking` spawns a fresh thread per
-/// call; blocked threads cost only memory, not a pool slot.
+/// call; a runtime-wide limit and bounded stack reserve cap their memory cost.
 #[derive(Clone)]
 pub struct CompletionSender {
+    state: Arc<DedicatedState>,
+}
+
+struct DedicatedState {
     tx: mpsc::Sender<TaskCompletion>,
+    canceller: TaskCanceller,
+    active: AtomicUsize,
+    max_threads: usize,
+    stack_size: usize,
+    shutting_down: AtomicBool,
+}
+
+/// Owner for bounded, one-thread-per-operation work that may wait indefinitely. It isolates live
+/// sockets/listeners/children from the finite shared pool without permitting unbounded threads.
+pub struct DedicatedExecutor {
+    state: Arc<DedicatedState>,
+}
+
+impl DedicatedExecutor {
+    pub fn new(
+        max_threads: usize,
+        stack_size: usize,
+        tx: mpsc::Sender<TaskCompletion>,
+        canceller: TaskCanceller,
+    ) -> Self {
+        Self {
+            state: Arc::new(DedicatedState {
+                tx,
+                canceller,
+                active: AtomicUsize::new(0),
+                max_threads: max_threads.max(1),
+                stack_size: stack_size.max(64 << 10),
+                shutting_down: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub fn handle(&self) -> CompletionSender {
+        CompletionSender {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl Drop for DedicatedExecutor {
+    fn drop(&mut self) {
+        self.state.shutting_down.store(true, Ordering::Release);
+    }
 }
 
 impl CompletionSender {
-    pub fn new(tx: mpsc::Sender<TaskCompletion>) -> CompletionSender {
-        CompletionSender { tx }
-    }
     /// Run `work` on a new dedicated thread; its result comes back to the loop as a
     /// [`TaskCompletion`] tagged with `id` (settled through the [`TaskRegistry`], like pool work).
     pub fn run_blocking(
@@ -272,11 +506,53 @@ impl CompletionSender {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = work();
-            let _ = tx.send(TaskCompletion { task: id, result });
-        });
+        let cancelled = self.state.canceller.register(id);
+        let acquired = self
+            .state
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.state.max_threads).then_some(active + 1)
+            })
+            .is_ok();
+        if self.state.shutting_down.load(Ordering::Acquire) || !acquired {
+            self.state.canceller.finish(id);
+            let message = if acquired {
+                self.state.active.fetch_sub(1, Ordering::AcqRel);
+                "dedicated executor is shutting down"
+            } else {
+                "dedicated executor thread limit reached"
+            };
+            let _ = self.state.tx.send(TaskCompletion {
+                task: id,
+                result: Err(TaskFailure::new(message)),
+            });
+            return;
+        }
+
+        let state = Arc::clone(&self.state);
+        let spawn = std::thread::Builder::new()
+            .name(format!("lumen-dedicated-{id}"))
+            .stack_size(state.stack_size)
+            .spawn(move || {
+                let result = if cancelled.load(Ordering::Acquire) {
+                    Err(TaskFailure::new("blocking task was cancelled"))
+                } else {
+                    run_task(Box::new(work))
+                };
+                state.canceller.finish(id);
+                state.active.fetch_sub(1, Ordering::AcqRel);
+                let _ = state.tx.send(TaskCompletion { task: id, result });
+            });
+        if let Err(error) = spawn {
+            self.state.canceller.finish(id);
+            self.state.active.fetch_sub(1, Ordering::AcqRel);
+            let _ = self.state.tx.send(TaskCompletion {
+                task: id,
+                result: Err(TaskFailure::new(format!(
+                    "spawn dedicated blocking thread: {error}"
+                ))),
+            });
+        }
     }
 }
 
@@ -287,10 +563,16 @@ pub type TaskDecoder = fn(&mut Ctx, Box<dyn Any + Send>) -> Result<Vec<Value>, V
 /// In-flight async tasks: `TaskId -> (JS callback, payload decoder)`. Lives in [`OpState`];
 /// the op that spawns work registers here, the loop settles from [`TaskCompletion`]s. The
 /// event loop stays alive while this is non-empty.
-#[derive(Default)]
 pub struct TaskRegistry {
     next: TaskId,
     map: std::collections::HashMap<TaskId, TaskEntry>,
+    canceller: TaskCanceller,
+}
+
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self::with_canceller(TaskCanceller::default())
+    }
 }
 
 /// How to settle one in-flight task: success callback, optional failure callback (a promise's
@@ -306,6 +588,14 @@ pub struct TaskEntry {
 }
 
 impl TaskRegistry {
+    pub fn with_canceller(canceller: TaskCanceller) -> Self {
+        Self {
+            next: 0,
+            map: std::collections::HashMap::new(),
+            canceller,
+        }
+    }
+
     /// Reserve an id for work about to be spawned, remembering how to settle it.
     pub fn register(&mut self, on_ok: Value, on_err: Option<Value>, decode: TaskDecoder) -> TaskId {
         let id = self.next;
@@ -323,6 +613,12 @@ impl TaskRegistry {
     }
     /// Claim a completed task's settlement entry (a missing id means it was cancelled).
     pub fn take(&mut self, id: TaskId) -> Option<TaskEntry> {
+        self.canceller.finish(id);
+        self.map.remove(&id)
+    }
+    /// Cancel a pending settlement and prevent its queued native work from starting.
+    pub fn cancel(&mut self, id: TaskId) -> Option<TaskEntry> {
+        self.canceller.cancel(id);
         self.map.remove(&id)
     }
     /// Mark a pending task as `unref`'d (see [`TaskEntry::unref`]).
@@ -347,13 +643,30 @@ impl TaskRegistry {
     }
 }
 
+impl Drop for TaskRegistry {
+    fn drop(&mut self) {
+        for id in self.map.keys() {
+            self.canceller.cancel(*id);
+        }
+    }
+}
+
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Closing the work channel ends each worker's recv loop; join so no worker outlives
-        // the runtime that owns the completion receiver.
+        self.state.shutting_down.store(true, Ordering::Release);
+        self.state.available.store(false, Ordering::Release);
         self.work_tx.take();
+        // A native call cannot be forcibly unwound safely. Give finite work a short grace period,
+        // join workers that exit, and detach any still inside an OS call so Runtime::drop itself
+        // has a hard latency bound.
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while Instant::now() < deadline && self.workers.iter().any(|worker| !worker.is_finished()) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         for w in self.workers.drain(..) {
-            let _ = w.join();
+            if w.is_finished() {
+                let _ = w.join();
+            }
         }
     }
 }

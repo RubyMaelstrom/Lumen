@@ -11,8 +11,8 @@
 // worker; an uncaught exception emits 'error' on the parent and exits the worker with code 1.
 //
 // Honest throws (semantics lumen cannot honor): SHARE_ENV (realms snapshot the env; there is no
-// shared store), a non-empty transferList (messages are always copied — no SharedArrayBuffer or
-// port transfer), the stdin/stdout/stderr capture options (workers share the process stdio),
+// shared store), MessagePort/SharedArrayBuffer cross-thread sharing, the stdin/stdout/stderr
+// capture options (workers share the process stdio),
 // moveMessagePortToContext, postMessageToThread. BroadcastChannel is the same-realm web one.
 {
   const EventEmitter = __builtins.get("events");
@@ -21,7 +21,7 @@
   const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
   const environmentData = new Map();
 
-  const ser = (v) => globalThis.__serializeForClone(v);
+  const ser = (v, transfer) => globalThis.__serializeForClone(v, transfer);
   const deser = (b) => globalThis.__deserializeClone(b);
 
   // The runtime's worker extension installs after this glue and stashes its ops in a hidden
@@ -33,17 +33,6 @@
       throw new Error("worker_threads Worker requires the lumen runtime (worker ops not installed)");
     }
     return workerOps;
-  }
-
-  function checkTransferList(transfer) {
-    const list = Array.isArray(transfer)
-      ? transfer
-      : transfer && typeof transfer === "object" && Array.isArray(transfer.transfer)
-        ? transfer.transfer
-        : [];
-    if (list.length > 0) {
-      throw new Error("worker_threads transferList is not supported in lumen (messages are always copied)");
-    }
   }
 
   // Worker-side uncaught errors travel as "Name: message" text; rebuild a matching Error here.
@@ -106,7 +95,7 @@
         env,
         envData: environmentData,
         entry: options.eval ? "[worker eval]" : entry,
-      });
+      }, options.transferList);
       const res = ops.spawn(entry, isModule, (kind, a) => this.#onEvent(kind, a), {
         node: true,
         eval: !!options.eval,
@@ -144,9 +133,8 @@
       }
     }
     postMessage(value, transferList) {
-      checkTransferList(transferList);
       if (this.#exited) return;
-      getWorkerOps().post(this.#id, ser(value));
+      getWorkerOps().post(this.#id, ser(value, transferList));
     }
     terminate(callback) {
       // Legacy callback form, still honored by Node alongside the promise.
@@ -194,8 +182,8 @@
     SHARE_ENV,
     resourceLimits: {},
     Worker,
-    // The same-realm entangled pair from the web glue; transferring a port across threads is what
-    // the non-empty-transferList throw above refuses.
+    // The same-realm entangled pair from the web glue. ArrayBuffers transfer; moving a MessagePort
+    // into another OS-thread realm remains unsupported.
     MessageChannel: globalThis.MessageChannel,
     MessagePort: globalThis.MessagePort,
     BroadcastChannel: globalThis.BroadcastChannel,
@@ -270,9 +258,8 @@
           });
         }
         postMessage(value, transferList) {
-          checkTransferList(transferList);
           if (this.#closed) return;
-          wself.post(ser(value));
+          wself.post(ser(value, transferList));
         }
         // Node's MessagePort is also an EventTarget; alias the listener API.
         addEventListener(type, fn) {

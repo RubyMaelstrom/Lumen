@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_int, c_long, c_void};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 type SslMethod = c_void;
@@ -92,6 +93,21 @@ struct Api {
     err_error_string: ErrErrorString,
 }
 
+// OpenSSL 1.1 and later initialize their process-global state internally and make both the
+// immutable function table and SSL_CTX safe to use from multiple threads. The dynamic libraries
+// remain loaded for as long as the cached Api is reachable.
+unsafe impl Send for Api {}
+unsafe impl Sync for Api {}
+
+static API: OnceLock<Result<Arc<Api>, String>> = OnceLock::new();
+
+fn api() -> Result<Arc<Api>, String> {
+    API.get_or_init(|| Api::load().map(Arc::new))
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(Clone::clone)
+}
+
 impl Api {
     fn load() -> Result<Self, String> {
         let crypto = Library::open_candidates(crypto_candidates())?;
@@ -148,12 +164,36 @@ impl Api {
     }
 }
 
+struct ContextInner {
+    api: Arc<Api>,
+    context: *mut SslCtx,
+    verify_peer: bool,
+    _alpn_config: Option<Box<AlpnConfig>>,
+}
+
+// An SSL_CTX is explicitly designed to create independent SSL connections concurrently. Its
+// session cache and certificate store are synchronized by OpenSSL.
+unsafe impl Send for ContextInner {}
+unsafe impl Sync for ContextInner {}
+
+impl Drop for ContextInner {
+    fn drop(&mut self) {
+        unsafe { (self.api.ctx_free)(self.context) };
+    }
+}
+
+/// Reusable client-side OpenSSL configuration and session-cache scope.
+#[derive(Clone)]
+pub struct ClientContext(Arc<ContextInner>);
+
+/// Reusable server-side certificate, ALPN configuration, and OpenSSL session-cache scope.
+#[derive(Clone)]
+pub struct ServerContext(Arc<ContextInner>);
+
 pub struct TlsStream {
     stream: TcpStream,
-    api: Api,
-    context: *mut SslCtx,
+    context: Arc<ContextInner>,
     ssl: *mut Ssl,
-    _alpn_config: Option<Box<AlpnConfig>>,
 }
 
 struct AlpnConfig(Vec<Vec<u8>>);
@@ -196,26 +236,9 @@ unsafe extern "C" fn select_alpn(
 // is never accessed concurrently; OpenSSL permits an SSL connection to move between OS threads.
 unsafe impl Send for TlsStream {}
 
-impl TlsStream {
-    pub fn connect(stream: TcpStream, hostname: &str) -> Result<Self, String> {
-        Self::connect_with_options(stream, hostname, &[], true)
-    }
-
-    pub fn connect_with_alpn(
-        stream: TcpStream,
-        hostname: &str,
-        protocols: &[String],
-    ) -> Result<Self, String> {
-        Self::connect_with_options(stream, hostname, protocols, true)
-    }
-
-    pub fn connect_with_options(
-        stream: TcpStream,
-        hostname: &str,
-        protocols: &[String],
-        verify_peer: bool,
-    ) -> Result<Self, String> {
-        let api = Api::load()?;
+impl ClientContext {
+    pub fn new(verify_peer: bool) -> Result<Self, String> {
+        let api = api()?;
         let method: ClientMethod = unsafe { api._ssl_lib.function("TLS_client_method")? };
         let context = unsafe { (api.ctx_new)(method()) };
         if context.is_null() {
@@ -226,87 +249,22 @@ impl TlsStream {
             unsafe { (api.ctx_free)(context) };
             return Err("OpenSSL could not load default CA paths".into());
         }
-        let ssl = unsafe { (api.ssl_new)(context) };
-        if ssl.is_null() {
-            unsafe { (api.ctx_free)(context) };
-            return Err("SSL_new failed".into());
-        }
-        let host = CString::new(hostname).map_err(|_| "TLS hostname contains NUL".to_string())?;
-        let mut alpn = Vec::new();
-        for protocol in protocols {
-            if protocol.is_empty() || protocol.len() > u8::MAX as usize {
-                unsafe {
-                    (api.ssl_free)(ssl);
-                    (api.ctx_free)(context);
-                }
-                return Err("TLS ALPN protocol names must contain 1 to 255 bytes".into());
-            }
-            alpn.push(protocol.len() as u8);
-            alpn.extend_from_slice(protocol.as_bytes());
-        }
-        const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
-        const TLSEXT_NAMETYPE_HOST_NAME: c_long = 0;
-        if (!alpn.is_empty()
-            && unsafe { (api.ssl_set_alpn)(ssl, alpn.as_ptr(), alpn.len() as u32) } != 0)
-            || unsafe {
-                (api.ssl_ctrl)(
-                    ssl,
-                    SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                    TLSEXT_NAMETYPE_HOST_NAME,
-                    host.as_ptr() as *mut _,
-                )
-            } != 1
-            || (verify_peer && unsafe { (api.ssl_set_host)(ssl, host.as_ptr()) } != 1)
-            || unsafe { (api.ssl_set_fd)(ssl, stream.as_raw_fd()) } != 1
-        {
-            unsafe {
-                (api.ssl_free)(ssl);
-                (api.ctx_free)(context);
-            }
-            return Err("failed to configure TLS hostname or socket".into());
-        }
-        let result = unsafe { (api.ssl_connect)(ssl) };
-        if result != 1 {
-            let code = unsafe { (api.ssl_get_error)(ssl, result) };
-            let detail = api.error_queue();
-            unsafe {
-                (api.ssl_free)(ssl);
-                (api.ctx_free)(context);
-            }
-            return Err(format!("TLS handshake failed (SSL error {code}: {detail})"));
-        }
-        let verify = unsafe { (api.verify_result)(ssl) };
-        if verify_peer && verify != 0 {
-            unsafe {
-                (api.ssl_free)(ssl);
-                (api.ctx_free)(context);
-            }
-            return Err(format!("TLS certificate verification failed ({verify})"));
-        }
-        Ok(Self {
-            stream,
+        Ok(Self(Arc::new(ContextInner {
             api,
             context,
-            ssl,
+            verify_peer,
             _alpn_config: None,
-        })
+        })))
     }
+}
 
-    pub fn accept(
-        stream: TcpStream,
-        certificate_pem: &[u8],
-        private_key_pem: &[u8],
-    ) -> Result<Self, String> {
-        Self::accept_with_alpn(stream, certificate_pem, private_key_pem, &[])
-    }
-
-    pub fn accept_with_alpn(
-        stream: TcpStream,
+impl ServerContext {
+    pub fn new(
         certificate_pem: &[u8],
         private_key_pem: &[u8],
         protocols: &[String],
     ) -> Result<Self, String> {
-        let api = Api::load()?;
+        let api = api()?;
         let method: ServerMethod = unsafe { api._ssl_lib.function("TLS_server_method")? };
         let context = unsafe { (api.ctx_new)(method()) };
         if context.is_null() {
@@ -347,7 +305,7 @@ impl TlsStream {
         let mut alpn_config = if protocols.is_empty() {
             None
         } else {
-            let values = protocols
+            let values = match protocols
                 .iter()
                 .map(|protocol| {
                     if protocol.is_empty() || protocol.len() > u8::MAX as usize {
@@ -356,7 +314,14 @@ impl TlsStream {
                         Ok(protocol.as_bytes().to_vec())
                     }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(values) => values,
+                Err(error) => {
+                    unsafe { (api.ctx_free)(context) };
+                    return Err(error);
+                }
+            };
             Some(Box::new(AlpnConfig(values)))
         };
         if let Some(config) = &mut alpn_config {
@@ -368,36 +333,158 @@ impl TlsStream {
                 )
             };
         }
-        let ssl = unsafe { (api.ssl_new)(context) };
+        Ok(Self(Arc::new(ContextInner {
+            api,
+            context,
+            verify_peer: false,
+            _alpn_config: alpn_config,
+        })))
+    }
+}
+
+static VERIFIED_CLIENT_CONTEXT: OnceLock<Result<ClientContext, String>> = OnceLock::new();
+static UNVERIFIED_CLIENT_CONTEXT: OnceLock<Result<ClientContext, String>> = OnceLock::new();
+
+fn cached_client_context(verify_peer: bool) -> Result<ClientContext, String> {
+    let slot = if verify_peer {
+        &VERIFIED_CLIENT_CONTEXT
+    } else {
+        &UNVERIFIED_CLIENT_CONTEXT
+    };
+    slot.get_or_init(|| ClientContext::new(verify_peer)).clone()
+}
+
+impl TlsStream {
+    pub fn connect(stream: TcpStream, hostname: &str) -> Result<Self, String> {
+        Self::connect_with_options(stream, hostname, &[], true)
+    }
+
+    pub fn connect_with_alpn(
+        stream: TcpStream,
+        hostname: &str,
+        protocols: &[String],
+    ) -> Result<Self, String> {
+        Self::connect_with_options(stream, hostname, protocols, true)
+    }
+
+    pub fn connect_with_options(
+        stream: TcpStream,
+        hostname: &str,
+        protocols: &[String],
+        verify_peer: bool,
+    ) -> Result<Self, String> {
+        let context = cached_client_context(verify_peer)?;
+        Self::connect_with_context(stream, hostname, protocols, &context)
+    }
+
+    pub fn connect_with_context(
+        stream: TcpStream,
+        hostname: &str,
+        protocols: &[String],
+        context: &ClientContext,
+    ) -> Result<Self, String> {
+        let context = context.0.clone();
+        let api = &context.api;
+        let verify_peer = context.verify_peer;
+        let ssl = unsafe { (api.ssl_new)(context.context) };
         if ssl.is_null() {
-            unsafe { (api.ctx_free)(context) };
+            return Err("SSL_new failed".into());
+        }
+        let host = match CString::new(hostname) {
+            Ok(host) => host,
+            Err(_) => {
+                unsafe { (api.ssl_free)(ssl) };
+                return Err("TLS hostname contains NUL".into());
+            }
+        };
+        let mut alpn = Vec::new();
+        for protocol in protocols {
+            if protocol.is_empty() || protocol.len() > u8::MAX as usize {
+                unsafe { (api.ssl_free)(ssl) };
+                return Err("TLS ALPN protocol names must contain 1 to 255 bytes".into());
+            }
+            alpn.push(protocol.len() as u8);
+            alpn.extend_from_slice(protocol.as_bytes());
+        }
+        const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
+        const TLSEXT_NAMETYPE_HOST_NAME: c_long = 0;
+        if (!alpn.is_empty()
+            && unsafe { (api.ssl_set_alpn)(ssl, alpn.as_ptr(), alpn.len() as u32) } != 0)
+            || unsafe {
+                (api.ssl_ctrl)(
+                    ssl,
+                    SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                    TLSEXT_NAMETYPE_HOST_NAME,
+                    host.as_ptr() as *mut _,
+                )
+            } != 1
+            || (verify_peer && unsafe { (api.ssl_set_host)(ssl, host.as_ptr()) } != 1)
+            || unsafe { (api.ssl_set_fd)(ssl, stream.as_raw_fd()) } != 1
+        {
+            unsafe { (api.ssl_free)(ssl) };
+            return Err("failed to configure TLS hostname or socket".into());
+        }
+        let result = unsafe { (api.ssl_connect)(ssl) };
+        if result != 1 {
+            let code = unsafe { (api.ssl_get_error)(ssl, result) };
+            let detail = api.error_queue();
+            unsafe { (api.ssl_free)(ssl) };
+            return Err(format!("TLS handshake failed (SSL error {code}: {detail})"));
+        }
+        let verify = unsafe { (api.verify_result)(ssl) };
+        if verify_peer && verify != 0 {
+            unsafe { (api.ssl_free)(ssl) };
+            return Err(format!("TLS certificate verification failed ({verify})"));
+        }
+        Ok(Self {
+            stream,
+            context,
+            ssl,
+        })
+    }
+
+    pub fn accept(
+        stream: TcpStream,
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+    ) -> Result<Self, String> {
+        Self::accept_with_alpn(stream, certificate_pem, private_key_pem, &[])
+    }
+
+    pub fn accept_with_alpn(
+        stream: TcpStream,
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+        protocols: &[String],
+    ) -> Result<Self, String> {
+        let context = ServerContext::new(certificate_pem, private_key_pem, protocols)?;
+        Self::accept_with_context(stream, &context)
+    }
+
+    pub fn accept_with_context(stream: TcpStream, context: &ServerContext) -> Result<Self, String> {
+        let context = context.0.clone();
+        let api = &context.api;
+        let ssl = unsafe { (api.ssl_new)(context.context) };
+        if ssl.is_null() {
             return Err("SSL_new failed".into());
         }
         if unsafe { (api.ssl_set_fd)(ssl, stream.as_raw_fd()) } != 1 {
-            unsafe {
-                (api.ssl_free)(ssl);
-                (api.ctx_free)(context);
-            }
+            unsafe { (api.ssl_free)(ssl) };
             return Err("failed to configure TLS server socket".into());
         }
         let result = unsafe { (api.ssl_accept)(ssl) };
         if result != 1 {
             let code = unsafe { (api.ssl_get_error)(ssl, result) };
             let detail = api.error_queue();
-            unsafe {
-                (api.ssl_free)(ssl);
-                (api.ctx_free)(context);
-            }
+            unsafe { (api.ssl_free)(ssl) };
             return Err(format!(
                 "TLS server handshake failed (SSL error {code}: {detail})"
             ));
         }
         Ok(Self {
             stream,
-            api,
             context,
             ssl,
-            _alpn_config: alpn_config,
         })
     }
 
@@ -405,8 +492,15 @@ impl TlsStream {
         self.stream.set_read_timeout(timeout)
     }
 
+    /// Switch the transport used by OpenSSL between blocking and nonblocking operation. Callers
+    /// using nonblocking mode must retry `Interrupted` I/O after the socket becomes ready; the
+    /// WebSocket transport uses this to wait outside its per-connection SSL serialization lock.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
+
     pub fn protocol(&self) -> String {
-        let value = unsafe { (self.api.ssl_get_version)(self.ssl) };
+        let value = unsafe { (self.context.api.ssl_get_version)(self.ssl) };
         if value.is_null() {
             String::new()
         } else {
@@ -417,11 +511,11 @@ impl TlsStream {
     }
 
     pub fn cipher(&self) -> String {
-        let cipher = unsafe { (self.api.ssl_get_cipher)(self.ssl) };
+        let cipher = unsafe { (self.context.api.ssl_get_cipher)(self.ssl) };
         if cipher.is_null() {
             return String::new();
         }
-        let value = unsafe { (self.api.cipher_get_name)(cipher) };
+        let value = unsafe { (self.context.api.cipher_get_name)(cipher) };
         if value.is_null() {
             String::new()
         } else {
@@ -434,7 +528,7 @@ impl TlsStream {
     pub fn alpn_protocol(&self) -> String {
         let mut data = std::ptr::null();
         let mut length = 0;
-        unsafe { (self.api.ssl_get_alpn)(self.ssl, &mut data, &mut length) };
+        unsafe { (self.context.api.ssl_get_alpn)(self.ssl, &mut data, &mut length) };
         if data.is_null() || length == 0 {
             return String::new();
         }
@@ -443,16 +537,22 @@ impl TlsStream {
     }
 
     fn io_error(&self, result: c_int) -> std::io::Error {
-        let code = unsafe { (self.api.ssl_get_error)(self.ssl, result) };
-        if matches!(code, 2 | 3 | 5) {
-            return std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "TLS operation should retry",
-            );
+        let code = unsafe { (self.context.api.ssl_get_error)(self.ssl, result) };
+        if code == 2 {
+            return std::io::Error::new(std::io::ErrorKind::WouldBlock, "TLS wants socket read");
+        }
+        if code == 3 {
+            return std::io::Error::new(std::io::ErrorKind::Interrupted, "TLS wants socket write");
+        }
+        if code == 5 {
+            let transport = std::io::Error::last_os_error();
+            if transport.raw_os_error().is_some_and(|number| number != 0) {
+                return transport;
+            }
         }
         std::io::Error::other(format!(
             "OpenSSL I/O error {code}: {}",
-            self.api.error_queue()
+            self.context.api.error_queue()
         ))
     }
 }
@@ -518,7 +618,7 @@ impl Read for TlsStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let length = buffer.len().min(c_int::MAX as usize);
         let result = unsafe {
-            (self.api.ssl_read)(self.ssl, buffer.as_mut_ptr() as *mut _, length as c_int)
+            (self.context.api.ssl_read)(self.ssl, buffer.as_mut_ptr() as *mut _, length as c_int)
         };
         if result > 0 {
             Ok(result as usize)
@@ -533,8 +633,9 @@ impl Read for TlsStream {
 impl Write for TlsStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let length = buffer.len().min(c_int::MAX as usize);
-        let result =
-            unsafe { (self.api.ssl_write)(self.ssl, buffer.as_ptr() as *const _, length as c_int) };
+        let result = unsafe {
+            (self.context.api.ssl_write)(self.ssl, buffer.as_ptr() as *const _, length as c_int)
+        };
         if result > 0 {
             Ok(result as usize)
         } else {
@@ -549,9 +650,8 @@ impl Write for TlsStream {
 impl Drop for TlsStream {
     fn drop(&mut self) {
         unsafe {
-            (self.api.ssl_shutdown)(self.ssl);
-            (self.api.ssl_free)(self.ssl);
-            (self.api.ctx_free)(self.context);
+            (self.context.api.ssl_shutdown)(self.ssl);
+            (self.context.api.ssl_free)(self.ssl);
         }
     }
 }
@@ -643,7 +743,12 @@ mod tests {
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
     #[test]
     fn loads_verified_client_api() {
-        Api::load().expect("system OpenSSL should load");
+        let first = api().expect("system OpenSSL should load");
+        let second = api().expect("system OpenSSL should stay cached");
+        assert!(Arc::ptr_eq(&first, &second));
+        let first = cached_client_context(true).expect("verified context");
+        let second = cached_client_context(true).expect("cached verified context");
+        assert!(Arc::ptr_eq(&first.0, &second.0));
     }
 
     #[test]
@@ -681,8 +786,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
+            let context = ServerContext::new(&cert_bytes, &key_bytes, &[]).unwrap();
             let (tcp, _) = listener.accept().unwrap();
-            let mut tls = TlsStream::accept(tcp, &cert_bytes, &key_bytes).unwrap();
+            let mut tls = TlsStream::accept_with_context(tcp, &context).unwrap();
             let mut request = [0u8; 4];
             tls.read_exact(&mut request).unwrap();
             assert_eq!(&request, b"ping");

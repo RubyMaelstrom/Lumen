@@ -5,7 +5,7 @@
 //! thread running in parallel with the worker. This is therefore an engine control completion,
 //! not a JavaScript exception.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -33,27 +33,32 @@ impl InterruptReason {
 /// deadlines are reusable: the host clears/rearms them at the next task boundary.
 #[derive(Debug, Default)]
 pub struct RuntimeInterrupt {
-    cancelled: AtomicBool,
-    user_navigation: AtomicBool,
-    deadline_armed: AtomicBool,
+    /// Active host-control reasons. Keeping the common state in one word makes every execution
+    /// tier's overwhelmingly common "keep running" poll one acquire load; the deadline mutex is
+    /// consulted only when its bit is armed.
+    state: AtomicU8,
     deadline: Mutex<Option<Instant>>,
 }
 
+const CANCELLED: u8 = 1 << 0;
+const USER_NAVIGATION: u8 = 1 << 1;
+const DEADLINE_ARMED: u8 = 1 << 2;
+
 impl RuntimeInterrupt {
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.state.fetch_or(CANCELLED, Ordering::Release);
     }
 
     pub fn request_user_navigation(&self) {
-        self.user_navigation.store(true, Ordering::Release);
+        self.state.fetch_or(USER_NAVIGATION, Ordering::Release);
     }
 
     pub fn begin_user_interaction(&self) {
-        self.user_navigation.store(false, Ordering::Release);
+        self.state.fetch_and(!USER_NAVIGATION, Ordering::Release);
     }
 
     pub fn user_navigation_requested(&self) -> bool {
-        self.user_navigation.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & USER_NAVIGATION != 0
     }
 
     pub fn set_deadline(&self, deadline: Option<Instant>) {
@@ -62,18 +67,23 @@ impl RuntimeInterrupt {
             .deadline
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = deadline;
-        self.deadline_armed.store(armed, Ordering::Release);
+        if armed {
+            self.state.fetch_or(DEADLINE_ARMED, Ordering::Release);
+        } else {
+            self.state.fetch_and(!DEADLINE_ARMED, Ordering::Release);
+        }
     }
 
     /// The currently active reason, in host-control priority order.
     pub fn current_reason(&self) -> Option<InterruptReason> {
-        if self.cancelled.load(Ordering::Acquire) {
+        let state = self.state.load(Ordering::Acquire);
+        if state & CANCELLED != 0 {
             return Some(InterruptReason::Cancelled);
         }
-        if self.user_navigation.load(Ordering::Acquire) {
+        if state & USER_NAVIGATION != 0 {
             return Some(InterruptReason::UserNavigation);
         }
-        if self.deadline_armed.load(Ordering::Acquire)
+        if state & DEADLINE_ARMED != 0
             && self
                 .deadline
                 .lock()
@@ -83,5 +93,43 @@ impl RuntimeInterrupt {
             return Some(InterruptReason::DeadlineExceeded);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InterruptReason, RuntimeInterrupt};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn packed_interrupt_state_preserves_priority_and_reusable_reasons() {
+        let interrupt = RuntimeInterrupt::default();
+        assert_eq!(interrupt.current_reason(), None);
+
+        interrupt.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        assert_eq!(interrupt.current_reason(), None);
+
+        interrupt.request_user_navigation();
+        assert!(interrupt.user_navigation_requested());
+        assert_eq!(
+            interrupt.current_reason(),
+            Some(InterruptReason::UserNavigation)
+        );
+        interrupt.begin_user_interaction();
+        assert!(!interrupt.user_navigation_requested());
+        assert_eq!(interrupt.current_reason(), None);
+
+        interrupt.set_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        assert_eq!(
+            interrupt.current_reason(),
+            Some(InterruptReason::DeadlineExceeded)
+        );
+
+        interrupt.request_user_navigation();
+        interrupt.cancel();
+        assert_eq!(interrupt.current_reason(), Some(InterruptReason::Cancelled));
+        interrupt.begin_user_interaction();
+        interrupt.set_deadline(None);
+        assert_eq!(interrupt.current_reason(), Some(InterruptReason::Cancelled));
     }
 }

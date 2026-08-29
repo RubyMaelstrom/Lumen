@@ -12,6 +12,13 @@ fn run(src: &str) -> String {
     }
 }
 
+fn run_in(engine: &mut Engine, src: &str) -> String {
+    match engine.eval(src, false).expect("parse") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}
+
 fn throws(src: &str) -> String {
     match Engine::new().eval(src, false).expect("parse") {
         Completion::Value(v) => panic!("expected throw, got {v}"),
@@ -62,7 +69,12 @@ fn control_flow() {
 
 #[test]
 fn objects_and_prototypes() {
-    assert_eq!(run("function P(x){ this.x = x; } P.prototype.get = function(){ return this.x; }; new P(42).get()"), "42");
+    assert_eq!(
+        run(
+            "function P(x){ this.x = x; } P.prototype.get = function(){ return this.x; }; new P(42).get()"
+        ),
+        "42"
+    );
     assert_eq!(run("const a = [3,1,2]; a.push(4); a.length"), "4");
     assert_eq!(run("[1,2,3].map(x => x*2).join(',')"), "2,4,6");
     assert_eq!(
@@ -82,6 +94,24 @@ fn errors_have_names() {
     assert_eq!(
         run("try { throw new TypeError('m') } catch (e) { e.message }"),
         "m"
+    );
+}
+
+#[test]
+fn regexp_resource_exhaustion_throws_instead_of_becoming_no_match() {
+    // RegExpBuiltinExec returns null only for the matcher's failure result. An implementation
+    // limit is an abrupt completion, not permission to silently select the no-match branch.
+    assert_eq!(
+        run(r#"
+            const re = /(a|aa)*b/y;
+            try {
+                re.test("a".repeat(40));
+                "returned";
+            } catch (error) {
+                error.name + ":" + re.lastIndex;
+            }
+        "#),
+        "RangeError:0"
     );
 }
 
@@ -330,15 +360,21 @@ fn classes_inheritance() {
 #[test]
 fn instanceof_default_intrinsic_and_override() {
     assert_eq!(
-        run("function A(){} function B(){} B.prototype=Object.create(A.prototype); var b=new B(); [b instanceof B,b instanceof A,b instanceof Array].join(',')"),
+        run(
+            "function A(){} function B(){} B.prototype=Object.create(A.prototype); var b=new B(); [b instanceof B,b instanceof A,b instanceof Array].join(',')"
+        ),
         "true,true,false"
     );
     assert_eq!(
-        run("var calls=0; var rhs={[Symbol.hasInstance](v){calls++;return v===7}}; [(7 instanceof rhs),(8 instanceof rhs),calls].join(',')"),
+        run(
+            "var calls=0; var rhs={[Symbol.hasInstance](v){calls++;return v===7}}; [(7 instanceof rhs),(8 instanceof rhs),calls].join(',')"
+        ),
         "true,false,2"
     );
     assert_eq!(
-        run("function C(){} var calls=0; var p=new Proxy({}, {getPrototypeOf(){calls++;return C.prototype}}); [(p instanceof C),calls].join(',')"),
+        run(
+            "function C(){} var calls=0; var p=new Proxy({}, {getPrototypeOf(){calls++;return C.prototype}}); [(p instanceof C),calls].join(',')"
+        ),
         "true,1"
     );
     // Warm the JIT cache, then mutate facts that shapes do and do not encode. Replacing the
@@ -523,7 +559,9 @@ fn function_constructor() {
 fn function_apply_dense_and_observable_fallbacks() {
     assert_eq!(run("Math.max.apply(null,[3,7,4])"), "7");
     assert_eq!(
-        run("var hits=0,a=[1,2];Object.defineProperty(a,'1',{get(){hits++;return 9}});Math.max.apply(null,a)+','+hits"),
+        run(
+            "var hits=0,a=[1,2];Object.defineProperty(a,'1',{get(){hits++;return 9}});Math.max.apply(null,a)+','+hits"
+        ),
         "9,1"
     );
     assert_eq!(run("Array.prototype[1]=8;Math.max.apply(null,[3,,4])"), "8");
@@ -585,6 +623,159 @@ fn symbols() {
     assert_eq!(run("Symbol('z').toString()"), "Symbol(z)");
     assert_eq!(throws("Symbol() + ''"), "TypeError"); // no implicit string coercion
     assert_eq!(throws("+Symbol()"), "TypeError"); // no number coercion
+}
+
+#[test]
+fn symbol_registry_is_agent_owned_and_shared_by_realms() {
+    let mut first = Engine::new();
+    first
+        .eval("Symbol.for('agent-key')", false)
+        .expect("first registry insertion parses");
+    let first_symbol = first.interp.symbol_agent.borrow().global_by_key["agent-key"].clone();
+
+    // Constructing another Engine on the same driver thread must neither clear nor share the
+    // first Agent's registry.
+    let mut second = Engine::new();
+    second
+        .eval("Symbol.for('agent-key')", false)
+        .expect("second registry insertion parses");
+    let second_symbol = second.interp.symbol_agent.borrow().global_by_key["agent-key"].clone();
+    assert!(!std::rc::Rc::ptr_eq(&first_symbol, &second_symbol));
+    first
+        .eval("Symbol.for('agent-key')", false)
+        .expect("first registry remains usable");
+    assert!(std::rc::Rc::ptr_eq(
+        &first_symbol,
+        &first.interp.symbol_agent.borrow().global_by_key["agent-key"]
+    ));
+
+    // A ShadowRealm is a Realm of the same Agent: both registered and well-known Symbols have
+    // the same identity on either side of a wrapped callable boundary.
+    assert!(matches!(
+        first
+            .eval(
+                "var sr = new ShadowRealm();
+                 [sr.evaluate(\"() => Symbol.for('shadow-key')\")() === Symbol.for('shadow-key'),
+                  sr.evaluate(\"() => Symbol.iterator\")() === Symbol.iterator].join(',')",
+                false,
+            )
+            .expect("ShadowRealm symbol checks parse"),
+        Completion::Value(ref value) if value == "true,true"
+    ));
+}
+
+#[test]
+fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
+    let mut engine = Engine::new();
+    let baseline = engine.interp.symbol_agent.borrow().symbols.len();
+    engine
+        .eval(
+            "(() => { const symbol = Symbol('property-only');
+                       globalThis.symbolHolder = { [symbol]: 1 }; })()",
+            false,
+        )
+        .expect("symbol-key setup parses");
+    let held = engine
+        .interp
+        .symbol_agent
+        .borrow()
+        .symbols
+        .values()
+        .filter_map(std::rc::Weak::upgrade)
+        .find(|symbol| symbol.description.as_deref() == Some("property-only"))
+        .expect("symbol property key owns its identity");
+    let weak = std::rc::Rc::downgrade(&held);
+    drop(held);
+
+    engine.interp.gc_collect();
+    assert!(
+        weak.upgrade().is_some(),
+        "live property key lost its Symbol"
+    );
+    assert!(matches!(
+        engine
+            .eval(
+                "var recovered = Object.getOwnPropertySymbols(symbolHolder)[0];
+                 recovered.description + ':' + symbolHolder[recovered]",
+                false,
+            )
+            .expect("property-key recovery parses"),
+        Completion::Value(ref value) if value == "property-only:1"
+    ));
+
+    engine
+        .eval(
+            "delete symbolHolder[recovered]; recovered = null; symbolHolder = null",
+            false,
+        )
+        .expect("symbol-key release parses");
+    engine.interp.gc_collect();
+    assert!(
+        weak.upgrade().is_none(),
+        "deleted property retained its Symbol"
+    );
+
+    // Symbol allocation alone must not become a permanent identity registry. The collector also
+    // prunes weak lookup headers, returning to the baseline after transient churn.
+    engine
+        .eval("for (let i = 0; i < 10000; i++) Symbol('transient')", false)
+        .expect("symbol churn parses");
+    engine.interp.gc_collect();
+    assert_eq!(engine.interp.symbol_agent.borrow().symbols.len(), baseline);
+
+    // In contrast, the Agent's GlobalSymbolRegistry is normatively append-only and strong.
+    engine
+        .eval("Symbol.for('registry-kept')", false)
+        .expect("registered symbol parses");
+    let registered =
+        std::rc::Rc::downgrade(&engine.interp.symbol_agent.borrow().global_by_key["registry-kept"]);
+    engine.interp.gc_collect();
+    assert!(registered.upgrade().is_some());
+    assert_eq!(
+        run("Symbol.keyFor(Symbol.for('registry-kept'))"),
+        "registry-kept"
+    );
+}
+
+#[test]
+fn temporary_symbol_property_keys_keep_their_identity() {
+    // ECMA-262 ToPropertyKey returns an actual Symbol, and OrdinaryOwnPropertyKeys must later
+    // return that same identity. None of these keys has a variable or registry as a second owner.
+    assert_eq!(
+        run("var o={}; o[Symbol('assignment')]=1;
+             Object.getOwnPropertySymbols(o)[0].description"),
+        "assignment"
+    );
+    assert_eq!(
+        run("var o={ [Symbol('literal')]: 1 };
+             Object.getOwnPropertySymbols(o)[0].description"),
+        "literal"
+    );
+    assert_eq!(
+        run(
+            "var o={}; o[{[Symbol.toPrimitive](){return Symbol('coerced')}}]=1;
+             Object.getOwnPropertySymbols(o)[0].description"
+        ),
+        "coerced"
+    );
+    assert_eq!(
+        run("var o={}; o[Symbol('proxy')]=1; var p=new Proxy(o,{});
+             [Object.keys(p).length, typeof Reflect.ownKeys(p)[0],
+              Reflect.ownKeys(p)[0].description].join(',')"),
+        "0,symbol,proxy"
+    );
+    assert_eq!(
+        run("var got=false;
+             Reflect.set(new Proxy({}, {set(t,k){got=typeof k==='symbol';return true}}),
+                         Symbol(), 1); got"),
+        "true"
+    );
+    assert_eq!(
+        run("var C=class { [Symbol('method')](){} [Symbol('field')]=1 };
+             var c=new C; Object.getOwnPropertySymbols(C.prototype)[0].description+','+
+             Object.getOwnPropertySymbols(c)[0].description"),
+        "method,field"
+    );
 }
 
 #[test]
@@ -852,9 +1043,22 @@ fn embedder_can_mirror_and_detach_an_array_buffer() {
         Some(3.0)
     );
     assert!(engine.ctx().array_buffer_set_bytes(&buffer, &[9, 8, 7, 6]));
+    let version = engine
+        .ctx()
+        .array_buffer_version(&buffer)
+        .expect("attached buffer version");
     assert_eq!(
         engine.ctx().buffer_source_bytes(&buffer, false),
         Some(vec![9, 8, 7, 6])
+    );
+    assert!(engine
+        .eval_value_interruptible("new Uint8Array(mirrored)[0] = 4")
+        .expect("view write parses")
+        .is_ok());
+    assert_ne!(
+        engine.ctx().array_buffer_version(&buffer),
+        Some(version),
+        "JavaScript writes advance the embedder mutation generation"
     );
     assert!(!engine.ctx().array_buffer_set_bytes(&buffer, &[1, 2]));
     assert!(engine.ctx().detach_array_buffer(&buffer));
@@ -1116,7 +1320,10 @@ fn promises() {
         "7"
     );
     assert_eq!(
-        after("var r; Promise.all([Promise.resolve(1), Promise.resolve(2), 3]).then(a=>{r=a.join(',');});", "r"),
+        after(
+            "var r; Promise.all([Promise.resolve(1), Promise.resolve(2), 3]).then(a=>{r=a.join(',');});",
+            "r"
+        ),
         "1,2,3"
     );
     assert_eq!(
@@ -1143,7 +1350,12 @@ fn generators() {
         run("function* g(){ yield 1; yield 2; yield 3; } [...g()].join(',')"),
         "1,2,3"
     );
-    assert_eq!(run("function* g(){ yield 1; yield 2; } var it = g(); it.next().value + ',' + it.next().value"), "1,2");
+    assert_eq!(
+        run(
+            "function* g(){ yield 1; yield 2; } var it = g(); it.next().value + ',' + it.next().value"
+        ),
+        "1,2"
+    );
     assert_eq!(
         run("function* g(){ yield 1; } var it=g(); it.next(); it.next().done"),
         "true"
@@ -1156,7 +1368,12 @@ fn generators() {
         run("function* g(){ yield* [1,2]; yield 3; } [...g()].join(',')"),
         "1,2,3"
     );
-    assert_eq!(run("function* g(){ yield 1; return 99; } var it=g(); it.next(); var r=it.next(); r.value+':'+r.done"), "99:true");
+    assert_eq!(
+        run(
+            "function* g(){ yield 1; return 99; } var it=g(); it.next(); var r=it.next(); r.value+':'+r.done"
+        ),
+        "99:true"
+    );
     assert_eq!(
         run("let s=0; function* g(){ yield 10; yield 20; } for (const x of g()) s+=x; s"),
         "30"
@@ -1195,7 +1412,13 @@ fn async_functions() {
         ),
         "9"
     );
-    assert_eq!(after("var r; async function f(){ try { await Promise.reject('e'); } catch(x){ return 'caught'; } } f().then(v=>{r=v;});", "r"), "caught");
+    assert_eq!(
+        after(
+            "var r; async function f(){ try { await Promise.reject('e'); } catch(x){ return 'caught'; } } f().then(v=>{r=v;});",
+            "r"
+        ),
+        "caught"
+    );
 }
 
 #[test]
@@ -1387,7 +1610,9 @@ fn embedder_can_settle_a_host_promise_after_an_external_task() {
 fn gc_keeps_reachable_cycles() {
     // A cycle still reachable from a live binding must survive collection unscathed.
     assert_eq!(
-        run("var o={}; o.self=o; var a=[o]; o.a=a; for(var i=0;i<250000;i++){var t={};t.t=t;} o.a[0].self===o"),
+        run(
+            "var o={}; o.self=o; var a=[o]; o.a=a; for(var i=0;i<250000;i++){var t={};t.t=t;} o.a[0].self===o"
+        ),
         "true"
     );
 }
@@ -1446,8 +1671,188 @@ fn gc_registry_remains_valid_across_repeated_sweeps() {
 }
 
 #[test]
+fn gc_registry_follows_an_agent_across_generator_thread_handoffs() {
+    use std::rc::Rc;
+
+    // ECMA-262 §9.7 Agents makes the executing thread a replaceable component of an Agent, and
+    // §27.5.3.3 GeneratorResume runs the suspended [[GeneratorContext]]. An object and lexical
+    // environment allocated by that context therefore remain owned by the same Agent when Lumen
+    // happens to execute it on a pooled native worker.
+    let mut engine = Engine::new();
+    let scopes_before = crate::value::gc_scope_snapshot(&engine.interp.gc_heap).len();
+    match engine
+        .eval(
+            "function* migrated() {
+                 const local = { madeOnWorker: true };
+                 globalThis.workerObject = local;
+                 yield 1;
+                 return local;
+             }
+             globalThis.heldGenerator = migrated();
+             heldGenerator.next();",
+            false,
+        )
+        .expect("generator setup parses")
+    {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("generator setup threw {name}: {message}"),
+    }
+
+    let worker_object = match engine
+        .interp
+        .global
+        .borrow()
+        .props
+        .get("workerObject")
+        .map(|property| property.value())
+    {
+        Some(crate::value::Value::Obj(object)) => object,
+        _ => panic!("generator did not publish its worker-allocated object"),
+    };
+    let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+    assert!(
+        snapshot
+            .iter()
+            .any(|object| Rc::ptr_eq(object, &worker_object)),
+        "the Agent heap omitted an object allocated by its suspended execution context"
+    );
+    let scopes_after = crate::value::gc_scope_snapshot(&engine.interp.gc_heap).len();
+    assert!(
+        scopes_after > scopes_before,
+        "the Agent heap omitted the suspended generator's lexical environment"
+    );
+
+    // Complete the body, then exercise collection after its worker-created values return to and
+    // are ultimately released by the driver thread.
+    match engine
+        .eval(
+            "heldGenerator.next(); delete globalThis.heldGenerator; delete globalThis.workerObject;",
+            false,
+        )
+        .expect("generator completion parses")
+    {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => {
+            panic!("generator completion threw {name}: {message}")
+        }
+    }
+    drop(snapshot);
+    drop(worker_object);
+    engine.interp.collect_garbage_for_host();
+    match engine.eval("6 * 7", false).expect("realm remains usable") {
+        Completion::Value(value) => assert_eq!(value, "42"),
+        Completion::Throw { name, message } => {
+            panic!("realm threw after migrated object collection: {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
+    use std::rc::Rc;
+
+    let mut first = Engine::new();
+    let mut second = Engine::new();
+    let _ = first
+        .eval("globalThis.agentMarker = { agent: 1 }", false)
+        .expect("first Agent script parses");
+    let _ = second
+        .eval("globalThis.agentMarker = { agent: 2 }", false)
+        .expect("second Agent script parses");
+
+    let first_object = match first
+        .interp
+        .global
+        .borrow()
+        .props
+        .get("agentMarker")
+        .map(|property| property.value())
+    {
+        Some(crate::value::Value::Obj(object)) => object,
+        _ => panic!("first Agent marker missing"),
+    };
+    let second_object = match second
+        .interp
+        .global
+        .borrow()
+        .props
+        .get("agentMarker")
+        .map(|property| property.value())
+    {
+        Some(crate::value::Value::Obj(object)) => object,
+        _ => panic!("second Agent marker missing"),
+    };
+    let first_snapshot = crate::value::heap_gc_snapshot(&first.interp.gc_heap);
+    let second_snapshot = crate::value::heap_gc_snapshot(&second.interp.gc_heap);
+
+    assert!(first_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &first_object)));
+    assert!(!first_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &second_object)));
+    assert!(second_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &second_object)));
+    assert!(!second_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &first_object)));
+}
+
+#[test]
+fn object_shapes_follow_the_agent_across_generator_thread_handoffs() {
+    // Shape identity is an implementation guard for ECMA-262 §§10.1.5, 10.1.8, and 10.1.9:
+    // equal identities must prove the same ordered own-property layout before a cached slot can
+    // stand in for [[GetOwnProperty]]. Native-thread-local tables both lost convergence at a
+    // handoff and eventually recycled ids into unrelated layouts.
+    let mut engine = Engine::new();
+    let _ = engine
+        .eval(
+            "const mainObject = {}; mainObject.shared = 1;
+             globalThis.mainObject = mainObject;
+             globalThis.mainArray = [1, 2];
+             function* buildOnWorker() {
+                 const workerObject = {}; workerObject.shared = 2;
+                 globalThis.workerObject = workerObject;
+                 globalThis.workerArray = [3, 4];
+                 yield 1;
+             }
+             globalThis.shapeGenerator = buildOnWorker();
+             shapeGenerator.next();",
+            false,
+        )
+        .expect("shape handoff script parses");
+
+    let get_object = |name: &str| match engine
+        .interp
+        .global
+        .borrow()
+        .props
+        .get(name)
+        .map(|property| property.value())
+    {
+        Some(crate::value::Value::Obj(object)) => object,
+        _ => panic!("{name} was not published as an object"),
+    };
+    let main_object = get_object("mainObject");
+    let worker_object = get_object("workerObject");
+    let main_array = get_object("mainArray");
+    let worker_array = get_object("workerArray");
+
+    assert_eq!(
+        main_object.borrow().props.shape(),
+        worker_object.borrow().props.shape(),
+        "the same named-property transition diverged across native threads"
+    );
+    assert_eq!(
+        main_array.borrow().props.shape(),
+        worker_array.borrow().props.shape(),
+        "the Agent-local intrinsic array shape memo diverged across native threads"
+    );
+}
+
+#[test]
 fn moving_and_dropping_an_engine_safely_stops_suspended_generators() {
-    let acknowledged_before = crate::coroutine::termination_acknowledgements();
     let mut engine = Engine::new();
     match engine
         .eval(
@@ -1471,24 +1876,681 @@ fn moving_and_dropping_an_engine_safely_stops_suspended_generators() {
         Completion::Throw { name, message } => panic!("generator resume threw {name}: {message}"),
     }
     drop(moved_engine);
-    assert!(
-        crate::coroutine::termination_acknowledgements() > acknowledged_before,
-        "dropping the engine did not receive the suspended worker's unwind acknowledgement"
+}
+
+#[test]
+fn recursive_calls_reach_the_interpreter_guard_on_every_continuation() {
+    // Generator VM continuations and ordinary execution share the conservative native recursion
+    // limit: useful recursion succeeds, while crossing the limit is a catchable JS RangeError
+    // rather than a process-ending native stack overflow on a 2 MiB host thread.
+    assert_eq!(
+        run(
+            "function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(64)} g().next().value"
+        ),
+        "64"
+    );
+    assert_eq!(
+        run(
+            "function recurse(n){return n ? 1+recurse(n-1) : 0} var guarded=false; try{recurse(180)}catch(e){guarded=e instanceof RangeError && /Maximum call stack/.test(e.message)} guarded"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(180)} var guarded=false; try{g().next()}catch(e){guarded=e instanceof RangeError && /Maximum call stack/.test(e.message)} guarded"
+        ),
+        "true"
     );
 }
 
 #[test]
-fn coroutine_stack_reaches_the_interpreter_recursion_guard() {
-    // Coroutine workers reserve a bounded native stack. Keep enough headroom for the documented
-    // interpreter limit, and verify that going beyond it becomes a catchable JS RangeError rather
-    // than a process-ending native stack overflow.
+fn embedder_recursion_budget_preserves_the_default_and_supports_large_host_stacks() {
+    // ECMA-262 §9.4 specifies execution-context stacking without prescribing a finite native
+    // capacity. Keep the default safe for ordinary test threads, while proving that an embedder
+    // which provisions a larger stack can raise the realm-local guard on every execution tier.
+    let value = std::thread::Builder::new()
+        .name(String::from("lumen-depth-budget-test"))
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut engine = Engine::new();
+            engine.set_tier(crate::bytecode::Tier::Jit);
+            engine.set_tier_threshold(0);
+            engine.set_max_eval_depth(256);
+            match engine
+                .eval(
+                    "function recurse(n){return n ? 1+recurse(n-1) : 0} recurse(180)",
+                    false,
+                )
+                .expect("configured recursion fixture parses")
+            {
+                Completion::Value(value) => value,
+                Completion::Throw { name, message } => {
+                    panic!("configured recursion fixture threw {name}: {message}")
+                }
+            }
+        })
+        .expect("spawn configured recursion test")
+        .join()
+        .expect("configured recursion thread");
+    assert_eq!(value, "180");
+}
+
+#[test]
+fn yield_and_yield_star_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* values(){let x=yield 1;try{yield x+1}catch(e){yield e}} globalThis.iterator=values()",
+            false,
+        )
+        .expect("generator setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match engine
+        .eval(
+            "let a=iterator.next();let b=iterator.next(4);let c=iterator.throw(9);`${a.value},${b.value},${c.value}`",
+            false,
+        )
+        .expect("generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "1,5,9"),
+        Completion::Throw { name, message } => panic!("generator drive threw {name}: {message}"),
+    }
+
+    engine
+        .eval(
+            "async function* asyncValues(){yield await Promise.resolve(3)} globalThis.asyncIterator=asyncValues()",
+            false,
+        )
+        .expect("async generator setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+
+    engine
+        .eval(
+            "function* delegated(){yield* [1,2]} globalThis.fallback=delegated(); fallback.next()",
+            false,
+        )
+        .expect("delegated generator setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+
+    engine
+        .eval(
+            "function* varLoop(){for(var [x] of [[1],[2]])yield x;yield x} globalThis.varIterator=varLoop()",
+            false,
+        )
+        .expect("var for-of generator setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "`${varIterator.next().value},${varIterator.next().value},${varIterator.next().value},${varIterator.next().done}`",
+            false,
+        )
+        .expect("var for-of generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "1,2,2,true"),
+        Completion::Throw { name, message } => {
+            panic!("var for-of generator drive threw {name}: {message}")
+        }
+    }
+
+    let mut interp_tier = Engine::new();
+    interp_tier.set_tier(crate::bytecode::Tier::Interp);
+    interp_tier
+        .eval(
+            "globalThis.gate=new Promise(()=>{});async function wait(){await gate}globalThis.waiting=wait()",
+            false,
+        )
+        .expect("interpreter-tier async setup parses");
+    assert!(interp_tier
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+
+    // FunctionDeclarationInstantiation evaluates a coroutine's parameter defaults exactly once,
+    // before its resumable body starts. VM entry consumes those bound values rather than replaying
+    // the initializer, while `arguments` still reflects the original call list.
     assert_eq!(
-        run("function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(1400)} g().next().value"),
-        "1400"
+        run(
+            "var calls=0;function init(){calls++;return 7}function* defaults(x=init()){yield x;yield calls}var i=defaults();`${calls},${i.next().value},${i.next().value}`"
+        ),
+        "1,7,1"
     );
     assert_eq!(
-        run("function recurse(n){return n ? 1+recurse(n-1) : 0} function* g(){yield recurse(1600)} var guarded=false; try{g().next()}catch(e){guarded=e instanceof RangeError && /Maximum call stack/.test(e.message)} guarded"),
-        "true"
+        run("function* patterned({x=2},...rest){yield x+rest[0]}patterned({},3).next().value"),
+        "5"
+    );
+    assert_eq!(
+        run(
+            "var calls=0;function init(){calls++;return 6}function* captured({x=init()}={}){yield ()=>x}var read=captured().next().value;`${read()},${calls}`"
+        ),
+        "6,1"
+    );
+    let mut async_defaults = Engine::new();
+    async_defaults
+        .eval(
+            "var calls=0;function init(){calls++;return 8}var out='';async function defaults(x=init()){await 0;out=x+','+calls}defaults()",
+            false,
+        )
+        .expect("async default setup parses");
+    match async_defaults
+        .eval("out", false)
+        .expect("async default result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "8,1"),
+        Completion::Throw { name, message } => {
+            panic!("async default result threw {name}: {message}")
+        }
+    }
+    let mut async_patterned = Engine::new();
+    async_patterned
+        .eval(
+            "var out='';async function patterned([x],...rest){await 0;out=x+rest[0]}patterned([4],5)",
+            false,
+        )
+        .expect("async patterned parameter setup parses");
+    assert!(async_patterned
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_patterned
+        .eval("out", false)
+        .expect("async patterned parameter result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "9"),
+        Completion::Throw { name, message } => {
+            panic!("async patterned parameter result threw {name}: {message}")
+        }
+    }
+
+    let mut logical = Engine::new();
+    logical
+        .eval(
+            "var object={p:null},baseCalls=0,keyCalls=0;function base(){baseCalls++;return object}function key(){keyCalls++;return 'p'}function* assignments(){let x=0;x||=yield 7;let untouched=5;untouched||=yield 99;base()[key()]??=yield 8;return `${x},${untouched},${object.p},${baseCalls},${keyCalls}`}globalThis.assignmentIterator=assignments()",
+            false,
+        )
+        .expect("logical assignment generator setup parses");
+    assert!(logical
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match logical
+        .eval(
+            "let a=assignmentIterator.next();let b=assignmentIterator.next(3);let c=assignmentIterator.next(4);`${a.value},${b.value},${c.value},${c.done}`",
+            false,
+        )
+        .expect("logical assignment generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "7,8,3,5,4,1,1,true"),
+        Completion::Throw { name, message } => {
+            panic!("logical assignment generator drive threw {name}: {message}")
+        }
+    }
+
+    assert_eq!(
+        run(
+            "function* closing(){try{yield 1}finally{yield 2}}var i=closing();var a=i.next(),b=i.return(9),c=i.next();`${a.value},${a.done},${b.value},${b.done},${c.value},${c.done}`"
+        ),
+        "1,false,2,false,9,true"
+    );
+    assert_eq!(
+        run(
+            "function* throwing(){try{yield 1}finally{yield 2}}var i=throwing();i.next();var a=i.throw(7),caught;try{i.next()}catch(e){caught=e}`${a.value},${a.done},${caught}`"
+        ),
+        "2,false,7"
+    );
+    assert_eq!(
+        run(
+            "function* overriding(){try{yield 1}finally{return 4}}var i=overriding();i.next();var result=i.throw(7);`${result.value},${result.done}`"
+        ),
+        "4,true"
+    );
+    assert_eq!(
+        run(
+            "function* jumping(){var log=[];outer:for(var i=0;i<3;i++){try{if(i===0)continue;if(i===1)break outer}finally{log.push(i);yield i}}return log.join(',')}var it=jumping(),a=it.next(),b=it.next(),c=it.next();`${a.value},${a.done}|${b.value},${b.done}|${c.value},${c.done}`"
+        ),
+        "0,false|1,false|0,1,true"
+    );
+    assert_eq!(
+        run(
+            "function* nestedJump(){outer:while(true){try{try{break outer}finally{yield 'inner'}}finally{yield 'outer'}}return 'done'}var it=nestedJump(),a=it.next(),b=it.next(),c=it.next();`${a.value},${b.value},${c.value},${c.done}`"
+        ),
+        "inner,outer,done,true"
+    );
+    assert_eq!(
+        run(
+            "function* overrideJump(){var log=[];for(var i=0;i<2;i++){try{break}finally{log.push(i);if(i===0)continue}}return log.join(',')}overrideJump().next().value"
+        ),
+        "0,1"
+    );
+    // A loop target records its actual surrounding handler depth. Breaking a loop nested in a
+    // try/catch must retain that catch for subsequent statements in the same try block.
+    assert_eq!(
+        run(
+            "function* retainCatch(){var caught='';try{while(true){break}throw 3}catch(e){caught=e}yield caught}retainCatch().next().value"
+        ),
+        "3"
+    );
+    assert_eq!(
+        run(
+            "var log=[];var iterator={next(){return{value:1,done:false}},return(){log.push('close');return{} }};var iterable={[Symbol.iterator](){return iterator}};function* closeAfterFinally(){outer:for(var x of iterable){try{break outer}finally{log.push('finally');yield 1;log.push('done')}}return log.join(',')}var it=closeAfterFinally(),a=it.next(),b=it.next();`${a.value},${a.done}|${b.value},${b.done}`"
+        ),
+        "1,false|finally,done,close,true"
+    );
+    // IteratorClose happens while handlers surrounding the for-of are still active. Its abrupt
+    // result replaces the break Completion and is therefore catchable before the target exits.
+    assert_eq!(
+        run(
+            "var iterator={next(){return{value:1,done:false}},return(){throw new RangeError('close')}};var iterable={[Symbol.iterator](){return iterator}};function* closeCaught(){outer:while(true){try{for(var x of iterable){try{break outer}finally{yield 'finally'}}}catch(e){return e.name+':'+e.message}}}var it=closeCaught();it.next();it.next().value"
+        ),
+        "RangeError:close"
+    );
+    assert_eq!(
+        run(
+            "var log=[];function iterable(name){return{[Symbol.iterator](){return{next(){return{value:1,done:false}},return(){log.push(name);return{}}}}}}function* nestedClose(){outer:for(var a of iterable('outer'))for(var b of iterable('inner')){try{break outer}finally{yield 'finally'}}return log.join(',')}var it=nestedClose();it.next();it.next().value"
+        ),
+        "inner,outer"
+    );
+    assert_eq!(
+        run(
+            "var log=[];function iterable(name,fail){return{[Symbol.iterator](){return{next(){return{value:1,done:false}},return(){log.push(name);if(fail)throw new RangeError(name);return{}}}}}}function* nestedCloseThrow(){try{outer:for(var a of iterable('outer',false))for(var b of iterable('inner',true)){try{break outer}finally{yield 'finally'}}}catch(e){return e.message+':'+log.join(',')}}var it=nestedCloseThrow();it.next();it.next().value"
+        ),
+        "inner:inner,outer"
+    );
+    assert_eq!(
+        run(
+            "var log=[];var iterator={next(){return{value:1,done:false}},return(){log.push('close');return{}}};var iterable={[Symbol.iterator](){return iterator}};function* returnThroughLoop(){for(var x of iterable){try{yield x}finally{log.push('finally');yield 2;log.push('done')}}}var it=returnThroughLoop(),a=it.next(),b=it.return(9),c=it.next();`${a.value}|${b.value},${b.done}|${c.value},${c.done}|${log.join(',')}`"
+        ),
+        "1|2,false|9,true|finally,done,close"
+    );
+    assert_eq!(
+        run(
+            "var log=[];function iterable(name){return{[Symbol.iterator](){return{next(){return{value:1,done:false}},return(){log.push(name);return{}}}}}}function* sourceReturn(){for(var a of iterable('outer'))for(var b of iterable('inner'))return 7}var result=sourceReturn().next();`${result.value},${result.done}|${log.join(',')}`"
+        ),
+        "7,true|inner,outer"
+    );
+    assert_eq!(
+        run(
+            "function* labelled(){var log=[];outer:{try{break outer}finally{yield 1;log.push('finally')}log.push('unreachable')}log.push('after');return log.join(',')}var it=labelled(),a=it.next(),b=it.next();`${a.value},${a.done}|${b.value},${b.done}`"
+        ),
+        "1,false|finally,after,true"
+    );
+    assert_eq!(
+        run(
+            "function* stacked(){var n=0;a:b:{while(true){n++;break}break a;n=9}yield n}stacked().next().value"
+        ),
+        "1"
+    );
+    let mut for_in = Engine::new();
+    for_in
+        .eval(
+            "var object={a:1,b:2};function* keys(){var seen=[];for(var key in object){seen.push(key);if(key==='a')delete object.b;yield key}return seen.join(',')}globalThis.keyIterator=keys()",
+            false,
+        )
+        .expect("for-in generator setup parses");
+    assert!(for_in
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match for_in
+        .eval(
+            "var first=keyIterator.next(),last=keyIterator.next();`${first.value},${first.done}|${last.value},${last.done}`",
+            false,
+        )
+        .expect("for-in generator result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "a,false|a,true"),
+        Completion::Throw { name, message } => {
+            panic!("for-in generator result threw {name}: {message}")
+        }
+    }
+    assert_eq!(
+        run(
+            "var calls=0;var target={a:1};var proxy=new Proxy(target,{ownKeys(t){calls++;return Reflect.ownKeys(t)}});function* keys(){for(var key in proxy)yield key;return calls}var it=keys();it.next();it.next().value"
+        ),
+        "1"
+    );
+    assert_eq!(
+        run(
+            "function* pattern(){var first='';for(var [head] in {xy:1})first=head;yield first}pattern().next().value"
+        ),
+        "x"
+    );
+    assert_eq!(
+        run("function* nullKeys(){for(var key in null)yield key;return 3}nullKeys().next().value"),
+        "3"
+    );
+    let mut async_for_in = Engine::new();
+    async_for_in
+        .eval(
+            "var out='pending';async function scan(){var keys=[];for(var key in {a:1,b:2}){await 0;keys.push(key)}return keys.join(',')}scan().then(value=>out=value)",
+            false,
+        )
+        .expect("async for-in setup parses");
+    assert!(async_for_in
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_for_in
+        .eval("out", false)
+        .expect("async for-in result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "a,b"),
+        Completion::Throw { name, message } => {
+            panic!("async for-in result threw {name}: {message}")
+        }
+    }
+    let mut member_loop_heads = Engine::new();
+    member_loop_heads
+        .eval(
+            "var target={},baseCalls=0,keyCalls=0;function base(){baseCalls++;return target}function key(){keyCalls++;return 'value'};function* assign(){for(base()[key()] of [3,4])yield target.value;for(target.name in {a:1})yield target.name}globalThis.memberHeadIterator=assign()",
+            false,
+        )
+        .expect("member loop-head setup parses");
+    assert!(member_loop_heads
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match member_loop_heads
+        .eval(
+            "var a=memberHeadIterator.next(),b=memberHeadIterator.next(),c=memberHeadIterator.next(),d=memberHeadIterator.next();`${a.value},${b.value},${c.value},${d.done}|${baseCalls},${keyCalls}`",
+            false,
+        )
+        .expect("member loop-head result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "3,4,a,true|2,2"),
+        Completion::Throw { name, message } => {
+            panic!("member loop-head result threw {name}: {message}")
+        }
+    }
+
+    let mut async_finally = Engine::new();
+    async_finally
+        .eval(
+            "var out='';async function finalized(){try{await 0;return 3}finally{out+='f';await 0;out+='z'}}finalized().then(value=>out+=value)",
+            false,
+        )
+        .expect("async finally setup parses");
+    assert!(async_finally
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_finally
+        .eval("out", false)
+        .expect("async finally result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "fz3"),
+        Completion::Throw { name, message } => {
+            panic!("async finally result threw {name}: {message}")
+        }
+    }
+
+    let mut async_loop_finally = Engine::new();
+    async_loop_finally
+        .eval(
+            "var out='pending';async function loop(){var log=[];for(var i=0;i<3;i++){try{if(i<2)continue;break}finally{log.push(i);await 0}}return log.join(',')}loop().then(value=>out=value)",
+            false,
+        )
+        .expect("async loop-finally setup parses");
+    assert!(async_loop_finally
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_loop_finally
+        .eval("out", false)
+        .expect("async loop-finally result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "0,1,2"),
+        Completion::Throw { name, message } => {
+            panic!("async loop-finally result threw {name}: {message}")
+        }
+    }
+
+    // ECMA-262 AsyncGeneratorUnwrapYieldResumption awaits a caller-supplied return value before
+    // injecting the Return Completion. That completion must survive both kinds of suspension in
+    // a finally block without being awaited again. A source `return expression` likewise awaits
+    // before its Return Completion enters the finalizer (ECMA-262 §14.10.1).
+    let mut async_generator_finally = Engine::new();
+    async_generator_finally
+        .eval(
+            "var log=[],out='pending';var external={get then(){log.push('external');return r=>r(9)}};\
+             async function* finalized(){try{yield 1}finally{log.push('finally');yield 2;await 0;log.push('done')}}\
+             var finalizedIterator=finalized();finalizedIterator.next().then(()=>finalizedIterator.return(external)).then(first=>{log.push(first.value+':'+first.done);return finalizedIterator.next()}).then(last=>{out=last.value+':'+last.done+'|'+log.join(',')})",
+            false,
+        )
+        .expect("async-generator injected return setup parses");
+    assert!(async_generator_finally
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_generator_finally
+        .eval("out", false)
+        .expect("async-generator injected return result parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "9:true|external,finally,2:false,done")
+        }
+        Completion::Throw { name, message } => {
+            panic!("async-generator injected return result threw {name}: {message}")
+        }
+    }
+
+    let mut async_generator_source_return = Engine::new();
+    async_generator_source_return
+        .eval(
+            "var log=[],out='pending';var source={get then(){log.push('source');return r=>r(4)}};\
+             async function* returning(){try{return source}finally{log.push('finally');await 0;log.push('done')}}\
+             returning().next().then(result=>{out=result.value+':'+result.done+'|'+log.join(',')})",
+            false,
+        )
+        .expect("async-generator source return setup parses");
+    assert!(async_generator_source_return
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_generator_source_return
+        .eval("out", false)
+        .expect("async-generator source return result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "4:true|source,finally,done"),
+        Completion::Throw { name, message } => {
+            panic!("async-generator source return result threw {name}: {message}")
+        }
+    }
+
+    let mut async_generator_override = Engine::new();
+    async_generator_override
+        .eval(
+            "var log=[],out='pending';var external={get then(){log.push('external');return r=>r(9)}};\
+             var override={get then(){log.push('override');return r=>r(5)}};\
+             async function* overriding(){try{yield 1}finally{log.push('finally');return override}}\
+             var overridingIterator=overriding();overridingIterator.next().then(()=>overridingIterator.return(external)).then(result=>{out=result.value+':'+result.done+'|'+log.join(',')})",
+            false,
+        )
+        .expect("async-generator overriding return setup parses");
+    match async_generator_override
+        .eval("out", false)
+        .expect("async-generator overriding return result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "5:true|external,finally,override"),
+        Completion::Throw { name, message } => {
+            panic!("async-generator overriding return result threw {name}: {message}")
+        }
+    }
+
+    let mut async_generator_loop_return = Engine::new();
+    async_generator_loop_return
+        .eval(
+            "var log=[],out='pending';var iterator={next(){return{value:1,done:false}},return(){log.push('close');return{}}};var iterable={[Symbol.iterator](){return iterator}};\
+             async function* values(){for(var x of iterable)yield x}var valuesIterator=values();\
+             valuesIterator.next().then(()=>valuesIterator.return(Promise.resolve(9))).then(result=>{out=result.value+':'+result.done+'|'+log.join(',')})",
+            false,
+        )
+        .expect("async-generator loop return setup parses");
+    assert!(async_generator_loop_return
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_generator_loop_return
+        .eval("out", false)
+        .expect("async-generator loop return result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "9:true|close"),
+        Completion::Throw { name, message } => {
+            panic!("async-generator loop return result threw {name}: {message}")
+        }
+    }
+
+    let mut async_generator_source_loop_return = Engine::new();
+    async_generator_source_loop_return
+        .eval(
+            "var log=[],out='pending';var source={get then(){log.push('await');return r=>r(6)}};\
+             var iterator={next(){return{value:1,done:false}},return(){log.push('close');return{}}};var iterable={[Symbol.iterator](){return iterator}};\
+             async function* returning(){for(var x of iterable)return source}returning().next().then(result=>{out=result.value+':'+result.done+'|'+log.join(',')})",
+            false,
+        )
+        .expect("async-generator source loop return setup parses");
+    match async_generator_source_loop_return
+        .eval("out", false)
+        .expect("async-generator source loop return result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "6:true|await,close"),
+        Completion::Throw { name, message } => {
+            panic!("async-generator source loop return result threw {name}: {message}")
+        }
+    }
+
+    // The VM continuation owns the generator activation's arguments object even though its body
+    // does not begin running until the first next().
+    assert_eq!(
+        run(
+            "function* args(){yield arguments.length+':'+arguments[0]+':'+arguments[1]}args(4,5).next().value"
+        ),
+        "2:4:5"
+    );
+}
+
+#[test]
+fn yield_star_forwards_the_sync_iterator_protocol() {
+    // ECMA-262 §15.5.5: a non-done synchronous result is passed straight to GeneratorYield. Its
+    // identity is preserved and IteratorValue is not evaluated eagerly.
+    assert_eq!(
+        run(
+            "var reads=0,sent=[];var result={get value(){reads++;return 7},done:false};\
+             var inner={next(v){sent.push(v);return sent.length===1?result:{value:v,done:true}},\
+             [Symbol.iterator](){return this}};function* outer(){return yield* inner}\
+             var it=outer(),first=it.next();var before=reads,same=first===result,value=first.value,after=reads,last=it.next(9);\
+             [before,same,value,after,last.value,last.done,sent[0]===undefined,sent[1]].join(',')"
+        ),
+        "0,true,7,1,9,true,true,9"
+    );
+
+    // throw() is forwarded, and a non-done throw result is yielded before delegation resumes via
+    // next(). A done throw result, by contrast, becomes the normal value of the YieldExpression.
+    assert_eq!(
+        run(
+            "var log=[];var inner={next(v){log.push('n'+v);return log.length===1?{value:'start',done:false}:{value:'end:'+v,done:true}},\
+             throw(v){log.push('t'+v);return {value:'caught:'+v,done:false}},[Symbol.iterator](){return this}};\
+             function* outer(){return yield* inner}var it=outer(),a=it.next(),b=it.throw('x'),c=it.next('resume');\
+             [a.value,b.value,b.done,c.value,c.done,log.join('|')].join(',')"
+        ),
+        "start,caught:x,false,end:resume,true,nundefined|tx|nresume"
+    );
+    assert_eq!(
+        run(
+            "var inner={next(){return {value:1,done:false}},throw(v){return {value:'done:'+v,done:true}},[Symbol.iterator](){return this}};\
+             function* outer(){return yield* inner}var it=outer();it.next();var r=it.throw(4);r.value+':'+r.done"
+        ),
+        "done:4:true"
+    );
+
+    // return() is likewise forwarded. A non-done result suspends again; if the delegate has no
+    // return method, the caller's return value completes the outer generator directly.
+    assert_eq!(
+        run(
+            "var log=[];var pause={value:'pause',done:false};var inner={next(v){log.push('n'+v);return log.length===1?{value:'start',done:false}:{value:'end:'+v,done:true}},\
+             return(v){log.push('r'+v);return pause},[Symbol.iterator](){return this}};function* outer(){return yield* inner}\
+             var it=outer(),a=it.next(),b=it.return(4),c=it.next(5);[a.value,b===pause,b.value,b.done,c.value,c.done,log.join('|')].join(',')"
+        ),
+        "start,true,pause,false,end:5,true,nundefined|r4|n5"
+    );
+    assert_eq!(
+        run(
+            "var inner={next(){return {value:1,done:false}},[Symbol.iterator](){return this}};\
+             function* outer(){return yield* inner}var it=outer();it.next();var r=it.return(8);r.value+':'+r.done"
+        ),
+        "8:true"
+    );
+}
+
+#[test]
+fn yield_star_closes_and_validates_sync_iterators() {
+    // A missing delegated throw method performs IteratorClose before the required TypeError. An
+    // abrupt close supersedes that protocol error, while a present but non-callable throw method
+    // fails GetMethod without closing.
+    assert_eq!(
+        run(
+            "var closed=0,name='';var inner={next(){return {value:1,done:false}},return(){closed++;return {done:true}},[Symbol.iterator](){return this}};\
+             function* outer(){yield* inner}var it=outer();it.next();try{it.throw(1)}catch(e){name=e.name}closed+':'+name"
+        ),
+        "1:TypeError"
+    );
+    assert_eq!(
+        run(
+            "var closed=0,name='';var inner={next(){return {value:1,done:false}},return(){closed++;throw new RangeError('close')},[Symbol.iterator](){return this}};\
+             function* outer(){yield* inner}var it=outer();it.next();try{it.throw(1)}catch(e){name=e.name}closed+':'+name"
+        ),
+        "1:RangeError"
+    );
+    assert_eq!(
+        run(
+            "var closed=0,name='';var inner={next(){return {value:1,done:false}},throw:1,return(){closed++;return {done:true}},[Symbol.iterator](){return this}};\
+             function* outer(){yield* inner}var it=outer();it.next();try{it.throw(1)}catch(e){name=e.name}closed+':'+name"
+        ),
+        "0:TypeError"
+    );
+
+    // Every iterator method used by yield* must produce an object, and an error raised while
+    // driving the delegate is injected back into the bytecode handler surrounding the expression.
+    assert_eq!(
+        run(
+            "function* outer(inner){try{yield* inner}catch(e){return e.name}}\
+             var a={next(){return 1},[Symbol.iterator](){return this}};outer(a).next().value"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "function name(which){var inner={next(){return {value:1,done:false}},throw(){return 1},return(){return 1},[Symbol.iterator](){return this}};\
+             var it=(function*(){yield* inner})();it.next();try{which==='throw'?it.throw(0):it.return(0)}catch(e){return e.name}}\
+             name('throw')+','+name('return')"
+        ),
+        "TypeError,TypeError"
     );
 }
 
@@ -1634,7 +2696,12 @@ fn temporal_until_since() {
         run("Temporal.PlainTime.from('10:00').until('12:30').minutes"),
         "30"
     );
-    assert_eq!(run("Temporal.Instant.fromEpochMilliseconds(0).until(Temporal.Instant.fromEpochMilliseconds(5000)).seconds"), "5");
+    assert_eq!(
+        run(
+            "Temporal.Instant.fromEpochMilliseconds(0).until(Temporal.Instant.fromEpochMilliseconds(5000)).seconds"
+        ),
+        "5"
+    );
 }
 
 #[test]
@@ -1727,9 +2794,24 @@ fn temporal_tostring_options() {
 #[test]
 fn temporal_duration_round_relative() {
     // P1Y rounded to months relative to 2021-01-01 = 12 months.
-    assert_eq!(run("Temporal.Duration.from({years:1}).round({largestUnit:'month', relativeTo:'2021-01-01'}).months"), "12");
-    assert_eq!(run("Temporal.Duration.from({months:13}).round({largestUnit:'year', relativeTo:'2021-01-01'}).years"), "1");
-    assert_eq!(run("Temporal.Duration.from({days:40}).round({largestUnit:'month', relativeTo:'2021-01-01'}).months"), "1");
+    assert_eq!(
+        run(
+            "Temporal.Duration.from({years:1}).round({largestUnit:'month', relativeTo:'2021-01-01'}).months"
+        ),
+        "12"
+    );
+    assert_eq!(
+        run(
+            "Temporal.Duration.from({months:13}).round({largestUnit:'year', relativeTo:'2021-01-01'}).years"
+        ),
+        "1"
+    );
+    assert_eq!(
+        run(
+            "Temporal.Duration.from({days:40}).round({largestUnit:'month', relativeTo:'2021-01-01'}).months"
+        ),
+        "1"
+    );
 }
 
 #[test]
@@ -1764,7 +2846,12 @@ fn temporal_named_timezones() {
 #[test]
 fn atomics_basic() {
     assert_eq!(run("typeof Atomics"), "object");
-    assert_eq!(run("var a=new Int32Array(new SharedArrayBuffer(16)); Atomics.store(a,0,5); Atomics.load(a,0)"), "5");
+    assert_eq!(
+        run(
+            "var a=new Int32Array(new SharedArrayBuffer(16)); Atomics.store(a,0,5); Atomics.load(a,0)"
+        ),
+        "5"
+    );
     assert_eq!(
         run("var a=new Int32Array(4); Atomics.add(a,0,3); Atomics.add(a,0,4)"),
         "3"
@@ -1799,7 +2886,12 @@ fn array_bycopy_groupby() {
         "1,9,3|1,2,3"
     );
     assert_eq!(run("[1,2,3,4].toSpliced(1,2,'a').join(',')"), "1,a,4");
-    assert_eq!(run("var g=Object.groupBy([1,2,3,4],x=>x%2?'odd':'even'); g.odd.join(',')+'|'+g.even.join(',')"), "1,3|2,4");
+    assert_eq!(
+        run(
+            "var g=Object.groupBy([1,2,3,4],x=>x%2?'odd':'even'); g.odd.join(',')+'|'+g.even.join(',')"
+        ),
+        "1,3|2,4"
+    );
     assert_eq!(
         run("var r=Promise.withResolvers(); typeof r.promise+typeof r.resolve+typeof r.reject"),
         "objectfunctionfunction"
@@ -1942,6 +3034,14 @@ fn subclass_state() {
         "true2"
     );
     assert_eq!(
+        run("class W extends WeakMap{};var k={},w=new W();w.set(k,7);w.has(k)+':'+w.get(k)"),
+        "true:7"
+    );
+    assert_eq!(
+        run("class W extends WeakSet{};var k={},w=new W();w.add(k);w.has(k)"),
+        "true"
+    );
+    assert_eq!(
         run("class I extends Int8Array{}; var a=new I([5,6,7]); a[1]"),
         "6"
     );
@@ -1972,7 +3072,12 @@ fn label_validation() {
     assert!(Engine::new()
         .eval("foo: for(;;){ continue bar; }", false)
         .is_err());
-    assert_eq!(run("var s=0; outer: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j==1) continue outer; s++; } } s"), "3");
+    assert_eq!(
+        run(
+            "var s=0; outer: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j==1) continue outer; s++; } } s"
+        ),
+        "3"
+    );
     assert_eq!(run("a: { break a; } 'ok'"), "ok");
     assert_eq!(run("function f(){ l: for(;;) break l; return 1 } f()"), "1");
     assert_eq!(run("x: 1; x: 2; 'ok'"), "ok"); // sequential same label is fine
@@ -1991,7 +3096,9 @@ fn labelled_continue_while() {
     assert_eq!(run("var i=0; a: do { i++; break a; } while(i<3); i"), "1");
     // Inner while `continue`s the outer label: the outer loop advances, the inner is abandoned.
     assert_eq!(
-        run("var log=[]; a: for(var i=0;i<3;i++){ var j=0; while(j<3){ j++; if(j===2) continue a; log.push(i+':'+j);} } log.join(',')"),
+        run(
+            "var log=[]; a: for(var i=0;i<3;i++){ var j=0; while(j<3){ j++; if(j===2) continue a; log.push(i+':'+j);} } log.join(',')"
+        ),
         "0:1,1:1,2:1"
     );
     // Labelled continue on an outer while, driven from an inner while.
@@ -2265,15 +3372,21 @@ fn packed_dense_numeric_array_semantics() {
 #[test]
 fn small_holey_arrays_keep_absence_and_prototype_setter_semantics() {
     assert_eq!(
-        run("var a=new Array(4); [a.length,0 in a,Object.hasOwn(a,0),Object.keys(a).length,a[0]].join('|')"),
+        run(
+            "var a=new Array(4); [a.length,0 in a,Object.hasOwn(a,0),Object.keys(a).length,a[0]].join('|')"
+        ),
         "4|false|false|0|"
     );
     assert_eq!(
-        run("var seen=0; Object.defineProperty(Array.prototype,'0',{set(v){seen=v},configurable:true}); var a=new Array(4); a[0]=7; var out=[seen,Object.hasOwn(a,0),a.length].join('|'); delete Array.prototype[0]; out"),
+        run(
+            "var seen=0; Object.defineProperty(Array.prototype,'0',{set(v){seen=v},configurable:true}); var a=new Array(4); a[0]=7; var out=[seen,Object.hasOwn(a,0),a.length].join('|'); delete Array.prototype[0]; out"
+        ),
         "7|false|4"
     );
     assert_eq!(
-        run("var a=new Array(4); a[3]=9; a[0]=2; delete a[3]; [a.length,a[0],3 in a,Object.keys(a).join(',')].join('|')"),
+        run(
+            "var a=new Array(4); a[3]=9; a[0]=2; delete a[3]; [a.length,a[0],3 in a,Object.keys(a).join(',')].join('|')"
+        ),
         "4|2|false|0"
     );
     assert_eq!(
@@ -2281,7 +3394,9 @@ fn small_holey_arrays_keep_absence_and_prototype_setter_semantics() {
         "false|false|4"
     );
     assert_eq!(
-        run("var a=new Array(4); Object.preventExtensions(a); a[0]=1; [Object.hasOwn(a,0),a.length].join('|')"),
+        run(
+            "var a=new Array(4); Object.preventExtensions(a); a[0]=1; [Object.hasOwn(a,0),a.length].join('|')"
+        ),
         "false|4"
     );
 }
@@ -2289,7 +3404,9 @@ fn small_holey_arrays_keep_absence_and_prototype_setter_semantics() {
 #[test]
 fn packed_elements_do_not_duplicate_far_index_entries() {
     assert_eq!(
-        run("var a=[0,1,2,3,4,5,6,7]; a[300]=1; for(var i=8;i<300;i++)a[i]=i; a[300]=2; delete a[300]; var keys=Reflect.ownKeys(a).filter(k=>k==='300').length; [300 in a,keys,a.length].join('|')"),
+        run(
+            "var a=[0,1,2,3,4,5,6,7]; a[300]=1; for(var i=8;i<300;i++)a[i]=i; a[300]=2; delete a[300]; var keys=Reflect.ownKeys(a).filter(k=>k==='300').length; [300 in a,keys,a.length].join('|')"
+        ),
         "false|0|301"
     );
 }
@@ -2322,5623 +3439,6 @@ fn jit_numeric_diamond_fills_small_holey_arrays_and_deopts_for_setters() {
         ),
         "5,6,7,8|9|false|10|4|,10,11,12"
     );
-}
-
-#[test]
-fn jit_scheduler_shell_guards_methods_globals_and_value_types() {
-    assert_eq!(
-        run_jit(
-            "var HELD=4,SUSPENDED=2;
-             function Tcb(link,state,id){this.link=link;this.state=state;this.id=id}
-             var originalHeld=Tcb.prototype.held=function(){return (this.state&HELD)!=0||(this.state==SUSPENDED)};
-             function Scheduler(list){this.list=list;this.current=null;this.seen=0}
-             Scheduler.prototype.schedule=function(){
-               this.current=this.list;
-               while(this.current!=null){
-                 if(this.current.held())this.current=this.current.link;
-                 else{this.seen=this.current.id;this.current=null}
-               }
-               return this.seen
-             };
-             function warmSchedule(s,n){var out=0;for(var i=0;i<n;i++)out=s.schedule();return out}
-             var active=new Tcb(null,0,7),held=new Tcb(active,4,3),s=new Scheduler(held);
-             var warm=warmSchedule(s,600);
-             Tcb.prototype.held=function(){return false};
-             s.list=held;var methodChanged=s.schedule();
-             Tcb.prototype.held=originalHeld;HELD=0;
-             s.list=held;var globalChanged=s.schedule();
-             HELD=4;held.state='4';
-             s.list=held;var stateChanged=s.schedule();
-             held.state=4;Object.setPrototypeOf(held,{held:function(){return false}});
-             s.list=held;var protoChanged=s.schedule();
-             [warm,methodChanged,globalChanged,stateChanged,protoChanged,s.current===null].join('|')"
-        ),
-        "7|3|3|7|3|true"
-    );
-}
-
-#[test]
-fn jit_scheduler_active_prefix_materializes_and_deopts_transactionally() {
-    assert_eq!(
-        run_jit(
-            "var HELD=4,SUSPENDED=2,SR=3,RUNNING=0,RUNNABLE=1;
-             function Task(){this.last=99}
-             Task.prototype.run=function(packet){this.last=packet==null?-1:packet.id;return null};
-             function Tcb(link,state,queue,task,id){
-               this.link=link;this.state=state;this.queue=queue;this.task=task;this.id=id
-             }
-             Tcb.prototype.held=function(){return (this.state&HELD)!=0||(this.state==SUSPENDED)};
-             var originalRun=Tcb.prototype.run=function(){
-               if(this.state==SR){
-                 var packet=this.queue;this.queue=packet.link;
-                 if(this.queue==null)this.state=RUNNING;else this.state=RUNNABLE
-               }else packet=null;
-               return this.task.run(packet)
-             };
-             function Scheduler(list){this.list=list;this.current=null;this.currentId=-1}
-             Scheduler.prototype.schedule=function(){
-               this.current=this.list;
-               while(this.current!=null){
-                 if(this.current.held())this.current=this.current.link;
-                 else{this.currentId=this.current.id;this.current=this.current.run()}
-               }
-             };
-             function hot(s,t,p,tail,n){
-               for(var i=0;i<n;i++){p.link=(i&1)?null:tail;t.state=SR;t.queue=p;s.schedule()}
-             }
-             var task=new Task(),p={link:null,id:5},tail={link:null,id:7};
-             var t=new Tcb(null,SR,p,task,42),gate=new Tcb(t,HELD,null,task,9);
-             var s=new Scheduler(gate);hot(s,t,p,tail,600);
-             var warm=[task.last,t.state,s.currentId,s.current===null];
-             p.link=tail;t.state=SR;t.queue=p;s.schedule();
-             var objectLink=[t.queue===tail,t.state,task.last];
-             p.link=p;t.state=SR;t.queue=p;s.schedule();
-             var selfLink=[t.queue===p,t.state,task.last];
-             p.link=undefined;t.state=SR;t.queue=p;s.schedule();
-             var undefinedLink=[t.queue===undefined,t.state,task.last];
-             var dda=$262.IsHTMLDDA;p.link=dda;t.state=SR;t.queue=p;s.schedule();
-             var ddaLink=[t.queue===dda,t.state,task.last];
-             p.link=null;SR=99;t.state=3;t.queue=p;s.schedule();
-             var globalChanged=[task.last,t.state];
-             SR=3;Tcb.prototype.run=function(){this.state=77;return null};
-             t.state=SR;t.queue=p;s.schedule();var methodChanged=t.state;
-             Tcb.prototype.run=originalRun;var gets=0,sets=0,stored=1;
-             Object.defineProperty(t,'queue',{get(){gets++;return p},set(v){sets++;stored=v},configurable:true});
-             t.state=SR;p.link=null;s.schedule();
-             [warm,objectLink,selfLink,undefinedLink,ddaLink,globalChanged,methodChanged,
-              gets,sets,stored===null,t.state,task.last].flat().join('|')"
-        ),
-        "5|0|42|true|true|1|5|true|1|5|true|0|5|true|0|5|-1|3|77|2|1|true|1|5"
-    );
-}
-
-#[test]
-fn jit_scheduler_active_inline_null_materialization_preserves_stale_owner_aliases() {
-    assert_eq!(
-        run_jit(
-            "var HELD=4,SUSPENDED=2,SR=3,RUNNING=0,RUNNABLE=1;
-             function Task(next){this.next=next;this.last=-2}
-             Task.prototype.run=function(packet){this.last=packet==null?-1:packet.id;return this.next};
-             function Tcb(link,state,queue,task,id){
-               this.link=link;this.state=state;this.queue=queue;this.task=task;this.id=id
-             }
-             Tcb.prototype.held=function(){return (this.state&HELD)!=0||(this.state==SUSPENDED)};
-             Tcb.prototype.run=function(){
-               if(this.state==SR){
-                 var packet=this.queue;this.queue=packet.link;
-                 if(this.queue==null)this.state=RUNNING;else this.state=RUNNABLE
-               }else packet=null;
-               return this.task.run(packet)
-             };
-             function Scheduler(list){this.list=list;this.current=null;this.currentId=-1}
-             Scheduler.prototype.schedule=function(){
-               this.current=this.list;
-               while(this.current!=null){
-                 if(this.current.held())this.current=this.current.link;
-                 else{this.currentId=this.current.id;this.current=this.current.run()}
-               }
-             };
-             var tailTask=new Task(null),tail=new Tcb(null,RUNNING,null,tailTask,2);
-             var aliasTask=new Task(tail),alias=new Tcb(null,SR,null,aliasTask,1);
-             alias.queue=alias;
-             var s=new Scheduler(alias);
-             for(var i=0;i<600;i++){
-               alias.state=SR;alias.queue=alias;aliasTask.next=tail;
-               tail.state=RUNNING;tailTask.next=null;s.schedule()
-             }
-             var aliasResult=[aliasTask.last,tailTask.last,s.currentId,s.current===null];
-             var loneTask=new Task(tail),lone=new Tcb(null,SR,{link:null,id:17},loneTask,3);
-             tail.state=RUNNING;tailTask.next=null;s.list=lone;s.schedule();
-             var lastOwnerResult=[loneTask.last,tailTask.last,lone.state,s.currentId,s.current===null];
-             [aliasResult,lastOwnerResult].flat().join('|')"
-        ),
-        "1|-1|2|true|17|-1|0|2|true"
-    );
-}
-
-#[test]
-fn jit_scheduler_active_null_dispatches_all_richards_roles_and_owners() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active null roles: ' + message;
-        }
-
-        // Device's buffered packet moves to a lower-priority held target. Returning the current
-        // TCB makes the following null iteration suspend it, while the target retains the owner.
-        var deviceScheduler = new Scheduler();
-        var deviceTask = new DeviceTask(deviceScheduler);
-        var devicePacket = new Packet(null, ID_WORKER, KIND_DEVICE);
-        devicePacket.a1 = 91;
-        deviceTask.v1 = devicePacket;
-        var deviceTarget = new TaskControlBlock(null, ID_WORKER, 1, null, {
-          run: function() { throw 'device target ran'; }
-        });
-        deviceTarget.state = STATE_SUSPENDED | STATE_HELD;
-        var device = new TaskControlBlock(
-            null, ID_DEVICE_A, 2, null, deviceTask);
-        device.state = STATE_RUNNING;
-        deviceScheduler.blocks[ID_WORKER] = deviceTarget;
-        deviceScheduler.list = device;
-        deviceScheduler.schedule();
-        check(deviceTask.v1 === null && deviceTarget.queue === devicePacket,
-              'Device packet owner moved');
-        check(devicePacket.link === null && devicePacket.id === ID_DEVICE_A &&
-              devicePacket.a1 === 91 && deviceScheduler.queueCount === 1,
-              'Device queue writes');
-        check(device.state === STATE_SUSPENDED &&
-              deviceTarget.state === (STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE) &&
-              deviceScheduler.currentId === ID_DEVICE_A &&
-              deviceScheduler.currentTcb === null,
-              'Device completion');
-
-        // HandlerTask and WorkerTask deliberately have the same three own fields in the same
-        // order. A completed Handler work packet must take its queue arm, not Worker's null arm.
-        var handlerScheduler = new Scheduler();
-        var handlerTask = new HandlerTask(handlerScheduler);
-        var handlerWork = new Packet(null, ID_WORKER, KIND_WORK);
-        handlerWork.a1 = DATA_SIZE;
-        handlerWork.a2[0] = 92;
-        handlerTask.v1 = handlerWork;
-        var handlerTarget = new TaskControlBlock(null, ID_WORKER, 1, null, {
-          run: function() { throw 'handler target ran'; }
-        });
-        handlerTarget.state = STATE_SUSPENDED | STATE_HELD;
-        var handler = new TaskControlBlock(
-            null, ID_HANDLER_A, 2, null, handlerTask);
-        handler.state = STATE_RUNNING;
-        handlerScheduler.blocks[ID_WORKER] = handlerTarget;
-        handlerScheduler.list = handler;
-        handlerScheduler.schedule();
-        check(handlerTask.v1 === null && handlerTarget.queue === handlerWork,
-              'Handler work owner moved');
-        check(handlerWork.link === null && handlerWork.id === ID_HANDLER_A &&
-              handlerWork.a1 === DATA_SIZE && handlerScheduler.queueCount === 1,
-              'Handler queue writes');
-        check(handler.state === STATE_SUSPENDED &&
-              handlerTarget.state === (STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE) &&
-              handlerScheduler.currentId === ID_HANDLER_A &&
-              handlerScheduler.currentTcb === null,
-              'Handler completion');
-
-        var workerScheduler = new Scheduler();
-        var workerTask = new WorkerTask(workerScheduler, ID_HANDLER_A, 17);
-        var worker = new TaskControlBlock(
-            null, ID_WORKER, 2, null, workerTask);
-        worker.state = STATE_RUNNING;
-        workerScheduler.list = worker;
-        workerScheduler.schedule();
-        check(Object.keys(handlerTask).join('|') ===
-              Object.keys(workerTask).join('|') &&
-              Object.getPrototypeOf(handlerTask) !== Object.getPrototypeOf(workerTask),
-              'Handler and Worker own layouts match');
-        check(workerTask.v1 === ID_HANDLER_A && workerTask.v2 === 17,
-              'Worker fields untouched');
-        check(worker.state === STATE_SUSPENDED &&
-              workerScheduler.currentId === ID_WORKER &&
-              workerScheduler.currentTcb === null,
-              'Worker completion');
-
-        var idleScheduler = new Scheduler();
-        var idleTask = new IdleTask(idleScheduler, 23, 1);
-        var idle = new TaskControlBlock(null, ID_IDLE, 1, null, idleTask);
-        idle.state = STATE_RUNNING;
-        idleScheduler.list = idle;
-        idleScheduler.schedule();
-        check(idleTask.count === 0 && idleTask.v1 === 23,
-              'Idle numeric writes');
-        check(idle.state === STATE_HELD && idleScheduler.holdCount === 1 &&
-              idleScheduler.currentId === ID_IDLE && idleScheduler.currentTcb === null,
-              'Idle completion');
-
-        check(device.task === deviceTask && handler.task === handlerTask &&
-              worker.task === workerTask && idle.task === idleTask,
-              'TCB task owners retained');
-        check(deviceScheduler.list === device && handlerScheduler.list === handler &&
-              workerScheduler.list === worker && idleScheduler.list === idle,
-              'scheduler list owners retained');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_null_dispatch_replays_run_changes_and_task_accessor_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active null role guards: ' + message;
-        }
-        function oneRole(role) {
-          var scheduler = new Scheduler(), task, id;
-          if (role === 'Device') {
-            task = new DeviceTask(scheduler);
-            id = ID_DEVICE_A;
-          } else if (role === 'Handler') {
-            task = new HandlerTask(scheduler);
-            id = ID_HANDLER_A;
-          } else if (role === 'Idle') {
-            task = new IdleTask(scheduler, 29, 1);
-            id = ID_IDLE;
-          } else {
-            task = new WorkerTask(scheduler, ID_HANDLER_A, 19);
-            id = ID_WORKER;
-          }
-          var tcb = new TaskControlBlock(null, id, 2, null, task);
-          tcb.state = STATE_RUNNING;
-          scheduler.blocks[id] = tcb;
-          scheduler.list = tcb;
-          return { scheduler: scheduler, task: task, tcb: tcb, id: id, role: role };
-        }
-        function checkFinished(one, label) {
-          var expectedState = one.role === 'Idle' ? STATE_HELD : STATE_SUSPENDED;
-          check(one.tcb.state === expectedState, label + ' final state');
-          check(one.scheduler.currentId === one.id &&
-                one.scheduler.currentTcb === null, label + ' scheduler completion');
-          check(one.tcb.task === one.task && one.scheduler.list === one.tcb,
-                label + ' owners retained');
-          if (one.role === 'Idle') {
-            check(one.task.count === 0 && one.scheduler.holdCount === 1,
-                  label + ' Idle effects once');
-          }
-        }
-        function changedRun(role, prototype) {
-          var one = oneRole(role);
-          var original = prototype.run, hits = 0, sawNull = false;
-          var entryState = -1, entryId = -1, wasCurrent = false;
-          prototype.run = function(packet) {
-            hits++;
-            sawNull = packet === null;
-            entryState = one.tcb.state;
-            entryId = one.scheduler.currentId;
-            wasCurrent = one.scheduler.currentTcb === one.tcb;
-            return original.call(this, packet);
-          };
-          one.scheduler.schedule();
-          prototype.run = original;
-          check(hits === 1 && sawNull && entryState === STATE_RUNNING &&
-                entryId === one.id && wasCurrent,
-                role + ' changed run source order');
-          checkFinished(one, role + ' changed run');
-        }
-
-        changedRun('Device', DeviceTask.prototype);
-        changedRun('Handler', HandlerTask.prototype);
-        changedRun('Idle', IdleTask.prototype);
-        changedRun('Worker', WorkerTask.prototype);
-
-        // Changing TCB.task into an accessor changes the receiver shape. The generic replay must
-        // publish currentId first, invoke the getter once, and tolerate a further shape mutation
-        // performed by the getter before dispatching the returned DeviceTask.
-        var accessor = oneRole('Device');
-        var storedTask = accessor.task, taskGets = 0, getterState = -1;
-        var getterId = -1, getterWasCurrent = false;
-        Object.defineProperty(accessor.tcb, 'task', {
-          configurable: true,
-          get: function() {
-            taskGets++;
-            getterState = this.state;
-            getterId = accessor.scheduler.currentId;
-            getterWasCurrent = accessor.scheduler.currentTcb === this;
-            this.afterTaskRead = 97;
-            return storedTask;
-          }
-        });
-        accessor.scheduler.schedule();
-        check(taskGets === 1 && getterState === STATE_RUNNING &&
-              getterId === ID_DEVICE_A && getterWasCurrent,
-              'task accessor source order');
-        check(accessor.tcb.afterTaskRead === 97, 'task getter shape mutation');
-        check(accessor.tcb.state === STATE_SUSPENDED &&
-              accessor.scheduler.currentTcb === null,
-              'task accessor completion');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_pc59_cold_epoch_orders_same_shape_device_and_handler_roles() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'pc59 cold roles: ' + message;
-        }
-
-        var deviceScheduler = new Scheduler();
-        var deviceTask = new DeviceTask(deviceScheduler);
-        var deviceTcb = new TaskControlBlock(
-            null, ID_DEVICE_A, 1, null, deviceTask);
-        deviceTcb.state = STATE_RUNNING;
-        deviceScheduler.list = deviceTcb;
-
-        // Construct both tasks with the exact same own properties, then change only the second
-        // task's immediate prototype. Shape alone must not select Device ahead of Handler.
-        var handlerScheduler = new Scheduler();
-        var handlerTask = new DeviceTask(handlerScheduler);
-        Object.setPrototypeOf(handlerTask, HandlerTask.prototype);
-        var handlerTcb = new TaskControlBlock(
-            null, ID_HANDLER_A, 1, null, handlerTask);
-        handlerTcb.state = STATE_RUNNING;
-        handlerScheduler.list = handlerTcb;
-        var ownLayout = Object.keys(deviceTask).join('|');
-        check(ownLayout === Object.keys(handlerTask).join('|') &&
-              Object.getPrototypeOf(deviceTask) === DeviceTask.prototype &&
-              Object.getPrototypeOf(handlerTask) === HandlerTask.prototype,
-              'same own layout, distinct role prototypes');
-
-        // Reject the scheduler shell before it establishes an epoch. pc59 must retain its full
-        // exact-method checks when x28 is zero and dispatch each same-shaped task only once.
-        var originalHeld = TaskControlBlock.prototype.isHeldOrSuspended;
-        var originalDeviceRun = DeviceTask.prototype.run;
-        var originalHandlerRun = HandlerTask.prototype.run;
-        var heldHits = 0, deviceHits = 0, handlerHits = 0;
-        var deviceSawNull = false, handlerSawNull = false;
-        var deviceState = -1, handlerState = -1;
-        var deviceCurrent = false, handlerCurrent = false;
-        var deviceId = -1, handlerId = -1;
-        TaskControlBlock.prototype.isHeldOrSuspended = function() {
-          heldHits++;
-          return originalHeld.call(this);
-        };
-        DeviceTask.prototype.run = function(packet) {
-          deviceHits++;
-          deviceSawNull = packet === null;
-          deviceState = deviceTcb.state;
-          deviceCurrent = deviceScheduler.currentTcb === deviceTcb;
-          deviceId = deviceScheduler.currentId;
-          return originalDeviceRun.call(this, packet);
-        };
-        HandlerTask.prototype.run = function(packet) {
-          handlerHits++;
-          handlerSawNull = packet === null;
-          handlerState = handlerTcb.state;
-          handlerCurrent = handlerScheduler.currentTcb === handlerTcb;
-          handlerId = handlerScheduler.currentId;
-          return originalHandlerRun.call(this, packet);
-        };
-
-        deviceScheduler.schedule();
-        handlerScheduler.schedule();
-        TaskControlBlock.prototype.isHeldOrSuspended = originalHeld;
-        DeviceTask.prototype.run = originalDeviceRun;
-        HandlerTask.prototype.run = originalHandlerRun;
-
-        check(heldHits === 4, 'cold shell method called in source order');
-        check(deviceHits === 1 && handlerHits === 1 &&
-              deviceSawNull && handlerSawNull,
-              'ordered role methods called once');
-        check(deviceState === STATE_RUNNING && deviceCurrent &&
-              deviceId === ID_DEVICE_A,
-              'Device run entry');
-        check(handlerState === STATE_RUNNING && handlerCurrent &&
-              handlerId === ID_HANDLER_A,
-              'Handler run entry');
-        check(deviceTcb.state === STATE_SUSPENDED &&
-              handlerTcb.state === STATE_SUSPENDED,
-              'both roles suspended');
-        check(deviceTcb.task === deviceTask && handlerTcb.task === handlerTask &&
-              deviceTask.scheduler === deviceScheduler &&
-              handlerTask.scheduler === handlerScheduler,
-              'task and scheduler owners retained');
-        check(deviceScheduler.list === deviceTcb &&
-              handlerScheduler.list === handlerTcb &&
-              deviceScheduler.currentTcb === null &&
-              handlerScheduler.currentTcb === null,
-              'cold dispatch completed');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_pc59_device_hold_replays_late_link_throw_and_preserves_owner() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'pc59 Device hold: ' + message;
-        }
-        function oneIncomingDevice() {
-          var scheduler = new Scheduler();
-          var device = new DeviceTask(scheduler);
-          var marker = { value: 137 };
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          packet.a2[0] = marker;
-          var current = new TaskControlBlock(
-              null, ID_DEVICE_A, 1, packet, device);
-          scheduler.blocks[ID_DEVICE_A] = current;
-          scheduler.list = current;
-          // Do not return packet: after the Active dequeue, Device.v1 must keep its only fixture
-          // owner alive across the throwing fallback.
-          return [scheduler, device, current, marker];
-        }
-
-        var one = oneIncomingDevice();
-        var scheduler = one[0], device = one[1], current = one[2], marker = one[3];
-        var originalMark = TaskControlBlock.prototype.markAsHeld;
-        var markHits = 0, markState = -1, markCount = -1;
-        var markQueueNull = false, markCurrent = false, markOwner = false;
-        var linkHits = 0, linkState = -1, linkCount = -1;
-        var linkCurrent = false, linkOwner = false;
-
-        // The changed nested method is a late precommit miss after pc59 has selected Device.
-        // Generic replay installs the observable link accessor only after Active's dequeue,
-        // Device.v1 publication, and holdCount's increment, keeping the original TCB shape hot.
-        TaskControlBlock.prototype.markAsHeld = function() {
-          markHits++;
-          markState = this.state;
-          markCount = scheduler.holdCount;
-          markQueueNull = this.queue === null;
-          markCurrent = scheduler.currentTcb === this &&
-                        scheduler.currentId === ID_DEVICE_A;
-          markOwner = device.v1 !== null && device.v1.a2[0] === marker;
-          Object.defineProperty(this, 'link', {
-            configurable: true,
-            get: function() {
-              linkHits++;
-              linkState = this.state;
-              linkCount = scheduler.holdCount;
-              linkCurrent = scheduler.currentTcb === this;
-              linkOwner = device.v1 !== null && device.v1.a2[0] === marker;
-              throw 'late link boom';
-            }
-          });
-          return originalMark.call(this);
-        };
-
-        var error = '';
-        try { scheduler.schedule(); } catch (e) { error = e; }
-        TaskControlBlock.prototype.markAsHeld = originalMark;
-        check(error === 'late link boom', 'late link throw propagated');
-        check(markHits === 1 && markState === STATE_RUNNING && markCount === 1 &&
-              markQueueNull && markCurrent && markOwner,
-              'mark entry saw prior effects once');
-        check(linkHits === 1 && linkState === STATE_HELD && linkCount === 1 &&
-              linkCurrent && linkOwner,
-              'link getter saw held effects once');
-        check(current.queue === null && current.state === STATE_HELD &&
-              scheduler.holdCount === 1,
-              'Active and hold state retained');
-        check(scheduler.currentId === ID_DEVICE_A &&
-              scheduler.currentTcb === current && scheduler.list === current,
-              'throw stopped outer current assignment');
-        check(current.task === device && device.scheduler === scheduler &&
-              device.v1 !== null && device.v1.link === null &&
-              device.v1.id === ID_WORKER && device.v1.a2[0] === marker &&
-              marker.value === 137,
-              'packet payload and owners survived');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_active_device_packet_fallback_preserves_graph_and_last_owners() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph Active Device fallback owners: ' + message;
-        }
-        function oneHold(kind, code) {
-          var scheduler = new Scheduler();
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-
-          var packet = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-          packet.a1 = code;
-          packet.a2[0] = { code: code + 1000 };
-          if (kind === 'object') {
-            packet.link = new Packet(null, ID_DEVICE_B, KIND_DEVICE);
-            packet.link.a1 = code + 1;
-            packet.link.a2[0] = { code: code + 2000 };
-          } else if (kind === 'self') {
-            packet.link = packet;
-          } else if (kind === 'undefined') {
-            packet.link = undefined;
-          }
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, packet);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-
-          // Preserve the exact six-record graph while ensuring that the single Device hold is
-          // the only runnable role. The packet, successor, and payload markers have no roots
-          // outside the TCB/task graph after this helper returns.
-          for (var id = 0; id < NUMBER_OF_IDS; id++) {
-            if (id !== ID_DEVICE_A) scheduler.blocks[id].state = STATE_HELD;
-          }
-          return [scheduler, scheduler.blocks[ID_DEVICE_A],
-                  scheduler.blocks[ID_DEVICE_A].task];
-        }
-
-        var nullCase = oneHold('null', 31);
-        nullCase[0].holdCount = 1.25;
-        nullCase[0].schedule();
-        check(nullCase[0].holdCount === 2.25 &&
-              nullCase[1].state === STATE_HELD && nullCase[1].queue === null,
-              'Null state/IEEE count/queue');
-        check(nullCase[2].v1 !== null && nullCase[2].v1.link === null &&
-              nullCase[2].v1.a1 === 31 && nullCase[2].v1.a2[0].code === 1031,
-              'Null packet last owner');
-
-        var objectCase = oneHold('object', 41);
-        objectCase[0].schedule();
-        var objectPacket = objectCase[2].v1;
-        var objectSuccessor = objectCase[1].queue;
-        check(objectCase[0].holdCount === 1 &&
-              objectCase[1].state === (STATE_RUNNABLE | STATE_HELD),
-              'object state/count');
-        check(objectPacket !== null && objectSuccessor !== null &&
-              objectPacket.link === objectSuccessor &&
-              objectSuccessor.link === null && objectSuccessor.a1 === 42,
-              'P.link and C.queue share successor');
-        check(objectPacket.a2[0].code === 1041 &&
-              objectSuccessor.a2[0].code === 2041,
-              'object packet and successor last owners');
-
-        var selfCase = oneHold('self', 51);
-        selfCase[0].schedule();
-        var selfPacket = selfCase[2].v1;
-        check(selfCase[0].holdCount === 1 &&
-              selfCase[1].state === (STATE_RUNNABLE | STATE_HELD),
-              'self state/count');
-        check(selfPacket !== null && selfCase[1].queue === selfPacket &&
-              selfPacket.link === selfPacket && selfPacket.a2[0].code === 1051,
-              'self P.link/C.queue/Device.v1 owners');
-
-        var undefinedCase = oneHold('undefined', 61);
-        undefinedCase[0].schedule();
-        check(undefinedCase[0].holdCount === 1 &&
-              undefinedCase[1].state === STATE_HELD &&
-              undefinedCase[1].queue === undefined,
-              'Undefined state/count/queue');
-        check(undefinedCase[2].v1 !== null &&
-              undefinedCase[2].v1.link === undefined &&
-              undefinedCase[2].v1.a2[0].code === 1061,
-              'Undefined packet last owner');
-
-        // Device B holds directly into Device A. This exercises Device role routing through
-        // generic packet materialization for two consecutive holds.
-        function twoHolds() {
-          var scheduler = new Scheduler();
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          var packetA = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-          var packetB = new Packet(null, ID_DEVICE_B, KIND_DEVICE);
-          packetA.a1 = 91; packetB.a1 = 92;
-          packetA.a2[0] = { code: 1091 }; packetB.a2[0] = { code: 1092 };
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, packetA);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, packetB);
-          for (var id = 0; id < ID_DEVICE_A; id++) scheduler.blocks[id].state = STATE_HELD;
-          return [scheduler, scheduler.blocks[ID_DEVICE_A],
-                  scheduler.blocks[ID_DEVICE_B],
-                  scheduler.blocks[ID_DEVICE_A].task,
-                  scheduler.blocks[ID_DEVICE_B].task];
-        }
-        var pair = twoHolds();
-        pair[0].schedule();
-        check(pair[0].holdCount === 2 && pair[0].currentId === ID_DEVICE_A &&
-              pair[0].currentTcb === null,
-              'Device B to A fast graph resume');
-        check(pair[1].state === STATE_HELD && pair[2].state === STATE_HELD &&
-              pair[1].queue === null && pair[2].queue === null,
-              'two Device Active prefixes and holds');
-        check(pair[3].v1.a1 === 91 && pair[3].v1.a2[0].code === 1091 &&
-              pair[4].v1.a1 === 92 && pair[4].v1.a2[0].code === 1092,
-              'two Device packet last owners');
-        check(pair[2].link === pair[1] &&
-              pair[1].link === pair[0].blocks[ID_HANDLER_B],
-              'two Device canonical graph links');
-
-        var cases = [nullCase, objectCase, selfCase, undefinedCase];
-        for (var n = 0; n < cases.length; n++) {
-          var scheduler = cases[n][0], current = cases[n][1], device = cases[n][2];
-          check(scheduler.currentId === ID_DEVICE_A && scheduler.currentTcb === null,
-                'current/currentId ' + n);
-          check(scheduler.list === scheduler.blocks[ID_DEVICE_B] &&
-                scheduler.blocks[ID_DEVICE_B].link === current &&
-                current.link === scheduler.blocks[ID_HANDLER_B],
-                'graph links ' + n);
-          check(current.task === device && device.scheduler === scheduler,
-                'task/scheduler owners ' + n);
-        }
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_active_device_packet_fallback_replays_live_guards_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph Active Device fallback guards: ' + message;
-        }
-        function oneHold(code) {
-          var scheduler = new Scheduler();
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          var packet = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-          packet.a1 = code;
-          packet.a2[0] = { code: code + 1000 };
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, packet);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-          for (var id = 0; id < NUMBER_OF_IDS; id++) {
-            if (id !== ID_DEVICE_A) scheduler.blocks[id].state = STATE_HELD;
-          }
-          return [scheduler, scheduler.blocks[ID_DEVICE_A],
-                  scheduler.blocks[ID_DEVICE_A].task];
-        }
-
-        var originalRun = DeviceTask.prototype.run;
-        var runCase = oneHold(71), runHits = 0, runEntry = '';
-        DeviceTask.prototype.run = function(packet) {
-          runHits++;
-          runEntry = [packet.a1, runCase[1].queue === null,
-                      runCase[1].state, runCase[0].currentId,
-                      runCase[0].currentTcb === runCase[1], this.v1 === null].join('|');
-          return originalRun.call(this, packet);
-        };
-        runCase[0].schedule();
-        DeviceTask.prototype.run = originalRun;
-        check(runHits === 1 && runEntry === '71|true|0|4|true|true',
-              'changed Device.run once at source entry');
-        check(runCase[2].v1.a1 === 71 && runCase[1].state === STATE_HELD &&
-              runCase[0].holdCount === 1, 'changed Device.run result');
-
-        var originalHold = Scheduler.prototype.holdCurrent;
-        var holdCase = oneHold(72), holdHits = 0, holdEntry = '';
-        Scheduler.prototype.holdCurrent = function() {
-          holdHits++;
-          holdEntry = [holdCase[2].v1.a1, holdCase[1].queue === null,
-                       holdCase[1].state, this.holdCount,
-                       this.currentId, this.currentTcb === holdCase[1]].join('|');
-          return originalHold.call(this);
-        };
-        holdCase[0].schedule();
-        Scheduler.prototype.holdCurrent = originalHold;
-        check(holdHits === 1 && holdEntry === '72|true|0|0|4|true',
-              'changed holdCurrent once after Device.v1');
-        check(holdCase[2].v1.a1 === 72 && holdCase[1].state === STATE_HELD &&
-              holdCase[0].holdCount === 1, 'changed holdCurrent result');
-
-        var originalMark = TaskControlBlock.prototype.markAsHeld;
-        var markCase = oneHold(73), markHits = 0, markEntry = '';
-        TaskControlBlock.prototype.markAsHeld = function() {
-          markHits++;
-          markEntry = [markCase[2].v1.a1, markCase[1].queue === null,
-                       this.state, markCase[0].holdCount,
-                       markCase[0].currentId,
-                       markCase[0].currentTcb === this].join('|');
-          return originalMark.call(this);
-        };
-        markCase[0].schedule();
-        TaskControlBlock.prototype.markAsHeld = originalMark;
-        check(markHits === 1 && markEntry === '73|true|0|1|4|true',
-              'changed markAsHeld once after count');
-        check(markCase[2].v1.a1 === 73 && markCase[1].state === STATE_HELD &&
-              markCase[0].holdCount === 1, 'changed markAsHeld result');
-
-        // Observable descriptors must reject eager graph use without being invoked, then execute
-        // exactly where the source operation occurs. The stored values retain the only packet
-        // owner after each helper's locals disappear.
-        var v1Case = oneHold(74), storedV1 = null, v1Gets = 0, v1Sets = 0;
-        Object.defineProperty(v1Case[2], 'v1', {
-          configurable: true,
-          get: function() { v1Gets++; return storedV1; },
-          set: function(value) { v1Sets++; storedV1 = value; }
-        });
-        v1Case[0].schedule();
-        check(v1Gets === 0 && v1Sets === 1 && storedV1.a1 === 74 &&
-              storedV1.a2[0].code === 1074,
-              'Device.v1 descriptor once and last owner');
-
-        var linkCase = oneHold(75), storedLink = linkCase[1].link, linkGets = 0;
-        Object.defineProperty(linkCase[1], 'link', {
-          configurable: true,
-          get: function() { linkGets++; return storedLink; }
-        });
-        linkCase[0].schedule();
-        check(linkGets === 1 && linkCase[2].v1.a1 === 75 &&
-              linkCase[1].state === STATE_HELD &&
-              linkCase[0].currentTcb === null,
-              'TCB.link descriptor once after hold effects');
-
-        var countCase = oneHold(76), count = 0, countGets = 0, countSets = 0;
-        Object.defineProperty(countCase[0], 'holdCount', {
-          configurable: true,
-          get: function() { countGets++; return count; },
-          set: function(value) { countSets++; count = value; }
-        });
-        countCase[0].schedule();
-        check(countGets === 1 && countSets === 1 && count === 1 &&
-              countCase[2].v1.a1 === 76 && countCase[1].state === STATE_HELD,
-              'holdCount descriptor once');
-
-        // A pre-existing v1 alias takes the ordinary Device fallback's overwrite path.
-        var aliasCase = oneHold(78), aliasPacket = aliasCase[1].queue;
-        aliasCase[2].v1 = aliasPacket;
-        aliasCase[0].schedule();
-        check(aliasCase[2].v1 === aliasPacket && aliasPacket.a1 === 78 &&
-              aliasCase[1].state === STATE_HELD &&
-              aliasCase[0].holdCount === 1 && aliasCase[0].currentTcb === null,
-              'pre-existing Device.v1 packet alias');
-
-        // A role-local foreign scheduler preserves ordinary Device fallback semantics. Its
-        // currentTcb edge is the only fixture owner of the active TCB
-        // outside the canonical scheduler graph while holdCurrent executes.
-        var foreignCase = oneHold(77), foreign = new Scheduler();
-        foreign.currentTcb = foreignCase[1];
-        foreignCase[2].scheduler = foreign;
-        foreignCase[0].schedule();
-        check(foreign.holdCount === 1 && foreign.currentTcb === foreignCase[1] &&
-              foreignCase[0].holdCount === 0,
-              'foreign scheduler receives hold');
-        check(foreignCase[2].v1.a1 === 77 &&
-              foreignCase[1].state === STATE_HELD &&
-              foreignCase[0].currentId === ID_DEVICE_A &&
-              foreignCase[0].currentTcb === null,
-              'foreign scheduler ordinary completion');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_active_packet_role_router_exact_roles() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph Active packet roles: ' + message;
-        }
-        function addSix(scheduler) {
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-          for (var id = 0; id < NUMBER_OF_IDS; id++) scheduler.blocks[id].state = STATE_HELD;
-        }
-
-        // Each run retains a complete canonical graph, but publishes exactly one packet-bearing
-        // role. Same-layout Worker and Handler records must still select their exact prototypes;
-        // Device must not cascade through either role before taking the generic fallback.
-        var workerScheduler = new Scheduler();
-        addSix(workerScheduler);
-        var worker = workerScheduler.blocks[ID_WORKER];
-        var workerTask = worker.task;
-        var workerPacket = new Packet(null, ID_WORKER, KIND_WORK);
-        worker.queue = workerPacket;
-        worker.state = STATE_SUSPENDED_RUNNABLE;
-        workerScheduler.blocks[ID_HANDLER_B].state = STATE_SUSPENDED | STATE_HELD;
-        workerScheduler.list = worker;
-        workerScheduler.schedule();
-        check(workerTask.v1 === ID_HANDLER_B && workerTask.v2 === DATA_SIZE &&
-              workerPacket.id === ID_WORKER && workerPacket.a1 === 0 &&
-              workerScheduler.blocks[ID_HANDLER_B].queue === workerPacket,
-              'Worker exact packet role');
-        check(worker.state === STATE_SUSPENDED && worker.queue === null &&
-              workerScheduler.queueCount === 1,
-              'Worker Active prefix, queue, and later null suspend');
-
-        var handlerScheduler = new Scheduler();
-        addSix(handlerScheduler);
-        var handler = handlerScheduler.blocks[ID_HANDLER_A];
-        var handlerTask = handler.task;
-        var handlerPacket = new Packet(null, ID_HANDLER_A, KIND_DEVICE);
-        handler.queue = handlerPacket;
-        handler.state = STATE_SUSPENDED_RUNNABLE;
-        handlerScheduler.list = handler;
-        handlerScheduler.schedule();
-        check(handlerTask.v1 === null && handlerTask.v2 === handlerPacket &&
-              handlerPacket.link === null,
-              'Handler exact incoming role');
-        check(handler.state === STATE_SUSPENDED && handler.queue === null &&
-              handlerScheduler.holdCount === 0 && handlerScheduler.queueCount === 0,
-              'Handler suspended without Worker/Device effects');
-
-        var deviceScheduler = new Scheduler();
-        addSix(deviceScheduler);
-        var device = deviceScheduler.blocks[ID_DEVICE_A];
-        var deviceTask = device.task;
-        var devicePacket = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        device.queue = devicePacket;
-        device.state = STATE_SUSPENDED_RUNNABLE;
-        deviceScheduler.list = device;
-        deviceScheduler.schedule();
-        check(deviceTask.v1 === devicePacket && devicePacket.link === null &&
-              device.state === STATE_HELD && device.queue === null,
-              'Device exact hold role');
-        check(deviceScheduler.holdCount === 1 && deviceScheduler.queueCount === 0 &&
-              deviceScheduler.currentId === ID_DEVICE_A &&
-              deviceScheduler.currentTcb === null,
-              'Device did not cross-dispatch');
-
-        check(Object.keys(workerTask).join('|') === Object.keys(handlerTask).join('|') &&
-              Object.getPrototypeOf(workerTask) !== Object.getPrototypeOf(handlerTask) &&
-              deviceTask.scheduler === deviceScheduler,
-              'role fixture identities');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_active_device_packet_fallback_parity_case() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function oneHold(kind, code) {
-          var scheduler = new Scheduler();
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          var packet = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-          packet.a1 = code;
-          if (kind === 1) packet.link = new Packet(null, ID_DEVICE_B, KIND_DEVICE);
-          if (kind === 2) packet.link = packet;
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, packet);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-          for (var id = 0; id < NUMBER_OF_IDS; id++) {
-            if (id !== ID_DEVICE_A) scheduler.blocks[id].state = STATE_HELD;
-          }
-          scheduler.schedule();
-          var current = scheduler.blocks[ID_DEVICE_A], device = current.task;
-          return [scheduler.holdCount, current.state, current.queue === null,
-                  device.v1.a1, device.v1.link === current.queue,
-                  kind === 2 ? device.v1.link === device.v1 : true,
-                  scheduler.currentId, scheduler.currentTcb === null,
-                  current.link === scheduler.blocks[ID_HANDLER_B]].join('|');
-        }
-        oneHold(0, 81) + ';' + oneHold(1, 82) + ';' + oneHold(2, 83)
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(
-        run_jit(&src),
-        "1|4|true|81|true|true|4|true|true;1|5|false|82|true|true|4|true|true;1|5|false|83|true|true|4|true|true"
-    );
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-#[test]
-fn jit_scheduler_graph_active_packet_role_router_enabled_disabled_parity() {
-    use std::process::Command;
-
-    let executable = std::env::current_exe().expect("current test executable");
-    for router_disabled in [false, true] {
-        let mut command = Command::new(&executable);
-        command
-            .arg("--exact")
-            .arg("tests::jit_scheduler_graph_active_device_packet_fallback_parity_case")
-            .arg("--nocapture")
-            .env_remove("LUMEN_JIT_NO_SCHED_ACTIVE_PACKET_ROLE_DISPATCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_EPOCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_DEVICE_DIRECT")
-            .env_remove("LUMEN_JIT_NO_SCHED_DEVICE_HOLD")
-            .env("LUMEN_JIT_REGIONLOG", "1");
-        if router_disabled {
-            command.env("LUMEN_JIT_NO_SCHED_ACTIVE_PACKET_ROLE_DISPATCH", "1");
-        }
-        let output = command
-            .output()
-            .expect("run graph Active packet router parity child test");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success() && stdout.contains("running 1 test"),
-            "graph Active packet router parity child router_disabled={router_disabled} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
-            stderr.contains(&format!(
-                "active_packet_role_dispatch={}",
-                !router_disabled
-            )),
-            "graph Active packet router parity did not plan the expected gate router_disabled={router_disabled}\nstderr:\n{stderr}"
-        );
-    }
-}
-
-#[test]
-fn jit_scheduler_trusted_session_rechecks_globals_and_state_after_user_code() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler trusted session: ' + message;
-        }
-
-        // The trusted constants are observations from the current schedule() call, not compile-
-        // time constants. Changing them before entry must reject the native session before it
-        // commits anything, and ordinary execution must consume the packet with the new values.
-        var beforePacket = {link: null, id: 71};
-        var beforeSeen = null;
-        var beforeTcb = new TaskControlBlock(null, ID_WORKER, 1, beforePacket, {
-          run: function(packet) { beforeSeen = packet; return null; }
-        });
-        STATE_SUSPENDED_RUNNABLE = 8;
-        STATE_RUNNING = 16;
-        STATE_RUNNABLE = 17;
-        beforeTcb.state = STATE_SUSPENDED_RUNNABLE;
-        var beforeScheduler = new Scheduler();
-        beforeScheduler.list = beforeTcb;
-        beforeScheduler.schedule();
-        check(beforeSeen === beforePacket, 'pre-entry constants replay packet');
-        check(beforeTcb.state === 16 && beforeScheduler.currentTcb === null,
-              'pre-entry constants replay state');
-
-        STATE_SUSPENDED_RUNNABLE = 3;
-        STATE_RUNNING = 0;
-        STATE_RUNNABLE = 1;
-
-        // A generic task is arbitrary user code and must end the trusted session. The following
-        // TCB therefore has to re-read all three active-state names before interpreting state 8.
-        var middlePacket = {link: null, id: 72};
-        var middleSeen = null;
-        var middleTcb = new TaskControlBlock(null, ID_WORKER, 1, middlePacket, {
-          run: function(packet) { middleSeen = packet; return null; }
-        });
-        var namesMutator = new TaskControlBlock(middleTcb, ID_WORKER, 1, null, {
-          run: function() {
-            STATE_SUSPENDED_RUNNABLE = 8;
-            STATE_RUNNING = 16;
-            STATE_RUNNABLE = 17;
-            middleTcb.state = STATE_SUSPENDED_RUNNABLE;
-            return middleTcb;
-          }
-        });
-        namesMutator.state = STATE_RUNNING;
-        var middleScheduler = new Scheduler();
-        middleScheduler.list = namesMutator;
-        middleScheduler.schedule();
-        check(middleSeen === middlePacket, 'post-call constants re-read packet');
-        check(middleTcb.state === 16 && middleScheduler.currentTcb === null,
-              'post-call constants re-read state');
-
-        STATE_SUSPENDED_RUNNABLE = 3;
-        STATE_RUNNING = 0;
-        STATE_RUNNABLE = 1;
-
-        // Trusted state is also scoped to the direct continuation. Replace the next TCB's data
-        // slot with an accessor from a generic task. Both the active and subsequent suspended
-        // iterations must execute the getter, and markAsSuspended must execute the setter once.
-        var descriptorScheduler = new Scheduler();
-        var descriptorTcb = new TaskControlBlock(
-            null, ID_DEVICE_A, 1, null, new DeviceTask(descriptorScheduler));
-        descriptorTcb.state = STATE_RUNNING;
-        var stateGets = 0, stateSets = 0, storedState = STATE_RUNNING;
-        var descriptorMutator = new TaskControlBlock(
-            descriptorTcb, ID_WORKER, 1, null, {
-              run: function() {
-                Object.defineProperty(descriptorTcb, 'state', {
-                  configurable: true,
-                  get: function() { stateGets++; return storedState; },
-                  set: function(value) { stateSets++; storedState = value; }
-                });
-                return descriptorTcb;
-              }
-            });
-        descriptorMutator.state = STATE_RUNNING;
-        descriptorScheduler.list = descriptorMutator;
-        descriptorScheduler.schedule();
-        check(stateGets === 6 && stateSets === 1,
-              'post-call state descriptor invoked exactly');
-        check(storedState === STATE_SUSPENDED && descriptorScheduler.currentTcb === null,
-              'post-call state descriptor preserved result');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_fast_loop_rechecks_after_generic_calls_and_budget() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler fast loop: ' + message;
-        }
-        function directDevice(scheduler, link, id) {
-          var task = new DeviceTask(scheduler);
-          var tcb = new TaskControlBlock(link, id, 1, null, task);
-          tcb.state = STATE_RUNNING;
-          return tcb;
-        }
-
-        // A direct Device suspend enters the internal continuation. The unknown task in the
-        // middle must clear it before user code replaces a shell method; the following Device
-        // iteration must observe that replacement through ordinary replay.
-        var scheduler = new Scheduler();
-        var tail = directDevice(scheduler, null, ID_DEVICE_B);
-        var originalHeld = TaskControlBlock.prototype.isHeldOrSuspended;
-        var heldCalls = 0;
-        var mutator = new TaskControlBlock(tail, ID_WORKER, 2, null, {
-          run: function() {
-            TaskControlBlock.prototype.isHeldOrSuspended = function() {
-              heldCalls++;
-              return originalHeld.call(this);
-            };
-            return tail;
-          }
-        });
-        mutator.state = STATE_RUNNING;
-        var head = directDevice(scheduler, mutator, ID_DEVICE_A);
-        scheduler.list = head;
-        scheduler.schedule();
-        TaskControlBlock.prototype.isHeldOrSuspended = originalHeld;
-        check(heldCalls >= 2, 'generic call invalidates cached method');
-        check(head.state === STATE_SUSPENDED && tail.state === STATE_SUSPENDED,
-              'both direct devices suspended');
-        check(scheduler.currentTcb === null, 'generic chain completed');
-
-        // More than one 1024-transition epoch forces a canonical full-shell re-guard without
-        // growing a native frame per iteration or losing any TCB owner.
-        var longScheduler = new Scheduler(), chain = null, tcbs = [];
-        for (var n = 0; n < 1100; n++) {
-          chain = directDevice(longScheduler, chain,
-                               (n & 1) ? ID_DEVICE_A : ID_DEVICE_B);
-          tcbs.push(chain);
-        }
-        longScheduler.list = chain;
-        longScheduler.schedule();
-        var suspended = 0;
-        for (var n = 0; n < tcbs.length; n++) {
-          if (tcbs[n].state === STATE_SUSPENDED) suspended++;
-        }
-        check(suspended === tcbs.length, 'budget re-entry preserves every state');
-        check(longScheduler.currentTcb === null, 'budget chain completed');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_epoch_rechecks_role_identity_and_task_shape_after_long_direct_chain() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler role epoch: ' + message;
-        }
-        function directRole(scheduler, link, ordinal) {
-          var task, id;
-          if ((ordinal % 3) === 0) {
-            task = new DeviceTask(scheduler);
-            id = ID_DEVICE_A;
-          } else if ((ordinal % 3) === 1) {
-            task = new HandlerTask(scheduler);
-            id = ID_HANDLER_A;
-          } else {
-            task = new WorkerTask(scheduler, ID_HANDLER_A, 17);
-            id = ID_WORKER;
-          }
-          var tcb = new TaskControlBlock(link, id, 1, null, task);
-          tcb.state = STATE_RUNNING;
-          return [tcb, task];
-        }
-
-        // The first 1040 active-null roles are completely direct, crossing the 1024-transition
-        // continuation budget. The next TCB has a task accessor and mutates its own shape while
-        // being read; no role fact from the earlier epoch may bypass that source-level get.
-        var scheduler = new Scheduler(), tcbs = new Array(1100);
-        var tasks = new Array(1100), link = null;
-        for (var n = 1099; n >= 0; n--) {
-          var pair = directRole(scheduler, link, n);
-          tcbs[n] = pair[0];
-          tasks[n] = pair[1];
-          link = pair[0];
-        }
-        var accessorIndex = 1040, accessorTcb = tcbs[accessorIndex];
-        var accessorTask = tasks[accessorIndex], taskGets = 0;
-        var getterState = -1, getterId = -1, getterWasCurrent = false;
-        Object.defineProperty(accessorTcb, 'task', {
-          configurable: true,
-          get: function() {
-            taskGets++;
-            getterState = this.state;
-            getterId = scheduler.currentId;
-            getterWasCurrent = scheduler.currentTcb === this;
-            this.afterTaskRead = 101;
-            return accessorTask;
-          }
-        });
-
-        // Worker and Handler have identical own layouts, so a later Worker on a distinct
-        // prototype is a precise role-prototype guard. Its replacement must run once through
-        // ordinary dispatch without affecting the normal roles that follow it.
-        var prototypeIndex = 1043, prototypeTcb = tcbs[prototypeIndex];
-        var prototypeTask = tasks[prototypeIndex];
-        check(prototypeTask instanceof WorkerTask, 'prototype fixture role');
-        var alternate = Object.create(WorkerTask.prototype);
-        var prototypeHits = 0, prototypeState = -1, prototypeId = -1;
-        var prototypeSawNull = false, prototypeWasCurrent = false;
-        alternate.run = function(packet) {
-          prototypeHits++;
-          prototypeState = prototypeTcb.state;
-          prototypeId = scheduler.currentId;
-          prototypeSawNull = packet === null;
-          prototypeWasCurrent = scheduler.currentTcb === prototypeTcb;
-          return WorkerTask.prototype.run.call(this, packet);
-        };
-        Object.setPrototypeOf(prototypeTask, alternate);
-
-        scheduler.list = tcbs[0];
-        scheduler.schedule();
-        check(taskGets === 1 && getterState === STATE_RUNNING &&
-              getterId === accessorTcb.id && getterWasCurrent,
-              'post-epoch task getter source order');
-        check(accessorTcb.afterTaskRead === 101 &&
-              accessorTcb.state === STATE_SUSPENDED,
-              'post-epoch task shape mutation');
-        check(prototypeHits === 1 && prototypeState === STATE_RUNNING &&
-              prototypeId === ID_WORKER && prototypeSawNull && prototypeWasCurrent,
-              'post-epoch alternate prototype once');
-        check(prototypeTask.v1 === ID_HANDLER_A && prototypeTask.v2 === 17 &&
-              prototypeTcb.state === STATE_SUSPENDED,
-              'post-epoch Worker result');
-
-        var suspended = 0;
-        for (var n = 0; n < tcbs.length; n++) {
-          if (tcbs[n].state === STATE_SUSPENDED) suspended++;
-        }
-        check(suspended === tcbs.length, 'every mixed role suspended once');
-        check(tcbs[1023].link === tcbs[1024] && tcbs[1099].link === null,
-              'chain owners retained');
-        check(tasks[accessorIndex] === accessorTask &&
-              tcbs[prototypeIndex].task === prototypeTask,
-              'task owners retained');
-        check(scheduler.list === tcbs[0] && scheduler.currentTcb === null &&
-              scheduler.currentId === tcbs[1099].id,
-              'long session completed');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_generic_exit_invalidates_tcb_role_and_shell_global_epoch() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler generic epoch: ' + message;
-        }
-        function directDevice(scheduler, link, id) {
-          var task = new DeviceTask(scheduler);
-          var tcb = new TaskControlBlock(link, id, 1, null, task);
-          tcb.state = STATE_RUNNING;
-          return tcb;
-        }
-
-        var scheduler = new Scheduler();
-        var tail = directDevice(scheduler, null, ID_DEVICE_B);
-        var originalTcbRun = TaskControlBlock.prototype.run;
-        var originalDeviceRun = DeviceTask.prototype.run;
-        var oldSuspended = STATE_SUSPENDED;
-        var tcbHits = 0, tcbState = -1, tcbId = -1, tcbWasCurrent = false;
-        var deviceHits = 0, deviceState = -1, deviceId = -1;
-        var deviceSawNull = false, deviceWasCurrent = false;
-
-        // This task is deliberately outside every exact role. Its call must terminate the direct
-        // session before changing a hoisted TCB method, a role method, and the shell's suspended
-        // global. The returned Device must observe all three replacements in this iteration.
-        var mutator = new TaskControlBlock(tail, ID_WORKER, 1, null, {
-          run: function() {
-            TaskControlBlock.prototype.run = function() {
-              tcbHits++;
-              tcbState = this.state;
-              tcbId = scheduler.currentId;
-              tcbWasCurrent = scheduler.currentTcb === this;
-              return originalTcbRun.call(this);
-            };
-            DeviceTask.prototype.run = function(packet) {
-              deviceHits++;
-              deviceState = tail.state;
-              deviceId = scheduler.currentId;
-              deviceSawNull = packet === null;
-              deviceWasCurrent = scheduler.currentTcb === tail;
-              return originalDeviceRun.call(this, packet);
-            };
-            STATE_SUSPENDED = 8;
-            return tail;
-          }
-        });
-        mutator.state = STATE_RUNNING;
-        var head = directDevice(scheduler, mutator, ID_DEVICE_A);
-        scheduler.list = head;
-        scheduler.schedule();
-
-        TaskControlBlock.prototype.run = originalTcbRun;
-        DeviceTask.prototype.run = originalDeviceRun;
-        STATE_SUSPENDED = oldSuspended;
-        check(head.state === oldSuspended, 'head used pre-mutation global');
-        check(tcbHits === 1 && tcbState === STATE_RUNNING &&
-              tcbId === ID_DEVICE_B && tcbWasCurrent,
-              'changed TCB.run entered once after currentId');
-        check(deviceHits === 1 && deviceState === STATE_RUNNING &&
-              deviceId === ID_DEVICE_B && deviceSawNull && deviceWasCurrent,
-              'changed Device.run entered once after TCB.run');
-        check(tail.state === 8, 'tail used changed suspended global');
-        check(scheduler.currentId === ID_DEVICE_B && scheduler.currentTcb === null,
-              'changed shell global terminated session');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_refilled_epoch_rechecks_nested_suspend_methods_after_generic_exit() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler nested epoch: ' + message;
-        }
-        function directDevice(scheduler, link, id) {
-          var task = new DeviceTask(scheduler);
-          var tcb = new TaskControlBlock(link, id, 1, null, task);
-          tcb.state = STATE_RUNNING;
-          return tcb;
-        }
-
-        var scheduler = new Scheduler();
-        var tail = directDevice(scheduler, null, ID_DEVICE_B);
-        var tailTask = tail.task;
-        var originalSuspend = Scheduler.prototype.suspendCurrent;
-        var originalMark = TaskControlBlock.prototype.markAsSuspended;
-        var suspendHits = 0, suspendState = -1, suspendId = -1;
-        var suspendThis = false, suspendCurrent = false;
-        var markHits = 0, markState = -1, markThis = false, markCurrent = false;
-
-        // This unknown task runs only after the direct prefix has crossed and refilled the 1024
-        // transition epoch. Replacing both nested methods must invalidate that refilled epoch
-        // before the returned Device reaches its null-packet suspend path.
-        var mutator = new TaskControlBlock(tail, ID_WORKER, 1, null, {
-          run: function() {
-            Scheduler.prototype.suspendCurrent = function() {
-              suspendHits++;
-              suspendState = this.currentTcb.state;
-              suspendId = this.currentId;
-              suspendThis = this === scheduler;
-              suspendCurrent = this.currentTcb === tail;
-              return originalSuspend.call(this);
-            };
-            TaskControlBlock.prototype.markAsSuspended = function() {
-              markHits++;
-              markState = this.state;
-              markThis = this === tail;
-              markCurrent = scheduler.currentTcb === this;
-              return originalMark.call(this);
-            };
-            return tail;
-          }
-        });
-        mutator.state = STATE_RUNNING;
-
-        var prefix = new Array(1050), link = mutator;
-        for (var n = 1049; n >= 0; n--) {
-          prefix[n] = directDevice(
-              scheduler, link, (n & 1) ? ID_DEVICE_A : ID_DEVICE_B);
-          link = prefix[n];
-        }
-        scheduler.list = prefix[0];
-        scheduler.schedule();
-
-        Scheduler.prototype.suspendCurrent = originalSuspend;
-        TaskControlBlock.prototype.markAsSuspended = originalMark;
-        check(suspendHits === 1 && suspendState === STATE_RUNNING &&
-              suspendId === ID_DEVICE_B && suspendThis && suspendCurrent,
-              'changed suspend entered once with live current');
-        check(markHits === 1 && markState === STATE_RUNNING &&
-              markThis && markCurrent,
-              'changed mark entered once after suspend');
-        check(tail.state === STATE_SUSPENDED && tail.task === tailTask &&
-              tailTask.scheduler === scheduler,
-              'tail state and owners');
-
-        var suspended = 0;
-        for (var n = 0; n < prefix.length; n++) {
-          if (prefix[n].state === STATE_SUSPENDED) suspended++;
-        }
-        check(suspended === prefix.length, 'direct prefix suspended once');
-        check(prefix[1023].link === prefix[1024] &&
-              prefix[1049].link === mutator && mutator.link === tail,
-              'prefix and tail links retained');
-        check(scheduler.list === prefix[0] && scheduler.currentId === ID_DEVICE_B &&
-              scheduler.currentTcb === null,
-              'refilled session completed');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_foreign_blocks_target_replays_queue_methods_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler foreign target: ' + message;
-        }
-
-        var scheduler = new Scheduler();
-        var deviceTask = new DeviceTask(scheduler);
-        var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-        packet.a1 = 113;
-        deviceTask.v1 = packet;
-        var source = new TaskControlBlock(
-            null, ID_DEVICE_A, 2, null, deviceTask);
-        source.state = STATE_RUNNING;
-
-        var target = new TaskControlBlock(null, ID_WORKER, 3, null, {
-          run: function() { throw 'held foreign target ran'; }
-        });
-        target.state = STATE_SUSPENDED | STATE_HELD;
-        var ordinary = new TaskControlBlock(null, ID_WORKER, 3, null, {});
-        ordinary.state = STATE_SUSPENDED | STATE_HELD;
-        var ownLayout = Object.keys(target).join('|');
-        check(ownLayout === Object.keys(ordinary).join('|'), 'same own layout fixture');
-
-        // The target comes from Scheduler.blocks and keeps the ordinary TCB own layout, but its
-        // immediate prototype overrides both queue methods. A cached standard-TCB method epoch
-        // must reject before queue/check writes and replay each foreign method exactly once.
-        var foreign = Object.create(TaskControlBlock.prototype);
-        var originalCheck = TaskControlBlock.prototype.checkPriorityAdd;
-        var originalMark = TaskControlBlock.prototype.markAsRunnable;
-        var checkHits = 0, checkTask = null, checkPacket = null;
-        var checkCount = -1, checkQueue = 1, checkState = -1, checkId = -1;
-        var markHits = 0, markQueue = null, markState = -1;
-        foreign.checkPriorityAdd = function(task, value) {
-          checkHits++;
-          checkTask = task;
-          checkPacket = value;
-          checkCount = scheduler.queueCount;
-          checkQueue = this.queue;
-          checkState = this.state;
-          checkId = value.id;
-          return originalCheck.call(this, task, value);
-        };
-        foreign.markAsRunnable = function() {
-          markHits++;
-          markQueue = this.queue;
-          markState = this.state;
-          return originalMark.call(this);
-        };
-        Object.setPrototypeOf(target, foreign);
-        check(Object.keys(target).join('|') === ownLayout &&
-              Object.getPrototypeOf(target) === foreign &&
-              target instanceof TaskControlBlock,
-              'foreign immediate prototype fixture');
-
-        scheduler.blocks[ID_WORKER] = target;
-        scheduler.list = source;
-        scheduler.schedule();
-        check(checkHits === 1 && checkTask === source && checkPacket === packet &&
-              checkCount === 1 && checkQueue === null &&
-              checkState === (STATE_SUSPENDED | STATE_HELD) &&
-              checkId === ID_DEVICE_A,
-              'foreign check saw queue prefix once');
-        check(markHits === 1 && markQueue === packet &&
-              markState === (STATE_SUSPENDED | STATE_HELD),
-              'foreign mark saw target publication once');
-        check(deviceTask.v1 === null && source.state === STATE_RUNNING &&
-              source.queue === null,
-              'source Device effects');
-        check(packet.link === null && packet.id === ID_DEVICE_A && packet.a1 === 113 &&
-              scheduler.queueCount === 1,
-              'packet queue effects');
-        check(target.queue === packet &&
-              target.state === (STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE),
-              'foreign target state');
-        check(Object.keys(target).join('|') === ownLayout &&
-              Object.getPrototypeOf(target) === foreign,
-              'foreign target identity retained');
-        check(scheduler.currentId === ID_DEVICE_A && scheduler.currentTcb === null &&
-              scheduler.list === source && scheduler.blocks[ID_WORKER] === target,
-              'scheduler owners and completion');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_epoch_rebuilds_same_layout_blocks_identity_after_delayed_exit() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler graph refill: ' + message;
-        }
-
-        // Keep all six entry records canonical. Handler A consumes one TCB queue node per
-        // scheduler iteration, so the observable final packet cannot be reached until 1050
-        // completely direct active iterations have crossed the 1024-transition refill boundary.
-        var scheduler = new Scheduler();
-        scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-        scheduler.addWorkerTask(ID_WORKER, 1000, null);
-
-        var special = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        special.a1 = 131;
-        var queue = special;
-        for (var n = 0; n < 1050; n++) {
-          var work = new Packet(queue, ID_WORKER, KIND_WORK);
-          work.a1 = 0;
-          work.a2[0] = 91;
-          queue = work;
-        }
-        scheduler.addHandlerTask(ID_HANDLER_A, 2000, queue);
-        scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-        scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-        scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-
-        var idle = scheduler.blocks[ID_IDLE];
-        var handlerA = scheduler.blocks[ID_HANDLER_A];
-        var handlerB = scheduler.blocks[ID_HANDLER_B];
-        var original = scheduler.blocks[ID_DEVICE_A];
-        var deviceB = scheduler.blocks[ID_DEVICE_B];
-        var foreignTask = new DeviceTask(scheduler);
-        var foreign = new TaskControlBlock(
-            original.link, ID_DEVICE_A, original.priority, null, foreignTask);
-        foreign.state = STATE_SUSPENDED | STATE_HELD;
-        check(Object.keys(foreign).join('|') === Object.keys(original).join('|') &&
-              Object.getPrototypeOf(foreign) === Object.getPrototypeOf(original) &&
-              Object.keys(foreignTask).join('|') ===
-                  Object.keys(original.task).join('|') &&
-              Object.getPrototypeOf(foreignTask) ===
-                  Object.getPrototypeOf(original.task),
-              'same-layout replacement fixture');
-
-        var kindGets = 0, getterState = -1, getterId = -1;
-        var getterWasCurrent = false, getterSawOld = false;
-        Object.defineProperty(special, 'kind', {
-          configurable: true,
-          get: function() {
-            kindGets++;
-            getterState = handlerA.state;
-            getterId = scheduler.currentId;
-            getterWasCurrent = scheduler.currentTcb === handlerA;
-            getterSawOld = scheduler.blocks[ID_DEVICE_A] === original &&
-                           deviceB.link === original;
-            // Publish a complete, still-valid six-record graph. A stale epoch pointer would
-            // enqueue `special` on the detached original Device A instead of this replacement.
-            deviceB.link = foreign;
-            scheduler.blocks[ID_DEVICE_A] = foreign;
-            return KIND_DEVICE;
-          }
-        });
-
-        scheduler.schedule();
-        check(kindGets === 1 && getterState === STATE_RUNNING &&
-              getterId === ID_HANDLER_A && getterWasCurrent && getterSawOld,
-              'delayed getter ran once at source position');
-        check(scheduler.queueCount === 1 && special.id === ID_HANDLER_A &&
-              special.link === null && special.a1 === 91,
-              'post-exit queue effects');
-        check(foreign.queue === special &&
-              foreign.state === (STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE) &&
-              foreign.task === foreignTask && foreignTask.scheduler === scheduler,
-              'replacement record received the packet');
-        check(original.queue === null && original.state === STATE_SUSPENDED &&
-              original.task.v1 === null,
-              'detached record was never reached through a stale pointer');
-        check(scheduler.blocks[ID_DEVICE_A] === foreign && deviceB.link === foreign &&
-              foreign.link === handlerB && scheduler.list === deviceB,
-              'rebuilt six-record owners');
-        check(idle.task.scheduler === scheduler && handlerA.task.scheduler === scheduler &&
-              scheduler.currentTcb === null && scheduler.currentId === ID_IDLE,
-              'refilled session completed');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_epoch_rejects_observable_and_foreign_scheduler_graphs() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'scheduler graph reject: ' + message;
-        }
-        function addSix(scheduler, idleCount) {
-          scheduler.addIdleTask(ID_IDLE, 0, null, idleCount);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-        }
-
-        // An observable blocks property must decline eager graph validation without invoking
-        // user code. The one source-level Idle release reads it only after committing count/v1
-        // and currentId, which the getter records exactly once.
-        var observable = new Scheduler();
-        addSix(observable, 2);
-        var observableIdle = observable.blocks[ID_IDLE];
-        var observableDevice = observable.blocks[ID_DEVICE_B];
-        var storedBlocks = observable.blocks;
-        var blocksGets = 0, getterCount = -1, getterV1 = -1, getterId = -1;
-        var getterWasCurrent = false;
-        Object.defineProperty(observable, 'blocks', {
-          configurable: true,
-          get: function() {
-            blocksGets++;
-            getterCount = observableIdle.task.count;
-            getterV1 = observableIdle.task.v1;
-            getterId = this.currentId;
-            getterWasCurrent = this.currentTcb === observableIdle;
-            return storedBlocks;
-          }
-        });
-        observable.schedule();
-        check(blocksGets === 1 && getterCount === 1 && getterV1 === 0xD008 &&
-              getterId === ID_IDLE && getterWasCurrent,
-              'blocks getter ran once after Idle prefix');
-        check(observableIdle.state === STATE_HELD &&
-              observableDevice.state === STATE_SUSPENDED &&
-              observable.currentTcb === null,
-              'observable graph ordinary result');
-
-        // A role task can retain the exact own shape/prototype while its scheduler identity is
-        // foreign. Entry validation must reject before calling the foreign method. Drop every
-        // outside owner: the task.scheduler edge alone must keep both scheduler and marker alive.
-        var mismatch = new Scheduler();
-        addSix(mismatch, 1);
-        var mismatchDevice = mismatch.blocks[ID_DEVICE_B];
-        var mismatchTask = mismatchDevice.task;
-        mismatchDevice.state = STATE_RUNNING;
-        var foreign = new Scheduler();
-        var marker = { code: 223, seen: 0 };
-        foreign.marker = marker;
-        var methodHits = 0, methodId = -1, methodWasCurrent = false;
-        var methodThis = null;
-        foreign.suspendCurrent = function() {
-          methodHits++;
-          methodId = mismatch.currentId;
-          methodWasCurrent = mismatch.currentTcb === mismatchDevice;
-          methodThis = this;
-          this.marker.seen++;
-          return null;
-        };
-        mismatchTask.scheduler = foreign;
-        foreign = null;
-        marker = null;
-
-        mismatch.schedule();
-        check(methodHits === 1 && methodId === ID_DEVICE_B &&
-              methodWasCurrent && methodThis === mismatchTask.scheduler,
-              'foreign scheduler method ran once at source position');
-        check(mismatchTask.scheduler.marker.code === 223 &&
-              mismatchTask.scheduler.marker.seen === 1,
-              'last-owner scheduler and marker survived rejection');
-        check(mismatchDevice.state === STATE_RUNNING && mismatch.currentTcb === null &&
-              mismatch.currentId === ID_DEVICE_B,
-              'foreign scheduler ordinary result');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_core_suspend_parity_case() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph core suspend: ' + message;
-        }
-        function addSix(scheduler) {
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-          for (var id = 0; id < NUMBER_OF_IDS; id++)
-            scheduler.blocks[id].state = STATE_HELD;
-        }
-
-        // One graph session reaches every CORE-backed null suspend consumer in link order:
-        // Device A -> held Handler B -> Handler A -> Worker -> held Idle.
-        var scheduler = new Scheduler();
-        addSix(scheduler);
-        var device = scheduler.blocks[ID_DEVICE_A];
-        var handler = scheduler.blocks[ID_HANDLER_A];
-        var worker = scheduler.blocks[ID_WORKER];
-        device.state = STATE_RUNNING;
-        handler.state = STATE_RUNNING;
-        worker.state = STATE_RUNNING;
-        scheduler.list = device;
-
-        scheduler.schedule();
-
-        check(device.state === STATE_SUSPENDED, 'Device suspended');
-        check(handler.state === STATE_SUSPENDED, 'Handler suspended');
-        check(worker.state === STATE_SUSPENDED, 'Worker suspended');
-        check(scheduler.currentId === ID_WORKER && scheduler.currentTcb === null,
-              'scheduler completion');
-        check(device.task.scheduler === scheduler &&
-              handler.task.scheduler === scheduler &&
-              worker.task.scheduler === scheduler,
-              'task scheduler owners');
-        check(device.link === scheduler.blocks[ID_HANDLER_B] &&
-              handler.link === worker && worker.link === scheduler.blocks[ID_IDLE],
-              'canonical links retained');
-
-        [device.state, handler.state, worker.state, scheduler.currentId,
-         scheduler.currentTcb === null, device.task.v1 === null,
-         handler.task.v1 === null && handler.task.v2 === null].join('|')
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "2|2|2|1|true|true|true");
-}
-
-#[test]
-fn jit_scheduler_graph_core_epoch_soft_rejects_foreign_task_scheduler_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph core soft reject: ' + message;
-        }
-        function addSix(scheduler) {
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-          for (var id = 0; id < NUMBER_OF_IDS; id++)
-            scheduler.blocks[id].state = STATE_HELD;
-        }
-
-        var scheduler = new Scheduler();
-        addSix(scheduler);
-        var device = scheduler.blocks[ID_DEVICE_A];
-        var handler = scheduler.blocks[ID_HANDLER_A];
-        var worker = scheduler.blocks[ID_WORKER];
-        var workerTask = worker.task;
-        device.state = STATE_RUNNING;
-        handler.state = STATE_RUNNING;
-        worker.state = STATE_RUNNING;
-        scheduler.list = device;
-
-        // Replacing the value retains WorkerTask's exact shape and prototype, so the base graph
-        // remains valid. Only CORE's all-six outer-Scheduler identity contract must decline.
-        var keys = Object.keys(workerTask).join('|');
-        var foreign = new Scheduler();
-        var gets = 0, calls = 0, callThis = null, sourceOrder = false;
-        Object.defineProperty(foreign, 'suspendCurrent', {
-          configurable: true,
-          get: function() {
-            gets++;
-            sourceOrder =
-                device.state === STATE_SUSPENDED &&
-                handler.state === STATE_SUSPENDED &&
-                worker.state === STATE_RUNNING &&
-                scheduler.currentId === ID_WORKER &&
-                scheduler.currentTcb === worker;
-            return function() {
-              calls++;
-              callThis = this;
-              return null;
-            };
-          }
-        });
-        workerTask.scheduler = foreign;
-        check(Object.keys(workerTask).join('|') === keys &&
-              Object.getPrototypeOf(workerTask) === WorkerTask.prototype,
-              'same-shape task fixture');
-
-        scheduler.schedule();
-
-        check(gets === 1 && calls === 1 && callThis === foreign,
-              'foreign accessor and call once');
-        check(sourceOrder, 'foreign accessor source position');
-        check(device.state === STATE_SUSPENDED &&
-              handler.state === STATE_SUSPENDED,
-              'base graph continued before generic fallback');
-        check(worker.state === STATE_RUNNING &&
-              scheduler.currentTcb === null &&
-              scheduler.currentId === ID_WORKER,
-              'foreign result preserved');
-        check(worker.task === workerTask && workerTask.scheduler === foreign &&
-              scheduler.blocks[ID_WORKER] === worker,
-              'foreign and graph owners retained');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-#[test]
-fn jit_scheduler_graph_core_suspend_enabled_disabled_parity() {
-    use std::process::Command;
-
-    let executable = std::env::current_exe().expect("current test executable");
-    for disabled in [false, true] {
-        let mut command = Command::new(&executable);
-        command
-            .arg("--exact")
-            .arg("tests::jit_scheduler_graph_core_suspend_parity_case")
-            .arg("--nocapture")
-            .env("LUMEN_JIT_REGIONLOG", "1")
-            .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_CORE")
-            .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_EPOCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_METHOD_EPOCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_ROLE_EPOCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_ROLE_DISPATCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_FAST_LOOP")
-            .env_remove("LUMEN_JIT_NO_SCHED_REGION");
-        if disabled {
-            command.env("LUMEN_JIT_NO_SCHED_GRAPH_CORE", "1");
-        }
-
-        let output = command.output().expect("run graph CORE parity child");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success()
-                && stdout.contains("running 1 test")
-                && stderr.contains("graph_epoch=true")
-                && stderr.contains(&format!("graph_core={}", !disabled)),
-            "graph CORE parity child disabled={disabled} failed\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-}
-
-#[test]
-fn jit_scheduler_graph_core_epoch_rebuilds_task_identities_across_calls() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph core identity refill: ' + message;
-        }
-        function addSix(scheduler) {
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-        }
-        function newTask(scheduler, id, n) {
-          if (id === ID_WORKER)
-            return new WorkerTask(scheduler, ID_HANDLER_A, n + 11);
-          if (id === ID_HANDLER_A)
-            return new HandlerTask(scheduler);
-          return new DeviceTask(scheduler);
-        }
-
-        var scheduler = new Scheduler();
-        addSix(scheduler);
-        var roles = [ID_WORKER, ID_HANDLER_A, ID_DEVICE_A];
-
-        // Every call ends the old bounded session. Same-layout replacement records/tasks must be
-        // rediscovered on the next call; stale raw frame identities must neither retain nor touch
-        // the detached objects.
-        for (var n = 0; n < 48; n++) {
-          for (var j = 0; j < NUMBER_OF_IDS; j++)
-            scheduler.blocks[j].state = STATE_HELD;
-
-          var id = roles[n % roles.length];
-          var old = scheduler.blocks[id];
-          var oldTask = old.task;
-          var predecessor = scheduler.blocks[id + 1];
-          var task = newTask(scheduler, id, n);
-          var fresh = new TaskControlBlock(
-              old.link, id, old.priority, null, task);
-          fresh.state = STATE_RUNNING;
-
-          check(Object.keys(fresh).join('|') === Object.keys(old).join('|') &&
-                Object.getPrototypeOf(fresh) === Object.getPrototypeOf(old),
-                'same-layout TCB ' + n);
-          check(Object.keys(task).join('|') === Object.keys(oldTask).join('|') &&
-                Object.getPrototypeOf(task) === Object.getPrototypeOf(oldTask),
-                'same-layout task ' + n);
-
-          predecessor.link = fresh;
-          scheduler.blocks[id] = fresh;
-          scheduler.list = fresh;
-          scheduler.schedule();
-
-          check(fresh.state === STATE_SUSPENDED &&
-                scheduler.currentId === id && scheduler.currentTcb === null,
-                'fresh record result ' + n);
-          check(scheduler.blocks[id] === fresh && predecessor.link === fresh &&
-                fresh.task === task && task.scheduler === scheduler,
-                'fresh identities published ' + n);
-          check(old.state === STATE_HELD && old.task === oldTask &&
-                oldTask.scheduler === scheduler,
-                'detached identities untouched ' + n);
-        }
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_graph_core_incoming_suspend_parity_case() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph core incoming: ' + message;
-        }
-        function addSix(scheduler) {
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-          for (var id = 0; id < NUMBER_OF_IDS; id++)
-            scheduler.blocks[id].state = STATE_HELD;
-        }
-
-        // Three incoming DEVICE packets retain one complete canonical graph session while the
-        // Active successor alternates pending RUNNABLE and final RUNNING state.
-        var deviceScheduler = new Scheduler();
-        addSix(deviceScheduler);
-        var deviceCurrent = deviceScheduler.blocks[ID_HANDLER_A];
-        var deviceTask = deviceCurrent.task;
-        var d3 = new Packet(null, ID_WORKER, KIND_DEVICE);
-        var d2 = new Packet(d3, ID_WORKER, KIND_DEVICE);
-        var d1 = new Packet(d2, ID_WORKER, KIND_DEVICE);
-        deviceCurrent.queue = d1;
-        deviceCurrent.state = STATE_SUSPENDED_RUNNABLE;
-        deviceScheduler.list = deviceCurrent;
-        deviceScheduler.schedule();
-        check(deviceTask.v2 === d1 && d1.link === d2 && d2.link === d3 &&
-              d3.link === null, 'DEVICE bounded list and owners');
-        check(deviceCurrent.queue === null &&
-              deviceCurrent.state === STATE_SUSPENDED &&
-              deviceScheduler.currentId === ID_HANDLER_A &&
-              deviceScheduler.currentTcb === null,
-              'DEVICE final scheduler state');
-
-        // The second WORK packet takes the one-old-node append arm before the same CORE-backed
-        // suspend tail. All other graph records remain canonical and held.
-        var workScheduler = new Scheduler();
-        addSix(workScheduler);
-        var workCurrent = workScheduler.blocks[ID_HANDLER_A];
-        var workTask = workCurrent.task;
-        var w2 = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        var w1 = new Packet(w2, ID_HANDLER_A, KIND_WORK);
-        workCurrent.queue = w1;
-        workCurrent.state = STATE_SUSPENDED_RUNNABLE;
-        workScheduler.list = workCurrent;
-        workScheduler.schedule();
-        check(workTask.v1 === w1 && w1.link === w2 && w2.link === null,
-              'WORK bounded list and owners');
-        check(workTask.v2 === null && workCurrent.queue === null &&
-              workCurrent.state === STATE_SUSPENDED &&
-              workScheduler.currentId === ID_HANDLER_A &&
-              workScheduler.currentTcb === null,
-              'WORK final scheduler state');
-        check(deviceTask.scheduler === deviceScheduler &&
-              workTask.scheduler === workScheduler &&
-              deviceCurrent.link === deviceScheduler.blocks[ID_WORKER] &&
-              workCurrent.link === workScheduler.blocks[ID_WORKER],
-              'canonical graph identities retained');
-
-        [deviceCurrent.state, deviceCurrent.queue === null,
-         deviceTask.v2 === d1 && d3.link === null,
-         deviceScheduler.currentTcb === null,
-         workCurrent.state, workCurrent.queue === null,
-         workTask.v1 === w1 && w2.link === null,
-         workScheduler.currentTcb === null].join('|')
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "2|true|true|true|2|true|true|true");
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-#[test]
-fn jit_scheduler_graph_core_incoming_suspend_enabled_disabled_parity() {
-    use std::process::Command;
-
-    let executable = std::env::current_exe().expect("current test executable");
-    for disabled in [false, true] {
-        let mut command = Command::new(&executable);
-        command
-            .arg("--exact")
-            .arg("tests::jit_scheduler_graph_core_incoming_suspend_parity_case")
-            .arg("--nocapture")
-            .env("LUMEN_JIT_REGIONLOG", "1")
-            .env_remove("LUMEN_JIT_SCHED_TRACE")
-            .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_CORE_INCOMING")
-            .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_CORE")
-            .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_EPOCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_METHOD_EPOCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_ROLE_EPOCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_ROLE_DISPATCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_ACTIVE_PACKET_ROLE_DISPATCH")
-            .env_remove("LUMEN_JIT_NO_SCHED_HANDLER_INCOMING_SUSPEND")
-            .env_remove("LUMEN_JIT_NO_SCHED_FAST_LOOP")
-            .env_remove("LUMEN_JIT_NO_SCHED_REGION");
-        if disabled {
-            command.env("LUMEN_JIT_NO_SCHED_GRAPH_CORE_INCOMING", "1");
-        }
-
-        let output = command
-            .output()
-            .expect("run graph CORE incoming parity child");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success()
-                && stdout.contains("running 1 test")
-                && stderr.contains("graph_epoch=true")
-                && stderr.contains("graph_core=true")
-                && stderr.contains(&format!("graph_core_incoming={}", !disabled)),
-            "graph CORE incoming parity child disabled={disabled} failed\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-#[test]
-fn jit_scheduler_graph_core_incoming_suspend_uses_saved_record_under_trace() {
-    use std::process::Command;
-
-    let executable = std::env::current_exe().expect("current test executable");
-    let output = Command::new(&executable)
-        .arg("--exact")
-        .arg("tests::jit_scheduler_graph_core_incoming_suspend_parity_case")
-        .arg("--nocapture")
-        .env("LUMEN_JIT_REGIONLOG", "1")
-        .env("LUMEN_JIT_SCHED_TRACE", "1")
-        .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_CORE_INCOMING")
-        .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_CORE")
-        .env_remove("LUMEN_JIT_NO_SCHED_GRAPH_EPOCH")
-        .env_remove("LUMEN_JIT_NO_SCHED_METHOD_EPOCH")
-        .env_remove("LUMEN_JIT_NO_SCHED_ROLE_EPOCH")
-        .env_remove("LUMEN_JIT_NO_SCHED_ROLE_DISPATCH")
-        .env_remove("LUMEN_JIT_NO_SCHED_ACTIVE_PACKET_ROLE_DISPATCH")
-        .env_remove("LUMEN_JIT_NO_SCHED_HANDLER_INCOMING_SUSPEND")
-        .env_remove("LUMEN_JIT_NO_SCHED_FAST_LOOP")
-        .env_remove("LUMEN_JIT_NO_SCHED_REGION")
-        .output()
-        .expect("run graph CORE incoming trace child");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success()
-            && stdout.contains("running 1 test")
-            && stderr.contains("graph_epoch=true")
-            && stderr.contains("graph_core=true")
-            && stderr.contains("graph_core_incoming=true"),
-        "graph CORE incoming trace child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-}
-
-#[test]
-fn jit_scheduler_graph_core_incoming_soft_rejects_foreign_handler_scheduler_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'graph core incoming soft reject: ' + message;
-        }
-        function addSix(scheduler) {
-          scheduler.addIdleTask(ID_IDLE, 0, null, 1);
-          scheduler.addWorkerTask(ID_WORKER, 1000, null);
-          scheduler.addHandlerTask(ID_HANDLER_A, 2000, null);
-          scheduler.addHandlerTask(ID_HANDLER_B, 3000, null);
-          scheduler.addDeviceTask(ID_DEVICE_A, 4000, null);
-          scheduler.addDeviceTask(ID_DEVICE_B, 5000, null);
-          for (var id = 0; id < NUMBER_OF_IDS; id++)
-            scheduler.blocks[id].state = STATE_HELD;
-        }
-
-        var scheduler = new Scheduler();
-        addSix(scheduler);
-        var current = scheduler.blocks[ID_HANDLER_A];
-        var handler = current.task;
-        var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-        current.queue = packet;
-        current.state = STATE_SUSPENDED_RUNNABLE;
-        scheduler.list = current;
-
-        // A value-only replacement keeps HandlerTask's graph-proven shape/prototype. CORE must
-        // remain a soft miss and generic replay must expose all prior Active/addTo effects once.
-        var keys = Object.keys(handler).join('|');
-        var foreign = new Scheduler();
-        var gets = 0, calls = 0, callThis = null, sourceOrder = false;
-        Object.defineProperty(foreign, 'suspendCurrent', {
-          configurable: true,
-          get: function() {
-            gets++;
-            sourceOrder = handler.v2 === packet && packet.link === null &&
-                current.queue === null && current.state === STATE_RUNNING &&
-                scheduler.currentId === ID_HANDLER_A &&
-                scheduler.currentTcb === current;
-            return function() {
-              calls++;
-              callThis = this;
-              return null;
-            };
-          }
-        });
-        handler.scheduler = foreign;
-        check(Object.keys(handler).join('|') === keys &&
-              Object.getPrototypeOf(handler) === HandlerTask.prototype,
-              'same-shape Handler fixture');
-
-        scheduler.schedule();
-
-        check(gets === 1 && calls === 1 && callThis === foreign,
-              'foreign accessor and call once');
-        check(sourceOrder, 'foreign accessor source position');
-        check(handler.v2 === packet && packet.link === null &&
-              current.queue === null && current.state === STATE_RUNNING,
-              'generic Handler effects preserved');
-        check(scheduler.currentId === ID_HANDLER_A &&
-              scheduler.currentTcb === null &&
-              handler.scheduler === foreign &&
-              scheduler.blocks[ID_HANDLER_A] === current,
-              'scheduler and graph owners retained');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_idle_stitches_releases_and_replays_late_method_guard() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        // Populate all four task-run call-cache ways and warm IdleTask's second-stage body before
-        // compiling the scheduler. The cases below then enter Idle through SchedulerActive with
-        // an exact Null packet, rather than calling IdleTask.run directly.
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active idle stitch: ' + message;
-        }
-        function oneScheduledIdle(v1, count, id) {
-          var scheduler = new Scheduler();
-          var idleTask = new IdleTask(scheduler, v1, count);
-          var idle = new TaskControlBlock(null, ID_IDLE, 1, null, idleTask);
-          idle.state = STATE_RUNNING;
-
-          // release() turns HELD into RUNNING. The higher-priority Device then proves that the
-          // returned target was published to Scheduler.currentTcb: it runs once and suspends.
-          var target = new TaskControlBlock(
-              null, id, 3, null, new DeviceTask(scheduler));
-          target.state = STATE_HELD;
-          scheduler.blocks[id] = target;
-          scheduler.list = idle;
-          return {
-            scheduler: scheduler,
-            idleTask: idleTask,
-            idle: idle,
-            target: target
-          };
-        }
-
-        var even = oneScheduledIdle(2, 2, ID_DEVICE_A);
-        even.scheduler.schedule();
-        check(even.idleTask.count === 1 && even.idleTask.v1 === 1,
-              'even release numerics');
-        check(even.target.state === STATE_SUSPENDED,
-              'even target became current and ran');
-        check(even.scheduler.currentId === ID_DEVICE_A &&
-              even.scheduler.currentTcb === null && even.scheduler.holdCount === 0,
-              'even scheduler continuation');
-
-        var odd = oneScheduledIdle(3, 2, ID_DEVICE_B);
-        odd.scheduler.schedule();
-        check(odd.idleTask.count === 1 &&
-              odd.idleTask.v1 === ((3 >> 1) ^ 0xD008),
-              'odd release numerics');
-        check(odd.target.state === STATE_SUSPENDED,
-              'odd target became current and ran');
-        check(odd.scheduler.currentId === ID_DEVICE_B &&
-              odd.scheduler.currentTcb === null && odd.scheduler.holdCount === 0,
-              'odd scheduler continuation');
-
-        // count==1 cannot use the release transaction: ordinary IdleTask.run decrements to zero,
-        // calls holdCurrent, and leaves v1 untouched.
-        var finalCase = oneScheduledIdle(9, 1, ID_DEVICE_A);
-        finalCase.scheduler.schedule();
-        check(finalCase.idleTask.count === 0 && finalCase.idleTask.v1 === 9,
-              'final iteration numerics');
-        check(finalCase.idle.state === STATE_HELD &&
-              finalCase.scheduler.holdCount === 1 &&
-              finalCase.target.state === STATE_HELD &&
-              finalCase.scheduler.currentTcb === null,
-              'final iteration replayed hold');
-
-        // This identity guard is deliberately late in the fused transaction. It must decline
-        // before any write; baseline replay then performs count, v1, and mark exactly once.
-        var originalMark = TaskControlBlock.prototype.markAsNotHeld;
-        var markCalls = 0;
-        TaskControlBlock.prototype.markAsNotHeld = function() {
-          markCalls++;
-          return originalMark.call(this);
-        };
-        var changedMark = oneScheduledIdle(2, 2, ID_DEVICE_A);
-        changedMark.scheduler.schedule();
-        TaskControlBlock.prototype.markAsNotHeld = originalMark;
-        check(markCalls === 1, 'changed mark method called once');
-        check(changedMark.idleTask.count === 1 && changedMark.idleTask.v1 === 1,
-              'changed mark replayed Idle writes once');
-        check(changedMark.target.state === STATE_SUSPENDED &&
-              changedMark.scheduler.currentTcb === null,
-              'changed mark replay preserved scheduler result');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_idle_replays_changed_callees_and_alias_edges_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        // Seed every Scheduler task-run way and compile the Idle child transaction. Each case
-        // below reaches Idle through the scheduler's exact Null-packet active dispatch.
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active idle replay edges: ' + message;
-        }
-        function oneScheduledIdle(v1, count, id) {
-          var scheduler = new Scheduler();
-          var idleTask = new IdleTask(scheduler, v1, count);
-          var idle = new TaskControlBlock(null, ID_IDLE, 1, null, idleTask);
-          idle.state = STATE_RUNNING;
-          var target = new TaskControlBlock(
-              null, id, 3, null, new DeviceTask(scheduler));
-          target.state = STATE_HELD;
-          scheduler.blocks[id] = target;
-          scheduler.list = idle;
-          return {
-            scheduler: scheduler,
-            idleTask: idleTask,
-            idle: idle,
-            target: target
-          };
-        }
-        function checkReleased(one, count, v1, label) {
-          check(one.idleTask.count === count && one.idleTask.v1 === v1,
-                label + ' Idle writes');
-          check(one.target.state === STATE_SUSPENDED,
-                label + ' target ran once');
-          check(one.scheduler.currentId === one.target.id &&
-                one.scheduler.currentTcb === null &&
-                one.scheduler.holdCount === 0,
-                label + ' scheduler completed');
-        }
-
-        // Changing IdleTask.run must decline before count/v1 are touched. Ordinary replay then
-        // enters the replacement exactly once with the original values.
-        var originalIdleRun = IdleTask.prototype.run;
-        var runHits = 0, runCount = -1, runV1 = -1, runSawNull = false;
-        IdleTask.prototype.run = function(packet) {
-          runHits++;
-          runCount = this.count;
-          runV1 = this.v1;
-          runSawNull = packet === null;
-          return originalIdleRun.call(this, packet);
-        };
-        var changedRun = oneScheduledIdle(2, 2, ID_DEVICE_A);
-        changedRun.scheduler.schedule();
-        IdleTask.prototype.run = originalIdleRun;
-        check(runHits === 1 && runCount === 2 && runV1 === 2 && runSawNull,
-              'changed run entered once before writes');
-        checkReleased(changedRun, 1, 1, 'changed run');
-
-        // release is called after the source-level count/v1 updates. Its identity guard still
-        // has to decline before the fused transaction commits, so replay must expose exactly one
-        // already-updated call to the replacement.
-        var originalRelease = Scheduler.prototype.release;
-        var releaseHits = 0, releaseCount = -1, releaseV1 = -1;
-        Scheduler.prototype.release = function(id) {
-          releaseHits++;
-          releaseCount = this.currentTcb.task.count;
-          releaseV1 = this.currentTcb.task.v1;
-          return originalRelease.call(this, id);
-        };
-        var changedRelease = oneScheduledIdle(3, 2, ID_DEVICE_B);
-        changedRelease.scheduler.schedule();
-        Scheduler.prototype.release = originalRelease;
-        check(releaseHits === 1 && releaseCount === 1 &&
-              releaseV1 === ((3 >> 1) ^ 0xD008),
-              'changed release observed one source-ordered update');
-        checkReleased(changedRelease, 1, ((3 >> 1) ^ 0xD008),
-                      'changed release');
-
-        // An IdleTask may point at a different, shape-compatible Scheduler. The stitched path
-        // cannot substitute the outer scheduler; replay must mutate the foreign block once while
-        // the outer loop continues with the returned TCB.
-        var wrongScheduler = oneScheduledIdle(2, 2, ID_DEVICE_A);
-        var foreign = new Scheduler();
-        foreign.currentTcb = wrongScheduler.idle;
-        foreign.blocks[ID_DEVICE_A] = wrongScheduler.target;
-        wrongScheduler.idleTask.scheduler = foreign;
-        wrongScheduler.scheduler.schedule();
-        checkReleased(wrongScheduler, 1, 1, 'foreign scheduler');
-        check(foreign.currentTcb === wrongScheduler.idle &&
-              foreign.holdCount === 0 && foreign.queueCount === 0,
-              'foreign scheduler identity preserved');
-
-        // A non-writable currentTcb entry must force replay. The first assignment intentionally
-        // fails and schedules Idle a second time. markAsHeld restores writability before the
-        // count==0 fallback returns, making the exact two-iteration result observable and finite.
-        var nonWritable = oneScheduledIdle(2, 2, ID_DEVICE_A);
-        var originalMarkHeld = TaskControlBlock.prototype.markAsHeld;
-        var heldHits = 0;
-        TaskControlBlock.prototype.markAsHeld = function() {
-          if (this === nonWritable.idle) {
-            heldHits++;
-            Object.defineProperty(nonWritable.scheduler, 'currentTcb', {
-              value: nonWritable.scheduler.currentTcb,
-              writable: true,
-              configurable: true
-            });
-          }
-          return originalMarkHeld.call(this);
-        };
-        Object.defineProperty(nonWritable.scheduler, 'currentTcb', {
-          value: nonWritable.idle,
-          writable: false,
-          configurable: true
-        });
-        nonWritable.scheduler.schedule();
-        TaskControlBlock.prototype.markAsHeld = originalMarkHeld;
-        check(heldHits === 1 && nonWritable.idleTask.count === 0 &&
-              nonWritable.idleTask.v1 === 1,
-              'non-writable current replayed exactly twice');
-        check(nonWritable.idle.state === STATE_HELD &&
-              nonWritable.target.state === STATE_RUNNING &&
-              nonWritable.scheduler.holdCount === 1 &&
-              nonWritable.scheduler.currentId === ID_IDLE &&
-              nonWritable.scheduler.currentTcb === null,
-              'non-writable current preserved assignment semantics');
-
-        // release(target === current) is legal and returns current. It is not an ownership
-        // transfer, so the fused higher-priority path must replay; Idle then reaches hold once.
-        var selfTarget = oneScheduledIdle(2, 2, ID_DEVICE_A);
-        selfTarget.scheduler.blocks[ID_DEVICE_A] = selfTarget.idle;
-        selfTarget.scheduler.schedule();
-        check(selfTarget.idleTask.count === 0 && selfTarget.idleTask.v1 === 1,
-              'self target Idle writes once per source iteration');
-        check(selfTarget.idle.state === STATE_HELD &&
-              selfTarget.target.state === STATE_HELD &&
-              selfTarget.scheduler.holdCount === 1 &&
-              selfTarget.scheduler.currentId === ID_IDLE &&
-              selfTarget.scheduler.currentTcb === null,
-              'self target replay completed without owner transfer');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_worker_null_stitches_suspend_and_replays_method_guards() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        // Fill Scheduler's polymorphic task-run profile and trigger its second-stage compile.
-        // The custom cases below then reach WorkerTask through SchedulerActive with an exact
-        // Null packet, which is the pure bridge to suspendCurrent covered by this regression.
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active worker stitch: ' + message;
-        }
-        function oneScheduledWorker() {
-          var scheduler = new Scheduler();
-          var task = new WorkerTask(scheduler, ID_HANDLER_A, 0);
-          var worker = new TaskControlBlock(null, ID_WORKER, 1000, null, task);
-          worker.state = STATE_RUNNING;
-          scheduler.blocks[ID_WORKER] = worker;
-          scheduler.list = worker;
-          return { scheduler: scheduler, task: task, worker: worker };
-        }
-        function checkCompleted(one, label) {
-          check(one.worker.state === STATE_SUSPENDED, label + ' suspended');
-          check(one.scheduler.currentId === ID_WORKER, label + ' current id');
-          check(one.scheduler.currentTcb === null, label + ' completed');
-        }
-
-        var direct = oneScheduledWorker();
-        direct.scheduler.schedule();
-        checkCompleted(direct, 'direct');
-
-        // A changed WorkerTask.run must decline the bridge before touching the TCB. The ordinary
-        // call observes STATE_RUNNING and executes exactly once.
-        var originalRun = WorkerTask.prototype.run;
-        var runHits = 0, runEntryState = -1, runSawNull = false;
-        WorkerTask.prototype.run = function(packet) {
-          runHits++;
-          runEntryState = this.scheduler.currentTcb.state;
-          runSawNull = packet === null;
-          return originalRun.call(this, packet);
-        };
-        var changedRun = oneScheduledWorker();
-        changedRun.scheduler.schedule();
-        WorkerTask.prototype.run = originalRun;
-        check(runHits === 1 && runEntryState === STATE_RUNNING && runSawNull,
-              'changed run replayed once before effects');
-        checkCompleted(changedRun, 'changed run');
-
-        // suspendCurrent is guarded before the shared state transaction. Its replacement must
-        // likewise see the untouched state and run once through the canonical call path.
-        var originalSuspend = Scheduler.prototype.suspendCurrent;
-        var suspendHits = 0, suspendEntryState = -1;
-        Scheduler.prototype.suspendCurrent = function() {
-          suspendHits++;
-          suspendEntryState = this.currentTcb.state;
-          return originalSuspend.call(this);
-        };
-        var changedSuspend = oneScheduledWorker();
-        changedSuspend.scheduler.schedule();
-        Scheduler.prototype.suspendCurrent = originalSuspend;
-        check(suspendHits === 1 && suspendEntryState === STATE_RUNNING,
-              'changed suspend replayed once before effects');
-        checkCompleted(changedSuspend, 'changed suspend');
-
-        // The nested method guard is deliberately late, but still precedes the state write.
-        // Observing STATE_RUNNING here rejects a partial fast update followed by generic replay.
-        var originalMark = TaskControlBlock.prototype.markAsSuspended;
-        var markHits = 0, markEntryState = -1;
-        TaskControlBlock.prototype.markAsSuspended = function() {
-          markHits++;
-          markEntryState = this.state;
-          return originalMark.call(this);
-        };
-        var changedMark = oneScheduledWorker();
-        changedMark.scheduler.schedule();
-        TaskControlBlock.prototype.markAsSuspended = originalMark;
-        check(markHits === 1 && markEntryState === STATE_RUNNING,
-              'changed mark replayed once before effects');
-        checkCompleted(changedMark, 'changed mark');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_worker_packet_preempts_and_preserves_owners() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active worker packet owners: ' + message;
-        }
-        function oneWorker(link, v1, v2) {
-          var scheduler = new Scheduler();
-          var task = new WorkerTask(scheduler, v1, v2);
-          var packet = new Packet(link, ID_WORKER, KIND_WORK);
-          var worker = new TaskControlBlock(
-              null, ID_WORKER, 1000, packet, task);
-          var target = new TaskControlBlock(
-              null, ID_HANDLER_B, 2000, null, new HandlerTask(scheduler));
-          // queue() still publishes and preempts to this TCB, but the held bit keeps the
-          // following scheduler iteration finite and leaves the packet available to inspect.
-          target.state = STATE_SUSPENDED | STATE_HELD;
-          for (var id = 0; id < NUMBER_OF_IDS; id++) scheduler.blocks[id] = target;
-          scheduler.blocks[ID_WORKER] = worker;
-          scheduler.list = worker;
-          return {
-            scheduler: scheduler,
-            task: task,
-            worker: worker,
-            target: target,
-            packet: packet
-          };
-        }
-        function checkQueued(one, sourceQueue, sourceState, targetState, label) {
-          check(one.scheduler.queueCount === 1, label + ' queue count');
-          check(one.worker.queue === sourceQueue && one.worker.state === sourceState,
-                label + ' source dequeue');
-          check(one.target.queue === one.packet && one.target.state === targetState,
-                label + ' target publication');
-          check(one.packet.link === null && one.packet.id === ID_WORKER &&
-                one.packet.a1 === 0, label + ' queue prefix');
-          check(one.scheduler.currentId === ID_WORKER &&
-                one.scheduler.currentTcb === null, label + ' scheduler completion');
-        }
-
-        // Exercise the canonical toggle and the v2 wrap while retaining the packet payload and
-        // the source successor through independent owners.
-        var successor = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        successor.a1 = 77;
-        var direct = oneWorker(successor, ID_HANDLER_A, 24);
-        var payload = direct.packet.a2;
-        direct.scheduler.schedule();
-        check(direct.task.v1 === ID_HANDLER_B && direct.task.v2 === 2,
-              'direct Worker numerics');
-        check(payload === direct.packet.a2 && payload.join(',') === '25,26,1,2',
-              'direct payload identity');
-        check(successor.a1 === 77, 'direct successor remains live');
-        checkQueued(direct, successor, STATE_RUNNABLE,
-                    STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE, 'direct');
-
-        var reverse = oneWorker(null, ID_HANDLER_B, 26);
-        reverse.scheduler.schedule();
-        check(reverse.task.v1 === ID_HANDLER_A && reverse.task.v2 === 4,
-              'reverse Worker numerics');
-        check(reverse.packet.a2.join(',') === '1,2,3,4', 'reverse payload');
-        checkQueued(reverse, null, STATE_RUNNING,
-                    STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE, 'reverse');
-
-        // The source successor can be the packet itself. queue() later clears packet.link, but
-        // both TCB queues must retain their separate owners of the packet.
-        var selfLink = oneWorker(null, ID_HANDLER_A, 0);
-        selfLink.packet.link = selfLink.packet;
-        selfLink.scheduler.schedule();
-        check(selfLink.worker.queue === selfLink.packet &&
-              selfLink.target.queue === selfLink.packet,
-              'self link aliases both queues');
-        check(selfLink.packet.link === null && selfLink.task.v2 === 4,
-              'self link queue rewrite');
-        checkQueued(selfLink, selfLink.packet, STATE_RUNNABLE,
-                    STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE, 'self link');
-
-        // Likewise, moving the current TCB itself out of packet.link must not release it before
-        // the source queue takes ownership. Break the intentional cycle after observing it.
-        var currentLink = oneWorker(null, ID_HANDLER_A, 0);
-        currentLink.packet.link = currentLink.worker;
-        currentLink.scheduler.schedule();
-        check(currentLink.worker.queue === currentLink.worker &&
-              currentLink.worker.priority === 1000, 'current link survives transfer');
-        checkQueued(currentLink, currentLink.worker, STATE_RUNNABLE,
-                    STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE, 'current link');
-        currentLink.worker.queue = null;
-
-        // Worker names are live values. These cases must replay when they no longer match the
-        // profiled Richards constants rather than baking old loop bounds, ids, or state bits.
-        var oldDataSize = DATA_SIZE;
-        var shortLoop = oneWorker(null, ID_HANDLER_A, 0);
-        DATA_SIZE = 2;
-        shortLoop.scheduler.schedule();
-        DATA_SIZE = oldDataSize;
-        check(shortLoop.task.v2 === 2 && shortLoop.packet.a2[0] === 1 &&
-              shortLoop.packet.a2[1] === 2 && !Object.hasOwn(shortLoop.packet.a2, 2) &&
-              !Object.hasOwn(shortLoop.packet.a2, 3), 'live DATA_SIZE');
-        checkQueued(shortLoop, null, STATE_RUNNING,
-                    STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE, 'short loop');
-
-        var oldSuspendedRunnable = STATE_SUSPENDED_RUNNABLE;
-        var oldRunning = STATE_RUNNING;
-        var oldRunnable = STATE_RUNNABLE;
-        var liveState = oneWorker(null, ID_HANDLER_A, 0);
-        STATE_SUSPENDED_RUNNABLE = 8;
-        STATE_RUNNING = 16;
-        STATE_RUNNABLE = 17;
-        liveState.worker.state = STATE_SUSPENDED_RUNNABLE;
-        liveState.scheduler.schedule();
-        STATE_SUSPENDED_RUNNABLE = oldSuspendedRunnable;
-        STATE_RUNNING = oldRunning;
-        STATE_RUNNABLE = oldRunnable;
-        check(liveState.worker.state === 16 && liveState.target.state === 23,
-              'live active state names');
-        check(liveState.scheduler.queueCount === 1 &&
-              liveState.scheduler.currentTcb === null, 'live state completion');
-
-        var oldHandlerA = ID_HANDLER_A;
-        var oldHandlerB = ID_HANDLER_B;
-        var liveIds = oneWorker(null, ID_HANDLER_A, 0);
-        ID_HANDLER_A = 7;
-        ID_HANDLER_B = 8;
-        liveIds.task.v1 = ID_HANDLER_A;
-        liveIds.scheduler.blocks[ID_HANDLER_B] = liveIds.target;
-        liveIds.scheduler.schedule();
-        ID_HANDLER_A = oldHandlerA;
-        ID_HANDLER_B = oldHandlerB;
-        check(liveIds.task.v1 === 8 && liveIds.packet.id === ID_WORKER,
-              'live handler ids');
-        check(liveIds.target.queue === liveIds.packet &&
-              liveIds.scheduler.currentTcb === null, 'live id target');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_worker_packet_replays_changed_methods_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active worker packet methods: ' + message;
-        }
-        function oneWorker() {
-          var scheduler = new Scheduler();
-          var task = new WorkerTask(scheduler, ID_HANDLER_A, 24);
-          var packet = new Packet(null, ID_WORKER, KIND_WORK);
-          var worker = new TaskControlBlock(
-              null, ID_WORKER, 1000, packet, task);
-          var target = new TaskControlBlock(
-              null, ID_HANDLER_B, 2000, null, new HandlerTask(scheduler));
-          target.state = STATE_SUSPENDED | STATE_HELD;
-          for (var id = 0; id < NUMBER_OF_IDS; id++) scheduler.blocks[id] = target;
-          scheduler.blocks[ID_WORKER] = worker;
-          scheduler.list = worker;
-          return {
-            scheduler: scheduler,
-            task: task,
-            worker: worker,
-            target: target,
-            packet: packet
-          };
-        }
-        function checkComplete(one, targetState, label) {
-          check(one.task.v1 === ID_HANDLER_B && one.task.v2 === 2,
-                label + ' Worker numerics once');
-          check(one.packet.a2.join(',') === '25,26,1,2',
-                label + ' payload once');
-          check(one.worker.queue === null && one.worker.state === STATE_RUNNING,
-                label + ' source dequeue');
-          check(one.scheduler.queueCount === 1 && one.target.queue === one.packet &&
-                one.target.state === targetState, label + ' target publish');
-          check(one.packet.link === null && one.packet.id === ID_WORKER &&
-                one.scheduler.currentTcb === null, label + ' completion');
-        }
-
-        // TCB.run dequeues and updates state before looking up WorkerTask.run. A replacement must
-        // therefore enter once after those effects, but before any Worker field or packet write.
-        var originalWorkerRun = WorkerTask.prototype.run;
-        var runHits = 0, runPacket = null, runState = -1, runQueue = 1;
-        var runV1 = -1, runV2 = -1;
-        WorkerTask.prototype.run = function(packet) {
-          runHits++;
-          runPacket = packet;
-          runState = this.scheduler.currentTcb.state;
-          runQueue = this.scheduler.currentTcb.queue;
-          runV1 = this.v1;
-          runV2 = this.v2;
-          return originalWorkerRun.call(this, packet);
-        };
-        var changedRun = oneWorker();
-        changedRun.scheduler.schedule();
-        WorkerTask.prototype.run = originalWorkerRun;
-        check(runHits === 1 && runPacket === changedRun.packet &&
-              runState === STATE_RUNNING && runQueue === null &&
-              runV1 === ID_HANDLER_A && runV2 === 24,
-              'changed run source-order entry');
-        checkComplete(changedRun,
-                      STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE,
-                      'changed run');
-
-        // queue is looked up after every Worker mutation. Its replacement also changes a state
-        // name before delegating, so checkPriorityAdd must consume that new value in this call.
-        var originalQueue = Scheduler.prototype.queue;
-        var queueHits = 0, queueSawCurrent = false, queueCountAtEntry = -1;
-        var queueV1 = -1, queueV2 = -1, queueId = -1, queuePayload = '';
-        var oldRunnable = STATE_RUNNABLE;
-        Scheduler.prototype.queue = function(packet) {
-          queueHits++;
-          queueSawCurrent = this.currentTcb === changedQueue.worker;
-          queueCountAtEntry = this.queueCount;
-          queueV1 = changedQueue.task.v1;
-          queueV2 = changedQueue.task.v2;
-          queueId = packet.id;
-          queuePayload = packet.a2.join(',');
-          STATE_RUNNABLE = 8;
-          return originalQueue.call(this, packet);
-        };
-        var changedQueue = oneWorker();
-        changedQueue.scheduler.schedule();
-        Scheduler.prototype.queue = originalQueue;
-        STATE_RUNNABLE = oldRunnable;
-        check(queueHits === 1 && queueSawCurrent && queueCountAtEntry === 0 &&
-              queueV1 === ID_HANDLER_B && queueV2 === 2 &&
-              queueId === ID_HANDLER_B && queuePayload === '25,26,1,2',
-              'changed queue sees Worker effects once');
-        checkComplete(changedQueue, STATE_SUSPENDED | STATE_HELD | 8,
-                      'changed queue');
-
-        // checkPriorityAdd is looked up only after Scheduler.queue's prefix has committed, while
-        // the target queue and state are still untouched.
-        var originalCheck = TaskControlBlock.prototype.checkPriorityAdd;
-        var checkHits = 0, checkCount = -1, checkPacketId = -1;
-        var checkTargetQueue = 1, checkTargetState = -1, checkTask = null;
-        TaskControlBlock.prototype.checkPriorityAdd = function(task, packet) {
-          checkHits++;
-          checkCount = changedCheck.scheduler.queueCount;
-          checkPacketId = packet.id;
-          checkTargetQueue = this.queue;
-          checkTargetState = this.state;
-          checkTask = task;
-          return originalCheck.call(this, task, packet);
-        };
-        var changedCheck = oneWorker();
-        changedCheck.scheduler.schedule();
-        TaskControlBlock.prototype.checkPriorityAdd = originalCheck;
-        check(checkHits === 1 && checkCount === 1 &&
-              checkPacketId === ID_WORKER && checkTargetQueue === null &&
-              checkTargetState === (STATE_SUSPENDED | STATE_HELD) &&
-              checkTask === changedCheck.worker,
-              'changed check sees queue prefix once');
-        checkComplete(changedCheck,
-                      STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE,
-                      'changed check');
-
-        // markAsRunnable is later again: target.queue has been published, but its state has not
-        // yet changed. A replay after a partial native commit would make either observation fail.
-        var originalMark = TaskControlBlock.prototype.markAsRunnable;
-        var markHits = 0, markQueue = null, markState = -1;
-        TaskControlBlock.prototype.markAsRunnable = function() {
-          markHits++;
-          markQueue = this.queue;
-          markState = this.state;
-          return originalMark.call(this);
-        };
-        var changedMark = oneWorker();
-        changedMark.scheduler.schedule();
-        TaskControlBlock.prototype.markAsRunnable = originalMark;
-        check(markHits === 1 && markQueue === changedMark.packet &&
-              markState === (STATE_SUSPENDED | STATE_HELD),
-              'changed mark source-order entry');
-        checkComplete(changedMark,
-                      STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE,
-                      'changed mark');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_worker_packet_preserves_source_order_on_throws() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active worker packet throws: ' + message;
-        }
-        function oneWorker(link, v2) {
-          var scheduler = new Scheduler();
-          var task = new WorkerTask(scheduler, ID_HANDLER_A, v2);
-          var packet = new Packet(link, ID_WORKER, KIND_WORK);
-          var worker = new TaskControlBlock(
-              null, ID_WORKER, 1000, packet, task);
-          var target = new TaskControlBlock(
-              null, ID_HANDLER_B, 2000, null, new HandlerTask(scheduler));
-          target.state = STATE_SUSPENDED | STATE_HELD;
-          for (var id = 0; id < NUMBER_OF_IDS; id++) scheduler.blocks[id] = target;
-          scheduler.blocks[ID_WORKER] = worker;
-          scheduler.list = worker;
-          return {
-            scheduler: scheduler,
-            task: task,
-            worker: worker,
-            target: target,
-            packet: packet
-          };
-        }
-
-        // The third dense write throws after v1/id/a1 and three v2 updates. Earlier element writes
-        // and TCB.run's dequeue must survive, but Scheduler.queue must not have begun.
-        var elementThrow = oneWorker(null, 0);
-        var elementSets = 0;
-        Object.defineProperty(elementThrow.packet.a2, '2', {
-          configurable: true,
-          set: function(value) { elementSets++; throw 'element boom'; }
-        });
-        var elementError = '';
-        try { elementThrow.scheduler.schedule(); } catch (e) { elementError = e; }
-        check(elementError === 'element boom' && elementSets === 1,
-              'element setter throws once');
-        check(elementThrow.worker.queue === null &&
-              elementThrow.worker.state === STATE_RUNNING,
-              'element throw source dequeue');
-        check(elementThrow.task.v1 === ID_HANDLER_B && elementThrow.task.v2 === 3,
-              'element throw Worker numerics');
-        check(elementThrow.packet.id === ID_HANDLER_B && elementThrow.packet.a1 === 0 &&
-              elementThrow.packet.a2[0] === 1 && elementThrow.packet.a2[1] === 2 &&
-              Object.hasOwn(elementThrow.packet.a2, 2) &&
-              !Object.hasOwn(elementThrow.packet.a2, 3),
-              'element throw partial payload');
-        check(elementThrow.scheduler.queueCount === 0 &&
-              elementThrow.target.queue === null &&
-              elementThrow.scheduler.currentTcb === elementThrow.worker,
-              'element throw stops before queue');
-
-        // scheduler is read only after the complete Worker loop. Its getter observes all Worker
-        // effects and throws before queue(), while packet.link and the dequeued successor coexist.
-        var successor = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        successor.a1 = 91;
-        var schedulerThrow = oneWorker(successor, 0);
-        var schedulerGets = 0;
-        Object.defineProperty(schedulerThrow.task, 'scheduler', {
-          configurable: true,
-          get: function() { schedulerGets++; throw 'scheduler boom'; }
-        });
-        var schedulerError = '';
-        try { schedulerThrow.scheduler.schedule(); } catch (e) { schedulerError = e; }
-        check(schedulerError === 'scheduler boom' && schedulerGets === 1,
-              'scheduler getter throws once');
-        check(schedulerThrow.worker.queue === successor &&
-              schedulerThrow.worker.state === STATE_RUNNABLE &&
-              schedulerThrow.packet.link === successor && successor.a1 === 91,
-              'scheduler throw preserves successor owners');
-        check(schedulerThrow.task.v1 === ID_HANDLER_B && schedulerThrow.task.v2 === 4 &&
-              schedulerThrow.packet.id === ID_HANDLER_B &&
-              schedulerThrow.packet.a2.join(',') === '1,2,3,4',
-              'scheduler throw preserves Worker writes');
-        check(schedulerThrow.scheduler.queueCount === 0 &&
-              schedulerThrow.scheduler.currentTcb === schedulerThrow.worker,
-              'scheduler throw stops before queue');
-
-        // A current-priority getter runs after queueCount, packet rewrites, target publication,
-        // and markAsRunnable. Throwing here must preserve all those effects exactly once while
-        // leaving Scheduler.currentTcb on the source TCB.
-        var priorityThrow = oneWorker(null, 0);
-        var priorityGets = 0;
-        Object.defineProperty(priorityThrow.worker, 'priority', {
-          configurable: true,
-          get: function() { priorityGets++; throw 'priority boom'; }
-        });
-        var priorityError = '';
-        try { priorityThrow.scheduler.schedule(); } catch (e) { priorityError = e; }
-        check(priorityError === 'priority boom' && priorityGets === 1,
-              'priority getter throws once');
-        check(priorityThrow.task.v1 === ID_HANDLER_B && priorityThrow.task.v2 === 4 &&
-              priorityThrow.worker.queue === null &&
-              priorityThrow.worker.state === STATE_RUNNING,
-              'priority throw Worker effects');
-        check(priorityThrow.scheduler.queueCount === 1 &&
-              priorityThrow.packet.link === null &&
-              priorityThrow.packet.id === ID_WORKER,
-              'priority throw queue prefix');
-        check(priorityThrow.target.queue === priorityThrow.packet &&
-              priorityThrow.target.state ===
-                  (STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE) &&
-              priorityThrow.scheduler.currentTcb === priorityThrow.worker,
-              'priority throw target effects');
-
-        // The outer assignment is later than WorkerTask.run and Scheduler.queue. A setter that
-        // rejects the preempting target must see the initial source assignment first and retain
-        // the old current value after every preceding effect has committed.
-        var currentThrow = oneWorker(null, 0);
-        var storedCurrent = null, currentGets = 0, currentSets = 0;
-        Object.defineProperty(currentThrow.scheduler, 'currentTcb', {
-          configurable: true,
-          get: function() { currentGets++; return storedCurrent; },
-          set: function(value) {
-            currentSets++;
-            if (value === currentThrow.target) throw 'current boom';
-            storedCurrent = value;
-          }
-        });
-        var currentError = '';
-        try { currentThrow.scheduler.schedule(); } catch (e) { currentError = e; }
-        check(currentError === 'current boom' && currentSets === 2 && currentGets > 0,
-              'current setter source order');
-        check(storedCurrent === currentThrow.worker &&
-              currentThrow.scheduler.queueCount === 1,
-              'current setter retains source');
-        check(currentThrow.task.v1 === ID_HANDLER_B && currentThrow.task.v2 === 4 &&
-              currentThrow.target.queue === currentThrow.packet &&
-              currentThrow.target.state ===
-                  (STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE),
-              'current setter preserves prior effects');
-
-        // An element setter is arbitrary user code. Mutating both loop and queue globals during
-        // the first store must terminate the loop at one element and affect the later target mark.
-        var liveSetter = oneWorker(null, 0);
-        var oldDataSize = DATA_SIZE;
-        var oldRunnable = STATE_RUNNABLE;
-        var storedElement = -1, liveSets = 0;
-        Object.defineProperty(liveSetter.packet.a2, '0', {
-          configurable: true,
-          get: function() { return storedElement; },
-          set: function(value) {
-            liveSets++;
-            storedElement = value;
-            DATA_SIZE = 1;
-            STATE_RUNNABLE = 8;
-          }
-        });
-        liveSetter.scheduler.schedule();
-        DATA_SIZE = oldDataSize;
-        STATE_RUNNABLE = oldRunnable;
-        check(liveSets === 1 && storedElement === 1 && liveSetter.task.v2 === 1 &&
-              !Object.hasOwn(liveSetter.packet.a2, 1),
-              'live setter changes loop bound');
-        check(liveSetter.scheduler.queueCount === 1 &&
-              liveSetter.target.queue === liveSetter.packet &&
-              liveSetter.target.state === (STATE_SUSPENDED | STATE_HELD | 8) &&
-              liveSetter.scheduler.currentTcb === null,
-              'live setter changes runnable bit');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_idle_release_flattens_both_branches_and_preserves_return_owners() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'idle release owners: ' + message;
-        }
-        function oneIdle(v1, count, id, targetState, targetPriority, currentPriority) {
-          var scheduler = new Scheduler();
-          var current = new TaskControlBlock(null, ID_IDLE, currentPriority, null, {});
-          current.state = STATE_RUNNING;
-          var target = new TaskControlBlock(null, id, targetPriority, null, {marker: 77});
-          target.state = targetState;
-          scheduler.blocks[id] = target;
-          scheduler.currentTcb = current;
-          return {
-            scheduler: scheduler,
-            idle: new IdleTask(scheduler, v1, count),
-            current: current,
-            target: target,
-            id: id
-          };
-        }
-
-        var even = oneIdle(2, 2, ID_DEVICE_A,
-                           STATE_HELD | STATE_RUNNABLE, 3, 2);
-        var evenResult = even.idle.run(null);
-        check(evenResult === even.target, 'even return identity');
-        check(even.idle.count === 1 && even.idle.v1 === 1, 'even numerics');
-        check(even.target.state === STATE_RUNNABLE, 'even state');
-        check(even.scheduler.currentTcb === even.current, 'even current untouched');
-
-        var odd = oneIdle(3, 2, ID_DEVICE_B,
-                          STATE_HELD | STATE_SUSPENDED | STATE_RUNNABLE, 4, 2);
-        var oddResult = odd.idle.run(null);
-        check(oddResult === odd.target, 'odd return identity');
-        check(odd.idle.count === 1 && odd.idle.v1 === ((3 >> 1) ^ 0xD008),
-              'odd numerics');
-        check(odd.target.state === (STATE_SUSPENDED | STATE_RUNNABLE), 'odd state');
-
-        // Drop every source owner after return. The returned Value must retain its own Rc.
-        even.scheduler.blocks[even.id] = null;
-        even.target = null;
-        check(evenResult.task.marker === 77 && evenResult.priority === 3,
-              'returned target remains owned');
-
-        // count==1 is the final hold and must replay the untouched ordinary function.
-        var finalCase = oneIdle(9, 1, ID_DEVICE_A, STATE_HELD, 1, 2);
-        var tail = new TaskControlBlock(null, ID_WORKER, 1, null, {});
-        finalCase.current.link = tail;
-        var finalResult = finalCase.idle.run(null);
-        check(finalResult === tail && finalCase.idle.count === 0, 'final hold return');
-        check(finalCase.scheduler.holdCount === 1 &&
-              finalCase.current.state === STATE_HELD, 'final hold effects');
-        check(finalCase.idle.v1 === 9, 'final hold leaves v1');
-
-        // Unsupported outcomes replay from pc0 and apply their ordinary effects exactly once.
-        var low = oneIdle(2, 2, ID_DEVICE_A, STATE_HELD, 1, 2);
-        var lowResult = low.idle.run(null);
-        check(lowResult === low.current && low.idle.count === 1 && low.idle.v1 === 1,
-              'nonpreempt replay');
-        check(low.target.state === STATE_RUNNING, 'nonpreempt mark');
-        var missing = oneIdle(2, 2, ID_DEVICE_A, STATE_HELD, 3, 2);
-        missing.scheduler.blocks[ID_DEVICE_A] = null;
-        var missingResult = missing.idle.run(null);
-        check(missingResult === null && missing.idle.count === 1 && missing.idle.v1 === 1,
-              'missing target replay');
-
-        // IDs and the state mask are live bindings, not constants baked into native code.
-        var oldA = ID_DEVICE_A;
-        ID_DEVICE_A = 1;
-        var liveId = oneIdle(2, 2, ID_DEVICE_A, STATE_HELD, 3, 2);
-        check(liveId.idle.run(null) === liveId.target, 'live device id');
-        ID_DEVICE_A = oldA;
-        var oldMask = STATE_NOT_HELD;
-        STATE_NOT_HELD = ~8;
-        var liveMask = oneIdle(2, 2, ID_DEVICE_A, 13, 3, 2);
-        liveMask.idle.run(null);
-        check(liveMask.target.state === 5, 'live not-held mask');
-
-        var oldB = ID_DEVICE_B;
-        ID_DEVICE_B = 1;
-        var liveOdd = oneIdle(3, 2, ID_DEVICE_B, 13, 3, 2);
-        check(liveOdd.idle.run(null) === liveOdd.target, 'live odd device id');
-        check(liveOdd.idle.v1 === ((3 >> 1) ^ 0xD008) && liveOdd.target.state === 5,
-              'live odd values');
-        ID_DEVICE_B = oldB;
-        STATE_NOT_HELD = oldMask;
-
-        // Signed ToInt32 shifts stay on the fast path for both branches.
-        var signedOdd = oneIdle(-1, 2, ID_DEVICE_B, STATE_HELD, 3, 2);
-        signedOdd.idle.run(null);
-        check(signedOdd.idle.v1 === ((-1 >> 1) ^ 0xD008), 'signed odd shift');
-        var signedEven = oneIdle(-2147483648, 2, ID_DEVICE_A, STATE_HELD, 3, 2);
-        signedEven.idle.run(null);
-        check(signedEven.idle.v1 === -1073741824, 'signed even shift');
-
-        // target===current is the equal-priority/nonpreempting ownership case and must replay.
-        var alias = oneIdle(2, 2, ID_DEVICE_A, STATE_HELD, 3, 2);
-        alias.current.priority = 3;
-        alias.current.state = STATE_HELD;
-        alias.scheduler.blocks[ID_DEVICE_A] = alias.current;
-        var aliasResult = alias.idle.run(null);
-        check(aliasResult === alias.current && alias.current.state === STATE_RUNNING,
-              'target current alias');
-        check(alias.idle.count === 1 && alias.idle.v1 === 1, 'alias effects once');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_idle_release_replays_observable_guards_and_partial_effects_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'idle release guards: ' + message;
-        }
-        function oneIdle(v1) {
-          var scheduler = new Scheduler();
-          var current = new TaskControlBlock(null, ID_IDLE, 2, null, {});
-          current.state = STATE_RUNNING;
-          var target = new TaskControlBlock(null, ID_DEVICE_A, 3, null, {});
-          target.state = STATE_HELD;
-          scheduler.blocks[ID_DEVICE_A] = target;
-          scheduler.currentTcb = current;
-          return [scheduler, new IdleTask(scheduler, v1, 2), current, target];
-        }
-
-        var originalRelease = Scheduler.prototype.release, releaseCalls = 0;
-        Scheduler.prototype.release = function(id) {
-          releaseCalls++;
-          return originalRelease.call(this, id);
-        };
-        var releaseCase = oneIdle(2);
-        check(releaseCase[1].run(null) === releaseCase[3], 'release replacement return');
-        Scheduler.prototype.release = originalRelease;
-        check(releaseCalls === 1 && releaseCase[1].count === 1 &&
-              releaseCase[1].v1 === 1, 'release replacement once');
-
-        var originalMark = TaskControlBlock.prototype.markAsNotHeld, markCalls = 0;
-        TaskControlBlock.prototype.markAsNotHeld = function() {
-          markCalls++;
-          return originalMark.call(this);
-        };
-        var markCase = oneIdle(2);
-        markCase[1].run(null);
-        TaskControlBlock.prototype.markAsNotHeld = originalMark;
-        check(markCalls === 1 && markCase[3].state === STATE_RUNNING,
-              'mark replacement once');
-
-        // UpdateProp reads count, writes it, then the following GetProp reads it again.
-        var countCase = oneIdle(2), countValue = 2, countGets = 0, countSets = 0;
-        Object.defineProperty(countCase[1], 'count', {
-          get: function() { countGets++; return countValue; },
-          set: function(value) { countSets++; countValue = value; }, configurable: true
-        });
-        countCase[1].run(null);
-        check(countGets === 2 && countSets === 1 && countValue === 1,
-              'count accessor order');
-
-        // The branch test and shift are two distinct v1 reads in the source program.
-        var v1Case = oneIdle(2), v1Value = 2, v1Gets = 0, v1Sets = 0;
-        Object.defineProperty(v1Case[1], 'v1', {
-          get: function() { v1Gets++; return v1Value; },
-          set: function(value) { v1Sets++; v1Value = value; }, configurable: true
-        });
-        v1Case[1].run(null);
-        check(v1Gets === 2 && v1Sets === 1 && v1Value === 1,
-              'v1 accessor order');
-
-        var schedulerCase = oneIdle(2), schedulerValue = schedulerCase[0], schedulerGets = 0;
-        Object.defineProperty(schedulerCase[1], 'scheduler', {
-          get: function() { schedulerGets++; return schedulerValue; }, configurable: true
-        });
-        schedulerCase[1].run(null);
-        check(schedulerGets === 1, 'scheduler accessor once');
-
-        var stateCase = oneIdle(2), stateValue = STATE_HELD;
-        var stateGets = 0, stateSets = 0;
-        Object.defineProperty(stateCase[3], 'state', {
-          get: function() { stateGets++; return stateValue; },
-          set: function(value) { stateSets++; stateValue = value; }, configurable: true
-        });
-        stateCase[1].run(null);
-        check(stateGets === 1 && stateSets === 1 && stateValue === STATE_RUNNING,
-              'state accessor once');
-
-        // A blocks getter runs after Idle's count/v1 writes but before markAsNotHeld.
-        var blocksCase = oneIdle(2), blocksGets = 0, blocksError = '';
-        Object.defineProperty(blocksCase[0], 'blocks', {
-          get: function() { blocksGets++; throw 'blocks boom'; }, configurable: true
-        });
-        try { blocksCase[1].run(null); } catch (e) { blocksError = e; }
-        check(blocksError === 'blocks boom' && blocksGets === 1, 'blocks throw once');
-        check(blocksCase[1].count === 1 && blocksCase[1].v1 === 1 &&
-              blocksCase[3].state === STATE_HELD, 'blocks throw prefix effects');
-
-        // An indexed accessor declines the packed-element guard, then executes once normally.
-        var elementCase = oneIdle(2), elementGets = 0;
-        Object.defineProperty(elementCase[0].blocks, String(ID_DEVICE_A), {
-          get: function() { elementGets++; return elementCase[3]; }, configurable: true
-        });
-        elementCase[1].run(null);
-        check(elementGets === 1 && elementCase[3].state === STATE_RUNNING,
-              'blocks element accessor once');
-
-        // A late throwing priority getter observes the earlier count, v1, and state writes once.
-        var priorityCase = oneIdle(2), priorityGets = 0, priorityError = '';
-        Object.defineProperty(priorityCase[3], 'priority', {
-          get: function() { priorityGets++; throw 'priority boom'; }, configurable: true
-        });
-        try { priorityCase[1].run(null); } catch (e) { priorityError = e; }
-        check(priorityError === 'priority boom' && priorityGets === 1,
-              'priority throw once');
-        check(priorityCase[1].count === 1 && priorityCase[1].v1 === 1 &&
-              priorityCase[3].state === STATE_RUNNING, 'priority throw prefix effects');
-
-        var currentCase = oneIdle(2), currentGets = 0, currentError = '';
-        Object.defineProperty(currentCase[2], 'priority', {
-          get: function() { currentGets++; throw 'current priority boom'; }, configurable: true
-        });
-        try { currentCase[1].run(null); } catch (e) { currentError = e; }
-        check(currentError === 'current priority boom' && currentGets === 1,
-              'current priority throw once');
-        check(currentCase[1].count === 1 && currentCase[1].v1 === 1 &&
-              currentCase[3].state === STATE_RUNNING, 'current throw prefix effects');
-
-        var currentTcbCase = oneIdle(2), currentTcbGets = 0, currentTcbError = '';
-        Object.defineProperty(currentTcbCase[0], 'currentTcb', {
-          get: function() { currentTcbGets++; throw 'current tcb boom'; }, configurable: true
-        });
-        try { currentTcbCase[1].run(null); } catch (e) { currentTcbError = e; }
-        check(currentTcbError === 'current tcb boom' && currentTcbGets === 1,
-              'current tcb throw once');
-        check(currentTcbCase[1].count === 1 && currentTcbCase[1].v1 === 1 &&
-              currentTcbCase[3].state === STATE_RUNNING, 'current tcb prefix effects');
-
-        var nanPriority = oneIdle(2);
-        nanPriority[3].priority = NaN;
-        check(nanPriority[1].run(null) === nanPriority[2] &&
-              nanPriority[3].state === STATE_RUNNING, 'NaN priority replay');
-        var valueOfCalls = 0, objectPriority = oneIdle(2);
-        objectPriority[3].priority = {
-          valueOf: function() { valueOfCalls++; return 3; }
-        };
-        check(objectPriority[1].run(null) === objectPriority[3] && valueOfCalls === 1,
-              'object priority coercion once');
-
-        // Coercive values deliberately replay the baseline ToInt32/Number semantics.
-        var fractional = oneIdle(2);
-        fractional[1].count = 2.5;
-        fractional[1].run(null);
-        check(fractional[1].count === 1.5 && fractional[1].v1 === 1,
-              'fractional count replay');
-        var stringV1 = oneIdle('3');
-        stringV1[0].blocks[ID_DEVICE_B] = stringV1[3];
-        stringV1[1].run(null);
-        check(stringV1[1].v1 === ((3 >> 1) ^ 0xD008), 'string v1 replay');
-        var oldNotHeld = STATE_NOT_HELD;
-        STATE_NOT_HELD = 1.5;
-        var fractionalMask = oneIdle(2);
-        fractionalMask[1].run(null);
-        STATE_NOT_HELD = oldNotHeld;
-        check(fractionalMask[3].state === STATE_RUNNING, 'fractional mask replay');
-
-        // A throwing replacement is reached after the two Idle writes and only once on replay.
-        var throwCase = oneIdle(2), throwCalls = 0, throwError = '';
-        Scheduler.prototype.release = function() { throwCalls++; throw 'release boom'; };
-        try { throwCase[1].run(null); } catch (e) { throwError = e; }
-        Scheduler.prototype.release = originalRelease;
-        check(throwError === 'release boom' && throwCalls === 1,
-              'release throw once');
-        check(throwCase[1].count === 1 && throwCase[1].v1 === 1 &&
-              throwCase[3].state === STATE_HELD, 'release throw prefix effects');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_device_suspend_guards_methods_globals_and_descriptors() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-
-        var originalRun = DeviceTask.prototype.run, runHits = 0;
-        DeviceTask.prototype.run = function(packet) {
-          runHits++;
-          return originalRun.call(this, packet);
-        };
-        runRichards();
-        DeviceTask.prototype.run = originalRun;
-
-        var originalSuspend = Scheduler.prototype.suspendCurrent, suspendHits = 0;
-        Scheduler.prototype.suspendCurrent = function() {
-          suspendHits++;
-          return originalSuspend.call(this);
-        };
-        runRichards();
-        Scheduler.prototype.suspendCurrent = originalSuspend;
-
-        var originalMark = TaskControlBlock.prototype.markAsSuspended, markHits = 0;
-        TaskControlBlock.prototype.markAsSuspended = function() {
-          markHits++;
-          return originalMark.call(this);
-        };
-        runRichards();
-        TaskControlBlock.prototype.markAsSuspended = originalMark;
-
-        function oneDevice() {
-          var scheduler = new Scheduler();
-          var device = new DeviceTask(scheduler);
-          var tcb = new TaskControlBlock(null, ID_DEVICE_A, 1, null, device);
-          tcb.state = STATE_RUNNING;
-          scheduler.list = tcb;
-          return [scheduler, device, tcb];
-        }
-
-        var oldSuspended = STATE_SUSPENDED;
-        STATE_SUSPENDED = 8;
-        var globalCase = oneDevice();
-        globalCase[0].schedule();
-        var globalState = globalCase[2].state;
-        STATE_SUSPENDED = oldSuspended;
-
-        var v1Case = oneDevice(), v1 = null, v1Gets = 0, v1Sets = 0;
-        Object.defineProperty(v1Case[1], 'v1', {
-          get: function() { v1Gets++; return v1; },
-          set: function(x) { v1Sets++; v1 = x; },
-          configurable: true
-        });
-        v1Case[0].schedule();
-
-        var currentCase = oneDevice(), current = currentCase[0].currentTcb;
-        var currentGets = 0, currentSets = 0;
-        Object.defineProperty(currentCase[0], 'currentTcb', {
-          get: function() { currentGets++; return current; },
-          set: function(x) { currentSets++; current = x; },
-          configurable: true
-        });
-        currentCase[0].schedule();
-
-        var stateCase = oneDevice(), state = STATE_RUNNING, stateGets = 0, stateSets = 0;
-        Object.defineProperty(stateCase[2], 'state', {
-          get: function() { stateGets++; return state; },
-          set: function(x) { stateSets++; state = x; },
-          configurable: true
-        });
-        stateCase[0].schedule();
-
-        [runHits, suspendHits, markHits, globalState,
-         v1Gets, v1Sets, v1Case[2].state,
-         currentGets > 0, currentSets > 0, current === null,
-         stateGets, stateSets, state].join('|')
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "2777|2324|2324|8|1|0|2|true|true|true|6|1|2");
-}
-
-#[test]
-fn jit_scheduler_device_hold_guards_methods_ownership_and_numeric_updates() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-
-        var originalHold = Scheduler.prototype.holdCurrent, holdHits = 0;
-        Scheduler.prototype.holdCurrent = function() {
-          holdHits++;
-          return originalHold.call(this);
-        };
-        runRichards();
-        Scheduler.prototype.holdCurrent = originalHold;
-
-        var originalMark = TaskControlBlock.prototype.markAsHeld, markHits = 0;
-        TaskControlBlock.prototype.markAsHeld = function() {
-          markHits++;
-          return originalMark.call(this);
-        };
-        runRichards();
-        TaskControlBlock.prototype.markAsHeld = originalMark;
-
-        function oneHold(link) {
-          var scheduler = new Scheduler();
-          var device = new DeviceTask(scheduler);
-          var packet = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-          var tcb = new TaskControlBlock(link, ID_DEVICE_A, 1, packet, device);
-          scheduler.list = tcb;
-          return [scheduler, device, tcb, packet];
-        }
-
-        var oldHeld = STATE_HELD;
-        STATE_HELD = 8;
-        var globalScheduler = new Scheduler();
-        var globalDevice = new DeviceTask(globalScheduler);
-        var globalPacket = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        var tail = new TaskControlBlock(null, 0, 1, null, globalDevice);
-        var globalTcb = new TaskControlBlock(tail, ID_DEVICE_A, 1,
-                                             globalPacket, globalDevice);
-        tail.state = 8;
-        globalScheduler.list = globalTcb;
-        globalScheduler.schedule();
-        var globalResult = [globalScheduler.holdCount, globalTcb.state,
-                            globalDevice.v1 === globalPacket,
-                            globalScheduler.currentTcb === null, tail.state];
-        STATE_HELD = oldHeld;
-
-        var v1Case = oneHold(null), v1 = null, v1Gets = 0, v1Sets = 0;
-        Object.defineProperty(v1Case[1], 'v1', {
-          get: function() { v1Gets++; return v1; },
-          set: function(x) { v1Sets++; v1 = x; },
-          configurable: true
-        });
-        v1Case[0].schedule();
-
-        var countCase = oneHold(null), count = 0, countGets = 0, countSets = 0;
-        Object.defineProperty(countCase[0], 'holdCount', {
-          get: function() { countGets++; return count; },
-          set: function(x) { countSets++; count = x; },
-          configurable: true
-        });
-        countCase[0].schedule();
-
-        var stateCase = oneHold(null), state = stateCase[2].state;
-        var stateGets = 0, stateSets = 0;
-        Object.defineProperty(stateCase[2], 'state', {
-          get: function() { stateGets++; return state; },
-          set: function(x) { stateSets++; state = x; },
-          configurable: true
-        });
-        stateCase[0].schedule();
-
-        var linkCase = oneHold(null), link = linkCase[2].link, linkGets = 0;
-        Object.defineProperty(linkCase[2], 'link', {
-          get: function() { linkGets++; return link; }, configurable: true
-        });
-        linkCase[0].schedule();
-
-        var overflow = oneHold(null);
-        overflow[0].holdCount = 2147483647;
-        overflow[0].schedule();
-
-        [holdHits, markHits, globalResult,
-         v1Gets, v1Sets, v1 === v1Case[3], v1Case[0].holdCount, v1Case[2].state,
-         countGets, countSets, count,
-         stateGets, stateSets, state,
-         linkGets, linkCase[0].holdCount, linkCase[1].v1 === linkCase[3],
-         overflow[0].holdCount].flat().join('|')
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(
-        run_jit(&src),
-        "928|928|1|8|true|true|8|0|1|true|1|4|1|1|1|4|2|4|1|1|true|2147483648"
-    );
-}
-
-#[test]
-fn jit_scheduler_device_queue_guards_ownership_descriptors_and_overflow() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-
-        function oneQueue(link, queued, targetPriority, currentPriority) {
-          var scheduler = new Scheduler();
-          var device = new DeviceTask(scheduler);
-          var packet = new Packet(link, ID_HANDLER_A, KIND_DEVICE);
-          var targetTask = {
-            seen: null,
-            run: function(packet) { this.seen = packet; return null; }
-          };
-          var target = new TaskControlBlock(null, ID_HANDLER_A,
-                                            targetPriority == null ? 1 : targetPriority,
-                                            queued, targetTask);
-          var current = new TaskControlBlock(null, ID_DEVICE_A,
-                                             currentPriority == null ? 2 : currentPriority,
-                                             null, device);
-          current.state = STATE_RUNNING;
-          for (var id = 0; id < NUMBER_OF_IDS; id++) scheduler.blocks[id] = target;
-          scheduler.blocks[ID_DEVICE_A] = current;
-          scheduler.list = current;
-          device.v1 = packet;
-          return [scheduler, device, current, target, packet, targetTask];
-        }
-
-        var oldLink = new Packet(null, ID_WORKER, KIND_WORK);
-        oldLink.a1 = 77;
-        var direct = oneQueue(oldLink, null, 1, 2);
-        direct[0].schedule();
-        var directResult = [direct[0].queueCount, direct[3].state,
-                            direct[3].queue === direct[4], direct[4].link === null,
-                            direct[4].id, direct[1].v1 === null, oldLink.a1,
-                            direct[2].state, direct[0].currentTcb === null];
-
-        var selfLink = oneQueue(null, null, 1, 2);
-        selfLink[4].link = selfLink[4];
-        selfLink[0].schedule();
-        var selfLinkResult = [selfLink[0].queueCount,
-                              selfLink[3].queue === selfLink[4],
-                              selfLink[4].link === null,
-                              selfLink[1].v1 === null,
-                              selfLink[3].state,
-                              selfLink[0].currentTcb === null];
-
-        var lastOwner = oneQueue(new Packet(null, ID_WORKER, KIND_WORK),
-                                 null, 1, 2);
-        lastOwner[0].schedule();
-        var lastOwnerResult = [lastOwner[0].queueCount,
-                               lastOwner[3].queue === lastOwner[4],
-                               lastOwner[4].link === null,
-                               lastOwner[1].v1 === null];
-
-        var preempt = oneQueue(null, null, 3, 2);
-        preempt[0].schedule();
-        var preemptResult = [preempt[0].queueCount,
-                             preempt[5].seen === preempt[4],
-                             preempt[3].queue === null,
-                             preempt[3].state,
-                             preempt[4].id,
-                             preempt[4].link === null,
-                             preempt[1].v1 === null,
-                             preempt[0].currentTcb === null];
-
-        var originalQueue = Scheduler.prototype.queue, queueHits = 0;
-        Scheduler.prototype.queue = function(packet) {
-          queueHits++;
-          return originalQueue.call(this, packet);
-        };
-        oneQueue(null, null, 1, 2)[0].schedule();
-        Scheduler.prototype.queue = originalQueue;
-
-        var originalCheck = TaskControlBlock.prototype.checkPriorityAdd, checkHits = 0;
-        TaskControlBlock.prototype.checkPriorityAdd = function(task, packet) {
-          checkHits++;
-          return originalCheck.call(this, task, packet);
-        };
-        oneQueue(null, null, 1, 2)[0].schedule();
-        TaskControlBlock.prototype.checkPriorityAdd = originalCheck;
-
-        var originalMark = TaskControlBlock.prototype.markAsRunnable, markHits = 0;
-        TaskControlBlock.prototype.markAsRunnable = function() {
-          markHits++;
-          return originalMark.call(this);
-        };
-        oneQueue(null, null, 1, 2)[0].schedule();
-        TaskControlBlock.prototype.markAsRunnable = originalMark;
-
-        var oldRunnable = STATE_RUNNABLE;
-        STATE_RUNNABLE = 8;
-        var globalCase = oneQueue(null, null, 1, 2);
-        globalCase[0].schedule();
-        var globalState = globalCase[3].state;
-        STATE_RUNNABLE = oldRunnable;
-
-        var holeLink = new Packet(null, ID_WORKER, KIND_WORK);
-        var hole = oneQueue(holeLink, null, 1, 2);
-        delete hole[0].blocks[ID_HANDLER_A];
-        hole[0].schedule();
-        var holeResult = [hole[0].queueCount, hole[3].queue === null,
-                          hole[1].v1 === null, hole[4].link === holeLink,
-                          hole[4].id];
-
-        var tail = new Packet(null, ID_HANDLER_A, KIND_DEVICE);
-        var queued = new Packet(tail, ID_HANDLER_A, KIND_DEVICE);
-        var replacedLink = new Packet(null, ID_WORKER, KIND_WORK);
-        var nonempty = oneQueue(replacedLink, queued, 1, 2);
-        nonempty[0].schedule();
-        var nonemptyResult = [nonempty[0].queueCount,
-                              nonempty[3].queue === queued,
-                              tail.link === nonempty[4],
-                              nonempty[4].link === null,
-                              nonempty[4].id,
-                              nonempty[3].state,
-                              replacedLink.id];
-
-        var overflow = oneQueue(null, null, 1, 2);
-        overflow[0].queueCount = 2147483647;
-        overflow[0].schedule();
-        var overflowCount = overflow[0].queueCount;
-
-        var countCase = oneQueue(null, null, 1, 2), count = 0;
-        var countGets = 0, countSets = 0;
-        Object.defineProperty(countCase[0], 'queueCount', {
-          get: function() { countGets++; return count; },
-          set: function(x) { countSets++; count = x; }, configurable: true
-        });
-        countCase[0].schedule();
-
-        var linkCase = oneQueue(null, null, 1, 2), storedLink = oldLink;
-        var linkGets = 0, linkSets = 0;
-        Object.defineProperty(linkCase[4], 'link', {
-          get: function() { linkGets++; return storedLink; },
-          set: function(x) { linkSets++; storedLink = x; }, configurable: true
-        });
-        linkCase[0].schedule();
-
-        var idCase = oneQueue(null, null, 1, 2), storedId = ID_HANDLER_A;
-        var idGets = 0, idSets = 0;
-        Object.defineProperty(idCase[4], 'id', {
-          get: function() { idGets++; return storedId; },
-          set: function(x) { idSets++; storedId = x; }, configurable: true
-        });
-        idCase[0].schedule();
-
-        var blocksCase = oneQueue(null, null, 1, 2), storedBlocks = blocksCase[0].blocks;
-        var blocksGets = 0;
-        Object.defineProperty(blocksCase[0], 'blocks', {
-          get: function() { blocksGets++; return storedBlocks; }, configurable: true
-        });
-        blocksCase[0].schedule();
-
-        var targetQueueCase = oneQueue(null, null, 1, 2), storedQueue = null;
-        var queueGets = 0, queueSets = 0;
-        Object.defineProperty(targetQueueCase[3], 'queue', {
-          get: function() { queueGets++; return storedQueue; },
-          set: function(x) { queueSets++; storedQueue = x; }, configurable: true
-        });
-        targetQueueCase[0].schedule();
-
-        var stateCase = oneQueue(null, null, 1, 2), storedState = stateCase[3].state;
-        var stateGets = 0, stateSets = 0;
-        Object.defineProperty(stateCase[3], 'state', {
-          get: function() { stateGets++; return storedState; },
-          set: function(x) { stateSets++; storedState = x; }, configurable: true
-        });
-        stateCase[0].schedule();
-
-        var priorityCase = oneQueue(null, null, 1, 2);
-        var targetPriority = priorityCase[3].priority;
-        var currentPriority = priorityCase[2].priority;
-        var targetPriorityGets = 0, currentPriorityGets = 0;
-        Object.defineProperty(priorityCase[3], 'priority', {
-          get: function() { targetPriorityGets++; return targetPriority; },
-          configurable: true
-        });
-        Object.defineProperty(priorityCase[2], 'priority', {
-          get: function() { currentPriorityGets++; return currentPriority; },
-          configurable: true
-        });
-        priorityCase[0].schedule();
-
-        [directResult, selfLinkResult, lastOwnerResult, preemptResult,
-         queueHits, checkHits, markHits, globalState,
-         holeResult, nonemptyResult, overflowCount,
-         countGets, countSets, count,
-         linkGets, linkSets, storedLink === null, oldLink.a1,
-         idGets, idSets, storedId,
-         blocksGets, blocksCase[3].queue === blocksCase[4],
-         queueGets, queueSets, storedQueue === targetQueueCase[4],
-         stateGets, stateSets, storedState,
-         targetPriorityGets, currentPriorityGets].flat().join('|')
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(
-        run_jit(&src),
-        "1|3|true|true|4|true|77|2|true|1|true|true|true|3|true|1|true|true|true|1|true|true|0|4|true|true|true|1|1|1|10|0|true|true|true|2|1|true|true|true|4|3|1|2147483648|1|1|1|0|1|true|77|1|1|4|1|true|1|1|true|1|1|3|1|1"
-    );
-}
-
-#[test]
-fn jit_scheduler_active_handler_null_full_transfers_delivery_and_completion_owners() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler null owners: ' + message;
-        }
-        function makeCase(count, payload, workLink, packetLink, queued,
-                          targetPriority, holdTarget) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(workLink, ID_WORKER, KIND_WORK);
-          work.a1 = count;
-          work.a2[count] = payload;
-          var packet = new Packet(packetLink, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(
-              null, ID_WORKER, targetPriority, queued, { run: function() {
-                throw 'held/off-list target ran';
-              }});
-          if (holdTarget) target.state = target.state | STATE_HELD;
-          var current = new TaskControlBlock(
-              null, ID_HANDLER_A, 2, null, handler);
-          current.state = STATE_RUNNING;
-          scheduler.blocks[ID_WORKER] = target;
-          // A later completed Handler packet deliberately terminates the isolated schedule.
-          scheduler.blocks[ID_HANDLER_A] = null;
-          scheduler.list = current;
-          handler.v1 = work;
-          handler.v2 = packet;
-          return {
-            scheduler: scheduler, handler: handler, work: work, packet: packet,
-            current: current, target: target, queued: queued,
-            workLink: workLink, packetLink: packetLink
-          };
-        }
-
-        // One-node delivery keeps current unchanged and can take the graph fast-resume edge.
-        // The following completed-work miss terminates without disturbing the appended owner.
-        var queued = new Packet(null, ID_WORKER, KIND_DEVICE);
-        var oneNode = makeCase(DATA_SIZE - 1, 71, null, null, queued, 1, false);
-        oneNode.scheduler.schedule();
-        check(oneNode.scheduler.queueCount === 2 && queued.link === oneNode.packet &&
-              oneNode.packet.link === oneNode.work && oneNode.work.link === null,
-              'one-node delivery/completion publication');
-        check(oneNode.packet.a1 === 71 &&
-              oneNode.packet.id === ID_HANDLER_A, 'one-node packet writes');
-        check(oneNode.handler.v2 === null && oneNode.handler.v1 === null &&
-              oneNode.work.a1 === DATA_SIZE, 'one-node Handler writes');
-
-        // Empty/preempting delivery stops on a held target. P.link's sole list owner moves to
-        // Handler.v2 while the former Handler.v2 owner moves into target.queue.
-        var packetTail = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        packetTail.a2[0] = 81;
-        var preempt = makeCase(1, 72, null, packetTail, null, 3, true);
-        preempt.scheduler.schedule();
-        check(preempt.handler.v2 === packetTail && packetTail.a2[0] === 81,
-              'delivery successor owner');
-        check(preempt.target.queue === preempt.packet && preempt.packet.link === null &&
-              preempt.packet.a1 === 72, 'delivery packet owner');
-        check(preempt.current.state === STATE_RUNNING &&
-              preempt.scheduler.currentTcb === null, 'delivery preempt completion');
-
-        // Completed-v1 queue transfers W.link into Handler.v1 and W into target.queue without
-        // transient retains. The next Handler iteration observes the successor and suspends.
-        var workTail = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        workTail.a1 = 0;
-        workTail.a2[0] = 82;
-        var completed = makeCase(DATA_SIZE, 73, workTail, null, null, 1, true);
-        completed.handler.v2 = null;
-        completed.scheduler.schedule();
-        check(completed.handler.v1 === workTail && workTail.a2[0] === 82,
-              'completion successor owner');
-        check(completed.target.queue === completed.work && completed.work.link === null &&
-              completed.work.id === ID_HANDLER_A, 'completion packet owner');
-        check(completed.scheduler.queueCount === 1 &&
-              completed.current.state === STATE_SUSPENDED, 'completion scheduler writes');
-
-        // W=P is intentionally outside the direct delivery transaction. Untouched pc59 replay
-        // must preserve the source-ordered double a1 write and publish exactly one packet.
-        var aliasQueued = new Packet(null, ID_WORKER, KIND_DEVICE);
-        var alias = makeCase(3, 74, null, null, aliasQueued, 1, false);
-        alias.handler.v1 = alias.packet;
-        alias.packet.a1 = 3;
-        alias.packet.a2[3] = 74;
-        alias.scheduler.schedule();
-        check(alias.handler.v1 === null && alias.handler.v2 === null &&
-              alias.packet.a1 === DATA_SIZE, 'delivery alias write order');
-        check(aliasQueued.link === alias.packet && alias.packet.link === null &&
-              alias.scheduler.queueCount === 1, 'delivery alias owner');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_handler_null_full_replays_live_globals_accessors_and_methods() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler null guards: ' + message;
-        }
-        function oneDelivery(count, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_WORKER, KIND_WORK);
-          work.a1 = count;
-          work.a2[count] = payload;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 3, null, {
-            run: function() { throw 'held target ran'; }
-          });
-          target.state = target.state | STATE_HELD;
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, null, handler);
-          current.state = STATE_RUNNING;
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = null;
-          scheduler.list = current;
-          handler.v1 = work;
-          handler.v2 = packet;
-          return {
-            scheduler: scheduler, handler: handler, work: work, packet: packet,
-            current: current, target: target, payload: payload
-          };
-        }
-
-        // DATA_SIZE is guarded live. An exact changed integer selects completion; a fractional
-        // value declines the stitch and executes the original numeric comparison/delivery.
-        var oldDataSize = DATA_SIZE;
-        var changedSize = oneDelivery(1, 83);
-        DATA_SIZE = 1;
-        changedSize.scheduler.schedule();
-        DATA_SIZE = oldDataSize;
-        check(changedSize.target.queue === changedSize.work &&
-              changedSize.handler.v1 === null && changedSize.handler.v2 === changedSize.packet,
-              'changed integer DATA_SIZE');
-
-        var fractional = oneDelivery(1, 84);
-        DATA_SIZE = 4.5;
-        fractional.scheduler.schedule();
-        DATA_SIZE = oldDataSize;
-        check(fractional.target.queue === fractional.packet &&
-              fractional.handler.v2 === null && fractional.work.a1 === 2 &&
-              fractional.packet.a1 === 84, 'fractional DATA_SIZE replay');
-
-        // Accessor shapes must fall back before the stitch writes anything. Original Handler
-        // source order performs three v2 gets and one set for a delivery.
-        var v2Case = oneDelivery(1, 85), storedV2 = v2Case.packet;
-        var v2Gets = 0, v2Sets = 0;
-        Object.defineProperty(v2Case.handler, 'v2', {
-          get: function() { v2Gets++; return storedV2; },
-          set: function(value) { v2Sets++; storedV2 = value; }, configurable: true
-        });
-        v2Case.scheduler.schedule();
-        check(v2Gets === 3 && v2Sets === 1 && storedV2 === null &&
-              v2Case.packet.a1 === 85, 'v2 accessor replay once');
-
-        var a1Case = oneDelivery(1, 86), storedA1 = 1;
-        var a1Gets = 0, a1Sets = 0;
-        Object.defineProperty(a1Case.work, 'a1', {
-          get: function() { a1Gets++; return storedA1; },
-          set: function(value) { a1Sets++; storedA1 = value; }, configurable: true
-        });
-        a1Case.scheduler.schedule();
-        check(a1Gets === 1 && a1Sets === 1 && storedA1 === 2 &&
-              a1Case.packet.a1 === 86, 'a1 accessor replay once');
-
-        var schedulerCase = oneDelivery(1, 87), schedulerGets = 0;
-        var storedScheduler = schedulerCase.scheduler;
-        Object.defineProperty(schedulerCase.handler, 'scheduler', {
-          get: function() { schedulerGets++; return storedScheduler; }, configurable: true
-        });
-        schedulerCase.scheduler.schedule();
-        check(schedulerGets === 1 && schedulerCase.packet.a1 === 87,
-              'scheduler accessor replay once');
-
-        // Changed task and nested scheduler methods are resolved in original order, once, and
-        // see the same pre-call state as the interpreter path.
-        var originalRun = HandlerTask.prototype.run, runHits = 0;
-        HandlerTask.prototype.run = function(packet) {
-          runHits++;
-          return originalRun.call(this, packet);
-        };
-        var runCase = oneDelivery(1, 88);
-        runCase.scheduler.schedule();
-        HandlerTask.prototype.run = originalRun;
-        check(runHits === 1 && runCase.packet.a1 === 88, 'run method replay once');
-
-        var originalQueue = Scheduler.prototype.queue, queueHits = 0;
-        var queueCase = oneDelivery(1, 89), queueSawWrites = false;
-        Scheduler.prototype.queue = function(packet) {
-          queueHits++;
-          queueSawWrites = queueCase.handler.v2 === null &&
-                           queueCase.work.a1 === 2 && packet.a1 === 89 &&
-                           this.queueCount === 0;
-          return originalQueue.call(this, packet);
-        };
-        queueCase.scheduler.schedule();
-        Scheduler.prototype.queue = originalQueue;
-        check(queueHits === 1 && queueSawWrites, 'queue method replay once');
-
-        // Handler.scheduler may name a different Scheduler. Equality failure must occur before
-        // delivery writes, then ordinary execution mutates only that foreign receiver.
-        var foreignCase = oneDelivery(1, 90), foreign = new Scheduler();
-        foreign.blocks[ID_WORKER] = foreignCase.target;
-        foreign.currentTcb = foreignCase.current;
-        foreign.currentId = 99;
-        foreignCase.handler.scheduler = foreign;
-        foreignCase.scheduler.schedule();
-        check(foreign.queueCount === 1 && foreignCase.scheduler.queueCount === 0 &&
-              foreignCase.packet.id === 99 && foreignCase.packet.a1 === 90,
-              'foreign scheduler receiver');
-        check(foreignCase.target.queue === foreignCase.packet &&
-              foreignCase.handler.v2 === null && foreignCase.work.a1 === 2,
-              'foreign scheduler writes once');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_handler_wait_suspend_guards_live_values_and_descriptors() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-
-        var originalRun = HandlerTask.prototype.run, runHits = 0;
-        HandlerTask.prototype.run = function(packet) {
-          runHits++;
-          return originalRun.call(this, packet);
-        };
-        runRichards();
-        HandlerTask.prototype.run = originalRun;
-
-        var originalSuspend = Scheduler.prototype.suspendCurrent, suspendHits = 0;
-        Scheduler.prototype.suspendCurrent = function() {
-          suspendHits++;
-          return originalSuspend.call(this);
-        };
-        runRichards();
-        Scheduler.prototype.suspendCurrent = originalSuspend;
-
-        var originalMark = TaskControlBlock.prototype.markAsSuspended, markHits = 0;
-        TaskControlBlock.prototype.markAsSuspended = function() {
-          markHits++;
-          return originalMark.call(this);
-        };
-        runRichards();
-        TaskControlBlock.prototype.markAsSuspended = originalMark;
-
-        function oneWait(a1, v2) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          if (a1 !== null) {
-            var packet = new Packet(null, ID_HANDLER_A, KIND_WORK);
-            packet.a1 = a1;
-            handler.v1 = packet;
-          } else {
-            var packet = null;
-          }
-          handler.v2 = v2;
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 1, null, handler);
-          current.state = STATE_RUNNING;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          return [scheduler, handler, current, packet];
-        }
-
-        var nullCase = oneWait(null, null);
-        nullCase[0].schedule();
-
-        var oldLink = new Packet(null, ID_WORKER, KIND_WORK);
-        var objectCase = oneWait(1, null);
-        objectCase[3].link = oldLink;
-        objectCase[0].schedule();
-
-        var oldDataSize = DATA_SIZE;
-        var fractionalGlobal = oneWait(1, null);
-        DATA_SIZE = 4.5;
-        fractionalGlobal[0].schedule();
-        DATA_SIZE = oldDataSize;
-
-        var fractionalA1 = oneWait(1.5, null);
-        fractionalA1[0].schedule();
-
-        var oldSuspended = STATE_SUSPENDED;
-        STATE_SUSPENDED = 8;
-        var globalState = oneWait(1, null);
-        globalState[0].schedule();
-        STATE_SUSPENDED = oldSuspended;
-
-        var undefinedCase = oneWait(null, null);
-        undefinedCase[1].v1 = undefined;
-        undefinedCase[0].schedule();
-        var ddaCase = oneWait(null, null);
-        ddaCase[1].v1 = $262.IsHTMLDDA;
-        ddaCase[0].schedule();
-
-        var v1Case = oneWait(null, null), storedV1 = null, v1Gets = 0;
-        Object.defineProperty(v1Case[1], 'v1', {
-          get: function() { v1Gets++; return storedV1; }, configurable: true
-        });
-        v1Case[0].schedule();
-
-        var a1Case = oneWait(1, null), storedA1 = 1, a1Gets = 0;
-        Object.defineProperty(a1Case[3], 'a1', {
-          get: function() { a1Gets++; return storedA1; }, configurable: true
-        });
-        a1Case[0].schedule();
-
-        var v2Case = oneWait(1, null), storedV2 = null, v2Gets = 0;
-        Object.defineProperty(v2Case[1], 'v2', {
-          get: function() { v2Gets++; return storedV2; }, configurable: true
-        });
-        v2Case[0].schedule();
-
-        var schedulerCase = oneWait(1, null), storedScheduler = schedulerCase[0];
-        var schedulerGets = 0;
-        Object.defineProperty(schedulerCase[1], 'scheduler', {
-          get: function() { schedulerGets++; return storedScheduler; }, configurable: true
-        });
-        schedulerCase[0].schedule();
-
-        var stateCase = oneWait(1, null), storedState = STATE_RUNNING;
-        var stateGets = 0, stateSets = 0;
-        Object.defineProperty(stateCase[2], 'state', {
-          get: function() { stateGets++; return storedState; },
-          set: function(x) { stateSets++; storedState = x; }, configurable: true
-        });
-        stateCase[0].schedule();
-
-        var currentCase = oneWait(1, null), storedCurrent = currentCase[0].currentTcb;
-        var currentGets = 0, currentSets = 0;
-        Object.defineProperty(currentCase[0], 'currentTcb', {
-          get: function() { currentGets++; return storedCurrent; },
-          set: function(x) { currentSets++; storedCurrent = x; }, configurable: true
-        });
-        currentCase[0].schedule();
-
-        [runHits, suspendHits, markHits,
-         nullCase[2].state, nullCase[0].currentTcb === null,
-         objectCase[2].state, objectCase[1].v1 === objectCase[3],
-         objectCase[3].a1, objectCase[3].link === oldLink,
-         objectCase[0].currentTcb === null,
-         fractionalGlobal[2].state, fractionalA1[2].state,
-         globalState[2].state, undefinedCase[2].state, ddaCase[2].state,
-         v1Gets, v1Case[2].state,
-         a1Gets, a1Case[2].state,
-         v2Gets, v2Case[2].state,
-         schedulerGets, schedulerCase[2].state,
-         stateGets > 0, stateSets, storedState,
-         currentGets > 0, currentSets > 0, storedCurrent === null].join('|')
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(
-        run_jit(&src),
-        "2328|2324|2324|2|true|2|true|1|true|true|2|2|8|2|2|1|2|1|2|1|2|1|2|true|1|2|true|true|true"
-    );
-}
-
-#[test]
-fn jit_scheduler_handler_queue_transfers_owners_and_replays_before_effects() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-
-        function check(value, message) {
-          if (!value) throw 'handler queue: ' + message;
-        }
-        function linked(a1) {
-          var packet = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-          packet.a1 = a1;
-          return packet;
-        }
-        function oneHandlerQueue(link, queued, targetPriority, currentPriority, a1) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var packet = new Packet(link, ID_WORKER, KIND_WORK);
-          packet.a1 = a1 === undefined ? DATA_SIZE : a1;
-          var targetTask = {
-            seen: null,
-            run: function(packet) { this.seen = packet; return null; }
-          };
-          var target = new TaskControlBlock(null, ID_WORKER,
-                                            targetPriority == null ? 1 : targetPriority,
-                                            queued, targetTask);
-          var current = new TaskControlBlock(null, ID_HANDLER_A,
-                                             currentPriority == null ? 2 : currentPriority,
-                                             null, handler);
-          current.state = STATE_RUNNING;
-          scheduler.blocks[ID_WORKER] = target;
-          // A Handler self-link queues once, then the rewritten Handler id deliberately misses.
-          scheduler.blocks[ID_HANDLER_A] = null;
-          scheduler.list = current;
-          handler.v1 = packet;
-          return [scheduler, handler, current, target, packet, targetTask];
-        }
-
-        var direct = oneHandlerQueue(null, null);
-        direct[0].schedule();
-        check(direct[0].queueCount === 1, 'direct count');
-        check(direct[3].queue === direct[4] && direct[3].state === 3, 'direct target');
-        check(direct[1].v1 === null && direct[4].link === null, 'direct source');
-        check(direct[2].state === STATE_SUSPENDED && direct[0].currentTcb === null,
-              'direct suspension');
-
-        var oldLink = linked(1);
-        oldLink.a2[0] = 77;
-        var transfer = oneHandlerQueue(oldLink, null);
-        transfer[0].schedule();
-        check(transfer[1].v1 === oldLink && oldLink.a2[0] === 77, 'object transfer');
-        check(transfer[3].queue === transfer[4] && transfer[4].link === null,
-              'object packet move');
-
-        var selfLink = oneHandlerQueue(null, null);
-        selfLink[4].link = selfLink[4];
-        selfLink[0].schedule();
-        check(selfLink[0].queueCount === 1, 'self count');
-        check(selfLink[3].queue === selfLink[4] && selfLink[4].link === null,
-              'self packet');
-        check(selfLink[1].v1 === null && selfLink[0].currentTcb === null, 'self source');
-
-        var lastOwner = oneHandlerQueue(null, null);
-        lastOwner[4].link = linked(1);
-        lastOwner[4].link.a2[0] = 91;
-        lastOwner[0].schedule();
-        check(lastOwner[1].v1.a2[0] === 91 && lastOwner[4].link === null,
-              'last-owner link');
-
-        var missingLink = linked(2);
-        var missing = oneHandlerQueue(missingLink, null);
-        missing[0].blocks[ID_WORKER] = null;
-        missing[0].schedule();
-        check(missing[0].queueCount === 0 && missing[1].v1 === missingLink,
-              'missing target source effect');
-        check(missing[4].link === missingLink && missing[4].id === ID_WORKER,
-              'missing target packet untouched');
-
-        var queued = linked(0), replaced = linked(1);
-        var nonempty = oneHandlerQueue(replaced, queued);
-        nonempty[0].schedule();
-        check(nonempty[3].queue === queued && queued.link === nonempty[4],
-              'nonempty append');
-        check(nonempty[1].v1 === replaced && nonempty[4].link === null,
-              'nonempty source');
-
-        var preempt = oneHandlerQueue(null, null, 3, 2);
-        preempt[0].schedule();
-        check(preempt[0].queueCount === 1 && preempt[5].seen === preempt[4],
-              'preempt run');
-        check(preempt[3].queue === null && preempt[3].state === STATE_RUNNING,
-              'preempt consume');
-
-        var undefinedLink = oneHandlerQueue(null, null);
-        undefinedLink[4].link = undefined;
-        undefinedLink[0].schedule();
-        check(undefinedLink[1].v1 === undefined && undefinedLink[3].queue === undefinedLink[4],
-              'undefined link fallback');
-        var ddaLink = oneHandlerQueue(null, null);
-        ddaLink[4].link = $262.IsHTMLDDA;
-        ddaLink[0].schedule();
-        check(ddaLink[1].v1 === $262.IsHTMLDDA && ddaLink[3].queue === ddaLink[4],
-              'HTMLDDA link fallback');
-
-        var undefinedQueue = oneHandlerQueue(null, undefined);
-        undefinedQueue[0].schedule();
-        check(undefinedQueue[3].queue === undefinedQueue[4], 'undefined target queue');
-        var ddaQueue = oneHandlerQueue(null, $262.IsHTMLDDA);
-        ddaQueue[0].schedule();
-        check(ddaQueue[3].queue === ddaQueue[4], 'HTMLDDA target queue');
-
-        var originalRun = HandlerTask.prototype.run, runHits = 0;
-        HandlerTask.prototype.run = function(packet) {
-          runHits++;
-          return originalRun.call(this, packet);
-        };
-        var runCase = oneHandlerQueue(null, null);
-        runCase[0].schedule();
-        HandlerTask.prototype.run = originalRun;
-        check(runHits > 0 && runCase[3].queue === runCase[4], 'run replacement');
-
-        var originalQueue = Scheduler.prototype.queue, queueHits = 0;
-        Scheduler.prototype.queue = function(packet) {
-          queueHits++;
-          return originalQueue.call(this, packet);
-        };
-        var queueCase = oneHandlerQueue(null, null);
-        queueCase[0].schedule();
-        Scheduler.prototype.queue = originalQueue;
-        check(queueHits === 1 && queueCase[3].queue === queueCase[4], 'queue replacement');
-
-        var originalCheck = TaskControlBlock.prototype.checkPriorityAdd, checkHits = 0;
-        TaskControlBlock.prototype.checkPriorityAdd = function(task, packet) {
-          checkHits++;
-          return originalCheck.call(this, task, packet);
-        };
-        var checkCase = oneHandlerQueue(null, null);
-        checkCase[0].schedule();
-        TaskControlBlock.prototype.checkPriorityAdd = originalCheck;
-        check(checkHits === 1 && checkCase[3].queue === checkCase[4], 'check replacement');
-
-        var originalMark = TaskControlBlock.prototype.markAsRunnable, markHits = 0;
-        TaskControlBlock.prototype.markAsRunnable = function() {
-          markHits++;
-          return originalMark.call(this);
-        };
-        var markCase = oneHandlerQueue(null, null);
-        markCase[0].schedule();
-        TaskControlBlock.prototype.markAsRunnable = originalMark;
-        check(markHits === 1 && markCase[3].state === 3, 'mark replacement');
-
-        var oldRunnable = STATE_RUNNABLE;
-        STATE_RUNNABLE = 8;
-        var runnableCase = oneHandlerQueue(null, null);
-        runnableCase[0].schedule();
-        STATE_RUNNABLE = oldRunnable;
-        check(runnableCase[3].state === 10, 'live runnable global');
-
-        var oldDataSize = DATA_SIZE;
-        DATA_SIZE = 5;
-        var waitCase = oneHandlerQueue(null, null, 1, 2, 4);
-        waitCase[0].schedule();
-        DATA_SIZE = oldDataSize;
-        check(waitCase[0].queueCount === 0 && waitCase[1].v1 === waitCase[4],
-              'live DATA_SIZE branch');
-
-        var v1Case = oneHandlerQueue(null, null), storedV1 = v1Case[4];
-        var v1Gets = 0, v1Sets = 0;
-        Object.defineProperty(v1Case[1], 'v1', {
-          get: function() { v1Gets++; return storedV1; },
-          set: function(value) { v1Sets++; storedV1 = value; }, configurable: true
-        });
-        v1Case[0].schedule();
-        check(v1Gets > 0 && v1Sets > 0 && storedV1 === null, 'v1 accessor');
-
-        var linkCase = oneHandlerQueue(null, null), storedLink = linked(1);
-        var linkGets = 0, linkSets = 0;
-        Object.defineProperty(linkCase[4], 'link', {
-          get: function() { linkGets++; return storedLink; },
-          set: function(value) { linkSets++; storedLink = value; }, configurable: true
-        });
-        linkCase[0].schedule();
-        check(linkGets > 0 && linkSets > 0 && storedLink === null, 'link accessor');
-        check(linkCase[1].v1.a1 === 1, 'link accessor transfer');
-
-        var schedulerCase = oneHandlerQueue(null, null), storedScheduler = schedulerCase[0];
-        var schedulerGets = 0;
-        Object.defineProperty(schedulerCase[1], 'scheduler', {
-          get: function() { schedulerGets++; return storedScheduler; }, configurable: true
-        });
-        schedulerCase[0].schedule();
-        check(schedulerGets > 0 && schedulerCase[3].queue === schedulerCase[4],
-              'scheduler accessor');
-
-        var currentCase = oneHandlerQueue(null, null), storedCurrent = null;
-        var currentGets = 0, currentSets = 0;
-        Object.defineProperty(currentCase[0], 'currentTcb', {
-          get: function() { currentGets++; return storedCurrent; },
-          set: function(value) { currentSets++; storedCurrent = value; }, configurable: true
-        });
-        currentCase[0].schedule();
-        check(currentGets > 0 && currentSets > 0 && storedCurrent === null,
-              'current accessor');
-        check(currentCase[3].queue === currentCase[4], 'current accessor effects');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_work_delivery_moves_source_and_v2_owners() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active Handler WORK delivery: ' + message;
-        }
-        function oneDelivery(depth, preempt, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 0;
-          work.a2[0] = payload;
-          var devices = null;
-          for (var i = 0; i < depth; i++)
-            devices = new Packet(devices, ID_WORKER, KIND_DEVICE);
-          handler.v2 = devices;
-          var queued = preempt ? null : new Packet(null, ID_WORKER, KIND_DEVICE);
-          var targetTask = {
-            seen: null,
-            run: function(packet) { this.seen = packet; return null; }
-          };
-          var target = new TaskControlBlock(null, ID_WORKER, preempt ? 3 : 1,
-                                            queued, targetTask);
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, work, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          // W and every D are intentionally omitted. Their only source owners must move through
-          // C.queue/H.v1 and H.v2/target without a retain or last-owner gap.
-          return [scheduler, handler, current, target, targetTask, queued];
-        }
-
-        var one = oneDelivery(1, false, 71), q = one[5];
-        one[0].schedule();
-        var d1 = q.link, w1 = one[1].v1;
-        check(d1 !== null && d1.link === null && d1.a1 === 71 &&
-              d1.id === ID_HANDLER_A, 'depth-one delivered owner');
-        check(w1 !== null && w1.a1 === 1 && w1.link === null &&
-              one[1].v2 === null, 'depth-one work/source owners');
-        check(one[3].queue === q && one[2].queue === null &&
-              one[2].state === STATE_SUSPENDED && one[0].queueCount === 1,
-              'one-node nonpreempt');
-
-        var two = oneDelivery(2, true, 72);
-        two[0].schedule();
-        var first2 = two[4].seen, rest2 = two[1].v2, work2 = two[1].v1;
-        check(first2 !== null && first2.link === null && first2.a1 === 72 &&
-              first2.id === ID_HANDLER_A, 'depth-two delivered owner');
-        check(rest2 !== null && rest2.link === null && work2 !== null &&
-              work2.a1 === 1 && work2.link === null, 'depth-two successor/source owners');
-        check(two[3].queue === null && two[2].queue === null &&
-              two[2].state === STATE_RUNNING && two[0].queueCount === 1,
-              'depth-two empty preempt');
-
-        var three = oneDelivery(3, true, 73);
-        three[0].schedule();
-        var first3 = three[4].seen, rest3 = three[1].v2, work3 = three[1].v1;
-        check(first3 !== null && first3.link === null && first3.a1 === 73 &&
-              first3.id === ID_HANDLER_A, 'depth-three delivered owner');
-        check(rest3 !== null && rest3.link !== null && rest3.link.link === null &&
-              work3 !== null && work3.a1 === 1 && work3.link === null,
-              'depth-three successor/source owners');
-        check(three[2].state === STATE_RUNNING && three[0].currentTcb === null &&
-              three[0].queueCount === 1, 'depth-three graph rebuild');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_work_delivery_replays_late_guards_and_aliases() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active Handler WORK replay: ' + message;
-        }
-        function oneDelivery(preempt, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 0;
-          work.a2[0] = payload;
-          var device = new Packet(null, ID_WORKER, KIND_DEVICE);
-          handler.v2 = device;
-          var queued = preempt ? null : new Packet(null, ID_WORKER, KIND_DEVICE);
-          var task = { seen: null, run: function(p) { this.seen = p; return null; } };
-          var target = new TaskControlBlock(null, ID_WORKER, preempt ? 3 : 1,
-                                            queued, task);
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, work, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          return [scheduler, handler, current, target, task, queued, work, device];
-        }
-
-        // W.a1 is read after incoming addTo. Generic replay must expose H.v1=W but leave H.v2,
-        // D, target, and queueCount untouched when the accessor throws exactly once.
-        var a1Case = oneDelivery(true, 81), a1Gets = 0, storedA1 = 0;
-        Object.defineProperty(a1Case[6], 'a1', {
-          get: function() { a1Gets++; throw 'a1'; },
-          set: function(v) { storedA1 = v; }, configurable: true
-        });
-        var a1Error = '';
-        try { a1Case[0].schedule(); } catch (e) { a1Error = e; }
-        check(a1Error === 'a1' && a1Gets === 1 && a1Case[1].v1 === a1Case[6],
-              'a1 accessor replay once');
-        check(a1Case[1].v2 === a1Case[7] && a1Case[4].seen === null &&
-              a1Case[0].queueCount === 0 && a1Case[2].queue === null &&
-              a1Case[2].state === STATE_RUNNING, 'a1 checkpoint');
-
-        // The indexed payload read follows H.v2 advancement in source order.
-        var elemCase = oneDelivery(true, 82), elemGets = 0;
-        Object.defineProperty(elemCase[6].a2, 0, {
-          get: function() { elemGets++; throw 'elem'; }, configurable: true
-        });
-        var elemError = '';
-        try { elemCase[0].schedule(); } catch (e) { elemError = e; }
-        check(elemError === 'elem' && elemGets === 1 && elemCase[1].v1 === elemCase[6] &&
-              elemCase[1].v2 === null, 'payload accessor source order');
-        check(elemCase[7].a1 === 0 && elemCase[4].seen === null &&
-              elemCase[0].queueCount === 0, 'payload checkpoint');
-
-        var originalAdd = Packet.prototype.addTo, addHits = 0;
-        Packet.prototype.addTo = function(queue) {
-          addHits++;
-          return originalAdd.call(this, queue);
-        };
-        var addCase = oneDelivery(true, 83);
-        addCase[0].schedule();
-        Packet.prototype.addTo = originalAdd;
-        check(addHits === 1 && addCase[4].seen === addCase[7],
-              'incoming addTo replacement once');
-
-        var originalQueue = Scheduler.prototype.queue, queueHits = 0;
-        Scheduler.prototype.queue = function(packet) {
-          queueHits++;
-          return originalQueue.call(this, packet);
-        };
-        var queueCase = oneDelivery(true, 84);
-        queueCase[0].schedule();
-        Scheduler.prototype.queue = originalQueue;
-        check(queueHits === 1 && queueCase[4].seen === queueCase[7] &&
-              queueCase[7].a1 === 84, 'queue replacement once');
-
-        // A non-Null incoming link is moved by Active into C.queue before Handler clears W.link.
-        // It is outside the narrow direct subset and must survive generic delivery/preemption.
-        var linkCase = oneDelivery(true, 85);
-        var successor = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        linkCase[6].link = successor;
-        linkCase[0].schedule();
-        check(linkCase[2].queue === successor && linkCase[6].link === null &&
-              linkCase[2].state === STATE_RUNNABLE && linkCase[4].seen === linkCase[7],
-              'incoming successor owner replay');
-
-        // Preexisting H.v1 forces the full addTo path before delivery from H.v2.
-        var oldCase = oneDelivery(true, 86);
-        var oldWork = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        oldWork.a1 = 0;
-        oldWork.a2[0] = 86;
-        oldCase[1].v1 = oldWork;
-        oldCase[0].schedule();
-        check(oldCase[1].v1 === oldWork && oldWork.link === oldCase[6] &&
-              oldWork.a1 === 1 && oldCase[6].link === null,
-              'preexisting v1 replay');
-        check(oldCase[4].seen === oldCase[7] && oldCase[7].a1 === 86,
-              'preexisting v1 delivery');
-
-        // D===W is valid source behavior. The second a1 store wins after the payload copy.
-        var aliasScheduler = new Scheduler();
-        var aliasHandler = new HandlerTask(aliasScheduler);
-        var aliasPacket = new Packet(null, ID_WORKER, KIND_WORK);
-        aliasPacket.a1 = 0;
-        aliasPacket.a2[0] = 99;
-        aliasHandler.v2 = aliasPacket;
-        var aliasTask = { seen: null, run: function(p) { this.seen = p; return null; } };
-        var aliasTarget = new TaskControlBlock(null, ID_WORKER, 3, null, aliasTask);
-        var aliasCurrent = new TaskControlBlock(null, ID_HANDLER_A, 2,
-                                                aliasPacket, aliasHandler);
-        aliasScheduler.blocks[ID_WORKER] = aliasTarget;
-        aliasScheduler.blocks[ID_HANDLER_A] = aliasCurrent;
-        aliasScheduler.list = aliasCurrent;
-        aliasScheduler.schedule();
-        check(aliasTask.seen === aliasPacket && aliasPacket.a1 === 1 &&
-              aliasPacket.id === ID_HANDLER_A && aliasPacket.link === null,
-              'D equals W source order');
-        check(aliasHandler.v1 === aliasPacket && aliasHandler.v2 === null &&
-              aliasScheduler.queueCount === 1, 'D equals W graph');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_work_delivery_parity_case() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function oneDelivery(preempt, depth, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a2[0] = payload;
-          var devices = null;
-          for (var i = 0; i < depth; i++)
-            devices = new Packet(devices, ID_WORKER, KIND_DEVICE);
-          handler.v2 = devices;
-          var queued = preempt ? null : new Packet(null, ID_WORKER, KIND_DEVICE);
-          var task = { seen: null, run: function(p) { this.seen = p; return null; } };
-          var target = new TaskControlBlock(null, ID_WORKER, preempt ? 3 : 1,
-                                            queued, task);
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, work, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          scheduler.schedule();
-          var delivered = preempt ? task.seen : queued.link;
-          return [scheduler.queueCount, current.queue === null, current.state,
-                  handler.v1 === work, work.a1, work.link === null,
-                  delivered.a1, delivered.id, delivered.link === null,
-                  handler.v2 === null ? 0 : 1].join('|');
-        }
-        oneDelivery(false, 1, 91) + ';' + oneDelivery(true, 2, 92)
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(
-        run_jit(&src),
-        "1|true|2|true|1|true|91|2|true|0;1|true|0|true|1|true|92|2|true|1"
-    );
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-#[test]
-fn jit_scheduler_active_handler_incoming_work_delivery_enabled_disabled_parity() {
-    use std::process::Command;
-
-    let executable = std::env::current_exe().expect("current test executable");
-    for disabled in [false, true] {
-        let mut command = Command::new(&executable);
-        command
-            .arg("--exact")
-            .arg("tests::jit_scheduler_active_handler_incoming_work_delivery_parity_case")
-            .arg("--nocapture")
-            .env("LUMEN_JIT_REGIONLOG", "1")
-            .env_remove("LUMEN_JIT_NO_SCHED_HANDLER_ACTIVE_WORK_DELIVERY");
-        if disabled {
-            command.env("LUMEN_JIT_NO_SCHED_HANDLER_ACTIVE_WORK_DELIVERY", "1");
-        }
-        let output = command.output().expect("run parity child test");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let planned = if disabled {
-            "incoming_work_delivery=false"
-        } else {
-            "incoming_work_delivery=true"
-        };
-        assert!(
-            output.status.success() && stdout.contains("running 1 test") && stderr.contains(planned),
-            "Handler Active WORK delivery parity child disabled={disabled} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_suspend_moves_bounded_packet_pools() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active Handler incoming suspend: ' + message;
-        }
-        function deviceBurst() {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var p3 = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var p2 = new Packet(p3, ID_WORKER, KIND_DEVICE);
-          var p1 = new Packet(p2, ID_WORKER, KIND_DEVICE);
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, p1, handler);
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          // Do not return any packet root. Each incoming C.queue owner must move into v2/the
-          // previous tail before its source is removed, including across same-record resumes.
-          return [scheduler, handler, current];
-        }
-        var devices = deviceBurst();
-        devices[0].schedule();
-        var p1 = devices[1].v2, p2 = p1.link, p3 = p2.link;
-        check(p1 !== null && p2 !== null && p3 !== null && p3.link === null,
-              'DEVICE depth 0/1/2 chain');
-        check(p1.id === ID_WORKER && p2.id === ID_WORKER && p3.id === ID_WORKER,
-              'DEVICE owners survived');
-        check(devices[2].queue === null && devices[2].state === STATE_SUSPENDED,
-              'null successor final state');
-        check(devices[0].currentId === ID_HANDLER_A &&
-              devices[0].currentTcb === null && devices[0].queueCount === 0,
-              'DEVICE scheduler result');
-
-        // A non-Null successor makes the collapsed run+suspend state exactly
-        // SUSPENDED_RUNNABLE. The next packet's throwing link getter checkpoints that state
-        // before its own TaskControlBlock.run can advance the queue.
-        var linkGets = 0;
-        var successor = {};
-        Object.defineProperty(successor, 'link', {
-          get: function() { linkGets++; throw 'successor link'; }, configurable: true
-        });
-        var successorScheduler = new Scheduler();
-        var successorHandler = new HandlerTask(successorScheduler);
-        var first = new Packet(successor, ID_WORKER, KIND_DEVICE);
-        var successorCurrent = new TaskControlBlock(
-            null, ID_HANDLER_A, 2, first, successorHandler);
-        successorScheduler.blocks[ID_HANDLER_A] = successorCurrent;
-        successorScheduler.list = successorCurrent;
-        var successorError = '';
-        try { successorScheduler.schedule(); } catch (e) { successorError = e; }
-        check(successorError === 'successor link' && linkGets === 1,
-              'successor replay once');
-        check(successorCurrent.queue === successor &&
-              successorCurrent.state === STATE_SUSPENDED_RUNNABLE,
-              'non-Null successor pending state');
-        check(successorHandler.v2 === first && first.link === null,
-              'successor/P owner moves');
-
-        function workCase(withHead) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var incoming = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          var head = withHead ? new Packet(null, ID_HANDLER_A, KIND_WORK) : null;
-          if (head !== null) handler.v1 = head;
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, incoming, handler);
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          return [scheduler, handler, current, head];
-        }
-        var empty = workCase(false);
-        empty[0].schedule();
-        check(empty[1].v1 !== null && empty[1].v1.link === null &&
-              empty[1].v1.a1 === 0, 'WORK empty v1');
-        check(empty[2].queue === null && empty[2].state === STATE_SUSPENDED &&
-              empty[0].currentTcb === null, 'WORK empty suspend');
-
-        var one = workCase(true), head = one[3];
-        one[0].schedule();
-        check(one[1].v1 === head && head.link !== null && head.link.link === null &&
-              head.a1 === 0, 'WORK one-node append');
-        check(one[2].queue === null && one[2].state === STATE_SUSPENDED &&
-              one[0].currentId === ID_HANDLER_A && one[0].queueCount === 0,
-              'WORK one-node suspend');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_suspend_replays_bounds_and_guards() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active Handler incoming replay: ' + message;
-        }
-        function oneIncoming(kind, v1, v2) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var packet = new Packet(null, ID_HANDLER_A, kind);
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, packet, handler);
-          handler.v1 = v1;
-          handler.v2 = v2;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          return [scheduler, handler, current, packet];
-        }
-
-        // Lists just beyond the unrolled subsets must replay Packet.addTo's full scan once.
-        var d3 = new Packet(null, ID_WORKER, KIND_DEVICE);
-        var d2 = new Packet(d3, ID_WORKER, KIND_DEVICE);
-        var d1 = new Packet(d2, ID_WORKER, KIND_DEVICE);
-        var longDevice = oneIncoming(KIND_DEVICE, null, d1);
-        longDevice[0].schedule();
-        check(d1.link === d2 && d2.link === d3 && d3.link === longDevice[3] &&
-              longDevice[3].link === null, 'DEVICE length-three replay');
-
-        var w2 = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        var w1 = new Packet(w2, ID_HANDLER_A, KIND_WORK);
-        var longWork = oneIncoming(KIND_WORK, w1, null);
-        longWork[0].schedule();
-        check(w1.link === w2 && w2.link === longWork[3] &&
-              longWork[3].link === null, 'WORK length-two replay');
-
-        // An observable kind access declines before Active/Handler writes, then generic replay
-        // performs the getter exactly once after TaskControlBlock.run's dequeue/state prefix.
-        var kindCase = oneIncoming(KIND_DEVICE, null, null), kindGets = 0;
-        Object.defineProperty(kindCase[3], 'kind', {
-          get: function() {
-            kindGets++;
-            check(kindCase[2].queue === null && kindCase[2].state === STATE_RUNNING &&
-                  kindCase[0].currentId === ID_HANDLER_A && kindCase[1].v2 === null,
-                  'kind getter checkpoint');
-            return KIND_DEVICE;
-          }, configurable: true
-        });
-        kindCase[0].schedule();
-        check(kindGets === 1 && kindCase[1].v2 === kindCase[3], 'kind getter once');
-
-        var originalAdd = Packet.prototype.addTo, addHits = 0;
-        Packet.prototype.addTo = function(queue) {
-          addHits++;
-          return originalAdd.call(this, queue);
-        };
-        var addCase = oneIncoming(KIND_DEVICE, null, null);
-        addCase[0].schedule();
-        Packet.prototype.addTo = originalAdd;
-        check(addHits === 1 && addCase[1].v2 === addCase[3], 'addTo replacement once');
-
-        var originalSuspend = Scheduler.prototype.suspendCurrent, suspendHits = 0;
-        Scheduler.prototype.suspendCurrent = function() {
-          suspendHits++;
-          return originalSuspend.call(this);
-        };
-        var suspendCase = oneIncoming(KIND_DEVICE, null, null);
-        suspendCase[0].schedule();
-        Scheduler.prototype.suspendCurrent = originalSuspend;
-        check(suspendHits === 1 && suspendCase[2].state === STATE_SUSPENDED,
-              'suspend replacement once');
-
-        var originalMark = TaskControlBlock.prototype.markAsSuspended, markHits = 0;
-        TaskControlBlock.prototype.markAsSuspended = function() {
-          markHits++;
-          return originalMark.call(this);
-        };
-        var markCase = oneIncoming(KIND_DEVICE, null, null);
-        markCase[0].schedule();
-        TaskControlBlock.prototype.markAsSuspended = originalMark;
-        check(markHits === 1 && markCase[1].v2 === markCase[3] &&
-              markCase[2].state === STATE_SUSPENDED, 'mark replacement once');
-
-        var schedulerCase = oneIncoming(KIND_DEVICE, null, null), schedulerGets = 0;
-        var storedScheduler = schedulerCase[0];
-        Object.defineProperty(schedulerCase[1], 'scheduler', {
-          get: function() { schedulerGets++; return storedScheduler; }, configurable: true
-        });
-        schedulerCase[0].schedule();
-        check(schedulerGets === 1 && schedulerCase[1].v2 === schedulerCase[3],
-              'Handler.scheduler accessor once');
-
-        // Non-numeric KIND_WORK forces generic loose-equality coercion exactly once.
-        var oldKindWork = KIND_WORK, nameHits = 0;
-        KIND_WORK = { valueOf: function() { nameHits++; return oldKindWork; } };
-        var nameCase = oneIncoming(oldKindWork, null, null);
-        nameCase[0].schedule();
-        KIND_WORK = oldKindWork;
-        check(nameHits === 1 && nameCase[1].v1 === nameCase[3] &&
-              nameCase[1].v2 === null, 'KIND_WORK coercion replay');
-
-        // P already present as the selected list head is a valid but uncommon source-order
-        // alias. Ordinary addTo creates the self-link; the direct transaction must decline.
-        var alias = oneIncoming(KIND_DEVICE, null, null);
-        alias[1].v2 = alias[3];
-        alias[0].schedule();
-        check(alias[1].v2 === alias[3] && alias[3].link === alias[3] &&
-              alias[2].state === STATE_SUSPENDED, 'P equals v2 replay');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_suspend_parity_case() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        var scheduler = new Scheduler();
-        var handler = new HandlerTask(scheduler);
-        var p3 = new Packet(null, ID_WORKER, KIND_DEVICE);
-        var p2 = new Packet(p3, ID_WORKER, KIND_DEVICE);
-        var p1 = new Packet(p2, ID_WORKER, KIND_DEVICE);
-        var current = new TaskControlBlock(null, ID_HANDLER_A, 2, p1, handler);
-        scheduler.blocks[ID_HANDLER_A] = current;
-        scheduler.list = current;
-        scheduler.schedule();
-        var deviceState = current.state;
-        var deviceQueueNull = current.queue === null;
-        var deviceChainComplete = handler.v2.link.link.link === null;
-        var deviceCurrentNull = scheduler.currentTcb === null;
-        var wScheduler = new Scheduler();
-        var wHandler = new HandlerTask(wScheduler);
-        var oldWork = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        var newWork = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        var wCurrent = new TaskControlBlock(null, ID_HANDLER_A, 2, newWork, wHandler);
-        wHandler.v1 = oldWork;
-        wScheduler.blocks[ID_HANDLER_A] = wCurrent;
-        wScheduler.list = wCurrent;
-        wScheduler.schedule();
-        var workState = wCurrent.state;
-        [deviceState, deviceQueueNull, deviceChainComplete, deviceCurrentNull,
-         workState, wHandler.v1 === oldWork,
-         oldWork.link === newWork, newWork.link === null].join('|')
-        "#,
-    ]
-    .join("\n");
-    // This deliberately global construction retains the scheduler's runnable checkpoint; the
-    // parent parity test executes the identical fixture with the stitched arm both on and off.
-    assert_eq!(run_jit(&src), "2|true|true|true|2|true|true|true");
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_suspend_enabled_disabled_parity() {
-    use std::process::Command;
-
-    let executable = std::env::current_exe().expect("current test executable");
-    for disabled in [false, true] {
-        let mut command = Command::new(&executable);
-        command
-            .arg("--exact")
-            .arg("tests::jit_scheduler_active_handler_incoming_suspend_parity_case")
-            .arg("--nocapture")
-            .env_remove("LUMEN_JIT_NO_SCHED_HANDLER_INCOMING_SUSPEND");
-        if disabled {
-            command.env("LUMEN_JIT_NO_SCHED_HANDLER_INCOMING_SUSPEND", "1");
-        }
-        let output = command.output().expect("run parity child test");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success() && stdout.contains("running 1 test"),
-            "Handler incoming suspend parity child disabled={disabled} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-}
-
-#[test]
-fn jit_scheduler_handler_incoming_device_bridge_preserves_owners_and_replays_guards() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler incoming: ' + message;
-        }
-        function oneIncoming(link, count, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = count;
-          work.a2[count] = payload;
-          var packet = new Packet(link, ID_WORKER, KIND_DEVICE);
-          var queued = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 1, queued, {
-            run: function() { return null; }
-          });
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, packet, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          handler.v1 = work;
-          // Deliberately omit packet from the returned roots. A successful bridge must preserve
-          // it through both skipped inline frames until the target queue receives the owner.
-          return [scheduler, handler, current, target, work, queued];
-        }
-
-        var direct = oneIncoming(null, 1, 77);
-        direct[0].schedule();
-        var delivered = direct[3].queue.link;
-        check(direct[0].queueCount === 1, 'direct queue count');
-        check(delivered.a1 === 77 && delivered.id === ID_HANDLER_A,
-              'direct packet fields');
-        check(delivered.link === null && direct[4].a1 === 2 && direct[1].v2 === null,
-              'direct Handler state');
-        check(direct[2].queue === null && direct[2].state === STATE_SUSPENDED &&
-              direct[0].currentId === ID_HANDLER_A && direct[0].currentTcb === null,
-              'direct active state');
-
-        // A successor is moved into current.queue by TaskControlBlock.run before Handler runs.
-        // The bridge's pre-prefix Null-link guard must replay, after which both packets are
-        // delivered once without losing the successor's last hidden owner.
-        var successor = new Packet(null, ID_WORKER, KIND_DEVICE);
-        successor.a2[0] = 91;
-        var linked = oneIncoming(successor, 1, 81);
-        linked[0].schedule();
-        var first = linked[3].queue.link;
-        check(linked[0].queueCount === 2 && first.a1 === 81, 'linked deliveries');
-        check(first.link === successor && successor.link === null, 'linked owners');
-        check(successor.a1 === linked[4].a2[2] && linked[4].a1 === 3,
-              'linked cursor');
-        check(linked[2].queue === null && linked[2].state === STATE_SUSPENDED,
-              'linked suspension');
-
-        // An observable kind read makes the generic Active fast path materialize and replay.
-        // The getter must nevertheless observe only the source-ordered Active effects: currentId
-        // and the queue/state prefix, but none of HandlerTask.run's writes.
-        var early = oneIncoming(null, 1, 80);
-        var earlyPacket = early[2].queue, kindThrows = 0;
-        Object.defineProperty(earlyPacket, 'kind', {
-          get: function() { kindThrows++; throw 'kind boom'; }, configurable: true
-        });
-        var kindError = '';
-        try { early[0].schedule(); } catch (e) { kindError = e; }
-        check(kindError === 'kind boom' && kindThrows === 1, 'early throw once');
-        check(early[2].queue === null && early[2].state === STATE_RUNNING &&
-              early[0].currentId === ID_HANDLER_A && early[0].currentTcb === early[2],
-              'early active checkpoint');
-        check(early[1].v2 === null && early[4].a1 === 1 &&
-              early[0].queueCount === 0 && early[3].queue === early[5],
-              'early Handler untouched');
-
-        var originalAdd = Packet.prototype.addTo, addHits = 0;
-        Packet.prototype.addTo = function(queue) {
-          addHits++;
-          return originalAdd.call(this, queue);
-        };
-        var methodCase = oneIncoming(null, 1, 82);
-        methodCase[0].schedule();
-        Packet.prototype.addTo = originalAdd;
-        check(addHits === 2 && methodCase[3].queue.link.a1 === 82,
-              'method replacement replay');
-
-        var kindCase = oneIncoming(null, 1, 83);
-        var kindPacket = kindCase[2].queue, kindGets = 0;
-        Object.defineProperty(kindPacket, 'kind', {
-          get: function() { kindGets++; return KIND_DEVICE; }, configurable: true
-        });
-        kindCase[0].schedule();
-        check(kindGets === 1 && kindCase[3].queue.link === kindPacket,
-              'kind getter replay');
-
-        // Handler.v1 is observed after the incoming Packet.addTo side effects. A late throw must
-        // therefore see the active-prefix and addTo effects exactly once, but no delivery writes.
-        var throwCase = oneIncoming(null, 1, 84);
-        var throwPacket = throwCase[2].queue, v1Gets = 0;
-        Object.defineProperty(throwCase[1], 'v1', {
-          get: function() { v1Gets++; throw 'v1 boom'; }, configurable: true
-        });
-        var error = '';
-        try { throwCase[0].schedule(); } catch (e) { error = e; }
-        check(error === 'v1 boom' && v1Gets === 1, 'late throw once');
-        check(throwCase[2].queue === null && throwCase[2].state === STATE_RUNNING &&
-              throwCase[0].currentId === ID_HANDLER_A &&
-              throwCase[0].currentTcb === throwCase[2], 'late active effects');
-        check(throwCase[1].v2 === throwPacket && throwPacket.link === null,
-              'late addTo effects');
-        check(throwCase[0].queueCount === 0 && throwCase[3].queue === throwCase[5] &&
-              throwCase[5].link === null && throwCase[0].currentTcb === throwCase[2],
-              'late target untouched');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_handler_incoming_delivery_fuses_preempt_and_replays_late_guards() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler incoming delivery: ' + message;
-        }
-        function emptyTarget(targetPriority, currentPriority, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 1;
-          work.a2[1] = payload;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var seen = { packet: null, handlerState: -1, wasCurrent: false };
-          var current, target;
-          var task = {
-            run: function(value) {
-              seen.packet = value;
-              seen.handlerState = current.state;
-              seen.wasCurrent = scheduler.currentTcb === target;
-              return null;
-            }
-          };
-          target = new TaskControlBlock(null, ID_WORKER, targetPriority, null, task);
-          current = new TaskControlBlock(target, ID_HANDLER_A, currentPriority, packet, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          handler.v1 = work;
-          return [scheduler, handler, current, target, work, packet, seen];
-        }
-
-        // The fused empty-target arm must publish exactly one packet owner and immediately
-        // preempt when the target priority is higher. The Handler has not run its later suspend.
-        var preempt = emptyTarget(3, 2, 71);
-        preempt[0].schedule();
-        check(preempt[6].packet === preempt[5] && preempt[6].wasCurrent,
-              'preempt packet/current');
-        check(preempt[6].handlerState === STATE_RUNNING,
-              'preempt happens before Handler suspend');
-        check(preempt[5].a1 === 71 && preempt[5].id === ID_HANDLER_A &&
-              preempt[5].link === null, 'preempt packet fields');
-        check(preempt[1].v2 === null && preempt[4].a1 === 2 &&
-              preempt[0].queueCount === 1, 'preempt Handler writes');
-
-        // The same empty target with a lower priority must decline the fused preempt guard and
-        // replay pc59. Handler suspends before the linked target is selected, with no duplicates.
-        var noPreempt = emptyTarget(1, 2, 72);
-        noPreempt[0].schedule();
-        check(noPreempt[6].packet === noPreempt[5] && noPreempt[6].wasCurrent,
-              'nonpreempt packet/current');
-        check(noPreempt[6].handlerState === STATE_SUSPENDED,
-              'nonpreempt runs after Handler suspend');
-        check(noPreempt[5].a1 === 72 && noPreempt[4].a1 === 2 &&
-              noPreempt[0].queueCount === 1, 'nonpreempt writes once');
-
-        function twoNodeTarget() {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 1;
-          work.a2[1] = 73;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var tail = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var head = new Packet(tail, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 1, head, {
-            run: function() { return null; }
-          });
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, packet, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          handler.v1 = work;
-          return [scheduler, handler, current, target, work, packet, head, tail];
-        }
-
-        // A two-node destination is intentionally outside the one-node transaction. Full replay
-        // must run Packet.addTo's scan once and append rather than overwrite the existing tail.
-        var scanned = twoNodeTarget();
-        scanned[0].schedule();
-        check(scanned[6].link === scanned[7] && scanned[7].link === scanned[5] &&
-              scanned[5].link === null, 'two-node append order');
-        check(scanned[0].queueCount === 1 && scanned[5].a1 === 73 &&
-              scanned[4].a1 === 2 && scanned[1].v2 === null,
-              'two-node replay writes once');
-
-        function latePayloadThrow() {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 1;
-          var payload = {}, hits = { value: 0 };
-          Object.defineProperty(payload, '1', {
-            get: function() { hits.value++; throw 'payload boom'; }, configurable: true
-          });
-          // Keep the Packet's warmed shape unchanged while making a2 non-packed. The incoming
-          // prefix can fuse, but the later delivery guard must decline before committing.
-          work.a2 = payload;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var queued = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 1, queued, {
-            run: function() { return null; }
-          });
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, packet, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          handler.v1 = work;
-          return [scheduler, handler, current, target, work, packet, queued, hits];
-        }
-
-        // Original execution has already published the incoming packet to v2 and advanced v2
-        // back to Null when the payload getter throws. Replaying from pc161 would miss that order.
-        var late = latePayloadThrow(), error = '';
-        try { late[0].schedule(); } catch (e) { error = e; }
-        check(error === 'payload boom' && late[7].value === 1, 'late throw once');
-        check(late[1].v2 === null && late[5].link === null && late[5].a1 === 0 &&
-              late[5].id === ID_WORKER, 'late prefix/delivery checkpoint');
-        check(late[4].a1 === 1 && late[0].queueCount === 0 &&
-              late[3].queue === late[6] && late[6].link === null,
-              'late queue untouched');
-        check(late[2].queue === null && late[2].state === STATE_RUNNING &&
-              late[0].currentTcb === late[2], 'late active effects');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_active_handler_incoming_replays_changed_methods_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'active handler methods: ' + message;
-        }
-        function oneIncoming(payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 1;
-          work.a2[1] = payload;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 3, null, {
-            run: function() { throw 'held target ran'; }
-          });
-          target.state = STATE_SUSPENDED | STATE_HELD;
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, packet, handler);
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = current;
-          scheduler.list = current;
-          handler.v1 = work;
-          return {
-            scheduler: scheduler, handler: handler, work: work, packet: packet,
-            current: current, target: target, payload: payload
-          };
-        }
-        function checkComplete(one, label) {
-          check(one.current.queue === null && one.current.state === STATE_RUNNING,
-                label + ' source dequeue');
-          check(one.scheduler.currentId === ID_HANDLER_A &&
-                one.scheduler.currentTcb === null, label + ' scheduler state');
-          check(one.handler.v2 === null && one.work.a1 === 2 &&
-                one.packet.a1 === one.payload, label + ' Handler writes');
-          check(one.scheduler.queueCount === 1 && one.packet.link === null &&
-                one.packet.id === ID_HANDLER_A, label + ' queue prefix');
-          check(one.target.queue === one.packet &&
-                one.target.state === (STATE_SUSPENDED | STATE_HELD | STATE_RUNNABLE),
-                label + ' target publication');
-        }
-
-        // TaskControlBlock.run dequeues and writes currentId before resolving Handler.run.
-        var originalRun = HandlerTask.prototype.run;
-        var runCase, runHits = 0, runPacket = null, runQueue = 1;
-        var runState = -1, runId = -1, runV2 = 1;
-        HandlerTask.prototype.run = function(packet) {
-          runHits++;
-          runPacket = packet;
-          runQueue = runCase.current.queue;
-          runState = runCase.current.state;
-          runId = runCase.scheduler.currentId;
-          runV2 = this.v2;
-          return originalRun.call(this, packet);
-        };
-        runCase = oneIncoming(71);
-        runCase.scheduler.schedule();
-        HandlerTask.prototype.run = originalRun;
-        check(runHits === 1 && runPacket === runCase.packet && runQueue === null &&
-              runState === STATE_RUNNING && runId === ID_HANDLER_A && runV2 === null,
-              'run entry once');
-        checkComplete(runCase, 'run');
-
-        // The first addTo is still before Handler.v2 is published. An empty target avoids a
-        // second addTo inside checkPriorityAdd, making this call count exact.
-        var originalAdd = Packet.prototype.addTo;
-        var addCase, addHits = 0, addQueue = 1, addLink = 1, addCurrent = false;
-        Packet.prototype.addTo = function(queue) {
-          addHits++;
-          addQueue = queue;
-          addLink = this.link;
-          addCurrent = addCase.scheduler.currentTcb === addCase.current &&
-                       addCase.current.queue === null;
-          return originalAdd.call(this, queue);
-        };
-        addCase = oneIncoming(72);
-        addCase.scheduler.schedule();
-        Packet.prototype.addTo = originalAdd;
-        check(addHits === 1 && addQueue === null && addLink === null && addCurrent,
-              'addTo entry once');
-        checkComplete(addCase, 'addTo');
-
-        // Scheduler.queue is resolved after all Handler delivery writes, but before its own
-        // queueCount/link/id prefix.
-        var originalQueue = Scheduler.prototype.queue;
-        var queueCase, queueHits = 0, queueCountAtEntry = -1;
-        var queueV2 = 1, queueCount = -1, queueId = -1, queueLink = 1;
-        Scheduler.prototype.queue = function(packet) {
-          queueHits++;
-          queueCountAtEntry = this.queueCount;
-          queueV2 = queueCase.handler.v2;
-          queueCount = queueCase.work.a1;
-          queueId = packet.id;
-          queueLink = packet.link;
-          return originalQueue.call(this, packet);
-        };
-        queueCase = oneIncoming(73);
-        queueCase.scheduler.schedule();
-        Scheduler.prototype.queue = originalQueue;
-        check(queueHits === 1 && queueCountAtEntry === 0 && queueV2 === null &&
-              queueCount === 2 && queueId === ID_WORKER && queueLink === null &&
-              queueCase.packet.a1 === 73, 'queue entry once');
-        checkComplete(queueCase, 'queue');
-
-        // checkPriorityAdd sees Scheduler.queue's prefix and no target mutation yet.
-        var originalCheck = TaskControlBlock.prototype.checkPriorityAdd;
-        var checkCase, checkHits = 0, checkTask = null, checkQueue = 1;
-        var checkState = -1, checkId = -1, checkCount = -1;
-        TaskControlBlock.prototype.checkPriorityAdd = function(task, packet) {
-          checkHits++;
-          checkTask = task;
-          checkQueue = this.queue;
-          checkState = this.state;
-          checkId = packet.id;
-          checkCount = checkCase.scheduler.queueCount;
-          return originalCheck.call(this, task, packet);
-        };
-        checkCase = oneIncoming(74);
-        checkCase.scheduler.schedule();
-        TaskControlBlock.prototype.checkPriorityAdd = originalCheck;
-        check(checkHits === 1 && checkTask === checkCase.current && checkQueue === null &&
-              checkState === (STATE_SUSPENDED | STATE_HELD) &&
-              checkId === ID_HANDLER_A && checkCount === 1, 'check entry once');
-        checkComplete(checkCase, 'check');
-
-        // markAsRunnable is later still: target.queue owns the packet while state is unchanged.
-        var originalMark = TaskControlBlock.prototype.markAsRunnable;
-        var markCase, markHits = 0, markQueue = null, markState = -1;
-        TaskControlBlock.prototype.markAsRunnable = function() {
-          markHits++;
-          markQueue = this.queue;
-          markState = this.state;
-          return originalMark.call(this);
-        };
-        markCase = oneIncoming(75);
-        markCase.scheduler.schedule();
-        TaskControlBlock.prototype.markAsRunnable = originalMark;
-        check(markHits === 1 && markQueue === markCase.packet &&
-              markState === (STATE_SUSPENDED | STATE_HELD), 'mark entry once');
-        checkComplete(markCase, 'mark');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_handler_v2_delivery_preserves_aliases_and_owner_moves() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler v2 owners: ' + message;
-        }
-        function oneDelivery(count, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = count;
-          work.a2[count] = payload;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var queued = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 1, queued, {
-            run: function() { return null; }
-          });
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, null, handler);
-          current.state = STATE_RUNNING;
-          handler.v1 = work;
-          handler.v2 = packet;
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = null;
-          scheduler.list = current;
-          return [scheduler, handler, current, target, packet, work, queued];
-        }
-
-        var direct = oneDelivery(1, 77);
-        direct[0].schedule();
-        check(direct[0].queueCount === 1, 'direct count');
-        check(direct[1].v2 === null && direct[4].link === null, 'direct source');
-        check(direct[4].a1 === 77 && direct[5].a1 === 2, 'direct numerics');
-        check(direct[4].id === ID_HANDLER_A, 'direct id');
-        check(direct[3].queue === direct[6] && direct[6].link === direct[4],
-              'direct append');
-        check(direct[2].state === STATE_SUSPENDED && direct[0].currentTcb === null,
-              'direct suspension');
-
-        // Valid aliases currently replay at the transaction head. These assertions pin the
-        // source-order behavior so a future alias-specialized commit cannot silently drift.
-        var queueIsPacket = oneDelivery(3, 70);
-        var successor = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        successor.a2[0] = 91;
-        queueIsPacket[4].link = successor;
-        queueIsPacket[3].queue = queueIsPacket[4];
-        queueIsPacket[0].schedule();
-        check(queueIsPacket[1].v2 === successor, 'Q=P successor');
-        check(queueIsPacket[4].link === queueIsPacket[4], 'Q=P self append');
-        check(queueIsPacket[3].queue === queueIsPacket[4], 'Q=P queue');
-
-        var workIsPacket = oneDelivery(1, 88);
-        workIsPacket[1].v1 = workIsPacket[4];
-        workIsPacket[4].a1 = 1;
-        workIsPacket[4].a2[1] = 88;
-        workIsPacket[0].schedule();
-        check(workIsPacket[4].a1 === 2, 'W=P ordered a1 writes');
-        check(workIsPacket[6].link === workIsPacket[4], 'W=P append');
-
-        var queueIsWork = oneDelivery(1, 66);
-        queueIsWork[3].queue = queueIsWork[5];
-        queueIsWork[0].schedule();
-        check(queueIsWork[5].link === queueIsWork[4], 'Q=W append');
-        check(queueIsWork[5].a1 === 2 && queueIsWork[4].a1 === 66,
-              'Q=W distinct fields');
-
-        var linkIsQueue = oneDelivery(3, 65);
-        linkIsQueue[4].link = linkIsQueue[6];
-        linkIsQueue[0].schedule();
-        check(linkIsQueue[1].v2 === linkIsQueue[6], 'L=Q transfer');
-        check(linkIsQueue[6].link === linkIsQueue[4], 'L=Q append');
-
-        var selfSource = oneDelivery(3, 64);
-        selfSource[4].link = selfSource[4];
-        selfSource[0].schedule();
-        check(selfSource[1].v2 === selfSource[4], 'L=P transfer');
-        check(selfSource[4].link === null && selfSource[6].link === selfSource[4],
-              'L=P queue clear');
-
-        var lastOwner = oneDelivery(3, 63);
-        lastOwner[4].link = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        lastOwner[4].link.a2[0] = 92;
-        lastOwner[0].schedule();
-        check(lastOwner[1].v2.a2[0] === 92, 'last-owner successor');
-        check(lastOwner[4].link === null && lastOwner[6].link === lastOwner[4],
-              'last-owner packet move');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_handler_v2_delivery_guards_effect_order_and_live_values() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler v2 guards: ' + message;
-        }
-        function oneDelivery(count, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = count;
-          work.a2[count] = payload;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var queued = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 1, queued, {
-            run: function() { return null; }
-          });
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, null, handler);
-          current.state = STATE_RUNNING;
-          handler.v1 = work;
-          handler.v2 = packet;
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = null;
-          scheduler.list = current;
-          return [scheduler, handler, current, target, packet, work, queued];
-        }
-
-        // The region must use the count local captured before this getter changes Handler.v1.
-        var changed = oneDelivery(0, 10);
-        var oldWork = changed[5];
-        var newWork = new Packet(null, ID_HANDLER_A, KIND_WORK);
-        newWork.a1 = 0;
-        newWork.a2[1] = 81;
-        Object.defineProperty(oldWork, 'a1', {
-          get: function() { changed[1].v1 = newWork; return 1; }, configurable: true
-        });
-        changed[0].schedule();
-        check(changed[4].a1 === 81 && newWork.a1 === 2, 'captured count');
-        check(changed[6].link === changed[4], 'changed work append');
-
-        var hole = oneDelivery(1, 11);
-        delete hole[5].a2[1];
-        Array.prototype[1] = 73;
-        hole[0].schedule();
-        delete Array.prototype[1];
-        check(hole[4].a1 === 73, 'inherited payload hole');
-
-        var element = oneDelivery(1, 12), elementGets = 0;
-        Object.defineProperty(element[5].a2, '1', {
-          get: function() { elementGets++; return 74; }, configurable: true
-        });
-        element[0].schedule();
-        check(elementGets === 1 && element[4].a1 === 74, 'payload getter');
-
-        var payloadObject = { marker: 75 };
-        var objectPayload = oneDelivery(1, payloadObject);
-        objectPayload[0].schedule();
-        check(objectPayload[4].a1 === payloadObject, 'object payload ownership');
-
-        var originalAdd = Packet.prototype.addTo, addHits = 0;
-        Packet.prototype.addTo = function(queue) {
-          addHits++;
-          return originalAdd.call(this, queue);
-        };
-        var addCase = oneDelivery(1, 76);
-        addCase[0].schedule();
-        Packet.prototype.addTo = originalAdd;
-        check(addHits === 1 && addCase[6].link === addCase[4], 'addTo replacement');
-
-        var linkCase = oneDelivery(1, 77), storedLink = null;
-        var linkGets = 0, linkSets = 0;
-        Object.defineProperty(linkCase[4], 'link', {
-          get: function() { linkGets++; return storedLink; },
-          set: function(value) { linkSets++; storedLink = value; }, configurable: true
-        });
-        linkCase[0].schedule();
-        check(linkGets > 0 && linkSets > 0 && storedLink === null, 'packet link accessor');
-        check(linkCase[6].link === linkCase[4], 'packet link accessor append');
-
-        var twoNode = oneDelivery(1, 78);
-        var tail = new Packet(null, ID_WORKER, KIND_DEVICE);
-        twoNode[6].link = tail;
-        twoNode[0].schedule();
-        check(twoNode[6].link === tail && tail.link === twoNode[4], 'two-node replay');
-
-        var undefinedLink = oneDelivery(1, 79);
-        undefinedLink[6].link = undefined;
-        undefinedLink[0].schedule();
-        check(undefinedLink[6].link === undefinedLink[4], 'undefined queued link');
-        var ddaLink = oneDelivery(1, 80);
-        ddaLink[6].link = $262.IsHTMLDDA;
-        ddaLink[0].schedule();
-        check(ddaLink[6].link === ddaLink[4], 'HTMLDDA queued link');
-
-        // Missing target returns before Scheduler.queue's own writes, but Handler's three writes
-        // have already happened and must be replayed exactly once.
-        var missing = oneDelivery(1, 82);
-        var missingSuccessor = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        missing[4].link = missingSuccessor;
-        missing[0].blocks[ID_WORKER] = null;
-        missing[0].schedule();
-        check(missing[1].v2 === missingSuccessor, 'missing source transfer');
-        check(missing[4].a1 === 82 && missing[5].a1 === 2, 'missing Handler writes');
-        check(missing[0].queueCount === 0, 'missing queue count');
-        check(missing[4].link === missingSuccessor && missing[4].id === ID_WORKER,
-              'missing packet untouched');
-
-        // An id setter throws after queueCount and packet.link, but before target mutation.
-        var idThrow = oneDelivery(1, 83), idValue = ID_WORKER, idSets = 0;
-        Object.defineProperty(idThrow[4], 'id', {
-          get: function() { return idValue; },
-          set: function(value) { idSets++; throw 'id boom'; }, configurable: true
-        });
-        var idError = '';
-        try { idThrow[0].schedule(); } catch (e) { idError = e; }
-        check(idError === 'id boom' && idSets === 1, 'id throw once');
-        check(idThrow[1].v2 === null && idThrow[4].a1 === 83 && idThrow[5].a1 === 2,
-              'id throw Handler effects');
-        check(idThrow[0].queueCount === 1 && idThrow[4].link === null,
-              'id throw queue prefix');
-        check(idThrow[6].link === null, 'id throw target untouched');
-
-        // The tail setter throws after every queue prefix write and before target.queue's no-op.
-        var tailThrow = oneDelivery(1, 84), tailValue = null, tailSets = 0;
-        Object.defineProperty(tailThrow[6], 'link', {
-          get: function() { return tailValue; },
-          set: function(value) { tailSets++; throw 'tail boom'; }, configurable: true
-        });
-        var tailError = '';
-        try { tailThrow[0].schedule(); } catch (e) { tailError = e; }
-        check(tailError === 'tail boom' && tailSets === 1, 'tail throw once');
-        check(tailThrow[1].v2 === null && tailThrow[4].a1 === 84 && tailThrow[5].a1 === 2,
-              'tail throw Handler effects');
-        check(tailThrow[0].queueCount === 1 && tailThrow[4].link === null,
-              'tail throw queue prefix');
-        check(tailThrow[4].id === ID_HANDLER_A && tailThrow[3].queue === tailThrow[6],
-              'tail throw target state');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_handler_v2_empty_preempt_preserves_effects_and_owners() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler v2 empty: ' + message;
-        }
-        function emptyDelivery(targetState, targetPriority, currentPriority, payload) {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 1;
-          work.a2[1] = payload;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var observed = { calls: 0, packet: null };
-          var target = new TaskControlBlock(null, ID_WORKER, targetPriority, null, {
-            run: function(value) {
-              observed.calls++;
-              observed.packet = value;
-              return null;
-            }
-          });
-          target.state = targetState;
-          var current = new TaskControlBlock(null, ID_HANDLER_A, currentPriority, null, handler);
-          current.state = STATE_RUNNING;
-          handler.v1 = work;
-          handler.v2 = packet;
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = null;
-          scheduler.list = current;
-          return [scheduler, handler, current, target, packet, work, observed];
-        }
-
-        // A held higher-priority target exposes the transaction after preemption without
-        // consuming the packet on the following scheduler iteration.
-        var held = emptyDelivery(STATE_SUSPENDED | STATE_HELD, 3, 2, 91);
-        var successor = new Packet(null, ID_DEVICE_A, KIND_DEVICE);
-        successor.a2[0] = 92;
-        held[4].link = successor;
-        held[0].schedule();
-        check(held[0].queueCount === 1, 'held queue count');
-        check(held[1].v2 === successor && held[4].link === null, 'held owner moves');
-        check(held[4].a1 === 91 && held[5].a1 === 2, 'held numeric writes');
-        check(held[4].id === ID_HANDLER_A, 'held packet id');
-        check(held[3].queue === held[4] && held[3].state === 7, 'held target publish');
-        check(held[6].calls === 0 && held[0].currentTcb === null, 'held preemption');
-
-        // The source successor may be the old current TCB. Its link owner moves to Handler.v2
-        // before Scheduler.current releases its separate owner.
-        var currentLink = emptyDelivery(STATE_SUSPENDED | STATE_HELD, 4, 2, 93);
-        currentLink[4].link = currentLink[2];
-        currentLink[0].schedule();
-        check(currentLink[1].v2 === currentLink[2], 'L=C survives current release');
-        check(currentLink[1].v2.priority === 2 && currentLink[4].link === null,
-              'L=C remains live');
-        check(currentLink[3].queue === currentLink[4], 'L=C packet move');
-
-        // A suspended target immediately consumes the newly queued packet after preemption.
-        var consume = emptyDelivery(STATE_SUSPENDED, 3, 2, 94);
-        consume[0].schedule();
-        check(consume[6].calls === 1 && consume[6].packet === consume[4],
-              'suspended target consumes identity');
-        check(consume[3].queue === null && consume[3].state === STATE_RUNNING,
-              'suspended target state');
-        check(consume[1].v2 === null && consume[4].a1 === 94, 'consume source writes');
-
-        // The runnable bit is read from the live global, not baked into generated code.
-        var oldRunnable = STATE_RUNNABLE;
-        STATE_RUNNABLE = 8;
-        var liveFlag = emptyDelivery(STATE_HELD, 5, 2, 95);
-        liveFlag[0].schedule();
-        STATE_RUNNABLE = oldRunnable;
-        check(liveFlag[3].queue === liveFlag[4] && liveFlag[3].state === 12,
-              'live runnable flag');
-
-        // Non-preemption deliberately replays, but all ordinary effects must still occur once.
-        var noPreempt = emptyDelivery(STATE_SUSPENDED | STATE_HELD, 1, 2, 96);
-        noPreempt[0].schedule();
-        check(noPreempt[0].queueCount === 1 && noPreempt[3].queue === noPreempt[4],
-              'nonpreempt queue');
-        check(noPreempt[3].state === 7 && noPreempt[4].a1 === 96,
-              'nonpreempt state and payload');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
-}
-
-#[test]
-fn jit_scheduler_handler_v2_empty_preempt_replays_observable_guards_once() {
-    let src = [
-        include_str!("../../../v8-v7/base.js"),
-        include_str!("../../../v8-v7/richards.js"),
-        r#"
-        for (var i = 0; i < 110; i++) runRichards();
-        function check(value, message) {
-          if (!value) throw 'handler v2 empty guards: ' + message;
-        }
-        function emptyDelivery() {
-          var scheduler = new Scheduler();
-          var handler = new HandlerTask(scheduler);
-          var work = new Packet(null, ID_HANDLER_A, KIND_WORK);
-          work.a1 = 1;
-          work.a2[1] = 77;
-          var packet = new Packet(null, ID_WORKER, KIND_DEVICE);
-          var target = new TaskControlBlock(null, ID_WORKER, 3, null, {
-            run: function() { return null; }
-          });
-          target.state = STATE_SUSPENDED | STATE_HELD;
-          var current = new TaskControlBlock(null, ID_HANDLER_A, 2, null, handler);
-          current.state = STATE_RUNNING;
-          handler.v1 = work;
-          handler.v2 = packet;
-          scheduler.blocks[ID_WORKER] = target;
-          scheduler.blocks[ID_HANDLER_A] = null;
-          scheduler.list = current;
-          return [scheduler, handler, current, target, packet, work];
-        }
-
-        var originalMark = TaskControlBlock.prototype.markAsRunnable, markCalls = 0;
-        TaskControlBlock.prototype.markAsRunnable = function() {
-          markCalls++;
-          return originalMark.call(this);
-        };
-        var markCase = emptyDelivery();
-        markCase[0].schedule();
-        TaskControlBlock.prototype.markAsRunnable = originalMark;
-        check(markCalls === 1 && markCase[3].queue === markCase[4],
-              'mark replacement once');
-        check(markCase[3].state === 7, 'mark replacement state');
-
-        var stateCase = emptyDelivery(), stateValue = stateCase[3].state;
-        var stateGets = 0, stateSets = 0;
-        Object.defineProperty(stateCase[3], 'state', {
-          get: function() { stateGets++; return stateValue; },
-          set: function(value) { stateSets++; stateValue = value; }, configurable: true
-        });
-        stateCase[0].schedule();
-        check(stateGets > 0 && stateSets === 1 && stateValue === 7,
-              'state accessor effects');
-        check(stateCase[3].queue === stateCase[4], 'state accessor packet');
-
-        var targetPriority = emptyDelivery(), targetPriorityGets = 0;
-        Object.defineProperty(targetPriority[3], 'priority', {
-          get: function() { targetPriorityGets++; return 3; }, configurable: true
-        });
-        targetPriority[0].schedule();
-        check(targetPriorityGets === 1 && targetPriority[3].queue === targetPriority[4],
-              'target priority getter once');
-
-        // The throwing priority read happens after Handler, queue-prefix, target.queue, and
-        // markAsRunnable effects in ordinary source order, but before Scheduler.current changes.
-        var throwing = emptyDelivery(), currentPriorityGets = 0;
-        Object.defineProperty(throwing[2], 'priority', {
-          get: function() { currentPriorityGets++; throw 'priority boom'; }, configurable: true
-        });
-        var error = '';
-        try { throwing[0].schedule(); } catch (e) { error = e; }
-        check(error === 'priority boom' && currentPriorityGets === 1, 'priority throw once');
-        check(throwing[1].v2 === null && throwing[4].a1 === 77 && throwing[5].a1 === 2,
-              'priority throw Handler effects');
-        check(throwing[0].queueCount === 1 && throwing[4].link === null &&
-              throwing[4].id === ID_HANDLER_A, 'priority throw queue prefix');
-        check(throwing[3].queue === throwing[4] && throwing[3].state === 7,
-              'priority throw target effects');
-        check(throwing[0].currentTcb === throwing[2], 'priority throw current untouched');
-        'ok'
-        "#,
-    ]
-    .join("\n");
-    assert_eq!(run_jit(&src), "ok");
 }
 
 #[test]
@@ -8073,6 +3573,37 @@ fn species_getters() {
 #[test]
 fn array_from_fixes() {
     assert_eq!(run("Array.from([1,2,3]).join(',')"), "1,2,3");
+    assert_eq!(
+        run(
+            "var a=[];a.length=2048;var token={};var same=a.fill(token);[same===a,a[0]===token,a[2047]===token,Object.keys(a).length].join(',')"
+        ),
+        "true,true,true,2048"
+    );
+    // Indexed prototype setters and patched iterators are observable and must bypass dense paths.
+    assert_eq!(
+        run(
+            "var seen=0;Object.defineProperty(Array.prototype,'1',{set(v){seen=v},configurable:true});var a=[];a.length=3;a.fill(7);delete Array.prototype[1];[seen,a.hasOwnProperty(1),a[0],a[2]].join(',')"
+        ),
+        "7,false,7,7"
+    );
+    assert_eq!(
+        run(
+            "var a=[1,2,3];a[Symbol.iterator]=function*(){yield 9;yield 8};Array.from(a).join(',')"
+        ),
+        "9,8"
+    );
+    assert_eq!(
+        run(
+            "var values=[1,2,3];Object.getPrototypeOf([].values()).next=function(){var done=!values.length;return {value:values.pop(),done}};Array.from([0]).join(',')"
+        ),
+        "3,2,1"
+    );
+    assert_eq!(
+        run(
+            "var other=$262.createRealm().global;var a=other.Array.from([1,2]);var b=Array.from.call(other.Array,[3,4]);String(a instanceof other.Array&&b instanceof other.Array)"
+        ),
+        "true"
+    );
     assert_eq!(run("Array.from('abc').join(',')"), "a,b,c");
     assert_eq!(run("Array.from([1,2],x=>x*2).join(',')"), "2,4");
     assert_eq!(
@@ -8203,17 +3734,37 @@ fn define_property_semantics() {
     assert_eq!(throws("Object.defineProperty({},'x',{get:5})"), "TypeError");
     assert_eq!(throws("Object.defineProperty({},'x',5)"), "TypeError");
     // partial redefine keeps other fields
-    assert_eq!(run("var o={}; Object.defineProperty(o,'x',{value:1,writable:true,enumerable:true,configurable:true}); Object.defineProperty(o,'x',{enumerable:false}); var d=Object.getOwnPropertyDescriptor(o,'x'); d.value+','+d.writable+','+d.enumerable"), "1,true,false");
+    assert_eq!(
+        run(
+            "var o={}; Object.defineProperty(o,'x',{value:1,writable:true,enumerable:true,configurable:true}); Object.defineProperty(o,'x',{enumerable:false}); var d=Object.getOwnPropertyDescriptor(o,'x'); d.value+','+d.writable+','+d.enumerable"
+        ),
+        "1,true,false"
+    );
     // non-configurable can't be redefined incompatibly
-    assert_eq!(throws("var o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); Object.defineProperty(o,'x',{value:2})"), "TypeError");
-    assert_eq!(throws("var o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); Object.defineProperty(o,'x',{configurable:true})"), "TypeError");
+    assert_eq!(
+        throws(
+            "var o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); Object.defineProperty(o,'x',{value:2})"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        throws(
+            "var o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); Object.defineProperty(o,'x',{configurable:true})"
+        ),
+        "TypeError"
+    );
     // non-extensible
     assert_eq!(
         throws("var o=Object.preventExtensions({}); Object.defineProperty(o,'x',{value:1})"),
         "TypeError"
     );
     // Reflect returns false (no throw) on invariant failure
-    assert_eq!(run("var o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); Reflect.defineProperty(o,'x',{value:2})"), "false");
+    assert_eq!(
+        run(
+            "var o={}; Object.defineProperty(o,'x',{value:1,configurable:false}); Reflect.defineProperty(o,'x',{value:2})"
+        ),
+        "false"
+    );
     // normal cases work
     assert_eq!(
         run("var o={}; Object.defineProperty(o,'x',{value:42}); o.x"),
@@ -8223,7 +3774,12 @@ fn define_property_semantics() {
         run("var o={}; Object.defineProperty(o,'x',{get(){return 7}}); o.x"),
         "7"
     );
-    assert_eq!(run("var o={}; Object.defineProperty(o,'x',{value:1,configurable:true}); Object.defineProperty(o,'x',{value:2}); o.x"), "2");
+    assert_eq!(
+        run(
+            "var o={}; Object.defineProperty(o,'x',{value:1,configurable:true}); Object.defineProperty(o,'x',{value:2}); o.x"
+        ),
+        "2"
+    );
 }
 #[test]
 fn coll_brand_checks() {
@@ -8282,7 +3838,12 @@ fn typed_array_intrinsic() {
         run("var TA=Object.getPrototypeOf(Int8Array); typeof TA.prototype.at"),
         "function"
     );
-    assert_eq!(run("var TA=Object.getPrototypeOf(Int8Array); TA.prototype===Object.getPrototypeOf(Int8Array.prototype)"), "true");
+    assert_eq!(
+        run(
+            "var TA=Object.getPrototypeOf(Int8Array); TA.prototype===Object.getPrototypeOf(Int8Array.prototype)"
+        ),
+        "true"
+    );
     assert_eq!(
         run("Object.getPrototypeOf(Int8Array)===Object.getPrototypeOf(Float64Array)"),
         "true"
@@ -8334,8 +3895,18 @@ fn ta_returns_ta() {
 #[test]
 fn iterator_close_destructure() {
     // Lazy: only pulls 2, closes the rest (would be infinite otherwise).
-    assert_eq!(run("var n=0; var iter={[Symbol.iterator](){return {next(){return {value:n++,done:false}},return(){this.closed=true;return {}}}}}; var [a,b]=iter; a+','+b"), "0,1");
-    assert_eq!(run("var closed=false; var iter={[Symbol.iterator](){return {next(){return {value:1,done:false}},return(){closed=true;return {}}}}}; var [a]=iter; closed"), "true");
+    assert_eq!(
+        run(
+            "var n=0; var iter={[Symbol.iterator](){return {next(){return {value:n++,done:false}},return(){this.closed=true;return {}}}}}; var [a,b]=iter; a+','+b"
+        ),
+        "0,1"
+    );
+    assert_eq!(
+        run(
+            "var closed=false; var iter={[Symbol.iterator](){return {next(){return {value:1,done:false}},return(){closed=true;return {}}}}}; var [a]=iter; closed"
+        ),
+        "true"
+    );
     // rest consumes all (finite)
     assert_eq!(run("var [a,...r]=[1,2,3,4]; a+'/'+r.join(',')"), "1/2,3,4");
     assert_eq!(run("var [a,b,c]=[1,2]; a+','+b+','+c"), "1,2,undefined");
@@ -8346,20 +3917,35 @@ fn iterator_close_destructure() {
 #[test]
 fn forof_lazy_close() {
     // break closes the iterator (infinite otherwise)
-    assert_eq!(run("var closed=false; var it={[Symbol.iterator](){return {next(){return {value:1,done:false}},return(){closed=true;return {}}}}}; for(var x of it){break;} closed"), "true");
+    assert_eq!(
+        run(
+            "var closed=false; var it={[Symbol.iterator](){return {next(){return {value:1,done:false}},return(){closed=true;return {}}}}}; for(var x of it){break;} closed"
+        ),
+        "true"
+    );
     assert_eq!(run("var s=0; for(var x of [1,2,3]){s+=x} s"), "6");
     assert_eq!(
         run("var s=0; for(var x of [1,2,3,4,5]){ if(x>3)break; s+=x } s"),
         "6"
     );
-    assert_eq!(run("var n=0; var it={[Symbol.iterator](){return {next(){return {value:n++,done:n>1000000000}}}}}; var c=0; for(var x of it){c++; if(c>=3)break;} c"), "3");
+    assert_eq!(
+        run(
+            "var n=0; var it={[Symbol.iterator](){return {next(){return {value:n++,done:n>1000000000}}}}}; var c=0; for(var x of it){c++; if(c>=3)break;} c"
+        ),
+        "3"
+    );
     assert_eq!(run("var r=''; for(var k of 'abc'){r+=k} r"), "abc");
 }
 #[test]
 fn assign_destructure_close() {
     assert_eq!(run("var a,b; [a,b]=[1,2]; a+','+b"), "1,2");
     assert_eq!(run("var a,r; [a,...r]=[1,2,3]; a+'/'+r.join(',')"), "1/2,3");
-    assert_eq!(run("var closed=false,a; var it={[Symbol.iterator](){return {next(){return {value:1,done:false}},return(){closed=true;return {}}}}}; [a]=it; closed"), "true");
+    assert_eq!(
+        run(
+            "var closed=false,a; var it={[Symbol.iterator](){return {next(){return {value:1,done:false}},return(){closed=true;return {}}}}}; [a]=it; closed"
+        ),
+        "true"
+    );
     assert_eq!(run("var a,b; [a,,b]=[1,2,3]; a+','+b"), "1,3");
     assert_eq!(run("var x; [x=5]=[]; x"), "5");
 }
@@ -8426,7 +4012,12 @@ fn temporal_round_string() {
 }
 #[test]
 fn reflect_construct_newtarget() {
-    assert_eq!(run("function isC(f){try{Reflect.construct(function(){},[],f);return true}catch(e){return false}} isC(function(){})+','+isC(Math.max)+','+isC(Array)+','+isC(()=>{})"), "true,false,true,false");
+    assert_eq!(
+        run(
+            "function isC(f){try{Reflect.construct(function(){},[],f);return true}catch(e){return false}} isC(function(){})+','+isC(Math.max)+','+isC(Array)+','+isC(()=>{})"
+        ),
+        "true,false,true,false"
+    );
     assert_eq!(run("Reflect.construct(Array,[1,2,3]).length"), "3");
     assert_eq!(throws("Reflect.construct(Math.max,[])"), "TypeError");
     assert_eq!(
@@ -8456,12 +4047,22 @@ fn abstract_subclass() {
     var_check();
 }
 fn var_check() {
-    assert_eq!(run("var TA=Object.getPrototypeOf(Int8Array); class T extends Int8Array {}; new T(3).length"), "3");
+    assert_eq!(
+        run(
+            "var TA=Object.getPrototypeOf(Int8Array); class T extends Int8Array {}; new T(3).length"
+        ),
+        "3"
+    );
 }
 #[test]
 fn disposable_stack() {
     assert_eq!(run("typeof DisposableStack"), "function");
-    assert_eq!(run("var log=''; var s=new DisposableStack(); s.use({[Symbol.dispose](){log+='a'}}); s.use({[Symbol.dispose](){log+='b'}}); s.dispose(); log"), "ba");
+    assert_eq!(
+        run(
+            "var log=''; var s=new DisposableStack(); s.use({[Symbol.dispose](){log+='a'}}); s.use({[Symbol.dispose](){log+='b'}}); s.dispose(); log"
+        ),
+        "ba"
+    );
     assert_eq!(run("var s=new DisposableStack(); s.disposed"), "false");
     assert_eq!(
         run("var s=new DisposableStack(); s.dispose(); s.disposed"),
@@ -8475,7 +4076,12 @@ fn disposable_stack() {
         run("var log=''; var s=new DisposableStack(); s.adopt(5,v=>log+=v); s.dispose(); log"),
         "5"
     );
-    assert_eq!(run("var s=new DisposableStack(); s.use({[Symbol.dispose](){}}); var s2=s.move(); s.disposed+','+s2.disposed"), "true,false");
+    assert_eq!(
+        run(
+            "var s=new DisposableStack(); s.use({[Symbol.dispose](){}}); var s2=s.move(); s.disposed+','+s2.disposed"
+        ),
+        "true,false"
+    );
     assert_eq!(run("typeof Symbol.dispose"), "symbol");
 }
 #[test]
@@ -8817,6 +4423,37 @@ fn compiled_regexp_literal_is_fresh() {
 }
 
 #[test]
+fn reconstructible_string_and_regexp_caches_account_retained_bytes() {
+    let mut engine = Engine::new();
+    let source = "é".repeat(128);
+    let source = crate::lstr::LStr::from(source.as_str());
+    let units = engine.interp.units_full(&source);
+    assert_eq!(units.len(), 128);
+    let (unit_entries, unit_bytes) = engine.interp.str_units.stats();
+    assert_eq!(unit_entries, 1);
+    assert!(unit_bytes >= source.len() + units.len() * 2);
+
+    let text = engine.interp.re_text(true, &source);
+    assert!(text.heap_bytes() > 0);
+    let (text_entries, text_bytes) = engine.interp.re_texts.stats();
+    assert_eq!(text_entries, 1);
+    assert!(text_bytes >= source.len() + text.heap_bytes());
+
+    let first = engine
+        .interp
+        .compiled_regexp("a+", "gi")
+        .unwrap_or_else(|_| panic!("first regexp compilation failed"));
+    let second = engine
+        .interp
+        .compiled_regexp("a+", "gi")
+        .unwrap_or_else(|_| panic!("cached regexp lookup failed"));
+    assert!(std::rc::Rc::ptr_eq(&first, &second));
+    let (program_entries, program_bytes) = engine.interp.regexp_programs.stats();
+    assert_eq!(program_entries, 1);
+    assert!(program_bytes >= first.heap_bytes());
+}
+
+#[test]
 fn bytecode_compiles_labelled_loops() {
     // Labelled loops used to bail out of the compiler (falling back to the interpreter). They now
     // compile to the fast tier: assert `compile` actually produces a chunk rather than `None`.
@@ -8842,8 +4479,8 @@ fn bytecode_compiles_labelled_loops() {
     assert!(compiles(
         "function f(){ outer: for(var i=0;i<2;i++){ for(var j=0;j<2;j++){ continue outer; } } }"
     ));
-    // A label on a non-loop statement stays outside the compiled subset (bails to the interpreter).
-    assert!(!compiles("function f(){ a: { break a; } }"));
+    // LabelledEvaluation also permits a matching break from any labelled statement.
+    assert!(compiles("function f(){ a: { break a; } }"));
 }
 
 #[test]
@@ -8863,6 +4500,7 @@ fn bytecode_labelled_loops_match_interp() {
         "function f(){ var i=0; a: while(i<3){ i++; continue a; } return i; } f()",
         "function f(){ var i=0; a: do { i++; continue a; } while(i<3); return i; } f()",
         "function f(){ var n=0; a: while(n<5){ n++; if(n===3) break a; } return n; } f()",
+        "function f(){ var n=0; a: { n=1; break a; n=9; } return n; } f()",
         "function f(){ var r=0; a: b: for(var i=0;i<4;i++){ if(i===2) continue a; r+=i; } return r; } f()",
         "function f(){ var s=0; outer: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j===1) continue outer; s+=10*i+j; } } return s; } f()",
         "function f(){ var s=''; a: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j===1) break a; s+=i+''+j; } } return s; } f()",
@@ -8943,7 +4581,12 @@ fn array_species() {
         run("class A extends Array {}; new A(1,2,3).filter(()=>true) instanceof A"),
         "true"
     );
-    assert_eq!(run("var a=[1,2]; a.constructor={[Symbol.species]:function(n){this.tag='X';return new Array(n)}}; var r=a.map(x=>x); typeof r"), "object");
+    assert_eq!(
+        run(
+            "var a=[1,2]; a.constructor={[Symbol.species]:function(n){this.tag='X';return new Array(n)}}; var r=a.map(x=>x); typeof r"
+        ),
+        "object"
+    );
     assert_eq!(throws("[1,2,3].map(5)"), "TypeError");
     assert_eq!(run("[1,2,3].map(x=>x).constructor.name"), "Array");
 }
@@ -9048,6 +4691,1993 @@ fn for_of_member_target() {
     assert_eq!(run("var o={}; [o.p]=[7]; o.p"), "7");
 }
 #[test]
+fn for_of_member_put_error_closes_iterator() {
+    // ECMA-262 ForIn/OfBodyEvaluation: evaluating the lhs Reference and PutValue are part of
+    // the loop-body status, so either abrupt completion performs IteratorClose before escaping.
+    assert_eq!(
+        run("var closes=0, bodies=0;\
+             var iterable={[Symbol.iterator](){return {\
+               next(){return {done:false,value:1}},\
+               return(){closes++; return {done:true}}\
+             }}};\
+             var o={set p(v){throw Error('put')}};\
+             try { for (o.p of iterable) bodies++; } catch (e) {}\
+             [closes,bodies].join(',')"),
+        "1,0"
+    );
+}
+#[test]
+fn destructuring_assignment_loop_heads_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var target={};\
+             function* assign(){\
+               let x,y,rest,a,b,other;\
+               for ([x,target.y=2,...rest] of [[1,undefined,3,4]])\
+                 yield x+','+target.y+','+rest.join(':');\
+               for ({a,['b']:b=5,...other} of [{a:6,b:undefined,c:7}])\
+                 yield a+','+b+','+other.c;\
+             }\
+             globalThis.assignmentPatternIterator=assign()",
+            false,
+        )
+        .expect("destructuring-assignment loop-head setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=assignmentPatternIterator.next(),b=assignmentPatternIterator.next(),c=assignmentPatternIterator.next();`${a.value}|${b.value}|${c.done}`",
+            false,
+        )
+        .expect("destructuring-assignment loop-head result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "1,2,3:4|6,5,7|true"),
+        Completion::Throw { name, message } => {
+            panic!("destructuring-assignment loop head threw {name}: {message}")
+        }
+    }
+
+    // AssignmentElement evaluates a non-pattern target Reference before stepping the nested
+    // destructuring iterator. A target failure closes that inner iterator and then the outer
+    // for-of iterator, preserving inside-out IteratorClose order.
+    assert_eq!(
+        run("var log=[];\
+             var target={set x(v){log.push('set');throw Error('put')}};\
+             function iterable(name,value){return{[Symbol.iterator](){return{\
+               next(){log.push(name+'-next');return{value,done:false}},\
+               return(){log.push(name+'-close');return{done:true}}\
+             }}}}\
+             function base(){log.push('base');return target}\
+             function* assign(){try{for([base().x] of iterable('outer',iterable('inner',1)))yield 0}catch(e){yield log.join(',')}}\
+             assign().next().value"),
+        "outer-next,base,inner-next,set,inner-close,outer-close"
+    );
+    assert_eq!(
+        run(
+            "function* partial(){let first=0;const frozen=0;try{for([first,frozen] of [[1,2]]);}catch(e){yield first+','+frozen+','+e.name}}partial().next().value"
+        ),
+        "1,0,TypeError"
+    );
+
+    let mut suspending = Engine::new();
+    suspending
+        .eval(
+            "var target={},out={};
+             function* assign(){let value,rest,other;
+               for([target[yield 'array-key'],value=yield 'array-default',...rest]
+                   of [[33,undefined,44,55]])
+                 yield target.ak+','+value+','+rest.join(':');
+               for({[yield 'source-key']:target[yield 'target-key']=yield 'object-default',...other}
+                   of [{p:undefined,q:7}])
+                 yield target.ok+','+other.q;
+             }
+             globalThis.suspendingAssignment=assign();",
+            false,
+        )
+        .expect("suspending assignment-pattern setup parses");
+    assert!(suspending
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match suspending
+        .eval(
+            "var i=suspendingAssignment;
+             var a=i.next(),b=i.next('ak'),c=i.next(9),d=i.next(),e=i.next('p'),
+                 f=i.next('ok'),g=i.next(12),h=i.next();
+             [a.value,b.value,c.value,d.value,e.value,f.value,g.value,h.done].join('|')",
+            false,
+        )
+        .expect("suspending assignment-pattern drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "array-key|array-default|33,9,44:55|source-key|target-key|object-default|12,7|true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("suspending assignment-pattern drive threw {name}: {message}")
+        }
+    }
+
+    // A member Reference is created before IteratorStep, and an externally injected completion
+    // while its computed key/default is suspended closes the nested assignment iterator before
+    // the enclosing for-of iterator.
+    assert_eq!(
+        run("var log=[],target={};
+             var inner={[Symbol.iterator](){return{
+               next(){log.push('inner-next');return{value:undefined,done:false}},
+               return(){log.push('inner-close');return{done:true}}
+             }}};
+             var outer={[Symbol.iterator](){var sent=false;return{
+               next(){if(sent)return{done:true};sent=true;return{value:inner,done:false}},
+               return(){log.push('outer-close');return{done:true}}
+             }}};
+             function base(){log.push('base');return target}
+             function* assign(){for([base()[yield 'key']=yield 'default'] of outer);}
+             var iterator=assign(),first=iterator.next(),last=iterator.return(9);
+             first.value+'|'+last.value+':'+last.done+'|'+log.join(',')"),
+        "key|9:true|base,inner-close,outer-close"
+    );
+
+    let mut awaiting = Engine::new();
+    awaiting
+        .eval(
+            "var out='pending',target={};
+             async function assign(){let value;
+               for([target[await Promise.resolve('key')],value=await Promise.resolve(6)]
+                   of [[4,undefined]]){}
+               for await({x:target[await Promise.resolve('other')]=await Promise.resolve(8)}
+                   of [{x:undefined}]){}
+               return target.key+','+value+','+target.other;
+             }
+             assign().then(value=>out=value);",
+            false,
+        )
+        .expect("awaiting assignment-pattern setup parses");
+    assert!(awaiting
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match awaiting
+        .eval("out", false)
+        .expect("awaiting assignment result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "4,6,8"),
+        Completion::Throw { name, message } => {
+            panic!("awaiting assignment-pattern result threw {name}: {message}")
+        }
+    }
+
+    let mut bindings = Engine::new();
+    bindings
+        .eval(
+            "function* bind(){
+               for(let [value=yield 'array-default',...rest] of [[undefined,2,3]])
+                 yield value+','+rest.join(':');
+               for(const {[yield 'source-key']:value=yield 'object-default',...other}
+                   of [{p:undefined,q:4}])
+                 yield value+','+other.q;
+             }
+             globalThis.bindingPatternIterator=bind();",
+            false,
+        )
+        .expect("suspending binding-pattern setup parses");
+    assert!(bindings
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match bindings
+        .eval(
+            "var i=bindingPatternIterator,a=i.next(),b=i.next(1),c=i.next(),d=i.next('p'),
+                 e=i.next(5),f=i.next();
+             [a.value,b.value,c.value,d.value,e.value,f.done].join('|')",
+            false,
+        )
+        .expect("suspending binding-pattern drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(
+                value,
+                "array-default|1,2:3|source-key|object-default|5,4|true"
+            )
+        }
+        Completion::Throw { name, message } => {
+            panic!("suspending binding-pattern drive threw {name}: {message}")
+        }
+    }
+
+    let mut async_bindings = Engine::new();
+    async_bindings
+        .eval(
+            "var out='pending';
+             async function bind(){let log=[];
+               for(let [value=await Promise.resolve(6),...rest] of [[undefined,7,8]])
+                 log.push(value+','+rest.join(':'));
+               for await(const {[await Promise.resolve('p')]:value=await Promise.resolve(9),...other}
+                   of [{p:undefined,q:10}])
+                 log.push(value+','+other.q);
+               return log.join('|');
+             }
+             bind().then(value=>out=value);",
+            false,
+        )
+        .expect("awaiting binding-pattern setup parses");
+    assert!(async_bindings
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match async_bindings
+        .eval("out", false)
+        .expect("awaiting binding-pattern result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "6,7:8|9,10"),
+        Completion::Throw { name, message } => {
+            panic!("awaiting binding-pattern result threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn literal_forms_use_vm_continuations_and_preserve_evaluation_order() {
+    let mut generator = Engine::new();
+    generator
+        .eval(
+            "function* literals(){
+               let setterCalls=0;
+               Object.defineProperty(Array.prototype,'0',{
+                 set(value){setterCalls++},configurable:true
+               });
+               const array=[yield 'array-item',,...(yield 'array-spread'),yield 'array-last'];
+               delete Array.prototype[0];
+               const proto={x:11},symbol=Symbol('spread'),source={s:6};
+               source[symbol]=7;
+               globalThis.literalProto=proto;
+               globalThis.literalSource=source;
+               const object={
+                 [yield 'data-key']:yield 'data-value',
+                 ...(yield 'object-spread'),
+                 __proto__:yield 'prototype',
+                 [yield 'method-key'](){return super.x},
+                 get [yield 'getter-key'](){return this._seen||0},
+                 set [yield 'setter-key'](value){this._seen=value},
+                 named:function(){}
+               };
+               object.a=12;
+               const descriptor=Object.getOwnPropertyDescriptor(object,'a');
+               yield [setterCalls,array.length,1 in array,array.join(':'),
+                 object.k,object.s,object[symbol],Object.getPrototypeOf(object)===proto,
+                 object.m(),object.a,descriptor.get.name,descriptor.set.name,
+                 object.named.name].join('|');
+             }
+             globalThis.literalIterator=literals();",
+            false,
+        )
+        .expect("suspending literal setup parses");
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match generator
+        .eval(
+            "var i=literalIterator,
+                 a=i.next(),b=i.next(1),c=i.next([2,3]),d=i.next(4),
+                 e=i.next('k'),f=i.next(5),g=i.next(literalSource),
+                 h=i.next(literalProto),j=i.next('m'),k=i.next('a'),
+                 l=i.next('a'),m=i.next();
+             [a.value,b.value,c.value,d.value,e.value,f.value,g.value,h.value,
+              j.value,k.value,l.value,m.done].join('~')",
+            false,
+        )
+        .expect("suspending literal drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "array-item~array-spread~array-last~data-key~data-value~object-spread~prototype~method-key~getter-key~setter-key~0|5|false|1::2:3:4|5|6|7|true|11|12|get a|set a|named~true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("suspending literal drive threw {name}: {message}")
+        }
+    }
+
+    let mut awaiting = Engine::new();
+    awaiting
+        .eval(
+            "var out='pending';
+             async function literals(){
+               const array=[await Promise.resolve(1),,...(await Promise.resolve([2,3]))];
+               const proto={x:4};
+               const object={
+                 [await Promise.resolve('k')]:await Promise.resolve(5),
+                 ...(await Promise.resolve({s:6})),
+                 __proto__:await Promise.resolve(proto),
+                 [await Promise.resolve('m')](){return super.x}
+               };
+               return [array.length,1 in array,array.join(':'),object.k,object.s,
+                 Object.getPrototypeOf(object)===proto,object.m()].join('|');
+             }
+             literals().then(value=>out=value);",
+            false,
+        )
+        .expect("awaiting literal setup parses");
+    assert!(awaiting
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match awaiting
+        .eval("out", false)
+        .expect("awaiting literal result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "4|false|1::2:3|5|6|true|4"),
+        Completion::Throw { name, message } => {
+            panic!("awaiting literal result threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn tagged_import_meta_and_private_forms_use_vm_continuations() {
+    let mut generators = Engine::new();
+    generators
+        .eval(
+            "var tagger={prefix:'P',tag(strings,a,b){
+               return this.prefix+'|'+strings[0]+a+strings[1]+b+strings[2]+'|'+
+                 Object.isFrozen(strings)+'|'+Object.isFrozen(strings.raw)
+             }};
+             function* tagged(){return tagger.tag`a${yield 1}b${yield 2}c`}
+             function* noncallable(){return (0)`x${yield 'must-not-run'}y`}
+             class Box{#value=1;*has(value){yield 'private';return #value in value}}
+             var box=new Box();
+             globalThis.taggedIterator=tagged();
+             globalThis.privateIterator=box.has(box);
+             globalThis.targetIterator=(function*(){yield 'target';return new.target})();
+             try{noncallable().next()}catch(error){globalThis.noncallableResult=error.name}",
+            false,
+        )
+        .expect("tag/private continuation setup parses");
+    assert!(generators
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match generators
+        .eval(
+            "var a=taggedIterator.next(),b=taggedIterator.next(3),c=taggedIterator.next(4),
+                 d=privateIterator.next(),e=privateIterator.next(),
+                 f=targetIterator.next(),g=targetIterator.next();
+             [a.value,b.value,c.value,c.done,d.value,e.value,e.done,
+              f.value,String(g.value),g.done,noncallableResult].join('~')",
+            false,
+        )
+        .expect("tag/private continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "1~2~P|a3b4c|true|true~true~private~true~true~target~undefined~true~TypeError"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("tag/private continuation drive threw {name}: {message}")
+        }
+    }
+
+    let mut module = Engine::new();
+    module
+        .eval_module(
+            "globalThis.importResult='pending';
+             async function load(){
+               const meta=import.meta,log=[];
+               const source=await import.source(
+                 (log.push('specifier'),await Promise.resolve('<module source>')),
+                 (log.push('options'),await Promise.resolve(undefined))
+               );
+               return [meta===import.meta,typeof source,typeof new.target,log.join(',')].join('|');
+             }
+             load().then(value=>importResult=value);",
+            "continuation-forms.js",
+            |_, _| None,
+        )
+        .expect("module continuation setup parses");
+    assert!(module
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match module
+        .eval("importResult", false)
+        .expect("module continuation result parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "true|object|undefined|specifier,options")
+        }
+        Completion::Throw { name, message } => {
+            panic!("module continuation result threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn new_target_uses_heap_vm_continuations() {
+    let mut generator = Engine::new();
+    generator
+        .eval(
+            "function* target(){yield new.target;return new.target}
+             globalThis.targetIterator=target();
+             globalThis.firstTarget=targetIterator.next();",
+            false,
+        )
+        .expect("new.target generator setup parses");
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match generator
+        .eval(
+            "[String(firstTarget.value),firstTarget.done,
+               String(targetIterator.next().value)].join('|')",
+            false,
+        )
+        .expect("new.target generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "undefined|false|undefined"),
+        Completion::Throw { name, message } => {
+            panic!("new.target generator drive threw {name}: {message}")
+        }
+    }
+
+    // An async arrow closes over its defining ordinary function's [[NewTarget]]. The outer
+    // constructor has returned before the await resumes, so a mutable interpreter-global value
+    // cannot accidentally satisfy this check.
+    let mut arrow = Engine::new();
+    arrow
+        .eval(
+            "var release,result='pending',gate=new Promise(resolve=>release=resolve);
+             function F(){
+               var expected=new.target;
+               (async()=>{var before=new.target;await gate;
+                          return before===new.target&&before===expected})()
+                 .then(value=>result=value)
+             }
+             new F();",
+            false,
+        )
+        .expect("lexical new.target async-arrow setup parses");
+    assert!(arrow
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(arrow
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    arrow
+        .eval("release()", false)
+        .expect("lexical new.target async-arrow release parses");
+    match arrow
+        .eval("result", false)
+        .expect("lexical new.target async-arrow result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true"),
+        Completion::Throw { name, message } => {
+            panic!("lexical new.target async-arrow drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn unmapped_and_lexical_arguments_use_heap_vm_continuations() {
+    let mut generator = Engine::new();
+    generator
+        .eval(
+            "function* values(){var inherited=()=>arguments;
+               yield inherited()===arguments;return arguments[0]}
+             globalThis.valuesIterator=values(7);
+             globalThis.firstArguments=valuesIterator.next();",
+            false,
+        )
+        .expect("arguments generator setup parses");
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match generator
+        .eval(
+            "[firstArguments.value,valuesIterator.next().value].join('|')",
+            false,
+        )
+        .expect("arguments generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true|7"),
+        Completion::Throw { name, message } => {
+            panic!("arguments generator drive threw {name}: {message}")
+        }
+    }
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var release,result='pending',gate=new Promise(resolve=>release=resolve);
+             async function strictArgs(a,b){'use strict';var before=arguments;await gate;
+               return [before===arguments,a,b,arguments[0],arguments.length].join(',')}
+             strictArgs(3,4).then(value=>result=value);",
+            false,
+        )
+        .expect("strict async arguments setup parses");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    asynchronous
+        .eval("release()", false)
+        .expect("strict async arguments release parses");
+    match asynchronous
+        .eval("result", false)
+        .expect("strict async arguments result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true,3,4,3,2"),
+        Completion::Throw { name, message } => {
+            panic!("strict async arguments drive threw {name}: {message}")
+        }
+    }
+
+    let mut arrow = Engine::new();
+    arrow
+        .eval(
+            "var release,result='pending',gate=new Promise(resolve=>release=resolve);
+             function outer(value){var expected=arguments;
+               return async extra=>{await gate;
+                 return arguments===expected&&arguments[0]===value&&extra===9}}
+             outer(5)(9).then(value=>result=value);",
+            false,
+        )
+        .expect("lexical arguments async-arrow setup parses");
+    assert!(arrow
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(arrow
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    arrow
+        .eval("release()", false)
+        .expect("lexical arguments async-arrow release parses");
+    match arrow
+        .eval("result", false)
+        .expect("lexical arguments async-arrow result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true"),
+        Completion::Throw { name, message } => {
+            panic!("lexical arguments async-arrow drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn mapped_arguments_use_heap_vm_continuations_and_share_parameter_storage() {
+    let mut generator = Engine::new();
+    generator
+        .eval(
+            "function* mapped(a,b){
+               var same=arguments,read=()=>a;
+               yield [a,arguments[0],read(),same===arguments].join(',');
+               arguments[0]=7;
+               yield [a,read()].join(',');
+               a=9;
+               yield arguments[0];
+               delete arguments[0];
+               a=11;
+               return [0 in arguments,String(arguments[0]),a,read()].join(',')
+             }
+             function* hoisted(a){yield [typeof a,arguments[0]===a].join(',');
+               function a(){} }
+             globalThis.mappedIterator=mapped(1,2);
+             globalThis.hoistedIterator=hoisted(3);
+             globalThis.mappedFirst=mappedIterator.next();
+             globalThis.hoistedFirst=hoistedIterator.next();",
+            false,
+        )
+        .expect("mapped arguments generator setup parses");
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match generator
+        .eval(
+            "var second=mappedIterator.next(),third=mappedIterator.next(),last=mappedIterator.next();
+             [mappedFirst.value,second.value,third.value,last.value,
+              hoistedFirst.value].join('|')",
+            false,
+        )
+        .expect("mapped arguments generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "1,1,1,true|7,7|9|false,undefined,11,11|function,true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("mapped arguments generator drive threw {name}: {message}")
+        }
+    }
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var release,result='pending',gate=new Promise(resolve=>release=resolve);
+             async function mappedAsync(a){var same=arguments;await gate;
+               arguments[0]=6;a+=1;return [a,arguments[0],same===arguments].join(',')}
+             mappedAsync(2).then(value=>result=value);",
+            false,
+        )
+        .expect("mapped arguments async setup parses");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    asynchronous
+        .eval("release()", false)
+        .expect("mapped arguments async release parses");
+    match asynchronous
+        .eval("result", false)
+        .expect("mapped arguments async result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "7,7,true"),
+        Completion::Throw { name, message } => {
+            panic!("mapped arguments async drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn named_coroutine_expressions_use_their_immutable_expression_environment() {
+    let mut generator = Engine::new();
+    generator
+        .eval(
+            "var named=function* self(depth){
+               yield [self===named,(()=>self)()===named].join(',');
+               self=1;
+               if(depth)return yield* self(depth-1);
+               return self===named
+             };
+             var shadowed=function* self(){yield typeof self;var self=3;return self};
+             var strictNamed=function* strictSelf(){'use strict';yield strictSelf===strictNamed;
+               try{strictSelf=1}catch(error){return error.name}}
+             globalThis.namedIterator=named(1);
+             globalThis.shadowedIterator=shadowed();
+             globalThis.strictNamedIterator=strictNamed();",
+            false,
+        )
+        .expect("named coroutine expression setup parses");
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match generator
+        .eval(
+            "var a=namedIterator.next(),b=namedIterator.next(),c=namedIterator.next(),
+                 d=shadowedIterator.next(),e=shadowedIterator.next(),
+                 f=strictNamedIterator.next(),g=strictNamedIterator.next();
+             [a.value,b.value,c.value,c.done,d.value,e.value,e.done,
+              f.value,g.value,g.done,typeof self].join('|')",
+            false,
+        )
+        .expect("named coroutine expression drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "true,true|true,true|true|true|undefined|3|true|true|TypeError|true|undefined"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("named coroutine expression drive threw {name}: {message}")
+        }
+    }
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var release,result='pending',gate=new Promise(resolve=>release=resolve);
+             var recurse=async function self(depth){
+               if(depth)return await self(depth-1);
+               var same=self===recurse;await gate;return same&&self===recurse
+             };
+             recurse(2).then(value=>result=value);",
+            false,
+        )
+        .expect("named async expression setup parses");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    asynchronous
+        .eval("release()", false)
+        .expect("named async expression release parses");
+    match asynchronous
+        .eval("result", false)
+        .expect("named async expression result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true"),
+        Completion::Throw { name, message } => {
+            panic!("named async expression drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn async_arrows_keep_lexical_this_in_heap_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var release,result='pending',gate=new Promise(resolve=>release=resolve),
+                 receiver={tag:'receiver'},alternate={tag:'alternate'};
+             function make(){
+               var expected=this;
+               return async()=>{var before=this,read=()=>this;await gate;
+                 return [before===this,this===expected,read()===this,this.tag].join(',')}
+             }
+             var arrow=make.call(receiver);
+             arrow.call(alternate).then(value=>result=value);",
+            false,
+        )
+        .expect("lexical this async-arrow setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    engine
+        .eval("release()", false)
+        .expect("lexical this async-arrow release parses");
+    match engine
+        .eval("result", false)
+        .expect("lexical this async-arrow result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true,true,true,receiver"),
+        Completion::Throw { name, message } => {
+            panic!("lexical this async-arrow drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn direct_eval_uses_the_retained_coroutine_activation() {
+    let mut generator = Engine::new();
+    generator
+        .eval(
+            "function* direct(a){
+               var local=1;
+               eval('local=2;var made=3;function dynamic(){return local+made}');
+               yield [local,made,dynamic(),arguments[0]].join(',');
+               eval('a=5');
+               yield arguments[0];
+               local=4;
+               return dynamic()
+             }
+             function* conflict(){let lexical=1;
+               try{eval('var lexical=2');yield 'no-error'}catch{yield 'SyntaxError'}
+               return lexical
+             }
+             function* strictEval(){'use strict';var local=1;
+               eval('var hidden=2;local=3');yield [local,typeof hidden].join(',')
+             }
+             var named=function* Self(){eval('Self=1');yield Self===named};
+             var simpleGlobal=10,compoundGlobal=10,logicalGlobal=0;
+             function* simpleReference(){
+               var result=simpleGlobal=eval('var simpleGlobal=20;3');
+               yield [simpleGlobal,globalThis.simpleGlobal,result].join(',')
+             }
+             function* compoundReference(){
+               var result=compoundGlobal+=eval('var compoundGlobal=20;3');
+               yield [compoundGlobal,globalThis.compoundGlobal,result].join(',')
+             }
+             function* logicalReference(){
+               var result=logicalGlobal||=eval('var logicalGlobal=20;3');
+               yield [logicalGlobal,globalThis.logicalGlobal,result].join(',')
+             }
+             globalThis.directIterator=direct(1);
+             globalThis.conflictIterator=conflict();
+             globalThis.strictEvalIterator=strictEval();
+             globalThis.namedEvalIterator=named();
+             globalThis.simpleReferenceIterator=simpleReference();
+             globalThis.compoundReferenceIterator=compoundReference();
+             globalThis.logicalReferenceIterator=logicalReference();",
+            false,
+        )
+        .expect("direct eval generator setup parses");
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match generator
+        .eval(
+            "var a=directIterator.next(),b=directIterator.next(),c=directIterator.next(),
+                 d=conflictIterator.next(),e=conflictIterator.next(),
+                 f=strictEvalIterator.next(),g=namedEvalIterator.next(),
+                 h=simpleReferenceIterator.next(),j=compoundReferenceIterator.next(),
+                 k=logicalReferenceIterator.next();
+             [a.value,b.value,c.value,c.done,d.value,e.value,e.done,f.value,g.value,
+              h.value,j.value,k.value].join('|')",
+            false,
+        )
+        .expect("direct eval generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "2,3,5,1|5|7|true|SyntaxError|1|true|3,undefined|true|20,3,3|20,13,13|20,3,3"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("direct eval generator drive threw {name}: {message}")
+        }
+    }
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var release,result='pending',gate=new Promise(resolve=>release=resolve);
+             async function directAsync(value){
+               eval('value+=2;var made=value*2');await gate;
+               return [value,made].join(',')
+             }
+             directAsync(3).then(value=>result=value);",
+            false,
+        )
+        .expect("direct eval async setup parses");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    asynchronous
+        .eval("release()", false)
+        .expect("direct eval async release parses");
+    match asynchronous
+        .eval("result", false)
+        .expect("direct eval async result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "5,10"),
+        Completion::Throw { name, message } => {
+            panic!("direct eval async drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn direct_eval_destructuring_default_retains_its_earlier_reference() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var globalValue=10;
+             function* referenceOrder(){
+               [globalValue=eval('var globalValue=20;3')]=[];
+               yield [globalValue,globalThis.globalValue].join(',')
+             }
+             globalThis.referenceOrderIterator=referenceOrder();",
+            false,
+        )
+        .expect("direct eval destructuring setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    let result = engine
+        .eval("referenceOrderIterator.next().value", false)
+        .expect("direct eval destructuring drive parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match result {
+        Completion::Value(value) => assert_eq!(value, "20,3"),
+        Completion::Throw { name, message } => {
+            panic!("direct eval destructuring drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn non_suspending_with_uses_heap_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* dynamic(){
+               var local=1,blocked=3,callResult=false,objectEvaluations=0;
+               var object={local:4,method(){return this===object}};
+               object[Symbol.unscopables]={blocked:true};
+               yield 'ready';
+               with((objectEvaluations++,object)){
+                 local+=2;
+                 blocked+=1;
+                 callResult=method()
+               }
+               yield [local,object.local,blocked,callResult,objectEvaluations].join(',');
+               try{with(null){}}catch(error){return error.name}
+             }
+             function* nested(){
+               var captured=2,target={};
+               function change(){with(target){captured=9}}
+               yield captured;
+               change();
+               return captured
+             }
+             function* primitive(){
+               var result;
+               with('xy'){result=[length,charAt(1),charAt(0)].join(',')}
+               yield result
+             }
+             globalThis.dynamicIterator=dynamic();
+             globalThis.nestedIterator=nested();
+             globalThis.primitiveIterator=primitive();",
+            false,
+        )
+        .expect("with generator setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match engine
+        .eval(
+            "var a=dynamicIterator.next(),b=dynamicIterator.next(),c=dynamicIterator.next(),
+                 d=nestedIterator.next(),e=nestedIterator.next();
+             var f=primitiveIterator.next(),g=primitiveIterator.next();
+             [a.value,b.value,c.value,c.done,d.value,e.value,e.done,f.value,g.done].join('|')",
+            false,
+        )
+        .expect("with generator drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(
+                value,
+                "ready|1,6,4,true,1|TypeError|true|2|9|true|2,y,x|true"
+            )
+        }
+        Completion::Throw { name, message } => {
+            panic!("with generator drive threw {name}: {message}")
+        }
+    }
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn suspending_with_uses_heap_vm_environment_cursor() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var probe='global',observed='unset';
+             var object={
+               x:'object',probe:'object',
+               method(value){return (this===object)+':'+value}
+             };
+             function* dynamic(object){
+               var x='outer';
+               yield 'before';
+               try{
+                 with(object){
+                   yield x;
+                   yield method(yield 'argument');
+                   throw 'boom'
+                 }
+               }catch(error){yield x}
+               return x
+             }
+             function* close(object){
+               try{with(object){yield probe}}
+               finally{observed=probe}
+             }
+             function* objectExpression(){
+               with(yield 'object'){yield x}
+             }
+             function* primitive(){
+               with(yield 'primitive'){yield charAt(yield 1)}
+             }
+             function* nestedEnvironments(outer,inner){
+               with(outer){with(inner){yield x}yield x}
+               return probe
+             }
+             function* loopCompletion(object){
+               var index=0;
+               outer:while(index<2){
+                 with(object){yield x+':'+index;index++;continue outer}
+               }
+               return probe
+             }
+             function* injectedThrow(object){
+               try{with(object){yield 'inside'}}
+               catch(error){return probe+':'+error}
+             }
+             var asyncResult='pending';
+             async function asyncWith(object){
+               with(object){return await Promise.resolve(method('awaited'))}
+             }
+             globalThis.dynamicIterator=dynamic(object);
+             globalThis.closeIterator=close(object);
+             globalThis.objectIterator=objectExpression();
+             globalThis.primitiveIterator=primitive();
+             globalThis.nestedEnvironmentIterator=nestedEnvironments(
+               {x:'outer-with',probe:'outer-with'},
+               {x:'inner-with',probe:'inner-with'}
+             );
+             globalThis.loopCompletionIterator=loopCompletion(object);
+             globalThis.injectedThrowIterator=injectedThrow(object);
+             asyncWith(object).then(value=>asyncResult=value,error=>asyncResult='error:'+error);",
+            false,
+        )
+        .expect("suspending with setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match engine
+        .eval(
+            "var a=dynamicIterator.next();
+             object.x='changed';
+             var b=dynamicIterator.next(),c=dynamicIterator.next(),
+                 d=dynamicIterator.next(7),e=dynamicIterator.next(),f=dynamicIterator.next();
+             var g=closeIterator.next(),h=closeIterator.return('external');
+             var j=objectIterator.next(),k=objectIterator.next(object),l=objectIterator.next();
+             var m=primitiveIterator.next(),n=primitiveIterator.next('xy'),
+                 p=primitiveIterator.next(1),q=primitiveIterator.next();
+             var r=nestedEnvironmentIterator.next(),s=nestedEnvironmentIterator.next(),
+                 t=nestedEnvironmentIterator.next();
+             var u=loopCompletionIterator.next(),v=loopCompletionIterator.next(),
+                 w=loopCompletionIterator.next();
+             var aa=injectedThrowIterator.next(),ab=injectedThrowIterator.throw('injected');
+             [a.value,b.value,c.value,d.value,e.value,f.value,f.done,
+              g.value,h.value,h.done,observed,j.value,k.value,l.done,
+              m.value,n.value,p.value,q.done,r.value,s.value,t.value,t.done,
+              u.value,v.value,w.value,w.done,aa.value,ab.value,ab.done,
+              asyncResult].join('|')",
+            false,
+        )
+        .expect("suspending with drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "before|changed|argument|true:7|outer|outer|true|object|external|true|global|object|changed|true|primitive|1|y|true|inner-with|outer-with|global|true|changed:0|changed:1|global|true|inside|global:injected|true|true:awaited"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("suspending with drive threw {name}: {message}")
+        }
+    }
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn with_assignment_references_survive_suspension() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* simple(object){
+               var x='outer';with(object){x=yield 'simple'}return x+','+object.x
+             }
+             function* compound(object){
+               var x=1;with(object){x+=yield 'compound'}return x+','+object.x
+             }
+             function* logical(object){
+               var x='outer';with(object){x&&=yield 'logical'}return x+','+object.x
+             }
+             function* pattern(object){
+               var x='outer';with(object){[x=yield 'pattern']=[]}return x+','+object.x
+             }
+             function* loopPattern(object){
+               var x='outer';with(object){for([x=yield 'loop'] of [[]]){}}
+               return x+','+object.x
+             }
+             var objects=[{x:4},{x:4},{x:'old'},{x:'old'},{x:'old'}];
+             var iterators=[simple(objects[0]),compound(objects[1]),logical(objects[2]),
+                            pattern(objects[3]),loopPattern(objects[4])];",
+            false,
+        )
+        .expect("with assignment-reference setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match engine
+        .eval(
+            "var starts=iterators.map(iterator=>iterator.next().value);
+             for(var index=0;index<objects.length;index++){
+               objects[index][Symbol.unscopables]={x:true}
+             }
+             var results=[iterators[0].next(8),iterators[1].next(2),
+                          iterators[2].next('new'),iterators[3].next('pattern-value'),
+                          iterators[4].next('loop-value')];
+             [starts.join(','),results.map(result=>result.value).join('|'),
+              results.every(result=>result.done)].join('::')",
+            false,
+        )
+        .expect("with assignment-reference drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "simple,compound,logical,pattern,loop::outer,8|1,6|outer,new|outer,pattern-value|outer,loop-value::true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("with assignment-reference drive threw {name}: {message}")
+        }
+    }
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn sync_using_uses_heap_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var log=[];
+             function resource(name, failure){
+               return {[Symbol.dispose](){log.push(name);if(failure!==undefined)throw failure}}
+             }
+             function* normal(){
+               using value=resource('normal');
+               yield 'ready';
+               return 'done'
+             }
+             function* nestedFailure(){
+               using outer=resource('outer','outer-error');
+               {
+                 using inner=resource('inner','inner-error');
+                 yield 'nested-ready';
+                 return 'body-return'
+               }
+             }
+             function* injected(){
+               using value=resource('injected');
+               yield 'injected-ready'
+             }
+             function* capturedMethod(){
+               var object=resource('old');
+               using value=object;
+               object[Symbol.dispose]=function(){log.push('new')};
+               yield 'captured-ready'
+             }
+             function* tdz(){
+               using value={
+                 get [Symbol.dispose](){
+                   try{value}catch(error){log.push(error.name)}
+                   return function(){log.push('tdz-dispose')}
+                 }
+               };
+               yield 'tdz-ready'
+             }
+             function* breakScope(){
+               outer:{
+                 using value=resource('break');
+                 yield 'break-ready';
+                 break outer
+               }
+               return 'after-break'
+             }
+             globalThis.normalIterator=normal();
+             globalThis.failureIterator=nestedFailure();
+             globalThis.injectedIterator=injected();
+             globalThis.capturedIterator=capturedMethod();
+             globalThis.tdzIterator=tdz();
+             globalThis.breakIterator=breakScope();",
+            false,
+        )
+        .expect("sync using generator setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match engine
+        .eval(
+            "var a=normalIterator.next(),b=normalIterator.next();
+             var c=failureIterator.next(),failure;
+             try{failureIterator.next()}catch(error){
+               failure=[error.constructor.name,error.error,error.suppressed].join(',')
+             }
+             var d=injectedIterator.next(),e=injectedIterator.return('external');
+             var f=capturedIterator.next(),g=capturedIterator.next();
+             var h=tdzIterator.next(),j=tdzIterator.next();
+             var k=breakIterator.next(),m=breakIterator.next();
+             [a.value,b.value,b.done,c.value,failure,d.value,e.value,e.done,
+              f.value,g.done,h.value,j.done,k.value,m.value,m.done,log.join(',')].join('|')",
+            false,
+        )
+        .expect("sync using generator drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            concat!(
+                "ready|done|true|nested-ready|SuppressedError,outer-error,inner-error|",
+                "injected-ready|external|true|captured-ready|true|tdz-ready|true|",
+                "break-ready|after-break|true|normal,inner,outer,injected,old,ReferenceError,",
+                "tdz-dispose,break"
+            )
+        ),
+        Completion::Throw { name, message } => {
+            panic!("sync using generator drive threw {name}: {message}")
+        }
+    }
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn super_and_private_references_survive_vm_suspension() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var log=[];
+             class Base{
+               get value(){log.push('base-get');return this._value||10}
+               set value(value){log.push('base-set:'+value);this._value=value}
+               method(value){log.push('method:'+value);return value+1}
+             }
+             class Derived extends Base{
+               *run(){
+                 const read=super[yield 'read-key'];
+                 const called=super[yield 'call-key'](yield 'argument');
+                 super[yield 'set-key']=yield 'set-value';
+                 super.value+=yield 'compound';
+                 super.value||=yield 'must-not-run';
+                 const post=super.value++;
+                 return [read,called,post,this._value,log.join(',')].join('|');
+               }
+             }
+             globalThis.Derived=Derived;
+             globalThis.superIterator=new Derived().run();
+             class Vault{
+               #value=1;
+               #method(value){return value+this.#value}
+               *run(other){
+                 const called=this.#method(yield 'private-call');
+                 this.#value+=yield 'private-compound';
+                 this.#value||=yield 'private-must-not-run';
+                 const post=this.#value++;
+                 return [called,post,this.#value,#value in other].join(',');
+               }
+             }
+             const vault=new Vault();
+             globalThis.privateReferenceIterator=vault.run(vault);",
+            false,
+        )
+        .expect("super/private reference setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var i=superIterator,
+                 a=i.next(),b=i.next('value'),c=i.next('method'),d=i.next(3),
+                 e=i.next('value');
+             var alternate={
+               get value(){log.push('alternate-get');return this._value||100},
+               set value(value){log.push('alternate-set:'+value);this._value=value}
+             };
+             Object.setPrototypeOf(Derived.prototype,alternate);
+             var f=i.next(20),g=i.next(2),v=privateReferenceIterator,
+                 h=v.next(),j=v.next(3),k=v.next(2);
+             [a.value,b.value,c.value,d.value,e.value,f.value,g.value,g.done,
+              h.value,j.value,k.value,k.done].join('~')",
+            false,
+        )
+        .expect("super/private reference drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "read-key~call-key~argument~set-key~set-value~compound~10|4|22|23|base-get,method:3,base-set:20,alternate-get,alternate-set:22,alternate-get,alternate-get,alternate-set:23~true~private-call~private-compound~4,3,4,true~true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("super/private reference drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn class_definitions_do_not_force_native_coroutines() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "class Base{base(){return 2}}
+             function* classes(BaseCtor){
+               yield 'before-declaration';
+               let captured=3;
+               class Declared extends BaseCtor{
+                 #private=4;
+                 field=captured;
+                 static value=5;
+                 static{this.block=6}
+                 read(){return this.#private+this.field+super.base()}
+               }
+               yield [Declared.value,Declared.block,new Declared().read(),Declared.name].join(',');
+               const Named=class extends BaseCtor{field=7};
+               return [Named.name,new Named().field,new Named().base()].join(',');
+             }
+             globalThis.classIterator=classes(Base);",
+            false,
+        )
+        .expect("class continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var i=classIterator,a=i.next(),b=i.next(),c=i.next();
+             [a.value,b.value,c.value,c.done].join('|')",
+            false,
+        )
+        .expect("class continuation drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "before-declaration|5,6,9,Declared|Named,7,2|true")
+        }
+        Completion::Throw { name, message } => {
+            panic!("class continuation drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn interleaved_call_and_construct_spreads_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var receiver={label:'R',collect(...values){return this.label+':'+values.join(',')}};
+             class Box{constructor(...values){this.value=values.join(',')}}
+             function* spreads(){
+               const called=receiver.collect(
+                 yield 'call-first',...(yield 'call-spread-one'),
+                 yield 'call-middle',...(yield 'call-spread-two'));
+               const built=new Box(
+                 yield 'new-first',...(yield 'new-spread'),yield 'new-last');
+               return called+'|'+built.value;
+             }
+             globalThis.spreadIterator=spreads();",
+            false,
+        )
+        .expect("interleaved spread continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var i=spreadIterator,a=i.next(),b=i.next(1),c=i.next([2,3]),d=i.next(4),
+                 e=i.next([5,6]),f=i.next(7),g=i.next([8,9]),h=i.next(10);
+             [a.value,b.value,c.value,d.value,e.value,f.value,g.value,h.value,h.done].join('|')",
+            false,
+        )
+        .expect("interleaved spread continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "call-first|call-spread-one|call-middle|call-spread-two|new-first|new-spread|new-last|R:1,2,3,4,5,6|7,8,9,10|true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("interleaved spread continuation drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn switch_lexical_environment_survives_vm_suspension() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* run(){
+               let lexical='outer';var read;
+               switch(yield lexical){
+                 case 1:
+                   let lexical=yield 'initialize';
+                   read=()=>lexical;
+                 case 2:
+                   return read();
+               }
+             }
+             function* tdz(){
+               let lexical='outer';
+               try{switch(yield lexical){case typeof lexical:let lexical}}
+               catch(error){return error.name}
+             }
+             globalThis.switchIterator=run();globalThis.switchTdzIterator=tdz();",
+            false,
+        )
+        .expect("switch lexical continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=switchIterator.next(),b=switchIterator.next(1),c=switchIterator.next(9),
+                 d=switchTdzIterator.next(),e=switchTdzIterator.next(0);
+             [a.value,b.value,c.value,c.done,d.value,e.value,e.done].join('|')",
+            false,
+        )
+        .expect("switch lexical continuation drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "outer|initialize|9|true|outer|ReferenceError|true")
+        }
+        Completion::Throw { name, message } => {
+            panic!("switch lexical continuation drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn captured_reentered_switch_uses_fresh_heap_environments() {
+    // CaseBlockEvaluation creates one fresh shared environment after each discriminant evaluation.
+    // Re-entering the same switch must not overwrite a captured record from an earlier pass.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* switches(){
+               var reads=[];
+               for(var index=0;index<3;index++){
+                 switch(index){
+                   case 0:
+                   case 1:
+                   default:
+                     let value=index;
+                     reads.push(()=>value);
+                     yield value;
+                     value+=10
+                 }
+               }
+               return reads.map(read=>read()).join(',')
+             }
+             globalThis.switchIterator=switches();",
+            false,
+        )
+        .expect("captured re-entered switch setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "var a=switchIterator.next(),b=switchIterator.next(),c=switchIterator.next(),
+                 d=switchIterator.next();
+             [a.value,b.value,c.value,d.value,d.done].join('|')"
+        ),
+        "0|1|2|10,11,12|true"
+    );
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn optional_calls_with_spreads_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.optionalPlain=function(){
+               'use strict';return (this===undefined)+':'+
+                 Array.prototype.join.call(arguments,',')
+             };
+             globalThis.optionalReceiver={label:'R',m(...values){
+               return this.label+':'+values.join(',')
+             }};
+             function* optionalCalls(){
+               const skipped=null?.(...(yield 'must-not-run'));
+               const plain=(yield 'plain-callee')?.(
+                 yield 'plain-argument',...(yield 'plain-spread'),yield 'plain-last');
+               const method=(yield 'receiver')?.[yield 'method-key']?.(
+                 yield 'method-argument',...(yield 'method-spread'),yield 'method-last');
+               return [skipped,plain,method].join('|');
+             }
+             globalThis.optionalCallIterator=optionalCalls();",
+            false,
+        )
+        .expect("optional call continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var i=optionalCallIterator,a=i.next(),b=i.next(optionalPlain),c=i.next(1),
+                 d=i.next([2,3]),e=i.next(4),f=i.next(optionalReceiver),g=i.next('m'),
+                 h=i.next(5),j=i.next([6,7]),k=i.next(8);
+             [a.value,b.value,c.value,d.value,e.value,f.value,g.value,h.value,j.value,
+              k.value,k.done].join('~')",
+            false,
+        )
+        .expect("optional call continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "plain-callee~plain-argument~plain-spread~plain-last~receiver~method-key~method-argument~method-spread~method-last~|true:1,2,3,4|R:5,6,7,8~true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("optional call continuation drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn delete_references_use_vm_continuations_and_super_throws() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* deletes(){
+               globalThis.deletable=1;var local=1;
+               const absent=delete null?.[yield 'must-not-run'];
+               const object={x:1};
+               const live=delete object?.[yield 'delete-key'];
+               return [absent,live,'x' in object,delete local,delete deletable].join(',');
+             }
+             var coercions=[];
+             class Base{}
+             class Derived extends Base{
+               *remove(){
+                 try{delete super[yield 'super-key']}
+                 catch(error){return error.name+':'+coercions.join('!')}
+               }
+             }
+             globalThis.deleteIterator=deletes();
+             globalThis.deleteSuperIterator=new Derived().remove();
+             globalThis.deleteKey={
+               [Symbol.toPrimitive](){coercions.push('coerced');return 'x'}
+             };void 0;",
+            false,
+        )
+        .expect("delete continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=deleteIterator.next(),b=deleteIterator.next('x'),
+                 c=deleteSuperIterator.next(),d=deleteSuperIterator.next(deleteKey);
+             [a.value,b.value,b.done,c.value,d.value,d.done].join('|')",
+            false,
+        )
+        .expect("delete continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "delete-key|true,true,false,false,true|true|super-key|ReferenceError:|true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("delete continuation drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn immutable_writes_use_vm_continuations_and_preserve_error_order() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* immutableWrites(){
+               const log=[];
+               const plain=1;
+               try{plain=yield 'simple'}catch(error){log.push(error.name)}
+               const compound={
+                 [Symbol.toPrimitive](){log.push('compound-coercion');return 2}
+               };
+               try{compound+=yield 'compound'}catch(error){log.push(error.name)}
+               const logical=0;
+               try{logical||=yield 'logical'}catch(error){log.push(error.name)}
+               const shorted=1;
+               log.push(shorted||=yield 'must-not-run');
+               const captured=5,read=()=>captured;
+               try{captured=yield 'captured'}catch(error){log.push(error.name+':'+read())}
+               const updated={
+                 [Symbol.toPrimitive](){log.push('update-coercion');return 4}
+               };
+               try{updated++}catch(error){log.push(error.name)}
+               return log.join(',');
+             }
+             function* capturedTdz(){
+               const read=()=>binding;
+               try{binding=yield 'tdz-simple'}catch(error){return error.name}
+               const binding=1;
+             }
+             function* compoundTdz(){
+               try{binding+=yield 'must-not-run'}catch(error){return error.name}
+               const binding=1;
+             }
+             globalThis.immutableIterator=immutableWrites();
+             globalThis.capturedTdzIterator=capturedTdz();
+             globalThis.compoundTdzIterator=compoundTdz();",
+            false,
+        )
+        .expect("immutable-write continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=immutableIterator.next(),b=immutableIterator.next(9),
+                 c=immutableIterator.next(3),d=immutableIterator.next(7),
+                 e=immutableIterator.next(8),f=immutableIterator.next(11),
+                 g=capturedTdzIterator.next(),h=capturedTdzIterator.next(2),
+                 j=compoundTdzIterator.next();
+             [a.value,b.value,c.value,d.value,e.value,f.value,f.done,
+              g.value,h.value,h.done,j.value,j.done].join('|')",
+            false,
+        )
+        .expect("immutable-write continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "simple|compound|logical|captured|TypeError,compound-coercion,TypeError,TypeError,1,TypeError:5,update-coercion,TypeError||true|tdz-simple|ReferenceError|true|ReferenceError|true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("immutable-write continuation drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn destructuring_catch_parameters_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var catchIteratorClosed=0;
+             function makeCatchIterator(){
+               return {
+                 [Symbol.iterator](){return this},
+                 next(){return {value:undefined,done:false}},
+                 return(){catchIteratorClosed++;return {done:true}}
+               }
+             }
+             function* objectCatch(){
+               try{throw {a:undefined,b:2,c:3}}
+               catch({a=yield 'object-default',b,...rest}){
+                 return [a,b,rest.c].join(',')
+               }
+             }
+             function* catchFinally(){
+               try{
+                 try{throw makeCatchIterator()}
+                 catch([value=yield 'array-default']){
+                   yield 'catch:'+catchIteratorClosed;
+                   return value
+                 }
+               }finally{yield 'finally:'+catchIteratorClosed}
+             }
+             function* abruptBinding(){
+               var entered=false;
+               try{
+                 try{throw null}catch({x}){entered=true}
+               }finally{yield entered?'bad-body':'binding-finally'}
+             }
+             globalThis.objectCatchIterator=objectCatch();
+             globalThis.catchFinallyIterator=catchFinally();
+             globalThis.abruptBindingIterator=abruptBinding();",
+            false,
+        )
+        .expect("destructuring catch continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=objectCatchIterator.next(),b=objectCatchIterator.next(4),
+                 c=catchFinallyIterator.next(),d=catchFinallyIterator.next(7),
+                 e=catchFinallyIterator.next(),f=catchFinallyIterator.next(),
+                 g=abruptBindingIterator.next(),h;
+             try{abruptBindingIterator.next()}catch(error){h=error.name}
+             [a.value,b.value,b.done,c.value,d.value,e.value,f.value,f.done,
+              g.value,h].join('|')",
+            false,
+        )
+        .expect("destructuring catch continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "object-default|4,2,3|true|array-default|catch:1|finally:1|7|true|binding-finally|TypeError"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("destructuring catch continuation drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn classic_for_destructuring_initializers_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var classicForClosed=0;
+             function makeClassicForIterator(){
+               var stepped=false;
+               return {
+                 [Symbol.iterator](){return this},
+                 next(){
+                   if(stepped)return {done:true};
+                   stepped=true;return {value:6,done:false}
+                 },
+                 return(){classicForClosed++;return {done:true}}
+               }
+             }
+             function* classicForPatterns(){
+               const out=[];
+               for(let [index=yield 'let-default',...tail]=[undefined,2,3];
+                   index<2;index++){
+                 out.push(yield index+':'+tail.join(','))
+               }
+               for(var {[yield 'var-key']:value,...rest}={x:4,y:5};
+                   value<5;value++){
+                 out.push(value+rest.y)
+               }
+               for(const [only]=makeClassicForIterator();false;){out.push(only)}
+               return out.join(',')+':'+classicForClosed
+             }
+             globalThis.classicForIterator=classicForPatterns();",
+            false,
+        )
+        .expect("classic-for destructuring continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=classicForIterator.next(),b=classicForIterator.next(0),
+                 c=classicForIterator.next('A'),d=classicForIterator.next('B'),
+                 e=classicForIterator.next('x');
+             [a.value,b.value,c.value,d.value,e.value,e.done].join('|')",
+            false,
+        )
+        .expect("classic-for destructuring continuation drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "let-default|0:2,3|1:2,3|var-key|A,B,9:1|true")
+        }
+        Completion::Throw { name, message } => {
+            panic!("classic-for destructuring continuation drive threw {name}: {message}")
+        }
+    }
+}
+#[test]
+fn captured_body_lexical_patterns_use_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* capturedPatterns(){
+               let read;
+               const [a=yield 'array-default',b,...rest]=[undefined,2,3,4];
+               let {x=yield 'object-default',y:local,...tail}={x:undefined,y:6,z:7};
+               read=()=>[a,b,rest.join(','),x,tail.z].join(':');
+               yield local;
+               return read()
+             }
+             function* capturedPatternTdz(){
+               try{
+                 const [a=typeof b,b=2]=[];
+                 const read=()=>b;
+                 return read()+a
+               }catch(error){return error.name}
+             }
+             globalThis.capturedPatternIterator=capturedPatterns();
+             globalThis.capturedPatternTdzIterator=capturedPatternTdz();",
+            false,
+        )
+        .expect("captured body-pattern continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=capturedPatternIterator.next(),b=capturedPatternIterator.next(1),
+                 c=capturedPatternIterator.next(5),d=capturedPatternIterator.next(),
+                 e=capturedPatternTdzIterator.next();
+             [a.value,b.value,c.value,d.value,d.done,e.value,e.done].join('|')",
+            false,
+        )
+        .expect("captured body-pattern continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "array-default|object-default|6|1:2:3,4:5:7|true|ReferenceError|true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("captured body-pattern continuation drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn strict_block_functions_use_vm_continuations_and_instantiate_at_scope_entry() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* blockFunctions(){
+               'use strict';
+               let previous;
+               for(let i=0;i<2;i++){
+                 {
+                   yield [typeof f,f(),previous===f].join(':');
+                   previous=f;
+                   function f(){return 7}
+                 }
+               }
+               return previous()
+             }
+             function* switchFunction(){
+               'use strict';
+               switch(yield 'discriminant'){
+                 case (yield f()): return f();
+                 default: function f(){return 9}
+               }
+             }
+             globalThis.blockFunctionIterator=blockFunctions();
+             globalThis.switchFunctionIterator=switchFunction();",
+            false,
+        )
+        .expect("strict block-function continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var a=blockFunctionIterator.next(),b=blockFunctionIterator.next(),
+                 c=blockFunctionIterator.next(),d=blockFunctionIterator.next(),
+                 e=switchFunctionIterator.next(),f=switchFunctionIterator.next(0),
+                 g=switchFunctionIterator.next(0);
+             [a.value,b.value,c.value,c.done,d.value,d.done,
+              e.value,f.value,g.value,g.done].join('|')",
+            false,
+        )
+        .expect("strict block-function continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "function:7:false|function:7:false|7|true||true|discriminant|9|9|true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("strict block-function continuation drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn jit_iterator_abort_unwinds_only_live_operands() {
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(0);
+    match engine
+        .eval(
+            "function run(iterable){
+               for(var value of iterable){throw new Error('outer')}
+             }
+             function source(returnValue,getterThrows){
+               return {[Symbol.iterator](){
+                 const iterator={next(){return {done:false,value:null}}};
+                 if(getterThrows){
+                   Object.defineProperty(iterator,'return',{get(){throw new Error('inner')}})
+                 }else iterator.return=returnValue;
+                 return iterator
+               }}
+             }
+             const messages=[];
+             try{run(source(undefined,true))}catch(error){messages.push(error.message)}
+             try{run(source('not callable',false))}catch(error){messages.push(error.message)}
+             messages.join(',')",
+            false,
+        )
+        .expect("JIT iterator-abort regression parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "outer,outer"),
+        Completion::Throw { name, message } => {
+            panic!("JIT iterator-abort regression threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn compiled_super_references_bind_the_actual_receiver() {
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine
+            .eval(
+                "const proto={x:NaN,1:NaN};
+                 const receiver={
+                   __proto__:proto,
+                   named(value){return (super.x ||= value)},
+                   computed(value){let key=1;return (super[key] ||= value)}
+                 };
+                 const namedResult=receiver.named('named');
+                 const computedResult=receiver.computed('computed');
+                 [namedResult,receiver.x,computedResult,receiver[1],
+                  Object.hasOwn(globalThis,'x'),Object.hasOwn(globalThis,'1')].join('|')",
+                false,
+            )
+            .expect("compiled super-reference receiver regression parses")
+        {
+            Completion::Value(value) => {
+                assert_eq!(value, "named|named|computed|computed|false|false")
+            }
+            Completion::Throw { name, message } => {
+                panic!("compiled super-reference receiver regression threw {name}: {message}")
+            }
+        }
+    }
+}
+
+#[test]
 fn for_head_no_in() {
     assert_eq!(run("var x; for (x in {a:1}); x"), "a");
     assert_eq!(run("for (var i=('x' in {x:1})?0:5; i<1; i++); i"), "1"); // `in` allowed in parens
@@ -9061,7 +6691,9 @@ fn for_head_no_in() {
     // [~In] applies to the for initializer, not to the parameters/body of a
     // nested function. This is the minified jQuery shape used by erome.com.
     assert_eq!(
-        run("var out; for (out = function(x = 'p' in {p:1}) { return x && 'q' in {q:1}; }(); false;); out"),
+        run(
+            "var out; for (out = function(x = 'p' in {p:1}) { return x && 'q' in {q:1}; }(); false;); out"
+        ),
         "true"
     );
 }
@@ -9163,8 +6795,18 @@ fn split_limit_and_radix() {
 }
 #[test]
 fn proxy_traps() {
-    assert_eq!(run("var log=''; var p=new Proxy({},{getPrototypeOf(t){log+='gp';return Array.prototype}}); Object.getPrototypeOf(p)===Array.prototype && log==='gp'"), "true");
-    assert_eq!(run("var p=new Proxy({},{ownKeys(){return ['a','b']}}); Object.getOwnPropertyNames(p).join(',')"), "a,b");
+    assert_eq!(
+        run(
+            "var log=''; var p=new Proxy({},{getPrototypeOf(t){log+='gp';return Array.prototype}}); Object.getPrototypeOf(p)===Array.prototype && log==='gp'"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{ownKeys(){return ['a','b']}}); Object.getOwnPropertyNames(p).join(',')"
+        ),
+        "a,b"
+    );
     assert_eq!(
         run("var p=new Proxy({},{ownKeys(){return ['a','b']}}); Reflect.ownKeys(p).join(',')"),
         "a,b"
@@ -9193,26 +6835,76 @@ fn proxy_traps() {
 }
 #[test]
 fn proxy_gopd_trap() {
-    assert_eq!(run("var p=new Proxy({},{getOwnPropertyDescriptor(t,k){return {value:42,configurable:true}}}); Object.getOwnPropertyDescriptor(p,'x').value"), "42");
-    assert_eq!(run("var p=new Proxy({},{getOwnPropertyDescriptor(){return undefined}}); Object.getOwnPropertyDescriptor(p,'x')"), "undefined");
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{getOwnPropertyDescriptor(t,k){return {value:42,configurable:true}}}); Object.getOwnPropertyDescriptor(p,'x').value"
+        ),
+        "42"
+    );
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{getOwnPropertyDescriptor(){return undefined}}); Object.getOwnPropertyDescriptor(p,'x')"
+        ),
+        "undefined"
+    );
     assert_eq!(
         run("var p=new Proxy({a:5},{}); Object.getOwnPropertyDescriptor(p,'a').value"),
         "5"
     );
-    assert_eq!(run("var log=''; var p=new Proxy({},{getOwnPropertyDescriptor(t,k){log+=k;return {value:1,configurable:true}}}); Object.getOwnPropertyDescriptor(p,'foo'); log"), "foo");
-    assert_eq!(run("var p=new Proxy({},{getOwnPropertyDescriptor(){return {value:9,configurable:true}}}); Object.getOwnPropertyDescriptor(p,'x').writable"), "false");
+    assert_eq!(
+        run(
+            "var log=''; var p=new Proxy({},{getOwnPropertyDescriptor(t,k){log+=k;return {value:1,configurable:true}}}); Object.getOwnPropertyDescriptor(p,'foo'); log"
+        ),
+        "foo"
+    );
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{getOwnPropertyDescriptor(){return {value:9,configurable:true}}}); Object.getOwnPropertyDescriptor(p,'x').writable"
+        ),
+        "false"
+    );
 }
 #[test]
 fn proxy_defineprop_trap() {
-    assert_eq!(run("var log=''; var p=new Proxy({},{defineProperty(t,k,d){log+=k+':'+d.value;return true}}); Object.defineProperty(p,'x',{value:7}); log"), "x:7");
-    assert_eq!(throws("var p=new Proxy({},{defineProperty(){return false}}); Object.defineProperty(p,'x',{value:1})"), "TypeError");
-    assert_eq!(run("var p=new Proxy({},{defineProperty(){return true}}); Reflect.defineProperty(p,'x',{value:1})"), "true");
-    assert_eq!(run("var p=new Proxy({},{defineProperty(){return false}}); Reflect.defineProperty(p,'x',{value:1})"), "false");
-    assert_eq!(run("var t={}; var p=new Proxy(t,{}); Object.defineProperty(p,'a',{value:5,configurable:true}); t.a"), "5");
+    assert_eq!(
+        run(
+            "var log=''; var p=new Proxy({},{defineProperty(t,k,d){log+=k+':'+d.value;return true}}); Object.defineProperty(p,'x',{value:7}); log"
+        ),
+        "x:7"
+    );
+    assert_eq!(
+        throws(
+            "var p=new Proxy({},{defineProperty(){return false}}); Object.defineProperty(p,'x',{value:1})"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{defineProperty(){return true}}); Reflect.defineProperty(p,'x',{value:1})"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{defineProperty(){return false}}); Reflect.defineProperty(p,'x',{value:1})"
+        ),
+        "false"
+    );
+    assert_eq!(
+        run(
+            "var t={}; var p=new Proxy(t,{}); Object.defineProperty(p,'a',{value:5,configurable:true}); t.a"
+        ),
+        "5"
+    );
 }
 #[test]
 fn proxy_delete_trap() {
-    assert_eq!(run("var log=''; var p=new Proxy({},{deleteProperty(t,k){log+=k;return true}}); delete p.x; log"), "x");
+    assert_eq!(
+        run(
+            "var log=''; var p=new Proxy({},{deleteProperty(t,k){log+=k;return true}}); delete p.x; log"
+        ),
+        "x"
+    );
     assert_eq!(
         run("var p=new Proxy({},{deleteProperty(){return false}}); delete p.x"),
         "false"
@@ -9228,13 +6920,28 @@ fn proxy_delete_trap() {
 }
 #[test]
 fn proxy_misc_traps() {
-    assert_eq!(run("var log=''; var p=new Proxy({},{setPrototypeOf(t,pr){log+='sp';return true}}); Object.setPrototypeOf(p,null); log"), "sp");
+    assert_eq!(
+        run(
+            "var log=''; var p=new Proxy({},{setPrototypeOf(t,pr){log+='sp';return true}}); Object.setPrototypeOf(p,null); log"
+        ),
+        "sp"
+    );
     assert_eq!(
         throws("var p=new Proxy({},{setPrototypeOf(){return false}}); Object.setPrototypeOf(p,{})"),
         "TypeError"
     );
-    assert_eq!(run("var t={};Object.preventExtensions(t);var p=new Proxy(t,{isExtensible(){return false}}); Object.isExtensible(p)"), "false");
-    assert_eq!(run("var log=''; var p=new Proxy({},{preventExtensions(t){log+='pe';Object.preventExtensions(t);return true}}); Object.preventExtensions(p); log"), "pe");
+    assert_eq!(
+        run(
+            "var t={};Object.preventExtensions(t);var p=new Proxy(t,{isExtensible(){return false}}); Object.isExtensible(p)"
+        ),
+        "false"
+    );
+    assert_eq!(
+        run(
+            "var log=''; var p=new Proxy({},{preventExtensions(t){log+='pe';Object.preventExtensions(t);return true}}); Object.preventExtensions(p); log"
+        ),
+        "pe"
+    );
     assert_eq!(
         throws(
             "var p=new Proxy({},{preventExtensions(){return false}}); Object.preventExtensions(p)"
@@ -9242,7 +6949,12 @@ fn proxy_misc_traps() {
         "TypeError"
     );
     assert_eq!(throws("Object.setPrototypeOf({},5)"), "TypeError");
-    assert_eq!(run("var t={}; var p=new Proxy(t,{}); Object.setPrototypeOf(p,Array.prototype); Object.getPrototypeOf(t)===Array.prototype"), "true");
+    assert_eq!(
+        run(
+            "var t={}; var p=new Proxy(t,{}); Object.setPrototypeOf(p,Array.prototype); Object.getPrototypeOf(t)===Array.prototype"
+        ),
+        "true"
+    );
 }
 #[test]
 fn proxy_keys() {
@@ -9250,8 +6962,18 @@ fn proxy_keys() {
         run("var p=new Proxy({a:1,b:2},{}); Object.keys(p).join(',')"),
         "a,b"
     );
-    assert_eq!(run("var p=new Proxy({},{ownKeys(){return ['x','y']},getOwnPropertyDescriptor(t,k){return {value:1,enumerable:true,configurable:true}}}); Object.keys(p).join(',')"), "x,y");
-    assert_eq!(run("var p=new Proxy({},{ownKeys(){return ['x','y']},getOwnPropertyDescriptor(t,k){return {value:1,enumerable:k==='x',configurable:true}}}); Object.keys(p).join(',')"), "x");
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{ownKeys(){return ['x','y']},getOwnPropertyDescriptor(t,k){return {value:1,enumerable:true,configurable:true}}}); Object.keys(p).join(',')"
+        ),
+        "x,y"
+    );
+    assert_eq!(
+        run(
+            "var p=new Proxy({},{ownKeys(){return ['x','y']},getOwnPropertyDescriptor(t,k){return {value:1,enumerable:k==='x',configurable:true}}}); Object.keys(p).join(',')"
+        ),
+        "x"
+    );
 }
 #[test]
 fn set_methods() {
@@ -9338,7 +7060,9 @@ fn promise_try_regexp_escape() {
         "true"
     );
     assert_eq!(
-        run("var q=[];class P extends Promise{constructor(e){q.push('ctor');super(e)}}P.try(()=>{q.push('callback');return 1});q.join(',')"),
+        run(
+            "var q=[];class P extends Promise{constructor(e){q.push('ctor');super(e)}}P.try(()=>{q.push('callback');return 1});q.join(',')"
+        ),
         "callback,ctor"
     );
     let mut e = Engine::new();
@@ -9397,7 +7121,12 @@ fn uint8_base64_hex() {
 }
 #[test]
 fn uint8_setfrom() {
-    assert_eq!(run("var a=new Uint8Array(4); var r=a.setFromHex('41424344'); a.join(',')+'/'+r.written+','+r.read"), "65,66,67,68/4,8");
+    assert_eq!(
+        run(
+            "var a=new Uint8Array(4); var r=a.setFromHex('41424344'); a.join(',')+'/'+r.written+','+r.read"
+        ),
+        "65,66,67,68/4,8"
+    );
     assert_eq!(
         run("var a=new Uint8Array(2); a.setFromHex('414243'); a.join(',')"),
         "65,66"
@@ -9459,7 +7188,12 @@ fn async_disposable_stack() {
         },
         "ba!"
     );
-    assert_eq!(run("var s=new AsyncDisposableStack(); s.use({[Symbol.asyncDispose](){}}); var s2=s.move(); s.disposed+','+s2.disposed"), "true,false");
+    assert_eq!(
+        run(
+            "var s=new AsyncDisposableStack(); s.use({[Symbol.asyncDispose](){}}); var s2=s.move(); s.disposed+','+s2.disposed"
+        ),
+        "true,false"
+    );
 }
 #[test]
 fn detached_typedarray() {
@@ -9496,8 +7230,18 @@ fn detached_typedarray() {
 }
 #[test]
 fn ta_index_properties() {
-    assert_eq!(run("var a=new Int8Array(3); Object.defineProperty(a,'0',{value:7,writable:true,enumerable:true,configurable:true}); a[0]"), "7");
-    assert_eq!(run("var a=new Int8Array(3); var d=Object.getOwnPropertyDescriptor(a,'0'); d.value+','+d.writable+','+d.enumerable+','+d.configurable"), "0,true,true,true");
+    assert_eq!(
+        run(
+            "var a=new Int8Array(3); Object.defineProperty(a,'0',{value:7,writable:true,enumerable:true,configurable:true}); a[0]"
+        ),
+        "7"
+    );
+    assert_eq!(
+        run(
+            "var a=new Int8Array(3); var d=Object.getOwnPropertyDescriptor(a,'0'); d.value+','+d.writable+','+d.enumerable+','+d.configurable"
+        ),
+        "0,true,true,true"
+    );
     assert_eq!(run("new Int8Array(3).hasOwnProperty('0')"), "true");
     assert_eq!(run("new Int8Array([1,2,3]).hasOwnProperty('5')"), "false");
     assert_eq!(
@@ -9718,12 +7462,22 @@ fn async_generators() {
         run("async function* g(){yield 1} typeof g().return"),
         "function"
     );
-    assert_eq!(run("var s=''; async function* g(){yield 'a';yield 'b'} var it=g(); it.next().then(r=>s=r.value); 'ok'"), "ok");
+    assert_eq!(
+        run(
+            "var s=''; async function* g(){yield 'a';yield 'b'} var it=g(); it.next().then(r=>s=r.value); 'ok'"
+        ),
+        "ok"
+    );
     assert_eq!(
         run("function* g(){yield 1} var it=g(); it.next().value+','+it.next().done"),
         "1,true"
     );
-    assert_eq!(run("function* g(){yield 1;yield 2} var it=g(); it.next(); it.return(9).value+','+it.next().done"), "9,true");
+    assert_eq!(
+        run(
+            "function* g(){yield 1;yield 2} var it=g(); it.next(); it.return(9).value+','+it.next().done"
+        ),
+        "9,true"
+    );
 }
 #[test]
 fn for_await_of() {
@@ -10210,7 +7964,12 @@ fn private_names_not_observable() {
         run("class C{ #f=1 } var c=new C(); c.hasOwnProperty('#f')"),
         "false"
     );
-    assert_eq!(run("class C{ #f=1; m(){return this.#f} } var c=new C(); Object.getOwnPropertyNames(c).length"), "0");
+    assert_eq!(
+        run(
+            "class C{ #f=1; m(){return this.#f} } var c=new C(); Object.getOwnPropertyNames(c).length"
+        ),
+        "0"
+    );
     assert_eq!(
         run("class C{ #f=1 } var c=new C(); Object.keys(c).join(',')"),
         ""
@@ -10269,9 +8028,24 @@ fn ta_meta_not_own() {
 #[test]
 fn ta_prototype_accessors() {
     // the accessors exist on %TypedArray.prototype% and brand-check
-    assert_eq!(run("var p=Object.getPrototypeOf(Int8Array.prototype); typeof Object.getOwnPropertyDescriptor(p,'byteLength').get"), "function");
-    assert_eq!(run("var g=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array.prototype),'length').get; try{g.call({});'no'}catch(e){e.constructor.name}"), "TypeError");
-    assert_eq!(run("var g=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype),'byteOffset').get; g.call(new Uint8Array(new ArrayBuffer(8),2,3))"), "2");
+    assert_eq!(
+        run(
+            "var p=Object.getPrototypeOf(Int8Array.prototype); typeof Object.getOwnPropertyDescriptor(p,'byteLength').get"
+        ),
+        "function"
+    );
+    assert_eq!(
+        run(
+            "var g=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array.prototype),'length').get; try{g.call({});'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "var g=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype),'byteOffset').get; g.call(new Uint8Array(new ArrayBuffer(8),2,3))"
+        ),
+        "2"
+    );
     // normal instance reads still work
     assert_eq!(run("new Float64Array(3).byteLength"), "24");
     assert_eq!(
@@ -10412,7 +8186,12 @@ fn shadow_realm_wrapped_fn() {
         "hi"
     );
     // a wrapped function isn't constructable, and passing an object throws
-    assert_eq!(run("var r=new ShadowRealm(); var f=r.evaluate('x=>x'); try{f({})}catch(e){e.constructor.name}"), "TypeError");
+    assert_eq!(
+        run(
+            "var r=new ShadowRealm(); var f=r.evaluate('x=>x'); try{f({})}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
     // returned function from a wrapped call is itself wrapped
     assert_eq!(
         run("var r=new ShadowRealm(); var f=r.evaluate('a=>b=>a+b'); typeof f(1)"),
@@ -10442,9 +8221,19 @@ fn array_exotic_defineprop() {
         "1,false"
     );
     // defining an index past length grows length
-    assert_eq!(run("var a=[1]; Object.defineProperty(a,'5',{value:9,writable:true,enumerable:true,configurable:true}); a.length"), "6");
+    assert_eq!(
+        run(
+            "var a=[1]; Object.defineProperty(a,'5',{value:9,writable:true,enumerable:true,configurable:true}); a.length"
+        ),
+        "6"
+    );
     // non-writable length blocks index growth
-    assert_eq!(run("var a=[1]; Object.defineProperty(a,'length',{writable:false}); var ok=true; try{Object.defineProperty(a,'5',{value:9})}catch(e){} a.length"), "1");
+    assert_eq!(
+        run(
+            "var a=[1]; Object.defineProperty(a,'length',{writable:false}); var ok=true; try{Object.defineProperty(a,'5',{value:9})}catch(e){} a.length"
+        ),
+        "1"
+    );
     // valid length set works
     assert_eq!(
         run("var a=[1,2]; Object.defineProperty(a,'length',{value:5}); a.length"),
@@ -10496,7 +8285,12 @@ fn proxy_get_invariant() {
         matches!(Engine::new().eval("var t={};Object.defineProperty(t,'x',{get:undefined,configurable:false});var p=new Proxy(t,{get(){return 2}});p.x", false), Ok(Completion::Throw{ref name,..}) if name=="TypeError")
     );
     // returning the same value is fine
-    assert_eq!(run("var t={};Object.defineProperty(t,'x',{value:1,writable:false,configurable:false});var p=new Proxy(t,{get(){return 1}});p.x"), "1");
+    assert_eq!(
+        run(
+            "var t={};Object.defineProperty(t,'x',{value:1,writable:false,configurable:false});var p=new Proxy(t,{get(){return 1}});p.x"
+        ),
+        "1"
+    );
     // configurable property: trap can return anything
     assert_eq!(
         run("var t={x:1};var p=new Proxy(t,{get(){return 9}});p.x"),
@@ -10605,7 +8399,12 @@ fn arraybuffer_length_validation() {
 }
 #[test]
 fn array_methods_coerce_primitive() {
-    assert_eq!(run("Boolean.prototype[0]=true;Boolean.prototype.length=1;Array.prototype.lastIndexOf.call(true,true)"), "0");
+    assert_eq!(
+        run(
+            "Boolean.prototype[0]=true;Boolean.prototype.length=1;Array.prototype.lastIndexOf.call(true,true)"
+        ),
+        "0"
+    );
     assert_eq!(run("Array.prototype.indexOf.call('abc','b')"), "1");
     assert_eq!(run("Array.prototype.join.call('abc','-')"), "a-b-c");
     assert_eq!(
@@ -10641,7 +8440,12 @@ fn array_concat_slice_holes() {
 fn date_parse_rfc() {
     assert_eq!(run("Date.parse('Thu, 01 Jan 1970 00:00:00 GMT')"), "0");
     assert_eq!(run("Date.parse('Thu Jan 01 1970 00:00:00 GMT+0000')"), "0");
-    assert_eq!(run("var d=new Date(Date.UTC(1993,6,28,14,39,7)); Date.parse(d.toUTCString())===d.getTime()-d.getMilliseconds()"), "true");
+    assert_eq!(
+        run(
+            "var d=new Date(Date.UTC(1993,6,28,14,39,7)); Date.parse(d.toUTCString())===d.getTime()-d.getMilliseconds()"
+        ),
+        "true"
+    );
     assert_eq!(
         run("Date.parse('Mon, 25 Dec 1995 13:30:00 GMT')"),
         "819898200000"
@@ -10849,7 +8653,12 @@ fn generator_coroutine() {
         "10"
     );
     // return value
-    assert_eq!(run("function* g(){yield 1;return 9}var it=g();it.next();var r=it.next();r.value+','+r.done"), "9,true");
+    assert_eq!(
+        run(
+            "function* g(){yield 1;return 9}var it=g();it.next();var r=it.next();r.value+','+r.done"
+        ),
+        "9,true"
+    );
     // return() method
     assert_eq!(
         run("function* g(){yield 1;yield 2}var it=g();it.next();it.return(5).value"),
@@ -10872,9 +8681,19 @@ fn generator_coroutine() {
         "6"
     );
     // infinite generator, taken lazily
-    assert_eq!(run("function* nat(){var i=0;while(true)yield i++}var it=nat();it.next();it.next();it.next().value"), "2");
+    assert_eq!(
+        run(
+            "function* nat(){var i=0;while(true)yield i++}var it=nat();it.next();it.next();it.next().value"
+        ),
+        "2"
+    );
     // side-effect ordering
-    assert_eq!(run("var log='';function* g(){log+='1';yield;log+='2';yield;log+='3'}var it=g();it.next();it.next();log"), "12");
+    assert_eq!(
+        run(
+            "var log='';function* g(){log+='1';yield;log+='2';yield;log+='3'}var it=g();it.next();it.next();log"
+        ),
+        "12"
+    );
 }
 #[test]
 fn async_coroutine() {
@@ -10892,7 +8711,13 @@ fn async_coroutine() {
         two("globalThis.r=0;(async()=>{globalThis.r=await 5})()", "r"),
         "5"
     );
-    assert_eq!(two("globalThis.r='';(async()=>{globalThis.r+='a';await 0;globalThis.r+='b'})();globalThis.r+='c'", "r"), "acb"); // await suspends after 'a', 'c' runs sync, then 'b'
+    assert_eq!(
+        two(
+            "globalThis.r='';(async()=>{globalThis.r+='a';await 0;globalThis.r+='b'})();globalThis.r+='c'",
+            "r"
+        ),
+        "acb"
+    ); // await suspends after 'a', 'c' runs sync, then 'b'
     assert_eq!(
         two(
             "globalThis.r=0;async function f(){return 7}f().then(v=>globalThis.r=v)",
@@ -10907,8 +8732,20 @@ fn async_coroutine() {
         ),
         "9"
     );
-    assert_eq!(two("globalThis.r=0;async function f(){var x=await 1;var y=await 2;return x+y}f().then(v=>globalThis.r=v)", "r"), "3");
-    assert_eq!(two("globalThis.r=0;async function f(){try{await Promise.reject(8)}catch(e){return e+1}}f().then(v=>globalThis.r=v)", "r"), "9");
+    assert_eq!(
+        two(
+            "globalThis.r=0;async function f(){var x=await 1;var y=await 2;return x+y}f().then(v=>globalThis.r=v)",
+            "r"
+        ),
+        "3"
+    );
+    assert_eq!(
+        two(
+            "globalThis.r=0;async function f(){try{await Promise.reject(8)}catch(e){return e+1}}f().then(v=>globalThis.r=v)",
+            "r"
+        ),
+        "9"
+    );
     assert_eq!(
         two(
             "globalThis.r='';async function f(){for(var i=0;i<3;i++){await 0;globalThis.r+=i}}f()",
@@ -10916,7 +8753,13 @@ fn async_coroutine() {
         ),
         "012"
     );
-    assert_eq!(two("globalThis.r=0;async function f(){return await Promise.resolve(42)}f().then(v=>globalThis.r=v)", "r"), "42");
+    assert_eq!(
+        two(
+            "globalThis.r=0;async function f(){return await Promise.resolve(42)}f().then(v=>globalThis.r=v)",
+            "r"
+        ),
+        "42"
+    );
 }
 #[test]
 fn async_generator_coroutine() {
@@ -10930,11 +8773,29 @@ fn async_generator_coroutine() {
         }
     }
     // async generator yields, consumed via for-await collected into a global
-    assert_eq!(two("globalThis.r='';async function* g(){yield 1;yield 2;yield 3}(async()=>{for await(const x of g())globalThis.r+=x})()", "r"), "123");
+    assert_eq!(
+        two(
+            "globalThis.r='';async function* g(){yield 1;yield 2;yield 3}(async()=>{for await(const x of g())globalThis.r+=x})()",
+            "r"
+        ),
+        "123"
+    );
     // await inside async generator
-    assert_eq!(two("globalThis.r='';async function* g(){yield await Promise.resolve('a');yield 'b'}(async()=>{for await(const x of g())globalThis.r+=x})()", "r"), "ab");
+    assert_eq!(
+        two(
+            "globalThis.r='';async function* g(){yield await Promise.resolve('a');yield 'b'}(async()=>{for await(const x of g())globalThis.r+=x})()",
+            "r"
+        ),
+        "ab"
+    );
     // next() returns a promise of {value,done}
-    assert_eq!(two("globalThis.r=0;async function* g(){yield 5}g().next().then(o=>globalThis.r=o.value+(o.done?'D':'N'))", "r"), "5N");
+    assert_eq!(
+        two(
+            "globalThis.r=0;async function* g(){yield 5}g().next().then(o=>globalThis.r=o.value+(o.done?'D':'N'))",
+            "r"
+        ),
+        "5N"
+    );
     assert_eq!(
         two(
             "globalThis.r=0;async function* g(){}g().next().then(o=>globalThis.r=(o.done?'D':'N'))",
@@ -11094,7 +8955,9 @@ fn new_target_basics() {
     );
     // Reflect.construct honors its newTarget argument's prototype.
     assert_eq!(
-        run("function A(){} function B(){} var o=Reflect.construct(A,[],B); Object.getPrototypeOf(o)===B.prototype"),
+        run(
+            "function A(){} function B(){} var o=Reflect.construct(A,[],B); Object.getPrototypeOf(o)===B.prototype"
+        ),
         "true"
     );
 }
@@ -11181,7 +9044,9 @@ fn iterator_includes_and_join() {
     assert_eq!(run("[1,2,3].values().includes(2,2)"), "false");
     assert_eq!(throws("[1].values().includes(1,'0')"), "TypeError");
     assert_eq!(
-        run("var c=0;var o={__proto__:Iterator.prototype,next(){return{value:1,done:false}},return(){c++;return{}}};[o.includes(1),c].join(',')"),
+        run(
+            "var c=0;var o={__proto__:Iterator.prototype,next(){return{value:1,done:false}},return(){c++;return{}}};[o.includes(1),c].join(',')"
+        ),
         "true,1"
     );
 
@@ -11189,7 +9054,9 @@ fn iterator_includes_and_join() {
     // close the source, while ordinary exhaustion does not.
     assert_eq!(run("[1,null,undefined,4].values().join('-')"), "1---4");
     assert_eq!(
-        run("var c=0;var bad={toString(){throw 1}};var o={__proto__:Iterator.prototype,i:0,next(){return this.i++?{done:true}:{value:bad,done:false}},return(){c++;return{}}};try{o.join()}catch(e){}String(c)"),
+        run(
+            "var c=0;var bad={toString(){throw 1}};var o={__proto__:Iterator.prototype,i:0,next(){return this.i++?{done:true}:{value:bad,done:false}},return(){c++;return{}}};try{o.join()}catch(e){}String(c)"
+        ),
         "1"
     );
 }
@@ -11203,7 +9070,9 @@ fn iterator_chunks_and_windows() {
     );
     // Windows retain the previous window without sharing the yielded arrays with page code.
     assert_eq!(
-        run("var w=[1,2,3,4].values().windows(2);var a=w.next().value;a[1]=9;a.join('')+';'+w.next().value.join('')"),
+        run(
+            "var w=[1,2,3,4].values().windows(2);var a=w.next().value;a[1]=9;a.join('')+';'+w.next().value.join('')"
+        ),
         "19;23"
     );
     assert_eq!(
@@ -11214,7 +9083,9 @@ fn iterator_chunks_and_windows() {
     assert_eq!(throws("[1].values().windows(1,'bad')"), "TypeError");
     // Once exhaustion has been observed, return() does not close the underlying iterator again.
     assert_eq!(
-        run("var c=0;var o={__proto__:Iterator.prototype,next(){return{done:true}},return(){c++;return{}}};var h=o.chunks(2);h.next();h.return();String(c)"),
+        run(
+            "var c=0;var o={__proto__:Iterator.prototype,next(){return{done:true}},return(){c++;return{}}};var h=o.chunks(2);h.next();h.return();String(c)"
+        ),
         "0"
     );
 }
@@ -11326,7 +9197,9 @@ fn boxed_symbol_wrapper() {
         "true"
     );
     assert_eq!(
-        run("Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get.call(Object(Symbol('d')))"),
+        run(
+            "Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get.call(Object(Symbol('d')))"
+        ),
         "d"
     );
 }
@@ -11385,7 +9258,9 @@ fn symbol_proto_to_primitive_and_tag() {
     );
     // The @@toPrimitive property is non-writable, non-enumerable, configurable.
     assert_eq!(
-        run("var d=Object.getOwnPropertyDescriptor(Symbol.prototype, Symbol.toPrimitive); [d.writable,d.enumerable,d.configurable].join(',')"),
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Symbol.prototype, Symbol.toPrimitive); [d.writable,d.enumerable,d.configurable].join(',')"
+        ),
         "false,false,true"
     );
 }
@@ -11451,7 +9326,9 @@ fn json_stringify_space_and_replacer_tostring() {
     );
     // BigInt with a toJSON serializes the toJSON result instead of throwing.
     assert_eq!(
-        run("BigInt.prototype.toJSON=function(){return 'big';}; var r=JSON.stringify(5n); delete BigInt.prototype.toJSON; r"),
+        run(
+            "BigInt.prototype.toJSON=function(){return 'big';}; var r=JSON.stringify(5n); delete BigInt.prototype.toJSON; r"
+        ),
         r#""big""#
     );
 }
@@ -11469,7 +9346,9 @@ fn json_parse_reviver() {
     );
     // The reviver is called with keys bottom-up then the root "".
     assert_eq!(
-        run("var ks=[]; JSON.parse('{\"a\":[1,2]}', function(k,v){ks.push(k);return v;}); ks.join(',')"),
+        run(
+            "var ks=[]; JSON.parse('{\"a\":[1,2]}', function(k,v){ks.push(k);return v;}); ks.join(',')"
+        ),
         "0,1,a,"
     );
 }
@@ -11512,12 +9391,16 @@ fn object_assign_semantics() {
     assert_eq!(throws("Object.assign(null, {})"), "TypeError");
     // Symbol-keyed and string-keyed enumerable own properties are copied; result is the target.
     assert_eq!(
-        run("var s=Symbol(); var t={}; var r=Object.assign(t, {a:1}, (function(){var o={};o[s]=2;return o;})()); [r===t, r.a, r[s]].join(',')"),
+        run(
+            "var s=Symbol(); var t={}; var r=Object.assign(t, {a:1}, (function(){var o={};o[s]=2;return o;})()); [r===t, r.a, r[s]].join(',')"
+        ),
         "true,1,2"
     );
     // Assigning to a non-writable target property throws.
     assert_eq!(
-        throws("var t=Object.defineProperty({}, 'x', {value:1, writable:false}); Object.assign(t, {x:2})"),
+        throws(
+            "var t=Object.defineProperty({}, 'x', {value:1, writable:false}); Object.assign(t, {x:2})"
+        ),
         "TypeError"
     );
     // null/undefined sources are skipped.
@@ -11670,7 +9553,9 @@ fn set_operations_spec() {
 fn number_constants_and_tofixed() {
     // The numeric constants are non-writable/enumerable/configurable.
     assert_eq!(
-        run("var d=Object.getOwnPropertyDescriptor(Number,'MAX_VALUE'); [d.writable,d.enumerable,d.configurable].join(',')"),
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Number,'MAX_VALUE'); [d.writable,d.enumerable,d.configurable].join(',')"
+        ),
         "false,false,false"
     );
     assert_eq!(run("Number.MAX_VALUE = 1; Number.MAX_VALUE === 1"), "false");
@@ -11713,7 +9598,9 @@ fn math_constants_and_hypot() {
         "number,number,number"
     );
     assert_eq!(
-        run("var d=Object.getOwnPropertyDescriptor(Math,'PI'); [d.writable,d.enumerable,d.configurable].join(',')"),
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Math,'PI'); [d.writable,d.enumerable,d.configurable].join(',')"
+        ),
         "false,false,false"
     );
     assert_eq!(run("Math.PI = 3; Math.PI === 3"), "false");
@@ -11786,7 +9673,9 @@ fn array_to_locale_string() {
 fn array_sort_holes_and_delete() {
     // Holes sort to the very end and remain holes (not own undefined properties).
     assert_eq!(
-        run("var a=[3,,1,undefined]; a.sort(); [a.join(','), a.length, a.hasOwnProperty(3)].join('|')"),
+        run(
+            "var a=[3,,1,undefined]; a.sort(); [a.join(','), a.length, a.hasOwnProperty(3)].join('|')"
+        ),
         "1,3,,|4|false"
     );
     // Present undefined sorts after defined values but before holes.
@@ -11831,7 +9720,9 @@ fn array_of_constructor() {
     assert_eq!(run("Array.isArray(Array.of(7))"), "true");
     // Honors a custom `this` constructor.
     assert_eq!(
-        run("function C(n){this.n=n;} var r=Array.of.call(C,'a','b'); [r instanceof C, r[0], r.length].join(',')"),
+        run(
+            "function C(n){this.n=n;} var r=Array.of.call(C,'a','b'); [r instanceof C, r[0], r.length].join(',')"
+        ),
         "true,a,2"
     );
 }
@@ -11853,7 +9744,9 @@ fn array_concat_spreadable_and_proxy() {
     assert_eq!(run("[1].concat(new Proxy([2,3],{})).length"), "3");
     // @@isConcatSpreadable forces (or suppresses) spreading.
     assert_eq!(
-        run("var o={length:2,0:'a',1:'b'}; o[Symbol.isConcatSpreadable]=true; [].concat(o).join(',')"),
+        run(
+            "var o={length:2,0:'a',1:'b'}; o[Symbol.isConcatSpreadable]=true; [].concat(o).join(',')"
+        ),
         "a,b"
     );
     assert_eq!(
@@ -11911,7 +9804,9 @@ fn regexp_flags_getter_generic() {
     assert_eq!(run("/x/dgimsy.flags"), "dgimsy");
     // The flags getter is generic — it reads each component accessor from the receiver.
     assert_eq!(
-        run("Object.getOwnPropertyDescriptor(RegExp.prototype,'flags').get.call({global:true, sticky:true, hasIndices:true})"),
+        run(
+            "Object.getOwnPropertyDescriptor(RegExp.prototype,'flags').get.call({global:true, sticky:true, hasIndices:true})"
+        ),
         "dgy"
     );
     // RegExp.prototype itself yields empty flags.
@@ -11952,7 +9847,9 @@ fn reflect_set_receiver() {
     );
     // An inherited setter is invoked with the receiver as `this`.
     assert_eq!(
-        run("var got; var proto={set p(v){got=this;}}; var r=Object.create(proto); Reflect.set(r,'p',1,r); got===r"),
+        run(
+            "var got; var proto={set p(v){got=this;}}; var r=Object.create(proto); Reflect.set(r,'p',1,r); got===r"
+        ),
         "true"
     );
 }
@@ -11971,7 +9868,9 @@ fn arraybuffer_accessor_getters() {
     );
     // A resizable buffer reports its max and resizes.
     assert_eq!(
-        run("var b=new ArrayBuffer(4, {maxByteLength:16}); [b.resizable, b.maxByteLength].join(',')"),
+        run(
+            "var b=new ArrayBuffer(4, {maxByteLength:16}); [b.resizable, b.maxByteLength].join(',')"
+        ),
         "true,16"
     );
     assert_eq!(
@@ -11995,7 +9894,9 @@ fn shared_array_buffer_getters() {
     );
     assert_eq!(run("new SharedArrayBuffer(8).growable"), "false");
     assert_eq!(
-        run("var s=new SharedArrayBuffer(4,{maxByteLength:16}); [s.growable, s.maxByteLength].join(',')"),
+        run(
+            "var s=new SharedArrayBuffer(4,{maxByteLength:16}); [s.growable, s.maxByteLength].join(',')"
+        ),
         "true,16"
     );
     assert_eq!(
@@ -12011,12 +9912,16 @@ fn shared_array_buffer_getters() {
 #[test]
 fn atomics_index_and_ops() {
     assert_eq!(
-        run("var ta=new Int32Array(new SharedArrayBuffer(8)); Atomics.store(ta,0,42); Atomics.load(ta,0)"),
+        run(
+            "var ta=new Int32Array(new SharedArrayBuffer(8)); Atomics.store(ta,0,42); Atomics.load(ta,0)"
+        ),
         "42"
     );
     // A fractional access index is truncated (ToIndex), not rejected.
     assert_eq!(
-        run("var ta=new Int32Array(new SharedArrayBuffer(8)); Atomics.store(ta,1.9,7); Atomics.load(ta,1)"),
+        run(
+            "var ta=new Int32Array(new SharedArrayBuffer(8)); Atomics.store(ta,1.9,7); Atomics.load(ta,1)"
+        ),
         "7"
     );
     assert_eq!(
@@ -12094,10 +9999,176 @@ fn weakref_brand_and_tag() {
 }
 
 #[test]
+fn weak_targets_clear_between_jobs_but_not_during_the_creating_job() {
+    // WeakRef construction performs AddToKeptObjects, so an explicit collection in the same job
+    // cannot clear the target.
+    assert_eq!(
+        run(
+            "var target = {}, weak = new WeakRef(target); target = null; $262.gc(); weak.deref() !== undefined"
+        ),
+        "true"
+    );
+
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var first, second; (() => { const target = {}; first = new WeakRef(target); second = new WeakRef(target); })();",
+            false,
+        )
+        .expect("setup parses");
+    // ClearKeptObjects ran when the setup job ended. One collection atomically clears every
+    // WeakRef for the same non-live target.
+    assert!(matches!(
+        engine
+            .eval("$262.gc(); first.deref() === undefined && second.deref() === undefined", false)
+            .expect("collection parses"),
+        Completion::Value(ref value) if value == "true"
+    ));
+}
+
+#[test]
+fn finalization_registry_retention_and_cleanup_jobs() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var cleaned = [], heldWeak;
+             var registry = new FinalizationRegistry(value => cleaned.push(value.tag));
+             (() => {
+               const target = {};
+               const held = { tag: 'held' };
+               heldWeak = new WeakRef(held);
+               // Using the target itself as unregister token must not keep it alive.
+               registry.register(target, held, target);
+             })();",
+            false,
+        )
+        .expect("setup parses");
+    engine.eval("$262.gc()", false).expect("collection parses");
+    assert!(matches!(
+        engine
+            .eval(
+                "cleaned.join(',') + ':' + String(heldWeak.deref() !== undefined)",
+                false
+            )
+            .expect("result parses"),
+        Completion::Value(ref value) if value == "held:false"
+    ));
+
+    // A live unregister token removes every matching cell and suppresses cleanup.
+    assert_eq!(
+        run(
+            "var calls=0, token={}, fr=new FinalizationRegistry(()=>calls++); fr.register({}, 1, token); fr.register({}, 2, token); [fr.unregister(token), fr.unregister(token), calls].join(',')"
+        ),
+        "true,false,0"
+    );
+}
+
+#[test]
+fn weakmap_uses_ephemeron_liveness() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var map = new WeakMap(), keyWeak, valueWeak;
+             (() => {
+               const key = {}, value = { key };
+               keyWeak = new WeakRef(key);
+               valueWeak = new WeakRef(value);
+               map.set(key, value);
+             })();",
+            false,
+        )
+        .expect("setup parses");
+    // A value->key cycle cannot bootstrap the weak key's liveness.
+    assert!(matches!(
+        engine
+            .eval(
+                "$262.gc(); keyWeak.deref() === undefined && valueWeak.deref() === undefined",
+                false
+            )
+            .expect("collection parses"),
+        Completion::Value(ref value) if value == "true"
+    ));
+
+    // Conversely, a genuinely live head key reveals the values/keys of an ephemeron chain to the
+    // fixed point; a single collection must not truncate it.
+    engine
+        .eval(
+            "var chain = new WeakMap(), head = {}, key = head;
+             for (var i = 0; i < 10000; i++) { const next = {}; chain.set(key, next); key = next; }
+             key = null;",
+            false,
+        )
+        .expect("chain setup parses");
+    assert!(matches!(
+        engine
+            .eval(
+                "$262.gc(); var count=0; for (var cursor=head; cursor; cursor=chain.get(cursor)) count++; count",
+                false
+            )
+            .expect("chain collection parses"),
+        Completion::Value(ref value) if value == "10001"
+    ));
+}
+
+#[test]
+fn pointer_keyed_side_tables_release_dead_owners() {
+    let mut engine = Engine::new();
+    let before = (
+        engine.interp.gc_pins.len(),
+        engine.interp.map_data.len(),
+        engine.interp.array_buffers.len(),
+        engine.interp.typed_arrays.len(),
+        engine.interp.data_views.len(),
+        engine.interp.regexps.len(),
+        engine.interp.proxies.len(),
+        engine.interp.promises.len(),
+        engine.interp.shadow_realms.len(),
+        engine.interp.realms.len(),
+        engine.interp.weak_refs.len(),
+        engine.interp.finalization_registries.len(),
+    );
+    engine
+        .eval(
+            "(() => {
+               const buffer = new ArrayBuffer(16);
+               new Uint8Array(buffer); new DataView(buffer);
+               new Map([[{}, {}]]); /side-table/;
+               new Proxy({}, {}); new Promise(() => {});
+               new ShadowRealm(); $262.createRealm(); new WeakRef({});
+               const registry = new FinalizationRegistry(() => {});
+               registry.register({}, {});
+             })();",
+            false,
+        )
+        .expect("side-table setup parses");
+    engine.interp.gc_collect();
+    let after = (
+        engine.interp.gc_pins.len(),
+        engine.interp.map_data.len(),
+        engine.interp.array_buffers.len(),
+        engine.interp.typed_arrays.len(),
+        engine.interp.data_views.len(),
+        engine.interp.regexps.len(),
+        engine.interp.proxies.len(),
+        engine.interp.promises.len(),
+        engine.interp.shadow_realms.len(),
+        engine.interp.realms.len(),
+        engine.interp.weak_refs.len(),
+        engine.interp.finalization_registries.len(),
+    );
+    assert_eq!(
+        after, before,
+        "dead internal-slot owners retained side tables"
+    );
+}
+
+#[test]
 fn promise_resolving_function_shape() {
     // The executor's resolve/reject functions have length 1 and an empty name.
     assert_eq!(
-        run("var o; new Promise((res,rej)=>{o=[res.length,rej.length,res.name,rej.name];}); o.join('|')"),
+        run(
+            "var o; new Promise((res,rej)=>{o=[res.length,rej.length,res.name,rej.name];}); o.join('|')"
+        ),
         "1|1||"
     );
 }
@@ -12112,7 +10183,9 @@ fn reflect_completeness() {
     assert_eq!(throws("Reflect.apply(Math.max, null, 5)"), "TypeError");
     // ownKeys order: integer indices ascending, then strings, then symbols.
     assert_eq!(
-        run("var s=Symbol(); var o={}; o.b=1;o[2]=1;o.a=1;o[0]=1;o[1]=1;o[s]=1; var k=Reflect.ownKeys(o); k.slice(0,5).join(',')"),
+        run(
+            "var s=Symbol(); var o={}; o.b=1;o[2]=1;o.a=1;o[0]=1;o[1]=1;o[s]=1; var k=Reflect.ownKeys(o); k.slice(0,5).join(',')"
+        ),
         "0,1,2,b,a"
     );
     // get honors the receiver for accessors; setPrototypeOf detects cycles.
@@ -12126,7 +10199,9 @@ fn reflect_completeness() {
     );
     // has/getOwnPropertyDescriptor go through proxy traps.
     assert_eq!(
-        run("var t=false; try{Reflect.has(new Proxy({},{has(){throw new TypeError();}}),'x');}catch(e){t=e instanceof TypeError;} t"),
+        run(
+            "var t=false; try{Reflect.has(new Proxy({},{has(){throw new TypeError();}}),'x');}catch(e){t=e instanceof TypeError;} t"
+        ),
         "true"
     );
     assert_eq!(
@@ -12166,7 +10241,9 @@ fn object_freeze_seal_integrity() {
 fn object_define_properties_spec() {
     // create/defineProperties handle symbol-keyed descriptors and ToObject(Properties).
     assert_eq!(
-        run("var s=Symbol.for('s'); var o=Object.create(null,{x:{value:5,enumerable:true},[s]:{value:9}}); [o.x, o[s]].join(',')"),
+        run(
+            "var s=Symbol.for('s'); var o=Object.create(null,{x:{value:5,enumerable:true},[s]:{value:9}}); [o.x, o[s]].join(',')"
+        ),
         "5,9"
     );
     // A null Properties argument throws (ToObject(null)).
@@ -12174,7 +10251,9 @@ fn object_define_properties_spec() {
     assert_eq!(throws("Object.defineProperties({}, null)"), "TypeError");
     // Only enumerable descriptor entries are applied.
     assert_eq!(
-        run("Object.defineProperties({}, Object.defineProperty({}, 'skip', {value:{value:1}, enumerable:false})).hasOwnProperty('skip')"),
+        run(
+            "Object.defineProperties({}, Object.defineProperty({}, 'skip', {value:{value:1}, enumerable:false})).hasOwnProperty('skip')"
+        ),
         "false"
     );
 }
@@ -12227,7 +10306,9 @@ fn atomics_methods_and_validation() {
     );
     // waitAsync returns a { async, value } record synchronously here.
     assert_eq!(
-        run("var w=Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(8)),0,999); [w.async,w.value].join(',')"),
+        run(
+            "var w=Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(8)),0,999); [w.async,w.value].join(',')"
+        ),
         "false,not-equal"
     );
     // pause validates its optional integer argument.
@@ -12239,11 +10320,15 @@ fn atomics_methods_and_validation() {
 fn shared_array_buffer_aliasing() {
     // Two TypedArrays over the same SharedArrayBuffer alias the same (registry-backed) memory.
     assert_eq!(
-        run("var s=new SharedArrayBuffer(16); var a=new Int32Array(s); var b=new Int32Array(s); a[0]=42; b[0]"),
+        run(
+            "var s=new SharedArrayBuffer(16); var a=new Int32Array(s); var b=new Int32Array(s); a[0]=42; b[0]"
+        ),
         "42"
     );
     assert_eq!(
-        run("var s=new SharedArrayBuffer(16); var a=new Int32Array(s); var b=new Int32Array(s); Atomics.store(a,1,99); Atomics.load(b,1)"),
+        run(
+            "var s=new SharedArrayBuffer(16); var a=new Int32Array(s); var b=new Int32Array(s); Atomics.store(a,1,99); Atomics.load(b,1)"
+        ),
         "99"
     );
     // wait returns 'not-equal' immediately when the value already differs.
@@ -12267,17 +10352,23 @@ fn shared_array_buffer_aliasing() {
 fn atomics_wait_async() {
     // A value mismatch resolves synchronously (not async).
     assert_eq!(
-        run("var a=new Int32Array(new SharedArrayBuffer(8)); a[0]=9; var r=Atomics.waitAsync(a,0,0); [r.async, r.value].join(',')"),
+        run(
+            "var a=new Int32Array(new SharedArrayBuffer(8)); a[0]=9; var r=Atomics.waitAsync(a,0,0); [r.async, r.value].join(',')"
+        ),
         "false,not-equal"
     );
     // A zero timeout times out synchronously.
     assert_eq!(
-        run("var a=new Int32Array(new SharedArrayBuffer(8)); var r=Atomics.waitAsync(a,0,0,0); [r.async, r.value].join(',')"),
+        run(
+            "var a=new Int32Array(new SharedArrayBuffer(8)); var r=Atomics.waitAsync(a,0,0,0); [r.async, r.value].join(',')"
+        ),
         "false,timed-out"
     );
     // Otherwise it returns a pending promise that resolves once notified (driven by the event loop).
     assert_eq!(
-        run("var a=new Int32Array(new SharedArrayBuffer(8)); var out='?'; var r=Atomics.waitAsync(a,0,0,2000); r.value.then(function(v){out=v;}); Atomics.notify(a,0,1); out"),
+        run(
+            "var a=new Int32Array(new SharedArrayBuffer(8)); var out='?'; var r=Atomics.waitAsync(a,0,0,2000); r.value.then(function(v){out=v;}); Atomics.notify(a,0,1); out"
+        ),
         "?"
     );
     assert_eq!(
@@ -12299,12 +10390,16 @@ fn atomics_wait_async() {
 fn dataview_length_tracking_and_toprimitive() {
     // A length-tracking DataView over a resizable buffer follows the buffer's current length.
     assert_eq!(
-        run("var b=new ArrayBuffer(8,{maxByteLength:16}); var dv=new DataView(b); var a=dv.byteLength; b.resize(16); a+','+dv.byteLength"),
+        run(
+            "var b=new ArrayBuffer(8,{maxByteLength:16}); var dv=new DataView(b); var a=dv.byteLength; b.resize(16); a+','+dv.byteLength"
+        ),
         "8,16"
     );
     // A shrunk resizable buffer makes an out-of-bounds fixed-length view throw on access.
     assert_eq!(
-        throws("var b=new ArrayBuffer(16,{maxByteLength:16}); var dv=new DataView(b,8,8); b.resize(4); dv.getInt8(0)"),
+        throws(
+            "var b=new ArrayBuffer(16,{maxByteLength:16}); var dv=new DataView(b,8,8); b.resize(4); dv.getInt8(0)"
+        ),
         "TypeError"
     );
     // @@toStringTag and getter names.
@@ -12320,7 +10415,9 @@ fn dataview_length_tracking_and_toprimitive() {
     );
     // A detached buffer is still an ArrayBuffer: ToNumber(byteOffset) runs before the detach throw.
     assert_eq!(
-        run("var n=0; var ab=new ArrayBuffer(8); var t=ab.transfer(); var o={valueOf(){n++;return 0;}}; try{new DataView(ab,o);}catch(e){} n"),
+        run(
+            "var n=0; var ab=new ArrayBuffer(8); var t=ab.transfer(); var o={valueOf(){n++;return 0;}}; try{new DataView(ab,o);}catch(e){} n"
+        ),
         "1"
     );
 }
@@ -12329,7 +10426,9 @@ fn dataview_length_tracking_and_toprimitive() {
 fn immutable_array_buffer() {
     // transferToImmutable produces an immutable buffer and detaches the source.
     assert_eq!(
-        run("var a=new ArrayBuffer(8); var i=a.transferToImmutable(); [i.immutable, a.detached, i.byteLength].join(',')"),
+        run(
+            "var a=new ArrayBuffer(8); var i=a.transferToImmutable(); [i.immutable, a.detached, i.byteLength].join(',')"
+        ),
         "true,true,8"
     );
     // Writing to an immutable buffer via a DataView throws TypeError (before reading arguments).
@@ -12344,7 +10443,9 @@ fn immutable_array_buffer() {
     );
     // sliceToImmutable copies a range without detaching the source.
     assert_eq!(
-        run("var a=new ArrayBuffer(8); new DataView(a).setInt8(2,7); var s=a.sliceToImmutable(2,4); [s.immutable,s.byteLength,a.detached,new DataView(s).getInt8(0)].join(',')"),
+        run(
+            "var a=new ArrayBuffer(8); new DataView(a).setInt8(2,7); var s=a.sliceToImmutable(2,4); [s.immutable,s.byteLength,a.detached,new DataView(s).getInt8(0)].join(',')"
+        ),
         "true,2,false,7"
     );
 }
@@ -12353,12 +10454,16 @@ fn immutable_array_buffer() {
 fn float16_rounds_once() {
     // 2^-25 + ε must round up to the smallest f16 subnormal (2^-24), not double-round to zero.
     assert_eq!(
-        run("var dv=new DataView(new ArrayBuffer(8)); dv.setFloat16(0, 2.980232238769532e-8); dv.getFloat16(0)"),
+        run(
+            "var dv=new DataView(new ArrayBuffer(8)); dv.setFloat16(0, 2.980232238769532e-8); dv.getFloat16(0)"
+        ),
         "5.960464477539063e-8"
     );
     // Exactly 2^-25 ties to even → zero.
     assert_eq!(
-        run("var dv=new DataView(new ArrayBuffer(8)); dv.setFloat16(0, 2.9802322387695312e-8); dv.getFloat16(0)"),
+        run(
+            "var dv=new DataView(new ArrayBuffer(8)); dv.setFloat16(0, 2.9802322387695312e-8); dv.getFloat16(0)"
+        ),
         "0"
     );
     assert_eq!(run("Math.f16round(1.337)"), "1.3369140625");
@@ -12373,12 +10478,16 @@ fn typedarray_iteration_semantics() {
     );
     // Callback methods observe live element writes during iteration.
     assert_eq!(
-        run("var a=new Int32Array([5,6,7]); var seen=[]; a.forEach(function(v,idx){ if(idx===0)a[1]=42; seen.push(v);}); seen.join(',')"),
+        run(
+            "var a=new Int32Array([5,6,7]); var seen=[]; a.forEach(function(v,idx){ if(idx===0)a[1]=42; seen.push(v);}); seen.join(',')"
+        ),
         "5,42,7"
     );
     // The length is captured once; shrinking mid-iteration surfaces undefined for OOB indices.
     assert_eq!(
-        run("var b=new ArrayBuffer(16,{maxByteLength:16}); var a=new Int32Array(b); a.fill(1); var seen=[]; a.forEach(function(v,idx){ if(idx===1)b.resize(4); seen.push(v);}); seen.map(String).join(',')"),
+        run(
+            "var b=new ArrayBuffer(16,{maxByteLength:16}); var a=new Int32Array(b); a.fill(1); var seen=[]; a.forEach(function(v,idx){ if(idx===1)b.resize(4); seen.push(v);}); seen.map(String).join(',')"
+        ),
         "1,1,undefined,undefined"
     );
     // includes reads OOB as undefined (found), indexOf uses strict equality on in-bounds only.
@@ -12441,7 +10550,12 @@ fn typedarray_sort_semantics() {
         "3,2,1"
     );
     // Sorting an immutable-backed array throws.
-    assert_eq!(throws("var i=(new Int32Array([3,1,2])).buffer.transferToImmutable(); new Int32Array(i).sort()"), "TypeError");
+    assert_eq!(
+        throws(
+            "var i=(new Int32Array([3,1,2])).buffer.transferToImmutable(); new Int32Array(i).sort()"
+        ),
+        "TypeError"
+    );
 }
 
 #[test]
@@ -12456,16 +10570,28 @@ fn typedarray_slice_and_subclass_buffer() {
         "4,5"
     );
     // A TypedArray subclass carries its buffer slot onto the derived `this`.
-    assert_eq!(run("class MyF extends Float32Array {}; var a=new MyF(4); [typeof a.buffer, a.byteLength, a instanceof Float32Array].join(',')"), "object,16,true");
+    assert_eq!(
+        run(
+            "class MyF extends Float32Array {}; var a=new MyF(4); [typeof a.buffer, a.byteLength, a instanceof Float32Array].join(',')"
+        ),
+        "object,16,true"
+    );
     // slice via a subclass source builds a subclass result with a real buffer.
-    assert_eq!(run("class MyU extends Uint8Array {}; var s=new MyU([1,2,3]).slice(1); [typeof s.buffer, s.join(',')].join('|')"), "object|2,3");
+    assert_eq!(
+        run(
+            "class MyU extends Uint8Array {}; var s=new MyU([1,2,3]).slice(1); [typeof s.buffer, s.join(',')].join('|')"
+        ),
+        "object|2,3"
+    );
 }
 
 #[test]
 fn typedarray_subarray_semantics() {
     // subarray shares the buffer (a view, not a copy).
     assert_eq!(
-        run("var a=new Int32Array([1,2,3,4]); var s=a.subarray(1,3); s[0]=9; a.join(',')+'|'+s.join(',')"),
+        run(
+            "var a=new Int32Array([1,2,3,4]); var s=a.subarray(1,3); s[0]=9; a.join(',')+'|'+s.join(',')"
+        ),
         "1,9,3,4|9,3"
     );
     // NaN/false end coerce to 0; a negative end counts from the end.
@@ -12476,7 +10602,9 @@ fn typedarray_subarray_semantics() {
     );
     // A length-tracking source with no end stays length-tracking.
     assert_eq!(
-        run("var b=new ArrayBuffer(16,{maxByteLength:32}); var a=new Int32Array(b); var s=a.subarray(1); var before=s.length; b.resize(32); before+','+s.length"),
+        run(
+            "var b=new ArrayBuffer(16,{maxByteLength:32}); var a=new Int32Array(b); var s=a.subarray(1); var before=s.length; b.resize(32); before+','+s.length"
+        ),
         "3,7"
     );
     // subarray over a detached buffer throws (constructing a view on detached memory).
@@ -12498,21 +10626,35 @@ fn typedarray_identity_and_names() {
         "true"
     );
     // Accessor getter names are prefixed with "get ".
-    assert_eq!(run("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array.prototype),'length').get.name"), "get length");
+    assert_eq!(
+        run(
+            "Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array.prototype),'length').get.name"
+        ),
+        "get length"
+    );
     // toLocaleString on an out-of-bounds view throws.
-    assert_eq!(throws("var b=new ArrayBuffer(16,{maxByteLength:16}); var a=new Int32Array(b,0,4); b.resize(4); a.toLocaleString()"), "TypeError");
+    assert_eq!(
+        throws(
+            "var b=new ArrayBuffer(16,{maxByteLength:16}); var a=new Int32Array(b,0,4); b.resize(4); a.toLocaleString()"
+        ),
+        "TypeError"
+    );
 }
 
 #[test]
 fn array_iterator_exhaustion_and_ta_bounds() {
     // An exhausted iterator stays done even if the array grows afterwards.
     assert_eq!(
-        run("var a=[1]; var it=a[Symbol.iterator](); it.next(); var d=it.next().done; a.push(2,3); [d, it.next().done].join(',')"),
+        run(
+            "var a=[1]; var it=a[Symbol.iterator](); it.next(); var d=it.next().done; a.push(2,3); [d, it.next().done].join(',')"
+        ),
         "true,true"
     );
     // A TypedArray iterator over a shrunk-out-of-bounds view throws TypeError.
     assert_eq!(
-        throws("var b=new ArrayBuffer(16,{maxByteLength:16}); var a=new Int32Array(b,0,4); var it=a[Symbol.iterator](); it.next(); b.resize(4); it.next();"),
+        throws(
+            "var b=new ArrayBuffer(16,{maxByteLength:16}); var a=new Int32Array(b,0,4); var it=a[Symbol.iterator](); it.next(); b.resize(4); it.next();"
+        ),
         "TypeError"
     );
 }
@@ -12524,7 +10666,12 @@ fn typedarray_exotic_internals() {
         run("var a=new Int8Array(3); Object.getOwnPropertyDescriptor(a,'+1')"),
         "undefined"
     );
-    assert_eq!(run("var a=new Int8Array(3); Object.defineProperty(a,'1.0',{value:9,configurable:true}); a['1.0']"), "9");
+    assert_eq!(
+        run(
+            "var a=new Int8Array(3); Object.defineProperty(a,'1.0',{value:9,configurable:true}); a['1.0']"
+        ),
+        "9"
+    );
     // A valid index write via a plain-object receiver whose proto is a TA creates on the receiver.
     assert_eq!(
         run("var t=new Int8Array([5]); var r=Object.create(t); r[0]=9; t[0]+','+r[0]"),
@@ -12550,13 +10697,37 @@ fn typedarray_from_of_validation() {
     assert_eq!(run("Int8Array.from([1,2,3]).join(',')"), "1,2,3");
     assert_eq!(run("Int8Array.of(4,5,6).join(',')"), "4,5,6");
     assert_eq!(run("Uint8Array.from([1,2,3], x=>x*2).join(',')"), "2,4,6");
+    // Dense-constructor shortcuts may only skip iteration when no indexed getter can run.
+    assert_eq!(
+        run(
+            "var calls=0,a=[1,,3];Object.defineProperty(a,'1',{get(){calls++;return 2}});var t=new Uint8Array(a);t.join(',')+'|'+calls"
+        ),
+        "1,2,3|1"
+    );
+    assert_eq!(
+        run(
+            "var a=[1,2,3];a[Symbol.iterator]=function*(){yield 6;yield 5};new Uint8Array(a).join(',')"
+        ),
+        "6,5"
+    );
+    assert_eq!(
+        run(
+            "var values=[1,2,3];Object.getPrototypeOf([].values()).next=function(){var done=!values.length;return {value:values.pop(),done}};new Uint8Array([0]).join(',')"
+        ),
+        "3,2,1"
+    );
     // A custom constructor that returns a non-TypedArray is a TypeError.
     assert_eq!(
         throws("var C=function(){return {};}; Int8Array.from.call(C,[1,2])"),
         "TypeError"
     );
     // A throwing @@iterator getter propagates.
-    assert_eq!(throws("var s={}; Object.defineProperty(s,Symbol.iterator,{get(){throw new TypeError('x');}}); Int8Array.from(s)"), "TypeError");
+    assert_eq!(
+        throws(
+            "var s={}; Object.defineProperty(s,Symbol.iterator,{get(){throw new TypeError('x');}}); Int8Array.from(s)"
+        ),
+        "TypeError"
+    );
 }
 
 #[test]
@@ -12564,7 +10735,9 @@ fn regexp_symbol_methods_are_generic() {
     // @@replace / @@split / @@match / @@search operate through `exec` on a generic object, so a
     // fake matcher with a custom `exec` works.
     assert_eq!(
-        run("var calls=0; var fake={ exec(s){ calls++; return calls===1?Object.assign(['b'],{index:1,length:1}):null; }, global:true, flags:'g' }; RegExp.prototype[Symbol.replace].call(fake, 'abc', 'X')"),
+        run(
+            "var calls=0; var fake={ exec(s){ calls++; return calls===1?Object.assign(['b'],{index:1,length:1}):null; }, global:true, flags:'g' }; RegExp.prototype[Symbol.replace].call(fake, 'abc', 'X')"
+        ),
         "aXc"
     );
     // @@search returns the match index and restores lastIndex.
@@ -12772,7 +10945,10 @@ fn module_live_bindings() {
     assert_eq!(
         run_module(
             &[
-                ("main", "import { n, bump } from 'dep'; const before = n; bump(); globalThis.r = before + ',' + n;"),
+                (
+                    "main",
+                    "import { n, bump } from 'dep'; const before = n; bump(); globalThis.r = before + ',' + n;"
+                ),
                 ("dep", "export let n = 0; export function bump(){ n++; }"),
             ],
             "r"
@@ -12798,13 +10974,16 @@ fn module_default_expression_self_import() {
 
 #[test]
 fn module_namespace_object() {
-    let src = &[(
-        "main",
-        "import * as ns from 'dep'; globalThis.r = Object.keys(ns).join(',') + '|' + ns[Symbol.toStringTag];",
-    ), (
-        "dep",
-        "export const b = 2; export const a = 1; export default 9;",
-    )];
+    let src = &[
+        (
+            "main",
+            "import * as ns from 'dep'; globalThis.r = Object.keys(ns).join(',') + '|' + ns[Symbol.toStringTag];",
+        ),
+        (
+            "dep",
+            "export const b = 2; export const a = 1; export default 9;",
+        ),
+    ];
     // Namespace keys are sorted; @@toStringTag is "Module".
     assert_eq!(run_module(src, "r"), "a,b,default|Module");
 }
@@ -12812,7 +10991,10 @@ fn module_namespace_object() {
 #[test]
 fn module_namespace_is_frozen() {
     let src = &[
-        ("main", "import * as ns from 'dep'; globalThis.set = Reflect.set(ns, 'a', 5); globalThis.a = ns.a;"),
+        (
+            "main",
+            "import * as ns from 'dep'; globalThis.set = Reflect.set(ns, 'a', 5); globalThis.a = ns.a;",
+        ),
         ("dep", "export const a = 1;"),
     ];
     assert_eq!(run_module(src, "set"), "false");
@@ -12976,7 +11158,9 @@ fn array_like_near_integer_limit() {
     // Generic Array methods on an array-like with a huge `length` operate on the bounded working
     // span near the limit without hitting the engine's materialization cap.
     assert_eq!(
-        run("var o={length: 2**53-1, '9007199254740990':'x'}; Array.prototype.pop.call(o); o.length"),
+        run(
+            "var o={length: 2**53-1, '9007199254740990':'x'}; Array.prototype.pop.call(o); o.length"
+        ),
         "9007199254740990"
     );
     assert_eq!(
@@ -12984,7 +11168,9 @@ fn array_like_near_integer_limit() {
         "9007199254740991"
     );
     assert_eq!(
-        run("var o={length: 2**53+2, '9007199254740989':'a','9007199254740990':'b'}; Array.prototype.slice.call(o, 9007199254740989).join(',')"),
+        run(
+            "var o={length: 2**53+2, '9007199254740989':'a','9007199254740990':'b'}; Array.prototype.slice.call(o, 9007199254740989).join(',')"
+        ),
         "a,b"
     );
 }
@@ -13032,7 +11218,9 @@ fn object_proto_accessor() {
     assert_eq!(run("({}).__proto__===Object.prototype"), "true");
     // The descriptor on Object.prototype is a configurable accessor.
     assert_eq!(
-        run("var d=Object.getOwnPropertyDescriptor(Object.prototype,'__proto__'); typeof d.get+','+typeof d.set+','+d.configurable"),
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Object.prototype,'__proto__'); typeof d.get+','+typeof d.set+','+d.configurable"
+        ),
         "function,function,true"
     );
     // Setting a non-object/null value is a silent no-op.
@@ -13081,7 +11269,9 @@ fn promise_internal_function_shapes() {
     );
     // Their name/length are own, non-enumerable, configurable data properties.
     assert_eq!(
-        run("var f; new Promise(function(res){f=res}); var d=Object.getOwnPropertyDescriptor(f,'name'); d.value+','+d.enumerable+','+d.configurable"),
+        run(
+            "var f; new Promise(function(res){f=res}); var d=Object.getOwnPropertyDescriptor(f,'name'); d.value+','+d.enumerable+','+d.configurable"
+        ),
         ",false,true"
     );
     // Promise.all element resolve function: name "" length 1 (captured through a custom
@@ -13119,7 +11309,9 @@ fn new_target_not_leaked_into_nested_native_call() {
     // A native constructor (Function) invoked as a plain function inside an outer `new` must not
     // inherit the outer new.target — its result's prototype stays %Function.prototype%.
     assert_eq!(
-        run("function FACTORY(){ this.f = Function('a','return a'); } var o=new FACTORY(); typeof o.f.apply"),
+        run(
+            "function FACTORY(){ this.f = Function('a','return a'); } var o=new FACTORY(); typeof o.f.apply"
+        ),
         "function"
     );
     assert_eq!(
@@ -13139,11 +11331,15 @@ fn typed_array_bytes_per_element_descriptor() {
     ] {
         assert_eq!(run(&format!("{ctor}.BYTES_PER_ELEMENT")), size);
         assert_eq!(
-            run(&format!("var d=Object.getOwnPropertyDescriptor({ctor},'BYTES_PER_ELEMENT'); d.writable+','+d.enumerable+','+d.configurable")),
+            run(&format!(
+                "var d=Object.getOwnPropertyDescriptor({ctor},'BYTES_PER_ELEMENT'); d.writable+','+d.enumerable+','+d.configurable"
+            )),
             "false,false,false"
         );
         assert_eq!(
-            run(&format!("var d=Object.getOwnPropertyDescriptor({ctor}.prototype,'BYTES_PER_ELEMENT'); d.value+','+d.configurable")),
+            run(&format!(
+                "var d=Object.getOwnPropertyDescriptor({ctor}.prototype,'BYTES_PER_ELEMENT'); d.value+','+d.configurable"
+            )),
             format!("{size},false")
         );
     }
@@ -13175,11 +11371,15 @@ fn date_to_temporal_instant() {
 fn array_length_shrink_stops_at_non_configurable() {
     // Reducing length past a non-configurable element throws and length settles just past it.
     assert_eq!(
-        run("var a=[0,1]; Object.defineProperty(a,'1',{configurable:false}); try{Object.defineProperty(a,'length',{value:1});'no'}catch(e){e.constructor.name}"),
+        run(
+            "var a=[0,1]; Object.defineProperty(a,'1',{configurable:false}); try{Object.defineProperty(a,'length',{value:1});'no'}catch(e){e.constructor.name}"
+        ),
         "TypeError"
     );
     assert_eq!(
-        run("var a=[0,1]; Object.defineProperty(a,'1',{configurable:false}); try{a.length=1;}catch(e){} a.length"),
+        run(
+            "var a=[0,1]; Object.defineProperty(a,'1',{configurable:false}); try{a.length=1;}catch(e){} a.length"
+        ),
         "2"
     );
     // A normal shrink still works.
@@ -13190,7 +11390,9 @@ fn array_length_shrink_stops_at_non_configurable() {
 fn atomics_wait_notify_validation_order() {
     // wait/notify reject a non-Int32/BigInt64 array with TypeError before coercing the index.
     assert_eq!(
-        run("var poison={valueOf(){throw new Error('x')}}; try{Atomics.notify(new Float64Array(4), poison);'no'}catch(e){e.constructor.name}"),
+        run(
+            "var poison={valueOf(){throw new Error('x')}}; try{Atomics.notify(new Float64Array(4), poison);'no'}catch(e){e.constructor.name}"
+        ),
         "TypeError"
     );
     assert_eq!(
@@ -13221,8 +11423,18 @@ fn generator_function_intrinsics() {
         "AsyncGeneratorFunction"
     );
     // The intrinsic constructors dynamically compile the right kind of function.
-    assert_eq!(run("var GF=Object.getPrototypeOf(function*(){}).constructor; var g=GF('yield 1;'); g().next().value"), "1");
-    assert_eq!(run("var AF=Object.getPrototypeOf(async function(){}).constructor; typeof AF('return 1')().then"), "function");
+    assert_eq!(
+        run(
+            "var GF=Object.getPrototypeOf(function*(){}).constructor; var g=GF('yield 1;'); g().next().value"
+        ),
+        "1"
+    );
+    assert_eq!(
+        run(
+            "var AF=Object.getPrototypeOf(async function(){}).constructor; typeof AF('return 1')().then"
+        ),
+        "function"
+    );
     // @@toStringTag on the prototype objects.
     assert_eq!(
         run("Object.getPrototypeOf(function*(){})[Symbol.toStringTag]"),
@@ -13236,11 +11448,15 @@ fn generator_function_intrinsics() {
 fn shadow_realm_wrapped_function_copies_name_length() {
     // A ShadowRealm WrappedFunction copies the target's name and length.
     assert_eq!(
-        run("var r=new ShadowRealm(); var f=r.evaluate('(function fn(a,b){})'); f.name+','+f.length"),
+        run(
+            "var r=new ShadowRealm(); var f=r.evaluate('(function fn(a,b){})'); f.name+','+f.length"
+        ),
         "fn,2"
     );
     assert_eq!(
-        run("var r=new ShadowRealm(); var f=r.evaluate('(function(){})'); var d=Object.getOwnPropertyDescriptor(f,'length'); d.writable+','+d.configurable"),
+        run(
+            "var r=new ShadowRealm(); var f=r.evaluate('(function(){})'); var d=Object.getOwnPropertyDescriptor(f,'length'); d.writable+','+d.configurable"
+        ),
         "false,true"
     );
 }
@@ -13270,23 +11486,34 @@ fn map_set_iterators() {
         "TypeError"
     );
     // Entries appended during iteration are observed.
-    assert_eq!(run("var m=new Map([[0,0]]); var out=[]; for(var[k]of m){out.push(k); if(k<3)m.set(k+1,0);} out.join(',')"), "0,1,2,3");
+    assert_eq!(
+        run(
+            "var m=new Map([[0,0]]); var out=[]; for(var[k]of m){out.push(k); if(k<3)m.set(k+1,0);} out.join(',')"
+        ),
+        "0,1,2,3"
+    );
 }
 
 #[test]
 fn throw_type_error_intrinsic() {
     // A strict function's arguments exposes `callee` as the %ThrowTypeError% poison accessor.
     assert_eq!(
-        run("var a=(function(){'use strict';return arguments})(); var d=Object.getOwnPropertyDescriptor(a,'callee'); typeof d.get+','+(d.get===d.set)+','+d.configurable"),
+        run(
+            "var a=(function(){'use strict';return arguments})(); var d=Object.getOwnPropertyDescriptor(a,'callee'); typeof d.get+','+(d.get===d.set)+','+d.configurable"
+        ),
         "function,true,false"
     );
     // %ThrowTypeError% is a frozen, length-0, empty-named function that throws on call.
     assert_eq!(
-        run("var T=Object.getOwnPropertyDescriptor((function(){'use strict';return arguments})(),'callee').get; T.name+','+T.length+','+Object.isExtensible(T)"),
+        run(
+            "var T=Object.getOwnPropertyDescriptor((function(){'use strict';return arguments})(),'callee').get; T.name+','+T.length+','+Object.isExtensible(T)"
+        ),
         ",0,false"
     );
     assert_eq!(
-        run("var T=Object.getOwnPropertyDescriptor((function(){'use strict';return arguments})(),'callee').get; try{T();'no'}catch(e){e.constructor.name}"),
+        run(
+            "var T=Object.getOwnPropertyDescriptor((function(){'use strict';return arguments})(),'callee').get; try{T();'no'}catch(e){e.constructor.name}"
+        ),
         "TypeError"
     );
 }
@@ -13301,12 +11528,16 @@ fn generator_prototype_chain() {
     // An async generator function has a .prototype whose chain reaches %AsyncIteratorPrototype%.
     assert_eq!(run("typeof (async function*(){}).prototype"), "object");
     assert_eq!(
-        run("var p=Object.getPrototypeOf(Object.getPrototypeOf((async function*(){}).prototype)); typeof p[Symbol.asyncIterator]"),
+        run(
+            "var p=Object.getPrototypeOf(Object.getPrototypeOf((async function*(){}).prototype)); typeof p[Symbol.asyncIterator]"
+        ),
         "function"
     );
     // %AsyncIteratorPrototype%[@@asyncIterator] returns this.
     assert_eq!(
-        run("var P=Object.getPrototypeOf(Object.getPrototypeOf((async function*(){}).prototype)); var o={}; Object.setPrototypeOf(o,P); o[Symbol.asyncIterator]()===o"),
+        run(
+            "var P=Object.getPrototypeOf(Object.getPrototypeOf((async function*(){}).prototype)); var o={}; Object.setPrototypeOf(o,P); o[Symbol.asyncIterator]()===o"
+        ),
         "true"
     );
 }
@@ -13316,17 +11547,23 @@ fn proxy_set_receiver_and_strict_delete() {
     // A missing/null `set` trap forwards to the target's [[Set]] with the original Receiver, so a
     // target setter sees `this` === the proxy.
     assert_eq!(
-        run("var ctx; var t={set attr(v){ctx=this}}; var p=new Proxy(t,{set:null}); p.attr=1; ctx===p"),
+        run(
+            "var ctx; var t={set attr(v){ctx=this}}; var p=new Proxy(t,{set:null}); p.attr=1; ctx===p"
+        ),
         "true"
     );
     // A strict `delete` through a proxy whose [[Delete]] returns false throws a TypeError.
     assert_eq!(
-        run("'use strict'; var f=function(){}; var p=new Proxy(new Proxy(f,{}),{}); try{delete p.prototype;'no'}catch(e){e.constructor.name}"),
+        run(
+            "'use strict'; var f=function(){}; var p=new Proxy(new Proxy(f,{}),{}); try{delete p.prototype;'no'}catch(e){e.constructor.name}"
+        ),
         "TypeError"
     );
     // Object.keys forwards ownKeys + enumerability through a proxy target.
     assert_eq!(
-        run("var o={a:1,b:2}; var p=new Proxy(new Proxy(o,{}),{ownKeys:null}); Object.keys(p).join(',')"),
+        run(
+            "var o={a:1,b:2}; var p=new Proxy(new Proxy(o,{}),{ownKeys:null}); Object.keys(p).join(',')"
+        ),
         "a,b"
     );
 }
@@ -13340,7 +11577,12 @@ fn function_bind_length_and_tostring() {
         run("var f=function(){}; Object.defineProperty(f,'length',{value:NaN}); f.bind().length"),
         "0"
     );
-    assert_eq!(run("var f=function(){}; Object.defineProperty(f,'length',{value:Infinity}); f.bind(null,1).length"), "Infinity");
+    assert_eq!(
+        run(
+            "var f=function(){}; Object.defineProperty(f,'length',{value:Infinity}); f.bind(null,1).length"
+        ),
+        "Infinity"
+    );
     // Function.prototype.toString throws for a non-callable receiver.
     assert_eq!(
         run("try{Function.prototype.toString.call({});'no'}catch(e){e.constructor.name}"),
@@ -13407,7 +11649,9 @@ fn proxy_get_receiver() {
 fn proxy_for_in_and_has_own() {
     // for-in over a proxy enumerates via [[OwnPropertyKeys]] + enumerable, through a proxy target.
     assert_eq!(
-        run("var o={a:1,b:2}; var p=new Proxy(new Proxy(o,{}),{}); var out=[]; for(var k in p)out.push(k); out.sort().join(',')"),
+        run(
+            "var o={a:1,b:2}; var p=new Proxy(new Proxy(o,{}),{}); var out=[]; for(var k in p)out.push(k); out.sort().join(',')"
+        ),
         "a,b"
     );
     // hasOwnProperty + propertyIsEnumerable go through the proxy's [[GetOwnProperty]].
@@ -13437,7 +11681,9 @@ fn proxy_has_string_wrapper_and_symbol_key() {
     );
     // The has trap receives the original property key: a symbol stays a symbol.
     assert_eq!(
-        run("var s=Symbol(); var t=new Proxy({},{has(_,k){return k===s}}); var p=new Proxy(t,{}); Reflect.has(p,s)"),
+        run(
+            "var s=Symbol(); var t=new Proxy({},{has(_,k){return k===s}}); var p=new Proxy(t,{}); Reflect.has(p,s)"
+        ),
         "true"
     );
 }
@@ -13446,12 +11692,16 @@ fn proxy_has_string_wrapper_and_symbol_key() {
 fn proxy_define_property_invariants() {
     // A trap can't report a non-configurable target property as configurable.
     assert_eq!(
-        run("var t={}; Object.defineProperty(t,'foo',{value:1,configurable:false}); var p=new Proxy(t,{defineProperty(){return true}}); try{Object.defineProperty(p,'foo',{value:1,configurable:true});'no'}catch(e){e.constructor.name}"),
+        run(
+            "var t={}; Object.defineProperty(t,'foo',{value:1,configurable:false}); var p=new Proxy(t,{defineProperty(){return true}}); try{Object.defineProperty(p,'foo',{value:1,configurable:true});'no'}catch(e){e.constructor.name}"
+        ),
         "TypeError"
     );
     // A non-configurable writable data target can't be reported non-writable (step 16.c).
     assert_eq!(
-        run("var p=new Proxy({},{defineProperty(t,k){Object.defineProperty(t,k,{configurable:false,writable:true});return true}}); try{Reflect.defineProperty(p,'x',{writable:false});'no'}catch(e){e.constructor.name}"),
+        run(
+            "var p=new Proxy({},{defineProperty(t,k){Object.defineProperty(t,k,{configurable:false,writable:true});return true}}); try{Reflect.defineProperty(p,'x',{writable:false});'no'}catch(e){e.constructor.name}"
+        ),
         "TypeError"
     );
 }
@@ -13486,11 +11736,15 @@ fn set_returns_boolean() {
 fn proxy_get_set_symbol_trap_key() {
     // get/set traps receive the original symbol key, not a stringified form.
     assert_eq!(
-        run("var s=Symbol(); var t=new Proxy({},{get(_,k){return k===s?42:0}}); var p=new Proxy(t,{get:null}); p[s]"),
+        run(
+            "var s=Symbol(); var t=new Proxy({},{get(_,k){return k===s?42:0}}); var p=new Proxy(t,{get:null}); p[s]"
+        ),
         "42"
     );
     assert_eq!(
-        run("var s=Symbol(); var got; var p=new Proxy({},{set(_,k,v){got=(k===s);return true}}); p[s]=1; String(got)"),
+        run(
+            "var s=Symbol(); var got; var p=new Proxy({},{set(_,k,v){got=(k===s);return true}}); p[s]=1; String(got)"
+        ),
         "true"
     );
     // String-wrapper length/index forward through a nested proxy's [[Get]].
@@ -13507,23 +11761,48 @@ fn array_buffer_slice_and_transfer_detach() {
         run("var s=new ArrayBuffer(4); var d=s.transfer(5); s.byteLength+','+d.byteLength"),
         "0,5"
     );
-    assert_eq!(run("var s=new ArrayBuffer(4); s.transfer(); try{s.slice();'no'}catch(e){e.constructor.name}"), "TypeError");
+    assert_eq!(
+        run(
+            "var s=new ArrayBuffer(4); s.transfer(); try{s.slice();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
     // slice requires an ArrayBuffer receiver and rejects a SharedArrayBuffer.
     assert_eq!(
         run("try{ArrayBuffer.prototype.slice.call({});'no'}catch(e){e.constructor.name}"),
         "TypeError"
     );
     // A normal slice copies the range.
-    assert_eq!(run("var b=new ArrayBuffer(4); new Uint8Array(b).set([1,2,3,4]); [...new Uint8Array(b.slice(1,3))].join(',')"), "2,3");
+    assert_eq!(
+        run(
+            "var b=new ArrayBuffer(4); new Uint8Array(b).set([1,2,3,4]); [...new Uint8Array(b.slice(1,3))].join(',')"
+        ),
+        "2,3"
+    );
 }
 
 #[test]
 fn array_buffer_slice_species_and_isview() {
     // slice goes through SpeciesConstructor and validates it.
-    assert_eq!(run("var b=new ArrayBuffer(4); b.constructor={[Symbol.species]:5}; try{b.slice();'no'}catch(e){e.constructor.name}"), "TypeError");
-    assert_eq!(run("var b=new ArrayBuffer(4); b.constructor={[Symbol.species]:function(){}}; try{b.slice();'no'}catch(e){e.constructor.name}"), "TypeError");
+    assert_eq!(
+        run(
+            "var b=new ArrayBuffer(4); b.constructor={[Symbol.species]:5}; try{b.slice();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "var b=new ArrayBuffer(4); b.constructor={[Symbol.species]:function(){}}; try{b.slice();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
     // A custom species is honored.
-    assert_eq!(run("var b=new ArrayBuffer(4); var C=function(n){return new ArrayBuffer(n)}; C[Symbol.species]=C; b.constructor=C; b.slice(0,2).byteLength"), "2");
+    assert_eq!(
+        run(
+            "var b=new ArrayBuffer(4); var C=function(n){return new ArrayBuffer(n)}; C[Symbol.species]=C; b.constructor=C; b.slice(0,2).byteLength"
+        ),
+        "2"
+    );
     // isView recognizes DataViews.
     assert_eq!(
         run("ArrayBuffer.isView(new DataView(new ArrayBuffer(8)))"),
@@ -13557,9 +11836,24 @@ fn array_buffer_species_and_transfer_resizable() {
 #[test]
 fn shared_array_buffer_slice_species() {
     // SAB slice requires a SharedArrayBuffer, goes through species, and copies the range.
-    assert_eq!(run("var s=new SharedArrayBuffer(4); new Uint8Array(s).set([1,2,3,4]); [...new Uint8Array(s.slice(1,3))].join(',')"), "2,3");
-    assert_eq!(run("try{SharedArrayBuffer.prototype.slice.call(new ArrayBuffer(4));'no'}catch(e){e.constructor.name}"), "TypeError");
-    assert_eq!(run("var s=new SharedArrayBuffer(4); s.constructor={[Symbol.species]:5}; try{s.slice();'no'}catch(e){e.constructor.name}"), "TypeError");
+    assert_eq!(
+        run(
+            "var s=new SharedArrayBuffer(4); new Uint8Array(s).set([1,2,3,4]); [...new Uint8Array(s.slice(1,3))].join(',')"
+        ),
+        "2,3"
+    );
+    assert_eq!(
+        run(
+            "try{SharedArrayBuffer.prototype.slice.call(new ArrayBuffer(4));'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "var s=new SharedArrayBuffer(4); s.constructor={[Symbol.species]:5}; try{s.slice();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
     assert_eq!(
         run("SharedArrayBuffer[Symbol.species]===SharedArrayBuffer"),
         "true"
@@ -13571,7 +11865,9 @@ fn array_iteration_uses_toobject_receiver() {
     // Array.prototype.map.call(primitive, cb): the callback's `this`-object arg is ToObject(this),
     // i.e. a wrapper, not the raw primitive.
     assert_eq!(
-        run("Boolean.prototype[0]=true;Boolean.prototype.length=1;String(Array.prototype.map.call(false,function(v,i,o){return o instanceof Boolean}))"),
+        run(
+            "Boolean.prototype[0]=true;Boolean.prototype.length=1;String(Array.prototype.map.call(false,function(v,i,o){return o instanceof Boolean}))"
+        ),
         "true"
     );
     // find/some/every throw TypeError on a non-callable predicate even for empty array-likes.
@@ -13592,7 +11888,12 @@ fn array_flat_flatmap_species_and_throw() {
     );
     assert_eq!(run("[1,[2]].flat(Infinity).length"), "2");
     // Non-extensible species result -> CreateDataPropertyOrThrow throws.
-    assert_eq!(run("var a=[1];a.constructor={[Symbol.species]:function(){var o=[];Object.preventExtensions(o);return o}};try{a.flat();'no'}catch(e){e.constructor.name}"), "TypeError");
+    assert_eq!(
+        run(
+            "var a=[1];a.constructor={[Symbol.species]:function(){var o=[];Object.preventExtensions(o);return o}};try{a.flat();'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
 }
 
 #[test]
@@ -13682,7 +11983,9 @@ fn super_call_in_ordinary_function_is_early_error() {
     );
     // A nested arrow inherits, a nested class constructor is its own context (both fine).
     assert_eq!(
-        run("class B{constructor(){this.v=2}}class D extends B{constructor(){(()=>super())()}}new D().v"),
+        run(
+            "class B{constructor(){this.v=2}}class D extends B{constructor(){(()=>super())()}}new D().v"
+        ),
         "2"
     );
 }
@@ -13760,6 +12063,94 @@ fn async_generator_yield_star_delegation() {
 }
 
 #[test]
+fn async_generator_yield_star_obeys_async_iterator_protocol() {
+    fn two(setup: &str, read: &str) -> String {
+        let mut e = Engine::new();
+        let _ = e.eval(setup, false);
+        match e.eval(read, false) {
+            Ok(Completion::Value(v)) => v,
+            Ok(Completion::Throw { name, .. }) => format!("T:{name}"),
+            Err(_) => "P".into(),
+        }
+    }
+
+    // Async-from-sync continuation awaits IteratorValue for both yielded and done results.
+    assert_eq!(
+        two(
+            "globalThis.out='pending';var n=0;var inner={next(v){n++;return n===1?{value:Promise.resolve(4),done:false}:{value:Promise.resolve(v+1),done:true}},[Symbol.iterator](){return this}};\
+             async function* outer(){return yield* inner}var it=outer();it.next().then(a=>it.next(7).then(b=>{globalThis.out=a.value+':'+a.done+':'+b.value+':'+b.done}))",
+            "out"
+        ),
+        "4:false:8:true"
+    );
+
+    // A native async iterator's result is awaited, but its IteratorValue is passed directly to
+    // AsyncGeneratorYield; unlike async-from-sync delegation, a promise-valued value is retained.
+    assert_eq!(
+        two(
+            "globalThis.out='pending';var yielded=Promise.resolve(5),n=0;var inner={next(){n++;return Promise.resolve(n===1?{value:yielded,done:false}:{value:9,done:true})},[Symbol.asyncIterator](){return this}};\
+             async function* outer(){return yield* inner}var it=outer();it.next().then(a=>{globalThis.out=(a.value===yielded)+':'+a.done;return it.next()}).then(b=>{globalThis.out+=':'+b.value+':'+b.done})",
+            "out"
+        ),
+        "true:false:9:true"
+    );
+
+    // AsyncGeneratorUnwrapYieldResumption awaits a return completion before it is forwarded to
+    // the delegate, so neither the inner return method nor the outer result sees the promise.
+    assert_eq!(
+        two(
+            "globalThis.out='pending',seen='';var inner={next(){return Promise.resolve({value:1,done:false})},return(v){seen=v+':'+(v instanceof Promise);return Promise.resolve({value:v+'!',done:true})},[Symbol.asyncIterator](){return this}};\
+             async function* outer(){yield* inner}var it=outer();it.next().then(()=>it.return(Promise.resolve('settled'))).then(r=>{globalThis.out=seen+'|'+r.value+':'+r.done})",
+            "out"
+        ),
+        "settled:false|settled!:true"
+    );
+
+    // With no throw method, AsyncIteratorClose is awaited before the required TypeError. A close
+    // rejection is the observable error instead of that later protocol error.
+    assert_eq!(
+        two(
+            "globalThis.out='pending',closed=0;var inner={next(){return Promise.resolve({value:1,done:false})},return(){closed++;return Promise.reject(new RangeError('close'))},[Symbol.asyncIterator](){return this}};\
+             async function* outer(){yield* inner}var it=outer();it.next().then(()=>it.throw('boom')).then(()=>{globalThis.out='resolved'},e=>{globalThis.out=closed+':'+e.name})",
+            "out"
+        ),
+        "1:RangeError"
+    );
+
+    // AsyncGeneratorUnwrapYieldResumption awaits the caller's return value, and yield* performs a
+    // second Await when the delegate has no return method.
+    assert_eq!(
+        two(
+            "globalThis.out='pending',reads=0;var value={get then(){reads++}};var inner={next(){return {value:1,done:false}},[Symbol.asyncIterator](){return this}};\
+             async function* outer(){yield* inner}var it=outer();it.next();it.return(value).then(()=>{globalThis.out=reads})",
+            "out"
+        ),
+        "2"
+    );
+}
+
+#[test]
+fn async_generator_explicit_return_awaits_even_undefined() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.out=[];async function* implicit(){}async function* bare(){return;}async function* explicit(){return undefined}\
+             Promise.resolve().then(()=>out.push('tick1')).then(()=>out.push('tick2'));\
+             implicit().next().then(()=>out.push('implicit'));bare().next().then(()=>out.push('bare'));\
+             explicit().next().then(()=>out.push('explicit'))",
+            false,
+        )
+        .expect("async-generator return ordering parses");
+    match engine
+        .eval("out.join(',')", false)
+        .expect("ordering read parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "tick1,implicit,bare,tick2,explicit"),
+        Completion::Throw { name, message } => panic!("ordering read threw {name}: {message}"),
+    }
+}
+
+#[test]
 fn async_generator_yield_awaits_operand() {
     fn two(setup: &str, read: &str) -> String {
         let mut e = Engine::new();
@@ -13791,7 +12182,12 @@ fn async_generator_yield_awaits_operand() {
 #[test]
 fn generator_prototype_constructor_links() {
     // %Generator%/%AsyncGenerator% (the function .prototype) <-> their instance prototype.
-    assert_eq!(run("function* g(){}Object.getPrototypeOf(g).prototype===Object.getPrototypeOf(g.prototype)"), "true");
+    assert_eq!(
+        run(
+            "function* g(){}Object.getPrototypeOf(g).prototype===Object.getPrototypeOf(g.prototype)"
+        ),
+        "true"
+    );
     assert_eq!(
         run("function* g(){}g.prototype.constructor===Object.getPrototypeOf(g)"),
         "true"
@@ -13801,7 +12197,12 @@ fn generator_prototype_constructor_links() {
         "true"
     );
     // The constructor link (on %GeneratorPrototype%) is non-enumerable, non-writable, configurable.
-    assert_eq!(run("function* g(){}var d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(g.prototype),'constructor');[d.writable,d.enumerable,d.configurable].join(',')"), "false,false,true");
+    assert_eq!(
+        run(
+            "function* g(){}var d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(g.prototype),'constructor');[d.writable,d.enumerable,d.configurable].join(',')"
+        ),
+        "false,false,true"
+    );
 }
 
 #[test]
@@ -13814,7 +12215,9 @@ fn get_iterator_reads_next_lazily() {
     );
     // Actually stepping a next-less iterator throws a TypeError (next is not a function).
     assert_eq!(
-        run("var it={};var o={[Symbol.iterator](){return it}};var n='none';try{var[a]=o}catch(e){n=e.constructor.name}n"),
+        run(
+            "var it={};var o={[Symbol.iterator](){return it}};var n='none';try{var[a]=o}catch(e){n=e.constructor.name}n"
+        ),
         "TypeError"
     );
 }
@@ -13824,7 +12227,9 @@ fn super_assignment_null_base_throws() {
     // `super.x = v` with a null home-object prototype: ToObject(super base) throws TypeError,
     // but only after the RHS is evaluated.
     assert_eq!(
-        run("var count=0;class C{static m(){super.x=(count+=1)}}Object.setPrototypeOf(C,null);var n='none';try{C.m()}catch(e){n=e.constructor.name}n+':'+count"),
+        run(
+            "var count=0;class C{static m(){super.x=(count+=1)}}Object.setPrototypeOf(C,null);var n='none';try{C.m()}catch(e){n=e.constructor.name}n+':'+count"
+        ),
         "TypeError:1"
     );
 }
@@ -13848,12 +12253,16 @@ fn assignment_to_tdz_binding_throws() {
 fn destructuring_assignment_target_reference_order() {
     // The destructuring target's Reference is evaluated before the source element is read.
     assert_eq!(
-        run("var log='';function tgt(){log+='t';return {set q(v){log+='set'}}}var o={get p(){log+='p'}};({p:tgt().q}=o);log"),
+        run(
+            "var log='';function tgt(){log+='t';return {set q(v){log+='set'}}}var o={get p(){log+='p'}};({p:tgt().q}=o);log"
+        ),
         "tpset"
     );
     // Array element: target reference before the iterator step.
     assert_eq!(
-        run("var log='';var it={next(){log+='n';return{done:false,value:1}}};var src={[Symbol.iterator](){return it}};function tgt(){log+='t';return{}}[tgt().x]=src;log"),
+        run(
+            "var log='';var it={next(){log+='n';return{done:false,value:1}}};var src={[Symbol.iterator](){return it}};function tgt(){log+='t';return{}}[tgt().x]=src;log"
+        ),
         "tn"
     );
 }
@@ -13862,7 +12271,9 @@ fn destructuring_assignment_target_reference_order() {
 fn object_rest_destructuring_assignment() {
     // Rest copies own enumerable properties (CopyDataProperties): symbols included, spec key order.
     assert_eq!(
-        run("var s=Symbol('x');var o={2:'b',a:1};o[s]=9;var r;({...r}=o);Object.keys(r).join(',')+'|'+(r[s]===9)"),
+        run(
+            "var s=Symbol('x');var o={2:'b',a:1};o[s]=9;var r;({...r}=o);Object.keys(r).join(',')+'|'+(r[s]===9)"
+        ),
         "2,a|true"
     );
     // Rest of a string primitive copies its index properties.
@@ -13880,13 +12291,17 @@ fn object_rest_destructuring_assignment() {
 fn simple_assignment_reference_before_rhs() {
     // `base[prop()] = rhs()`: the LHS reference (base + key expression) is evaluated before the RHS.
     assert_eq!(
-        run("var order='';var b={};function p(){order+='p';return 'k'}function r(){order+='r';return 1}b[p()]=r();order"),
+        run(
+            "var order='';var b={};function p(){order+='p';return 'k'}function r(){order+='r';return 1}b[p()]=r();order"
+        ),
         "pr"
     );
     // Deferred ToPropertyKey: PutValue's ToObject(null) throws TypeError before the key's toString
     // runs (the RHS is still evaluated first, per `=` order).
     assert_eq!(
-        run("var hit=false;var k={toString(){hit=true;return 'x'}};var b=null;var name='none';try{b[k]=1}catch(e){name=e.constructor.name}name+':'+hit"),
+        run(
+            "var hit=false;var k={toString(){hit=true;return 'x'}};var b=null;var name='none';try{b[k]=1}catch(e){name=e.constructor.name}name+':'+hit"
+        ),
         "TypeError:false"
     );
     // A member base with a side effect is evaluated once.
@@ -13901,17 +12316,23 @@ fn array_destructuring_assignment_iterator_close() {
     // Normal completion with more elements left: IteratorClose runs and a throwing `return`
     // propagates (destructuring throws that error).
     assert_eq!(
-        run("var rc=0;var it={next(){return{done:false,value:1}},return(){rc++;throw new Error('x')}};var iter={[Symbol.iterator](){return it}};var _;try{[_]=iter}catch(e){}rc+''"),
+        run(
+            "var rc=0;var it={next(){return{done:false,value:1}},return(){rc++;throw new Error('x')}};var iter={[Symbol.iterator](){return it}};var _;try{[_]=iter}catch(e){}rc+''"
+        ),
         "1"
     );
     // `return` returning a non-object -> TypeError from IteratorClose on normal completion.
     assert_eq!(
-        run("var it={next(){return{done:false,value:1}},return(){return 5}};var iter={[Symbol.iterator](){return it}};var _;var name='none';try{[_]=iter}catch(e){name=e.constructor.name}name"),
+        run(
+            "var it={next(){return{done:false,value:1}},return(){return 5}};var iter={[Symbol.iterator](){return it}};var _;var name='none';try{[_]=iter}catch(e){name=e.constructor.name}name"
+        ),
         "TypeError"
     );
     // A throwing target assignment closes the iterator but keeps the original error.
     assert_eq!(
-        run("var rc=0;var it={next(){return{done:false,value:1}},return(){rc++;return{}}};var iter={[Symbol.iterator](){return it}};var name='none';try{[({}).nope.x]=iter}catch(e){name=e.constructor.name}name+':'+rc"),
+        run(
+            "var rc=0;var it={next(){return{done:false,value:1}},return(){rc++;return{}}};var iter={[Symbol.iterator](){return it}};var name='none';try{[({}).nope.x]=iter}catch(e){name=e.constructor.name}name+':'+rc"
+        ),
         "TypeError:1"
     );
 }
@@ -13931,12 +12352,16 @@ fn compound_assignment_resolves_reference_once() {
     );
     // Deferred ToPropertyKey: a null base throws TypeError before the key's toString runs.
     assert_eq!(
-        run("var hit=false;var k={toString(){hit=true;return 'x'}};var b=null;try{b[k]^=1}catch(e){}String(hit)"),
+        run(
+            "var hit=false;var k={toString(){hit=true;return 'x'}};var b=null;try{b[k]^=1}catch(e){}String(hit)"
+        ),
         "false"
     );
     // Strict PutValue on a deleted global accessor throws ReferenceError.
     assert_eq!(
-        throws("'use strict';Object.defineProperty(globalThis,'gx',{configurable:true,get(){delete globalThis.gx;return 2}});gx^=3"),
+        throws(
+            "'use strict';Object.defineProperty(globalThis,'gx',{configurable:true,get(){delete globalThis.gx;return 2}});gx^=3"
+        ),
         "ReferenceError"
     );
 }
@@ -13970,7 +12395,12 @@ fn object_literal_proto_setter() {
         "null"
     );
     // A non-object/null value is ignored (no property, default proto).
-    assert_eq!(run("var o={__proto__:5};[o.hasOwnProperty('__proto__'),Object.getPrototypeOf(o)===Object.prototype].join(',')"), "false,true");
+    assert_eq!(
+        run(
+            "var o={__proto__:5};[o.hasOwnProperty('__proto__'),Object.getPrototypeOf(o)===Object.prototype].join(',')"
+        ),
+        "false,true"
+    );
     // Quoted key also sets the proto; computed and shorthand do NOT.
     assert_eq!(
         run("var o={'__proto__':Array.prototype};Object.getPrototypeOf(o)===Array.prototype"),
@@ -13987,13 +12417,38 @@ fn object_literal_proto_setter() {
 #[test]
 fn iterator_take_closes_on_bad_limit() {
     // A bad take/drop limit closes the underlying iterator (its return() is called).
-    assert_eq!(run("var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};try{o.take(NaN)}catch(e){}String(c)"), "1");
-    assert_eq!(run("var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};try{o.take(-1)}catch(e){}String(c)"), "1");
-    assert_eq!(run("var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};var n='';try{o.take(NaN)}catch(e){n=e.constructor.name}n"), "RangeError");
+    assert_eq!(
+        run(
+            "var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};try{o.take(NaN)}catch(e){}String(c)"
+        ),
+        "1"
+    );
+    assert_eq!(
+        run(
+            "var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};try{o.take(-1)}catch(e){}String(c)"
+        ),
+        "1"
+    );
+    assert_eq!(
+        run(
+            "var c=0;var o={__proto__:Iterator.prototype,get next(){throw 1},return(){c++;return{}}};var n='';try{o.take(NaN)}catch(e){n=e.constructor.name}n"
+        ),
+        "RangeError"
+    );
     // ECMA-262 §27.1.3.3.2 / §27.1.3.3.11: a finite limit above 2^53 - 1 is
     // rejected and closes the provisional iterator without observing `next`.
-    assert_eq!(run("var c=0,n=0;var o={__proto__:Iterator.prototype,get next(){n++;throw 1},return(){c++;return{}}};var e='';try{o.take(Number.MAX_SAFE_INTEGER+1)}catch(x){e=x.constructor.name}[e,c,n].join(',')"), "RangeError,1,0");
-    assert_eq!(run("var c=0,n=0;var o={__proto__:Iterator.prototype,get next(){n++;throw 1},return(){c++;return{}}};var e='';try{o.drop(Number.MAX_SAFE_INTEGER+1)}catch(x){e=x.constructor.name}[e,c,n].join(',')"), "RangeError,1,0");
+    assert_eq!(
+        run(
+            "var c=0,n=0;var o={__proto__:Iterator.prototype,get next(){n++;throw 1},return(){c++;return{}}};var e='';try{o.take(Number.MAX_SAFE_INTEGER+1)}catch(x){e=x.constructor.name}[e,c,n].join(',')"
+        ),
+        "RangeError,1,0"
+    );
+    assert_eq!(
+        run(
+            "var c=0,n=0;var o={__proto__:Iterator.prototype,get next(){n++;throw 1},return(){c++;return{}}};var e='';try{o.drop(Number.MAX_SAFE_INTEGER+1)}catch(x){e=x.constructor.name}[e,c,n].join(',')"
+        ),
+        "RangeError,1,0"
+    );
     // +Infinity is valid. A finite source is consumed to exhaustion when the helper is stepped.
     assert_eq!(run("[1,2,3].values().drop(Infinity).next().done"), "true");
 }
@@ -14013,7 +12468,12 @@ fn static_block_forbids_arguments() {
         .eval("class C{static{arguments}}", false)
         .is_err());
     // super.prop and new.target are still allowed in a static block.
-    assert_eq!(run("class B{static m(){return 5}}class C extends B{static y;static{C.y=super.m()}}String(C.y)"), "5");
+    assert_eq!(
+        run(
+            "class B{static m(){return 5}}class C extends B{static y;static{C.y=super.m()}}String(C.y)"
+        ),
+        "5"
+    );
     assert_eq!(
         run("var r;class C{static{r=String(new.target)}}r"),
         "undefined"
@@ -14202,6 +12662,901 @@ fn async_dispose_settles_via_return_result() {
         ),
         "ok:undefined"
     );
+}
+
+#[test]
+fn captured_block_using_uses_heap_vm_continuations() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var log=[];
+             function resource(name){
+               return {name,[Symbol.dispose](){log.push('dispose:'+name)}}
+             }
+             function* captured(){
+               var read;
+               {
+                 using value=resource('captured');
+                 read=()=>value.name;
+                 yield read()
+               }
+               yield read();
+               return 'done'
+             }
+             globalThis.capturedIterator=captured();",
+            false,
+        )
+        .expect("captured block using setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match engine
+        .eval(
+            "var first=capturedIterator.next(),second=capturedIterator.next(),
+                 third=capturedIterator.next();
+             [first.value,second.value,third.value,third.done,log.join(',')].join('|')",
+            false,
+        )
+        .expect("captured block using drive parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "captured|captured|done|true|dispose:captured")
+        }
+        Completion::Throw { name, message } => {
+            panic!("captured block using drive threw {name}: {message}")
+        }
+    }
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var result='pending',log=[];
+             function resource(name){
+               return {name,[Symbol.asyncDispose](){
+                 log.push('dispose:'+name);return Promise.resolve()
+               }}
+             }
+             async function captured(){
+               var read;
+               {
+                 await using value=resource('async-captured');
+                 read=()=>value.name;
+                 await Promise.resolve('suspended')
+               }
+               return read()
+             }
+             captured().then(value=>result=value,error=>result='error:'+error);",
+            false,
+        )
+        .expect("captured block await-using setup parses");
+    assert_eq!(
+        run_in(&mut asynchronous, "result+'|'+log.join(',')"),
+        "async-captured|dispose:async-captured"
+    );
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn captured_reentered_blocks_use_fresh_heap_environments() {
+    // ECMA-262 BlockDeclarationInstantiation creates a new Declarative Environment Record every
+    // time the block is evaluated. A closure made before suspension must retain that exact record,
+    // while continue/break/return restore the enclosing environment before control propagates.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var saved=[];
+             function* blocks(){
+               for(var index=0;index<3;index++){
+                 let value=index;
+                 saved.push(()=>value);
+                 yield value;
+                 value+=10
+               }
+               return saved.map(read=>read()).join(',')
+             }
+             globalThis.blockIterator=blocks();",
+            false,
+        )
+        .expect("captured reentered block setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "var a=blockIterator.next(),b=blockIterator.next(),c=blockIterator.next(),
+                 d=blockIterator.next();
+             [a.value,b.value,c.value,d.value,d.done,saved.map(read=>read()).join(',')].join('|')"
+        ),
+        "0|1|2|10,11,12|true|10,11,12"
+    );
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+
+    let mut abrupt = Engine::new();
+    abrupt
+        .eval(
+            "var read,after='pending';
+             function* stop(){
+               outer:{
+                 let value='captured';
+                 read=()=>value;
+                 yield value;
+                 break outer
+               }
+               after=typeof value;
+               return 'done'
+             }
+             globalThis.stopIterator=stop();",
+            false,
+        )
+        .expect("captured abrupt block setup parses");
+    assert_eq!(
+        run_in(
+            &mut abrupt,
+            "var first=stopIterator.next(),last=stopIterator.next();
+             [first.value,last.value,last.done,read(),after].join('|')"
+        ),
+        "captured|done|true|captured|undefined"
+    );
+    assert!(abrupt
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn captured_classic_for_let_uses_per_iteration_environments() {
+    // ForBodyEvaluation calls CreatePerIterationEnvironment before the first test and again before
+    // each increment. Body closures keep the body record; closures made by the increment observe
+    // the fresh copied record that the following test/body will use.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* classic(){
+               var bodyReads=[],updateReads=[];
+               for(let index=0;index<3;updateReads.push(()=>index),index++){
+                 bodyReads.push(()=>index);
+                 yield index
+               }
+               return bodyReads.map(read=>read()).join(',')+'|'+
+                      updateReads.map(read=>read()).join(',')
+             }
+             globalThis.classicIterator=classic();",
+            false,
+        )
+        .expect("captured classic for setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "var a=classicIterator.next(),b=classicIterator.next(),c=classicIterator.next(),
+                 d=classicIterator.next();
+             [a.value,b.value,c.value,d.value,d.done].join('|')"
+        ),
+        "0|1|2|0,1,2|1,2,3|true"
+    );
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn captured_for_in_of_heads_use_fresh_heap_environments() {
+    // ForIn/OfHeadEvaluation exposes a separate uninitialized head environment to the RHS, then
+    // ForIn/OfBodyEvaluation creates and initializes a fresh record for every iteration.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var rhsRead,ofReads=[],inReads=[],patternReads=[];
+             function* heads(){
+               for(let value of (rhsRead=()=>value,[0,1,2])){
+                 ofReads.push(()=>value);
+                 yield 'of:'+value
+               }
+               for(const key in {a:1,b:2}){
+                 inReads.push(()=>key);
+                 yield 'in:'+key
+               }
+               for(let [entry] of [[3],[4]]){
+                 patternReads.push(()=>entry);
+                 yield 'pattern:'+entry
+               }
+               return [ofReads.map(read=>read()).join(','),
+                       inReads.map(read=>read()).join(','),
+                       patternReads.map(read=>read()).join(',')].join('|')
+             }
+             globalThis.headIterator=heads();",
+            false,
+        )
+        .expect("captured for-in/of setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "var values=[],step;
+             while(!(step=headIterator.next()).done)values.push(step.value);
+             var rhsError='none';try{rhsRead()}catch(error){rhsError=error.name}
+             [values.join(','),step.value,rhsError].join('|')"
+        ),
+        "of:0,of:1,of:2,in:a,in:b,pattern:3,pattern:4|0,1,2|a,b|3,4|ReferenceError"
+    );
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var result='pending';
+             async function heads(){
+               var reads=[];
+               for await(const value of [Promise.resolve('a'),Promise.resolve('b')]){
+                 reads.push(()=>value);
+                 await Promise.resolve()
+               }
+               return reads.map(read=>read()).join(',')
+             }
+             heads().then(value=>result=value,error=>result='error:'+error);",
+            false,
+        )
+        .expect("captured for-await setup parses");
+    assert_eq!(run_in(&mut asynchronous, "result"), "a,b");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn captured_catch_parameters_use_fresh_heap_environments() {
+    // CatchClauseEvaluation creates a fresh parameter environment for every caught throw, then
+    // evaluates the catch Block in a separate nested environment. Both records must survive a
+    // suspension when captured, and both must be restored before an outer finally runs.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var parameterReads=[],blockReads=[];
+             function* catches(){
+               for(var index=0;index<2;index++){
+                 try{throw {caught:index}}
+                 catch({caught}){
+                   let blockValue=caught+10;
+                   parameterReads.push(()=>caught);
+                   blockReads.push(()=>blockValue);
+                   yield caught+':'+blockValue;
+                   caught+=20;
+                   blockValue+=20
+                 }
+               }
+               return parameterReads.map(read=>read()).join(',')+'|'+
+                      blockReads.map(read=>read()).join(',')
+             }
+             var abruptRead,restoration='pending';
+             function* abruptCatch(){
+               try{
+                 try{throw 'caught'}
+                 catch(reason){
+                   abruptRead=()=>reason;
+                   yield reason;
+                   return 'body-return'
+                 }
+               }finally{
+                 restoration=typeof reason;
+                 yield 'finally:'+restoration
+               }
+             }
+             globalThis.catchIterator=catches();
+             globalThis.abruptCatchIterator=abruptCatch();",
+            false,
+        )
+        .expect("captured catch setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "var a=catchIterator.next(),b=catchIterator.next(),c=catchIterator.next();
+             var d=abruptCatchIterator.next(),e=abruptCatchIterator.return('external'),
+                 f=abruptCatchIterator.next();
+             [a.value,b.value,c.value,c.done,
+              parameterReads.map(read=>read()).join(','),
+              blockReads.map(read=>read()).join(','),
+              d.value,e.value,e.done,f.value,f.done,abruptRead(),restoration].join('|')"
+        ),
+        "0:10|1:11|20,21|30,31|true|20,21|30,31|caught|finally:undefined|false|external|true|caught|undefined"
+    );
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var result='pending';
+             async function caught(){
+               var read;
+               try{throw {message:'async-caught'}}
+               catch({message}){
+                 read=()=>message;
+                 await Promise.resolve();
+                 return read()
+               }
+             }
+             caught().then(value=>result=value,error=>result='error:'+error);",
+            false,
+        )
+        .expect("captured async catch setup parses");
+    assert_eq!(run_in(&mut asynchronous, "result"), "async-caught");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn repeated_spelling_captured_lexicals_use_distinct_vm_environments() {
+    // Runtime lexical selection may conservatively promote every inner declaration with the same
+    // spelling, but each source scope and each re-entry still needs an independent Environment
+    // Record. This combines sibling/re-entered blocks and distinct catch parameter scopes.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* repeated(){
+               var reads=[];
+               for(var pass=0;pass<2;pass++){
+                 {
+                   let value='a'+pass;
+                   reads.push(()=>value);
+                   yield value;
+                   value+='!'
+                 }
+                 {
+                   let value='b'+pass;
+                   reads.push(()=>value);
+                   yield value;
+                   value+='!'
+                 }
+               }
+               try{throw 'catch-a'}catch(value){reads.push(()=>value);yield value}
+               try{throw 'catch-b'}catch(value){reads.push(()=>value);yield value}
+               return reads.map(read=>read()).join(',')
+             }
+             globalThis.repeatedIterator=repeated();",
+            false,
+        )
+        .expect("repeated captured spelling setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "var values=[],step;
+             while(!(step=repeatedIterator.next()).done)values.push(step.value);
+             values.join('|')+'|'+step.value"
+        ),
+        "a0|b0|a1|b1|catch-a|catch-b|a0!,b0!,a1!,b1!,catch-a,catch-b"
+    );
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+}
+
+#[test]
+fn await_using_follows_dispose_resources_await_order() {
+    fn after(setup: &str, read: &str) -> String {
+        let mut engine = Engine::new();
+        engine.eval(setup, false).expect("await using setup parses");
+        match engine.eval(read, false).expect("await using result parses") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => {
+                panic!("await using result threw {name}: {message}")
+            }
+        }
+    }
+    assert_eq!(
+        after(
+            "var log=[],result='pending';
+             async function orderedDisposal(){
+               using sync={ [Symbol.dispose](){log.push('sync')} };
+               await using empty=null;
+               Promise.resolve().then(()=>log.push('tick'));
+               log.push('body')
+             }
+             orderedDisposal().then(()=>result=log.join(','),error=>result='error:'+error);",
+            "result"
+        ),
+        "body,tick,sync"
+    );
+    assert_eq!(
+        after(
+            "var log=[],result='pending';
+             async function syncFallback(){
+               await using value={
+                 [Symbol.dispose](){log.push('fallback');return Promise.reject('ignored')}
+               };
+               return 'ok'
+             }
+             syncFallback().then(value=>result=value+':'+log.join(','),error=>result='error:'+error);",
+            "result"
+        ),
+        "ok:fallback"
+    );
+    assert_eq!(
+        after(
+            "var result='pending';
+             async function rejectedAsyncDisposal(){
+               await using value={
+                 [Symbol.asyncDispose](){return Promise.reject('dispose-error')}
+               };
+               return 'body-return'
+             }
+             rejectedAsyncDisposal().then(value=>result=value,error=>result=error);",
+            "result"
+        ),
+        "dispose-error"
+    );
+}
+
+#[test]
+fn await_using_uses_heap_vm_continuations() {
+    let mut function = Engine::new();
+    function
+        .eval(
+            "var release,result='pending',log=[],gate=new Promise(resolve=>release=resolve);
+             async function disposeOnReturn(){
+               await using value={
+                 [Symbol.asyncDispose](){log.push('dispose');return gate}
+               };
+               return 'body'
+             }
+             disposeOnReturn().then(value=>result='ok:'+value,error=>result='error:'+error);",
+            false,
+        )
+        .expect("await using async function setup parses");
+    assert!(function
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(function
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    function
+        .eval("release('settled')", false)
+        .expect("await using async function release parses");
+    match function
+        .eval("result+':'+log.join(',')", false)
+        .expect("await using async function result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "ok:body:dispose"),
+        Completion::Throw { name, message } => {
+            panic!("await using async function threw {name}: {message}")
+        }
+    }
+
+    let mut generator = Engine::new();
+    generator
+        .eval(
+            "var release,result='pending',first='pending',log=[],
+                 gate=new Promise(resolve=>release=resolve);
+             async function* disposeOnInjectedReturn(){
+               await using value={
+                 [Symbol.asyncDispose](){log.push('dispose');return gate}
+               };
+               yield 'ready';
+               return 'body'
+             }
+             globalThis.iterator=disposeOnInjectedReturn();
+             iterator.next().then(step=>first=step.value+','+step.done);",
+            false,
+        )
+        .expect("await using async generator setup parses");
+    generator
+        .eval(
+            "iterator.return('external').then(
+               step=>result=step.value+','+step.done,
+               error=>result='error:'+error
+             )",
+            false,
+        )
+        .expect("await using async generator return parses");
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(generator
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    generator
+        .eval("release('settled')", false)
+        .expect("await using async generator release parses");
+    match generator
+        .eval("[first,result,log.join(',')].join('|')", false)
+        .expect("await using async generator result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "ready,false|external,true|dispose"),
+        Completion::Throw { name, message } => {
+            panic!("await using async generator threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn using_loop_heads_use_heap_vm_continuations() {
+    let mut synchronous = Engine::new();
+    synchronous
+        .eval(
+            "var log=[];
+             function resource(name){
+               return {name,[Symbol.dispose](){log.push('dispose:'+name)}}
+             }
+             function* classic(){
+               var index=0;
+               for(using scope=resource('classic');index<2;index++)yield index;
+               return index
+             }
+             function* perIteration(){
+               for(using value of [resource('a'),resource('b')])yield value.name;
+               return 'unreached'
+             }
+             globalThis.classicIterator=classic();
+             globalThis.perIterationIterator=perIteration();",
+            false,
+        )
+        .expect("using loop-head setup parses");
+    assert!(synchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match synchronous
+        .eval(
+            "var a=classicIterator.next(),b=classicIterator.next(),c=classicIterator.next();
+             var d=perIterationIterator.next(),e=perIterationIterator.next(),
+                 f=perIterationIterator.return('external');
+             [a.value,b.value,c.value,c.done,d.value,e.value,f.value,f.done,log.join(',')].join('|')",
+            false,
+        )
+        .expect("using loop-head drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "0|1|2|true|a|b|external|true|dispose:classic,dispose:a,dispose:b"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("using loop-head drive threw {name}: {message}")
+        }
+    }
+    assert!(synchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var release,result='pending',log=[],gate=new Promise(resolve=>release=resolve);
+             function resource(name,pending){
+               return {name,[Symbol.asyncDispose](){
+                 log.push('dispose:'+name);
+                 return pending?gate:Promise.resolve()
+               }}
+             }
+             async function loop(){
+               for await(await using value of [resource('a',true),resource('b',false)]){
+                 log.push('body:'+value.name)
+               }
+               return 'done'
+             }
+             loop().then(value=>result=value,error=>result='error:'+error);",
+            false,
+        )
+        .expect("await using loop-head setup parses");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    asynchronous
+        .eval("release()", false)
+        .expect("await using loop-head release parses");
+    match asynchronous
+        .eval("result+'|'+log.join(',')", false)
+        .expect("await using loop-head result parses")
+    {
+        Completion::Value(value) => {
+            assert_eq!(value, "done|body:a,dispose:a,body:b,dispose:b")
+        }
+        Completion::Throw { name, message } => {
+            panic!("await using loop-head threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn using_for_of_disposes_before_iterator_close() {
+    let mut disposal_error = Engine::new();
+    disposal_error
+        .eval(
+            "var log=[],caught='none';
+             var resource={
+               [Symbol.dispose](){log.push('dispose');throw 'dispose-error'}
+             };
+             var iterable={
+               [Symbol.iterator](){
+                 var sent=false;
+                 return {
+                   next(){
+                     if(sent)return {done:true};
+                     sent=true;
+                     return {done:false,value:resource}
+                   },
+                   return(){log.push('close');throw 'close-error'}
+                 }
+               }
+             };
+             function* loop(){for(using value of iterable)yield 'ready'}
+             var iterator=loop(),first=iterator.next().value;
+             try{iterator.return('external')}catch(error){caught=error}",
+            false,
+        )
+        .expect("throwing using for-of cleanup parses");
+    assert!(disposal_error
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    match disposal_error
+        .eval("[first,caught,log.join(',')].join('|')", false)
+        .expect("throwing using for-of cleanup result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "ready|dispose-error|dispose,close"),
+        Completion::Throw { name, message } => {
+            panic!("throwing using for-of cleanup result threw {name}: {message}")
+        }
+    }
+
+    let mut close_error = Engine::new();
+    close_error
+        .eval(
+            "var log=[],caught='none';
+             var resource={
+               [Symbol.dispose](){log.push('dispose')}
+             };
+             var iterable={
+               [Symbol.iterator](){
+                 var sent=false;
+                 return {
+                   next(){
+                     if(sent)return {done:true};
+                     sent=true;
+                     return {done:false,value:resource}
+                   },
+                   return(){log.push('close');throw 'close-error'}
+                 }
+               }
+             };
+             function* loop(){for(using value of iterable)yield 'ready'}
+             var iterator=loop();iterator.next();
+             try{iterator.return('external')}catch(error){caught=error}",
+            false,
+        )
+        .expect("using for-of close-error setup parses");
+    match close_error
+        .eval("[caught,log.join(',')].join('|')", false)
+        .expect("using for-of close-error result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "close-error|dispose,close"),
+        Completion::Throw { name, message } => {
+            panic!("using for-of close-error result threw {name}: {message}")
+        }
+    }
+
+    let mut acquisition_error = Engine::new();
+    acquisition_error
+        .eval(
+            "var log=[],caught='none';
+             var resource={
+               get [Symbol.dispose](){log.push('get-dispose');throw 'acquire-error'}
+             };
+             var iterable={
+               [Symbol.iterator](){
+                 var sent=false;
+                 return {
+                   next(){
+                     if(sent)return {done:true};
+                     sent=true;
+                     return {done:false,value:resource}
+                   },
+                   return(){log.push('close');throw 'close-error'}
+                 }
+               }
+             };
+             function* loop(){for(using value of iterable)yield 'unreached'}
+             var iterator=loop();
+             try{iterator.next()}catch(error){caught=error}",
+            false,
+        )
+        .expect("using for-of acquisition-error setup parses");
+    match acquisition_error
+        .eval("[caught,log.join(',')].join('|')", false)
+        .expect("using for-of acquisition-error result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "acquire-error|get-dispose,close"),
+        Completion::Throw { name, message } => {
+            panic!("using for-of acquisition-error result threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
+fn await_using_for_await_disposes_before_async_iterator_close() {
+    let mut ordered = Engine::new();
+    ordered
+        .eval(
+            "var releaseDispose,releaseClose,result='pending',log=[];
+             var disposeGate=new Promise(resolve=>releaseDispose=resolve);
+             var closeGate=new Promise(resolve=>releaseClose=resolve);
+             var resource={
+               [Symbol.asyncDispose](){
+                 log.push('dispose:start');
+                 return disposeGate.then(()=>log.push('dispose:end'))
+               }
+             };
+             var iterable={
+               [Symbol.asyncIterator](){
+                 var sent=false;
+                 return {
+                   next(){
+                     if(sent)return Promise.resolve({done:true});
+                     sent=true;
+                     return Promise.resolve({done:false,value:resource})
+                   },
+                   return(){
+                     log.push('close:start');
+                     return closeGate.then(()=>{
+                       log.push('close:end');
+                       return {done:true}
+                     })
+                   }
+                 }
+               }
+             };
+             async function loop(){
+               for await(await using value of iterable){
+                 log.push('body');
+                 break
+               }
+               return 'done'
+             }
+             loop().then(value=>result=value,error=>result='error:'+error);",
+            false,
+        )
+        .expect("ordered await-using for-await setup parses");
+    assert!(ordered
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(ordered
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    assert_eq!(
+        run_in(&mut ordered, "result+'|'+log.join(',')"),
+        "pending|body,dispose:start"
+    );
+    ordered
+        .eval("releaseDispose()", false)
+        .expect("ordered await-using disposer release parses");
+    assert_eq!(
+        run_in(&mut ordered, "result+'|'+log.join(',')"),
+        "pending|body,dispose:start,dispose:end,close:start"
+    );
+    ordered
+        .eval("releaseClose()", false)
+        .expect("ordered await-using iterator-close release parses");
+    assert_eq!(
+        run_in(&mut ordered, "result+'|'+log.join(',')"),
+        "done|body,dispose:start,dispose:end,close:start,close:end"
+    );
+
+    let mut errors = Engine::new();
+    errors
+        .eval(
+            "var result='pending',log=[];
+             var resource={
+               [Symbol.asyncDispose](){
+                 log.push('dispose');
+                 return Promise.reject('dispose-error')
+               }
+             };
+             var iterable={
+               [Symbol.asyncIterator](){
+                 var sent=false;
+                 return {
+                   next(){
+                     if(sent)return Promise.resolve({done:true});
+                     sent=true;
+                     return Promise.resolve({done:false,value:resource})
+                   },
+                   return(){
+                     log.push('close');
+                     return Promise.reject('close-error')
+                   }
+                 }
+               }
+             };
+             async function loop(){
+               for await(await using value of iterable)return 'body-return'
+             }
+             loop().then(value=>result=value,error=>result='error:'+error);",
+            false,
+        )
+        .expect("throwing await-using for-await setup parses");
+    assert_eq!(
+        run_in(&mut errors, "result+'|'+log.join(',')"),
+        "error:dispose-error|dispose,close"
+    );
+    assert!(errors
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
 }
 
 #[test]
@@ -14456,7 +13811,9 @@ fn private_names_are_per_class_evaluation() {
     );
     // Private method names still display their source spelling.
     assert_eq!(
-        run("class C { #m() {} static n() { return Object.getOwnPropertyNames(C.prototype).length; } } String(C.n())"),
+        run(
+            "class C { #m() {} static n() { return Object.getOwnPropertyNames(C.prototype).length; } } String(C.n())"
+        ),
         "1"
     );
 }
@@ -14516,13 +13873,17 @@ fn annexb_function_in_block_hoisting() {
     // B.3.3: a sloppy block function gets a function-scope var binding, initialized to
     // undefined, synced with the block binding when the declaration evaluates.
     assert_eq!(
-        run("var r; (function() { eval('r = [typeof f]; { function f() {} } r.push(typeof f);'); }()); r.join(',')"),
+        run(
+            "var r; (function() { eval('r = [typeof f]; { function f() {} } r.push(typeof f);'); }()); r.join(',')"
+        ),
         "undefined,function"
     );
     // The block binding is independent: assigning inside the function rebinds the block
     // binding, and the promoted var keeps the function across repeated calls.
     assert_eq!(
-        run("var r; (function() { eval('{ function f() { r = [typeof f]; f = 123; r.push(f); return 1; } }f(); f();'); }()); r.join(',')"),
+        run(
+            "var r; (function() { eval('{ function f() { r = [typeof f]; f = 123; r.push(f); return 1; } }f(); f();'); }()); r.join(',')"
+        ),
         "number,123"
     );
     // A bare if-position declaration acts as an implicit block (B.3.4).
@@ -14532,16 +13893,22 @@ fn annexb_function_in_block_hoisting() {
     );
     // An intervening lexical (for-head let, destructured catch param) skips the promotion...
     assert_eq!(
-        run("(function() { return eval('for (let f; false; ) {{ function f() {} }} typeof f;'); }())"),
+        run(
+            "(function() { return eval('for (let f; false; ) {{ function f() {} }} typeof f;'); }())"
+        ),
         "undefined"
     );
     assert_eq!(
-        run("(function() { return eval('try { throw {}; } catch ({ f }) {{ function f() {} }} typeof f;'); }())"),
+        run(
+            "(function() { return eval('try { throw {}; } catch ({ f }) {{ function f() {} }} typeof f;'); }())"
+        ),
         "undefined"
     );
     // ...but a simple catch parameter does not (the B.3.5 legacy exemption).
     assert_eq!(
-        run("(function() { return eval('try { throw null; } catch (f) {{ function f() { return 1; } }} typeof f;'); }())"),
+        run(
+            "(function() { return eval('try { throw null; } catch (f) {{ function f() { return 1; } }} typeof f;'); }())"
+        ),
         "function"
     );
     // In *function code* (unlike eval code) a same-named parameter blocks the promotion.
@@ -14551,7 +13918,9 @@ fn annexb_function_in_block_hoisting() {
     );
     // `if (x) function f(){} else function f(){}` after a lexical: legal, promotion skipped.
     assert_eq!(
-        run("(function() { return eval('let f = 1; if (true) function f() {} else function _f() {} f;'); }()).toString()"),
+        run(
+            "(function() { return eval('let f = 1; if (true) function f() {} else function _f() {} f;'); }()).toString()"
+        ),
         "1"
     );
 }
@@ -15370,7 +14739,30 @@ fn regexp_v_flag_class_sets() {
     assert_eq!(run("String(/[[a-z]--[aeiou]]/v.test('e'))"), "false");
     // String disjunctions match longest-first.
     assert_eq!(run("/[\\q{a|bc|abc}]/v.exec('abcd')[0]"), "abc");
+    // A failed sequel backtracks from a longer string to a shorter matching element.
+    assert_eq!(run("/[\\q{ab|a}]b/v.exec('ab')[0]"), "ab");
+    // The singleton matcher precedes the empty-string matcher.
+    assert_eq!(run("/([\\q{|a}])/v.exec('a')[1]"), "a");
+    assert_eq!(run("String(/(?<=[\\q{ab|a}])c/v.test('abc'))"), "true");
+    assert_eq!(run("String(/^[\\q{AbC}]$/iv.test('aBc'))"), "true");
     assert_eq!(run("String(/[\\q{ab|cd}x]/v.test('x'))"), "true");
+    // Variable-length string atoms retain RepeatMatcher's greedy/lazy and bounded ordering.
+    assert_eq!(
+        run("/^([\\q{ab}]+)(.*)$/v.exec('abababab').slice(1).join('|')"),
+        "abababab|"
+    );
+    assert_eq!(
+        run("/^([\\q{ab}]+?)(.*)$/v.exec('abababab').slice(1).join('|')"),
+        "ab|ababab"
+    );
+    assert_eq!(
+        run("/^([\\q{ab}]{2,3})(.*)$/v.exec('abababab').slice(1).join('|')"),
+        "ababab|ab"
+    );
+    // Repetition can backtrack both its count and a string atom's shorter alternative.
+    assert_eq!(run("/^([\\q{aa|a}]+)b$/v.exec('aaab')[1]"), "aaa");
+    // Empty string elements satisfy a positive minimum but cannot spin indefinitely.
+    assert_eq!(run("String(/^[\\q{|ab}]+$/v.test('abab'))"), "true");
     // Negation of a plain set works; negating a set with strings is a SyntaxError.
     assert_eq!(run("String(/[^\\q{a}b]/v.test('c'))"), "true");
     assert_eq!(throws("new RegExp('[^\\\\q{ab}]', 'v')"), "SyntaxError");
@@ -15534,6 +14926,319 @@ fn listformat_to_parts_and_temporal_removed_methods() {
     );
 }
 
+#[cfg(feature = "intl")]
+#[test]
+fn listformat_cldr_patterns_and_contextual_selection() {
+    assert_eq!(
+        run("[
+            new Intl.ListFormat('de').format(['A', 'B', 'C']),
+            new Intl.ListFormat('fr').format(['A', 'B', 'C']),
+            new Intl.ListFormat('ja').format(['A', 'B', 'C']),
+            new Intl.ListFormat('zh').format(['A', 'B', 'C']),
+            new Intl.ListFormat('ar').format(['A', 'B', 'C']),
+            new Intl.ListFormat('hi').format(['A', 'B', 'C']),
+            new Intl.ListFormat('ja', {type: 'unit', style: 'narrow'}).format(['A', 'B', 'C'])
+        ].join('|')"),
+        "A, B und C|A, B et C|A、B、C|A、B和C|A وB وC|A, B, और C|ABC"
+    );
+    // UTS #35 List Patterns documents Spanish y→e and o→u selection from the following value.
+    assert_eq!(
+        run("const and = new Intl.ListFormat('es');
+             const or = new Intl.ListFormat('es', {type: 'disjunction'});
+             [and.format(['fuerte', 'indomable']),
+              and.format(['agua', 'hielo']),
+              and.format(['uno', 'dos', 'indomable']),
+              or.format(['delfines', 'orcas']),
+              or.format(['6', '8']),
+              or.format(['10', '11.000']),
+              or.format(['10', '111'])].join('|')"),
+        "fuerte e indomable|agua y hielo|uno, dos e indomable|delfines u orcas|6 u 8|10 u 11.000|10 o 111"
+    );
+    assert_eq!(
+        run("JSON.stringify(new Intl.ListFormat('ar').formatToParts(['A', 'B', 'C']))"),
+        "[{\"type\":\"element\",\"value\":\"A\"},{\"type\":\"literal\",\"value\":\" و\"},{\"type\":\"element\",\"value\":\"B\"},{\"type\":\"literal\",\"value\":\" و\"},{\"type\":\"element\",\"value\":\"C\"}]"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn relative_time_format_cldr_patterns_and_parts() {
+    // ECMA-402 PartitionRelativeTimePattern uses only an exact string-valued CLDR key for
+    // numeric:auto. In particular, fractional values must not truncate to an adjacent phrase.
+    assert_eq!(
+        run("[
+            new Intl.RelativeTimeFormat('de', {numeric: 'auto'}).format(-2, 'day'),
+            new Intl.RelativeTimeFormat('fr', {numeric: 'auto'}).format(2, 'day'),
+            new Intl.RelativeTimeFormat('ja', {numeric: 'auto'}).format(1, 'day'),
+            new Intl.RelativeTimeFormat('ar', {numeric: 'auto'}).format(-1, 'day'),
+            new Intl.RelativeTimeFormat('en', {numeric: 'auto'}).format(0.5, 'day')
+        ].join('|')"),
+        "vorgestern|après-demain|明日|أمس|in 0.5 days"
+    );
+
+    // These locales exercise differing word order, whitespace, plural categories, and CLDR
+    // patterns that intentionally spell out Arabic one/two without a number placeholder.
+    assert_eq!(
+        run("[
+            new Intl.RelativeTimeFormat('de').format(-2, 'day'),
+            new Intl.RelativeTimeFormat('fr').format(2, 'day'),
+            new Intl.RelativeTimeFormat('ja').format(-3, 'day'),
+            new Intl.RelativeTimeFormat('hi').format(4, 'day'),
+            new Intl.RelativeTimeFormat('ar', {numberingSystem: 'latn'}).format(1, 'day'),
+            new Intl.RelativeTimeFormat('ar', {numberingSystem: 'latn'}).format(2, 'day'),
+            new Intl.RelativeTimeFormat('ar', {numberingSystem: 'latn'}).format(3, 'day'),
+            new Intl.RelativeTimeFormat('fr', {style: 'narrow'}).format(-2, 'day'),
+            new Intl.RelativeTimeFormat('en').format(-0, 'day')
+        ].join('|')"),
+        "vor 2 Tagen|dans 2 jours|3 日前|4 दिन में|خلال يوم واحد|خلال يومين|خلال 3 أيام|-2 j|0 days ago"
+    );
+
+    // MakePartsList attaches the singular unit to every NumberFormat part, but not to the CLDR
+    // literals. A placeholder-free pattern remains a single literal part.
+    assert_eq!(
+        run("JSON.stringify([
+            new Intl.RelativeTimeFormat('fr').formatToParts(-2, 'day'),
+            new Intl.RelativeTimeFormat('ar').formatToParts(1, 'day'),
+            new Intl.RelativeTimeFormat('de', {numeric: 'auto'}).formatToParts(0, 'day')
+        ])"),
+        "[[{\"type\":\"literal\",\"value\":\"il y a \"},{\"type\":\"integer\",\"value\":\"2\",\"unit\":\"day\"},{\"type\":\"literal\",\"value\":\" jours\"}],[{\"type\":\"literal\",\"value\":\"خلال يوم واحد\"}],[{\"type\":\"literal\",\"value\":\"heute\"}]]"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn numberformat_cldr_symbols_patterns_currencies_and_compact() {
+    // ECMA-402's number-pattern algorithms obtain their symbols, grouping sizes, affixes, and
+    // compact notation patterns from locale data. These cases deliberately cross those axes.
+    assert_eq!(
+        run("[
+            new Intl.NumberFormat('ar').format(1234567.89),
+            new Intl.NumberFormat('hi').format(1234567.89),
+            new Intl.NumberFormat('fr', {style: 'percent'}).format(.123),
+            new Intl.NumberFormat('de', {style: 'currency', currency: 'USD'}).format(12.5),
+            new Intl.NumberFormat('fr', {style: 'currency', currency: 'USD'}).format(12.5),
+            new Intl.NumberFormat('fr', {style: 'currency', currency: 'USD', currencyDisplay: 'name'}).format(2),
+            new Intl.NumberFormat('en', {style: 'currency', currency: 'JPY'}).format(12.5)
+        ].join('|')"),
+        "١٬٢٣٤٬٥٦٧٫٨٩|12,34,567.89|12 %|12,50 $|12,50 $US|2,00 dollars des États-Unis|¥13"
+    );
+
+    assert_eq!(
+        run("[
+            new Intl.NumberFormat('fr', {notation: 'compact', compactDisplay: 'long'}).format(1000),
+            new Intl.NumberFormat('en', {notation: 'compact'}).format(999500),
+            new Intl.NumberFormat('hi', {notation: 'compact'}).format(100000),
+            new Intl.NumberFormat('ja', {notation: 'compact'}).format(12345),
+            new Intl.NumberFormat('ru', {notation: 'compact', compactDisplay: 'long'}).format(2000),
+            new Intl.NumberFormat('pl').format(1000),
+            new Intl.NumberFormat('pl').format(10000)
+        ].join('|')"),
+        "mille|1M|1 लाख|1.2万|2 тысячи|1000|10 000"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn numberformat_localized_parts_ranges_and_unit_plurals() {
+    assert_eq!(
+        run("JSON.stringify([
+            new Intl.NumberFormat('ar').formatToParts(-1234.5),
+            new Intl.NumberFormat('ar', {style: 'percent'}).formatToParts(-.5),
+            new Intl.NumberFormat('sv', {notation: 'scientific'}).formatToParts(-1234.5),
+            new Intl.NumberFormat('fr', {notation: 'compact', compactDisplay: 'long'}).formatToParts(1000),
+            new Intl.NumberFormat('si', {notation: 'compact', compactDisplay: 'long'}).formatToParts(1000)
+        ])"),
+        "[[{\"type\":\"literal\",\"value\":\"؜\"},{\"type\":\"minusSign\",\"value\":\"-\"},{\"type\":\"integer\",\"value\":\"١\"},{\"type\":\"group\",\"value\":\"٬\"},{\"type\":\"integer\",\"value\":\"٢٣٤\"},{\"type\":\"decimal\",\"value\":\"٫\"},{\"type\":\"fraction\",\"value\":\"٥\"}],[{\"type\":\"literal\",\"value\":\"؜\"},{\"type\":\"minusSign\",\"value\":\"-\"},{\"type\":\"integer\",\"value\":\"٥٠\"},{\"type\":\"percentSign\",\"value\":\"٪\"},{\"type\":\"literal\",\"value\":\"؜\"}],[{\"type\":\"minusSign\",\"value\":\"−\"},{\"type\":\"integer\",\"value\":\"1\"},{\"type\":\"decimal\",\"value\":\",\"},{\"type\":\"fraction\",\"value\":\"235\"},{\"type\":\"exponentSeparator\",\"value\":\"×10^\"},{\"type\":\"exponentInteger\",\"value\":\"3\"}],[{\"type\":\"compact\",\"value\":\"mille\"}],[{\"type\":\"compact\",\"value\":\"දහස\"},{\"type\":\"literal\",\"value\":\" \"},{\"type\":\"integer\",\"value\":\"1\"}]]"
+    );
+
+    // UTS #35 unit patterns are selected by the full plural category, including placeholder-free
+    // forms, and FormatNumericRange must localize every numeric part in both endpoints.
+    assert_eq!(
+        run("const ar = new Intl.NumberFormat('ar', {style: 'unit', unit: 'meter', unitDisplay: 'long'});
+             const sl = new Intl.NumberFormat('sl', {style: 'unit', unit: 'meter', unitDisplay: 'long'});
+             const range = new Intl.NumberFormat('ar');
+             [ar.format(1), ar.format(2), ar.format(3), ar.format(11),
+              sl.format(2), sl.format(3), sl.format(5),
+              range.formatRange(1234, 5678),
+              range.formatRangeToParts(1234, 5678).map(part => part.value).join('')].join('|')"),
+        "متر|٢ متر|٣ أمتار|١١ مترًا|2 metra|3 metri|5 metrov|١٬٢٣٤–٥٬٦٧٨|١٬٢٣٤–٥٬٦٧٨"
+    );
+    assert_eq!(
+        run(
+            "JSON.stringify(new Intl.NumberFormat('ar', {style: 'unit', unit: 'meter', unitDisplay: 'long'}).formatToParts(1))"
+        ),
+        "[{\"type\":\"unit\",\"value\":\"متر\"}]"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn display_names_cldr_locales_styles_and_language_composition() {
+    assert_eq!(
+        run("[
+            new Intl.DisplayNames('de', {type: 'language'}).of('fr'),
+            new Intl.DisplayNames('fr', {type: 'region'}).of('US'),
+            new Intl.DisplayNames('ja', {type: 'script'}).of('Hans'),
+            new Intl.DisplayNames('ar', {type: 'currency'}).of('USD'),
+            new Intl.DisplayNames('de', {type: 'calendar'}).of('gregory'),
+            new Intl.DisplayNames('fr', {type: 'dateTimeField'}).of('timeZoneName')
+        ].join('|')"),
+        "Französisch|États-Unis|漢字(簡体字)|دولار أمريكي|Gregorianischer Kalender|fuseau horaire"
+    );
+
+    // UTS #35 dialect mode consumes the longest compound language name, while standard mode
+    // composes the base language and localized qualifier names.
+    assert_eq!(
+        run("[
+            new Intl.DisplayNames('en', {type: 'language'}).of('en-GB'),
+            new Intl.DisplayNames('en', {type: 'language', languageDisplay: 'standard'}).of('en-GB'),
+            new Intl.DisplayNames('en', {type: 'language'}).of('en-Latn-GB'),
+            new Intl.DisplayNames('en', {type: 'language', languageDisplay: 'standard'}).of('en-Latn-GB'),
+            new Intl.DisplayNames('en', {type: 'language', style: 'short'}).of('en-GB'),
+            new Intl.DisplayNames('fr', {type: 'region', style: 'short'}).of('US')
+        ].join('|')"),
+        "British English|English (United Kingdom)|British English (Latin)|English (Latin, United Kingdom)|UK English|É.-U."
+    );
+
+    // CanonicalCodeForDisplayNames regularizes case without inventing a name. The fallback policy
+    // then returns that regularized code or undefined.
+    assert_eq!(
+        run("[
+            new Intl.DisplayNames('fr', {type: 'region', fallback: 'none'}).of('qz'),
+            new Intl.DisplayNames('fr', {type: 'region'}).of('qz'),
+            new Intl.DisplayNames('en', {type: 'calendar'}).of('ABC'),
+            new Intl.DisplayNames('en', {type: 'currency'}).of('xyz')
+        ].map(value => value === undefined ? 'undefined' : value).join('|')"),
+        "undefined|QZ|abc|XYZ"
+    );
+    assert_eq!(
+        run("[
+            Object.keys(new Intl.DisplayNames('en', {type: 'region'}).resolvedOptions()).join(','),
+            Object.keys(new Intl.DisplayNames('en', {type: 'language'}).resolvedOptions()).join(',')
+        ].join('|')"),
+        "locale,style,type,fallback|locale,style,type,fallback,languageDisplay"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn segmenter_unicode_boundaries_and_containing() {
+    // ECMA-402 Intl.Segmenter delegates its boundary decisions to locale-sensitive
+    // segmentation. These exercise the Unicode 17 UAX #29 defaults exposed through the public
+    // JS API, including UTF-16 indices and word-likeness metadata.
+    assert_eq!(
+        run(r#"
+            const segments = [...new Intl.Segmenter('en', {granularity: 'grapheme'})
+                .segment('a\u0308\u{1F469}\u200D\u{1F52C}\u0915\u094D\u0937')];
+            [segments.length,
+             segments.map(part => part.segment.length).join(','),
+             segments.map(part => part.index).join(',')].join(';')
+        "#),
+        "3;2,5,3;0,2,7"
+    );
+    assert_eq!(
+        run(r#"
+            const segments = [...new Intl.Segmenter('en', {granularity: 'word'})
+                .segment("can't 3.14 \u6F22\u5B57")];
+            [segments.length,
+             segments.map(part => part.segment.length).join(','),
+             segments.map(part => part.isWordLike).join(',')].join(';')
+        "#),
+        "6;5,1,4,1,1,1;true,false,true,false,true,true"
+    );
+    assert_eq!(
+        run(r#"
+            const segments = [...new Intl.Segmenter('en', {granularity: 'sentence'})
+                .segment('3.14 is pi. Next!')];
+            segments.map(part => part.index + ':' + part.segment.length).join(',')
+        "#),
+        "0:12,12:5"
+    );
+    assert_eq!(
+        run(r#"
+            const segments = new Intl.Segmenter('en').segment('aa\u{1F469}\u200D\u{1F52C}b');
+            [segments.containing(4).index,
+             segments.containing(NaN).index,
+             segments.containing(-1),
+             segments.containing(Infinity),
+             segments.containing(8)].join(',')
+        "#),
+        "2,0,,,"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn pluralrules_cldr_cardinal_ordinal_operands_and_ranges() {
+    let selections = |locale: &str, options: &str, values: &str| {
+        run(&format!(
+            "const rules = new Intl.PluralRules('{locale}', {options});
+             [{values}].map(value => rules.select(value)).join(',')"
+        ))
+    };
+
+    assert_eq!(
+        selections("ar", "{}", "0, 1, 2, 3, 11, 100, 0.5"),
+        "zero,one,two,few,many,other,other"
+    );
+    assert_eq!(
+        selections("ru", "{}", "1, 2, 5, 11, 21, 22, 1.2"),
+        "one,few,many,many,one,few,other"
+    );
+    // Serbian cardinal rules use the exact visible fraction digits (`f`), not merely whether a
+    // fraction exists.
+    assert_eq!(
+        selections("sr", "{}", "1.1, 1.2, 1.5, 11.1, 11.2"),
+        "one,few,other,one,few"
+    );
+    assert_eq!(
+        selections("en", "{type: 'ordinal'}", "1, 2, 3, 4, 11, 12, 13, 21"),
+        "one,two,few,other,other,other,other,one"
+    );
+    assert_eq!(
+        selections("hi", "{type: 'ordinal'}", "1, 2, 3, 4, 5, 6"),
+        "one,two,two,few,other,many"
+    );
+
+    // ResolvePlural runs FormatNumericToString first: padding and rounding therefore change the
+    // CLDR v/i operands. Exact BigInt digits must also survive without an f64 round-trip.
+    assert_eq!(
+        run("[
+            new Intl.PluralRules('en', {minimumFractionDigits: 1}).select(1),
+            new Intl.PluralRules('en', {maximumFractionDigits: 0}).select(1.2),
+            new Intl.PluralRules('ru').select(1000000000000000000001n)
+        ].join(',')"),
+        "other,one,one"
+    );
+    // French is one of the locales whose compact exponent (`c`/legacy `e`) changes selection.
+    assert_eq!(
+        run("const standard = new Intl.PluralRules('fr');
+             const compact = new Intl.PluralRules('fr', {notation: 'compact'});
+             [standard.select(1e6), compact.select(1e6),
+              standard.select(1.5e6), compact.select(1.5e6), compact.select(1e-6)].join(',')"),
+        "many,many,other,many,one"
+    );
+    assert_eq!(
+        run("[
+            new Intl.PluralRules('ar').selectRange(0, 1),
+            new Intl.PluralRules('ru').selectRange(2, 21),
+            new Intl.PluralRules('en').selectRange(1, 1),
+            new Intl.PluralRules('en').selectRange(1, 2)
+        ].join(',')"),
+        "zero,one,one,other"
+    );
+    assert_eq!(
+        run(
+            "const cardinal = new Intl.PluralRules('ar').resolvedOptions();
+             const ordinal = new Intl.PluralRules('en', {type: 'ordinal'}).resolvedOptions();
+             [cardinal.pluralCategories.join('-'), ordinal.pluralCategories.join('-'),
+              cardinal.roundingIncrement, cardinal.roundingMode,
+              cardinal.roundingPriority, cardinal.trailingZeroDisplay].join(',')"
+        ),
+        "zero-one-two-few-many-other,one-two-few-other,1,halfExpand,auto,auto"
+    );
+}
+
 #[test]
 fn async_generator_return_awaits_value() {
     fn after(setup: &str, read: &str) -> String {
@@ -15607,6 +15312,174 @@ fn async_from_sync_close_on_rejection() {
             "len"
         ),
         "0"
+    );
+}
+
+#[test]
+fn for_await_of_uses_vm_continuations_and_normative_async_close() {
+    fn after(setup: &str, read: &str) -> String {
+        let mut engine = Engine::new();
+        engine.eval(setup, false).expect("setup");
+        assert!(engine
+            .interp
+            .generators
+            .values()
+            .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        match engine.eval(read, false).expect("read") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        }
+    }
+
+    // Native async iteration awaits every step and supports further suspension in the body.
+    assert_eq!(
+        after(
+            "var out='pending',log=[],n=0;
+             const source={
+               [Symbol.asyncIterator](){return this},
+               next(){n++;return Promise.resolve(n<3?{value:n,done:false}:{done:true})}
+             };
+             async function run(){for await(const value of source){log.push(value);await 0}return log.join(',')}
+             run().then(value=>out=value);",
+            "out"
+        ),
+        "1,2"
+    );
+
+    // %AsyncFromSyncIteratorPrototype%.next never throws synchronously. Adapter failures reject
+    // its intrinsic promise, so an already-queued job runs before the loop's catch resumes.
+    assert_eq!(
+        after(
+            "var out='',log=[];
+             const source={[Symbol.iterator](){return{next(){
+               log.push('next');Promise.resolve().then(()=>log.push('tick'));throw 'step'
+             }}}};
+             async function run(){try{for await(const value of source){}}catch(e){log.push('catch:'+e)}}
+             run().then(()=>out=log.join(','));",
+            "out"
+        ),
+        "next,tick,catch:step"
+    );
+    // By contrast, Call on a native async iterator is the `? Call` preceding Await and an abrupt
+    // completion reaches the catch without an artificial promise turn.
+    assert_eq!(
+        after(
+            "var out='',log=[];
+             const source={[Symbol.asyncIterator](){return this},next(){
+               log.push('next');Promise.resolve().then(()=>log.push('tick'));throw 'step'
+             }};
+             async function run(){try{for await(const value of source){}}catch(e){log.push('catch:'+e)}}
+             run().then(()=>out=log.join(','));",
+            "out"
+        ),
+        "next,catch:step,tick"
+    );
+
+    // An early exit over a sync source still closes through the async-from-sync wrapper. Its
+    // absent underlying `return` produces a fulfilled promise and therefore a mandatory Await.
+    assert_eq!(
+        after(
+            "var out='',log=[];
+             const source={[Symbol.iterator](){return{next(){return{value:1,done:false}}}}};
+             async function run(){for await(const value of source){
+               log.push('body');Promise.resolve().then(()=>log.push('tick'));break
+             }log.push('after')}
+             run().then(()=>out=log.join(','));",
+            "out"
+        ),
+        "body,tick,after"
+    );
+
+    // Native AsyncIteratorClose awaits `return()`. Throw-mode close preserves the original body
+    // error, while a close rejection replaces a normal break completion.
+    assert_eq!(
+        after(
+            "var out='',log=[];
+             const source={[Symbol.asyncIterator](){return this},
+               next(){return Promise.resolve({value:1,done:false})},
+               return(){log.push('close');return Promise.reject('close-error')}};
+             async function run(){try{for await(const value of source){throw 'body-error'}}catch(e){log.push('catch:'+e)}}
+             run().then(()=>out=log.join(','));",
+            "out"
+        ),
+        "close,catch:body-error"
+    );
+    assert_eq!(
+        after(
+            "var out='',log=[];
+             const source={[Symbol.asyncIterator](){return this},
+               next(){return Promise.resolve({value:1,done:false})},
+               return(){log.push('close');return Promise.reject('close-error')}};
+             async function run(){try{for await(const value of source)break}catch(e){log.push('catch:'+e)}}
+             run().then(()=>out=log.join(','));",
+            "out"
+        ),
+        "close,catch:close-error"
+    );
+
+    // A step failure never closes that iterator. Async-from-sync closes only a rejected live
+    // value; a rejected value belonging to a done result is propagated without `return()`.
+    assert_eq!(
+        after(
+            "var out='',returns=0,caught='';
+             const source={[Symbol.asyncIterator](){return this},
+               next(){return Promise.reject('step')},
+               return(){returns++;return Promise.resolve({done:true})}};
+             (async()=>{try{for await(const value of source){}}catch(e){caught=e}})()
+               .then(()=>out=returns+':'+caught);",
+            "out"
+        ),
+        "0:step"
+    );
+    assert_eq!(
+        after(
+            "var out='',returns=0,caught='';
+             const source={[Symbol.iterator](){return{
+               next(){return{value:Promise.reject('done-value'),done:true}},
+               return(){returns++;return{done:true}}
+             }}};
+             (async()=>{try{for await(const value of source){}}catch(e){caught=e}})()
+               .then(()=>out=returns+':'+caught);",
+            "out"
+        ),
+        "0:done-value"
+    );
+
+    // An externally injected async-generator return is awaited, then closes the active async
+    // iterator before the generator request resolves.
+    assert_eq!(
+        after(
+            "var out='',log=[];
+             const source={[Symbol.asyncIterator](){return this},
+               next(){return Promise.resolve({value:1,done:false})},
+               return(){log.push('close-start');return Promise.resolve().then(()=>{
+                 log.push('close-end');return{done:true}
+               })}};
+             async function* values(){for await(const value of source)yield value}
+             const iterator=values();
+             iterator.next().then(first=>{log.push(first.value+':'+first.done);return iterator.return(9)})
+               .then(last=>{out=last.value+':'+last.done+'|'+log.join(',')});",
+            "out"
+        ),
+        "9:true|1:false,close-start,close-end"
+    );
+
+    // Labelled abandonment of nested async loops closes inside-out, awaiting each close before
+    // beginning the next one.
+    assert_eq!(
+        after(
+            "var out='',log=[];
+             function source(name){return{[Symbol.asyncIterator](){return this},
+               next(){return Promise.resolve({value:1,done:false})},
+               return(){log.push(name+'-start');return Promise.resolve().then(()=>{
+                 log.push(name+'-end');return{done:true}
+               })}}}
+             async function run(){outer:for await(const a of source('outer'))
+               for await(const b of source('inner'))break outer}
+             run().then(()=>out=log.join(','));",
+            "out"
+        ),
+        "inner-start,inner-end,outer-start,outer-end"
     );
 }
 #[test]
@@ -15690,6 +15563,17 @@ fn disposable_stack_semantics() {
              class C { static { using y = { [Symbol.dispose]() { out.push('s'); } }; } }
              out.join(',')"),
         "b,d,s"
+    );
+    // DisposeResources replaces a pending non-throw abrupt completion with a disposal throw.
+    assert_eq!(
+        run("function f() {
+               using x = { [Symbol.dispose]() { throw 'dispose'; } };
+               return 'body';
+             }
+             let result;
+             try { result = f(); } catch (error) { result = error; }
+             result"),
+        "dispose"
     );
 }
 #[test]
@@ -16220,7 +16104,9 @@ fn locale_info_uses_cldr_region_preference() {
 
     // Week data observes the same region preference and preserves non-standard weekends.
     assert_eq!(
-        run("var w = new Intl.Locale('fa-JP-u-sd-inka-rg-afzzzz').getWeekInfo(); `${w.firstDay}:${w.weekend}`"),
+        run(
+            "var w = new Intl.Locale('fa-JP-u-sd-inka-rg-afzzzz').getWeekInfo(); `${w.firstDay}:${w.weekend}`"
+        ),
         "6:4,5"
     );
     assert_eq!(
@@ -16243,6 +16129,23 @@ fn locale_info_collations_and_default_locale() {
     assert_eq!(
         run("new Intl.NumberFormat().resolvedOptions().locale"),
         "en-US"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn supported_values_reflect_available_collation_and_currency_data() {
+    assert_eq!(
+        run("var v=Intl.supportedValuesOf('collation');
+             [v.includes('emoji'),v.includes('big5han'),
+              v.every((x,n)=>n===0||v[n-1]<x)].join(',')"),
+        "true,false,true"
+    );
+    assert_eq!(
+        run("var v=Intl.supportedValuesOf('currency');
+             [v.includes('ADP'),v.includes('USD'),v.length>100,
+              v.every((x,n)=>n===0||v[n-1]<x)].join(',')"),
+        "true,true,true,true"
     );
 }
 
@@ -16294,6 +16197,43 @@ fn collator_three_level_compare() {
 
 #[cfg(feature = "intl")]
 #[test]
+fn collator_cldr_48_locale_tailorings() {
+    // UTS #35 Part 5 relations are evaluated over NFD input and remain distinct at primary
+    // sensitivity where CLDR uses `<`. This covers singleton insertions, decomposed accents,
+    // traditional contractions, and a multi-code-point phonetic tailoring.
+    assert_eq!(
+        run("const sort=(locale,values)=>values.sort(new Intl.Collator(locale,{sensitivity:'variant'}).compare).join(',');
+             [sort('pl',['ż','z','ź']),
+              sort('sv',['ö','ä','z','å']),
+              sort('es',['o','ñ','n']),
+              sort('es-u-co-trad',['d','ch','cz']),
+              sort('sl',['d','ć','c','č']),
+              sort('ln-u-co-phonetic',['h','gb','ga']),
+              sort('hi',['ः','ँ','ं','ॐ']),
+              sort('si',['ඃ','ං','ඖ'])].join('|')"),
+        "z,ź,ż|z,å,ä,ö|n,ñ,o|cz,ch,d|c,č,ć,d|ga,gb,h|ॐ,ं,ँ,ः|ඖ,ං,ඃ"
+    );
+    // Same-primary secondary and case relations still participate at the requested levels.
+    assert_eq!(
+        run("const base=new Intl.Collator('sv',{sensitivity:'base'});
+             const accent=new Intl.Collator('sv',{sensitivity:'accent'});
+             [base.compare('ä','æ'),accent.compare('ä','æ'),
+              new Intl.Collator('pl',{caseFirst:'upper'}).compare('ą','Ą')].join(',')"),
+        "0,-1,1"
+    );
+    // CLDR's full starred-primary chains provide pronunciation, stroke, and Japanese dictionary
+    // order rather than falling back to Han code-point order.
+    assert_eq!(
+        run("const values=[...'北京東一二三亜愛阿国語山川人'];
+             const sorted=locale=>values.slice().sort(new Intl.Collator(locale).compare).join('');
+             [sorted('ja'),sorted('zh-u-co-pinyin'),sorted('zh-Hant-u-co-stroke'),
+              sorted('zh-u-co-zhuyin')].join('|')"),
+        "亜阿愛一京語国三山人川東二北|阿愛北川東二国京人三山亜一語|一二人三山川北亜京国東阿愛語|北東国京川山人三阿愛二一亜語"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
 fn cldr_unit_patterns_correct_ids() {
     // Regression (issue #7): the CLDR table matched unit ids by bare suffix and picked up
     // unrelated compound units — `second` -> acceleration-meter-per-square-second,
@@ -16330,16 +16270,32 @@ fn numberformat_exact_decimal_inputs() {
     );
     // A decimal-string argument does not round through f64.
     assert_eq!(
-        run("new Intl.NumberFormat('en',{useGrouping:false,maximumFractionDigits:9}).format('9007200.256743991')"),
+        run(
+            "new Intl.NumberFormat('en',{useGrouping:false,maximumFractionDigits:9}).format('9007200.256743991')"
+        ),
         "9007200.256743991"
+    );
+    // ToIntlMathematicalValue remains exact through percent and notation scaling. Compact
+    // magnitudes beyond CLDR's last table entry reuse its exponent instead of dropping notation.
+    assert_eq!(
+        run("[
+            new Intl.NumberFormat('en',{notation:'compact',maximumFractionDigits:15}).format(12345678901234567n),
+            new Intl.NumberFormat('en',{notation:'compact',maximumFractionDigits:15}).format(1234567890123456789012345678901234567890n),
+            new Intl.NumberFormat('en',{notation:'scientific',maximumFractionDigits:15}).format(12345678901234567n),
+            new Intl.NumberFormat('en',{notation:'engineering',maximumFractionDigits:15}).format(12345678901234567n),
+            new Intl.NumberFormat('en',{style:'percent',maximumFractionDigits:0,useGrouping:false}).format(1234567890123456789012345678901234567890n)
+        ].join('|')"),
+        "12,345.678901234567T|1,234,567,890,123,456,789,012,345,678.90123456789T|1.234567890123457E16|12.345678901234567E15|123456789012345678901234567890123456789000%"
     );
 }
 #[cfg(feature = "intl")]
 #[test]
 fn dtf_chinese_calendar_year_parts() {
     assert_eq!(
-        run("JSON.stringify(new Intl.DateTimeFormat('zh-u-ca-chinese',{year:'numeric'})
-             .formatToParts(new Date(2019, 5, 1)))"),
+        run(
+            "JSON.stringify(new Intl.DateTimeFormat('zh-u-ca-chinese',{year:'numeric'})
+             .formatToParts(new Date(2019, 5, 1)))"
+        ),
         "[{\"type\":\"relatedYear\",\"value\":\"2019\"},{\"type\":\"yearName\",\"value\":\"己亥\"},{\"type\":\"literal\",\"value\":\"年\"}]"
     );
     // A DTF range with only the day differing collapses around shared fields.
@@ -16349,6 +16305,45 @@ fn dtf_chinese_calendar_year_parts() {
              .formatRange(new Date('2019-01-03T00:00:00'), new Date('2019-01-05T00:00:00'))"
         ),
         "Jan 3\u{2009}\u{2013}\u{2009}5, 2019"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn datetimeformat_cldr_styles_skeletons_connectors_and_ranges() {
+    // ECMA-402 DateTime Style Formats and best-fit component formats consume locale-specific CLDR
+    // patterns. This crosses named/numeric month widths, field order, and at-time connectors.
+    assert_eq!(
+        run("const t = Date.UTC(2020, 5, 15, 13, 45, 30);
+             const ja = new Intl.DateTimeFormat('ja', {
+               year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC'
+             });
+             [new Intl.DateTimeFormat('fr', {
+                dateStyle: 'long', timeStyle: 'short', timeZone: 'UTC'
+              }).format(t),
+              new Intl.DateTimeFormat('ja', {dateStyle: 'full', timeZone: 'UTC'}).format(t),
+              new Intl.DateTimeFormat('hi', {dateStyle: 'medium', timeZone: 'UTC'}).format(t),
+              ja.format(t), ja.resolvedOptions().month,
+              new Intl.DateTimeFormat('en-u-nu-arab', {
+                hour: 'numeric', minute: 'numeric', second: 'numeric',
+                fractionalSecondDigits: 3, timeZone: 'UTC'
+              }).formatToParts(t + 789).filter(p =>
+                p.type === 'fractionalSecond' || p.value === '٫'
+              ).map(p => p.value).join('')].join('|')"),
+        "15 juin 2020 à 13:45|2020年6月15日月曜日|15 जून 2020|2020/6/15|numeric|٫٧٨٩"
+    );
+
+    // UTS #35 interval formats collapse shared fields, may refine numeric widths, and split at the
+    // first repeated field. ECMA-402 marks the separator as shared.
+    assert_eq!(
+        run("const f = new Intl.DateTimeFormat('ja', {
+               year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC'
+             });
+             const a = Date.UTC(2019, 0, 3), b = Date.UTC(2019, 0, 5);
+             [f.formatRange(a, b),
+              f.formatRangeToParts(a, b).map(p => p.type + ':' + p.value + ':' + p.source).join('|')
+             ].join('\\n')"),
+        "2019/01/03～2019/01/05\nyear:2019:startRange|literal:/:startRange|month:01:startRange|literal:/:startRange|day:03:startRange|literal:～:shared|year:2019:endRange|literal:/:endRange|month:01:endRange|literal:/:endRange|day:05:endRange"
     );
 }
 #[test]

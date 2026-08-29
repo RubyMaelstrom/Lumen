@@ -2,55 +2,106 @@
 // can be consumed once, either through `text()`/`json()`/… or by reading its `.body` ReadableStream
 // (see streams.js). The two share one "consumed" flag.
 
+function toByteString(value, context) {
+  const string = String(value);
+  for (let i = 0; i < string.length; ++i) {
+    if (string.charCodeAt(i) > 0xff) {
+      throw new TypeError(`${context} is not a ByteString`);
+    }
+  }
+  return string;
+}
+
 function normalizeHeaderName(name) {
-  name = String(name);
+  name = toByteString(name, "header name");
   if (name === "" || /[^\x21-\x7e]/.test(name) || /[()<>@,;:\\"/[\]?={} \t]/.test(name)) {
     throw new TypeError(`invalid header name '${name}'`);
   }
   return name.toLowerCase();
 }
 
+// Fetch §2.2.2: normalization removes HTTP whitespace (SP, HTAB, CR, and LF)
+// only at the ends; validation then rejects NUL and every remaining CR/LF.
+function normalizeHeaderValue(value) {
+  value = toByteString(value, "header value").replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+  if (/[\0\r\n]/.test(value)) throw new TypeError("invalid header value");
+  return value;
+}
+
 class Headers {
   constructor(init) {
-    this._map = new Map(); // lower-name -> { name, value }
+    this._map = new Map(); // lower-name -> { name, values }
+    this._guard = "none";
+    if (init !== undefined) this._fill(init);
+  }
+  _fill(init) {
     if (init instanceof Headers) {
-      for (const [k, v] of init) this.append(k, v);
-    } else if (Array.isArray(init)) {
-      for (const pair of init) {
-        if (!pair || pair.length !== 2) throw new TypeError("Headers: init pair needs two items");
+      for (const [name, entry] of init._map) {
+        for (const value of entry.values) this.append(name, value);
+      }
+    } else if (init != null && typeof init[Symbol.iterator] === "function") {
+      for (const member of init) {
+        if (member == null || typeof member[Symbol.iterator] !== "function") {
+          throw new TypeError("Headers: init member is not a sequence");
+        }
+        const pair = [...member];
+        if (pair.length !== 2) throw new TypeError("Headers: init pair needs two items");
         this.append(pair[0], pair[1]);
       }
     } else if (init && typeof init === "object") {
       for (const k of Object.keys(init)) this.append(k, init[k]);
     }
   }
+  _canModify(name, value) {
+    if (this._guard === "immutable") throw new TypeError("Headers are immutable");
+    if (this._guard === "request" && isForbiddenRequestHeader(name, value)) return false;
+    if (this._guard === "response" && (name === "set-cookie" || name === "set-cookie2")) return false;
+    return true;
+  }
   append(name, value) {
     const key = normalizeHeaderName(name);
-    value = String(value).trim();
+    value = normalizeHeaderValue(value);
+    if (!this._canModify(key, value)) return;
     const existing = this._map.get(key);
-    this._map.set(key, { name: key, value: existing ? `${existing.value}, ${value}` : value });
+    if (existing) existing.values.push(value);
+    else this._map.set(key, { name: key, values: [value] });
   }
   delete(name) {
-    this._map.delete(normalizeHeaderName(name));
+    const key = normalizeHeaderName(name);
+    if (!this._canModify(key, "")) return;
+    this._map.delete(key);
   }
   get(name) {
     const hit = this._map.get(normalizeHeaderName(name));
-    return hit ? hit.value : null;
+    return hit ? hit.values.join(", ") : null;
+  }
+  getSetCookie() {
+    const hit = this._map.get("set-cookie");
+    return hit ? hit.values.slice() : [];
   }
   has(name) {
     return this._map.has(normalizeHeaderName(name));
   }
   set(name, value) {
     const key = normalizeHeaderName(name);
-    this._map.set(key, { name: key, value: String(value).trim() });
+    value = normalizeHeaderValue(value);
+    if (!this._canModify(key, value)) return;
+    this._map.set(key, { name: key, values: [value] });
   }
   forEach(fn, thisArg) {
     for (const [k, v] of this) fn.call(thisArg, v, k, this);
   }
   *entries() {
-    // Sorted by name, per spec.
+    // Fetch's "sort and combine" preserves each Set-Cookie value but joins all other names.
     const keys = [...this._map.keys()].sort();
-    for (const k of keys) yield [k, this._map.get(k).value];
+    for (const k of keys) {
+      const values = this._map.get(k).values;
+      if (k === "set-cookie") {
+        for (const value of values) yield [k, value];
+      } else {
+        yield [k, values.join(", ")];
+      }
+    }
   }
   *keys() {
     for (const [k] of this) yield k;
@@ -64,6 +115,49 @@ class Headers {
   _pairs() {
     return [...this].map(([k, v]) => [k, v]);
   }
+}
+
+function createHeaders(init, guard) {
+  const headers = new Headers();
+  headers._guard = guard === "immutable" ? "none" : guard;
+  if (init !== undefined) headers._fill(init);
+  headers._guard = guard;
+  return headers;
+}
+
+const forbiddenRequestHeaderNames = new Set([
+  "accept-charset", "accept-encoding", "access-control-request-headers",
+  "access-control-request-method", "connection", "content-length", "cookie", "cookie2",
+  "date", "dnt", "expect", "host", "keep-alive", "origin", "referer", "set-cookie",
+  "te", "trailer", "transfer-encoding", "upgrade", "via",
+]);
+
+function isForbiddenRequestHeader(name, value) {
+  if (forbiddenRequestHeaderNames.has(name) || name.startsWith("proxy-") || name.startsWith("sec-")) {
+    return true;
+  }
+  if (name === "x-http-method" || name === "x-http-method-override" || name === "x-method-override") {
+    return value.split(",").some((part) => /^(CONNECT|TRACE|TRACK)$/i.test(part.trim().replace(/^"|"$/g, "")));
+  }
+  return false;
+}
+
+function normalizeMethod(method) {
+  method = toByteString(method, "request method");
+  if (method === "" || /[^!#$%&'*+\-.^_`|~0-9A-Za-z]/.test(method)) {
+    throw new TypeError("invalid request method");
+  }
+  if (/^(CONNECT|TRACE|TRACK)$/i.test(method)) throw new TypeError("forbidden request method");
+  if (/^(DELETE|GET|HEAD|OPTIONS|POST|PUT)$/i.test(method)) return method.toUpperCase();
+  return method;
+}
+
+function normalizeCredentials(credentials) {
+  credentials = String(credentials);
+  if (credentials !== "omit" && credentials !== "same-origin" && credentials !== "include") {
+    throw new TypeError(`invalid Request credentials mode '${credentials}'`);
+  }
+  return credentials;
 }
 
 const kConsumed = Symbol("bodyConsumed");
@@ -134,9 +228,12 @@ function bodyMixin(proto) {
     throw new TypeError(`formData(): unsupported content-type '${ct}'`);
   };
   proto._consume = async function () {
-    if (this[kConsumed]) throw new TypeError("body already consumed");
+    const stream = this[kSourceStream] ?? this[kBodyStream];
+    if (this.bodyUsed || (stream && stream.locked)) throw new TypeError("body already consumed");
     this[kConsumed] = true;
     this._materialize();
+    // If the lazily-created stream was not the source just drained, discard its queued copy.
+    if (this[kBodyStream] !== undefined) this[kBodyStream].cancel().catch(() => {});
     return this._bodyBytes || new Uint8Array(0);
   };
   // Drain a deferred ReadableStream body into bytes, on first consume/send.
@@ -148,7 +245,8 @@ function bodyMixin(proto) {
   };
   Object.defineProperty(proto, "bodyUsed", {
     get() {
-      return !!this[kConsumed];
+      const stream = this[kSourceStream] ?? this[kBodyStream];
+      return !!this[kConsumed] || !!(stream && stream._disturbed);
     },
   });
   // `.body` is the user's ReadableStream if one was given (un-drained), else a stream over the
@@ -214,12 +312,11 @@ function drainStreamSync(stream) {
 // is no body.
 function makeBodyStream(owner) {
   return new ReadableStream({
-    pull(controller) {
+    start(controller) {
       if (owner[kConsumed]) {
         controller.error(new TypeError("body already consumed"));
         return;
       }
-      owner[kConsumed] = true;
       const bytes = owner._bodyBytes;
       if (bytes && bytes.length) controller.enqueue(bytes);
       controller.close();
@@ -232,8 +329,11 @@ class Request {
     init = init && typeof init === "object" ? init : {};
     if (input instanceof Request) {
       this.url = input.url;
-      this.method = init.method ? String(init.method).toUpperCase() : input.method;
-      this.headers = new Headers(init.headers || input.headers);
+      this.method = init.method !== undefined ? normalizeMethod(init.method) : input.method;
+      this.credentials = init.credentials !== undefined
+        ? normalizeCredentials(init.credentials)
+        : input.credentials;
+      this.headers = createHeaders("headers" in init ? init.headers : input.headers, "request");
       if ("body" in init) {
         initBody(this, init.body);
       } else {
@@ -243,9 +343,16 @@ class Request {
       }
       this.signal = init.signal || input.signal || null;
     } else {
-      this.url = new URL(String(input)).href;
-      this.method = init.method ? String(init.method).toUpperCase() : "GET";
-      this.headers = new Headers(init.headers);
+      const parsedURL = new URL(String(input));
+      if (parsedURL.username !== "" || parsedURL.password !== "") {
+        throw new TypeError("Request URL cannot include credentials");
+      }
+      this.url = parsedURL.href;
+      this.method = init.method !== undefined ? normalizeMethod(init.method) : "GET";
+      this.credentials = init.credentials !== undefined
+        ? normalizeCredentials(init.credentials)
+        : "same-origin";
+      this.headers = createHeaders(init.headers, "request");
       initBody(this, init.body);
       this.signal = init.signal || null;
     }
@@ -264,24 +371,42 @@ class Request {
       headers: this.headers,
       body: this._bodyBytes,
       signal: this.signal,
+      credentials: this.credentials,
     });
   }
 }
 bodyMixin(Request.prototype);
+
+// Server adapters create a Fetch Request from an already-validated HTTP message. This internal
+// path is needed because the public constructor correctly forbids GET/HEAD bodies and the three
+// forbidden author-controlled methods, while an HTTP server can receive either on the wire.
+function createIncomingRequest(method, url, headers, body) {
+  const request = new Request(url);
+  request.method = method;
+  request.headers = createHeaders(headers, "immutable");
+  if (body !== undefined) request._bodyBytes = toBodyBytes(body);
+  return request;
+}
 
 class Response {
   constructor(body = null, init = {}) {
     init = init && typeof init === "object" ? init : {};
     // A dictionary member set to `undefined` counts as absent (WebIDL), so `{ status: undefined }`
     // takes the default 200 rather than coercing to `Number(undefined)` → NaN.
-    this.status = init.status !== undefined ? Number(init.status) : 200;
+    this.status = init.status !== undefined ? toUnsignedShort(init.status) : 200;
     if (this.status < 200 || this.status > 599) {
       throw new RangeError(`invalid response status ${this.status}`);
     }
-    this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
-    this.headers = new Headers(init.headers);
+    this.statusText = init.statusText !== undefined ? toByteString(init.statusText, "statusText") : "";
+    if (this.statusText !== "" && /[^\t\x20-\x7e\x80-\xff]/.test(this.statusText)) {
+      throw new TypeError("invalid response statusText");
+    }
+    this.headers = createHeaders(init.headers, "response");
     this.url = "";
     this.redirected = false;
+    if (body !== null && [101, 103, 204, 205, 304].includes(this.status)) {
+      throw new TypeError(`response status ${this.status} cannot have a body`);
+    }
     initBody(this, body);
     this[kConsumed] = false;
   }
@@ -298,6 +423,7 @@ class Response {
     });
     r.url = this.url;
     r.redirected = this.redirected;
+    r.headers._guard = this.headers._guard;
     return r;
   }
   static json(data, init) {
@@ -313,6 +439,13 @@ class Response {
   }
 }
 bodyMixin(Response.prototype);
+
+function toUnsignedShort(value) {
+  let number = Number(value);
+  if (!Number.isFinite(number) || number === 0) return 0;
+  number = Math.trunc(number);
+  return ((number % 65536) + 65536) % 65536;
+}
 
 function fetch(input, init = {}) {
   return new Promise((resolve, reject) => {
@@ -331,6 +464,8 @@ function fetch(input, init = {}) {
     const headerPairs = request.headers._pairs();
     let bodyBytes;
     try {
+      if (request.bodyUsed) throw new TypeError("body already consumed");
+      request[kConsumed] = true;
       request._materialize(); // drain a deferred stream body now that we're actually sending
       bodyBytes = request._bodyBytes;
     } catch (e) {
@@ -350,17 +485,20 @@ function fetch(input, init = {}) {
       request.url,
       headerPairs,
       bodyBytes,
+      request.credentials === "include",
       (raw) => {
         if (settled) return; // aborted first
         settled = true;
         if (signal) signal.removeEventListener("abort", onAbort);
-        const response = new Response(raw.body, {
+        const nullBodyStatus = [101, 103, 204, 205, 304].includes(raw.status);
+        const response = new Response(nullBodyStatus ? null : raw.body, {
           status: raw.status,
           statusText: raw.statusText,
           headers: raw.headers,
         });
         response.url = raw.url;
         response.redirected = raw.url !== request.url;
+        response.headers._guard = "immutable";
         resolve(response);
       },
       (err) => {

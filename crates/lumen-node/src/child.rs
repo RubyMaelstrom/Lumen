@@ -35,6 +35,29 @@ pub struct ChildRegistry {
     procs: HashMap<u32, ChildProc>,
 }
 
+impl Drop for ChildRegistry {
+    fn drop(&mut self) {
+        for process in self.procs.values() {
+            // Killing first wakes blocked pipe reads/writes and wait() threads. Never wait for the
+            // stdin mutex during runtime teardown: a worker can be inside a blocking write.
+            let _ = process
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .kill();
+            match process.stdin.try_lock() {
+                Ok(mut stdin) => {
+                    stdin.take();
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    error.into_inner().take();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+    }
+}
+
 pub const CHILD_OPS: &[OpDecl] = ops![
     "spawn" (5) => op_spawn,
     "read" (4) => op_read,

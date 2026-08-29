@@ -30,7 +30,7 @@ function getDefaultSettings() {
   };
 }
 
-// RFC 7540 §6.5.1 SETTINGS payload: a sequence of (id:u16, value:u32) big-endian pairs. Only the
+// RFC 9113 §6.5.1 SETTINGS payload: a sequence of (id:u16, value:u32) big-endian pairs. Only the
 // fields present on `settings` are emitted, matching Node's ordering so the bytes are identical.
 function getPackedSettings(settings = {}) {
   const entries = [];
@@ -174,8 +174,11 @@ class ClientHttp2Session extends EventEmitter {
   _connected() {
     if (this.destroyed) return;
     this.socket.write(Buffer.from("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
-    this._writeFrame(4, 0, 0, getPackedSettings(this.localSettings));
     this.connecting = false;
+    // RFC 9113 §3.4 requires SETTINGS to be the first frame after the client preface. Request
+    // streams can be created and ended while the transport is still connecting, so flush every
+    // queued frame only after writing that mandatory prefix.
+    this._writeFrame(4, 0, 0, getPackedSettings(this.localSettings));
     const pending = this._pending;
     this._pending = [];
     for (const send of pending) send();
@@ -193,8 +196,7 @@ class ClientHttp2Session extends EventEmitter {
     if (normalized[":authority"] === undefined) normalized[":authority"] = new URL(this.origin).host;
     const clientStream = new ClientHttp2Stream(this, id, normalized, options);
     this._streams.set(id, clientStream);
-    const send = () => this._sendHeaders(id, normalized, !!options.endStream);
-    if (this.connecting) this._pending.push(send); else send();
+    this._sendHeaders(id, normalized, !!options.endStream);
     return clientStream;
   }
 
@@ -225,7 +227,12 @@ class ClientHttp2Session extends EventEmitter {
   }
 
   _writeFrame(type, flags, streamId, payload) {
-    if (!this.destroyed) this.socket.write(codec.encodeFrame(type, flags, streamId, payload));
+    if (this.destroyed) return;
+    const frame = codec.encodeFrame(type, flags, streamId, payload);
+    if (this.connecting) this._pending.push(() => {
+      if (!this.destroyed) this.socket.write(frame);
+    });
+    else this.socket.write(frame);
   }
 
   _receive(chunk) {
@@ -394,7 +401,9 @@ class ServerHttp2Session extends EventEmitter {
     this.connecting = false;
     this.closed = false;
     this.destroyed = false;
-    this.localSettings = { ...getDefaultSettings(), ...(options.settings || {}) };
+    // RFC 9113 §6.5.2: servers may omit SETTINGS_ENABLE_PUSH or send 0, but MUST NOT send 1.
+    // Keep the public settings snapshot aligned with the value actually placed on the wire.
+    this.localSettings = { ...getDefaultSettings(), ...(options.settings || {}), enablePush: false };
     this.remoteSettings = getDefaultSettings();
     this._decoder = new codec.FrameDecoder();
     this._hpack = new codec.Hpack();

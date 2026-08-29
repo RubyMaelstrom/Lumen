@@ -8,10 +8,11 @@
 //! calls, coercions, name resolution outside the function) delegates to the interpreter's own
 //! helpers, so behavior differences can only come from the local-variable and dispatch layers.
 //!
-//! Locals live in a flat slot vector: v0 refuses any function where a local could be observed
-//! from outside (inner functions/closures, direct `eval`, `with`, `arguments`, destructuring),
-//! which is what makes slot storage sound. TDZ is represented by `Value::Empty` in the slot —
-//! reads check it and throw the same ReferenceError the tree-walker would.
+//! Locals normally live in a flat slot vector. Bindings observable through closures, direct eval,
+//! mapped arguments, or other dynamic environments are instead homed in a retained activation;
+//! uncommon non-suspending syntax can share the normative evaluator through a projected frame.
+//! TDZ is represented by `Value::Empty` in a slot — reads check it and throw the same
+//! ReferenceError the tree-walker would.
 //!
 //! Tier selection (see `Interp::tier`): `jit` (default), `bytecode`, or `interp` (this module is
 //! never entered — the tree-walker runs). Compiled tiers kick in at `tier_threshold` calls (0 =
@@ -198,8 +199,8 @@ impl IcState {
 /// guard set (plain same-realm user fn, not an arrow / class ctor / proxy, compiled, machine
 /// code, no activation env), so a hit replays exactly that committed path. The same-realm proof
 /// is carried by `global_env`: the fill's env-root walk was relative to the then-active global
-/// scope, whose address is compared raw on every hit (and strong-pinned in
-/// `Interp::global_env_pins` so it can never be recycled); a realm switch changes the active
+/// scope, whose address is compared raw on every hit (and weak-allocation-pinned in
+/// `Interp::global_env_pins` so it cannot be recycled); a realm switch changes the active
 /// global and makes every cached site miss and revalidate. The blanket proxy/realm gates
 /// `call_jit_fast` re-checks per call are safe to skip on a hit: they exist to keep EXOTIC
 /// callees off the fast path, and identity proves this callee is the same plain user function.
@@ -437,7 +438,25 @@ pub enum Op {
     StoreName(u32),
     /// [`Op::StoreName`] with a per-site generation-checked name cache.
     StoreNameCached(u32, u32),
+    /// Resolve one identifier Reference now and retain its exact Environment Record/object base
+    /// in continuation-owned storage. `LoadRef`/`StoreRef` reuse it after arbitrary suspension or
+    /// user code instead of repeating ResolveBinding against a changed `with`/eval environment.
+    ResolveNameRef(u32, u16),
+    LoadRef(u16),
+    StoreRef(u16),
+    /// Assignment to a statically-known immutable slot lexical. Consume the attempted value,
+    /// preserve SetMutableBinding's TDZ-before-immutability check, then throw the runtime
+    /// TypeError. Operands are the slot and the diagnostic name index.
+    StoreConstLocal(u16, u32),
+    /// The activation-environment form of [`Op::StoreConstLocal`].
+    StoreConstCap(u32),
+    /// Complete ToNumeric and ±1 for an immutable update target, then reject its PutValue. The
+    /// old value is consumed from the stack; a preceding LoadLocal/LoadCap performs GetValue and
+    /// its TDZ check in the normative order.
+    UpdateConst(u32, UpdKind),
     LoadThis,
+    /// RequireObjectCoercible on the top stack value while retaining it as a Reference base.
+    RequireObject,
     /// `obj.name`. First operand is the name index; second is the per-site inline-cache index into
     /// `Chunk::caches` (see `Interp::get_prop_ic`).
     GetProp(u32, u32),
@@ -462,6 +481,16 @@ pub enum Op {
     /// `for…of` prologue: pops the iterable, pushes the iterator object then its `next` method
     /// (GetIterator with the sync hint, via the interpreter's own helper).
     GetIter,
+    /// `for await…of` prologue: GetIterator(value, async), represented without allocating the
+    /// otherwise-unobservable Async-from-Sync wrapper. Pushes iterator, next method, and a bool
+    /// identifying the sync fallback so stepping/closing can run its continuation algorithms.
+    GetAsyncIter,
+    /// `for…in` prologue: pops the RHS and pushes an internal dense array containing the candidate
+    /// enumerable string keys in prototype-chain order (deduplicated by first occurrence).
+    ForInKeys,
+    /// Step an internal `for…in` key snapshot. Operands are the key-array, numeric cursor, and
+    /// original RHS slots. Deleted object properties are skipped before pushing key + has-value.
+    ForInStepL(u16, u16, u16),
     /// One `for…of` step against the iterator/next stored in the two slots: pushes the yielded
     /// value (or `undefined` at exhaustion) then a has-value bool — a following `JumpIfFalse`
     /// exits the loop, so the branch reuses existing machinery in both tiers. A `next`/`done`/
@@ -473,6 +502,25 @@ pub enum Op {
     /// The `for…of` body's catch pad: pops the in-flight exception, closes the slot's iterator
     /// in throw mode (trap errors swallowed, per spec), and rethrows. Always abrupt.
     IterAbortL(u16),
+    /// One IteratorDestructuringAssignmentEvaluation step. The third slot is the iterator
+    /// record's [[Done]] state; it is set before a potentially abrupt IteratorStep so the
+    /// surrounding assignment-pattern handler knows not to close after a step failure.
+    DestructureStepL(u16, u16, u16),
+    /// Drain the remaining destructuring iterator into a fresh Array, with the same [[Done]]
+    /// bookkeeping as `DestructureStepL`.
+    DestructureRestL(u16, u16, u16),
+    /// IteratorClose only while an assignment-pattern iterator is still live.
+    IterCloseIfNotDoneL(u16, u16),
+    /// Throw-mode conditional IteratorClose: consume/preserve the in-flight exception.
+    IterAbortIfNotDoneL(u16, u16),
+    /// Start one `for await…of` step and suspend on the result promise. Operands are iterator,
+    /// next, async-from-sync flag, and saved done flag slots.
+    AsyncIterStepL(u16, u16, u16, u16),
+    /// Consume the settled step value and push iteration value + has-value bool.
+    AsyncIterResumeL(u16, u16),
+    /// Begin AsyncIteratorClose and suspend as needed. The bool selects throw-completion mode,
+    /// where close errors are discarded before execution resumes at the following throw pad.
+    AsyncIterCloseL(u16, u16, bool),
     /// Object-destructuring guard: throws the oracle's TypeError when the value on top of the
     /// stack (peeked, not popped) is null/undefined — GetProp's own nullish error has a
     /// different message, and the check must run before any property read.
@@ -484,6 +532,15 @@ pub enum Op {
     /// ident/hole elements only: a nested pattern's own reads would interleave with the
     /// iterator steps in the wrong order.
     DestructureArr(u16),
+    /// Destructuring-assignment loop head: pop one iteration value and run the retained
+    /// AssignmentPattern from `Chunk::assignment_targets`. This deliberately shares the
+    /// tree-walker's normative Reference/GetV/default/IteratorClose implementation rather than
+    /// maintaining a second subtly different algorithm. The compiler admits only patterns that
+    /// cannot suspend this activation; the enclosing VM for-of handler owns any abrupt close.
+    AssignTarget(u32),
+    /// Object assignment-rest: pop `count` already-normalized excluded property keys and the
+    /// source value, then push CopyDataProperties(source, excludedNames).
+    ObjectRest(u16),
     /// `delete obj.name` (pops obj, pushes the bool result). Operands: name index and the
     /// *function's* strictness — the oracle's `self.strict` is not maintained across direct
     /// JIT→JIT call sequences, so it travels in the op.
@@ -491,6 +548,10 @@ pub enum Op {
     /// `delete obj[k]` (pops k then obj, pushes the bool result; ToPropertyKey on the key
     /// before the nullish-base check, matching the oracle's order).
     DeleteElem(bool),
+    /// Sloppy `delete identifier`: resolve the Environment Reference and perform DeleteBinding.
+    DeleteName(u32),
+    /// Throw the mandatory ReferenceError after a super-property Reference has been evaluated.
+    DeleteSuper,
     /// `f(a, b, ...c)` — a spread argument in the LAST position (the only shape whose
     /// evaluate-everything-then-expand lowering matches the spec's interleaved evaluation
     /// order): pops the iterable and `argc-1` plain arguments, expands via the iterator
@@ -498,6 +559,11 @@ pub enum Op {
     CallSpread(u16),
     /// [`Op::CallSpread`] with a receiver beneath the callee (method calls, with-object hits).
     CallSpreadThis(u16),
+    /// Call with an internally-built dense argument array. This is the general
+    /// ArgumentListEvaluation path for interleaved/multiple spreads; the array never escapes.
+    CallArgsArray,
+    /// [`Op::CallArgsArray`] with a receiver beneath the callee.
+    CallArgsArrayThis,
     /// Statement-position `obj.name += v` (pops v, the compound-read lval, obj): appends IN
     /// PLACE when the property still holds the exact string the read produced and everything is
     /// plain (see `Interp::append_prop_fast`); otherwise runs the generic Add + IC store —
@@ -573,6 +639,10 @@ pub enum Op {
     TypeofName(u32),
     Void,
     Jump(u32),
+    /// A `break`/`continue` Completion crossing a `finally`: unwind handlers down to the second
+    /// operand, running every intervening finalizer, then continue at the first operand. The
+    /// destination is patched with the loop target just like [`Op::Jump`].
+    AbruptJump(u32, u32),
     JumpIfFalse(u32),
     /// Peek variants leave the operand on the stack (for `&&` / `||` / `??`).
     JumpIfFalsePeek(u32),
@@ -598,31 +668,150 @@ pub enum Op {
     /// callee's hoisted vars start fresh on every pass through the site.
     ResetSlots(u16, u16),
     New(u16, u32),
+    /// Construct with an internally-built dense argument array (the general spread path).
+    NewArgsArray,
     /// A regexp literal: source and flags indices in `names`. Each execution allocates a fresh
     /// JS RegExp object while `Interp::regexp_programs` shares the immutable compiled matcher.
     MakeRegExp(u32, u32),
     MakeArray(u16),
+    /// Incremental ArrayLiteral construction used when holes/spreads or suspending elements make
+    /// one batched `MakeArray` impossible. Every op retains the fresh array on the stack.
+    NewArray,
+    ArrayPush,
+    ArrayHole,
+    ArraySpread,
     /// Object literal: `count` plain data keys starting at names[start], values on the stack.
     MakeObject(u32, u16, u32),
+    /// Incremental ObjectLiteral construction. Data's bool requests runtime NamedEvaluation;
+    /// Method's kind is 0/method, 1/getter, or 2/setter.
+    NewObject,
+    ObjectData(bool),
+    ObjectSpread,
+    ObjectProto,
+    ObjectMethod(u32, u8),
+    /// Meta/import/private-name expression forms. DynamicImport's bool says whether an options
+    /// operand is present; its phase is the parsed proposal/core import phase.
+    ImportMeta,
+    NewTarget,
+    DynamicImport(ImportPhase, bool),
+    PrivateIn(u32),
+    GetPrivate(u32),
+    GetPrivateKeep(u32),
+    GetPrivateMethod(u32),
+    SetPrivate(u32),
+    UpdatePrivate(u32, UpdKind),
+    /// Split SuperProperty reference construction. The compiler emits SuperThis, then the key,
+    /// then SuperBase, matching GetThisBinding → computed key → GetSuperBase ordering.
+    SuperThis,
+    SuperBase,
+    SuperGet,
+    SuperGetKeep,
+    SuperGetMethod,
+    SuperSet,
+    SuperUpdate(UpdKind),
+    /// Push the realm-cached frozen template object for `Chunk::templates[site]`.
+    TemplateObject(u32),
+    /// Tagged templates must reject a non-callable tag before evaluating substitutions.
+    RequireCallable,
+    /// Retained uncommon expression evaluated through the normative tree-walker against a
+    /// projected view of this VM frame. Direct yield/await never enters this bridge.
+    EvalExpr(u32),
+    /// Pop a value, perform ToObject, and install a `with` Object Environment Record above the
+    /// continuation's current lexical environment. `PopEnv` restores its parent on every normal
+    /// or abrupt exit through the compiler's completion-aware cleanup pads.
+    PushWith,
+    /// Install a declarative Environment Record for the captured subset of one lexical scope.
+    /// Uncaptured bindings in the same source scope remain VM slots; `InitLex` performs the
+    /// declaration's InitializeBinding against this record.
+    PushLex(u32),
+    /// CreatePerIterationEnvironment for the captured subset of a classic `for (let ...)` head:
+    /// replace the current lexical record with a fresh sibling and copy its live binding values.
+    CloneLex(u32),
+    InitLex(u32),
+    PopEnv,
+    /// Open a continuation-owned DisposableResource stack. A following `PushFinally` protects
+    /// the corresponding statement list; keeping the records on the VM frame avoids sharing the
+    /// tree-walker's ambient stack between independently suspended coroutines.
+    PushDisposeFrame,
+    /// Capture the value currently on top of the operand stack as a sync/async disposable
+    /// resource without consuming it (BindingInitialization follows only after this succeeds).
+    AddDisposable(bool),
+    /// Dispose the innermost frame for a normal statement-list completion.
+    DisposeNormal,
+    /// Dispose while preserving/replacing the completion represented by the operand/pad kind.
+    DisposeThrow,
+    DisposeReturn,
+    DisposeBareReturn,
+    DisposeResumeReturn,
+    DisposeJump,
     Throw,
     Return,
+    /// An explicit source `return;`. Unlike fallthrough it is an abrupt Completion that unwinds
+    /// finalizers/iterators; unlike `return expression` in an async generator, it performs no
+    /// Await before the generator completes.
+    ReturnBare,
+    /// Re-issue an externally injected generator return after a finalizer. Unlike a source
+    /// ReturnStatement in an async generator, its value has already been awaited.
+    ResumeReturn,
+    /// Re-issue a saved `break`/`continue` Completion after a finalizer. Pops the destination and
+    /// target handler depth, which the finalizer pads preserve in hidden local slots.
+    ResumeJump,
     ReturnUndef,
     /// `await expr`: suspend the async body, handing the popped operand to the driver; on resume the
     /// settled value is pushed back (or a rejection is thrown). Only emitted for async functions.
     Await,
+    /// `yield expr`: suspend a synchronous generator and hand the popped operand to its iterator
+    /// driver. A later `next(value)` pushes `value` as the yield expression's result.
+    Yield,
+    /// `yield* expr`: initialize and drive a delegated iterator. The heap-owned [`VmCoro`]
+    /// retains the iterator record and the received normal/throw/return completion across every
+    /// suspension (ECMA-262 YieldExpression runtime semantics).
+    YieldStar,
     /// Enter a `try` region: register a handler that, on a throw anywhere in the region, unwinds the
     /// stack and jumps to the operand (the catch pc, with the exception pushed).
     PushHandler(u32),
-    /// Leave a `try` region without throwing: drop the innermost handler.
+    /// Enter a `try`/`finally` region. Its pads preserve throw, expression-return, bare-return,
+    /// already-awaited return, and break/continue Completions across finalizer suspension.
+    PushFinally(u32, u32, u32, u32, u32),
+    /// Enter one `for…of` body iteration. Throw, source return, bare return, and externally
+    /// resumed return use separate close pads so IteratorClose observes the exact Completion.
+    PushIterator(u32, u32, u32, u32),
+    /// Leave a protected try/iteration region normally: drop the innermost handler.
     PopHandler,
 }
 
 /// An active `try` region on the VM's handler stack.
 struct Handler {
-    /// Where to jump on a throw (the catch entry).
-    catch_pc: usize,
-    /// The operand-stack depth to unwind to before pushing the exception.
+    target: HandlerTarget,
+    /// The operand-stack depth to restore before entering a completion pad.
     stack_depth: usize,
+}
+
+enum HandlerTarget {
+    Catch {
+        throw_pc: usize,
+    },
+    Finally {
+        throw_pc: usize,
+        return_pc: usize,
+        bare_return_pc: usize,
+        resume_return_pc: usize,
+        jump_pc: usize,
+    },
+    Iterator {
+        throw_pc: usize,
+        return_pc: usize,
+        bare_return_pc: usize,
+        resume_return_pc: usize,
+    },
+}
+
+enum PendingCompletion {
+    Throw(Value),
+    ResumeReturn(Value),
+    SourceReturn(Value),
+    BareReturn,
+    Jump { target: usize, handler_depth: usize },
 }
 
 /// How one captured binding seeds into the activation environment at entry (in order).
@@ -637,6 +826,11 @@ pub(crate) enum CapInit {
     Lexical(Rc<str>, bool),
 }
 
+struct LexicalBinding {
+    name: Rc<str>,
+    is_const: bool,
+}
+
 pub struct Chunk {
     // (fields below; Debug is manual — `consts` holds engine Values)
     ops: Vec<Op>,
@@ -645,6 +839,8 @@ pub struct Chunk {
     n_slots: usize,
     /// Slot names, for TDZ ReferenceError messages.
     slot_names: Vec<Rc<str>>,
+    /// Number of opaque prepared-Reference homes needed by this chunk.
+    n_refs: usize,
     /// Parameter positions map onto slots [0, n_params).
     n_params: usize,
     /// Slot holding the ordinary function's materialized `arguments` object. Only compiled for
@@ -652,6 +848,10 @@ pub struct Chunk {
     /// covering common variadic helpers.
     arguments_slot: Option<u16>,
     uses_this: bool,
+    /// The source function's strictness. Heap continuations resume outside their original call
+    /// stack, so operations whose Reference semantics depend on strict mode restore this value
+    /// for every VM slice.
+    strict: bool,
     /// Distinct `this.name = …` stores before the body's first control-flow split, capped small.
     /// `new` uses this to reserve the instance property vector exactly once; it costs no bytes
     /// per object and avoids retaining geometric-growth slack.
@@ -661,9 +861,24 @@ pub struct Chunk {
     forwarded_capacity_hint: std::cell::Cell<u8>,
     /// Inner function templates for `MakeClosure`.
     funcs: Vec<Rc<Function>>,
+    /// Tagged-template sites retained by the chunk. Their stable backing address is the
+    /// GetTemplateObject site identity used by the realm cache.
+    templates: Vec<Vec<(Option<String>, String)>>,
+    eval_exprs: Vec<EvalExprPlan>,
+    /// AssignmentPattern expression trees retained only for generic [`Op::AssignTarget`] sites.
+    /// These sites replace whole-function/native-coroutine fallback while uncommon pattern work
+    /// stays off the hot scalar bytecode path.
+    assignment_targets: Vec<AssignmentTargetPlan>,
+    /// Captured subsets of block/loop lexical scopes. These allocate only when closure identity is
+    /// observable; ordinary lexical bindings stay in the allocation-free slot representation.
+    lexical_scopes: Vec<Vec<LexicalBinding>>,
     /// Captured bindings to seed into a fresh activation env at entry; empty = no activation
     /// needed (closures, if any, capture the definition env directly).
     cap_inits: Vec<CapInit>,
+    /// Coroutine FunctionDeclarationInstantiation already made the activation that owns mapped
+    /// parameters and their arguments object. Seed additional compiled bindings into that exact
+    /// environment so both access paths share storage.
+    reuse_activation: bool,
     /// An inner arrow chain reads the outer `this`: the activation carries a `this` binding.
     env_this: bool,
     /// One inline-cache slot per property-access op (`GetProp`/`SetProp`/`SetPropDrop`/`GetMethod`),
@@ -737,6 +952,28 @@ pub struct Chunk {
 pub(crate) struct SimpleConstructor<'a> {
     chunk: &'a Chunk,
     fields: &'a [InitializerField],
+}
+
+/// One visible slot-backed binding projected into the temporary Environment Record used by a
+/// generic destructuring-assignment operation. Captured bindings already live in `env` and are
+/// intentionally absent; free names continue resolving through the plan environment's parent.
+struct AssignmentLocal {
+    name: Rc<str>,
+    slot: u16,
+    mutable: bool,
+}
+
+struct AssignmentTargetPlan {
+    target: Expr,
+    locals: Vec<AssignmentLocal>,
+    strict: bool,
+}
+
+struct EvalExprPlan {
+    expr: Expr,
+    locals: Vec<AssignmentLocal>,
+    strict: bool,
+    name: Option<String>,
 }
 
 pub(crate) struct InitializerPlan {
@@ -920,19 +1157,24 @@ impl Chunk {
         self.makes_env() || self.arguments_slot.is_some()
     }
 
-    /// Build the activation environment for one call: a fresh scope under `env` holding exactly
-    /// the captured bindings (and `this` when an inner arrow chain reads it). Free names and
-    /// `MakeClosure` environments route through it. Returns `env` untouched when nothing is
-    /// captured — closures then capture the definition env directly, which resolves identically
-    /// because none of their free names are outer locals.
+    /// Build the activation environment for one call: normally a fresh scope under `env` holding
+    /// exactly the captured bindings (and `this` when an inner arrow chain reads it). A coroutine
+    /// with mapped arguments instead reuses the FunctionDeclarationInstantiation environment so
+    /// parameter homes and the arguments ParameterMap address the same bindings. Free names and
+    /// `MakeClosure` environments route through the result. Returns `env` untouched when nothing
+    /// needs seeding.
     fn make_run_env(&self, i: &Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
         if !self.makes_env() {
             return env.clone();
         }
-        let act = crate::interpreter::new_var_scope_with_capacity(
-            Some(env.clone()),
-            self.cap_inits.len() + usize::from(self.env_this),
-        );
+        let act = if self.reuse_activation {
+            env.clone()
+        } else {
+            crate::interpreter::new_var_scope_with_capacity(
+                Some(env.clone()),
+                self.cap_inits.len() + usize::from(self.env_this),
+            )
+        };
         // Function-declaration closures capture the activation itself, so they are created after
         // the borrow below is released.
         let mut fns: Vec<(u16, Rc<str>)> = Vec::new();
@@ -970,6 +1212,10 @@ impl Chunk {
                     }
                     CapInit::Fn(fidx, name) => fns.push((*fidx, name.clone())),
                     CapInit::Lexical(name, is_const) => {
+                        // Non-strict FunctionDeclarationInstantiation keeps body lexicals visible
+                        // to EvalDeclarationInstantiation's var-conflict walk. The compact Scope
+                        // stores both binding kinds together, so preserve that distinction here.
+                        b.lexical_names.push(name.to_string());
                         b.vars.insert(
                             name.clone(),
                             crate::interpreter::Binding {
@@ -1042,11 +1288,10 @@ struct CaptureScan {
     /// Names resolving from depth > 0 to a depth-0 scope.
     captured: std::collections::HashSet<String>,
     /// Names declared by a depth-0 scope that is NOT the function's top scope (block lexicals,
-    /// for-head lexicals, catch params). If one of these is captured, per-block binding
-    /// freshness matters — unless the name qualifies for activation homing (see
-    /// `homable_inner_lets`), the caller bails.
+    /// for-head lexicals, catch params). If one is captured, it must either qualify for safe
+    /// once-per-call activation homing or have an exact resumable Environment Record candidate.
     depth0_inner_decls: std::collections::HashSet<String>,
-    /// Activation-homing candidates: a plain `let` declared by a once-per-call depth-0 scope
+    /// Activation-homing candidates: a `let`/`using` declared by a once-per-call depth-0 scope
     /// (a block/switch outside every loop — freshness never matters) with no ENCLOSING
     /// declaration of the same name (an enclosing slot would wrongly shadow the env binding
     /// inside the block), keyed name → declaring scope serial. Same-name declarations nested
@@ -1054,10 +1299,14 @@ struct CaptureScan {
     /// any other same-name declaration poisons the entry. At the end a candidate homes only
     /// if every capture of the name resolved through ITS scope (see `captured_serials`) and
     /// the name was never a free/global reference.
-    candidates: std::collections::HashMap<String, u32>,
+    candidates: std::collections::HashMap<String, (u32, bool)>,
     /// Names that ever entered (or were disqualified from) candidacy — a second same-name
     /// once-per-call `let` cannot home (both would map to ONE activation binding).
     ever_candidates: std::collections::HashSet<String>,
+    /// Inner lexical declarations that can be represented by a real resumable Environment
+    /// Record. The compiler currently admits statement-list blocks and lexical loop heads; the
+    /// serial proves the capture and the one admitted declaration are the same binding.
+    runtime_candidates: std::collections::HashMap<String, Vec<u32>>,
     /// For candidate names: the scope serials their captures resolved through.
     captured_serials: std::collections::HashMap<String, std::collections::HashSet<u32>>,
     /// Names referenced somewhere they did NOT resolve to a scope (free/global uses).
@@ -1065,10 +1314,25 @@ struct CaptureScan {
     /// Innermost loop nesting at the current walk position (for-head scopes and every scope
     /// pushed inside a loop body are never homable).
     loop_depth: u32,
+    /// A block lexical declared beneath a `with` Object Environment Record cannot be flattened
+    /// into the function activation: doing so would put the with object before that lexical in
+    /// the environment chain. Keep such captured declarations on the conservative fallback.
+    with_depth: u32,
     /// Scope-push counter (the serial stored per scope for capture attribution).
     next_serial: u32,
     /// Whether `this` is read from an inner arrow chain rooted at the outer function.
     env_this: bool,
+    /// A direct eval can dynamically name every binding in the surrounding function. Coroutine
+    /// compilation may retain the real activation and home all function-scope names there, but
+    /// per-block environments still require the conservative fallback.
+    allow_direct_eval: bool,
+    saw_direct_eval: bool,
+    /// Coroutine bytecode carries a resumable lexical-environment cursor and can therefore
+    /// represent `with`; ordinary bytecode functions remain conservative.
+    allow_with: bool,
+    saw_with: bool,
+    with_requires_inner_env: bool,
+    top_names: std::collections::HashSet<String>,
     /// Arrow-ness of each enclosing function on the current path (index 0 = the outer function).
     arrow_path: Vec<bool>,
 }
@@ -1200,8 +1464,18 @@ fn hoisted_vars_stmt(
 }
 
 impl CaptureScan {
-    /// Analyze `func`, returning (captured names, inner-arrow-reads-this) or `None` to bail.
-    fn run(func: &Function) -> Option<(std::collections::HashSet<String>, bool, Vec<String>)> {
+    /// Analyze `func`, returning function captures, lexical `this`, safely homed once-per-call
+    /// bindings, runtime lexical bindings, and direct-eval observability.
+    fn run(
+        func: &Function,
+        allow_direct_eval: bool,
+    ) -> Option<(
+        std::collections::HashSet<String>,
+        bool,
+        Vec<(String, bool)>,
+        std::collections::HashSet<String>,
+        bool,
+    )> {
         let mut sc = CaptureScan {
             scopes: Vec::new(),
             fn_depth: 0,
@@ -1209,69 +1483,123 @@ impl CaptureScan {
             depth0_inner_decls: Default::default(),
             candidates: Default::default(),
             ever_candidates: Default::default(),
+            runtime_candidates: Default::default(),
             captured_serials: Default::default(),
             free_refs: Default::default(),
             loop_depth: 0,
+            with_depth: 0,
             next_serial: 0,
             env_this: false,
+            allow_direct_eval,
+            saw_direct_eval: false,
+            allow_with: allow_direct_eval,
+            saw_with: false,
+            with_requires_inner_env: false,
+            top_names: Default::default(),
             arrow_path: vec![func.is_arrow],
         };
         sc.fn_body(func)?;
+        // A direct eval at any nested function depth may dynamically reference any binding in the
+        // outer function. Function-wide params/vars/body lexicals can share one retained
+        // activation. A depth-0 inner lexical (block/catch/loop/class scope) needs a distinct
+        // runtime environment and is not flattened here.
+        if sc.saw_direct_eval {
+            if !sc.depth0_inner_decls.is_empty() {
+                return None;
+            }
+            sc.captured.extend(sc.top_names.iter().cloned());
+        }
+        // Every function-scope binding visible beneath a with object must have an Environment
+        // Record home; direct slots would bypass HasBinding/@@unscopables. Inner block lexicals
+        // need their own correctly ordered Environment Records, which are not flattened yet.
+        if sc.saw_with {
+            if sc.with_requires_inner_env {
+                return None;
+            }
+            sc.captured.extend(sc.top_names.iter().cloned());
+        }
         // A captured name declared by an inner depth-0 scope needs per-block freshness —
         // except a candidate whose EVERY capture resolved through its own scope (a same-name
         // capture through any other binding — a for-of head, another block — captured a
         // DIFFERENT binding, which one activation slot can't express), which the compiler
         // homes activation-wide instead.
-        let mut homed: Vec<String> = Vec::new();
+        let mut homed: Vec<(String, bool)> = Vec::new();
+        let mut runtime = std::collections::HashSet::new();
         for n in &sc.captured {
             if sc.depth0_inner_decls.contains(n) {
-                let ok = sc.candidates.get(n).is_some_and(|cs| {
+                let candidate = sc.candidates.get(n).copied();
+                let ok = candidate.is_some_and(|(serial, _)| {
                     !sc.free_refs.contains(n)
                         && sc
                             .captured_serials
                             .get(n)
-                            .is_some_and(|set| set.len() == 1 && set.contains(cs))
+                            .is_some_and(|set| set.len() == 1 && set.contains(&serial))
                 });
-                if !ok {
+                if ok {
+                    homed.push((n.clone(), candidate.expect("checked candidate").1));
+                    continue;
+                }
+                let runtime_serials = sc.runtime_candidates.get(n)?;
+                let captured_serials = sc.captured_serials.get(n)?;
+                if captured_serials
+                    .iter()
+                    .any(|serial| !runtime_serials.contains(serial))
+                {
                     return None;
                 }
-                homed.push(n.clone());
+                // The emitter selects runtime lexicals by spelling, so promote every supported
+                // declaration of this spelling. Each source scope still gets its own PushLex
+                // record; promoting an uncaptured sibling costs one small record but cannot merge
+                // identities or change resolution. A capture through a function-wide or otherwise
+                // unsupported declaration fails the serial-subset check above.
+                runtime.insert(n.clone());
             }
         }
         // Homed names leave `captured`: the remaining consumers (param/var/body-lexical
         // homing, the for-of gates) concern OTHER bindings of the name, and any same-name
         // binding that could conflict already poisoned candidacy above.
-        for n in &homed {
+        for (n, _) in &homed {
             sc.captured.remove(n);
         }
-        homed.sort(); // deterministic cap_init order
-        Some((sc.captured, sc.env_this, homed))
+        for n in &runtime {
+            sc.captured.remove(n);
+        }
+        homed.sort_by(|left, right| left.0.cmp(&right.0)); // deterministic cap_init order
+        Some((sc.captured, sc.env_this, homed, runtime, sc.saw_direct_eval))
     }
 
     fn push_scope(&mut self, names: std::collections::HashSet<String>) {
-        self.push_scope_lets(names, Default::default());
+        self.push_scope_lets(names, Default::default(), false);
     }
 
-    /// Like [`CaptureScan::push_scope`]; `lets` is the subset of `names` declared by plain
-    /// `let`s, which qualify for activation homing when the scope runs at most once per call
-    /// (outside every loop) and the name is unique/unambiguous (see `homable_inner_lets`).
+    /// Like [`CaptureScan::push_scope`]; `homable` is the subset that can share the activation
+    /// when the scope runs at most once per call. `runtime_capable` marks scopes for which the
+    /// compiler can instead maintain an exact heap-owned Environment Record.
     fn push_scope_lets(
         &mut self,
         names: std::collections::HashSet<String>,
-        lets: std::collections::HashSet<String>,
+        homable: std::collections::HashMap<String, bool>,
+        runtime_capable: bool,
     ) {
         let serial = self.next_serial;
         self.next_serial += 1;
         if self.fn_depth == 0 && !self.scopes.is_empty() {
             for n in &names {
                 self.depth0_inner_decls.insert(n.clone());
+                if runtime_capable {
+                    self.runtime_candidates
+                        .entry(n.clone())
+                        .or_default()
+                        .push(serial);
+                }
                 let enclosed = self.scopes.iter().any(|(s, _, _)| s.contains(n));
                 if self.loop_depth == 0
-                    && lets.contains(n)
+                    && self.with_depth == 0
+                    && homable.contains_key(n)
                     && !enclosed
                     && self.ever_candidates.insert(n.clone())
                 {
-                    self.candidates.insert(n.clone(), serial);
+                    self.candidates.insert(n.clone(), (serial, homable[n]));
                 } else {
                     // A non-qualifying declaration doesn't poison an existing candidate: a
                     // later same-name SLOT declaration (nested or sibling) shadows the env
@@ -1310,6 +1638,9 @@ impl CaptureScan {
             return None;
         }
         self.declare_lexicals(&func.body, &mut names);
+        if self.fn_depth == 0 {
+            self.top_names = names.clone();
+        }
         self.push_scope(names);
         // Parameter defaults evaluate in the function scope.
         for p in &func.params {
@@ -1324,9 +1655,8 @@ impl CaptureScan {
         Some(())
     }
 
-    /// Add a statement list's block-scoped declarations (let/const/class, strict block functions).
-    /// `lets` (when wanted) additionally collects the plain-`let` names — the only kind that
-    /// qualifies for activation homing when captured (see `homable_inner_lets`).
+    /// Add a statement list's block-scoped declarations. `homable` additionally collects the
+    /// `let`/`using` names whose once-per-call scope can safely share the activation.
     fn declare_lexicals(&self, stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
         self.declare_lexicals_lets(stmts, out, &mut Default::default());
     }
@@ -1335,7 +1665,7 @@ impl CaptureScan {
         &self,
         stmts: &[Stmt],
         out: &mut std::collections::HashSet<String>,
-        lets: &mut std::collections::HashSet<String>,
+        homable: &mut std::collections::HashMap<String, bool>,
     ) {
         for s in stmts {
             match s {
@@ -1343,15 +1673,22 @@ impl CaptureScan {
                     kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
                     decls,
                 } => {
-                    if matches!(
-                        s,
+                    let homed_const = match s {
                         Stmt::VarDecl {
                             kind: DeclKind::Let,
                             ..
-                        }
-                    ) {
+                        } => Some(false),
+                        Stmt::VarDecl {
+                            kind: DeclKind::Using | DeclKind::AwaitUsing,
+                            ..
+                        } => Some(true),
+                        _ => None,
+                    };
+                    if let Some(is_const) = homed_const {
                         for (p, _) in decls {
-                            pat_idents(p, lets);
+                            let mut names = std::collections::HashSet::new();
+                            pat_idents(p, &mut names);
+                            homable.extend(names.into_iter().map(|name| (name, is_const)));
                         }
                     }
                     for (p, _) in decls {
@@ -1378,9 +1715,9 @@ impl CaptureScan {
 
     fn block(&mut self, stmts: &[Stmt]) -> Option<()> {
         let mut names = std::collections::HashSet::new();
-        let mut lets = std::collections::HashSet::new();
-        self.declare_lexicals_lets(stmts, &mut names, &mut lets);
-        self.push_scope_lets(names, lets);
+        let mut homable = std::collections::HashMap::new();
+        self.declare_lexicals_lets(stmts, &mut names, &mut homable);
+        self.push_scope_lets(names, homable, true);
         for s in stmts {
             self.stmt(s)?;
         }
@@ -1545,7 +1882,7 @@ impl CaptureScan {
                 // The head scope itself counts as in-loop: its lexicals are per-iteration
                 // fresh, never once-per-call.
                 self.loop_depth += 1;
-                self.push_scope(names);
+                self.push_scope_lets(names, Default::default(), true);
                 let r = (|| {
                     match init.as_deref() {
                         Some(ForInit::VarDecl { decls, .. }) => {
@@ -1590,7 +1927,7 @@ impl CaptureScan {
                     None => {}
                 }
                 self.loop_depth += 1;
-                self.push_scope(names);
+                self.push_scope_lets(names, Default::default(), true);
                 let r = (|| {
                     if decl.is_none() {
                         self.pat_targets(left)?;
@@ -1611,23 +1948,23 @@ impl CaptureScan {
             } => {
                 self.block(block)?;
                 if let Some((param, body)) = handler {
-                    let mut names = std::collections::HashSet::new();
-                    if let Some(p) = param {
-                        pat_idents(p, &mut names);
+                    if let Some(pattern) = param {
+                        // CatchClauseEvaluation creates a parameter environment first, then
+                        // evaluates the catch Block in its own nested block environment. Keep
+                        // those scope serials distinct so a captured parameter or block lexical
+                        // can receive the exact fresh runtime record it denotes.
+                        let mut names = std::collections::HashSet::new();
+                        pat_idents(pattern, &mut names);
+                        self.push_scope_lets(names, Default::default(), true);
+                        let result = (|| {
+                            self.pat_decl_exprs(pattern)?;
+                            self.block(body)
+                        })();
+                        self.scopes.pop();
+                        result?;
+                    } else {
+                        self.block(body)?;
                     }
-                    self.declare_lexicals(body, &mut names);
-                    self.push_scope(names);
-                    let r = (|| {
-                        if let Some(p) = param {
-                            self.pat_decl_exprs(p)?;
-                        }
-                        for s in body {
-                            self.stmt(s)?;
-                        }
-                        Some(())
-                    })();
-                    self.scopes.pop();
-                    r?;
                 }
                 if let Some(f) = finalizer {
                     self.block(f)?;
@@ -1637,11 +1974,11 @@ impl CaptureScan {
             Stmt::Switch { disc, cases } => {
                 self.expr(disc)?;
                 let mut names = std::collections::HashSet::new();
-                let mut lets = std::collections::HashSet::new();
+                let mut homable = std::collections::HashMap::new();
                 for c in cases {
-                    self.declare_lexicals_lets(&c.body, &mut names, &mut lets);
+                    self.declare_lexicals_lets(&c.body, &mut names, &mut homable);
                 }
-                self.push_scope_lets(names, lets);
+                self.push_scope_lets(names, homable, true);
                 let r = (|| {
                     for c in cases {
                         if let Some(t) = &c.test {
@@ -1657,8 +1994,24 @@ impl CaptureScan {
                 r
             }
             Stmt::Labeled { body, .. } => self.stmt(body),
+            Stmt::With { obj, body } => {
+                if !self.allow_with {
+                    return None;
+                }
+                self.saw_with = true;
+                self.with_requires_inner_env |= self
+                    .scopes
+                    .iter()
+                    .skip(1)
+                    .any(|(names, depth, _)| *depth == 0 && !names.is_empty());
+                self.expr(obj)?;
+                self.with_depth += 1;
+                let result = self.stmt(body);
+                self.with_depth -= 1;
+                result
+            }
             Stmt::ClassDecl(c) => self.class(c),
-            // `with`, modules, and anything else unrecognized: unanalyzable.
+            // Modules and anything else unrecognized: unanalyzable.
             _ => None,
         }
     }
@@ -1804,9 +2157,18 @@ impl CaptureScan {
                 self.expr(alt)
             }
             Expr::Call { callee, args, .. } => {
-                // Direct eval inside any nested function could name arbitrary outer locals.
                 if matches!(&**callee, Expr::Ident(n) if n == "eval") {
-                    return None;
+                    if !self.allow_direct_eval {
+                        return None;
+                    }
+                    self.saw_direct_eval = true;
+                    for arg in args {
+                        match arg {
+                            ArrayElem::Item(expr) | ArrayElem::Spread(expr) => self.expr(expr)?,
+                            ArrayElem::Hole => {}
+                        }
+                    }
+                    return Some(());
                 }
                 self.expr(callee)?;
                 for a in args {
@@ -1982,39 +2344,62 @@ fn compile_inner(
     hot: Option<&Chunk>,
 ) -> Option<Rc<Chunk>> {
     // Body facts the scanner already knows: `new.target` is an observation channel into the
-    // activation that slots do not provide; `this` / `arguments` in an arrow are free variables
-    // we do not model. Parameterless synchronous ordinary functions can materialize an unmapped
-    // arguments object into a dedicated slot (the common variadic-helper shape).
+    // activation that slots do not provide; `this` / `arguments` in an ordinary arrow are free
+    // variables we do not model. Parameterless synchronous ordinary functions can materialize an
+    // unmapped arguments object into a dedicated slot (the common variadic-helper shape).
     let scan = func.scan_flags();
-    if scan & SCAN_NEW_TARGET != 0 {
+    let is_coroutine = func.is_generator || func.is_async;
+    // ECMA-262 §9.4.5 GetNewTarget reads the nearest this-binding Function Environment Record.
+    // Coroutine calls have already materialized that activation before this chunk is created and
+    // retain it for every resumption, including as the lexical parent of async arrows. Lean
+    // ordinary frames still omit the activation, so keep their conservative exclusion.
+    if scan & SCAN_NEW_TARGET != 0 && !is_coroutine {
         log_bail("fn", "new.target");
         return None;
     }
     let uses_arguments = scan & SCAN_ARGUMENTS != 0;
-    if uses_arguments && (func.is_arrow || func.is_async || !func.params.is_empty()) {
+    // ECMA-262 §10.2.11 creates a mapped arguments object only for a non-strict, non-arrow
+    // function with a simple parameter list. A nonempty mapped list must alias parameter writes;
+    // the current coroutine slot projection cannot yet preserve that relationship.
+    let has_mapped_parameter_aliases = uses_arguments
+        && !func.is_arrow
+        && !func.is_strict
+        && !func.params.is_empty()
+        && func.params.iter().all(|param| {
+            !param.rest && param.default.is_none() && matches!(param.pattern, Pattern::Ident(_))
+        })
+        && !func
+            .params
+            .iter()
+            .any(|param| matches!(&param.pattern, Pattern::Ident(name) if name == "arguments"));
+    if uses_arguments && !is_coroutine && (func.is_arrow || !func.params.is_empty()) {
         log_bail("fn", "arguments with arrow/async/parameters");
         return None;
     }
-    if func.is_arrow && scan & SCAN_THIS != 0 {
+    // Arrow functions do not bind `this`; they resolve it through their captured lexical
+    // environment (ECMA-262 §15.3.4). Async-arrow setup retains that chain and seeds the VM
+    // frame from its resolved value, including after the defining call has returned. Ordinary
+    // lean arrows still skip the observable activation machinery and remain conservative.
+    if func.is_arrow && scan & SCAN_THIS != 0 && !is_coroutine {
         log_bail("fn", "arrow reading this");
         return None;
     }
-    // Generators still run in the tree-walker (their `.return()`/`.throw()` injection and yield*
-    // delegation are not modeled here). Async functions compile: `await` lowers to `Op::Await`,
-    // which suspends the `VmCoro` that drives this body.
-    if func.is_generator {
-        log_bail("fn", "generator");
-        return None;
-    }
-    // A named function expression binds its own name inside the body — an env-side binding the
-    // slot model doesn't carry.
-    if func.is_fn_expr && func.name.is_some() {
+    // `yield`, `yield*`, and `await` lower to explicit VmCoro suspension points. Constructs the
+    // flat bytecode compiler cannot preserve still leave the entire function on the tree-walker.
+    // ECMA-262 Instantiate{Generator,Async}FunctionExpression creates a declarative environment
+    // outside the call activation, initializes its immutable self-name to the closure, and makes
+    // the closure capture it. Coroutine setup retains that exact environment chain, so unresolved
+    // Name operations correctly reach the self-binding (while a body `var` of the same name gets
+    // its own nearer home). Ordinary lean frames still bypass this setup and must stay excluded.
+    if func.is_fn_expr && func.name.is_some() && !is_coroutine {
         log_bail("fn", "named function expression");
         return None;
     }
     // Capture analysis: which locals inner functions can name (they live in a real activation
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
-    let Some((captured, env_this, block_lets)) = CaptureScan::run(func) else {
+    let Some((captured, env_this, block_lets, runtime_lexicals, direct_eval)) =
+        CaptureScan::run(func, is_coroutine)
+    else {
         let head: String = func
             .source
             .as_deref()
@@ -2035,6 +2420,10 @@ fn compile_inner(
     let mut c = Compiler {
         env_this,
         strict: func.is_strict,
+        is_coroutine,
+        direct_eval,
+        runtime_lexicals,
+        reuse_activation: has_mapped_parameter_aliases,
         plan_stack: vec![(plan.clone(), 0)],
         cache_seed_stack: hot
             .map(|chunk| vec![(property_cache_seeds(chunk), 0)])
@@ -2048,80 +2437,110 @@ fn compile_inner(
         ..Compiler::default()
     };
     if uses_arguments {
-        let slot = c.fresh_slot("arguments");
-        c.scope_bind("arguments", slot, false);
-        c.arguments_slot = Some(slot);
+        if has_mapped_parameter_aliases {
+            c.env_bind("arguments", false);
+        } else if !is_coroutine {
+            let slot = c.fresh_slot("arguments");
+            c.scope_bind("arguments", slot, false);
+            c.arguments_slot = Some(slot);
+        }
+        // Other coroutines deliberately leave `arguments` unresolved in the chunk. The normal
+        // name operation walks the retained activation installed by FunctionDeclarationInstantiation,
+        // or its parents for an arrow, so direct reads and nested arrows observe one object.
     }
     // Captured once-per-call block `let`s home in the activation (TDZ from entry, initialized
     // by the declaring block's own StoreCapInit); CaptureScan proved no enclosing same-name
     // declaration and block-resolved references only, so the function-flat env map is
     // faithful (nested same-name declarations shadow it through their slots).
-    for name in &block_lets {
+    for (name, is_const) in &block_lets {
         c.cap_inits
-            .push(CapInit::Lexical(Rc::from(name.as_str()), false));
-        c.env_bind(name, false);
+            .push(CapInit::Lexical(Rc::from(name.as_str()), *is_const));
+        c.env_bind(name, *is_const);
         c.homed_lets.insert(name.clone());
         c.homed_pending.insert(name.clone());
     }
-    // Parameters: plain identifiers only, one positional slot each (a sloppy duplicate name
-    // resolves to the later parameter, matching the env behavior where the later insert wins).
-    // A captured parameter keeps its positional slot (dead) but homes in the activation env.
+    // Ordinary compiled calls instantiate parameters in this chunk, so each formal needs its
+    // positional slot and only the subset whose default initialization is safely lowerable can
+    // compile. Coroutine calls have already completed FunctionDeclarationInstantiation in the
+    // tree-walker before their resumable context is created. For them, flatten BoundNames into
+    // slots and seed those slots from the live bindings; this admits rest/destructuring/default
+    // parameter lists without replaying any binding or initializer operation.
     let mut defaulted: Vec<(u16, &Expr)> = Vec::new();
-    for (k, p) in func.params.iter().enumerate() {
-        if p.rest {
-            log_bail("params", "rest parameter");
-            return None;
+    if func.is_generator || func.is_async {
+        let bound_names = crate::interpreter::param_bound_names(&func.params);
+        for (k, name) in bound_names.iter().enumerate() {
+            let slot = c.fresh_slot(name);
+            if has_mapped_parameter_aliases {
+                // The arguments exotic object's ParameterMap already aliases this binding in the
+                // retained call activation. Keep all direct and captured accesses there too.
+                c.env_bind(name, false);
+            } else if captured.contains(name) {
+                c.cap_inits
+                    .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
+                c.env_bind(name, false);
+            } else {
+                c.scope_bind(name, slot, false);
+            }
         }
-        let Pattern::Ident(name) = &p.pattern else {
-            log_bail("params", "destructuring parameter");
-            return None;
-        };
-        if let Some(d) = &p.default {
-            // Lowerable defaults: an uncaptured identifier parameter whose default expression
-            // can't observe this-or-later parameters (see `default_expr_safe`).
+        c.n_params = bound_names.len();
+    } else {
+        for (k, p) in func.params.iter().enumerate() {
+            if p.rest {
+                log_bail("params", "rest parameter");
+                return None;
+            }
+            let Pattern::Ident(name) = &p.pattern else {
+                log_bail("params", "destructuring parameter");
+                return None;
+            };
+            if let Some(d) = &p.default {
+                // Lowerable defaults: an uncaptured identifier parameter whose default expression
+                // can't observe this-or-later parameters (see `default_expr_safe`).
+                if captured.contains(name) {
+                    log_bail("params", "captured defaulted parameter");
+                    return None;
+                }
+                let banned: std::collections::HashSet<&str> = func.params[k..]
+                    .iter()
+                    .filter_map(|q| match &q.pattern {
+                        Pattern::Ident(n) => Some(n.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !default_expr_safe(d, &banned) {
+                    log_bail("params", "unsafe default expression");
+                    return None;
+                }
+                defaulted.push((k as u16, d));
+            }
+            let slot = c.fresh_slot(name);
             if captured.contains(name) {
-                log_bail("params", "captured defaulted parameter");
-                return None;
+                c.cap_inits
+                    .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
+                c.env_bind(name, false);
+            } else {
+                c.scope_bind(name, slot, false);
             }
-            let banned: std::collections::HashSet<&str> = func.params[k..]
-                .iter()
-                .filter_map(|q| match &q.pattern {
-                    Pattern::Ident(n) => Some(n.as_str()),
-                    _ => None,
-                })
-                .collect();
-            if !default_expr_safe(d, &banned) {
-                log_bail("params", "unsafe default expression");
-                return None;
-            }
-            defaulted.push((k as u16, d));
         }
-        let slot = c.fresh_slot(name);
-        if captured.contains(name) {
-            c.cap_inits
-                .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
-            c.env_bind(name, false);
-        } else {
-            c.scope_bind(name, slot, false);
+        c.n_params = func.params.len();
+        for (slot, d) in defaulted {
+            c.emit(Op::LoadLocal(slot));
+            c.emit(Op::Undef);
+            c.emit(Op::StrictEq);
+            let jf = c.emit(Op::JumpIfFalse(0));
+            c.expr(d).ok()?;
+            c.emit(Op::StoreLocal(slot));
+            c.patch(jf);
         }
-    }
-    c.n_params = func.params.len();
-    // Parameter defaults fill missing/undefined arguments before anything else runs (spec
-    // order: parameter binding precedes var/function hoisting).
-    for (slot, d) in defaulted {
-        c.emit(Op::LoadLocal(slot));
-        c.emit(Op::Undef);
-        c.emit(Op::StrictEq);
-        let jf = c.emit(Op::JumpIfFalse(0));
-        c.expr(d).ok()?;
-        c.emit(Op::StoreLocal(slot));
-        c.patch(jf);
     }
     // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
     for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &[]) {
         match op {
             HoistOp::Var(name) => {
-                if captured.contains(&name) {
+                if c.env_has(&name) {
+                    // A `var` sharing a parameter's Function Environment binding is already
+                    // instantiated. In particular, do not split mapped parameters into slots.
+                } else if captured.contains(&name) {
                     if !c.env_has(&name) {
                         c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
                         c.env_bind(&name, false);
@@ -2134,7 +2553,7 @@ fn compile_inner(
             HoistOp::Fn(name, f) => {
                 let fidx = c.funcs.len() as u16;
                 c.funcs.push(f.clone());
-                if captured.contains(&name) {
+                if c.env_has(&name) || captured.contains(&name) {
                     c.cap_inits.push(CapInit::Fn(fidx, Rc::from(name.as_str())));
                     c.env_bind(&name, false);
                 } else {
@@ -2161,11 +2580,31 @@ fn compile_inner(
         log_bail("body-lexicals", "unsupported declaration form");
         return None;
     }
-    for stmt in &func.body {
-        if c.stmt(stmt).is_err() {
-            log_bail("stmt-in", &format!("{:.80}", format!("{stmt:?}")));
-            return None;
+    let compile_body = |compiler: &mut Compiler| -> CResult {
+        for stmt in &func.body {
+            if compiler.stmt(stmt).is_err() {
+                log_bail("stmt-in", &format!("{:.80}", format!("{stmt:?}")));
+                return Err(Bail);
+            }
         }
+        Ok(())
+    };
+    let has_body_using = func.body.iter().any(|statement| {
+        matches!(
+            statement,
+            Stmt::VarDecl {
+                kind: DeclKind::Using | DeclKind::AwaitUsing,
+                ..
+            }
+        )
+    });
+    let body_result = if has_body_using {
+        c.disposal_scope(compile_body)
+    } else {
+        compile_body(&mut c)
+    };
+    if body_result.is_err() {
+        return None;
     }
     c.emit(Op::ReturnUndef);
     // Constructors in OO workloads overwhelmingly initialize a short, straight-line list of
@@ -2187,6 +2626,7 @@ fn compile_inner(
                 }
             }
             Op::Jump(..)
+            | Op::AbruptJump(..)
             | Op::JumpIfFalse(..)
             | Op::JumpIfFalsePeek(..)
             | Op::JumpIfTruePeek(..)
@@ -2194,9 +2634,31 @@ fn compile_inner(
             | Op::InlineGuard(..)
             | Op::Throw
             | Op::Return
+            | Op::ReturnBare
+            | Op::ResumeReturn
+            | Op::ResumeJump
             | Op::ReturnUndef
             | Op::Await
-            | Op::PushHandler(..) => break,
+            | Op::Yield
+            | Op::PushHandler(..)
+            | Op::PushFinally(..)
+            | Op::PushIterator(..) => break,
+            Op::PushDisposeFrame
+            | Op::AddDisposable(_)
+            | Op::DisposeNormal
+            | Op::DisposeThrow
+            | Op::DisposeReturn
+            | Op::DisposeBareReturn
+            | Op::DisposeResumeReturn
+            | Op::DisposeJump
+            | Op::PushWith
+            | Op::PushLex(_)
+            | Op::CloneLex(_)
+            | Op::InitLex(_)
+            | Op::PopEnv
+            | Op::ResolveNameRef(..)
+            | Op::LoadRef(_)
+            | Op::StoreRef(_) => break,
             _ => {}
         }
     }
@@ -2218,13 +2680,20 @@ fn compile_inner(
         names: c.names,
         n_slots: c.slot_names.len(),
         slot_names: c.slot_names,
+        n_refs: c.n_refs,
         n_params: c.n_params,
         arguments_slot: c.arguments_slot,
         uses_this: c.uses_this,
+        strict: c.strict,
         instance_capacity_hint,
         forwarded_capacity_hint: std::cell::Cell::new(0),
         funcs: c.funcs,
+        templates: c.templates,
+        eval_exprs: c.eval_exprs,
+        assignment_targets: c.assignment_targets,
+        lexical_scopes: c.lexical_scopes,
         cap_inits: c.cap_inits,
+        reuse_activation: c.reuse_activation,
         env_this: c.env_this,
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
@@ -2383,6 +2852,24 @@ fn plan_inlines_at(
                 matches!(
                     op,
                     Op::PushHandler(_)
+                        | Op::PushFinally(..)
+                        | Op::PushIterator(..)
+                        | Op::PushDisposeFrame
+                        | Op::AddDisposable(_)
+                        | Op::DisposeNormal
+                        | Op::DisposeThrow
+                        | Op::DisposeReturn
+                        | Op::DisposeBareReturn
+                        | Op::DisposeResumeReturn
+                        | Op::DisposeJump
+                        | Op::PushWith
+                        | Op::PushLex(_)
+                        | Op::CloneLex(_)
+                        | Op::InitLex(_)
+                        | Op::PopEnv
+                        | Op::ResolveNameRef(..)
+                        | Op::LoadRef(_)
+                        | Op::StoreRef(_)
                         | Op::MakeClosure(..)
                         | Op::StoreName(_)
                         | Op::StoreNameCached(..)
@@ -2446,6 +2933,15 @@ fn plan_inlines_at(
 struct Compiler {
     /// The compiled function's strictness (carried into ops whose runtime behavior forks on it).
     strict: bool,
+    /// Generator/async chunks use the VM as their resumable execution context, not merely as an
+    /// optimization tier. Some completion-aware lowerings are intentionally coroutine-only.
+    is_coroutine: bool,
+    /// This coroutine contains direct eval and CaptureScan proved every dynamically visible
+    /// depth-0 binding can live in the retained function activation.
+    direct_eval: bool,
+    /// Inner lexical names whose closure-visible binding must live in the resumable environment
+    /// chain. CaptureScan admits only an unambiguous declaring scope for each spelling.
+    runtime_lexicals: std::collections::HashSet<String>,
     /// Captured once-per-call block `let`s homed in the activation (see CaptureScan's
     /// `candidates`). `homed_pending` holds the ones whose declaring block hasn't been reached
     /// yet: the FIRST block-level declaration of the name consumes it (skipping slot creation);
@@ -2457,7 +2953,15 @@ struct Compiler {
     names: Vec<Rc<str>>,
     /// Lexical scopes for slot resolution: (name, slot, is_const), innermost last.
     scopes: Vec<Vec<(String, u16, bool)>>,
+    /// Environment-backed bindings at each compiler scope, parallel to `scopes`. An entry blocks
+    /// lookup of same-named outer slots and resolves through the VM's current environment cursor.
+    lexical_env_names: Vec<std::collections::HashMap<String, bool>>,
+    /// Scope-vector length at entry to each compiled `with` body. Bindings declared in scopes
+    /// added after the innermost boundary shadow the with object; all earlier slot/activation
+    /// homes must instead use dynamic Environment Record resolution.
+    with_scope_floors: Vec<usize>,
     slot_names: Vec<Rc<str>>,
+    n_refs: usize,
     n_params: usize,
     arguments_slot: Option<u16>,
     loops: Vec<LoopCtx>,
@@ -2491,6 +2995,9 @@ struct Compiler {
     /// emit a `PopHandler` per region crossed, or the stale handler catches unrelated throws
     /// later in the frame.
     try_depth: u32,
+    /// Active `finally` handler depths. A break/continue may discard ordinary catch/iterator
+    /// handlers, but it must never jump across a finalizer without executing it.
+    finally_depths: Vec<u32>,
     /// Slots that ever enter a temporal dead zone (an `Op::Tdz` was emitted for them). The fused
     /// element ops defer the base-slot read past key/value evaluation, which is only
     /// order-unobservable when the base can never TDZ-throw — params and `var`s qualify.
@@ -2498,7 +3005,12 @@ struct Compiler {
     /// Captured (env-homed) function-scope-wide names → is_const. Slot scopes shadow these.
     env_names: std::collections::HashMap<String, bool>,
     funcs: Vec<Rc<Function>>,
+    templates: Vec<Vec<(Option<String>, String)>>,
+    eval_exprs: Vec<EvalExprPlan>,
+    assignment_targets: Vec<AssignmentTargetPlan>,
+    lexical_scopes: Vec<Vec<LexicalBinding>>,
     cap_inits: Vec<CapInit>,
+    reuse_activation: bool,
     env_this: bool,
     /// Speculative-inline plan stack (second-stage only): one frame per active splice, each
     /// mapping that frame's call-site ordinal (== the function's first-compile `CallIc` index —
@@ -2511,6 +3023,26 @@ struct Compiler {
     /// `return` jumps inside the current spliced body, patched to the join point.
     inline_returns: Vec<usize>,
     inline_targets: Vec<InlineTarget>,
+}
+
+/// Whether a tagged-template call occurs in a tail position of a return operand.
+///
+/// Strict ordinary functions currently preserve proper tail calls through the tree-walker's
+/// trampoline.  Until bytecode returns can transfer tagged calls to that trampoline too, keep
+/// such functions on the normative path rather than turning an otherwise constant-stack loop
+/// into Rust recursion.  This is the expression part of ECMA-262 HasCallInTailPosition: only the
+/// selected conditional arm, the final sequence element, and the right logical operand inherit
+/// tail position.
+fn has_tail_tagged_template(expr: &Expr) -> bool {
+    match expr {
+        Expr::TaggedTemplate { .. } => true,
+        Expr::Cond { cons, alt, .. } => {
+            has_tail_tagged_template(cons) || has_tail_tagged_template(alt)
+        }
+        Expr::Seq(exprs) => exprs.last().is_some_and(has_tail_tagged_template),
+        Expr::Logical { right, .. } | Expr::Paren(right) => has_tail_tagged_template(right),
+        _ => false,
+    }
 }
 
 /// One planned inline: the callee function (AST) and its pinned identity.
@@ -2539,10 +3071,36 @@ pub struct InlineWay {
 }
 
 /// Where a name resolves inside the compiled body.
+#[derive(Clone, Copy)]
 enum Home {
     Slot(u16, bool),
     /// Captured: lives in the activation env; bool = is_const.
     Env(bool),
+}
+
+/// A destructuring-assignment Reference whose observable base/key evaluation has already run.
+/// Hidden slots retain member References across iterator steps and suspending defaults.
+enum PreparedAssignmentRef {
+    Local {
+        slot: u16,
+        is_const: bool,
+        name: u32,
+    },
+    Captured {
+        name: u32,
+        is_const: bool,
+    },
+    Name(u32),
+    Reference(u16),
+    Property {
+        base: u16,
+        name: u32,
+        cache: u32,
+    },
+    Element {
+        base: u16,
+        key: u16,
+    },
 }
 
 #[derive(Default)]
@@ -2555,6 +3113,9 @@ struct LoopCtx {
     /// A for-of loop's iterator slot: crossing `break`s close it (`IterCloseL`); its own
     /// `continue`s don't (the loop keeps iterating).
     foreach_iter: Option<u16>,
+    /// The async-from-sync flag slot for a `for await…of`; present means every abandonment uses
+    /// suspending AsyncIteratorClose rather than synchronous IteratorClose.
+    foreach_async_from_sync: Option<u16>,
     /// For a for-of context: `try_depth` just after its per-iteration body handler pushed —
     /// exits emitted inside the body pop down to here before touching the handler itself.
     body_try_depth: u32,
@@ -2564,6 +3125,9 @@ struct LoopCtx {
     /// A `switch` context: an unlabelled `break` targets it, but `continue` skips past it to the
     /// innermost enclosing loop.
     is_switch: bool,
+    /// A labelled non-breakable statement accepts only a matching labelled `break`; unlabelled
+    /// break/continue searches skip it.
+    is_label_block: bool,
 }
 
 /// Debug (`LUMEN_TIER_LOG=1`): report the AST construct a compile bail came from.
@@ -2577,6 +3141,13 @@ fn log_bail(what: &str, detail: &str) {
 /// Compilation bail: the construct is outside the v0 subset.
 struct Bail;
 type CResult = Result<(), Bail>;
+
+#[derive(Clone, Copy)]
+enum CallArgsMode {
+    Fixed(u16),
+    FinalSpread(u16),
+    Array,
+}
 
 /// Whether a parameter default is in the compiler's lowerable subset: no reference to any
 /// *banned* name (this parameter itself or a later one — the spec's param-scope TDZ would throw
@@ -2748,6 +3319,31 @@ impl Compiler {
         let cache = self.new_name_cache(name);
         self.emit(Op::StoreNameCached(name, cache));
     }
+
+    /// ECMA-262 §13.15.2 evaluates a statically-resolved immutable identifier like every other
+    /// Reference: simple assignment evaluates the RHS before PutValue, while compound assignment
+    /// first performs GetValue and the binary operation. The final store distinguishes a slot TDZ
+    /// from an initialized immutable binding instead of folding both failures into a TypeError.
+    fn immutable_assignment(&mut self, home: Home, name: &str, op: &str, value: &Expr) -> CResult {
+        let name_index = self.name_idx(name);
+        if op == "=" {
+            self.named_expr(value, name)?;
+        } else {
+            match home {
+                Home::Slot(slot, true) => self.emit(Op::LoadLocal(slot)),
+                Home::Env(true) => self.emit(Op::LoadCap(name_index)),
+                _ => unreachable!("immutable assignment requires an immutable home"),
+            };
+            self.expr(value)?;
+            self.emit_compound(op)?;
+        }
+        match home {
+            Home::Slot(slot, true) => self.emit(Op::StoreConstLocal(slot, name_index)),
+            Home::Env(true) => self.emit(Op::StoreConstCap(name_index)),
+            _ => unreachable!("immutable assignment requires an immutable home"),
+        };
+        Ok(())
+    }
     /// Reserve a fresh call-cache slot for a `Call`/`CallWithThis` site.
     fn new_call_cache(&mut self) -> u32 {
         // Every frame counts its own call-site ordinals (see `Compiler::plan_stack`).
@@ -2805,6 +3401,9 @@ impl Compiler {
             self.inline_targets.len(),
             self.slot_names.len(),
             self.funcs.len(),
+            self.templates.len(),
+            self.eval_exprs.len(),
+            self.assignment_targets.len(),
         );
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
             self.ops.truncate(snap.0);
@@ -2819,6 +3418,9 @@ impl Compiler {
             self.inline_targets.truncate(snap.6);
             self.slot_names.truncate(snap.7);
             self.funcs.truncate(snap.8);
+            self.templates.truncate(snap.9);
+            self.eval_exprs.truncate(snap.10);
+            self.assignment_targets.truncate(snap.11);
             if has_this {
                 self.emit(Op::CallWithThis(argc, cc));
             } else {
@@ -2934,6 +3536,7 @@ impl Compiler {
 
         // ---- compile the body under the callee's (empty) namespace ----
         let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_lexical_env_names = std::mem::take(&mut self.lexical_env_names);
         let saved_env_names = std::mem::take(&mut self.env_names);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_labels = std::mem::take(&mut self.pending_labels);
@@ -2961,7 +3564,7 @@ impl Compiler {
                 .unwrap_or_default(),
             0,
         ));
-        self.scopes.push(Vec::new());
+        self.push_compile_scope();
         for (k, p) in f.params.iter().enumerate() {
             let Pattern::Ident(name) = &p.pattern else {
                 unreachable!()
@@ -2980,6 +3583,7 @@ impl Compiler {
         self.pending_labels = saved_labels;
         self.loops = saved_loops;
         self.env_names = saved_env_names;
+        self.lexical_env_names = saved_lexical_env_names;
         self.scopes = saved_scopes;
         r?;
 
@@ -3027,11 +3631,14 @@ impl Compiler {
         Ok(())
     }
     /// Declare every binding a lexical declaration pattern introduces, in source order (slot +
-    /// TDZ each, like the plain-identifier path). Only the destructuring subset the compiler
-    /// can lower is accepted (see `destructure_store`); anything else bails to the tree-walker.
+    /// TDZ each, like the plain-identifier path). Defaults and computed keys are evaluations, not
+    /// declarations; rest and nested patterns contribute their BoundNames recursively.
     fn declare_lexical_pattern(&mut self, pat: &Pattern, is_const: bool) -> CResult {
         match pat {
             Pattern::Ident(name) => {
+                if self.current_lexical_env_has(name) {
+                    return Ok(());
+                }
                 if self.homed_pending.remove(name) {
                     // The homed block `let`'s own declaration (see `Compiler::homed_lets`):
                     // in TDZ since entry, no slot, no per-entry Tdz (the block runs at most
@@ -3046,16 +3653,11 @@ impl Compiler {
                 Ok(())
             }
             Pattern::Object(o) => {
-                if o.rest.is_some() {
-                    return Err(Bail);
-                }
                 for prop in &o.props {
-                    if prop.default.is_some()
-                        || !matches!(&prop.key, PropKey::Ident(_) | PropKey::Str(_))
-                    {
-                        return Err(Bail);
-                    }
                     self.declare_lexical_pattern(&prop.value, is_const)?;
+                }
+                if let Some(rest) = &o.rest {
+                    self.declare_lexical_pattern(&Pattern::Ident(rest.clone()), is_const)?;
                 }
                 Ok(())
             }
@@ -3063,11 +3665,9 @@ impl Compiler {
                 for e in elems {
                     match e {
                         ArrayPatElem::Hole => {}
-                        ArrayPatElem::Elem {
-                            pattern,
-                            default: None,
-                        } => self.declare_lexical_pattern(pattern, is_const)?,
-                        _ => return Err(Bail),
+                        ArrayPatElem::Elem { pattern, .. } | ArrayPatElem::Rest(pattern) => {
+                            self.declare_lexical_pattern(pattern, is_const)?
+                        }
                     }
                 }
                 Ok(())
@@ -3083,6 +3683,15 @@ impl Compiler {
     fn destructure_store(&mut self, pat: &Pattern, kind: DeclKind) -> CResult {
         match pat {
             Pattern::Ident(name) => {
+                if self.current_lexical_env_has(name) {
+                    let name = self.name_idx(name);
+                    self.emit(if matches!(kind, DeclKind::Var) {
+                        Op::StoreName(name)
+                    } else {
+                        Op::InitLex(name)
+                    });
+                    return Ok(());
+                }
                 let home = self.home(name).ok_or(Bail)?;
                 match home {
                     Home::Slot(slot, _) => {
@@ -3100,8 +3709,13 @@ impl Compiler {
                 Ok(())
             }
             Pattern::Object(o) => {
-                if o.rest.is_some() {
-                    return Err(Bail);
+                if o.rest.is_some()
+                    || o.props.iter().any(|prop| {
+                        prop.default.is_some()
+                            || !matches!(&prop.key, PropKey::Ident(_) | PropKey::Str(_))
+                    })
+                {
+                    return self.binding_object_pattern(o, kind);
                 }
                 self.emit(Op::DestructureGuard);
                 for prop in &o.props {
@@ -3128,15 +3742,19 @@ impl Compiler {
                 // leaf's initialization is visible to a later iterator step's next() per spec)
                 // and elements are flat idents/holes (a nested pattern's own reads would
                 // interleave with the steps), with no defaults (their evaluation interleaves).
-                for e in elems.iter() {
+                let batched = elems.iter().all(|e| {
                     match e {
                         ArrayPatElem::Hole => {}
                         ArrayPatElem::Elem {
                             pattern: Pattern::Ident(n),
                             default: None,
                         } if matches!(self.home(n), Some(Home::Slot(..))) => {}
-                        _ => return Err(Bail),
+                        _ => return false,
                     }
+                    true
+                });
+                if !batched {
+                    return self.binding_array_pattern(elems, kind);
                 }
                 self.emit(Op::DestructureArr(elems.len() as u16));
                 for e in elems.iter().rev() {
@@ -3156,25 +3774,197 @@ impl Compiler {
         }
     }
 
-    /// Emit a call's arguments left to right. `Ok(true)`: the last argument was a spread —
-    /// the caller must emit a `CallSpread` op (evaluate-then-expand only matches the spec's
-    /// interleaved order when nothing evaluates after the spread part, so any other spread
-    /// position bails).
-    fn call_args(&mut self, args: &[ArrayElem]) -> Result<bool, Bail> {
-        let spread_at = args.iter().position(|a| !matches!(a, ArrayElem::Item(_)));
-        if let Some(k) = spread_at {
-            if k != args.len() - 1 || !matches!(args[k], ArrayElem::Spread(_)) {
-                log_bail("expr", "spread argument (non-final)");
-                return Err(Bail);
+    fn binding_default(&mut self, pattern: &Pattern, default: Option<&Expr>) -> CResult {
+        let Some(default) = default else {
+            return Ok(());
+        };
+        self.emit(Op::Dup);
+        self.emit(Op::Undef);
+        self.emit(Op::StrictEq);
+        let present = self.emit(Op::JumpIfFalse(0));
+        self.emit(Op::Pop);
+        if let Pattern::Ident(name) = pattern {
+            self.named_expr(default, name)?;
+        } else {
+            self.expr(default)?;
+        }
+        self.patch(present);
+        Ok(())
+    }
+
+    fn binding_array_pattern(&mut self, elements: &[ArrayPatElem], kind: DeclKind) -> CResult {
+        let iterator = self.fresh_slot("%binding-iterator%");
+        let next = self.fresh_slot("%binding-next%");
+        let done = self.fresh_slot("%binding-done%");
+        self.emit(Op::GetIter);
+        self.emit(Op::StoreLocal(next));
+        self.emit(Op::StoreLocal(iterator));
+        let false_value = self.const_idx(Value::Bool(false));
+        self.emit(Op::Const(false_value));
+        self.emit(Op::StoreLocal(done));
+
+        let handler = self.emit(Op::PushIterator(0, 0, 0, 0));
+        self.try_depth += 1;
+        for element in elements {
+            match element {
+                ArrayPatElem::Hole => {
+                    self.emit(Op::DestructureStepL(iterator, next, done));
+                    self.emit(Op::Pop);
+                }
+                ArrayPatElem::Elem { pattern, default } => {
+                    self.emit(Op::DestructureStepL(iterator, next, done));
+                    self.binding_default(pattern, default.as_ref())?;
+                    self.destructure_store(pattern, kind)?;
+                }
+                ArrayPatElem::Rest(pattern) => {
+                    self.emit(Op::DestructureRestL(iterator, next, done));
+                    self.destructure_store(pattern, kind)?;
+                }
             }
         }
-        for a in args {
-            match a {
-                ArrayElem::Item(e) | ArrayElem::Spread(e) => self.expr(e)?,
-                ArrayElem::Hole => return Err(Bail),
+        self.emit(Op::PopHandler);
+        self.try_depth -= 1;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        let after_pads = self.emit(Op::Jump(0));
+
+        let throw_pc = self.ops.len() as u32;
+        self.emit(Op::IterAbortIfNotDoneL(iterator, done));
+        let return_pc = self.ops.len() as u32;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        self.emit(Op::Return);
+        let bare_return_pc = self.ops.len() as u32;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        self.emit(Op::ReturnBare);
+        let resume_return_pc = self.ops.len() as u32;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        self.emit(Op::ResumeReturn);
+        match &mut self.ops[handler] {
+            Op::PushIterator(
+                throw_target,
+                return_target,
+                bare_return_target,
+                resume_return_target,
+            ) => {
+                *throw_target = throw_pc;
+                *return_target = return_pc;
+                *bare_return_target = bare_return_pc;
+                *resume_return_target = resume_return_pc;
+            }
+            _ => unreachable!(),
+        }
+        self.patch(after_pads);
+        Ok(())
+    }
+
+    fn binding_object_pattern(
+        &mut self,
+        object: &crate::ast::ObjectPat,
+        kind: DeclKind,
+    ) -> CResult {
+        self.emit(Op::DestructureGuard);
+        let source = self.fresh_slot("%binding-object%");
+        self.emit(Op::StoreLocal(source));
+        let mut excluded = Vec::new();
+        for property in &object.props {
+            let key = self.assignment_object_key(source, &property.key)?;
+            excluded.push(key);
+            self.load_assignment_property(source, key);
+            self.binding_default(&property.value, property.default.as_ref())?;
+            self.destructure_store(&property.value, kind)?;
+        }
+        if let Some(rest) = &object.rest {
+            self.emit(Op::LoadLocal(source));
+            for key in &excluded {
+                self.emit(Op::LoadLocal(*key));
+            }
+            self.emit(Op::ObjectRest(excluded.len() as u16));
+            self.destructure_store(&Pattern::Ident(rest.clone()), kind)?;
+        }
+        Ok(())
+    }
+
+    /// Emit ArgumentListEvaluation from ECMA-262 §13.3.8.1. Plain calls retain their compact
+    /// fixed-arity op and one final spread retains the allocation-free expansion path. Multiple
+    /// or interleaved spreads build a private dense list incrementally, so each iterator is fully
+    /// consumed before the following argument expression is evaluated.
+    fn call_args(&mut self, args: &[ArrayElem]) -> Result<CallArgsMode, Bail> {
+        let spreads: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| matches!(arg, ArrayElem::Spread(_)).then_some(index))
+            .collect();
+        if args.iter().any(|arg| matches!(arg, ArrayElem::Hole)) {
+            return Err(Bail);
+        }
+        if spreads.is_empty() {
+            for arg in args {
+                let ArrayElem::Item(expr) = arg else {
+                    unreachable!("argument shape checked above")
+                };
+                self.expr(expr)?;
+            }
+            return Ok(CallArgsMode::Fixed(
+                u16::try_from(args.len()).map_err(|_| Bail)?,
+            ));
+        }
+        if spreads.as_slice() == [args.len() - 1] {
+            for arg in args {
+                match arg {
+                    ArrayElem::Item(expr) | ArrayElem::Spread(expr) => self.expr(expr)?,
+                    ArrayElem::Hole => unreachable!("argument shape checked above"),
+                }
+            }
+            return Ok(CallArgsMode::FinalSpread(
+                u16::try_from(args.len()).map_err(|_| Bail)?,
+            ));
+        }
+
+        self.emit(Op::NewArray);
+        for arg in args {
+            match arg {
+                ArrayElem::Item(expr) => {
+                    self.expr(expr)?;
+                    self.emit(Op::ArrayPush);
+                }
+                ArrayElem::Spread(expr) => {
+                    self.expr(expr)?;
+                    self.emit(Op::ArraySpread);
+                }
+                ArrayElem::Hole => unreachable!("argument shape checked above"),
             }
         }
-        Ok(spread_at.is_some())
+        Ok(CallArgsMode::Array)
+    }
+
+    fn finish_call(&mut self, args: &[ArrayElem], with_this: bool, allow_inline: bool) -> CResult {
+        match self.call_args(args)? {
+            CallArgsMode::Fixed(argc) => {
+                let plan_hit = allow_inline.then(|| self.plan_hit()).flatten();
+                let cache = self.new_call_cache();
+                match plan_hit {
+                    Some(entry) => self.emit_call_with_inline(entry, argc, cache, with_this),
+                    None if with_this => {
+                        self.emit(Op::CallWithThis(argc, cache));
+                    }
+                    None => {
+                        self.emit(Op::Call(argc, cache));
+                    }
+                }
+            }
+            CallArgsMode::FinalSpread(argc) if with_this => {
+                self.emit(Op::CallSpreadThis(argc));
+            }
+            CallArgsMode::FinalSpread(argc) => {
+                self.emit(Op::CallSpread(argc));
+            }
+            CallArgsMode::Array if with_this => {
+                self.emit(Op::CallArgsArrayThis);
+            }
+            CallArgsMode::Array => {
+                self.emit(Op::CallArgsArray);
+            }
+        }
+        Ok(())
     }
 
     /// `delete obj.p` / `delete obj[k]` on plain (non-optional, non-super, public) references;
@@ -3183,6 +3973,45 @@ impl Compiler {
     fn delete_expr(&mut self, arg: &Expr) -> CResult {
         match arg {
             Expr::Paren(inner) => self.delete_expr(inner),
+            Expr::OptionalChain(inner) => self.delete_optional_chain(inner),
+            Expr::Ident(name) => {
+                if self.home(name).is_some() {
+                    // Function/lexical declarations represented by slots or activation bindings
+                    // are never deletable. Only a free name needs the full environment/global
+                    // DeleteBinding lookup.
+                    let no = self.const_idx(Value::Bool(false));
+                    self.emit(Op::Const(no));
+                } else {
+                    let name = self.name_idx(name);
+                    self.emit(Op::DeleteName(name));
+                }
+                Ok(())
+            }
+            Expr::Member {
+                obj,
+                optional: false,
+                ..
+            } if matches!(**obj, Expr::Super) => {
+                // Evaluation of `super.name` performs GetThisBinding before Delete observes that
+                // this is a Super Reference and throws. It does not need GetSuperBase.
+                self.emit_super_this();
+                self.emit(Op::Pop);
+                self.emit(Op::DeleteSuper);
+                Ok(())
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                // The computed expression evaluates, but Delete throws before ToPropertyKey.
+                self.emit_super_this();
+                self.emit(Op::Pop);
+                self.expr(index)?;
+                self.emit(Op::Pop);
+                self.emit(Op::DeleteSuper);
+                Ok(())
+            }
             Expr::Member {
                 obj,
                 prop,
@@ -3203,7 +4032,6 @@ impl Compiler {
                 self.emit(Op::DeleteElem(self.strict));
                 Ok(())
             }
-            Expr::Ident(_) | Expr::OptionalChain(_) => Err(Bail),
             other => {
                 self.expr(other)?;
                 self.emit(Op::Pop);
@@ -3214,12 +4042,61 @@ impl Compiler {
         }
     }
 
+    /// OptionalChain evaluation for the delete operator. A short-circuited chain produces true,
+    /// while a live final Member/Index remains a Reference and performs [[Delete]].
+    fn delete_optional_chain(&mut self, inner: &Expr) -> CResult {
+        let mut shorts = Vec::new();
+        match inner {
+            Expr::Member {
+                obj,
+                prop,
+                optional,
+            } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                self.opt_chain(obj, &mut shorts)?;
+                if *optional {
+                    self.opt_link(1, &mut shorts);
+                }
+                let name = self.name_idx(prop);
+                self.emit(Op::DeleteProp(name, self.strict));
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional,
+            } if !matches!(**obj, Expr::Super) => {
+                self.opt_chain(obj, &mut shorts)?;
+                if *optional {
+                    self.opt_link(1, &mut shorts);
+                }
+                self.expr(index)?;
+                self.emit(Op::DeleteElem(self.strict));
+            }
+            other => {
+                self.opt_chain(other, &mut shorts)?;
+                self.emit(Op::Pop);
+                let yes = self.const_idx(Value::Bool(true));
+                self.emit(Op::Const(yes));
+            }
+        }
+        if shorts.is_empty() {
+            return Ok(());
+        }
+        let done = self.emit(Op::Jump(0));
+        for short in shorts {
+            self.patch(short);
+        }
+        let yes = self.const_idx(Value::Bool(true));
+        self.emit(Op::Const(yes));
+        self.patch(done);
+        Ok(())
+    }
+
     /// Compile an optional chain (`a?.b.c`, `r?.m(args)`): each optional link peeks its base —
     /// nullish pops what the link would have consumed and jumps to a shared pad that pushes the
     /// chain's `undefined` result (skipping every later link, key expression, and argument, per
-    /// spec). Non-optional links compile as usual. Supported spine: Member/Index reads and
-    /// Member-callee method calls; anything else (optional `delete`, `?.()` on a plain callee,
-    /// private names, `super`) bails to the tree-walker.
+    /// spec). Non-optional links compile as usual. Public Member/Index method calls and plain
+    /// optional callees preserve their distinct receiver rules; optional `delete`, private names,
+    /// and `super` retain the compatibility path.
     fn opt_chain(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
         match e {
             Expr::Member {
@@ -3253,39 +4130,52 @@ impl Compiler {
                 callee,
                 args,
                 optional: call_opt,
-            } => {
-                let Expr::Member {
+            } => match &**callee {
+                Expr::Member {
                     obj,
                     prop,
                     optional,
-                } = &**callee
-                else {
-                    return Err(Bail);
-                };
-                if matches!(**obj, Expr::Super) || prop.starts_with('#') {
-                    return Err(Bail);
+                } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                    self.opt_chain(obj, shorts)?;
+                    if *optional {
+                        self.opt_link(1, shorts);
+                    }
+                    let name = self.name_idx(prop);
+                    let cache = self.new_cache(name);
+                    self.emit(Op::GetMethod(name, cache));
+                    if *call_opt {
+                        // `a.b?.(args)`: the method value is peeked; nullish drops
+                        // [receiver, method].
+                        self.opt_link(2, shorts);
+                    }
+                    self.finish_call(args, true, true)
                 }
-                self.opt_chain(obj, shorts)?;
-                if *optional {
-                    self.opt_link(1, shorts);
+                Expr::Index {
+                    obj,
+                    index,
+                    optional,
+                } if !matches!(**obj, Expr::Super) => {
+                    self.opt_chain(obj, shorts)?;
+                    if *optional {
+                        self.opt_link(1, shorts);
+                    }
+                    self.expr(index)?;
+                    self.emit(Op::GetMethodElem);
+                    if *call_opt {
+                        self.opt_link(2, shorts);
+                    }
+                    self.finish_call(args, true, true)
                 }
-                let i = self.name_idx(prop);
-                let c = self.new_cache(i);
-                self.emit(Op::GetMethod(i, c));
-                if *call_opt {
-                    // `a.b?.(args)`: the method value is peeked; nullish drops [obj, method].
-                    self.opt_link(2, shorts);
+                plain => {
+                    self.opt_chain(plain, shorts)?;
+                    if *call_opt {
+                        self.opt_link(1, shorts);
+                    }
+                    // A non-Reference callee and an environment Reference both use undefined as
+                    // `this` here; method References were handled by the two arms above.
+                    self.finish_call(args, false, true)
                 }
-                for a in args {
-                    let ArrayElem::Item(a) = a else {
-                        return Err(Bail);
-                    };
-                    self.expr(a)?;
-                }
-                let cc = self.new_call_cache();
-                self.emit(Op::CallWithThis(args.len() as u16, cc));
-                Ok(())
-            }
+            },
             // The chain's base (before any `?.` link): an ordinary expression.
             other => self.expr(other),
         }
@@ -3328,9 +4218,24 @@ impl Compiler {
         self.slot_names.push(Rc::from(name));
         slot
     }
+    fn fresh_reference(&mut self) -> Result<u16, Bail> {
+        let reference = u16::try_from(self.n_refs).map_err(|_| Bail)?;
+        self.n_refs += 1;
+        Ok(reference)
+    }
+    fn push_compile_scope(&mut self) {
+        self.scopes.push(Vec::new());
+        self.lexical_env_names.push(Default::default());
+    }
+    fn pop_compile_scope(&mut self) {
+        self.scopes.pop().expect("compiler scope stack underflow");
+        self.lexical_env_names
+            .pop()
+            .expect("compiler lexical-environment stack underflow");
+    }
     fn scope_bind(&mut self, name: &str, slot: u16, is_const: bool) {
         if self.scopes.is_empty() {
-            self.scopes.push(Vec::new());
+            self.push_compile_scope();
         }
         let top = self.scopes.last_mut().unwrap();
         if let Some(e) = top.iter_mut().find(|(n, ..)| n == name) {
@@ -3340,12 +4245,26 @@ impl Compiler {
         }
     }
     fn lookup(&self, name: &str) -> Option<(u16, bool)> {
-        for scope in self.scopes.iter().rev() {
+        for (scope, environment) in self.scopes.iter().zip(&self.lexical_env_names).rev() {
             if let Some((_, slot, k)) = scope.iter().rev().find(|(n, ..)| n == name) {
                 return Some((*slot, *k));
             }
+            if environment.contains_key(name) {
+                return None;
+            }
         }
         None
+    }
+    fn lexical_env_bind(&mut self, name: &str, is_const: bool) {
+        self.lexical_env_names
+            .last_mut()
+            .expect("lexical binding requires a compiler scope")
+            .insert(name.to_string(), is_const);
+    }
+    fn current_lexical_env_has(&self, name: &str) -> bool {
+        self.lexical_env_names
+            .last()
+            .is_some_and(|scope| scope.contains_key(name))
     }
     fn env_bind(&mut self, name: &str, is_const: bool) {
         self.env_names.insert(name.to_string(), is_const);
@@ -3356,10 +4275,39 @@ impl Compiler {
     /// Resolve a local: innermost slot scope first (block lexicals shadow captured names — a
     /// captured block lexical bails compile, so every env name is function-scope-wide).
     fn home(&self, name: &str) -> Option<Home> {
-        if let Some((slot, k)) = self.lookup(name) {
-            return Some(Home::Slot(slot, k));
+        if let Some(floor) = self.with_scope_floors.last().copied() {
+            for (scope, environment) in self.scopes[floor..]
+                .iter()
+                .zip(&self.lexical_env_names[floor..])
+                .rev()
+            {
+                if let Some((_, slot, is_const)) =
+                    scope.iter().rev().find(|(candidate, ..)| candidate == name)
+                {
+                    return Some(Home::Slot(*slot, *is_const));
+                }
+                if environment.contains_key(name) {
+                    return None;
+                }
+            }
+            return None;
         }
-        self.env_names.get(name).map(|k| Home::Env(*k))
+        for (scope, environment) in self.scopes.iter().zip(&self.lexical_env_names).rev() {
+            if let Some((_, slot, is_const)) =
+                scope.iter().rev().find(|(candidate, ..)| candidate == name)
+            {
+                return Some(Home::Slot(*slot, *is_const));
+            }
+            if environment.contains_key(name) {
+                return None;
+            }
+        }
+        self.env_names
+            .get(name)
+            .map(|is_const| Home::Env(*is_const))
+    }
+    fn name_reference_can_change(&self, name: &str) -> bool {
+        self.home(name).is_none() && (self.direct_eval || !self.with_scope_floors.is_empty())
     }
     fn const_idx(&mut self, v: Value) -> u32 {
         self.consts.push(v);
@@ -3374,8 +4322,12 @@ impl Compiler {
     }
     fn patch(&mut self, at: usize) {
         let target = self.ops.len() as u32;
+        self.patch_to(at, target);
+    }
+    fn patch_to(&mut self, at: usize, target: u32) {
         match &mut self.ops[at] {
             Op::Jump(t)
+            | Op::AbruptJump(t, _)
             | Op::JumpIfFalse(t)
             | Op::JumpIfFalsePeek(t)
             | Op::JumpIfTruePeek(t)
@@ -3385,9 +4337,10 @@ impl Compiler {
         }
     }
 
-    /// Declare the function body's top-level `let`/`const`: captured ones home in the activation
+    /// Declare the function body's top-level lexical bindings: captured ones home in the activation
     /// env (inserted in TDZ by `make_run_env`), the rest get TDZ slots. Function declarations
-    /// were already handled by the hoist plan; classes and `using` bail.
+    /// were already handled by the hoist plan; classes and resource declarations follow the same
+    /// lexical initialization split.
     fn declare_body_lexicals(
         &mut self,
         stmts: &[Stmt],
@@ -3396,44 +4349,32 @@ impl Compiler {
         for s in stmts {
             match s {
                 Stmt::VarDecl {
-                    kind: kind @ (DeclKind::Let | DeclKind::Const),
+                    kind:
+                        kind
+                        @ (DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing),
                     decls,
                 } => {
-                    let is_const = matches!(kind, DeclKind::Const);
+                    let is_const = matches!(
+                        kind,
+                        DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing
+                    );
                     for (pat, _) in decls {
-                        // Patterns declare every bound ident; a captured one homes in the
-                        // activation env like the plain-ident path.
-                        let mut names = std::collections::HashSet::new();
-                        pat_idents(pat, &mut names);
-                        if !matches!(pat, Pattern::Ident(_)) {
-                            // The execution lowering only handles the object-pattern subset.
-                            if names.iter().any(|n| captured.contains(n)) {
-                                log_bail("body-lexicals", "captured destructured lexical");
-                                return Err(Bail);
-                            }
-                            self.declare_lexical_pattern(pat, is_const)?;
-                            continue;
-                        }
-                        let Pattern::Ident(name) = pat else {
-                            unreachable!()
-                        };
-                        if captured.contains(name) {
-                            self.cap_inits
-                                .push(CapInit::Lexical(Rc::from(name.as_str()), is_const));
-                            self.env_bind(name, is_const);
-                        } else {
-                            let slot = self.fresh_slot(name);
-                            self.scope_bind(name, slot, is_const);
-                            self.tdz_slots.insert(slot);
-                            self.emit(Op::Tdz(slot));
-                        }
+                        self.declare_body_lexical_pattern(pat, is_const, captured)?;
                     }
                 }
-                Stmt::VarDecl {
-                    kind: DeclKind::Using | DeclKind::AwaitUsing,
-                    ..
+                Stmt::ClassDecl(class) => {
+                    let name = class.name.as_ref().ok_or(Bail)?;
+                    if captured.contains(name) {
+                        self.cap_inits
+                            .push(CapInit::Lexical(Rc::from(name.as_str()), false));
+                        self.env_bind(name, false);
+                    } else {
+                        let slot = self.fresh_slot(name);
+                        self.scope_bind(name, slot, false);
+                        self.tdz_slots.insert(slot);
+                        self.emit(Op::Tdz(slot));
+                    }
                 }
-                | Stmt::ClassDecl(_) => return Err(Bail),
                 Stmt::FuncDecl(_) => {} // hoisted — created at entry
                 _ => {}
             }
@@ -3441,18 +4382,69 @@ impl Compiler {
         Ok(())
     }
 
-    /// Declare a statement list's `let`/`const` as TDZ slots (block entry).
+    /// FunctionDeclarationInstantiation creates every top-level lexical binding before body
+    /// evaluation. Split a binding pattern leaf-by-leaf: captured names live in the activation
+    /// Environment Record, while unobserved names retain the cheaper slot representation. Both
+    /// remain uninitialized until the declaration's BindingInitialization reaches that leaf.
+    fn declare_body_lexical_pattern(
+        &mut self,
+        pattern: &Pattern,
+        is_const: bool,
+        captured: &std::collections::HashSet<String>,
+    ) -> CResult {
+        match pattern {
+            Pattern::Ident(name) if captured.contains(name) => {
+                self.cap_inits
+                    .push(CapInit::Lexical(Rc::from(name.as_str()), is_const));
+                self.env_bind(name, is_const);
+                Ok(())
+            }
+            Pattern::Ident(_) => self.declare_lexical_pattern(pattern, is_const),
+            Pattern::Object(object) => {
+                for property in &object.props {
+                    self.declare_body_lexical_pattern(&property.value, is_const, captured)?;
+                }
+                if let Some(rest) = &object.rest {
+                    self.declare_body_lexical_pattern(
+                        &Pattern::Ident(rest.clone()),
+                        is_const,
+                        captured,
+                    )?;
+                }
+                Ok(())
+            }
+            Pattern::Array(elements) => {
+                for element in elements {
+                    match element {
+                        ArrayPatElem::Hole => {}
+                        ArrayPatElem::Elem { pattern, .. } | ArrayPatElem::Rest(pattern) => {
+                            self.declare_body_lexical_pattern(pattern, is_const, captured)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Pattern::Member(_) => Err(Bail),
+        }
+    }
+
+    /// Instantiate a statement list's block-scoped declarations at block entry. Per ECMA-262
+    /// BlockDeclarationInstantiation, every binding exists before statement evaluation and a
+    /// block FunctionDeclaration is initialized immediately rather than when its statement is
+    /// reached. CaptureScan keeps recursive/closure-captured block functions on the tree-walker;
+    /// the slot path here is therefore the exact, allocation-light representation of the
+    /// uncaptured subset.
     fn declare_block_lexicals(&mut self, stmts: &[Stmt]) -> CResult {
         for s in stmts {
             match s {
                 Stmt::VarDecl {
-                    kind: DeclKind::Let | DeclKind::Const,
+                    kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
                     decls,
                 } => {
                     let is_const = matches!(
                         s,
                         Stmt::VarDecl {
-                            kind: DeclKind::Const,
+                            kind: DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
                             ..
                         }
                     );
@@ -3460,13 +4452,33 @@ impl Compiler {
                         self.declare_lexical_pattern(pat, is_const)?;
                     }
                 }
-                Stmt::VarDecl {
-                    kind: DeclKind::Using | DeclKind::AwaitUsing,
-                    ..
+                Stmt::FuncDecl(function) => {
+                    let name = function.name.as_ref().ok_or(Bail)?;
+                    self.declare_lexical_pattern(&Pattern::Ident(name.clone()), false)?;
                 }
-                | Stmt::ClassDecl(_)
-                | Stmt::FuncDecl(_) => return Err(Bail),
+                Stmt::ClassDecl(class) => {
+                    let name = class.name.as_ref().ok_or(Bail)?;
+                    self.declare_lexical_pattern(&Pattern::Ident(name.clone()), false)?;
+                }
                 _ => {}
+            }
+        }
+        // InstantiateFunctionObject uses the current lexical environment and initializes the
+        // mutable block binding before the first statement executes. Do this after reserving all
+        // slots so source-order declarations resolve against the complete block scope.
+        for s in stmts {
+            if let Stmt::FuncDecl(function) = s {
+                let name = function.name.as_ref().ok_or(Bail)?;
+                self.emit_closure(function, None);
+                if self.current_lexical_env_has(name) {
+                    let name = self.name_idx(name);
+                    self.emit(Op::InitLex(name));
+                } else {
+                    let Home::Slot(slot, false) = self.home(name).ok_or(Bail)? else {
+                        return Err(Bail);
+                    };
+                    self.emit(Op::StoreLocal(slot));
+                }
             }
         }
         Ok(())
@@ -3476,15 +4488,32 @@ impl Compiler {
         match s {
             Stmt::Expr(e) => self.expr_stmt(e),
             Stmt::Empty | Stmt::Debugger => Ok(()),
-            // Top-level function declarations were hoisted (created at entry); block-level ones
-            // never reach here (declare_block_lexicals bails first).
+            // Top-level function declarations were hoisted at function entry; block-level ones
+            // were initialized by BlockDeclarationInstantiation at block entry.
             Stmt::FuncDecl(_) => Ok(()),
-            Stmt::VarDecl { kind, decls } => {
-                if matches!(kind, DeclKind::Using | DeclKind::AwaitUsing) {
-                    return Err(Bail);
+            Stmt::ClassDecl(class) => {
+                self.expr(&Expr::Class(class.clone()))?;
+                let name = class.name.as_ref().ok_or(Bail)?;
+                if self.current_lexical_env_has(name) {
+                    let name = self.name_idx(name);
+                    self.emit(Op::InitLex(name));
+                    return Ok(());
                 }
+                match self.home(name).ok_or(Bail)? {
+                    Home::Slot(slot, _) => self.emit(Op::StoreLocal(slot)),
+                    Home::Env(_) => {
+                        let name = self.name_idx(name);
+                        self.emit(Op::StoreCapInit(name))
+                    }
+                };
+                Ok(())
+            }
+            Stmt::VarDecl { kind, decls } => {
                 for (pat, init) in decls {
                     let Pattern::Ident(name) = pat else {
+                        if matches!(kind, DeclKind::Using | DeclKind::AwaitUsing) {
+                            return Err(Bail);
+                        }
                         // Destructuring declaration: evaluate the initializer, then lower the
                         // pattern against it (a pattern without an initializer is a parse error).
                         let Some(e) = init else { return Err(Bail) };
@@ -3492,7 +4521,12 @@ impl Compiler {
                         self.destructure_store(pat, *kind)?;
                         continue;
                     };
-                    let home = self.home(name).ok_or(Bail)?;
+                    let dynamic_lexical = self.current_lexical_env_has(name);
+                    let home = if dynamic_lexical {
+                        None
+                    } else {
+                        Some(self.home(name).ok_or(Bail)?)
+                    };
                     match init {
                         Some(e) => self.named_expr(e, name)?,
                         // `var x;` leaves an existing binding alone; `let x;` initializes.
@@ -3503,7 +4537,22 @@ impl Compiler {
                             self.emit(Op::Undef);
                         }
                     }
-                    match home {
+                    if matches!(kind, DeclKind::Using | DeclKind::AwaitUsing) {
+                        // UsingDeclaration Evaluation calls AddDisposableResource before
+                        // InitializeBinding. AddDisposable peeks so the same value then initializes
+                        // the immutable lexical home without a clone on the common primitive path.
+                        self.emit(Op::AddDisposable(matches!(kind, DeclKind::AwaitUsing)));
+                    }
+                    if dynamic_lexical {
+                        let name = self.name_idx(name);
+                        self.emit(if matches!(kind, DeclKind::Var) {
+                            Op::StoreName(name)
+                        } else {
+                            Op::InitLex(name)
+                        });
+                        continue;
+                    }
+                    match home.expect("non-dynamic declaration has a static home") {
                         Home::Slot(slot, _) => {
                             self.emit(Op::StoreLocal(slot));
                         }
@@ -3522,6 +4571,12 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Return(arg) => {
+                if self.strict
+                    && !self.is_coroutine
+                    && arg.as_ref().is_some_and(has_tail_tagged_template)
+                {
+                    return Err(Bail);
+                }
                 // Inside a spliced callee body, `return v` is "leave v on the stack and jump to
                 // the join point" (the plan guarantees no handlers/for-of regions to unwind:
                 // the callee chunk contains no PushHandler).
@@ -3536,33 +4591,41 @@ impl Compiler {
                     self.inline_returns.push(j);
                     return Ok(());
                 }
-                // A return crossing compiled for-of loops must IteratorClose them (the value
-                // evaluates first, spec order). One level is modeled exactly; more would need
-                // the spec's cascading throw-mode closes — bail to the tree-walker.
-                let fors: Vec<(u16, u32)> = self
-                    .loops
-                    .iter()
-                    .filter_map(|c| c.foreach_iter.map(|it| (it, c.body_try_depth)))
-                    .collect();
-                if fors.len() > 1 {
-                    return Err(Bail);
-                }
-                match arg {
-                    Some(e) => self.expr(e)?,
-                    None => {
-                        self.emit(Op::Undef);
+                let explicit = if let Some(e) = arg {
+                    self.expr(e)?;
+                    true
+                } else {
+                    false
+                };
+                if !self.is_coroutine {
+                    // Ordinary/JIT frames do not return through drive_vm. Preserve their direct
+                    // cleanup lowering; coroutine frames use completion-aware iterator handlers
+                    // so injected returns and suspending finalizers share the normative path.
+                    let fors: Vec<(u16, u32)> = self
+                        .loops
+                        .iter()
+                        .filter_map(|ctx| ctx.foreach_iter.map(|it| (it, ctx.body_try_depth)))
+                        .collect();
+                    if fors.len() > 1 {
+                        return Err(Bail);
                     }
-                }
-                if let Some(&(iter_s, body_depth)) = fors.first() {
-                    // Pop the regions inside the loop body, its handler, then close — a close
-                    // error propagates to handlers *outside* the loop, replacing the return.
-                    for _ in body_depth..self.try_depth {
+                    if let Some(&(iter_s, body_depth)) = fors.first() {
+                        for _ in body_depth..self.try_depth {
+                            self.emit(Op::PopHandler);
+                        }
                         self.emit(Op::PopHandler);
+                        self.emit(Op::IterCloseL(iter_s));
                     }
-                    self.emit(Op::PopHandler);
-                    self.emit(Op::IterCloseL(iter_s));
                 }
-                self.emit(Op::Return);
+                // ECMA-262 §14.10.1 distinguishes `return;` from `return Expression;` in an
+                // async generator: only the expression form performs Await, even when that
+                // expression evaluates to undefined. Both remain abrupt completions so active
+                // finalizers and for-of IteratorClose handlers see them in normative order.
+                if explicit {
+                    self.emit(Op::Return);
+                } else {
+                    self.emit(Op::ReturnBare);
+                }
                 Ok(())
             }
             Stmt::Throw(e) => {
@@ -3586,9 +4649,9 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Block(body) => {
-                self.scopes.push(Vec::new());
+                self.push_compile_scope();
                 let r = self.block_body(body);
-                self.scopes.pop();
+                self.pop_compile_scope();
                 r
             }
             Stmt::While { test, body } => {
@@ -3598,16 +4661,14 @@ impl Compiler {
                 let jf = self.emit(Op::JumpIfFalse(0));
                 self.loops.push(LoopCtx {
                     labels,
+                    entry_try_depth: self.try_depth,
                     ..LoopCtx::default()
                 });
                 let r = self.stmt(body);
                 let ctx = self.loops.pop().unwrap();
                 r?;
                 for c in ctx.continues {
-                    match &mut self.ops[c] {
-                        Op::Jump(t) => *t = start as u32,
-                        _ => unreachable!(),
-                    }
+                    self.patch_to(c, start as u32);
                 }
                 self.emit(Op::Jump(start as u32));
                 self.patch(jf);
@@ -3621,6 +4682,7 @@ impl Compiler {
                 let start = self.ops.len();
                 self.loops.push(LoopCtx {
                     labels,
+                    entry_try_depth: self.try_depth,
                     ..LoopCtx::default()
                 });
                 let r = self.stmt(body);
@@ -3628,10 +4690,7 @@ impl Compiler {
                 r?;
                 let cont = self.ops.len();
                 for c in ctx.continues {
-                    match &mut self.ops[c] {
-                        Op::Jump(t) => *t = cont as u32,
-                        _ => unreachable!(),
-                    }
+                    self.patch_to(c, cont as u32);
                 }
                 self.expr(test)?;
                 let jf = self.emit(Op::JumpIfFalse(0));
@@ -3648,37 +4707,40 @@ impl Compiler {
                 update,
                 body,
             } => {
-                self.scopes.push(Vec::new());
+                self.push_compile_scope();
                 let r = self.for_loop(init.as_deref(), test.as_ref(), update.as_ref(), body);
-                self.scopes.pop();
+                self.pop_compile_scope();
                 r
             }
             Stmt::Break(None) => {
-                let idx = self.loops.len().checked_sub(1).ok_or(Bail)?;
-                self.emit_exit_cleanup(idx, false)?;
-                let j = self.emit(Op::Jump(0));
+                let idx = self
+                    .loops
+                    .iter()
+                    .rposition(|ctx| !ctx.is_label_block)
+                    .ok_or(Bail)?;
+                let j = self.emit_exit_jump(idx, false)?;
                 self.loops[idx].breaks.push(j);
                 Ok(())
             }
             Stmt::Continue(None) => {
                 // `continue` skips switch contexts: it targets the innermost enclosing *loop*.
-                let idx = self.loops.iter().rposition(|c| !c.is_switch).ok_or(Bail)?;
-                self.emit_exit_cleanup(idx, true)?;
-                let j = self.emit(Op::Jump(0));
+                let idx = self
+                    .loops
+                    .iter()
+                    .rposition(|c| !c.is_switch && !c.is_label_block)
+                    .ok_or(Bail)?;
+                let j = self.emit_exit_jump(idx, true)?;
                 self.loops[idx].continues.push(j);
                 Ok(())
             }
-            // Labelled break/continue: jump to the loop on the stack that carries the target label.
-            // A `break` to a labelled *block* (not a loop) isn't modeled here — no ctx matches, so
-            // it bails to the interpreter.
+            // Labelled break/continue: jump to the control context carrying the target label.
             Stmt::Break(Some(name)) => {
                 let idx = self
                     .loops
                     .iter()
                     .rposition(|c| c.labels.iter().any(|l| l == name))
                     .ok_or(Bail)?;
-                self.emit_exit_cleanup(idx, false)?;
-                let j = self.emit(Op::Jump(0));
+                let j = self.emit_exit_jump(idx, false)?;
                 self.loops[idx].breaks.push(j);
                 Ok(())
             }
@@ -3688,15 +4750,17 @@ impl Compiler {
                 let idx = self
                     .loops
                     .iter()
-                    .rposition(|c| !c.is_switch && c.labels.iter().any(|l| l == name))
+                    .rposition(|c| {
+                        !c.is_switch && !c.is_label_block && c.labels.iter().any(|l| l == name)
+                    })
                     .ok_or(Bail)?;
-                self.emit_exit_cleanup(idx, true)?;
-                let j = self.emit(Op::Jump(0));
+                let j = self.emit_exit_jump(idx, true)?;
                 self.loops[idx].continues.push(j);
                 Ok(())
             }
             // A label naming a loop or switch attaches to that context; stacked labels
-            // (`a: b: for`) accumulate through the recursion. A label on any other statement bails.
+            // (`a: b: for`) accumulate through the recursion. Any other labelled statement gets
+            // a break-only context, matching ECMA-262 §14.13.4 LabelledEvaluation.
             Stmt::Labeled { label, body } => match &**body {
                 Stmt::While { .. }
                 | Stmt::DoWhile { .. }
@@ -3706,184 +4770,338 @@ impl Compiler {
                     self.pending_labels.push(label.clone());
                     self.stmt(body)
                 }
-                _ => Err(Bail),
-            },
-            // `switch`: the discriminant lands in a hidden slot; case tests run in source order
-            // (exactly the oracle's two-phase evaluation), then bodies are laid out contiguously
-            // so fall-through is just falling through. Any lexical/class/function declaration
-            // directly in a case body bails — the oracle gives all cases one shared block scope
-            // whose TDZ interleavings slots don't model.
-            Stmt::Switch { disc, cases } => {
-                for case in cases {
-                    for s in &case.body {
-                        match s {
-                            Stmt::VarDecl {
-                                kind:
-                                    DeclKind::Let
-                                    | DeclKind::Const
-                                    | DeclKind::Using
-                                    | DeclKind::AwaitUsing,
-                                ..
-                            }
-                            | Stmt::ClassDecl(_)
-                            | Stmt::FuncDecl(_) => return Err(Bail),
-                            _ => {}
-                        }
+                _ => {
+                    let mut labels = std::mem::take(&mut self.pending_labels);
+                    labels.push(label.clone());
+                    self.loops.push(LoopCtx {
+                        labels,
+                        entry_try_depth: self.try_depth,
+                        is_label_block: true,
+                        ..LoopCtx::default()
+                    });
+                    let result = self.stmt(body);
+                    let ctx = self.loops.pop().expect("just pushed labelled context");
+                    result?;
+                    for jump in ctx.breaks {
+                        self.patch(jump);
                     }
+                    Ok(())
                 }
+            },
+            // `switch`: evaluate the discriminant in the outer environment first, then perform
+            // one BlockDeclarationInstantiation shared by every case before any case test
+            // (ECMA-262 §14.12.4). Case tests run in source order and bodies remain contiguous,
+            // so fall-through is just falling through.
+            Stmt::Switch { disc, cases } => {
                 self.expr(disc)?;
                 let tmp = self.fresh_slot("%switch%");
                 self.emit(Op::StoreLocal(tmp));
-                // Phase 1: the test chain. Each match jumps to its (not yet emitted) body.
-                let mut body_jumps: Vec<(usize, usize)> = Vec::new();
-                for (ci, case) in cases.iter().enumerate() {
-                    if let Some(test) = &case.test {
-                        self.emit(Op::LoadLocal(tmp));
-                        self.expr(test)?;
-                        self.emit(Op::StrictEq);
-                        let jf = self.emit(Op::JumpIfFalse(0));
-                        let jb = self.emit(Op::Jump(0));
-                        body_jumps.push((ci, jb));
-                        self.patch(jf);
-                    }
-                }
-                let jdefault = self.emit(Op::Jump(0));
-                self.loops.push(LoopCtx {
-                    labels: std::mem::take(&mut self.pending_labels),
-                    is_switch: true,
-                    ..LoopCtx::default()
-                });
-                // Phase 2: bodies, contiguous and in source order.
-                let mut body_starts = vec![0usize; cases.len()];
-                let mut r = Ok(());
-                'bodies: for (ci, case) in cases.iter().enumerate() {
-                    body_starts[ci] = self.ops.len();
-                    for s in &case.body {
-                        r = self.stmt(s);
-                        if r.is_err() {
-                            break 'bodies;
+                self.push_compile_scope();
+                let mut bindings = Vec::new();
+                for case in cases {
+                    for binding in self.runtime_block_bindings(&case.body) {
+                        if !bindings.iter().any(|(name, _)| name == &binding.0) {
+                            bindings.push(binding);
                         }
                     }
                 }
-                let ctx = self.loops.pop().unwrap();
-                r?;
-                for (ci, at) in body_jumps {
-                    match &mut self.ops[at] {
-                        Op::Jump(t) => *t = body_starts[ci] as u32,
-                        _ => unreachable!(),
-                    }
-                }
-                match cases.iter().position(|c| c.test.is_none()) {
-                    Some(di) => match &mut self.ops[jdefault] {
-                        Op::Jump(t) => *t = body_starts[di] as u32,
-                        _ => unreachable!(),
-                    },
-                    None => self.patch(jdefault),
-                }
-                for b in ctx.breaks {
-                    self.patch(b);
-                }
-                Ok(())
+                let result = if bindings.is_empty() {
+                    self.switch_body(tmp, cases)
+                } else {
+                    let scope = self.push_runtime_lexical_scope(bindings);
+                    self.environment_scope(|compiler| compiler.switch_body(tmp, cases), scope)
+                };
+                self.pop_compile_scope();
+                result
             }
-            // `try { ... } catch (e?) { ... }` — no `finally` (bails), catch param an ident or none.
-            // On a throw in the try region the VM unwinds to `catch_pc` with the exception pushed.
+            // `try` completion handling follows ECMA-262 §14.15.3. Catch consumes only a throw.
+            // A coroutine finally handler intercepts throw/return, records that completion in
+            // hidden slots, runs the finalizer once (which may suspend), then re-issues the saved
+            // completion unless the finalizer itself completed abruptly.
             Stmt::Try {
                 block,
                 handler,
                 finalizer,
             } => {
-                if finalizer.is_some() {
-                    log_bail("stmt", "try/finally");
-                    return Err(Bail);
+                if let Some(finalizer) = finalizer {
+                    if !self.is_coroutine {
+                        log_bail("stmt", "try/finally outside supported coroutine subset");
+                        return Err(Bail);
+                    }
+
+                    let completion_slot = self.fresh_slot("%finally-value%");
+                    let completion_kind = self.fresh_slot("%finally-kind%");
+                    let completion_target_depth = self.fresh_slot("%finally-target-depth%");
+                    let push_finally = self.emit(Op::PushFinally(0, 0, 0, 0, 0));
+                    self.try_depth += 1;
+                    self.finally_depths.push(self.try_depth);
+
+                    if let Some((param, catch_body)) = handler {
+                        let push_catch = self.emit(Op::PushHandler(0));
+                        self.try_depth += 1;
+                        self.push_compile_scope();
+                        let try_result = self.block_body(block);
+                        self.pop_compile_scope();
+                        try_result?;
+                        self.emit(Op::PopHandler);
+                        self.try_depth -= 1;
+                        let after_catch = self.emit(Op::Jump(0));
+                        let catch_pc = self.ops.len() as u32;
+                        match &mut self.ops[push_catch] {
+                            Op::PushHandler(target) => *target = catch_pc,
+                            _ => unreachable!(),
+                        }
+                        self.catch_clause(param.as_ref(), catch_body)?;
+                        self.patch(after_catch);
+                    } else {
+                        self.push_compile_scope();
+                        let try_result = self.block_body(block);
+                        self.pop_compile_scope();
+                        try_result?;
+                    }
+
+                    // Normal completion: remove the handler and tag the saved completion as
+                    // normal. Throw/return pads are entered only after drive_vm already popped it.
+                    self.emit(Op::PopHandler);
+                    self.try_depth -= 1;
+                    self.finally_depths.pop();
+                    let normal = self.const_idx(Value::Num(0.0));
+                    self.emit(Op::Const(normal));
+                    self.emit(Op::StoreLocal(completion_kind));
+                    let normal_to_finally = self.emit(Op::Jump(0));
+
+                    let throw_pc = self.ops.len() as u32;
+                    self.emit(Op::StoreLocal(completion_slot));
+                    let throwing = self.const_idx(Value::Num(1.0));
+                    self.emit(Op::Const(throwing));
+                    self.emit(Op::StoreLocal(completion_kind));
+                    let throw_to_finally = self.emit(Op::Jump(0));
+
+                    let return_pc = self.ops.len() as u32;
+                    self.emit(Op::StoreLocal(completion_slot));
+                    let returning = self.const_idx(Value::Num(2.0));
+                    self.emit(Op::Const(returning));
+                    self.emit(Op::StoreLocal(completion_kind));
+                    let return_to_finally = self.emit(Op::Jump(0));
+
+                    let bare_return_pc = self.ops.len() as u32;
+                    let bare_returning = self.const_idx(Value::Num(5.0));
+                    self.emit(Op::Const(bare_returning));
+                    self.emit(Op::StoreLocal(completion_kind));
+                    let bare_return_to_finally = self.emit(Op::Jump(0));
+
+                    // AsyncGeneratorUnwrapYieldResumption and async-generator ReturnStatement
+                    // have already awaited their values before creating the Return Completion.
+                    // Keep those resumptions distinct so finalization cannot await them again.
+                    let resume_return_pc = self.ops.len() as u32;
+                    self.emit(Op::StoreLocal(completion_slot));
+                    let resume_returning = self.const_idx(Value::Num(3.0));
+                    self.emit(Op::Const(resume_returning));
+                    self.emit(Op::StoreLocal(completion_kind));
+                    let resume_return_to_finally = self.emit(Op::Jump(0));
+
+                    // A break/continue pad receives its patched bytecode destination followed by
+                    // the handler depth at that destination. Both are exact u32 integers in the
+                    // Number representation and survive arbitrary finalizer suspension.
+                    let jump_pc = self.ops.len() as u32;
+                    self.emit(Op::StoreLocal(completion_target_depth));
+                    self.emit(Op::StoreLocal(completion_slot));
+                    let jumping = self.const_idx(Value::Num(4.0));
+                    self.emit(Op::Const(jumping));
+                    self.emit(Op::StoreLocal(completion_kind));
+
+                    match &mut self.ops[push_finally] {
+                        Op::PushFinally(
+                            throw_target,
+                            return_target,
+                            bare_return_target,
+                            resume_return_target,
+                            jump_target,
+                        ) => {
+                            *throw_target = throw_pc;
+                            *return_target = return_pc;
+                            *bare_return_target = bare_return_pc;
+                            *resume_return_target = resume_return_pc;
+                            *jump_target = jump_pc;
+                        }
+                        _ => unreachable!(),
+                    }
+                    self.patch(normal_to_finally);
+                    self.patch(throw_to_finally);
+                    self.patch(return_to_finally);
+                    self.patch(bare_return_to_finally);
+                    self.patch(resume_return_to_finally);
+
+                    self.push_compile_scope();
+                    let finally_result = self.block_body(finalizer);
+                    self.pop_compile_scope();
+                    finally_result?;
+
+                    self.emit(Op::LoadLocal(completion_kind));
+                    self.emit(Op::Const(throwing));
+                    self.emit(Op::StrictEq);
+                    let not_throw = self.emit(Op::JumpIfFalse(0));
+                    self.emit(Op::LoadLocal(completion_slot));
+                    self.emit(Op::Throw);
+                    self.patch(not_throw);
+                    self.emit(Op::LoadLocal(completion_kind));
+                    self.emit(Op::Const(returning));
+                    self.emit(Op::StrictEq);
+                    let not_return = self.emit(Op::JumpIfFalse(0));
+                    self.emit(Op::LoadLocal(completion_slot));
+                    self.emit(Op::Return);
+                    self.patch(not_return);
+                    self.emit(Op::LoadLocal(completion_kind));
+                    self.emit(Op::Const(bare_returning));
+                    self.emit(Op::StrictEq);
+                    let not_bare_return = self.emit(Op::JumpIfFalse(0));
+                    self.emit(Op::ReturnBare);
+                    self.patch(not_bare_return);
+                    self.emit(Op::LoadLocal(completion_kind));
+                    self.emit(Op::Const(resume_returning));
+                    self.emit(Op::StrictEq);
+                    let not_resume_return = self.emit(Op::JumpIfFalse(0));
+                    self.emit(Op::LoadLocal(completion_slot));
+                    self.emit(Op::ResumeReturn);
+                    self.patch(not_resume_return);
+                    self.emit(Op::LoadLocal(completion_kind));
+                    self.emit(Op::Const(jumping));
+                    self.emit(Op::StrictEq);
+                    let not_jump = self.emit(Op::JumpIfFalse(0));
+                    self.emit(Op::LoadLocal(completion_slot));
+                    self.emit(Op::LoadLocal(completion_target_depth));
+                    self.emit(Op::ResumeJump);
+                    self.patch(not_jump);
+                    return Ok(());
                 }
+
                 let Some((param, catch_body)) = handler else {
-                    return Err(Bail); // `try`/`finally` with no `catch`
+                    return Err(Bail);
                 };
-                if matches!(param, Some(p) if !matches!(p, Pattern::Ident(_))) {
-                    return Err(Bail); // destructuring catch param
-                }
                 let push = self.emit(Op::PushHandler(0));
                 self.try_depth += 1;
-                self.scopes.push(Vec::new());
-                let tr = self.block_body(block);
-                self.scopes.pop();
-                tr?;
+                self.push_compile_scope();
+                let try_result = self.block_body(block);
+                self.pop_compile_scope();
+                try_result?;
                 self.emit(Op::PopHandler);
                 self.try_depth -= 1;
-                let jmp_after = self.emit(Op::Jump(0));
-                // Catch entry: the exception is on the stack.
+                let after_catch = self.emit(Op::Jump(0));
                 let catch_pc = self.ops.len() as u32;
                 match &mut self.ops[push] {
-                    Op::PushHandler(t) => *t = catch_pc,
+                    Op::PushHandler(target) => *target = catch_pc,
                     _ => unreachable!(),
                 }
-                self.scopes.push(Vec::new());
-                match param {
-                    Some(Pattern::Ident(name)) => {
-                        let slot = self.fresh_slot(name);
-                        self.scope_bind(name, slot, false);
-                        self.emit(Op::StoreLocal(slot));
-                    }
-                    _ => {
-                        self.emit(Op::Pop); // no binding (or `catch {}`): discard the exception
-                    }
-                }
-                let cr = self.block_body(catch_body);
-                self.scopes.pop();
-                cr?;
-                self.patch(jmp_after);
+                self.catch_clause(param.as_ref(), catch_body)?;
+                self.patch(after_catch);
                 Ok(())
             }
-            // `for (x of it)`: the iterator and its `next` live in hidden slots; each step is
-            // IterStepL + JumpIfFalse (existing branch machinery in both tiers); the body runs
-            // under a per-iteration handler whose pad closes the iterator in throw mode and
-            // rethrows. Exhaustion closes nothing (spec); break/return close via
-            // `emit_exit_cleanup` / the Return arm. for-in, `for await`, destructuring bindings
-            // and captured loop variables stay on the tree-walker.
+            // For-in/of iteration keeps its iterator/enumeration record in hidden slots. Sync
+            // and async bodies share completion-aware handlers; `for await` adds explicit Await
+            // points for stepping and AsyncIteratorClose without reserving a native thread.
             Stmt::ForInOf {
                 decl,
                 left,
                 right,
-                of: true,
-                is_await: false,
+                of,
+                is_await,
                 body,
             } => {
                 let labels = std::mem::take(&mut self.pending_labels);
-                // The loop variable: a declaration binds a fresh (uncaptured — else the
-                // per-iteration env freshness matters and we bail) slot scoped to the loop; a
-                // bare identifier assigns an existing binding or a free name. Spec order for a
-                // lexical declaration: the fresh binding exists — in TDZ — while the iterable
-                // expression evaluates (`for (const x of [x])` throws a ReferenceError), so the
-                // scope and Tdz emit BEFORE `right`.
-                self.scopes.push(Vec::new());
+                if *is_await && (!*of || !self.is_coroutine) {
+                    return Err(Bail);
+                }
+                // A lexical head is in TDZ while the iterable expression evaluates. Captured
+                // leaves use a real head Environment Record and a fresh sibling record per
+                // iteration; uncaptured leaves retain the allocation-free slot representation.
+                self.push_compile_scope();
+                let mut runtime_bindings = Vec::new();
+                if let Some(
+                    kind @ (DeclKind::Let
+                    | DeclKind::Const
+                    | DeclKind::Using
+                    | DeclKind::AwaitUsing),
+                ) = decl
+                {
+                    let mut names = std::collections::HashSet::new();
+                    pat_idents(left, &mut names);
+                    let mut names: Vec<_> = names.into_iter().collect();
+                    names.sort();
+                    runtime_bindings.extend(
+                        names
+                            .into_iter()
+                            .filter(|name| self.runtime_lexicals.contains(name))
+                            .map(|name| (name, !matches!(kind, DeclKind::Let))),
+                    );
+                }
+                let runtime_scope = (!runtime_bindings.is_empty())
+                    .then(|| self.push_runtime_lexical_scope(runtime_bindings));
                 enum Bind {
                     Slot(u16),
                     Cap(u32),
                     Name(u32),
+                    Lex(u32),
+                    Using {
+                        slot: u16,
+                        is_async: bool,
+                    },
+                    UsingLex {
+                        name: u32,
+                        is_async: bool,
+                    },
+                    AssignmentMember,
                     /// Destructuring lexical head: bound by `destructure_store` INSIDE the
                     /// body's handler region (a binding throw must IteratorClose in throw mode,
                     /// which is exactly what the body's abort pad does).
                     Pattern(DeclKind),
                 }
                 let bind = match (left, decl) {
-                    (_, Some(DeclKind::Using | DeclKind::AwaitUsing)) => {
-                        self.scopes.pop();
-                        return Err(Bail);
-                    }
-                    (Pattern::Ident(name), Some(kind)) => {
-                        // An env-homed name blocks a head slot — except a homed block `let`
-                        // (`Compiler::homed_lets`), which a fresh slot shadows correctly.
-                        if self.env_names.contains_key(name) && !self.homed_lets.contains(name) {
-                            self.scopes.pop();
+                    (
+                        Pattern::Ident(name),
+                        Some(kind @ (DeclKind::Using | DeclKind::AwaitUsing)),
+                    ) if *of => {
+                        if self.current_lexical_env_has(name) {
+                            Bind::UsingLex {
+                                name: self.name_idx(name),
+                                is_async: matches!(kind, DeclKind::AwaitUsing),
+                            }
+                        } else if self.env_names.contains_key(name) {
+                            self.pop_compile_scope();
                             return Err(Bail);
-                        }
-                        let slot = self.fresh_slot(name);
-                        self.scope_bind(name, slot, matches!(kind, DeclKind::Const));
-                        if matches!(kind, DeclKind::Let | DeclKind::Const) {
+                        } else {
+                            let slot = self.fresh_slot(name);
+                            self.scope_bind(name, slot, true);
                             self.tdz_slots.insert(slot);
                             self.emit(Op::Tdz(slot));
+                            Bind::Using {
+                                slot,
+                                is_async: matches!(kind, DeclKind::AwaitUsing),
+                            }
                         }
-                        Bind::Slot(slot)
+                    }
+                    (_, Some(DeclKind::Using | DeclKind::AwaitUsing)) => {
+                        self.pop_compile_scope();
+                        return Err(Bail);
+                    }
+                    (Pattern::Ident(name), Some(kind @ (DeclKind::Let | DeclKind::Const))) => {
+                        if self.current_lexical_env_has(name) {
+                            Bind::Lex(self.name_idx(name))
+                        } else {
+                            // An env-homed name blocks a head slot — except a homed block `let`
+                            // (`Compiler::homed_lets`), which a fresh slot shadows correctly.
+                            if self.env_names.contains_key(name) && !self.homed_lets.contains(name)
+                            {
+                                self.pop_compile_scope();
+                                return Err(Bail);
+                            }
+                            let slot = self.fresh_slot(name);
+                            self.scope_bind(name, slot, matches!(kind, DeclKind::Const));
+                            if matches!(kind, DeclKind::Let | DeclKind::Const) {
+                                self.tdz_slots.insert(slot);
+                                self.emit(Op::Tdz(slot));
+                            }
+                            Bind::Slot(slot)
+                        }
                     }
                     (pat, Some(kind @ (DeclKind::Let | DeclKind::Const))) => {
                         // A destructuring lexical head: fresh uncaptured slots for every leaf,
@@ -3899,90 +5117,230 @@ impl Compiler {
                                 .declare_lexical_pattern(pat, matches!(kind, DeclKind::Const))
                                 .is_err()
                         {
-                            self.scopes.pop();
+                            self.pop_compile_scope();
                             return Err(Bail);
                         }
                         Bind::Pattern(*kind)
                     }
-                    (_, Some(DeclKind::Var)) => {
-                        self.scopes.pop();
-                        return Err(Bail);
+                    (Pattern::Ident(name), Some(DeclKind::Var)) => match self.home(name) {
+                        // ECMA-262 §14.7.5.7 var-binding writes the already-instantiated
+                        // VariableEnvironment binding; it does not create a per-iteration slot.
+                        Some(Home::Slot(slot, false)) => Bind::Slot(slot),
+                        Some(Home::Env(false)) => Bind::Cap(self.name_idx(name)),
+                        None if !self.with_scope_floors.is_empty() => {
+                            Bind::Name(self.name_idx(name))
+                        }
+                        _ => {
+                            self.pop_compile_scope();
+                            return Err(Bail);
+                        }
+                    },
+                    (pat, Some(DeclKind::Var)) => {
+                        // Hoisting created every leaf home at function entry. Pattern binding is
+                        // inside the loop-body handler so an abrupt iterator/destructuring step
+                        // follows the same IteratorClose path as lexical patterns.
+                        let mut leaf_names = std::collections::HashSet::new();
+                        pat_idents(pat, &mut leaf_names);
+                        if leaf_names.iter().any(|name| self.home(name).is_none()) {
+                            self.pop_compile_scope();
+                            return Err(Bail);
+                        }
+                        Bind::Pattern(DeclKind::Var)
                     }
                     (Pattern::Ident(name), None) => match self.home(name) {
                         Some(Home::Slot(slot, is_const)) => {
                             if is_const {
-                                self.scopes.pop();
+                                self.pop_compile_scope();
                                 return Err(Bail);
                             }
                             Bind::Slot(slot)
                         }
                         Some(Home::Env(is_const)) => {
                             if is_const {
-                                self.scopes.pop();
+                                self.pop_compile_scope();
                                 return Err(Bail);
                             }
                             Bind::Cap(self.name_idx(name))
                         }
                         None => Bind::Name(self.name_idx(name)),
                     },
-                    // Destructuring *assignment* head (`for ([a, b] of xs)`) — oracle.
-                    (_, None) => {
-                        self.scopes.pop();
-                        return Err(Bail);
-                    }
+                    (Pattern::Member(_), None) => Bind::AssignmentMember,
+                    // Destructuring *assignment* heads are represented by the original covered
+                    // Array/ObjectLiteral in Pattern::Member. They lower through AssignTarget
+                    // below, retaining exact Reference-before-read and inner IteratorClose order.
+                    (_, None) => Bind::AssignmentMember,
                 };
-                let er = self.expr(right);
+                let er = if let Some(scope) = runtime_scope {
+                    self.environment_scope(|compiler| compiler.expr(right), scope)
+                } else {
+                    self.expr(right)
+                };
                 if er.is_err() {
-                    self.scopes.pop();
+                    self.pop_compile_scope();
                     return er;
+                }
+                if !of {
+                    // ForIn/OfHeadEvaluation(enumerate): snapshot candidate keys once, then check
+                    // whether each object property still exists immediately before visiting it.
+                    // Null/undefined and non-string primitives naturally produce no candidates.
+                    let source_s = self.fresh_slot("%for-in-source%");
+                    let keys_s = self.fresh_slot("%for-in-keys%");
+                    let index_s = self.fresh_slot("%for-in-index%");
+                    self.emit(Op::Dup);
+                    self.emit(Op::StoreLocal(source_s));
+                    self.emit(Op::ForInKeys);
+                    self.emit(Op::StoreLocal(keys_s));
+                    let zero = self.const_idx(Value::Num(0.0));
+                    self.emit(Op::Const(zero));
+                    self.emit(Op::StoreLocal(index_s));
+                    self.loops.push(LoopCtx {
+                        labels,
+                        entry_try_depth: self.try_depth,
+                        ..LoopCtx::default()
+                    });
+                    let loop_head = self.ops.len();
+                    self.emit(Op::ForInStepL(keys_s, index_s, source_s));
+                    let jexit = self.emit(Op::JumpIfFalse(0));
+                    if let Some(scope) = runtime_scope {
+                        self.emit(Op::PushLex(scope));
+                    }
+                    let compile_iteration = |compiler: &mut Compiler| match bind {
+                        Bind::Slot(slot) => {
+                            compiler.emit(Op::StoreLocal(slot));
+                            compiler.stmt(body)
+                        }
+                        Bind::Cap(name) => {
+                            compiler.emit(Op::StoreCap(name));
+                            compiler.stmt(body)
+                        }
+                        Bind::Name(name) => {
+                            compiler.emit_store_name(name);
+                            compiler.stmt(body)
+                        }
+                        Bind::Lex(name) => {
+                            compiler.emit(Op::InitLex(name));
+                            compiler.stmt(body)
+                        }
+                        Bind::Using { .. } | Bind::UsingLex { .. } => Err(Bail),
+                        Bind::AssignmentMember => compiler
+                            .for_head_member_store(left)
+                            .and_then(|()| compiler.stmt(body)),
+                        Bind::Pattern(kind) => compiler
+                            .destructure_store(left, kind)
+                            .and_then(|()| compiler.stmt(body)),
+                    };
+                    let result = if let Some(scope) = runtime_scope {
+                        self.environment_scope(compile_iteration, scope)
+                    } else {
+                        compile_iteration(self)
+                    };
+                    let ctx = self.loops.pop().expect("just pushed");
+                    self.pop_compile_scope();
+                    result?;
+                    for jump in ctx.continues {
+                        self.patch_to(jump, loop_head as u32);
+                    }
+                    self.emit(Op::Jump(loop_head as u32));
+                    self.patch(jexit);
+                    self.emit(Op::Pop); // exhausted-step placeholder
+                    for jump in ctx.breaks {
+                        self.patch(jump);
+                    }
+                    return Ok(());
                 }
                 let iter_s = self.fresh_slot("%iter%");
                 let next_s = self.fresh_slot("%next%");
-                self.emit(Op::GetIter);
-                self.emit(Op::StoreLocal(next_s));
-                self.emit(Op::StoreLocal(iter_s));
+                let async_from_sync_s = if *is_await {
+                    let slot = self.fresh_slot("%async-from-sync%");
+                    self.emit(Op::GetAsyncIter);
+                    self.emit(Op::StoreLocal(slot));
+                    self.emit(Op::StoreLocal(next_s));
+                    self.emit(Op::StoreLocal(iter_s));
+                    Some(slot)
+                } else {
+                    self.emit(Op::GetIter);
+                    self.emit(Op::StoreLocal(next_s));
+                    self.emit(Op::StoreLocal(iter_s));
+                    None
+                };
                 self.loops.push(LoopCtx {
                     labels,
                     entry_try_depth: self.try_depth,
                     foreach_iter: Some(iter_s),
+                    foreach_async_from_sync: async_from_sync_s,
                     ..Default::default()
                 });
                 let loop_head = self.ops.len();
-                self.emit(Op::IterStepL(iter_s, next_s));
-                let jexit = self.emit(Op::JumpIfFalse(0));
-                match bind {
-                    Bind::Slot(slot) => {
-                        self.emit(Op::StoreLocal(slot));
-                    }
-                    Bind::Cap(n) => {
-                        self.emit(Op::StoreCap(n));
-                    }
-                    Bind::Name(n) => {
-                        self.emit_store_name(n);
-                    }
-                    Bind::Pattern(_) => {} // bound below, inside the handler region
+                if let Some(from_sync_s) = async_from_sync_s {
+                    let done_s = self.fresh_slot("%async-step-done%");
+                    self.emit(Op::AsyncIterStepL(iter_s, next_s, from_sync_s, done_s));
+                    self.emit(Op::AsyncIterResumeL(from_sync_s, done_s));
+                } else {
+                    self.emit(Op::IterStepL(iter_s, next_s));
                 }
-                let push = self.emit(Op::PushHandler(0));
+                let jexit = self.emit(Op::JumpIfFalse(0));
+                // ForIn/OfBodyEvaluation includes every form of BindingInitialization and
+                // assignment in the status whose abrupt completion closes the iterator. Push the
+                // body handler before even the identifier stores: a strict unresolved assignment
+                // or environment operation can be abrupt just like a member/pattern PutValue.
+                let push = if self.is_coroutine {
+                    self.emit(Op::PushIterator(0, 0, 0, 0))
+                } else {
+                    self.emit(Op::PushHandler(0))
+                };
                 self.try_depth += 1;
                 self.loops.last_mut().expect("just pushed").body_try_depth = self.try_depth;
-                let r = match bind {
-                    Bind::Pattern(kind) => self
+                if let Some(scope) = runtime_scope {
+                    self.emit(Op::PushLex(scope));
+                }
+                let compile_iteration = |compiler: &mut Compiler| match bind {
+                    Bind::Slot(slot) => {
+                        compiler.emit(Op::StoreLocal(slot));
+                        compiler.stmt(body)
+                    }
+                    Bind::Cap(name) => {
+                        compiler.emit(Op::StoreCap(name));
+                        compiler.stmt(body)
+                    }
+                    Bind::Name(name) => {
+                        compiler.emit_store_name(name);
+                        compiler.stmt(body)
+                    }
+                    Bind::Lex(name) => {
+                        compiler.emit(Op::InitLex(name));
+                        compiler.stmt(body)
+                    }
+                    Bind::Using { slot, is_async } => compiler.disposal_scope(|compiler| {
+                        compiler.emit(Op::AddDisposable(is_async));
+                        compiler.emit(Op::StoreLocal(slot));
+                        compiler.stmt(body)
+                    }),
+                    Bind::UsingLex { name, is_async } => compiler.disposal_scope(|compiler| {
+                        compiler.emit(Op::AddDisposable(is_async));
+                        compiler.emit(Op::InitLex(name));
+                        compiler.stmt(body)
+                    }),
+                    Bind::Pattern(kind) => compiler
                         .destructure_store(left, kind)
-                        .and_then(|()| self.stmt(body)),
-                    _ => self.stmt(body),
+                        .and_then(|()| compiler.stmt(body)),
+                    Bind::AssignmentMember => compiler
+                        .for_head_member_store(left)
+                        .and_then(|()| compiler.stmt(body)),
+                };
+                let r = if let Some(scope) = runtime_scope {
+                    self.environment_scope(compile_iteration, scope)
+                } else {
+                    compile_iteration(self)
                 };
                 let ctx = self.loops.pop().expect("just pushed");
-                self.scopes.pop();
+                self.pop_compile_scope();
                 r?;
                 self.emit(Op::PopHandler);
                 self.try_depth -= 1;
                 // continues re-enter at the step (the loop head re-pushes the body handler —
                 // their cleanup already popped it).
                 for j in ctx.continues {
-                    match &mut self.ops[j] {
-                        Op::Jump(t) => *t = loop_head as u32,
-                        _ => unreachable!("continue is a jump"),
-                    }
+                    self.patch_to(j, loop_head as u32);
                 }
                 self.emit(Op::Jump(0));
                 let jback = self.ops.len() - 1;
@@ -3990,13 +5348,58 @@ impl Compiler {
                     Op::Jump(t) => *t = loop_head as u32,
                     _ => unreachable!(),
                 }
-                // The body's catch pad: swallow-close + rethrow (always abrupt).
+                // The body's completion pads implement ForIn/OfBodyEvaluation step 13. Throw
+                // closes in throw mode (preserving the original error); every return closes in
+                // normal mode, where a close error replaces the saved completion.
                 let abort_pc = self.ops.len() as u32;
-                match &mut self.ops[push] {
-                    Op::PushHandler(t) => *t = abort_pc,
-                    _ => unreachable!(),
+                if let Some(from_sync_s) = async_from_sync_s {
+                    self.emit(Op::AsyncIterCloseL(iter_s, from_sync_s, true));
+                    self.emit(Op::Throw);
+                } else {
+                    self.emit(Op::IterAbortL(iter_s));
                 }
-                self.emit(Op::IterAbortL(iter_s));
+                if self.is_coroutine {
+                    let return_pc = self.ops.len() as u32;
+                    if let Some(from_sync_s) = async_from_sync_s {
+                        self.emit(Op::AsyncIterCloseL(iter_s, from_sync_s, false));
+                    } else {
+                        self.emit(Op::IterCloseL(iter_s));
+                    }
+                    self.emit(Op::Return);
+                    let bare_return_pc = self.ops.len() as u32;
+                    if let Some(from_sync_s) = async_from_sync_s {
+                        self.emit(Op::AsyncIterCloseL(iter_s, from_sync_s, false));
+                    } else {
+                        self.emit(Op::IterCloseL(iter_s));
+                    }
+                    self.emit(Op::ReturnBare);
+                    let resume_return_pc = self.ops.len() as u32;
+                    if let Some(from_sync_s) = async_from_sync_s {
+                        self.emit(Op::AsyncIterCloseL(iter_s, from_sync_s, false));
+                    } else {
+                        self.emit(Op::IterCloseL(iter_s));
+                    }
+                    self.emit(Op::ResumeReturn);
+                    match &mut self.ops[push] {
+                        Op::PushIterator(
+                            throw_target,
+                            return_target,
+                            bare_return_target,
+                            resume_return_target,
+                        ) => {
+                            *throw_target = abort_pc;
+                            *return_target = return_pc;
+                            *bare_return_target = bare_return_pc;
+                            *resume_return_target = resume_return_pc;
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    match &mut self.ops[push] {
+                        Op::PushHandler(throw_target) => *throw_target = abort_pc,
+                        _ => unreachable!(),
+                    }
+                }
                 // Exhaustion lands here (the step's bool was false): drop the undefined
                 // placeholder the step pushed; no close on a completed iterator.
                 self.patch(jexit);
@@ -4004,13 +5407,11 @@ impl Compiler {
                 // Breaks jump here too — their cleanup (pop handler + close) ran at the site.
                 let after = self.ops.len() as u32;
                 for j in ctx.breaks {
-                    match &mut self.ops[j] {
-                        Op::Jump(t) => *t = after,
-                        _ => unreachable!("break is a jump"),
-                    }
+                    self.patch_to(j, after);
                 }
                 Ok(())
             }
+            Stmt::With { obj, body } if self.is_coroutine => self.with_scope(obj, body),
             other => {
                 log_bail("stmt", &format!("{:.60}", format!("{other:?}")));
                 Err(Bail)
@@ -4018,49 +5419,874 @@ impl Compiler {
         }
     }
 
+    /// Store the iterator/enumeration value on top of the stack into a member-expression loop
+    /// head. ForIn/OfBodyEvaluation obtains the value first, then evaluates the LHS Reference on
+    /// every iteration; the hidden slot keeps that ordering while evaluating base and key once.
+    fn for_head_member_store(&mut self, target: &Pattern) -> CResult {
+        let Pattern::Member(target) = target else {
+            return Err(Bail);
+        };
+        let value_slot = self.fresh_slot("%for-head-value%");
+        self.emit(Op::StoreLocal(value_slot));
+        match &**target {
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                self.expr(obj)?;
+                self.emit(Op::LoadLocal(value_slot));
+                let name = self.name_idx(prop);
+                let cache = self.new_cache(name);
+                self.emit(Op::SetPropDrop(name, cache));
+                Ok(())
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) => {
+                self.expr(obj)?;
+                self.expr(index)?;
+                self.emit(Op::LoadLocal(value_slot));
+                self.emit(Op::SetElemDrop);
+                Ok(())
+            }
+            target @ (Expr::Array(_) | Expr::Object(_)) => {
+                // A direct yield/await in a default, computed key, or target expression must be
+                // represented as VM suspension points rather than entered through the oracle.
+                let suspends = crate::eval::expr_contains(target, |expr| {
+                    matches!(expr, Expr::Yield { .. } | Expr::Await(_))
+                });
+                if self.is_coroutine && suspends {
+                    self.emit(Op::LoadLocal(value_slot));
+                    return self.assignment_pattern(target);
+                }
+                let locals = self.projected_locals();
+                let index = self.assignment_targets.len() as u32;
+                self.assignment_targets.push(AssignmentTargetPlan {
+                    target: target.clone(),
+                    locals,
+                    strict: self.strict,
+                });
+                self.emit(Op::LoadLocal(value_slot));
+                self.emit(Op::AssignTarget(index));
+                Ok(())
+            }
+            _ => Err(Bail),
+        }
+    }
+
+    fn projected_locals(&self) -> Vec<AssignmentLocal> {
+        let mut seen = std::collections::HashSet::new();
+        let mut locals = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for (name, slot, is_const) in scope.iter().rev() {
+                if !name.starts_with('%') && seen.insert(name.clone()) {
+                    locals.push(AssignmentLocal {
+                        name: Rc::from(name.as_str()),
+                        slot: *slot,
+                        mutable: !*is_const,
+                    });
+                }
+            }
+        }
+        locals
+    }
+
+    fn retain_eval_expr(&mut self, expr: &Expr) {
+        self.retain_named_eval_expr(expr, None);
+    }
+
+    fn retain_named_eval_expr(&mut self, expr: &Expr, name: Option<&str>) {
+        // The projected evaluator resolves `this` through an Environment Record. Keeping one in
+        // every bridged frame is rare-path overhead only and also covers super-property helpers.
+        self.env_this = true;
+        let plan = self.eval_exprs.len() as u32;
+        self.eval_exprs.push(EvalExprPlan {
+            expr: expr.clone(),
+            locals: self.projected_locals(),
+            strict: self.strict,
+            name: name.map(str::to_string),
+        });
+        self.emit(Op::EvalExpr(plan));
+    }
+
+    fn prepare_assignment_reference(
+        &mut self,
+        target: &Expr,
+    ) -> Result<PreparedAssignmentRef, Bail> {
+        match target {
+            Expr::Paren(inner) => self.prepare_assignment_reference(inner),
+            Expr::Ident(name) => {
+                let name_index = self.name_idx(name);
+                Ok(match self.home(name) {
+                    Some(Home::Slot(slot, is_const)) => PreparedAssignmentRef::Local {
+                        slot,
+                        is_const,
+                        name: name_index,
+                    },
+                    Some(Home::Env(is_const)) => PreparedAssignmentRef::Captured {
+                        name: name_index,
+                        is_const,
+                    },
+                    None if self.name_reference_can_change(name) => {
+                        let reference = self.fresh_reference()?;
+                        self.emit(Op::ResolveNameRef(name_index, reference));
+                        PreparedAssignmentRef::Reference(reference)
+                    }
+                    None => PreparedAssignmentRef::Name(name_index),
+                })
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                self.expr(obj)?;
+                self.emit(Op::RequireObject);
+                let base = self.fresh_slot("%assignment-base%");
+                self.emit(Op::StoreLocal(base));
+                let name = self.name_idx(prop);
+                let cache = self.new_cache(name);
+                Ok(PreparedAssignmentRef::Property { base, name, cache })
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) => {
+                self.expr(obj)?;
+                self.expr(index)?;
+                // EvaluatePropertyAccessWithExpressionKey performs RequireObjectCoercible and
+                // ToPropertyKey while creating the Reference, before any later iterator step.
+                self.emit(Op::ToPropKey);
+                let key = self.fresh_slot("%assignment-key%");
+                let base = self.fresh_slot("%assignment-base%");
+                self.emit(Op::StoreLocal(key));
+                self.emit(Op::StoreLocal(base));
+                Ok(PreparedAssignmentRef::Element { base, key })
+            }
+            _ => Err(Bail),
+        }
+    }
+
+    fn put_assignment_reference(&mut self, reference: PreparedAssignmentRef) {
+        match reference {
+            PreparedAssignmentRef::Local {
+                slot,
+                is_const,
+                name,
+            } => {
+                self.emit(if is_const {
+                    Op::StoreConstLocal(slot, name)
+                } else {
+                    Op::StoreLocal(slot)
+                });
+            }
+            PreparedAssignmentRef::Captured { name, is_const } => {
+                self.emit(if is_const {
+                    Op::StoreConstCap(name)
+                } else {
+                    Op::StoreCap(name)
+                });
+            }
+            PreparedAssignmentRef::Name(name) => {
+                self.emit_store_name(name);
+            }
+            PreparedAssignmentRef::Reference(reference) => {
+                self.emit(Op::StoreRef(reference));
+            }
+            PreparedAssignmentRef::Property { base, name, cache } => {
+                let value = self.fresh_slot("%assignment-value%");
+                self.emit(Op::StoreLocal(value));
+                self.emit(Op::LoadLocal(base));
+                self.emit(Op::LoadLocal(value));
+                self.emit(Op::SetPropDrop(name, cache));
+            }
+            PreparedAssignmentRef::Element { base, key } => {
+                let value = self.fresh_slot("%assignment-value%");
+                self.emit(Op::StoreLocal(value));
+                self.emit(Op::LoadLocal(base));
+                self.emit(Op::LoadLocal(key));
+                self.emit(Op::LoadLocal(value));
+                self.emit(Op::SetElemDrop);
+            }
+        }
+    }
+
+    fn assignment_default(&mut self, core: &Expr, default: Option<&Expr>) -> CResult {
+        let Some(default) = default else {
+            return Ok(());
+        };
+        self.emit(Op::Dup);
+        self.emit(Op::Undef);
+        self.emit(Op::StrictEq);
+        let present = self.emit(Op::JumpIfFalse(0));
+        self.emit(Op::Pop);
+        if let Expr::Ident(name) = core {
+            self.named_expr(default, name)?;
+        } else {
+            self.expr(default)?;
+        }
+        self.patch(present);
+        Ok(())
+    }
+
+    fn assignment_object_key(&mut self, source: u16, key: &PropKey) -> Result<u16, Bail> {
+        self.emit(Op::LoadLocal(source));
+        match key {
+            PropKey::Ident(key) => {
+                let value = self.const_idx(Value::from_string(key.clone()));
+                self.emit(Op::Const(value));
+            }
+            PropKey::Str(key) => {
+                let value = self.const_idx(Value::Str(key.clone().into()));
+                self.emit(Op::Const(value));
+            }
+            PropKey::Num(key) => {
+                let value = self.const_idx(Value::Num(*key));
+                self.emit(Op::Const(value));
+            }
+            PropKey::Computed(key) => self.expr(key)?,
+        }
+        self.emit(Op::ToPropKey);
+        let key_slot = self.fresh_slot("%assignment-object-key%");
+        self.emit(Op::StoreLocal(key_slot));
+        self.emit(Op::Pop); // retained source base used only to enforce Reference key ordering
+        Ok(key_slot)
+    }
+
+    fn load_assignment_property(&mut self, source: u16, key: u16) {
+        self.emit(Op::LoadLocal(source));
+        self.emit(Op::LoadLocal(key));
+        self.emit(Op::GetElem);
+    }
+
+    fn assignment_pattern(&mut self, target: &Expr) -> CResult {
+        match target {
+            Expr::Paren(inner) => self.assignment_pattern(inner),
+            Expr::Array(elements) => self.assignment_array_pattern(elements),
+            Expr::Object(properties) => self.assignment_object_pattern(properties),
+            _ => Err(Bail),
+        }
+    }
+
+    fn assignment_array_pattern(&mut self, elements: &[ArrayElem]) -> CResult {
+        let iterator = self.fresh_slot("%assignment-iterator%");
+        let next = self.fresh_slot("%assignment-next%");
+        let done = self.fresh_slot("%assignment-done%");
+        self.emit(Op::GetIter);
+        self.emit(Op::StoreLocal(next));
+        self.emit(Op::StoreLocal(iterator));
+        let false_value = self.const_idx(Value::Bool(false));
+        self.emit(Op::Const(false_value));
+        self.emit(Op::StoreLocal(done));
+
+        let handler = self.emit(Op::PushIterator(0, 0, 0, 0));
+        self.try_depth += 1;
+        for element in elements {
+            match element {
+                ArrayElem::Hole => {
+                    self.emit(Op::DestructureStepL(iterator, next, done));
+                    self.emit(Op::Pop);
+                }
+                ArrayElem::Item(element) => {
+                    let (core, default) = match element {
+                        Expr::Assign {
+                            op: "=",
+                            target,
+                            value,
+                        } => (&**target, Some(&**value)),
+                        _ => (element, None),
+                    };
+                    if matches!(core, Expr::Array(_) | Expr::Object(_)) {
+                        self.emit(Op::DestructureStepL(iterator, next, done));
+                        self.assignment_default(core, default)?;
+                        self.assignment_pattern(core)?;
+                    } else {
+                        let reference = self.prepare_assignment_reference(core)?;
+                        self.emit(Op::DestructureStepL(iterator, next, done));
+                        self.assignment_default(core, default)?;
+                        self.put_assignment_reference(reference);
+                    }
+                }
+                ArrayElem::Spread(target) => {
+                    if matches!(target, Expr::Array(_) | Expr::Object(_)) {
+                        self.emit(Op::DestructureRestL(iterator, next, done));
+                        self.assignment_pattern(target)?;
+                    } else {
+                        let reference = self.prepare_assignment_reference(target)?;
+                        self.emit(Op::DestructureRestL(iterator, next, done));
+                        self.put_assignment_reference(reference);
+                    }
+                }
+            }
+        }
+        self.emit(Op::PopHandler);
+        self.try_depth -= 1;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        let after_pads = self.emit(Op::Jump(0));
+
+        let throw_pc = self.ops.len() as u32;
+        self.emit(Op::IterAbortIfNotDoneL(iterator, done));
+        let return_pc = self.ops.len() as u32;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        self.emit(Op::Return);
+        let bare_return_pc = self.ops.len() as u32;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        self.emit(Op::ReturnBare);
+        let resume_return_pc = self.ops.len() as u32;
+        self.emit(Op::IterCloseIfNotDoneL(iterator, done));
+        self.emit(Op::ResumeReturn);
+        match &mut self.ops[handler] {
+            Op::PushIterator(
+                throw_target,
+                return_target,
+                bare_return_target,
+                resume_return_target,
+            ) => {
+                *throw_target = throw_pc;
+                *return_target = return_pc;
+                *bare_return_target = bare_return_pc;
+                *resume_return_target = resume_return_pc;
+            }
+            _ => unreachable!(),
+        }
+        self.patch(after_pads);
+        Ok(())
+    }
+
+    fn assignment_object_pattern(&mut self, properties: &[PropDef]) -> CResult {
+        self.emit(Op::DestructureGuard);
+        let source = self.fresh_slot("%assignment-object%");
+        self.emit(Op::StoreLocal(source));
+        let mut excluded = Vec::new();
+        for property in properties {
+            match property {
+                PropDef::KeyValue { key, value } | PropDef::Cover { key, value } => {
+                    let key = self.assignment_object_key(source, key)?;
+                    excluded.push(key);
+                    let (core, default) = match value {
+                        Expr::Assign {
+                            op: "=",
+                            target,
+                            value,
+                        } => (&**target, Some(&**value)),
+                        _ => (value, None),
+                    };
+                    if matches!(core, Expr::Array(_) | Expr::Object(_)) {
+                        self.load_assignment_property(source, key);
+                        self.assignment_default(core, default)?;
+                        self.assignment_pattern(core)?;
+                    } else {
+                        let reference = self.prepare_assignment_reference(core)?;
+                        self.load_assignment_property(source, key);
+                        self.assignment_default(core, default)?;
+                        self.put_assignment_reference(reference);
+                    }
+                }
+                PropDef::Proto(value) => {
+                    let key = self
+                        .assignment_object_key(source, &PropKey::Ident("__proto__".to_string()))?;
+                    excluded.push(key);
+                    if matches!(value, Expr::Array(_) | Expr::Object(_)) {
+                        self.load_assignment_property(source, key);
+                        self.assignment_pattern(value)?;
+                    } else {
+                        let reference = self.prepare_assignment_reference(value)?;
+                        self.load_assignment_property(source, key);
+                        self.put_assignment_reference(reference);
+                    }
+                }
+                PropDef::Spread(target) => {
+                    let reference = self.prepare_assignment_reference(target)?;
+                    self.emit(Op::LoadLocal(source));
+                    for key in &excluded {
+                        self.emit(Op::LoadLocal(*key));
+                    }
+                    self.emit(Op::ObjectRest(excluded.len() as u16));
+                    self.put_assignment_reference(reference);
+                }
+                PropDef::Method { .. } | PropDef::Getter { .. } | PropDef::Setter { .. } => {
+                    return Err(Bail);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Emit the bookkeeping a `break`/`continue` targeting `self.loops[target]` must run before
     /// its jump: pop every `try`/for-of-body handler region opened since the target's entry (a
     /// stale handler would catch unrelated throws later in the frame), and IteratorClose each
     /// for-of iterator being abandoned — the target's own iterator too for a `break`, but not
-    /// for a `continue` (the loop keeps iterating). Crossing more than one for-of level bails:
-    /// the spec cascades close errors through the *outer* loop's throw-mode close, which this
-    /// flat emission doesn't model (the tree-walker gets it right by unwinding).
-    fn emit_exit_cleanup(&mut self, target: usize, is_continue: bool) -> CResult {
+    /// for a `continue` (the loop keeps iterating). Multiple levels use abrupt-jump cleanup pads
+    /// so close errors cascade through the outer loops' existing throw-mode handlers.
+    fn emit_exit_jump(&mut self, target: usize, is_continue: bool) -> Result<usize, Bail> {
+        let floor = self.loops[target].entry_try_depth;
+        let crosses_finally = self
+            .finally_depths
+            .iter()
+            .any(|finally_depth| *finally_depth > floor && *finally_depth <= self.try_depth);
         // For-of levels whose iterator is abandoned by this jump.
-        let closes: Vec<(usize, u16, u32)> = self
+        let closes: Vec<(usize, u16, Option<u16>, u32)> = self
             .loops
             .iter()
             .enumerate()
             .skip(if is_continue { target + 1 } else { target })
-            .filter_map(|(k, c)| c.foreach_iter.map(|it| (k, it, c.body_try_depth)))
+            .filter_map(|(k, c)| {
+                c.foreach_iter
+                    .map(|it| (k, it, c.foreach_async_from_sync, c.body_try_depth))
+            })
             .collect();
-        if closes.len() > 1 {
-            return Err(Bail);
+        if crosses_finally || closes.len() > 1 {
+            // ECMA-262 §14.15.3 preserves a break/continue Completion when the finalizer is
+            // normal. Handler unwinding therefore owns the jump. Abandoned for-of iterators close
+            // inside-out: unwind only to each loop's entry, close with the outer body handlers
+            // still active, then resume. Consequently a close throw replaces the jump and is
+            // fed through every outer iterator's throw-mode close by its existing catch pad.
+            for &(_, iter_s, async_from_sync_s, body_depth) in closes.iter().rev() {
+                let to_cleanup = self.emit(Op::AbruptJump(0, body_depth - 1));
+                let cleanup_pc = self.ops.len() as u32;
+                self.patch_to(to_cleanup, cleanup_pc);
+                if let Some(from_sync_s) = async_from_sync_s {
+                    self.emit(Op::AsyncIterCloseL(iter_s, from_sync_s, false));
+                } else {
+                    self.emit(Op::IterCloseL(iter_s));
+                }
+            }
+            return Ok(self.emit(Op::AbruptJump(0, floor)));
         }
         let mut depth_now = self.try_depth;
-        if let Some(&(_, iter_s, body_depth)) = closes.last() {
+        if let Some(&(_, iter_s, async_from_sync_s, body_depth)) = closes.last() {
             // Pop the regions inside the for-of body, then its own body handler, then close.
             for _ in body_depth..depth_now {
                 self.emit(Op::PopHandler);
             }
             self.emit(Op::PopHandler);
-            self.emit(Op::IterCloseL(iter_s));
+            if let Some(from_sync_s) = async_from_sync_s {
+                self.emit(Op::AsyncIterCloseL(iter_s, from_sync_s, false));
+            } else {
+                self.emit(Op::IterCloseL(iter_s));
+            }
             depth_now = body_depth - 1;
         }
         // Remaining regions down to the target's entry (plain `try`s between the loops — and for
         // a continue to a for-of, its own body handler, which the loop head re-pushes).
-        let floor = self.loops[target].entry_try_depth;
         for _ in floor..depth_now {
             self.emit(Op::PopHandler);
+        }
+        Ok(self.emit(Op::Jump(0)))
+    }
+
+    fn switch_body(&mut self, discriminant: u16, cases: &[SwitchCase]) -> CResult {
+        for case in cases {
+            for statement in &case.body {
+                match statement {
+                    Stmt::VarDecl {
+                        kind: kind @ (DeclKind::Let | DeclKind::Const),
+                        decls,
+                    } => {
+                        let is_const = matches!(kind, DeclKind::Const);
+                        for (pattern, _) in decls {
+                            self.declare_lexical_pattern(pattern, is_const)?;
+                        }
+                    }
+                    Stmt::ClassDecl(class) => {
+                        let name = class.name.as_ref().ok_or(Bail)?;
+                        self.declare_lexical_pattern(&Pattern::Ident(name.clone()), false)?;
+                    }
+                    Stmt::VarDecl {
+                        kind: DeclKind::Using | DeclKind::AwaitUsing,
+                        ..
+                    } => return Err(Bail),
+                    Stmt::FuncDecl(function) => {
+                        let name = function.name.as_ref().ok_or(Bail)?;
+                        self.declare_lexical_pattern(&Pattern::Ident(name.clone()), false)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // CaseBlockEvaluation uses one shared lexical environment. Its block functions are
+        // instantiated after the discriminant but before the first case test, and declarations in
+        // later/default clauses are visible throughout the CaseBlock.
+        for case in cases {
+            for statement in &case.body {
+                if let Stmt::FuncDecl(function) = statement {
+                    let name = function.name.as_ref().ok_or(Bail)?;
+                    self.emit_closure(function, None);
+                    if self.current_lexical_env_has(name) {
+                        let name = self.name_idx(name);
+                        self.emit(Op::InitLex(name));
+                    } else {
+                        let Home::Slot(slot, false) = self.home(name).ok_or(Bail)? else {
+                            return Err(Bail);
+                        };
+                        self.emit(Op::StoreLocal(slot));
+                    }
+                }
+            }
+        }
+
+        // Phase 1: the test chain. Each match jumps to its (not yet emitted) body.
+        let mut body_jumps: Vec<(usize, usize)> = Vec::new();
+        for (case_index, case) in cases.iter().enumerate() {
+            if let Some(test) = &case.test {
+                self.emit(Op::LoadLocal(discriminant));
+                self.expr(test)?;
+                self.emit(Op::StrictEq);
+                let no_match = self.emit(Op::JumpIfFalse(0));
+                let body = self.emit(Op::Jump(0));
+                body_jumps.push((case_index, body));
+                self.patch(no_match);
+            }
+        }
+        let default_jump = self.emit(Op::Jump(0));
+        self.loops.push(LoopCtx {
+            labels: std::mem::take(&mut self.pending_labels),
+            entry_try_depth: self.try_depth,
+            is_switch: true,
+            ..LoopCtx::default()
+        });
+
+        // Phase 2: bodies, contiguous and in source order so normal fall-through is implicit.
+        let mut body_starts = vec![0usize; cases.len()];
+        let mut result = Ok(());
+        'bodies: for (case_index, case) in cases.iter().enumerate() {
+            body_starts[case_index] = self.ops.len();
+            for statement in &case.body {
+                result = self.stmt(statement);
+                if result.is_err() {
+                    break 'bodies;
+                }
+            }
+        }
+        let context = self.loops.pop().expect("switch context missing");
+        result?;
+        for (case_index, jump) in body_jumps {
+            match &mut self.ops[jump] {
+                Op::Jump(target) => *target = body_starts[case_index] as u32,
+                _ => unreachable!(),
+            }
+        }
+        match cases.iter().position(|case| case.test.is_none()) {
+            Some(default_index) => match &mut self.ops[default_jump] {
+                Op::Jump(target) => *target = body_starts[default_index] as u32,
+                _ => unreachable!(),
+            },
+            None => self.patch(default_jump),
+        }
+        for jump in context.breaks {
+            self.patch(jump);
         }
         Ok(())
     }
 
-    fn block_body(&mut self, body: &[Stmt]) -> CResult {
-        self.declare_block_lexicals(body)?;
-        for s in body {
-            self.stmt(s)?;
+    /// Lower CatchClauseEvaluation (ECMA-262 §14.15.2). A parameterized catch creates every
+    /// mutable binding before BindingInitialization; the catch Block then has its own nested
+    /// lexical scope. Binding-pattern defaults and iterator closing use the same suspension-aware
+    /// machinery as declarations, while an omitted parameter simply discards the thrown value.
+    fn catch_clause(&mut self, param: Option<&Pattern>, body: &[Stmt]) -> CResult {
+        if let Some(pattern) = param {
+            self.push_compile_scope();
+            let mut names = std::collections::HashSet::new();
+            pat_idents(pattern, &mut names);
+            let mut bindings: Vec<_> = names
+                .into_iter()
+                .filter(|name| self.runtime_lexicals.contains(name))
+                .map(|name| (name, false))
+                .collect();
+            bindings.sort_by(|left, right| left.0.cmp(&right.0));
+
+            let result = if bindings.is_empty() {
+                self.catch_clause_body(pattern, body)
+            } else {
+                // NewDeclarativeEnvironment precedes BindingInitialization, and the environment
+                // remains current through evaluation of the nested Block. Direct eval is excluded
+                // by CaptureScan whenever an inner lexical is present, so the catch-parameter-only
+                // Annex B flag is unobservable on this compiled path.
+                let scope = self.push_runtime_lexical_scope(bindings);
+                self.environment_scope(|compiler| compiler.catch_clause_body(pattern, body), scope)
+            };
+            self.pop_compile_scope();
+            return result;
         }
+
+        self.emit(Op::Pop);
+        self.push_compile_scope();
+        let result = self.block_body(body);
+        self.pop_compile_scope();
+        result
+    }
+
+    fn catch_clause_body(&mut self, pattern: &Pattern, body: &[Stmt]) -> CResult {
+        self.declare_lexical_pattern(pattern, false)?;
+        self.destructure_store(pattern, DeclKind::Let)?;
+
+        self.push_compile_scope();
+        let result = self.block_body(body);
+        self.pop_compile_scope();
+        result
+    }
+
+    fn block_body(&mut self, body: &[Stmt]) -> CResult {
+        let bindings = self.runtime_block_bindings(body);
+        if !bindings.is_empty() {
+            let scope = self.push_runtime_lexical_scope(bindings);
+            return self.environment_scope(|compiler| compiler.block_body_slots(body), scope);
+        }
+        self.block_body_slots(body)
+    }
+
+    fn block_body_slots(&mut self, body: &[Stmt]) -> CResult {
+        self.declare_block_lexicals(body)?;
+        if body.iter().any(|statement| {
+            matches!(
+                statement,
+                Stmt::VarDecl {
+                    kind: DeclKind::Using | DeclKind::AwaitUsing,
+                    ..
+                }
+            )
+        }) {
+            return self.disposal_scope(|compiler| {
+                for statement in body {
+                    compiler.stmt(statement)?;
+                }
+                Ok(())
+            });
+        }
+        for statement in body {
+            self.stmt(statement)?;
+        }
+        Ok(())
+    }
+
+    /// The closure-visible subset of BlockDeclarationInstantiation. Keeping uncaptured names out
+    /// of this list preserves the slot fast path while the selected bindings receive one fresh
+    /// Declarative Environment Record per block evaluation.
+    fn runtime_block_bindings(&self, body: &[Stmt]) -> Vec<(String, bool)> {
+        let mut bindings = Vec::new();
+        let mut add_pattern = |pattern: &Pattern, is_const: bool| {
+            let mut names = std::collections::HashSet::new();
+            pat_idents(pattern, &mut names);
+            let mut names: Vec<_> = names.into_iter().collect();
+            names.sort();
+            for name in names {
+                if self.runtime_lexicals.contains(&name)
+                    && !bindings.iter().any(|(existing, _)| existing == &name)
+                {
+                    bindings.push((name, is_const));
+                }
+            }
+        };
+        for statement in body {
+            match statement {
+                Stmt::VarDecl { kind, decls }
+                    if matches!(
+                        kind,
+                        DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing
+                    ) =>
+                {
+                    let is_const = !matches!(kind, DeclKind::Let);
+                    for (pattern, _) in decls {
+                        add_pattern(pattern, is_const);
+                    }
+                }
+                Stmt::ClassDecl(class) => {
+                    if let Some(name) = &class.name {
+                        add_pattern(&Pattern::Ident(name.clone()), false);
+                    }
+                }
+                Stmt::FuncDecl(function) => {
+                    if let Some(name) = &function.name {
+                        add_pattern(&Pattern::Ident(name.clone()), false);
+                    }
+                }
+                _ => {}
+            }
+        }
+        bindings
+    }
+
+    fn push_runtime_lexical_scope(&mut self, bindings: Vec<(String, bool)>) -> u32 {
+        for (name, is_const) in &bindings {
+            self.lexical_env_bind(name, *is_const);
+        }
+        let scope = self.lexical_scopes.len() as u32;
+        self.lexical_scopes.push(
+            bindings
+                .into_iter()
+                .map(|(name, is_const)| LexicalBinding {
+                    name: Rc::from(name),
+                    is_const,
+                })
+                .collect(),
+        );
+        self.emit(Op::PushLex(scope));
+        scope
+    }
+
+    /// Restore one compiler-created lexical environment on every Completion. The handler is
+    /// deliberately outside resource/iterator handlers compiled by `compile_body`, matching the
+    /// spec's restoration of LexicalEnvironment after inner cleanup has completed.
+    fn environment_scope(
+        &mut self,
+        compile_body: impl FnOnce(&mut Compiler) -> CResult,
+        _scope: u32,
+    ) -> CResult {
+        let push = self.emit(Op::PushFinally(0, 0, 0, 0, 0));
+        self.try_depth += 1;
+        self.finally_depths.push(self.try_depth);
+
+        compile_body(self)?;
+
+        self.emit(Op::PopHandler);
+        self.try_depth -= 1;
+        self.finally_depths.pop();
+        self.emit(Op::PopEnv);
+        let normal_exit = self.emit(Op::Jump(0));
+
+        let throw_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::Throw);
+        let return_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::Return);
+        let bare_return_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::ReturnBare);
+        let resume_return_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::ResumeReturn);
+        let jump_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::ResumeJump);
+
+        match &mut self.ops[push] {
+            Op::PushFinally(
+                throw_target,
+                return_target,
+                bare_return_target,
+                resume_return_target,
+                jump_target,
+            ) => {
+                *throw_target = throw_pc;
+                *return_target = return_pc;
+                *bare_return_target = bare_return_pc;
+                *resume_return_target = resume_return_pc;
+                *jump_target = jump_pc;
+            }
+            _ => unreachable!("lexical environment handler changed kind"),
+        }
+        self.patch(normal_exit);
+        Ok(())
+    }
+
+    /// Compile WithStatement Evaluation with its Object Environment Record stored directly in
+    /// the heap continuation. The `PushFinally` pads restore the previous environment for every
+    /// ECMAScript completion, including a throw/rejection or generator return injected while the
+    /// body is suspended.
+    fn with_scope(&mut self, object: &Expr, body: &Stmt) -> CResult {
+        self.expr(object)?;
+        self.emit(Op::PushWith);
+        let push = self.emit(Op::PushFinally(0, 0, 0, 0, 0));
+        self.try_depth += 1;
+        self.finally_depths.push(self.try_depth);
+
+        self.with_scope_floors.push(self.scopes.len());
+        let result = self.stmt(body);
+        self.with_scope_floors.pop();
+        result?;
+
+        self.emit(Op::PopHandler);
+        self.try_depth -= 1;
+        self.finally_depths.pop();
+        self.emit(Op::PopEnv);
+        let normal_exit = self.emit(Op::Jump(0));
+
+        let throw_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::Throw);
+        let return_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::Return);
+        let bare_return_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::ReturnBare);
+        let resume_return_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::ResumeReturn);
+        let jump_pc = self.ops.len() as u32;
+        self.emit(Op::PopEnv);
+        self.emit(Op::ResumeJump);
+
+        match &mut self.ops[push] {
+            Op::PushFinally(
+                throw_target,
+                return_target,
+                bare_return_target,
+                resume_return_target,
+                jump_target,
+            ) => {
+                *throw_target = throw_pc;
+                *return_target = return_pc;
+                *bare_return_target = bare_return_pc;
+                *resume_return_target = resume_return_pc;
+                *jump_target = jump_pc;
+            }
+            _ => unreachable!("with scope handler changed kind"),
+        }
+        self.patch(normal_exit);
+        Ok(())
+    }
+
+    /// Compile one statement-list disposal boundary as a completion-aware `finally` region.
+    /// Each pad consumes the exact Completion that caused scope exit, runs DisposeResources, and
+    /// reissues the surviving completion so outer finalizers/iterators observe the right order.
+    fn disposal_scope(&mut self, compile_body: impl FnOnce(&mut Compiler) -> CResult) -> CResult {
+        self.emit(Op::PushDisposeFrame);
+        let push = self.emit(Op::PushFinally(0, 0, 0, 0, 0));
+        self.try_depth += 1;
+        self.finally_depths.push(self.try_depth);
+
+        compile_body(self)?;
+
+        self.emit(Op::PopHandler);
+        self.try_depth -= 1;
+        self.finally_depths.pop();
+        self.emit(Op::DisposeNormal);
+        let normal_exit = self.emit(Op::Jump(0));
+
+        let throw_pc = self.ops.len() as u32;
+        self.emit(Op::DisposeThrow);
+        let return_pc = self.ops.len() as u32;
+        self.emit(Op::DisposeReturn);
+        let bare_return_pc = self.ops.len() as u32;
+        self.emit(Op::DisposeBareReturn);
+        let resume_return_pc = self.ops.len() as u32;
+        self.emit(Op::DisposeResumeReturn);
+        let jump_pc = self.ops.len() as u32;
+        self.emit(Op::DisposeJump);
+
+        match &mut self.ops[push] {
+            Op::PushFinally(
+                throw_target,
+                return_target,
+                bare_return_target,
+                resume_return_target,
+                jump_target,
+            ) => {
+                *throw_target = throw_pc;
+                *return_target = return_pc;
+                *bare_return_target = bare_return_pc;
+                *resume_return_target = resume_return_pc;
+                *jump_target = jump_pc;
+            }
+            _ => unreachable!("disposal scope handler changed kind"),
+        }
+        self.patch(normal_exit);
         Ok(())
     }
 
@@ -4074,37 +6300,132 @@ impl Compiler {
         // Claim any labels from an enclosing `Stmt::Labeled` before the head runs, so they land on
         // this loop's context (the head itself introduces no labelled break/continue targets).
         let labels = std::mem::take(&mut self.pending_labels);
+        let mut runtime_bindings = Vec::new();
+        if let Some(ForInit::VarDecl {
+            kind: kind @ (DeclKind::Let | DeclKind::Const),
+            decls,
+        }) = init
+        {
+            for (pattern, _) in decls {
+                let mut names = std::collections::HashSet::new();
+                pat_idents(pattern, &mut names);
+                let mut names: Vec<_> = names.into_iter().collect();
+                names.sort();
+                runtime_bindings.extend(
+                    names
+                        .into_iter()
+                        .filter(|name| self.runtime_lexicals.contains(name))
+                        .map(|name| (name, matches!(kind, DeclKind::Const))),
+                );
+            }
+        }
+        if !runtime_bindings.is_empty() {
+            let scope = self.push_runtime_lexical_scope(runtime_bindings);
+            let per_iteration = matches!(
+                init,
+                Some(ForInit::VarDecl {
+                    kind: DeclKind::Let,
+                    ..
+                })
+            )
+            .then_some(scope);
+            return self.environment_scope(
+                |compiler| compiler.for_loop_core(labels, init, test, update, body, per_iteration),
+                scope,
+            );
+        }
+        if let Some(ForInit::VarDecl {
+            kind: kind @ (DeclKind::Using | DeclKind::AwaitUsing),
+            decls,
+        }) = init
+        {
+            for (pattern, _) in decls {
+                self.declare_lexical_pattern(pattern, true)?;
+            }
+            return self.disposal_scope(|compiler| {
+                for (pattern, initializer) in decls {
+                    let Pattern::Ident(name) = pattern else {
+                        return Err(Bail);
+                    };
+                    let initializer = initializer.as_ref().ok_or(Bail)?;
+                    compiler.named_expr(initializer, name)?;
+                    compiler.emit(Op::AddDisposable(matches!(kind, DeclKind::AwaitUsing)));
+                    match compiler.home(name).ok_or(Bail)? {
+                        Home::Slot(slot, _) => compiler.emit(Op::StoreLocal(slot)),
+                        Home::Env(_) => {
+                            let name = compiler.name_idx(name);
+                            compiler.emit(Op::StoreCapInit(name))
+                        }
+                    };
+                }
+                compiler.for_loop_core(labels, None, test, update, body, None)
+            });
+        }
+        self.for_loop_core(labels, init, test, update, body, None)
+    }
+
+    fn for_loop_core(
+        &mut self,
+        labels: Vec<String>,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+        per_iteration_scope: Option<u32>,
+    ) -> CResult {
         match init {
             Some(ForInit::VarDecl { kind, decls }) => {
-                if matches!(kind, DeclKind::Using | DeclKind::AwaitUsing) {
-                    return Err(Bail);
-                }
+                debug_assert!(!matches!(kind, DeclKind::Using | DeclKind::AwaitUsing));
                 if matches!(kind, DeclKind::Let | DeclKind::Const) {
                     for (pat, _) in decls {
-                        let Pattern::Ident(name) = pat else {
-                            return Err(Bail);
-                        };
-                        let slot = self.fresh_slot(name);
-                        self.scope_bind(name, slot, matches!(kind, DeclKind::Const));
-                        self.tdz_slots.insert(slot);
-                        self.emit(Op::Tdz(slot));
+                        // ForLoopEvaluation creates every loopEnv binding before evaluating the
+                        // LexicalDeclaration. Captured leaves are already present in the runtime
+                        // record; uncaptured leaves retain TDZ slots and need no environment copy.
+                        self.declare_lexical_pattern(pat, matches!(kind, DeclKind::Const))?;
                     }
                 }
                 for (pat, initv) in decls {
                     let Pattern::Ident(name) = pat else {
-                        return Err(Bail);
+                        let Some(initializer) = initv else {
+                            return Err(Bail);
+                        };
+                        self.expr(initializer)?;
+                        self.destructure_store(pat, *kind)?;
+                        continue;
                     };
-                    let (slot, _) = self.lookup(name).ok_or(Bail)?;
+                    let dynamic_lexical = self.current_lexical_env_has(name);
+                    let home = if dynamic_lexical {
+                        None
+                    } else {
+                        Some(self.home(name).ok_or(Bail)?)
+                    };
                     match initv {
-                        Some(e) => {
-                            self.expr(e)?;
+                        Some(initializer) => self.named_expr(initializer, name)?,
+                        None if matches!(kind, DeclKind::Var) => continue,
+                        None => {
+                            self.emit(Op::Undef);
+                        }
+                    }
+                    if dynamic_lexical {
+                        let name = self.name_idx(name);
+                        self.emit(if matches!(kind, DeclKind::Var) {
+                            Op::StoreName(name)
+                        } else {
+                            Op::InitLex(name)
+                        });
+                        continue;
+                    }
+                    match home.expect("non-dynamic for declaration has a static home") {
+                        Home::Slot(slot, _) => {
                             self.emit(Op::StoreLocal(slot));
                         }
-                        None => {
-                            if !matches!(kind, DeclKind::Var) {
-                                self.emit(Op::Undef);
-                                self.emit(Op::StoreLocal(slot));
-                            }
+                        Home::Env(_) => {
+                            let name = self.name_idx(name);
+                            self.emit(if matches!(kind, DeclKind::Var) {
+                                Op::StoreCap(name)
+                            } else {
+                                Op::StoreCapInit(name)
+                            });
                         }
                     }
                 }
@@ -4113,6 +6434,10 @@ impl Compiler {
                 self.expr_stmt(e)?;
             }
             None => {}
+        }
+        if let Some(scope) = per_iteration_scope {
+            // ForBodyEvaluation calls CreatePerIterationEnvironment once before the first test.
+            self.emit(Op::CloneLex(scope));
         }
         let start = self.ops.len();
         let jf = match test {
@@ -4124,6 +6449,7 @@ impl Compiler {
         };
         self.loops.push(LoopCtx {
             labels,
+            entry_try_depth: self.try_depth,
             ..LoopCtx::default()
         });
         let r = self.stmt(body);
@@ -4131,10 +6457,12 @@ impl Compiler {
         r?;
         let cont = self.ops.len();
         for c in ctx.continues {
-            match &mut self.ops[c] {
-                Op::Jump(t) => *t = cont as u32,
-                _ => unreachable!(),
-            }
+            self.patch_to(c, cont as u32);
+        }
+        if let Some(scope) = per_iteration_scope {
+            // The next iteration's record is created before evaluating the increment expression;
+            // closures in the body therefore retain the record that the body actually observed.
+            self.emit(Op::CloneLex(scope));
         }
         if let Some(u) = update {
             self.expr_stmt(u)?;
@@ -4207,7 +6535,8 @@ impl Compiler {
             Expr::Ident(name) => match self.home(name) {
                 Some(Home::Slot(slot, is_const)) => {
                     if is_const {
-                        return Ok(false);
+                        self.immutable_assignment(Home::Slot(slot, true), name, op, value)?;
+                        return Ok(true);
                     }
                     if op == "=" {
                         self.named_expr(value, name)?;
@@ -4221,7 +6550,8 @@ impl Compiler {
                 }
                 Some(Home::Env(is_const)) => {
                     if is_const {
-                        return Ok(false); // runtime TypeError — the oracle's business
+                        self.immutable_assignment(Home::Env(true), name, op, value)?;
+                        return Ok(true);
                     }
                     let n = self.name_idx(name);
                     if op == "=" {
@@ -4236,20 +6566,31 @@ impl Compiler {
                 }
                 None => {
                     let i = self.name_idx(name);
+                    let reference = if self.name_reference_can_change(name) {
+                        let reference = self.fresh_reference()?;
+                        self.emit(Op::ResolveNameRef(i, reference));
+                        Some(reference)
+                    } else {
+                        None
+                    };
                     if op == "=" {
                         // StoreName already consumes the value without re-pushing it.
                         self.named_expr(value, name)?;
                     } else {
-                        // Resolve/read before the RHS, as compound assignment requires. Compiled
-                        // closures under `with` are rejected at entry and direct eval in this
-                        // body prevents compilation, so no nearer binding can appear between
-                        // this read and StoreName; re-resolution names the same Reference.
-                        let c = self.new_name_cache(i);
-                        self.emit(Op::LoadName(i, c));
+                        if let Some(reference) = reference {
+                            self.emit(Op::LoadRef(reference));
+                        } else {
+                            let c = self.new_name_cache(i);
+                            self.emit(Op::LoadName(i, c));
+                        }
                         self.expr(value)?;
                         self.emit_compound(op)?;
                     }
-                    self.emit_store_name(i);
+                    if let Some(reference) = reference {
+                        self.emit(Op::StoreRef(reference));
+                    } else {
+                        self.emit_store_name(i);
+                    }
                     Ok(true)
                 }
             },
@@ -4386,7 +6727,63 @@ impl Compiler {
             self.emit_closure(f, Some(name));
             return Ok(());
         }
+        if matches!(e, Expr::Class(class) if class.name.is_none()) {
+            if crate::eval::expr_contains(e, |expr| {
+                matches!(expr, Expr::Yield { .. } | Expr::Await(_))
+            }) {
+                return Err(Bail);
+            }
+            self.retain_named_eval_expr(e, Some(name));
+            return Ok(());
+        }
         self.expr(e)
+    }
+
+    /// Evaluate an ObjectLiteral property name while the fresh object remains immediately below
+    /// it on the operand stack. `ToPropKey` performs the observable coercion now (before the
+    /// property's value or method definition), as required by PropertyDefinitionEvaluation.
+    /// Numeric and string keys may remain in their cheap raw representation because their later
+    /// re-coercion is side-effect-free; object and symbol keys are normalized immediately.
+    fn object_literal_key(&mut self, key: &PropKey) -> CResult {
+        match key {
+            PropKey::Ident(key) => {
+                let value = self.const_idx(Value::from_string(key.clone()));
+                self.emit(Op::Const(value));
+            }
+            PropKey::Str(key) => {
+                let value = self.const_idx(Value::Str(key.clone().into()));
+                self.emit(Op::Const(value));
+            }
+            PropKey::Num(key) => {
+                let value = self.const_idx(Value::Num(*key));
+                self.emit(Op::Const(value));
+            }
+            PropKey::Computed(key) => self.expr(key)?,
+        }
+        self.emit(Op::ToPropKey);
+        Ok(())
+    }
+
+    fn super_named_reference(&mut self, name: &str) {
+        self.emit_super_this();
+        let key = self.const_idx(Value::from_string(name.to_string()));
+        self.emit(Op::Const(key));
+        self.emit(Op::SuperBase);
+    }
+
+    fn super_computed_reference(&mut self, key: &Expr) -> CResult {
+        self.emit_super_this();
+        self.expr(key)?;
+        self.emit(Op::SuperBase);
+        Ok(())
+    }
+
+    /// A Super Reference's `[[ThisValue]]` is the current function's actual this binding. Marking
+    /// that dependency is as important as emitting the read: lean compiled calls otherwise omit
+    /// OrdinaryCallBindThis and `SuperThis` could resolve an enclosing/global `this` instead.
+    fn emit_super_this(&mut self) {
+        self.uses_this = true;
+        self.emit(Op::SuperThis);
     }
 
     fn expr(&mut self, e: &Expr) -> CResult {
@@ -4503,6 +6900,25 @@ impl Compiler {
                 self.emit(Op::GetProp(i, c));
                 Ok(())
             }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_named_reference(prop);
+                self.emit(Op::SuperGet);
+                Ok(())
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if prop.starts_with('#') => {
+                self.expr(obj)?;
+                let name = self.name_idx(prop);
+                self.emit(Op::GetPrivate(name));
+                Ok(())
+            }
             Expr::Index {
                 obj,
                 index,
@@ -4516,6 +6932,15 @@ impl Compiler {
                     self.expr(index)?;
                     self.emit(Op::GetElem);
                 }
+                Ok(())
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_computed_reference(index)?;
+                self.emit(Op::SuperGet);
                 Ok(())
             }
             Expr::Binary { op, left, right } => {
@@ -4616,7 +7041,25 @@ impl Compiler {
                 self.emit(Op::Await);
                 Ok(())
             }
+            Expr::Yield { delegate, arg } => {
+                if let Some(value) = arg {
+                    self.expr(value)?;
+                } else {
+                    self.emit(Op::Undef);
+                }
+                self.emit(if *delegate { Op::YieldStar } else { Op::Yield });
+                Ok(())
+            }
             Expr::Update { op, prefix, arg } => {
+                if !self.with_scope_floors.is_empty()
+                    && matches!(&**arg, Expr::Ident(name) if self.home(name).is_none())
+                {
+                    // UpdateExpression retains one Environment Reference across GetValue,
+                    // ToNumeric (which may run user code), and PutValue. Re-resolving a name
+                    // through a mutable with object after ToNumeric would be observable.
+                    self.retain_eval_expr(e);
+                    return Ok(());
+                }
                 let kind = match (*op, *prefix) {
                     ("++", true) => UpdKind::PreInc,
                     ("--", true) => UpdKind::PreDec,
@@ -4630,6 +7073,102 @@ impl Compiler {
             Expr::ToStr(inner) => {
                 self.expr(inner)?;
                 self.emit(Op::ToStr);
+                Ok(())
+            }
+            Expr::ImportMeta => {
+                self.emit(Op::ImportMeta);
+                Ok(())
+            }
+            Expr::NewTarget => {
+                self.emit(Op::NewTarget);
+                Ok(())
+            }
+            Expr::ImportCall {
+                spec,
+                phase,
+                options,
+            } => {
+                self.expr(spec)?;
+                if let Some(options) = options {
+                    self.expr(options)?;
+                }
+                self.emit(Op::DynamicImport(*phase, options.is_some()));
+                Ok(())
+            }
+            Expr::PrivateIn { name, obj } => {
+                self.expr(obj)?;
+                let name = self.name_idx(name);
+                self.emit(Op::PrivateIn(name));
+                Ok(())
+            }
+            Expr::TaggedTemplate { tag, quasis, subs } => {
+                // Evaluation produces a Reference first, so method/with receivers are retained;
+                // IsCallable is checked before GetTemplateObject and every substitution.
+                match &**tag {
+                    Expr::Member {
+                        obj,
+                        prop,
+                        optional: false,
+                    } if matches!(**obj, Expr::Super) => {
+                        self.super_named_reference(prop);
+                        self.emit(Op::SuperGetMethod);
+                    }
+                    Expr::Index {
+                        obj,
+                        index,
+                        optional: false,
+                    } if matches!(**obj, Expr::Super) => {
+                        self.super_computed_reference(index)?;
+                        self.emit(Op::SuperGetMethod);
+                    }
+                    Expr::Member {
+                        obj,
+                        prop,
+                        optional: false,
+                    } if prop.starts_with('#') => {
+                        self.expr(obj)?;
+                        let name = self.name_idx(prop);
+                        self.emit(Op::GetPrivateMethod(name));
+                    }
+                    Expr::Member {
+                        obj,
+                        prop,
+                        optional: false,
+                    } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                        self.expr(obj)?;
+                        let name = self.name_idx(prop);
+                        let cache = self.new_cache(name);
+                        self.emit(Op::GetMethod(name, cache));
+                    }
+                    Expr::Index {
+                        obj,
+                        index,
+                        optional: false,
+                    } if !matches!(**obj, Expr::Super) => {
+                        self.expr(obj)?;
+                        self.expr(index)?;
+                        self.emit(Op::GetMethodElem);
+                    }
+                    Expr::Ident(name) if self.home(name).is_none() => {
+                        let name = self.name_idx(name);
+                        let cache = self.new_name_cache(name);
+                        self.emit(Op::LoadNameForCall(name, cache));
+                    }
+                    other => {
+                        self.emit(Op::Undef);
+                        self.expr(other)?;
+                    }
+                }
+                self.emit(Op::RequireCallable);
+                let site = self.templates.len() as u32;
+                self.templates.push(quasis.clone());
+                self.emit(Op::TemplateObject(site));
+                for substitution in subs {
+                    self.expr(substitution)?;
+                }
+                let argc = u16::try_from(subs.len() + 1).map_err(|_| Bail)?;
+                let cache = self.new_call_cache();
+                self.emit(Op::CallWithThis(argc, cache));
                 Ok(())
             }
             Expr::OptionalChain(inner) => {
@@ -4651,11 +7190,57 @@ impl Compiler {
                 args,
                 optional: false,
             } => {
-                // Direct eval can see the activation — bail the function.
                 if matches!(&**callee, Expr::Ident(n) if n == "eval") {
-                    return Err(Bail);
+                    // PerformEval is atomic with respect to this coroutine. Run the uncommon call
+                    // through the normative evaluator against the retained activation; every
+                    // statically declared function-scope binding was env-homed by CaptureScan, so
+                    // sloppy eval var/function declarations and later closures see shared storage.
+                    // An await/yield in argument evaluation must still be lowered around the call
+                    // rather than hidden inside the retained evaluator, so keep that shape out.
+                    if !self.direct_eval
+                        || args.iter().any(|arg| match arg {
+                            ArrayElem::Item(expr) | ArrayElem::Spread(expr) => {
+                                crate::eval::expr_contains(expr, |nested| {
+                                    matches!(nested, Expr::Yield { .. } | Expr::Await(_))
+                                })
+                            }
+                            ArrayElem::Hole => false,
+                        })
+                    {
+                        return Err(Bail);
+                    }
+                    self.retain_eval_expr(e);
+                    return Ok(());
                 }
                 match &**callee {
+                    Expr::Member {
+                        obj,
+                        prop,
+                        optional: false,
+                    } if matches!(**obj, Expr::Super) => {
+                        self.super_named_reference(prop);
+                        self.emit(Op::SuperGetMethod);
+                        self.finish_call(args, true, false)?;
+                    }
+                    Expr::Index {
+                        obj,
+                        index,
+                        optional: false,
+                    } if matches!(**obj, Expr::Super) => {
+                        self.super_computed_reference(index)?;
+                        self.emit(Op::SuperGetMethod);
+                        self.finish_call(args, true, false)?;
+                    }
+                    Expr::Member {
+                        obj,
+                        prop,
+                        optional: false,
+                    } if prop.starts_with('#') => {
+                        self.expr(obj)?;
+                        let name = self.name_idx(prop);
+                        self.emit(Op::GetPrivateMethod(name));
+                        self.finish_call(args, true, false)?;
+                    }
                     Expr::Member {
                         obj,
                         prop,
@@ -4665,20 +7250,7 @@ impl Compiler {
                         let i = self.name_idx(prop);
                         let c = self.new_cache(i);
                         self.emit(Op::GetMethod(i, c));
-                        if self.call_args(args)? {
-                            self.emit(Op::CallSpreadThis(args.len() as u16));
-                        } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, true)
-                                }
-                                None => {
-                                    self.emit(Op::CallWithThis(args.len() as u16, cc));
-                                }
-                            }
-                        }
+                        self.finish_call(args, true, true)?;
                     }
                     Expr::Index {
                         obj,
@@ -4688,20 +7260,7 @@ impl Compiler {
                         self.expr(obj)?;
                         self.expr(index)?;
                         self.emit(Op::GetMethodElem);
-                        if self.call_args(args)? {
-                            self.emit(Op::CallSpreadThis(args.len() as u16));
-                        } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, true)
-                                }
-                                None => {
-                                    self.emit(Op::CallWithThis(args.len() as u16, cc));
-                                }
-                            }
-                        }
+                        self.finish_call(args, true, true)?;
                     }
                     Expr::Super => return Err(Bail),
                     Expr::Ident(name) if self.home(name).is_none() => {
@@ -4710,51 +7269,47 @@ impl Compiler {
                         let i = self.name_idx(name);
                         let c = self.new_name_cache(i);
                         self.emit(Op::LoadNameForCall(i, c));
-                        if self.call_args(args)? {
-                            self.emit(Op::CallSpreadThis(args.len() as u16));
-                        } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, true)
-                                }
-                                None => {
-                                    self.emit(Op::CallWithThis(args.len() as u16, cc));
-                                }
-                            }
-                        }
+                        self.finish_call(args, true, true)?;
                     }
                     other => {
                         self.expr(other)?;
-                        if self.call_args(args)? {
-                            self.emit(Op::CallSpread(args.len() as u16));
-                        } else {
-                            let plan_hit = self.plan_hit();
-                            let cc = self.new_call_cache();
-                            match plan_hit {
-                                Some(entry) => {
-                                    self.emit_call_with_inline(entry, args.len() as u16, cc, false)
-                                }
-                                None => {
-                                    self.emit(Op::Call(args.len() as u16, cc));
-                                }
-                            }
-                        }
+                        self.finish_call(args, false, true)?;
                     }
                 }
                 Ok(())
             }
             Expr::New { callee, args } => {
                 self.expr(callee)?;
-                for a in args {
-                    let ArrayElem::Item(a) = a else {
-                        return Err(Bail);
-                    };
-                    self.expr(a)?;
+                if args.iter().all(|arg| matches!(arg, ArrayElem::Item(_))) {
+                    let argc = u16::try_from(args.len()).map_err(|_| Bail)?;
+                    for arg in args {
+                        let ArrayElem::Item(expr) = arg else {
+                            unreachable!("plain constructor arguments checked above")
+                        };
+                        self.expr(expr)?;
+                    }
+                    let cache = self.new_construct_cache();
+                    self.emit(Op::New(argc, cache));
+                    return Ok(());
                 }
-                let cache = self.new_construct_cache();
-                self.emit(Op::New(args.len() as u16, cache));
+
+                // Evaluate/expand each argument in source order before IsConstructor, as required
+                // by EvaluateNew and ArgumentListEvaluation. The private array does not escape.
+                self.emit(Op::NewArray);
+                for arg in args {
+                    match arg {
+                        ArrayElem::Item(expr) => {
+                            self.expr(expr)?;
+                            self.emit(Op::ArrayPush);
+                        }
+                        ArrayElem::Spread(expr) => {
+                            self.expr(expr)?;
+                            self.emit(Op::ArraySpread);
+                        }
+                        ArrayElem::Hole => return Err(Bail),
+                    }
+                }
+                self.emit(Op::NewArgsArray);
                 Ok(())
             }
             Expr::Regex { body, flags } => {
@@ -4764,36 +7319,102 @@ impl Compiler {
                 Ok(())
             }
             Expr::Array(elems) => {
-                for el in elems {
-                    match el {
-                        ArrayElem::Item(e) => self.expr(e)?,
-                        _ => return Err(Bail),
+                if elems
+                    .iter()
+                    .all(|element| matches!(element, ArrayElem::Item(_)))
+                {
+                    let count = u16::try_from(elems.len()).map_err(|_| Bail)?;
+                    for element in elems {
+                        let ArrayElem::Item(value) = element else {
+                            unreachable!("plain array literal fast path checked above")
+                        };
+                        self.expr(value)?;
+                    }
+                    self.emit(Op::MakeArray(count));
+                    return Ok(());
+                }
+
+                self.emit(Op::NewArray);
+                for element in elems {
+                    match element {
+                        ArrayElem::Item(value) => {
+                            self.expr(value)?;
+                            self.emit(Op::ArrayPush);
+                        }
+                        ArrayElem::Spread(value) => {
+                            self.expr(value)?;
+                            self.emit(Op::ArraySpread);
+                        }
+                        ArrayElem::Hole => {
+                            self.emit(Op::ArrayHole);
+                        }
                     }
                 }
-                self.emit(Op::MakeArray(elems.len() as u16));
                 Ok(())
             }
             Expr::Object(props) => {
-                let mut count = 0u16;
+                let plain = props.iter().all(|property| {
+                    let PropDef::KeyValue { key, .. } = property else {
+                        return false;
+                    };
+                    matches!(key, PropKey::Ident(key) if key != "__proto__" && !key.starts_with('#'))
+                        || matches!(key, PropKey::Str(key) if &**key != "__proto__" && !key.starts_with('#'))
+                });
+                if !plain {
+                    self.emit(Op::NewObject);
+                    for property in props {
+                        match property {
+                            PropDef::KeyValue { key, value } | PropDef::Cover { key, value } => {
+                                self.object_literal_key(key)?;
+                                self.expr(value)?;
+                                self.emit(Op::ObjectData(crate::eval::is_anonymous_fn(value)));
+                            }
+                            PropDef::Method { key, func } => {
+                                self.object_literal_key(key)?;
+                                let function = self.funcs.len() as u32;
+                                self.funcs.push(func.clone());
+                                self.emit(Op::ObjectMethod(function, 0));
+                            }
+                            PropDef::Getter { key, func } => {
+                                self.object_literal_key(key)?;
+                                let function = self.funcs.len() as u32;
+                                self.funcs.push(func.clone());
+                                self.emit(Op::ObjectMethod(function, 1));
+                            }
+                            PropDef::Setter { key, func } => {
+                                self.object_literal_key(key)?;
+                                let function = self.funcs.len() as u32;
+                                self.funcs.push(func.clone());
+                                self.emit(Op::ObjectMethod(function, 2));
+                            }
+                            PropDef::Spread(value) => {
+                                self.expr(value)?;
+                                self.emit(Op::ObjectSpread);
+                            }
+                            PropDef::Proto(value) => {
+                                self.expr(value)?;
+                                self.emit(Op::ObjectProto);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+
+                let count = u16::try_from(props.len()).map_err(|_| Bail)?;
                 // Keys must land contiguously in `names`; values go on the stack in order.
                 let mut keys: Vec<String> = Vec::new();
                 for p in props {
                     let PropDef::KeyValue { key, value } = p else {
-                        return Err(Bail);
+                        unreachable!("plain object literal fast path checked above")
                     };
                     let k = match key {
                         PropKey::Ident(k) => k.clone(),
                         PropKey::Str(k) => k.to_string(),
-                        _ => return Err(Bail),
+                        _ => unreachable!("plain object literal key checked above"),
                     };
-                    // `__proto__:` in literal position sets the prototype, not a property.
-                    if k == "__proto__" || k.starts_with('#') {
-                        return Err(Bail);
-                    }
                     // NamedEvaluation: `{ m: function(){} }` names the anonymous function "m".
                     self.named_expr(value, &k)?;
                     keys.push(k);
-                    count += 1;
                 }
                 // Keys go into `names` only after every value is compiled — value expressions
                 // add names of their own, and the key range must stay contiguous.
@@ -4817,8 +7438,14 @@ impl Compiler {
                 Ok(())
             }
             other => {
-                log_bail("expr", &format!("{:.60}", format!("{other:?}")));
-                Err(Bail)
+                if crate::eval::expr_contains(other, |expr| {
+                    matches!(expr, Expr::Yield { .. } | Expr::Await(_))
+                }) {
+                    log_bail("expr", &format!("{:.60}", format!("{other:?}")));
+                    return Err(Bail);
+                }
+                self.retain_eval_expr(other);
+                Ok(())
             }
         }
     }
@@ -4837,7 +7464,16 @@ impl Compiler {
                     self.emit(Op::UpdateCap(n, kind));
                     Ok(())
                 }
-                Some(Home::Slot(_, true)) | Some(Home::Env(true)) => Err(Bail),
+                Some(home @ (Home::Slot(_, true) | Home::Env(true))) => {
+                    let name = self.name_idx(name);
+                    match home {
+                        Home::Slot(slot, true) => self.emit(Op::LoadLocal(slot)),
+                        Home::Env(true) => self.emit(Op::LoadCap(name)),
+                        _ => unreachable!(),
+                    };
+                    self.emit(Op::UpdateConst(name, kind));
+                    Ok(())
+                }
                 None => {
                     let n = self.name_idx(name);
                     let c = self.new_name_cache(n);
@@ -4845,6 +7481,34 @@ impl Compiler {
                     Ok(())
                 }
             },
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_named_reference(prop);
+                self.emit(Op::SuperUpdate(kind));
+                Ok(())
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_computed_reference(index)?;
+                self.emit(Op::SuperUpdate(kind));
+                Ok(())
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if prop.starts_with('#') => {
+                self.expr(obj)?;
+                let name = self.name_idx(prop);
+                self.emit(Op::UpdatePrivate(name, kind));
+                Ok(())
+            }
             Expr::Member {
                 obj,
                 prop,
@@ -4875,14 +7539,24 @@ impl Compiler {
 
     fn assign(&mut self, op: &str, target: &Expr, value: &Expr) -> CResult {
         if matches!(op, "&&=" | "||=" | "??=") {
-            log_bail("expr", "logical assignment");
-            return Err(Bail);
+            return self.logical_assign(op, target, value);
+        }
+        if op == "=" && matches!(target, Expr::Array(_) | Expr::Object(_)) {
+            if !self.is_coroutine {
+                return Err(Bail);
+            }
+            // AssignmentExpression returns the unmodified RHS value after running the pattern.
+            // Keep one copy beneath the continuation-aware AssignmentPattern operation.
+            self.expr(value)?;
+            self.emit(Op::Dup);
+            self.assignment_pattern(target)?;
+            return Ok(());
         }
         match target {
             Expr::Ident(name) => match self.home(name) {
                 Some(Home::Slot(slot, is_const)) => {
                     if is_const {
-                        return Err(Bail);
+                        return self.immutable_assignment(Home::Slot(slot, true), name, op, value);
                     }
                     if op == "=" {
                         self.named_expr(value, name)?;
@@ -4897,7 +7571,7 @@ impl Compiler {
                 }
                 Some(Home::Env(is_const)) => {
                     if is_const {
-                        return Err(Bail);
+                        return self.immutable_assignment(Home::Env(true), name, op, value);
                     }
                     let n = self.name_idx(name);
                     if op == "=" {
@@ -4913,20 +7587,83 @@ impl Compiler {
                 }
                 None => {
                     let i = self.name_idx(name);
+                    let reference = if self.name_reference_can_change(name) {
+                        let reference = self.fresh_reference()?;
+                        self.emit(Op::ResolveNameRef(i, reference));
+                        Some(reference)
+                    } else {
+                        None
+                    };
                     if op == "=" {
                         self.named_expr(value, name)?;
                     } else {
-                        // See the discarded-assignment path above for the stable-Reference proof.
-                        let c = self.new_name_cache(i);
-                        self.emit(Op::LoadName(i, c));
+                        if let Some(reference) = reference {
+                            self.emit(Op::LoadRef(reference));
+                        } else {
+                            let c = self.new_name_cache(i);
+                            self.emit(Op::LoadName(i, c));
+                        }
                         self.expr(value)?;
                         self.emit_compound(op)?;
                     }
                     self.emit(Op::Dup);
-                    self.emit_store_name(i);
+                    if let Some(reference) = reference {
+                        self.emit(Op::StoreRef(reference));
+                    } else {
+                        self.emit_store_name(i);
+                    }
                     Ok(())
                 }
             },
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_named_reference(prop);
+                if op == "=" {
+                    self.expr(value)?;
+                } else {
+                    self.emit(Op::SuperGetKeep);
+                    self.expr(value)?;
+                    self.emit_compound(op)?;
+                }
+                self.emit(Op::SuperSet);
+                Ok(())
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_computed_reference(index)?;
+                if op == "=" {
+                    self.expr(value)?;
+                } else {
+                    self.emit(Op::SuperGetKeep);
+                    self.expr(value)?;
+                    self.emit_compound(op)?;
+                }
+                self.emit(Op::SuperSet);
+                Ok(())
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if prop.starts_with('#') => {
+                self.expr(obj)?;
+                let name = self.name_idx(prop);
+                if op == "=" {
+                    self.expr(value)?;
+                } else {
+                    self.emit(Op::GetPrivateKeep(name));
+                    self.expr(value)?;
+                    self.emit_compound(op)?;
+                }
+                self.emit(Op::SetPrivate(name));
+                Ok(())
+            }
             Expr::Member {
                 obj,
                 prop,
@@ -4986,6 +7723,201 @@ impl Compiler {
         }
     }
 
+    fn logical_super_assign(&mut self, op: &str, value: &Expr) -> CResult {
+        self.emit(Op::SuperGetKeep);
+        let current = self.fresh_slot("%logical-super-current%");
+        let base = self.fresh_slot("%logical-super-base%");
+        let key = self.fresh_slot("%logical-super-key%");
+        let receiver = self.fresh_slot("%logical-super-receiver%");
+        self.emit(Op::StoreLocal(current));
+        self.emit(Op::StoreLocal(base));
+        self.emit(Op::StoreLocal(key));
+        self.emit(Op::StoreLocal(receiver));
+        self.emit(Op::LoadLocal(current));
+        let done = match op {
+            "&&=" => self.emit(Op::JumpIfFalsePeek(0)),
+            "||=" => self.emit(Op::JumpIfTruePeek(0)),
+            "??=" => self.emit(Op::JumpIfNotNullishPeek(0)),
+            _ => return Err(Bail),
+        };
+        self.emit(Op::Pop);
+        self.emit(Op::LoadLocal(receiver));
+        self.emit(Op::LoadLocal(key));
+        self.emit(Op::LoadLocal(base));
+        self.expr(value)?;
+        self.emit(Op::SuperSet);
+        self.patch(done);
+        Ok(())
+    }
+
+    /// ECMA-262 §13.16.2 logical assignment: evaluate the left Reference exactly once, read it,
+    /// and only evaluate/write the RHS when the operator's short-circuit test permits it. The
+    /// old value remains the expression result on the short path; the stored RHS is the result on
+    /// the write path. Hidden slots retain member bases/keys across a suspending RHS.
+    fn logical_assign(&mut self, op: &str, target: &Expr, value: &Expr) -> CResult {
+        fn short_jump(compiler: &mut Compiler, op: &str) -> Result<usize, Bail> {
+            Ok(match op {
+                "&&=" => compiler.emit(Op::JumpIfFalsePeek(0)),
+                "||=" => compiler.emit(Op::JumpIfTruePeek(0)),
+                "??=" => compiler.emit(Op::JumpIfNotNullishPeek(0)),
+                _ => return Err(Bail),
+            })
+        }
+
+        match target {
+            Expr::Paren(inner) => self.logical_assign(op, inner, value),
+            Expr::Ident(name) => match self.home(name) {
+                Some(Home::Slot(slot, false)) => {
+                    self.emit(Op::LoadLocal(slot));
+                    let done = short_jump(self, op)?;
+                    self.emit(Op::Pop);
+                    self.named_expr(value, name)?;
+                    self.emit(Op::Dup);
+                    self.emit(Op::StoreLocal(slot));
+                    self.patch(done);
+                    Ok(())
+                }
+                Some(Home::Env(false)) => {
+                    let name_index = self.name_idx(name);
+                    self.emit(Op::LoadCap(name_index));
+                    let done = short_jump(self, op)?;
+                    self.emit(Op::Pop);
+                    self.named_expr(value, name)?;
+                    self.emit(Op::Dup);
+                    self.emit(Op::StoreCap(name_index));
+                    self.patch(done);
+                    Ok(())
+                }
+                Some(home @ (Home::Slot(_, true) | Home::Env(true))) => {
+                    let name_index = self.name_idx(name);
+                    match home {
+                        Home::Slot(slot, true) => self.emit(Op::LoadLocal(slot)),
+                        Home::Env(true) => self.emit(Op::LoadCap(name_index)),
+                        _ => unreachable!(),
+                    };
+                    let done = short_jump(self, op)?;
+                    self.emit(Op::Pop);
+                    self.named_expr(value, name)?;
+                    match home {
+                        Home::Slot(slot, true) => {
+                            self.emit(Op::StoreConstLocal(slot, name_index));
+                        }
+                        Home::Env(true) => {
+                            self.emit(Op::StoreConstCap(name_index));
+                        }
+                        _ => unreachable!(),
+                    }
+                    self.patch(done);
+                    Ok(())
+                }
+                None => {
+                    let name_index = self.name_idx(name);
+                    let reference = if self.name_reference_can_change(name) {
+                        let reference = self.fresh_reference()?;
+                        self.emit(Op::ResolveNameRef(name_index, reference));
+                        self.emit(Op::LoadRef(reference));
+                        Some(reference)
+                    } else {
+                        let cache = self.new_name_cache(name_index);
+                        self.emit(Op::LoadName(name_index, cache));
+                        None
+                    };
+                    let done = short_jump(self, op)?;
+                    self.emit(Op::Pop);
+                    self.named_expr(value, name)?;
+                    self.emit(Op::Dup);
+                    if let Some(reference) = reference {
+                        self.emit(Op::StoreRef(reference));
+                    } else {
+                        self.emit_store_name(name_index);
+                    }
+                    self.patch(done);
+                    Ok(())
+                }
+            },
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_named_reference(prop);
+                self.logical_super_assign(op, value)
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_computed_reference(index)?;
+                self.logical_super_assign(op, value)
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if prop.starts_with('#') => {
+                let base = self.fresh_slot("%logical-private-base%");
+                self.expr(obj)?;
+                self.emit(Op::StoreLocal(base));
+                let name = self.name_idx(prop);
+                self.emit(Op::LoadLocal(base));
+                self.emit(Op::GetPrivate(name));
+                let done = short_jump(self, op)?;
+                self.emit(Op::Pop);
+                self.emit(Op::LoadLocal(base));
+                self.expr(value)?;
+                self.emit(Op::SetPrivate(name));
+                self.patch(done);
+                Ok(())
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
+                let base_slot = self.fresh_slot("%logical-base%");
+                self.expr(obj)?;
+                self.emit(Op::StoreLocal(base_slot));
+                let name_index = self.name_idx(prop);
+                let get_cache = self.new_cache(name_index);
+                self.emit(Op::GetPropLocal(base_slot, name_index, get_cache));
+                let done = short_jump(self, op)?;
+                self.emit(Op::Pop);
+                self.emit(Op::LoadLocal(base_slot));
+                self.expr(value)?;
+                let set_cache = self.new_cache(name_index);
+                self.emit(Op::SetProp(name_index, set_cache));
+                self.patch(done);
+                Ok(())
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) => {
+                let base_slot = self.fresh_slot("%logical-base%");
+                let key_slot = self.fresh_slot("%logical-key%");
+                self.expr(obj)?;
+                self.expr(index)?;
+                self.emit(Op::ToPropKey);
+                self.emit(Op::StoreLocal(key_slot));
+                self.emit(Op::StoreLocal(base_slot));
+                self.emit(Op::LoadLocal(base_slot));
+                self.emit(Op::LoadLocal(key_slot));
+                self.emit(Op::GetElem);
+                let done = short_jump(self, op)?;
+                self.emit(Op::Pop);
+                self.emit(Op::LoadLocal(base_slot));
+                self.emit(Op::LoadLocal(key_slot));
+                self.expr(value)?;
+                self.emit(Op::SetElem);
+                self.patch(done);
+                Ok(())
+            }
+            _ => Err(Bail),
+        }
+    }
+
     fn emit_compound(&mut self, op: &str) -> CResult {
         let bop = match op {
             "+=" => Op::Add,
@@ -5014,11 +7946,47 @@ impl Compiler {
 // VM
 // ---------------------------------------------------------------------------------------------
 
+/// Completion carried through an asynchronous DisposeResources operation. Distinct return kinds
+/// preserve async-generator Await rules and externally injected returns across nested handlers.
+pub enum DisposeCompletion {
+    Normal,
+    Throw(Value),
+    SourceReturn(Value),
+    BareReturn,
+    ResumeReturn(Value),
+    Jump { target: usize, handler_depth: usize },
+}
+
 /// How one run of the VM ended: the body returned a value, suspended at an `await` (async bodies
 /// only — see [`VmCoro`]), or — carried as `Err(Abrupt::Throw)` — threw.
 pub enum VmStep {
     Done(Value),
+    /// An explicit `return expression`; async generators must Await its value before completion.
+    Return(Value),
+    /// An explicit source `return;`, kept distinct from both body fallthrough and expression
+    /// returns so it unwinds resources without adding an async-generator Await.
+    BareReturn,
+    /// A generator `.return(value)` completion whose value was already awaited by
+    /// AsyncGeneratorUnwrapYieldResumption before it entered a finalizer.
+    ResumeReturn(Value),
+    /// A `break`/`continue` Completion. `handler_depth` identifies the handler stack at the
+    /// destination so only intervening regions are unwound.
+    AbruptJump {
+        target: usize,
+        handler_depth: usize,
+    },
     Await(Value),
+    AsyncClose {
+        iterator: Value,
+        from_sync: bool,
+        swallow_error: bool,
+    },
+    Dispose {
+        frame: Vec<crate::interpreter::Disposable>,
+        completion: DisposeCompletion,
+    },
+    Yield(Value),
+    YieldStar(Value),
 }
 
 /// Execute a compiled function body. `env` is the root for free-name resolution — the *definition*
@@ -5038,7 +8006,8 @@ pub fn run(
 ) -> Result<Value, Abrupt> {
     // Captured locals (and a lexically-read `this`) live in a per-call activation env; slots
     // hold everything else. No captures → the definition env is used directly.
-    let env = chunk.make_run_env(i, env, &this_val, args);
+    let mut env = chunk.make_run_env(i, env, &this_val, args);
+    let cap_env = env.clone();
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let seed = chunk.n_params.min(args.len());
     slots.extend_from_slice(&args[..seed]);
@@ -5048,16 +8017,22 @@ pub fn run(
     }
     let mut pc = 0usize;
     let mut handlers: Vec<Handler> = Vec::new();
+    let mut disposal_frames: Vec<Vec<crate::interpreter::Disposable>> = Vec::new();
+    let mut references = (0..chunk.n_refs).map(|_| None).collect::<Vec<_>>();
     let r = drive_vm(
         i,
         chunk,
-        &env,
+        &mut env,
+        &cap_env,
+        &mut references,
         &mut slots,
         &mut stack,
         &mut pc,
         &this_val,
         &mut handlers,
+        &mut disposal_frames,
         None,
+        false,
     );
     slots.clear();
     stack.clear();
@@ -5065,46 +8040,366 @@ pub fn run(
         i.vm_pool.push((slots, stack));
     }
     match r? {
-        VmStep::Done(v) => Ok(v),
-        VmStep::Await(_) => unreachable!("a synchronous bytecode function cannot await"),
+        VmStep::Done(v) | VmStep::Return(v) | VmStep::ResumeReturn(v) => Ok(v),
+        VmStep::BareReturn => Ok(Value::Undefined),
+        VmStep::AbruptJump { .. } => unreachable!("drive_vm consumes loop completions"),
+        VmStep::Await(_)
+        | VmStep::AsyncClose { .. }
+        | VmStep::Dispose { .. }
+        | VmStep::Yield(_)
+        | VmStep::YieldStar(_) => {
+            unreachable!("a synchronous bytecode function cannot suspend")
+        }
     }
 }
 
-/// Drive the VM through throws: run to `Done`/`Await`, or on an uncaught op throw unwind to the
-/// innermost `try` handler (restore its stack depth, push the exception, jump to its catch) and
-/// keep going — propagating only when no handler remains. `pending_throw` injects a throw *before*
-/// the first step: a rejected `await` resuming inside a `try` (see [`VmCoro::resume`]).
+/// Drive the VM through abrupt completions. Catch handlers consume only throws; finally handlers
+/// consume throws and returns, restore their saved operand depth, and jump to a completion-specific
+/// pad with the completion value pushed. `pending` injects a completion before the first step (for
+/// a rejected `await`, generator `.throw()`, or generator `.return()`).
 #[allow(clippy::too_many_arguments)]
 fn drive_vm(
     i: &mut Interp,
     chunk: &Chunk,
-    env: &Env,
+    env: &mut Env,
+    cap_env: &Env,
+    references: &mut [Option<crate::eval::PreparedReference>],
     slots: &mut [Value],
     stack: &mut Vec<Value>,
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<Handler>,
-    mut pending_throw: Option<Value>,
+    disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
+    mut pending: Option<PendingCompletion>,
+    defer_source_return: bool,
 ) -> Result<VmStep, Abrupt> {
     loop {
-        let outcome = match pending_throw.take() {
-            Some(e) => Err(Abrupt::Throw(e)),
-            None => run_vm(i, chunk, env, slots, stack, pc, this_val, handlers),
+        let outcome = match pending.take() {
+            Some(PendingCompletion::Throw(error)) => Err(Abrupt::Throw(error)),
+            Some(PendingCompletion::ResumeReturn(value)) => Ok(VmStep::ResumeReturn(value)),
+            Some(PendingCompletion::SourceReturn(value)) => Ok(VmStep::Return(value)),
+            Some(PendingCompletion::BareReturn) => Ok(VmStep::BareReturn),
+            Some(PendingCompletion::Jump {
+                target,
+                handler_depth,
+            }) => Ok(VmStep::AbruptJump {
+                target,
+                handler_depth,
+            }),
+            None => run_vm(
+                i,
+                chunk,
+                env,
+                cap_env,
+                references,
+                slots,
+                stack,
+                pc,
+                this_val,
+                handlers,
+                disposal_frames,
+            ),
         };
         match outcome {
-            Ok(step) => return Ok(step),
-            Err(Abrupt::Throw(e)) => match handlers.pop() {
-                Some(h) => {
-                    stack.truncate(h.stack_depth);
-                    stack.push(e);
-                    *pc = h.catch_pc;
+            Ok(VmStep::Return(value)) => {
+                // In an async generator, ReturnStatement awaits its expression before creating
+                // the Return Completion that enters surrounding finalizers/IteratorClose.
+                if defer_source_return {
+                    return Ok(VmStep::Return(value));
                 }
-                None => return Err(Abrupt::Throw(e)),
-            },
+                let mut value = Some(value);
+                while let Some(handler) = handlers.pop() {
+                    let return_pc = match handler.target {
+                        HandlerTarget::Finally { return_pc, .. }
+                        | HandlerTarget::Iterator { return_pc, .. } => return_pc,
+                        HandlerTarget::Catch { .. } => continue,
+                    };
+                    stack.truncate(handler.stack_depth);
+                    stack.push(value.take().expect("return completion consumed once"));
+                    *pc = return_pc;
+                    break;
+                }
+                if let Some(value) = value {
+                    return Ok(VmStep::Return(value));
+                }
+            }
+            Ok(VmStep::BareReturn) => {
+                let mut handled = false;
+                while let Some(handler) = handlers.pop() {
+                    let bare_return_pc = match handler.target {
+                        HandlerTarget::Finally { bare_return_pc, .. }
+                        | HandlerTarget::Iterator { bare_return_pc, .. } => bare_return_pc,
+                        HandlerTarget::Catch { .. } => continue,
+                    };
+                    stack.truncate(handler.stack_depth);
+                    *pc = bare_return_pc;
+                    handled = true;
+                    break;
+                }
+                if !handled {
+                    return Ok(VmStep::BareReturn);
+                }
+            }
+            Ok(VmStep::ResumeReturn(value)) => {
+                let mut value = Some(value);
+                while let Some(handler) = handlers.pop() {
+                    let resume_return_pc = match handler.target {
+                        HandlerTarget::Finally {
+                            resume_return_pc, ..
+                        }
+                        | HandlerTarget::Iterator {
+                            resume_return_pc, ..
+                        } => resume_return_pc,
+                        HandlerTarget::Catch { .. } => continue,
+                    };
+                    stack.truncate(handler.stack_depth);
+                    stack.push(
+                        value
+                            .take()
+                            .expect("resumed return completion consumed once"),
+                    );
+                    *pc = resume_return_pc;
+                    break;
+                }
+                if let Some(value) = value {
+                    return Ok(VmStep::ResumeReturn(value));
+                }
+            }
+            Ok(VmStep::AbruptJump {
+                target,
+                handler_depth,
+            }) => {
+                let mut completion = Some((target, handler_depth));
+                while handlers.len() > handler_depth {
+                    let handler = handlers.pop().expect("handler depth checked");
+                    if let HandlerTarget::Finally { jump_pc, .. } = handler.target {
+                        stack.truncate(handler.stack_depth);
+                        stack.push(Value::Num(target as f64));
+                        stack.push(Value::Num(handler_depth as f64));
+                        *pc = jump_pc;
+                        completion = None;
+                        break;
+                    }
+                }
+                if completion.is_some() {
+                    debug_assert_eq!(handlers.len(), handler_depth);
+                    *pc = target;
+                }
+            }
+            Ok(step) => return Ok(step),
+            Err(Abrupt::Throw(error)) => {
+                let mut error = Some(error);
+                if let Some(handler) = handlers.pop() {
+                    let throw_pc = match handler.target {
+                        HandlerTarget::Catch { throw_pc }
+                        | HandlerTarget::Finally { throw_pc, .. }
+                        | HandlerTarget::Iterator { throw_pc, .. } => throw_pc,
+                    };
+                    stack.truncate(handler.stack_depth);
+                    stack.push(error.take().expect("throw completion consumed once"));
+                    *pc = throw_pc;
+                }
+                if let Some(error) = error {
+                    return Err(Abrupt::Throw(error));
+                }
+            }
             // Return/Break/Continue never escape a compiled body as an Abrupt; propagate defensively.
             Err(other) => return Err(other),
         }
     }
+}
+
+fn for_in_step(
+    i: &mut Interp,
+    slots: &mut [Value],
+    keys_slot: u16,
+    index_slot: u16,
+    source_slot: u16,
+) -> Result<Option<Value>, Abrupt> {
+    loop {
+        let index = match slots[index_slot as usize] {
+            Value::Num(index) => index as u32,
+            _ => unreachable!("for-in cursor is an internal integer"),
+        };
+        let key = match &slots[keys_slot as usize] {
+            Value::Obj(keys) => keys
+                .borrow()
+                .props
+                .get_index(index)
+                .map(|prop| prop.value()),
+            _ => unreachable!("for-in keys are stored in an internal array"),
+        };
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        slots[index_slot as usize] = Value::Num(index as f64 + 1.0);
+        if matches!(slots[source_slot as usize], Value::Obj(_)) {
+            let Value::Str(name) = &key else {
+                unreachable!("for-in candidates are strings")
+            };
+            let source = slots[source_slot as usize].clone();
+            if !i.js_has_property(&source, name)? {
+                continue;
+            }
+        }
+        return Ok(Some(key));
+    }
+}
+
+/// Run a retained AssignmentPattern against a slot-backed VM frame. The tree-walker operates on
+/// Environment Records, so project the lexically visible slot bindings into one child record,
+/// execute the normative algorithm, and copy bindings back even after an abrupt completion (an
+/// earlier element/property assignment remains observable when a later one throws).
+fn assign_target_with_slots(
+    i: &mut Interp,
+    plan: &AssignmentTargetPlan,
+    value: Value,
+    env: &Env,
+    slots: &mut [Value],
+) -> Result<(), Abrupt> {
+    let projected = crate::interpreter::new_scope(Some(env.clone()));
+    {
+        let mut scope = projected.borrow_mut();
+        for local in &plan.locals {
+            let value = slots[local.slot as usize].clone();
+            let initialized = !matches!(value, Value::Empty);
+            scope.vars.insert(
+                local.name.clone(),
+                crate::interpreter::Binding::data(value, local.mutable, initialized),
+            );
+        }
+    }
+
+    // Direct JIT-to-JIT calls do not maintain the interpreter's ambient strict flag. Assignment
+    // target semantics therefore carry the compiled function's strictness explicitly.
+    let old_strict = std::mem::replace(&mut i.strict, plan.strict);
+    let result = i.assign_to_target(&plan.target, value, &projected);
+    i.strict = old_strict;
+
+    let scope = projected.borrow();
+    for local in &plan.locals {
+        let binding = scope
+            .vars
+            .get(&local.name)
+            .expect("projected assignment binding remains present");
+        slots[local.slot as usize] = if binding.initialized {
+            binding.value.clone()
+        } else {
+            Value::Empty
+        };
+    }
+    result
+}
+
+/// Execute one uncommon, non-suspending expression through the normative evaluator while the
+/// surrounding function remains a heap VM continuation. Slot bindings are projected exactly like
+/// AssignmentPattern's shared bridge and copied back after both normal and abrupt completion.
+fn eval_expr_with_slots(
+    i: &mut Interp,
+    plan: &EvalExprPlan,
+    env: &Env,
+    slots: &mut [Value],
+) -> Result<Value, Abrupt> {
+    let projected = crate::interpreter::new_scope(Some(env.clone()));
+    {
+        let mut scope = projected.borrow_mut();
+        for local in &plan.locals {
+            let value = slots[local.slot as usize].clone();
+            let initialized = !matches!(value, Value::Empty);
+            scope.vars.insert(
+                local.name.clone(),
+                crate::interpreter::Binding::data(value, local.mutable, initialized),
+            );
+        }
+    }
+
+    let old_strict = std::mem::replace(&mut i.strict, plan.strict);
+    let old_name = std::mem::replace(&mut i.pending_fn_name, plan.name.clone());
+    let result = i.eval(&plan.expr, &projected);
+    i.pending_fn_name = old_name;
+    i.strict = old_strict;
+
+    let scope = projected.borrow();
+    for local in &plan.locals {
+        let binding = scope
+            .vars
+            .get(&local.name)
+            .expect("projected expression binding remains present");
+        slots[local.slot as usize] = if binding.initialized {
+            binding.value.clone()
+        } else {
+            Value::Empty
+        };
+    }
+    result
+}
+
+fn rejected_intrinsic_promise(i: &mut Interp, reason: Value) -> Value {
+    let promise = i.new_promise();
+    i.reject_promise(&promise, reason);
+    promise
+}
+
+/// The rejection handler installed by AsyncFromSyncIteratorContinuation when a live sync
+/// iterator value rejects. IteratorClose receives the throw completion, so its own failures are
+/// discarded and the original rejection is propagated by throwing it from this reaction.
+fn async_from_sync_close_rejection(
+    i: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let iterator = args.first().cloned().unwrap_or(Value::Undefined);
+    let error = args.get(1).cloned().unwrap_or(Value::Undefined);
+    i.iterator_close(&iterator);
+    Err(error)
+}
+
+fn async_from_sync_abrupt_promise(i: &mut Interp, completion: Abrupt) -> Result<Value, Abrupt> {
+    match completion {
+        Abrupt::Throw(error) => Ok(rejected_intrinsic_promise(i, error)),
+        other => Err(other),
+    }
+}
+
+fn array_literal_append(i: &mut Interp, array: &Value, value: Option<Value>) -> Result<(), Abrupt> {
+    let Value::Obj(array) = array else {
+        unreachable!("array literal builder retains an Array")
+    };
+    let index = i.array_length(array);
+    if index >= u32::MAX as usize {
+        return Err(i.throw("RangeError", "invalid array length"));
+    }
+    let mut object = array.borrow_mut();
+    if let Some(value) = value {
+        object
+            .props
+            .insert(index.to_string(), crate::value::Property::plain(value));
+    }
+    object
+        .props
+        .get_mut("length")
+        .expect("fresh Array has length")
+        .set_value(Value::Num(index as f64 + 1.0));
+    Ok(())
+}
+
+/// Consume the private dense array built by ArgumentListEvaluation lowering. No user code can
+/// observe this object between creation and consumption, so every index is a plain own value.
+fn argument_array_values(i: &Interp, array: Value) -> Vec<Value> {
+    let Value::Obj(array) = array else {
+        unreachable!("argument-list builder retains an Array")
+    };
+    let length = i.array_length(&array);
+    let array = array.borrow();
+    (0..length)
+        .map(|index| {
+            array
+                .props
+                .get_index(index as u32)
+                .expect("argument-list builder creates no holes")
+                .value()
+        })
+        .collect()
 }
 
 /// Run from `*pc` until the body returns (`Done`), suspends at an `await` (`Await`, async bodies
@@ -5114,12 +8409,15 @@ fn drive_vm(
 fn run_vm(
     i: &mut Interp,
     chunk: &Chunk,
-    env: &Env,
+    env: &mut Env,
+    cap_env: &Env,
+    references: &mut [Option<crate::eval::PreparedReference>],
     slots: &mut [Value],
     stack: &mut Vec<Value>,
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<Handler>,
+    disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
 ) -> Result<VmStep, Abrupt> {
     macro_rules! pop {
         () => {
@@ -5224,20 +8522,20 @@ fn run_vm(
             }
             Op::Tdz(s) => slots[s as usize] = Value::Empty,
             Op::LoadCap(n) => {
-                stack.push(chunk.load_cap_ic(i, env, n)?);
+                stack.push(chunk.load_cap_ic(i, cap_env, n)?);
             }
             Op::StoreCap(n) => {
                 let v = pop!();
-                chunk.store_cap_ic(i, env, n, v, false)?;
+                chunk.store_cap_ic(i, cap_env, n, v, false)?;
             }
             Op::StoreCapInit(n) => {
                 let v = pop!();
-                chunk.store_cap_ic(i, env, n, v, true)?;
+                chunk.store_cap_ic(i, cap_env, n, v, true)?;
             }
             Op::UpdateCap(n, kind) => {
                 let name = &chunk.names[n as usize];
                 let old = {
-                    let b = env.borrow();
+                    let b = cap_env.borrow();
                     let bd = b.vars.get(name).expect("captured binding missing");
                     if !bd.initialized {
                         let msg = format!("cannot access '{name}' before initialization");
@@ -5247,7 +8545,7 @@ fn run_vm(
                     bd.value.clone()
                 };
                 step_and_store(i, stack, kind, old, |_, v| {
-                    if let Some(bd) = env.borrow_mut().vars.get_mut(name) {
+                    if let Some(bd) = cap_env.borrow_mut().vars.get_mut(name) {
                         bd.value = v;
                     }
                     Ok(())
@@ -5282,7 +8580,67 @@ fn run_vm(
                 let v = pop!();
                 chunk.store_name_ic(i, env, n, c, v)?;
             }
+            Op::ResolveNameRef(name, reference) => {
+                references[reference as usize] =
+                    Some(i.prepare_name_reference(&chunk.names[name as usize], env)?);
+            }
+            Op::LoadRef(reference) => {
+                let reference = references[reference as usize]
+                    .as_mut()
+                    .expect("prepared name reference was resolved before use");
+                stack.push(i.read_prepared_reference(reference)?);
+            }
+            Op::StoreRef(reference) => {
+                let value = pop!();
+                let reference = references[reference as usize]
+                    .as_mut()
+                    .expect("prepared name reference was resolved before use");
+                i.write_prepared_reference(reference, value)?;
+            }
+            Op::StoreConstLocal(s, n) => {
+                pop!();
+                if matches!(slots[s as usize], Value::Empty) {
+                    return Err(i.throw(
+                        "ReferenceError",
+                        format!(
+                            "cannot access '{}' before initialization",
+                            chunk.slot_names[s as usize]
+                        ),
+                    ));
+                }
+                return Err(i.throw(
+                    "TypeError",
+                    format!(
+                        "assignment to constant variable '{}'",
+                        chunk.names[n as usize]
+                    ),
+                ));
+            }
+            Op::StoreConstCap(n) => {
+                pop!();
+                chunk.reject_const_cap_store(i, env, n)?;
+                unreachable!("immutable captured store always completes abruptly");
+            }
+            Op::UpdateConst(n, kind) => {
+                let old = pop!();
+                let name = chunk.names[n as usize].clone();
+                step_value(i, kind, old, |i, _| {
+                    Err(i.throw(
+                        "TypeError",
+                        format!("assignment to constant variable '{name}'"),
+                    ))
+                })?;
+                unreachable!("immutable update always completes abruptly");
+            }
             Op::LoadThis => stack.push(this_val.clone()),
+            Op::RequireObject => {
+                if matches!(
+                    stack.last().expect("vm stack underflow"),
+                    Value::Undefined | Value::Null
+                ) {
+                    return Err(i.throw("TypeError", "cannot access property of null or undefined"));
+                }
+            }
             Op::GetProp(n, c) => {
                 let obj = pop!();
                 let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
@@ -5377,6 +8735,230 @@ fn run_vm(
                     i.iterator_close_normal(&it)?;
                 }
             }
+            Op::AssignTarget(target) => {
+                let value = pop!();
+                assign_target_with_slots(
+                    i,
+                    &chunk.assignment_targets[target as usize],
+                    value,
+                    env,
+                    slots,
+                )?;
+            }
+            Op::EvalExpr(plan) => {
+                let value = eval_expr_with_slots(i, &chunk.eval_exprs[plan as usize], env, slots)?;
+                stack.push(value);
+            }
+            Op::PushWith => {
+                let value = pop!();
+                if matches!(value, Value::Undefined | Value::Null) {
+                    return Err(i.throw("TypeError", "Cannot convert undefined or null to object"));
+                }
+                let object = crate::builtins::box_primitive_pub(i, value);
+                *env = crate::interpreter::new_with_scope(env.clone(), object);
+            }
+            Op::PushLex(scope) => {
+                let next = crate::interpreter::new_scope(Some(env.clone()));
+                {
+                    let mut record = next.borrow_mut();
+                    for binding in &chunk.lexical_scopes[scope as usize] {
+                        record.lexical_names.push(binding.name.to_string());
+                        record.vars.insert(
+                            binding.name.clone(),
+                            crate::interpreter::Binding {
+                                value: Value::Undefined,
+                                mutable: !binding.is_const,
+                                strict_immutable: binding.is_const,
+                                initialized: false,
+                                import_ref: None,
+                                deletable: false,
+                            },
+                        );
+                    }
+                }
+                *env = next;
+            }
+            Op::CloneLex(scope) => {
+                let parent = env
+                    .borrow()
+                    .parent
+                    .clone()
+                    .expect("per-iteration lexical environment has a parent");
+                let next = crate::interpreter::new_scope(Some(parent));
+                {
+                    let current = env.borrow();
+                    let mut record = next.borrow_mut();
+                    for binding in &chunk.lexical_scopes[scope as usize] {
+                        let previous = current
+                            .vars
+                            .get(&binding.name)
+                            .expect("per-iteration binding missing");
+                        record.lexical_names.push(binding.name.to_string());
+                        record.vars.insert(
+                            binding.name.clone(),
+                            crate::interpreter::Binding {
+                                value: previous.value.clone(),
+                                mutable: previous.mutable,
+                                strict_immutable: previous.strict_immutable,
+                                initialized: previous.initialized,
+                                import_ref: None,
+                                deletable: false,
+                            },
+                        );
+                    }
+                }
+                *env = next;
+            }
+            Op::InitLex(name) => {
+                let name = &chunk.names[name as usize];
+                let mut record = env.borrow_mut();
+                let binding = record
+                    .vars
+                    .get_mut(name)
+                    .expect("lexical initialization requires an own binding");
+                binding.value = pop!();
+                binding.initialized = true;
+            }
+            Op::PopEnv => {
+                let parent = env
+                    .borrow()
+                    .parent
+                    .clone()
+                    .expect("compiled environment scope has a parent");
+                *env = parent;
+            }
+            Op::PushDisposeFrame => disposal_frames.push(Vec::new()),
+            Op::AddDisposable(is_async) => {
+                let value = stack.last().expect("vm stack underflow");
+                if let Some(resource) = i.create_disposable(value, is_async)? {
+                    disposal_frames
+                        .last_mut()
+                        .expect("using declaration outside a disposal boundary")
+                        .push(resource);
+                }
+            }
+            Op::DisposeNormal => {
+                let frame = disposal_frames
+                    .pop()
+                    .expect("normal disposal without an active frame");
+                if frame.iter().any(|resource| resource.kind_is_async) {
+                    return Ok(VmStep::Dispose {
+                        frame,
+                        completion: DisposeCompletion::Normal,
+                    });
+                }
+                i.dispose_frame(frame, Ok(Value::Undefined))?;
+            }
+            Op::DisposeThrow => {
+                let error = pop!();
+                let frame = disposal_frames
+                    .pop()
+                    .expect("throw disposal without an active frame");
+                if frame.iter().any(|resource| resource.kind_is_async) {
+                    return Ok(VmStep::Dispose {
+                        frame,
+                        completion: DisposeCompletion::Throw(error),
+                    });
+                }
+                return match i.dispose_frame(frame, Err(Abrupt::Throw(error))) {
+                    Err(completion) => Err(completion),
+                    Ok(_) => unreachable!("DisposeResources preserved a throw as normal"),
+                };
+            }
+            Op::DisposeReturn => {
+                let value = pop!();
+                let frame = disposal_frames
+                    .pop()
+                    .expect("return disposal without an active frame");
+                if frame.iter().any(|resource| resource.kind_is_async) {
+                    return Ok(VmStep::Dispose {
+                        frame,
+                        completion: DisposeCompletion::SourceReturn(value),
+                    });
+                }
+                return match i.dispose_frame(frame, Err(Abrupt::Return(value))) {
+                    Err(Abrupt::Return(value)) => Ok(VmStep::Return(value)),
+                    Err(completion) => Err(completion),
+                    Ok(_) => unreachable!("DisposeResources preserved a return as normal"),
+                };
+            }
+            Op::DisposeBareReturn => {
+                let frame = disposal_frames
+                    .pop()
+                    .expect("bare-return disposal without an active frame");
+                if frame.iter().any(|resource| resource.kind_is_async) {
+                    return Ok(VmStep::Dispose {
+                        frame,
+                        completion: DisposeCompletion::BareReturn,
+                    });
+                }
+                return match i.dispose_frame(frame, Err(Abrupt::Return(Value::Undefined))) {
+                    Err(Abrupt::Return(_)) => Ok(VmStep::BareReturn),
+                    Err(completion) => Err(completion),
+                    Ok(_) => unreachable!("DisposeResources preserved a return as normal"),
+                };
+            }
+            Op::DisposeResumeReturn => {
+                let value = pop!();
+                let frame = disposal_frames
+                    .pop()
+                    .expect("resumed-return disposal without an active frame");
+                if frame.iter().any(|resource| resource.kind_is_async) {
+                    return Ok(VmStep::Dispose {
+                        frame,
+                        completion: DisposeCompletion::ResumeReturn(value),
+                    });
+                }
+                return match i.dispose_frame(frame, Err(Abrupt::Return(value))) {
+                    Err(Abrupt::Return(value)) => Ok(VmStep::ResumeReturn(value)),
+                    Err(completion) => Err(completion),
+                    Ok(_) => unreachable!("DisposeResources preserved a return as normal"),
+                };
+            }
+            Op::DisposeJump => {
+                let handler_depth = match pop!() {
+                    Value::Num(value) => value as usize,
+                    _ => unreachable!("disposal jump depth is an internal integer"),
+                };
+                let target = match pop!() {
+                    Value::Num(value) => value as usize,
+                    _ => unreachable!("disposal jump target is an internal integer"),
+                };
+                let frame = disposal_frames
+                    .pop()
+                    .expect("jump disposal without an active frame");
+                if frame.iter().any(|resource| resource.kind_is_async) {
+                    return Ok(VmStep::Dispose {
+                        frame,
+                        completion: DisposeCompletion::Jump {
+                            target,
+                            handler_depth,
+                        },
+                    });
+                }
+                return match i.dispose_frame(frame, Err(Abrupt::Break(None, Value::Empty))) {
+                    Err(Abrupt::Break(..)) | Err(Abrupt::Continue(..)) => Ok(VmStep::AbruptJump {
+                        target,
+                        handler_depth,
+                    }),
+                    Err(completion) => Err(completion),
+                    Ok(_) => unreachable!("DisposeResources preserved a jump as normal"),
+                };
+            }
+            Op::ObjectRest(count) => {
+                let at = stack.len() - count as usize;
+                let excluded_values = stack.split_off(at);
+                let source = pop!();
+                let mut excluded = Vec::with_capacity(excluded_values.len());
+                for key in excluded_values {
+                    match key {
+                        Value::Str(key) => excluded.push(key.to_string()),
+                        other => excluded.push(i.to_property_key(&other)?.into_string()),
+                    }
+                }
+                let rest = i.copy_data_properties(&source, &excluded)?;
+                stack.push(Value::Obj(rest));
+            }
             Op::DeleteProp(n, strict) => {
                 let base = pop!();
                 let prop = &chunk.names[n as usize];
@@ -5402,6 +8984,12 @@ fn run_vm(
                 let v = i.delete_prop_with(base, &key, strict)?;
                 stack.push(v);
             }
+            Op::DeleteName(name) => {
+                stack.push(i.delete_ident(&chunk.names[name as usize], env)?);
+            }
+            Op::DeleteSuper => {
+                return Err(i.throw("ReferenceError", "cannot delete a super property"));
+            }
             Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
                 let spread = pop!();
                 let at = stack.len() - (argc as usize - 1);
@@ -5418,6 +9006,17 @@ fn run_vm(
                 };
                 let v = i.call(callee, this, &args)?;
                 stack.push(v);
+            }
+            Op::CallArgsArray | Op::CallArgsArrayThis => {
+                let args = argument_array_values(i, pop!());
+                let callee = pop!();
+                let this = if matches!(op, Op::CallArgsArrayThis) {
+                    pop!()
+                } else {
+                    Value::Undefined
+                };
+                let value = i.call(callee, this, &args)?;
+                stack.push(value);
             }
             Op::AppendProp(n, c) => {
                 let v = pop!();
@@ -5567,37 +9166,34 @@ fn run_vm(
                 let old = i.get_member(&obj, &k)?;
                 step_and_store(i, stack, kind, old, |i, v| i.set_member(&obj, &k, v))?;
             }
-            Op::ToPropKeyLocal(s) => match stack.last().expect("vm stack underflow") {
-                Value::Num(_) | Value::Str(_) => {}
-                _ => {
-                    let key = pop!();
-                    if matches!(slots[s as usize], Value::Undefined | Value::Null) {
-                        return Err(
-                            i.throw("TypeError", "cannot access property of null or undefined")
-                        );
-                    }
-                    let k = i.to_property_key(&key)?;
-                    stack.push(Value::str(k));
+            Op::ToPropKeyLocal(s) => {
+                if matches!(slots[s as usize], Value::Undefined | Value::Null) {
+                    return Err(i.throw("TypeError", "cannot access property of null or undefined"));
                 }
-            },
+                match stack.last().expect("vm stack underflow") {
+                    Value::Num(_) | Value::Str(_) => {}
+                    _ => {
+                        let key = pop!();
+                        let k = i.to_property_key(&key)?;
+                        stack.push(Value::str(k.into_string()));
+                    }
+                }
+            }
             Op::ToPropKey => {
+                if matches!(
+                    stack.get(stack.len().saturating_sub(2)),
+                    Some(Value::Undefined | Value::Null)
+                ) {
+                    return Err(i.throw("TypeError", "cannot access property of null or undefined"));
+                }
                 match stack.last().expect("vm stack underflow") {
                     // Side-effect-free and deterministic to coerce later; numbers stay numeric
                     // so GetElem/SetElem keep their dense fast path.
                     Value::Num(_) | Value::Str(_) => {}
                     _ => {
                         let key = pop!();
-                        if matches!(
-                            stack.last().expect("vm stack underflow"),
-                            Value::Undefined | Value::Null
-                        ) {
-                            return Err(i.throw(
-                                "TypeError",
-                                "cannot access property of null or undefined",
-                            ));
-                        }
                         let k = i.to_property_key(&key)?;
-                        stack.push(Value::str(k));
+                        stack.push(Value::str(k.into_string()));
                     }
                 }
             }
@@ -5827,6 +9423,11 @@ fn run_vm(
                 stack.truncate(at - 1);
                 stack.push(v);
             }
+            Op::NewArgsArray => {
+                let args = argument_array_values(i, pop!());
+                let callee = pop!();
+                stack.push(i.construct(callee, &args)?);
+            }
             Op::MakeRegExp(body, flags) => {
                 stack.push(
                     i.make_regexp(&chunk.names[body as usize], &chunk.names[flags as usize])?,
@@ -5836,6 +9437,24 @@ fn run_vm(
                 let at = stack.len() - n as usize;
                 let items: Vec<Value> = stack.split_off(at);
                 stack.push(i.make_array(items));
+            }
+            Op::NewArray => stack.push(i.make_array(Vec::new())),
+            Op::ArrayPush => {
+                let value = pop!();
+                let array = stack.last().expect("array builder missing").clone();
+                array_literal_append(i, &array, Some(value))?;
+            }
+            Op::ArrayHole => {
+                let array = stack.last().expect("array builder missing").clone();
+                array_literal_append(i, &array, None)?;
+            }
+            Op::ArraySpread => {
+                let spread = pop!();
+                let array = stack.last().expect("array builder missing").clone();
+                let (iterator, next) = i.get_iterator(&spread)?;
+                while let Some(value) = i.iterator_step(&iterator, &next)? {
+                    array_literal_append(i, &array, Some(value))?;
+                }
             }
             Op::MakeObject(start, count, tidx) => {
                 let at = stack.len() - count as usize;
@@ -5848,6 +9467,178 @@ fn run_vm(
                 };
                 stack.push(v);
             }
+            Op::NewObject => stack.push(Value::Obj(i.new_object())),
+            Op::ObjectData(name_anonymous) => {
+                let value = pop!();
+                let key = pop!();
+                let key = i.to_property_key(&key)?.into_string();
+                if name_anonymous {
+                    let name = i.fn_name_for_key(&key);
+                    i.set_fn_name(&value, &name);
+                }
+                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                    unreachable!("object literal builder retains an Object")
+                };
+                object
+                    .borrow_mut()
+                    .props
+                    .insert(key, crate::value::Property::plain(value));
+            }
+            Op::ObjectSpread => {
+                let source = pop!();
+                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                    unreachable!("object literal builder retains an Object")
+                };
+                i.copy_data_properties_into(object, &source, &[])?;
+            }
+            Op::ObjectProto => {
+                let prototype = pop!();
+                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                    unreachable!("object literal builder retains an Object")
+                };
+                match prototype {
+                    Value::Obj(prototype) => object.borrow_mut().proto = Some(prototype),
+                    Value::Null => object.borrow_mut().proto = None,
+                    _ => {}
+                }
+            }
+            Op::ObjectMethod(function, kind) => {
+                let key = pop!();
+                let key = i.to_property_key(&key)?.into_string();
+                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                    unreachable!("object literal builder retains an Object")
+                };
+                let home_env = crate::interpreter::new_scope(Some(env.clone()));
+                crate::eval::bind(&home_env, "%homeobject%", Value::Obj(object.clone()));
+                let value = i.make_function(chunk.funcs[function as usize].clone(), home_env);
+                let name = i.fn_name_for_key(&key);
+                match kind {
+                    0 => {
+                        i.set_fn_name(&value, &name);
+                        object
+                            .borrow_mut()
+                            .props
+                            .insert(key, crate::value::Property::plain(value));
+                    }
+                    1 => {
+                        i.set_fn_name(&value, &format!("get {name}"));
+                        i.define_accessor(object, &key, Some(value), None);
+                    }
+                    2 => {
+                        i.set_fn_name(&value, &format!("set {name}"));
+                        i.define_accessor(object, &key, None, Some(value));
+                    }
+                    _ => unreachable!("object method kind is compiler-internal"),
+                }
+            }
+            Op::ImportMeta => stack.push(i.import_meta_vm(env)),
+            Op::NewTarget => stack.push(i.new_target_vm(env)),
+            Op::DynamicImport(phase, has_options) => {
+                let options = has_options.then(|| pop!());
+                let specifier = pop!();
+                stack.push(i.import_call_vm(specifier, options, phase, env)?);
+            }
+            Op::PrivateIn(name) => {
+                let value = pop!();
+                stack.push(i.private_in_vm(&chunk.names[name as usize], value, env)?);
+            }
+            Op::GetPrivate(name) => {
+                let base = pop!();
+                stack.push(i.private_get_vm(&chunk.names[name as usize], &base, env)?);
+            }
+            Op::GetPrivateKeep(name) => {
+                let base = pop!();
+                let value = i.private_get_vm(&chunk.names[name as usize], &base, env)?;
+                stack.push(base);
+                stack.push(value);
+            }
+            Op::GetPrivateMethod(name) => {
+                let base = pop!();
+                let method = i.private_get_vm(&chunk.names[name as usize], &base, env)?;
+                stack.push(base);
+                stack.push(method);
+            }
+            Op::SetPrivate(name) => {
+                let value = pop!();
+                let base = pop!();
+                i.private_set_vm(&chunk.names[name as usize], &base, value.clone(), env)?;
+                stack.push(value);
+            }
+            Op::UpdatePrivate(name, kind) => {
+                let base = pop!();
+                let old = i.private_get_vm(&chunk.names[name as usize], &base, env)?;
+                if let Some(value) = step_value(i, kind, old, |i, value| {
+                    i.private_set_vm(&chunk.names[name as usize], &base, value, env)
+                })? {
+                    stack.push(value);
+                }
+            }
+            // ECMA-262 §13.3.7.1 creates a Super Reference with the current function's actual
+            // this binding as [[ThisValue]]. Compiled calls keep that binding in the VM frame
+            // rather than materializing an activation environment, so use it directly here.
+            Op::SuperThis => stack.push(this_val.clone()),
+            Op::SuperBase => stack.push(i.super_base_vm(env)?),
+            Op::SuperGet | Op::SuperGetMethod => {
+                let keep_receiver = matches!(op, Op::SuperGetMethod);
+                let base = pop!();
+                let key = pop!();
+                let receiver = pop!();
+                let value = i.super_get_vm(&base, receiver.clone(), key)?;
+                if keep_receiver {
+                    stack.push(receiver);
+                }
+                stack.push(value);
+            }
+            Op::SuperGetKeep => {
+                let base = pop!();
+                let key = pop!();
+                let receiver = pop!();
+                if matches!(base, Value::Null | Value::Undefined) {
+                    return Err(i.throw("TypeError", "cannot read property of null super base"));
+                }
+                let key = i.to_property_key(&key)?.into_string();
+                let value = i.get_member_recv(&base, &key, receiver.clone())?;
+                stack.push(receiver);
+                stack.push(Value::from_string(key));
+                stack.push(base);
+                stack.push(value);
+            }
+            Op::SuperSet => {
+                let value = pop!();
+                let base = pop!();
+                let key = pop!();
+                let receiver = pop!();
+                i.super_set_vm(&base, receiver, key, value.clone())?;
+                stack.push(value);
+            }
+            Op::SuperUpdate(kind) => {
+                let base = pop!();
+                let key = pop!();
+                let receiver = pop!();
+                if matches!(base, Value::Null | Value::Undefined) {
+                    return Err(i.throw("TypeError", "cannot read property of null super base"));
+                }
+                let key = i.to_property_key(&key)?.into_string();
+                let old = i.get_member_recv(&base, &key, receiver.clone())?;
+                if let Some(value) = step_value(i, kind, old, |i, value| {
+                    i.set_member_recv(&base, &key, value, receiver.clone())
+                        .map(|_| ())
+                })? {
+                    stack.push(value);
+                }
+            }
+            Op::TemplateObject(site) => {
+                stack.push(i.template_object(&chunk.templates[site as usize])?);
+            }
+            Op::RequireCallable => {
+                if !stack
+                    .last()
+                    .expect("tagged-template callee missing")
+                    .is_callable()
+                {
+                    return Err(i.throw("TypeError", "tag is not a function"));
+                }
+            }
             Op::ToStr => {
                 let v = pop!();
                 let s = i.to_string(&v)?;
@@ -5858,6 +9649,31 @@ fn run_vm(
                 let (it, nx) = i.get_iterator(&v)?;
                 stack.push(it);
                 stack.push(nx);
+            }
+            Op::GetAsyncIter => {
+                let v = pop!();
+                let opened = VmDelegate::open(i, v, true)?;
+                stack.push(opened.iterator);
+                stack.push(opened.next);
+                stack.push(Value::Bool(opened.from_sync));
+            }
+            Op::ForInKeys => {
+                let source = pop!();
+                let keys = i
+                    .for_in_keys(&source)?
+                    .into_iter()
+                    .map(Value::from_string)
+                    .collect();
+                stack.push(i.make_array(keys));
+            }
+            Op::ForInStepL(keys, index, source) => {
+                if let Some(key) = for_in_step(i, slots, keys, index, source)? {
+                    stack.push(key);
+                    stack.push(Value::Bool(true));
+                } else {
+                    stack.push(Value::Undefined);
+                    stack.push(Value::Bool(false));
+                }
             }
             Op::IterStepL(is, ns) => {
                 let it = slots[is as usize].clone();
@@ -5883,17 +9699,202 @@ fn run_vm(
                 i.iterator_close(&it);
                 return Err(Abrupt::Throw(exc));
             }
+            Op::DestructureStepL(iter_s, next_s, done_s) => {
+                if matches!(slots[done_s as usize], Value::Bool(true)) {
+                    stack.push(Value::Undefined);
+                    continue;
+                }
+                // IteratorDestructuringAssignmentEvaluation sets [[Done]] before propagating an
+                // abrupt IteratorStep. Restore false only after obtaining a live value.
+                slots[done_s as usize] = Value::Bool(true);
+                let iterator = slots[iter_s as usize].clone();
+                let next = slots[next_s as usize].clone();
+                match i.iterator_step(&iterator, &next)? {
+                    Some(value) => {
+                        slots[done_s as usize] = Value::Bool(false);
+                        stack.push(value);
+                    }
+                    None => stack.push(Value::Undefined),
+                }
+            }
+            Op::DestructureRestL(iter_s, next_s, done_s) => {
+                let mut values = Vec::new();
+                while !matches!(slots[done_s as usize], Value::Bool(true)) {
+                    slots[done_s as usize] = Value::Bool(true);
+                    let iterator = slots[iter_s as usize].clone();
+                    let next = slots[next_s as usize].clone();
+                    match i.iterator_step(&iterator, &next)? {
+                        Some(value) => {
+                            slots[done_s as usize] = Value::Bool(false);
+                            values.push(value);
+                        }
+                        None => break,
+                    }
+                }
+                stack.push(i.make_array(values));
+            }
+            Op::IterCloseIfNotDoneL(iter_s, done_s) => {
+                if !matches!(slots[done_s as usize], Value::Bool(true)) {
+                    slots[done_s as usize] = Value::Bool(true);
+                    let iterator = slots[iter_s as usize].clone();
+                    i.iterator_close_normal(&iterator)?;
+                }
+            }
+            Op::IterAbortIfNotDoneL(iter_s, done_s) => {
+                let error = pop!();
+                if !matches!(slots[done_s as usize], Value::Bool(true)) {
+                    slots[done_s as usize] = Value::Bool(true);
+                    let iterator = slots[iter_s as usize].clone();
+                    i.iterator_close(&iterator);
+                }
+                return Err(Abrupt::Throw(error));
+            }
+            Op::AsyncIterStepL(iter_s, next_s, from_sync_s, done_s) => {
+                let iterator = slots[iter_s as usize].clone();
+                let next = slots[next_s as usize].clone();
+                let from_sync = matches!(slots[from_sync_s as usize], Value::Bool(true));
+                let result = match i.call(next, iterator.clone(), &[]) {
+                    Ok(result) => result,
+                    Err(error) if from_sync => {
+                        return Ok(VmStep::Await(async_from_sync_abrupt_promise(i, error)?));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if !from_sync {
+                    return Ok(VmStep::Await(result));
+                }
+                if !matches!(result, Value::Obj(_)) {
+                    let error = i.make_error("TypeError", "iterator result is not an object");
+                    return Ok(VmStep::Await(rejected_intrinsic_promise(i, error)));
+                }
+                let done = match i.get_member(&result, "done") {
+                    Ok(done) => done,
+                    Err(error) => {
+                        return Ok(VmStep::Await(async_from_sync_abrupt_promise(i, error)?));
+                    }
+                };
+                let done = i.to_boolean(&done);
+                let value = match i.get_member(&result, "value") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Ok(VmStep::Await(async_from_sync_abrupt_promise(i, error)?));
+                    }
+                };
+                slots[done_s as usize] = Value::Bool(done);
+                // AsyncFromSyncIteratorContinuation resolves and chains the value into the
+                // adapter promise before the loop's Await. A live value rejection closes the
+                // underlying sync iterator in that reaction job, not one Await job later.
+                let wrapper = match i.promise_resolve_checked(value) {
+                    Ok(promise) => {
+                        let on_rejected = if done {
+                            Value::Undefined
+                        } else {
+                            crate::builtins::make_bound_len(
+                                i,
+                                async_from_sync_close_rejection,
+                                vec![iterator],
+                                1.0,
+                            )
+                        };
+                        i.promise_then(&promise, Value::Undefined, on_rejected)
+                    }
+                    Err(error) => {
+                        if !done {
+                            i.iterator_close(&iterator);
+                        }
+                        rejected_intrinsic_promise(i, error)
+                    }
+                };
+                return Ok(VmStep::Await(wrapper));
+            }
+            Op::AsyncIterResumeL(from_sync_s, done_s) => {
+                let settled = pop!();
+                let from_sync = matches!(slots[from_sync_s as usize], Value::Bool(true));
+                let (done, value) = if from_sync {
+                    let done = matches!(slots[done_s as usize], Value::Bool(true));
+                    (done, if done { Value::Undefined } else { settled })
+                } else {
+                    if !matches!(settled, Value::Obj(_)) {
+                        return Err(i.throw("TypeError", "iterator result is not an object"));
+                    }
+                    let done = i.get_member(&settled, "done")?;
+                    let done = i.to_boolean(&done);
+                    let value = if done {
+                        Value::Undefined
+                    } else {
+                        i.get_member(&settled, "value")?
+                    };
+                    (done, value)
+                };
+                stack.push(value);
+                stack.push(Value::Bool(!done));
+            }
+            Op::AsyncIterCloseL(iter_s, from_sync_s, swallow_error) => {
+                return Ok(VmStep::AsyncClose {
+                    iterator: slots[iter_s as usize].clone(),
+                    from_sync: matches!(slots[from_sync_s as usize], Value::Bool(true)),
+                    swallow_error,
+                });
+            }
             Op::Throw => {
                 let v = pop!();
                 return Err(Abrupt::Throw(v));
             }
-            Op::Return => return Ok(VmStep::Done(pop!())),
+            Op::AbruptJump(target, handler_depth) => {
+                return Ok(VmStep::AbruptJump {
+                    target: target as usize,
+                    handler_depth: handler_depth as usize,
+                });
+            }
+            Op::Return => return Ok(VmStep::Return(pop!())),
+            Op::ReturnBare => return Ok(VmStep::BareReturn),
+            Op::ResumeReturn => return Ok(VmStep::ResumeReturn(pop!())),
+            Op::ResumeJump => {
+                let handler_depth = match pop!() {
+                    Value::Num(value) => value as usize,
+                    _ => unreachable!("finally jump depth is an internal integer"),
+                };
+                let target = match pop!() {
+                    Value::Num(value) => value as usize,
+                    _ => unreachable!("finally jump target is an internal integer"),
+                };
+                return Ok(VmStep::AbruptJump {
+                    target,
+                    handler_depth,
+                });
+            }
             Op::ReturnUndef => return Ok(VmStep::Done(Value::Undefined)),
             Op::Await => return Ok(VmStep::Await(pop!())),
-            Op::PushHandler(catch_pc) => handlers.push(Handler {
-                catch_pc: catch_pc as usize,
+            Op::Yield => return Ok(VmStep::Yield(pop!())),
+            Op::YieldStar => return Ok(VmStep::YieldStar(pop!())),
+            Op::PushHandler(throw_pc) => handlers.push(Handler {
+                target: HandlerTarget::Catch {
+                    throw_pc: throw_pc as usize,
+                },
                 stack_depth: stack.len(),
             }),
+            Op::PushFinally(throw_pc, return_pc, bare_return_pc, resume_return_pc, jump_pc) => {
+                handlers.push(Handler {
+                    target: HandlerTarget::Finally {
+                        throw_pc: throw_pc as usize,
+                        return_pc: return_pc as usize,
+                        bare_return_pc: bare_return_pc as usize,
+                        resume_return_pc: resume_return_pc as usize,
+                        jump_pc: jump_pc as usize,
+                    },
+                    stack_depth: stack.len(),
+                })
+            }
+            Op::PushIterator(throw_pc, return_pc, bare_return_pc, resume_return_pc) => handlers
+                .push(Handler {
+                    target: HandlerTarget::Iterator {
+                        throw_pc: throw_pc as usize,
+                        return_pc: return_pc as usize,
+                        bare_return_pc: bare_return_pc as usize,
+                        resume_return_pc: resume_return_pc as usize,
+                    },
+                    stack_depth: stack.len(),
+                }),
             Op::PopHandler => {
                 handlers.pop();
             }
@@ -5901,13 +9902,650 @@ fn run_vm(
     }
 }
 
-/// An async function body running on the bytecode VM, suspendable at each `await` without an OS
-/// thread. It presents the same `resume(&mut Interp, Resume) -> Suspend` shape as the thread-backed
-/// coroutine, so the promise driver (`Interp::drive_async`) treats both uniformly — the only cost
-/// per await is now a couple of `Vec` swaps instead of a thread handoff.
+#[derive(Clone, Copy)]
+enum DelegateCompletion {
+    Normal,
+    Return,
+}
+
+enum DelegateStage {
+    /// Waiting for the completion produced by the outer generator's next/throw/return method.
+    Ready,
+    /// An async iterator method result is being awaited.
+    AwaitResult(DelegateCompletion),
+    /// An async-from-sync iterator result's value is being awaited.
+    AwaitValue {
+        completion: DelegateCompletion,
+        done: bool,
+    },
+    /// AsyncIteratorClose after a missing delegated `throw` is awaiting `return()`.
+    AwaitCloseResult,
+    /// The async-from-sync close result's value is being awaited.
+    AwaitCloseValue,
+    /// A delegated async iterator has no `return`; YieldExpression performs its own Await of the
+    /// already-unwrapped outer return value before propagating the return completion.
+    AwaitMissingReturn,
+}
+
+struct VmDelegate {
+    iterator: Value,
+    next: Value,
+    from_sync: bool,
+    async_mode: bool,
+    stage: DelegateStage,
+}
+
+enum DelegateAction {
+    Suspend(crate::coroutine::Suspend),
+    Continue(Value),
+    Return(Value),
+    Throw(Value),
+    Terminate,
+}
+
+struct VmDispose {
+    resources: Vec<crate::interpreter::Disposable>,
+    output: DisposeCompletion,
+    needs_await: bool,
+    has_awaited: bool,
+    /// A synchronous resource deferred until the await-only marker immediately above it has
+    /// yielded one job turn.
+    pending_resource: Option<crate::interpreter::Disposable>,
+}
+
+enum DisposeAction {
+    Suspend(Value),
+    Complete(DisposeCompletion),
+    Terminate,
+}
+
+impl VmDispose {
+    fn new(resources: Vec<crate::interpreter::Disposable>, output: DisposeCompletion) -> VmDispose {
+        VmDispose {
+            resources,
+            output,
+            needs_await: false,
+            has_awaited: false,
+            pending_resource: None,
+        }
+    }
+
+    fn record_error(&mut self, i: &mut Interp, error: Value) {
+        let previous = std::mem::replace(&mut self.output, DisposeCompletion::Normal);
+        self.output = match previous {
+            DisposeCompletion::Throw(suppressed) => {
+                DisposeCompletion::Throw(i.make_suppressed(error, suppressed))
+            }
+            _ => DisposeCompletion::Throw(error),
+        };
+    }
+
+    fn call_failure(&mut self, i: &mut Interp, error: Abrupt) -> Option<DisposeAction> {
+        match error {
+            Abrupt::Throw(error) => {
+                self.record_error(i, error);
+                None
+            }
+            Abrupt::Interrupt(_) => Some(DisposeAction::Terminate),
+            // Call's function boundary consumes these completion kinds. Keep the defensive path
+            // non-panicking if a host callable violates that contract.
+            Abrupt::Return(value) | Abrupt::Break(_, value) | Abrupt::Continue(_, value) => {
+                self.record_error(i, value);
+                None
+            }
+        }
+    }
+
+    fn advance(&mut self, i: &mut Interp) -> DisposeAction {
+        loop {
+            let resource = match self
+                .pending_resource
+                .take()
+                .or_else(|| self.resources.pop())
+            {
+                Some(resource) => resource,
+                None => {
+                    if self.needs_await && !self.has_awaited {
+                        self.needs_await = false;
+                        return DisposeAction::Suspend(Value::Undefined);
+                    }
+                    return DisposeAction::Complete(std::mem::replace(
+                        &mut self.output,
+                        DisposeCompletion::Normal,
+                    ));
+                }
+            };
+
+            if !resource.kind_is_async && self.needs_await && !self.has_awaited {
+                self.needs_await = false;
+                self.pending_resource = Some(resource);
+                return DisposeAction::Suspend(Value::Undefined);
+            }
+            if !resource.method.is_callable() {
+                debug_assert!(resource.kind_is_async);
+                self.needs_await = true;
+                continue;
+            }
+
+            let called = i.call(resource.method, resource.value, &[]);
+            if !resource.kind_is_async {
+                if let Err(error) = called {
+                    if let Some(action) = self.call_failure(i, error) {
+                        return action;
+                    }
+                }
+                continue;
+            }
+
+            if resource.method_is_async {
+                match called {
+                    Ok(value) => {
+                        self.has_awaited = true;
+                        return DisposeAction::Suspend(value);
+                    }
+                    Err(error) => {
+                        if let Some(action) = self.call_failure(i, error) {
+                            return action;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // The sync fallback is wrapped into an intrinsic async disposer. Its return value is
+            // ignored; a synchronous throw rejects the wrapper promise before Await observes it.
+            let promise = i.new_promise();
+            match called {
+                Ok(_) => i.resolve_promise(&promise, Value::Undefined),
+                Err(Abrupt::Throw(error)) => i.reject_promise(&promise, error),
+                Err(error) => {
+                    if let Some(action) = self.call_failure(i, error) {
+                        return action;
+                    }
+                    continue;
+                }
+            }
+            self.has_awaited = true;
+            return DisposeAction::Suspend(promise);
+        }
+    }
+
+    fn resume(&mut self, i: &mut Interp, signal: crate::coroutine::Resume) -> DisposeAction {
+        match signal {
+            crate::coroutine::Resume::Next(_) => {}
+            crate::coroutine::Resume::Throw(error) => self.record_error(i, error),
+            crate::coroutine::Resume::Return(value) => {
+                self.output = DisposeCompletion::ResumeReturn(value)
+            }
+            crate::coroutine::Resume::Terminate => return DisposeAction::Terminate,
+        }
+        self.advance(i)
+    }
+}
+
+fn pending_dispose_completion(completion: DisposeCompletion) -> Option<PendingCompletion> {
+    match completion {
+        DisposeCompletion::Normal => None,
+        DisposeCompletion::Throw(error) => Some(PendingCompletion::Throw(error)),
+        DisposeCompletion::SourceReturn(value) => Some(PendingCompletion::SourceReturn(value)),
+        DisposeCompletion::BareReturn => Some(PendingCompletion::BareReturn),
+        DisposeCompletion::ResumeReturn(value) => Some(PendingCompletion::ResumeReturn(value)),
+        DisposeCompletion::Jump {
+            target,
+            handler_depth,
+        } => Some(PendingCompletion::Jump {
+            target,
+            handler_depth,
+        }),
+    }
+}
+
+enum AsyncCloseStage {
+    AwaitResult,
+    AwaitValue,
+}
+
+struct VmAsyncClose {
+    /// Keep the iterator alive while an awaited close reaction is pending.
+    _iterator: Value,
+    swallow_error: bool,
+    stage: AsyncCloseStage,
+}
+
+enum AsyncCloseAction {
+    Suspend(crate::coroutine::Suspend),
+    Continue,
+    Throw(Value),
+    Terminate,
+}
+
+impl VmAsyncClose {
+    fn failure(swallow_error: bool, error: Abrupt) -> AsyncCloseAction {
+        match error {
+            Abrupt::Throw(_) if swallow_error => AsyncCloseAction::Continue,
+            Abrupt::Throw(error) => AsyncCloseAction::Throw(error),
+            Abrupt::Interrupt(_) => AsyncCloseAction::Terminate,
+            Abrupt::Return(value) => AsyncCloseAction::Throw(value),
+            Abrupt::Break(_, value) | Abrupt::Continue(_, value) => AsyncCloseAction::Throw(value),
+        }
+    }
+
+    fn start(
+        i: &mut Interp,
+        iterator: Value,
+        from_sync: bool,
+        swallow_error: bool,
+    ) -> (Option<VmAsyncClose>, AsyncCloseAction) {
+        use crate::coroutine::Suspend;
+
+        // CreateAsyncFromSyncIterator's `return` is an intrinsic method which always returns a
+        // promise. Even an absent underlying `return`, or a getter/call/protocol error, therefore
+        // reaches AsyncIteratorClose through Await. Preserve that mandatory job boundary instead
+        // of directly invoking the sync close as though this were IteratorClose.
+        if from_sync {
+            return Self::start_from_sync(i, iterator, swallow_error);
+        }
+
+        let ret = match i.get_member(&iterator, "return") {
+            Ok(ret) => ret,
+            Err(error) => return (None, Self::failure(swallow_error, error)),
+        };
+        if matches!(ret, Value::Undefined | Value::Null) {
+            return (None, AsyncCloseAction::Continue);
+        }
+        if !ret.is_callable() {
+            let error = i.throw("TypeError", "iterator 'return' is not callable");
+            return (None, Self::failure(swallow_error, error));
+        }
+        let result = match i.call(ret, iterator.clone(), &[]) {
+            Ok(result) => result,
+            Err(error) => return (None, Self::failure(swallow_error, error)),
+        };
+        (
+            Some(VmAsyncClose {
+                _iterator: iterator,
+                swallow_error,
+                stage: AsyncCloseStage::AwaitResult,
+            }),
+            AsyncCloseAction::Suspend(Suspend::Await(result)),
+        )
+    }
+
+    fn suspend_from_sync(
+        iterator: Value,
+        swallow_error: bool,
+        stage: AsyncCloseStage,
+        promise: Value,
+    ) -> (Option<VmAsyncClose>, AsyncCloseAction) {
+        (
+            Some(VmAsyncClose {
+                _iterator: iterator,
+                swallow_error,
+                stage,
+            }),
+            AsyncCloseAction::Suspend(crate::coroutine::Suspend::Await(promise)),
+        )
+    }
+
+    fn reject_from_sync(
+        i: &mut Interp,
+        iterator: Value,
+        swallow_error: bool,
+        error: Abrupt,
+    ) -> (Option<VmAsyncClose>, AsyncCloseAction) {
+        match error {
+            Abrupt::Throw(error) => Self::suspend_from_sync(
+                iterator,
+                swallow_error,
+                AsyncCloseStage::AwaitResult,
+                rejected_intrinsic_promise(i, error),
+            ),
+            other => (None, Self::failure(swallow_error, other)),
+        }
+    }
+
+    fn start_from_sync(
+        i: &mut Interp,
+        iterator: Value,
+        swallow_error: bool,
+    ) -> (Option<VmAsyncClose>, AsyncCloseAction) {
+        let ret = match i.get_member(&iterator, "return") {
+            Ok(ret) => ret,
+            Err(error) => {
+                return Self::reject_from_sync(i, iterator, swallow_error, error);
+            }
+        };
+        if matches!(ret, Value::Undefined | Value::Null) {
+            let promise = i.new_promise();
+            let result = i.iter_result_obj(Value::Undefined, true);
+            i.resolve_promise(&promise, result);
+            return Self::suspend_from_sync(
+                iterator,
+                swallow_error,
+                AsyncCloseStage::AwaitResult,
+                promise,
+            );
+        }
+        if !ret.is_callable() {
+            let error =
+                Abrupt::Throw(i.make_error("TypeError", "iterator 'return' is not callable"));
+            return Self::reject_from_sync(i, iterator, swallow_error, error);
+        }
+        let result = match i.call(ret, iterator.clone(), &[]) {
+            Ok(result) => result,
+            Err(error) => {
+                return Self::reject_from_sync(i, iterator, swallow_error, error);
+            }
+        };
+        if !matches!(result, Value::Obj(_)) {
+            let error =
+                Abrupt::Throw(i.make_error("TypeError", "iterator result is not an object"));
+            return Self::reject_from_sync(i, iterator, swallow_error, error);
+        }
+        // AsyncFromSyncIteratorContinuation observes `done` before `value`, even though
+        // AsyncIteratorClose only uses the repackaged result's object-ness.
+        if let Err(error) = i.get_member(&result, "done") {
+            return Self::reject_from_sync(i, iterator, swallow_error, error);
+        }
+        let value = match i.get_member(&result, "value") {
+            Ok(value) => value,
+            Err(error) => {
+                return Self::reject_from_sync(i, iterator, swallow_error, error);
+            }
+        };
+        let wrapper = match i.promise_resolve_checked(value) {
+            Ok(promise) => i.promise_then(&promise, Value::Undefined, Value::Undefined),
+            Err(error) => rejected_intrinsic_promise(i, error),
+        };
+        Self::suspend_from_sync(
+            iterator,
+            swallow_error,
+            AsyncCloseStage::AwaitValue,
+            wrapper,
+        )
+    }
+
+    fn resume(&mut self, i: &mut Interp, signal: crate::coroutine::Resume) -> AsyncCloseAction {
+        use crate::coroutine::Resume;
+        match signal {
+            Resume::Next(result) => match self.stage {
+                AsyncCloseStage::AwaitResult => {
+                    if matches!(result, Value::Obj(_)) {
+                        AsyncCloseAction::Continue
+                    } else {
+                        Self::failure(
+                            self.swallow_error,
+                            i.throw("TypeError", "iterator result is not an object"),
+                        )
+                    }
+                }
+                AsyncCloseStage::AwaitValue => AsyncCloseAction::Continue,
+            },
+            Resume::Throw(error) => Self::failure(self.swallow_error, Abrupt::Throw(error)),
+            Resume::Return(error) => Self::failure(self.swallow_error, Abrupt::Throw(error)),
+            Resume::Terminate => AsyncCloseAction::Terminate,
+        }
+    }
+}
+
+impl VmDelegate {
+    /// GetIterator(value, generator kind). Async generators prefer @@asyncIterator and otherwise
+    /// retain the sync iterator plus an explicit async-from-sync continuation state.
+    fn open(i: &mut Interp, value: Value, async_mode: bool) -> Result<Self, Abrupt> {
+        let (iterator, next, from_sync) = if async_mode {
+            let key = crate::builtins::async_iterator_key(i);
+            let method = match key {
+                Some(key) => i.get_member(&value, &key)?,
+                None => Value::Undefined,
+            };
+            if !matches!(method, Value::Undefined | Value::Null) && !method.is_callable() {
+                return Err(i.throw("TypeError", "@@asyncIterator is not callable"));
+            }
+            if method.is_callable() {
+                let iterator = i.call(method, value, &[])?;
+                if !matches!(iterator, Value::Obj(_)) {
+                    return Err(i.throw("TypeError", "@@asyncIterator did not return an object"));
+                }
+                let next = i.get_member(&iterator, "next")?;
+                (iterator, next, false)
+            } else {
+                let (iterator, next) = i.get_iterator(&value)?;
+                (iterator, next, true)
+            }
+        } else {
+            let (iterator, next) = i.get_iterator(&value)?;
+            (iterator, next, false)
+        };
+        Ok(Self {
+            iterator,
+            next,
+            from_sync,
+            async_mode,
+            stage: DelegateStage::Ready,
+        })
+    }
+
+    fn abrupt(error: Abrupt) -> DelegateAction {
+        match error {
+            Abrupt::Throw(value) => DelegateAction::Throw(value),
+            Abrupt::Return(value) => DelegateAction::Return(value),
+            Abrupt::Interrupt(_) => DelegateAction::Terminate,
+            Abrupt::Break(_, _) | Abrupt::Continue(_, _) => DelegateAction::Terminate,
+        }
+    }
+
+    fn type_error(i: &mut Interp, message: &str) -> DelegateAction {
+        DelegateAction::Throw(i.make_error("TypeError", message))
+    }
+
+    /// Consume either an outer resumption completion or an internal async-await reaction.
+    fn resume(&mut self, i: &mut Interp, signal: crate::coroutine::Resume) -> DelegateAction {
+        use crate::coroutine::{Resume, Suspend};
+        let stage = std::mem::replace(&mut self.stage, DelegateStage::Ready);
+        match stage {
+            DelegateStage::Ready => {
+                let (method, argument, completion) = match signal {
+                    Resume::Next(value) => (self.next.clone(), value, DelegateCompletion::Normal),
+                    Resume::Throw(error) => {
+                        let method = match i.get_member(&self.iterator, "throw") {
+                            Ok(method) => method,
+                            Err(error) => return Self::abrupt(error),
+                        };
+                        if matches!(method, Value::Undefined | Value::Null) {
+                            if !self.async_mode {
+                                if let Err(error) = i.iterator_close_normal(&self.iterator) {
+                                    return Self::abrupt(error);
+                                }
+                                return Self::type_error(
+                                    i,
+                                    "the delegated iterator has no 'throw' method",
+                                );
+                            }
+                            // AsyncIteratorClose(iteratorRecord, NormalCompletion(empty)) before
+                            // the mandated protocol TypeError.
+                            let ret = match i.get_member(&self.iterator, "return") {
+                                Ok(ret) => ret,
+                                Err(error) => return Self::abrupt(error),
+                            };
+                            if matches!(ret, Value::Undefined | Value::Null) {
+                                return Self::type_error(
+                                    i,
+                                    "the delegated iterator has no 'throw' method",
+                                );
+                            }
+                            if !ret.is_callable() {
+                                return Self::type_error(i, "iterator 'return' is not callable");
+                            }
+                            let result = match i.call(ret, self.iterator.clone(), &[]) {
+                                Ok(result) => result,
+                                Err(error) => return Self::abrupt(error),
+                            };
+                            self.stage = DelegateStage::AwaitCloseResult;
+                            return DelegateAction::Suspend(Suspend::Await(result));
+                        }
+                        if !method.is_callable() {
+                            return Self::type_error(i, "iterator 'throw' is not callable");
+                        }
+                        (method, error, DelegateCompletion::Normal)
+                    }
+                    Resume::Return(value) => {
+                        let method = match i.get_member(&self.iterator, "return") {
+                            Ok(method) => method,
+                            Err(error) => return Self::abrupt(error),
+                        };
+                        if matches!(method, Value::Undefined | Value::Null) {
+                            if self.async_mode {
+                                self.stage = DelegateStage::AwaitMissingReturn;
+                                return DelegateAction::Suspend(Suspend::Await(value));
+                            }
+                            return DelegateAction::Return(value);
+                        }
+                        if !method.is_callable() {
+                            return Self::type_error(i, "iterator 'return' is not callable");
+                        }
+                        (method, value, DelegateCompletion::Return)
+                    }
+                    Resume::Terminate => return DelegateAction::Terminate,
+                };
+                let result = match i.call(method, self.iterator.clone(), &[argument]) {
+                    Ok(result) => result,
+                    Err(error) => return Self::abrupt(error),
+                };
+                if self.async_mode {
+                    self.stage = DelegateStage::AwaitResult(completion);
+                    DelegateAction::Suspend(Suspend::Await(result))
+                } else {
+                    self.process_result(i, result, completion)
+                }
+            }
+            DelegateStage::AwaitResult(completion) => match signal {
+                Resume::Next(result) => self.process_result(i, result, completion),
+                Resume::Throw(error) => DelegateAction::Throw(error),
+                Resume::Return(value) => DelegateAction::Return(value),
+                Resume::Terminate => DelegateAction::Terminate,
+            },
+            DelegateStage::AwaitValue { completion, done } => match signal {
+                Resume::Next(value) => self.process_value(i, value, done, completion, None),
+                Resume::Throw(error) => {
+                    if !done {
+                        i.iterator_close(&self.iterator);
+                    }
+                    DelegateAction::Throw(error)
+                }
+                Resume::Return(value) => DelegateAction::Return(value),
+                Resume::Terminate => DelegateAction::Terminate,
+            },
+            DelegateStage::AwaitCloseResult => match signal {
+                Resume::Next(result) => {
+                    if !matches!(result, Value::Obj(_)) {
+                        return Self::type_error(i, "iterator 'return' must return an object");
+                    }
+                    if self.from_sync {
+                        let value = match i.get_member(&result, "value") {
+                            Ok(value) => value,
+                            Err(error) => return Self::abrupt(error),
+                        };
+                        self.stage = DelegateStage::AwaitCloseValue;
+                        DelegateAction::Suspend(Suspend::Await(value))
+                    } else {
+                        Self::type_error(i, "the delegated iterator has no 'throw' method")
+                    }
+                }
+                Resume::Throw(error) => DelegateAction::Throw(error),
+                Resume::Return(value) => DelegateAction::Return(value),
+                Resume::Terminate => DelegateAction::Terminate,
+            },
+            DelegateStage::AwaitCloseValue => match signal {
+                Resume::Next(_) => {
+                    Self::type_error(i, "the delegated iterator has no 'throw' method")
+                }
+                Resume::Throw(error) => DelegateAction::Throw(error),
+                Resume::Return(value) => DelegateAction::Return(value),
+                Resume::Terminate => DelegateAction::Terminate,
+            },
+            DelegateStage::AwaitMissingReturn => match signal {
+                Resume::Next(value) => DelegateAction::Return(value),
+                Resume::Throw(error) => DelegateAction::Throw(error),
+                Resume::Return(value) => DelegateAction::Return(value),
+                Resume::Terminate => DelegateAction::Terminate,
+            },
+        }
+    }
+
+    fn process_result(
+        &mut self,
+        i: &mut Interp,
+        result: Value,
+        completion: DelegateCompletion,
+    ) -> DelegateAction {
+        use crate::coroutine::Suspend;
+        if !matches!(result, Value::Obj(_)) {
+            return Self::type_error(i, "iterator result is not an object");
+        }
+        let done = match i.get_member(&result, "done") {
+            Ok(done) => i.to_boolean(&done),
+            Err(error) => return Self::abrupt(error),
+        };
+        if !self.async_mode && !done {
+            // ECMA-262 YieldExpression : yield * AssignmentExpression passes the complete iterator
+            // result to GeneratorYield here. In particular, it does not perform IteratorValue, so
+            // an observable `value` getter must not run until the outer caller reads it.
+            self.stage = DelegateStage::Ready;
+            i.yield_raw_result = true;
+            return DelegateAction::Suspend(Suspend::Yield(result));
+        }
+        let value = match i.get_member(&result, "value") {
+            Ok(value) => value,
+            Err(error) => return Self::abrupt(error),
+        };
+        if self.async_mode && self.from_sync {
+            self.stage = DelegateStage::AwaitValue { completion, done };
+            return DelegateAction::Suspend(Suspend::Await(value));
+        }
+        self.process_value(i, value, done, completion, Some(result))
+    }
+
+    fn process_value(
+        &mut self,
+        i: &mut Interp,
+        value: Value,
+        done: bool,
+        completion: DelegateCompletion,
+        result: Option<Value>,
+    ) -> DelegateAction {
+        use crate::coroutine::Suspend;
+        if done {
+            return match completion {
+                DelegateCompletion::Normal => DelegateAction::Continue(value),
+                DelegateCompletion::Return => DelegateAction::Return(value),
+            };
+        }
+        self.stage = DelegateStage::Ready;
+        if self.async_mode {
+            // AsyncGeneratorYield receives IteratorValue(innerResult); unlike an ordinary async
+            // `yield`, delegation does not await a value produced by a native async iterator.
+            DelegateAction::Suspend(Suspend::Yield(value))
+        } else {
+            // GeneratorYield(innerResult) forwards the exact result object, including getters and
+            // identity, instead of creating a fresh `{ value, done }` wrapper.
+            i.yield_raw_result = true;
+            DelegateAction::Suspend(Suspend::Yield(
+                result.expect("a synchronous delegation retains its iterator result"),
+            ))
+        }
+    }
+}
+
+/// An async function or generator body running as a heap-owned bytecode continuation. It presents
+/// the same `resume(&mut Interp, Resume) -> Suspend` shape as the thread-backed fallback, so the
+/// promise/generator drivers treat both uniformly.
 pub struct VmCoro {
     chunk: Rc<Chunk>,
+    /// Fixed activation containing compiler-homed captures. `env` may temporarily point at a
+    /// nested Object Environment Record while a suspending `with` body is active.
+    cap_env: Env,
     env: Env,
+    references: Vec<Option<crate::eval::PreparedReference>>,
     this_val: Value,
     slots: Vec<Value>,
     stack: Vec<Value>,
@@ -5915,91 +10553,408 @@ pub struct VmCoro {
     /// The `try` handler stack, saved across suspensions so a rejected `await` inside a `try` still
     /// lands in its `catch`.
     handlers: Vec<Handler>,
+    /// One DisposableResource list per active `using` statement-list boundary. Unlike the
+    /// tree-walker's ambient stack, this storage belongs to the suspended continuation.
+    disposal_frames: Vec<Vec<crate::interpreter::Disposable>>,
+    is_generator: bool,
+    is_async_generator: bool,
+    awaiting_yield_value: bool,
+    awaiting_return_value: bool,
+    awaiting_body_return: bool,
+    delegation: Option<VmDelegate>,
+    async_close: Option<VmAsyncClose>,
+    disposal: Option<VmDispose>,
     pub done: bool,
     pub started: bool,
 }
 
 impl VmCoro {
-    /// Build an async coroutine for `chunk` with params seeded from `args`, parked before its first
-    /// step (run on the first `resume`).
-    pub fn new(i: &Interp, chunk: Rc<Chunk>, env: Env, this_val: Value, args: &[Value]) -> VmCoro {
-        let env = chunk.make_run_env(i, &env, &this_val, args);
+    /// Build an async coroutine for `chunk` with its already-instantiated parameter values, parked
+    /// before its first step (run on the first `resume`). `arguments` remains the original call
+    /// list, as required for the function's arguments object.
+    pub fn new(
+        i: &mut Interp,
+        chunk: Rc<Chunk>,
+        env: Env,
+        this_val: Value,
+        params: &[Value],
+        arguments: &[Value],
+    ) -> VmCoro {
+        let env = chunk.make_run_env(i, &env, &this_val, params);
+        let references = (0..chunk.n_refs).map(|_| None).collect();
         let mut slots = vec![Value::Undefined; chunk.n_slots];
-        for (k, a) in args.iter().take(chunk.n_params).enumerate() {
+        for (k, a) in params.iter().take(chunk.n_params).enumerate() {
             slots[k] = a.clone();
+        }
+        if let Some(slot) = chunk.arguments_slot {
+            slots[slot as usize] = Value::Obj(i.make_compiled_arguments_object(arguments, &env));
         }
         VmCoro {
             chunk,
+            cap_env: env.clone(),
             env,
+            references,
             this_val,
             slots,
             stack: Vec::with_capacity(16),
             pc: 0,
             handlers: Vec::new(),
+            disposal_frames: Vec::new(),
+            is_generator: false,
+            is_async_generator: false,
+            awaiting_yield_value: false,
+            awaiting_return_value: false,
+            awaiting_body_return: false,
+            delegation: None,
+            async_close: None,
+            disposal: None,
             done: false,
             started: false,
         }
     }
 
-    /// Drive one step: run to the next `await` (`Suspend::Await`), to completion (`Done`), or to an
-    /// uncaught throw (`Throw`). A `Resume::Throw` (rejected await) is injected at the await point so
-    /// an enclosing `try`/`catch` in the body can catch it; only an uncaught one rejects the function.
+    /// Build a synchronous generator continuation, parked in suspended-start without reserving a
+    /// native thread stack.
+    pub fn new_generator(
+        i: &mut Interp,
+        chunk: Rc<Chunk>,
+        env: Env,
+        this_val: Value,
+        params: &[Value],
+        arguments: &[Value],
+    ) -> VmCoro {
+        let mut coroutine = Self::new(i, chunk, env, this_val, params, arguments);
+        coroutine.is_generator = true;
+        coroutine
+    }
+
+    /// Build an async-generator continuation. `yield value` first reports `Await(value)` to the
+    /// async-generator driver and publishes the settled value as `Yield` on the reaction resume.
+    pub fn new_async_generator(
+        i: &mut Interp,
+        chunk: Rc<Chunk>,
+        env: Env,
+        this_val: Value,
+        params: &[Value],
+        arguments: &[Value],
+    ) -> VmCoro {
+        let mut coroutine = Self::new_generator(i, chunk, env, this_val, params, arguments);
+        coroutine.is_async_generator = true;
+        coroutine
+    }
+
+    /// Drive one step: run to the next `await`/`yield`, completion, or uncaught throw. A resumed
+    /// throw is injected at the suspension point so an enclosing VM `try` can catch it.
     pub fn resume(
         &mut self,
         i: &mut Interp,
-        signal: crate::coroutine::Resume,
+        mut signal: crate::coroutine::Resume,
     ) -> crate::coroutine::Suspend {
         use crate::coroutine::{Resume, Suspend};
         if self.done {
             return Suspend::Done(Value::Undefined);
         }
-        let pending_throw = match signal {
-            Resume::Next(v) => {
-                if self.started {
-                    self.stack.push(v); // the settled value of the await we parked at
+        let mut settled_body_return = None;
+        if self.awaiting_body_return {
+            self.awaiting_body_return = false;
+            let settled = std::mem::replace(&mut signal, Resume::Terminate);
+            settled_body_return = Some(match settled {
+                Resume::Next(value) | Resume::Return(value) => {
+                    PendingCompletion::ResumeReturn(value)
                 }
+                Resume::Throw(error) => PendingCompletion::Throw(error),
+                Resume::Terminate => {
+                    self.done = true;
+                    return Suspend::Done(Value::Undefined);
+                }
+            });
+        }
+        // AsyncGeneratorUnwrapYieldResumption: a return completion received at a suspended yield
+        // is awaited before either completing the generator or reaching a `yield*` delegate.
+        if settled_body_return.is_none() && self.awaiting_return_value {
+            self.awaiting_return_value = false;
+            signal = match signal {
+                Resume::Next(value) => Resume::Return(value),
+                Resume::Throw(error) => Resume::Throw(error),
+                Resume::Return(value) => Resume::Return(value),
+                Resume::Terminate => Resume::Terminate,
+            };
+        } else if settled_body_return.is_none() && self.is_async_generator && self.started {
+            if let Resume::Return(value) = signal {
+                self.awaiting_return_value = true;
+                return Suspend::Await(value);
+            }
+        }
+        if self.awaiting_yield_value {
+            self.awaiting_yield_value = false;
+            signal = match signal {
+                Resume::Next(value) => return Suspend::Yield(value),
+                other => other,
+            };
+        }
+        let mut resume_directly = false;
+        let mut disposal_pending = None;
+        loop {
+            let pending = if let Some(pending) = settled_body_return.take() {
+                Some(pending)
+            } else if let Some(pending) = disposal_pending.take() {
+                Some(pending)
+            } else if self.disposal.is_some() {
+                let action = self
+                    .disposal
+                    .as_mut()
+                    .expect("checked above")
+                    .resume(i, signal.clone());
+                match action {
+                    DisposeAction::Suspend(value) => return Suspend::Await(value),
+                    DisposeAction::Complete(completion) => {
+                        self.disposal = None;
+                        let pending = pending_dispose_completion(completion);
+                        if pending.is_none() {
+                            resume_directly = true;
+                        }
+                        pending
+                    }
+                    DisposeAction::Terminate => {
+                        self.disposal = None;
+                        self.done = true;
+                        return Suspend::Done(Value::Undefined);
+                    }
+                }
+            } else if self.async_close.is_some() {
+                let action = self
+                    .async_close
+                    .as_mut()
+                    .expect("checked above")
+                    .resume(i, signal.clone());
+                match action {
+                    AsyncCloseAction::Suspend(suspend) => return suspend,
+                    AsyncCloseAction::Continue => {
+                        self.async_close = None;
+                        resume_directly = true;
+                        None
+                    }
+                    AsyncCloseAction::Throw(error) => {
+                        self.async_close = None;
+                        Some(PendingCompletion::Throw(error))
+                    }
+                    AsyncCloseAction::Terminate => {
+                        self.async_close = None;
+                        self.done = true;
+                        return Suspend::Done(Value::Undefined);
+                    }
+                }
+            } else if resume_directly {
+                resume_directly = false;
                 None
-            }
-            // A rejected await: re-enter the VM throwing `e` at the suspension point.
-            Resume::Throw(e) if self.started => Some(e),
-            Resume::Throw(e) => {
-                self.done = true;
-                return Suspend::Throw(e);
-            }
-            Resume::Return(v) => {
-                self.done = true;
-                return Suspend::Done(v);
-            }
-            Resume::Terminate => {
-                self.done = true;
-                return Suspend::Done(Value::Undefined);
-            }
-        };
-        self.started = true;
-        match drive_vm(
-            i,
-            &self.chunk,
-            &self.env,
-            &mut self.slots,
-            &mut self.stack,
-            &mut self.pc,
-            &self.this_val,
-            &mut self.handlers,
-            pending_throw,
-        ) {
-            Ok(VmStep::Await(a)) => Suspend::Await(a),
-            Ok(VmStep::Done(v)) => {
-                self.done = true;
-                Suspend::Done(v)
-            }
-            Err(Abrupt::Throw(e)) => {
-                self.done = true;
-                Suspend::Throw(e)
-            }
-            // Return/Break/Continue can't escape a function body; treat defensively as completion.
-            Err(_) => {
-                self.done = true;
-                Suspend::Done(Value::Undefined)
+            } else if let Some(delegate) = self.delegation.as_mut() {
+                match delegate.resume(i, signal.clone()) {
+                    DelegateAction::Suspend(suspend) => return suspend,
+                    DelegateAction::Continue(value) => {
+                        self.delegation = None;
+                        self.stack.push(value); // result of the YieldExpression
+                        None
+                    }
+                    DelegateAction::Return(value) => {
+                        self.delegation = None;
+                        if self.handlers.iter().any(|handler| {
+                            matches!(
+                                &handler.target,
+                                HandlerTarget::Finally { .. } | HandlerTarget::Iterator { .. }
+                            )
+                        }) {
+                            Some(PendingCompletion::ResumeReturn(value))
+                        } else {
+                            self.done = true;
+                            return Suspend::Done(value);
+                        }
+                    }
+                    DelegateAction::Throw(error) => {
+                        self.delegation = None;
+                        Some(PendingCompletion::Throw(error))
+                    }
+                    DelegateAction::Terminate => {
+                        self.delegation = None;
+                        self.done = true;
+                        return Suspend::Done(Value::Undefined);
+                    }
+                }
+            } else {
+                match signal.clone() {
+                    Resume::Next(value) => {
+                        if self.started {
+                            // Settled await value, or the value of an ordinary `yield` expression.
+                            self.stack.push(value);
+                        }
+                        None
+                    }
+                    // A rejected await or `throw()` resumption enters the VM at the suspension
+                    // point, so its saved try-handler stack gets the first chance to catch it.
+                    Resume::Throw(error) if self.started => Some(PendingCompletion::Throw(error)),
+                    Resume::Throw(error) => {
+                        self.done = true;
+                        return Suspend::Throw(error);
+                    }
+                    Resume::Return(value) if self.started => {
+                        if self.handlers.iter().any(|handler| {
+                            matches!(
+                                &handler.target,
+                                HandlerTarget::Finally { .. } | HandlerTarget::Iterator { .. }
+                            )
+                        }) {
+                            Some(PendingCompletion::ResumeReturn(value))
+                        } else {
+                            self.done = true;
+                            return Suspend::Done(value);
+                        }
+                    }
+                    Resume::Return(value) => {
+                        self.done = true;
+                        return Suspend::Done(value);
+                    }
+                    Resume::Terminate => {
+                        self.done = true;
+                        return Suspend::Done(Value::Undefined);
+                    }
+                }
+            };
+            self.started = true;
+            // GeneratorResume/AsyncFunctionStart reinstates the suspended execution context.
+            // In particular, PutValue must use this function code's strictness rather than the
+            // host job/script that happened to resume it. Ordinary compiled calls establish this
+            // in `run_compiled_chunk`; heap continuations must do the same on every VM slice.
+            let saved_strict = std::mem::replace(&mut i.strict, self.chunk.strict);
+            let step = drive_vm(
+                i,
+                &self.chunk,
+                &mut self.env,
+                &self.cap_env,
+                &mut self.references,
+                &mut self.slots,
+                &mut self.stack,
+                &mut self.pc,
+                &self.this_val,
+                &mut self.handlers,
+                &mut self.disposal_frames,
+                pending,
+                self.is_async_generator,
+            );
+            i.strict = saved_strict;
+            match step {
+                Ok(VmStep::Await(awaited)) => return Suspend::Await(awaited),
+                Ok(VmStep::AsyncClose {
+                    iterator,
+                    from_sync,
+                    swallow_error,
+                }) => {
+                    let (state, action) =
+                        VmAsyncClose::start(i, iterator, from_sync, swallow_error);
+                    self.async_close = state;
+                    match action {
+                        AsyncCloseAction::Suspend(suspend) => return suspend,
+                        AsyncCloseAction::Continue => {
+                            self.async_close = None;
+                            resume_directly = true;
+                        }
+                        AsyncCloseAction::Throw(error) => {
+                            self.async_close = None;
+                            signal = Resume::Throw(error);
+                        }
+                        AsyncCloseAction::Terminate => {
+                            self.async_close = None;
+                            self.done = true;
+                            return Suspend::Done(Value::Undefined);
+                        }
+                    }
+                    continue;
+                }
+                Ok(VmStep::Dispose { frame, completion }) => {
+                    let mut disposal = VmDispose::new(frame, completion);
+                    match disposal.advance(i) {
+                        DisposeAction::Suspend(value) => {
+                            self.disposal = Some(disposal);
+                            return Suspend::Await(value);
+                        }
+                        DisposeAction::Complete(completion) => {
+                            let pending = pending_dispose_completion(completion);
+                            if pending.is_none() {
+                                resume_directly = true;
+                            }
+                            disposal_pending = pending;
+                        }
+                        DisposeAction::Terminate => {
+                            self.done = true;
+                            return Suspend::Done(Value::Undefined);
+                        }
+                    }
+                    continue;
+                }
+                Ok(VmStep::Yield(value)) if self.is_async_generator => {
+                    self.awaiting_yield_value = true;
+                    return Suspend::Await(value);
+                }
+                Ok(VmStep::Yield(value)) if self.is_generator => return Suspend::Yield(value),
+                Ok(VmStep::Yield(_)) => {
+                    self.done = true;
+                    return Suspend::Throw(
+                        i.make_error("SyntaxError", "yield outside a generator"),
+                    );
+                }
+                Ok(VmStep::YieldStar(value)) if self.is_generator => {
+                    match VmDelegate::open(i, value, self.is_async_generator) {
+                        Ok(delegate) => {
+                            self.delegation = Some(delegate);
+                            // YieldExpression starts its loop with NormalCompletion(undefined).
+                            signal = Resume::Next(Value::Undefined);
+                        }
+                        Err(Abrupt::Throw(error)) => signal = Resume::Throw(error),
+                        Err(Abrupt::Return(value)) => signal = Resume::Return(value),
+                        Err(Abrupt::Interrupt(_))
+                        | Err(Abrupt::Break(_, _))
+                        | Err(Abrupt::Continue(_, _)) => signal = Resume::Terminate,
+                    }
+                    continue;
+                }
+                Ok(VmStep::YieldStar(_)) => {
+                    self.done = true;
+                    return Suspend::Throw(
+                        i.make_error("SyntaxError", "yield outside a generator"),
+                    );
+                }
+                Ok(VmStep::Done(value)) => {
+                    self.done = true;
+                    return Suspend::Done(value);
+                }
+                Ok(VmStep::Return(value)) if self.is_async_generator => {
+                    // ReturnStatement : return Expression awaits its operand in an async
+                    // generator before producing the return completion (ECMA-262 §14.10.1).
+                    self.awaiting_body_return = true;
+                    return Suspend::Await(value);
+                }
+                Ok(VmStep::Return(value)) => {
+                    self.done = true;
+                    return Suspend::Done(value);
+                }
+                Ok(VmStep::ResumeReturn(value)) => {
+                    self.done = true;
+                    return Suspend::Done(value);
+                }
+                Ok(VmStep::BareReturn) => {
+                    self.done = true;
+                    return Suspend::Done(Value::Undefined);
+                }
+                Ok(VmStep::AbruptJump { .. }) => {
+                    unreachable!("drive_vm consumes loop completions")
+                }
+                Err(Abrupt::Throw(error)) => {
+                    self.done = true;
+                    return Suspend::Throw(error);
+                }
+                // Return/Break/Continue can't escape a function body; treat defensively as completion.
+                Err(_) => {
+                    self.done = true;
+                    return Suspend::Done(Value::Undefined);
+                }
             }
         }
     }
@@ -6187,72 +11142,11 @@ impl Chunk {
             (1..PROP_IC_WAYS).all(|way| self.caches[idx as usize + way].get().depth == IC_EMPTY);
         (st.depth != IC_EMPTY && mono).then_some(st)
     }
-    /// The property-cache way for one exact receiver shape at a polymorphic site. Region
-    /// planners use this when an earlier guarded discriminator has already proved the receiver
-    /// shape (for example, one arm of a virtual task dispatch). Returning `None` for duplicate
-    /// ways is defensive: a stable cache should contain a receiver shape at most once, and a
-    /// contradictory snapshot is not worth specializing.
-    pub(crate) fn jit_cache_for_shape(&self, idx: u32, recv_shape: u32) -> Option<IcState> {
-        let mut found = None;
-        for way in 0..PROP_IC_WAYS {
-            let st = self.caches[idx as usize + way].get();
-            if st.depth == IC_EMPTY || st.recv_shape != recv_shape {
-                continue;
-            }
-            if found.is_some() {
-                return None;
-            }
-            found = Some(st);
-        }
-        found
-    }
     /// The stable address of call site `idx`'s way-1 `Cell<CallIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]: `call_caches` is fixed once compilation finishes and the Chunk
     /// outlives its JIT code).
     pub(crate) fn jit_call_cache_ptr(&self, idx: u32) -> usize {
         self.call_caches[idx as usize].entries.as_ptr() as usize
-    }
-    /// The one live callee observed at a call site, together with a strong handle proving that
-    /// the raw function/chunk pointers in [`CallIc`] remain valid while a region planner inspects
-    /// them. A polymorphic site is deliberately rejected. Generated code must still guard the
-    /// exact callee identity before relying on any child-chunk facts.
-    pub(crate) fn jit_call_target(&self, idx: u32) -> Option<(CallIc, crate::value::Gc)> {
-        let site = self.call_caches.get(idx as usize)?;
-        let mut found = None;
-        for entry in &site.entries {
-            let ic = entry.get();
-            if ic.callee == 0 {
-                continue;
-            }
-            if found.is_some_and(|old: CallIc| old.callee != ic.callee) {
-                return None;
-            }
-            found = Some(ic);
-        }
-        let ic = found?;
-        let obj = self.call_pins.borrow().get(&ic.callee)?.upgrade()?;
-        Some((ic, obj))
-    }
-    /// All distinct live callees recorded at a polymorphic call site. Region planners use this
-    /// only at compile time to discover a structurally recognized child transaction (for
-    /// example one arm of a four-way task dispatcher); generated code must still guard the
-    /// selected callee identity before consuming any child-chunk cache pointer.
-    pub(crate) fn jit_call_targets(&self, idx: u32) -> Vec<(CallIc, crate::value::Gc)> {
-        let Some(site) = self.call_caches.get(idx as usize) else {
-            return Vec::new();
-        };
-        let pins = self.call_pins.borrow();
-        let mut out: Vec<(CallIc, crate::value::Gc)> = Vec::new();
-        for entry in &site.entries {
-            let ic = entry.get();
-            if ic.callee == 0 || out.iter().any(|(seen, _)| seen.callee == ic.callee) {
-                continue;
-            }
-            if let Some(obj) = pins.get(&ic.callee).and_then(std::rc::Weak::upgrade) {
-                out.push((ic, obj));
-            }
-        }
-        out
     }
     /// The stable address of name-cache site `idx`'s `Cell<NameIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]).
@@ -6510,6 +11404,29 @@ impl Chunk {
             binding.initialized = true;
         }
         Ok(())
+    }
+
+    /// Reject PutValue to a compiler-proven immutable captured binding without cloning its old
+    /// value. DeclarativeEnvironmentRecord.SetMutableBinding checks initialization before
+    /// immutability (ECMA-262 §9.1.1.1.5), so a store into a TDZ remains a ReferenceError.
+    fn reject_const_cap_store(&self, i: &mut Interp, env: &Env, n: u32) -> Result<(), Abrupt> {
+        let binding = unsafe { &*self.cap_binding_ptr(env, n) };
+        if !binding.initialized {
+            return Err(i.throw(
+                "ReferenceError",
+                format!(
+                    "cannot access '{}' before initialization",
+                    self.names[n as usize]
+                ),
+            ));
+        }
+        Err(i.throw(
+            "TypeError",
+            format!(
+                "assignment to constant variable '{}'",
+                self.names[n as usize]
+            ),
+        ))
     }
 
     /// Cached free-name write. A cache hit validates the same resolution proof as a read and
@@ -6897,6 +11814,75 @@ impl Chunk {
     /// (pops, pushes) of the op at `pc`, for the static stack-depth analysis. `None` = an op the
     /// JIT can't account for (which refuses compilation).
     pub(crate) fn jit_stack_effect(&self, pc: usize) -> Option<(usize, usize)> {
+        // AssignTarget enters the normative tree-walker with a projected Environment Record.
+        // Keep that uncommon bridge in the bytecode VM: re-entering arbitrary evaluator code
+        // from a packed ARM64 frame is both unnecessary for coroutine conversion and unsafe for
+        // JIT ownership assumptions. The rest of the function still avoids the tree-walker and,
+        // crucially, coroutine bodies remain heap-owned rather than native-thread-backed.
+        if matches!(
+            self.ops[pc],
+            Op::AssignTarget(_)
+                | Op::EvalExpr(_)
+                | Op::PushWith
+                | Op::PushLex(_)
+                | Op::CloneLex(_)
+                | Op::InitLex(_)
+                | Op::PopEnv
+                | Op::ResolveNameRef(..)
+                | Op::LoadRef(_)
+                | Op::StoreRef(_)
+                | Op::PushDisposeFrame
+                | Op::AddDisposable(_)
+                | Op::DisposeNormal
+                | Op::DisposeThrow
+                | Op::DisposeReturn
+                | Op::DisposeBareReturn
+                | Op::DisposeResumeReturn
+                | Op::DisposeJump
+                | Op::StoreConstLocal(..)
+                | Op::StoreConstCap(_)
+                | Op::UpdateConst(..)
+                | Op::RequireObject
+                | Op::DestructureStepL(..)
+                | Op::DestructureRestL(..)
+                | Op::IterCloseIfNotDoneL(..)
+                | Op::IterAbortIfNotDoneL(..)
+                | Op::ObjectRest(_)
+                | Op::AsyncIterStepL(..)
+                | Op::AsyncIterCloseL(..)
+                | Op::NewArray
+                | Op::ArrayPush
+                | Op::ArrayHole
+                | Op::ArraySpread
+                | Op::CallArgsArray
+                | Op::CallArgsArrayThis
+                | Op::NewArgsArray
+                | Op::NewObject
+                | Op::ObjectData(_)
+                | Op::ObjectSpread
+                | Op::ObjectProto
+                | Op::ObjectMethod(..)
+                | Op::ImportMeta
+                | Op::NewTarget
+                | Op::DynamicImport(..)
+                | Op::PrivateIn(_)
+                | Op::GetPrivate(_)
+                | Op::GetPrivateKeep(_)
+                | Op::GetPrivateMethod(_)
+                | Op::SetPrivate(_)
+                | Op::UpdatePrivate(..)
+                | Op::SuperThis
+                | Op::SuperBase
+                | Op::SuperGet
+                | Op::SuperGetKeep
+                | Op::SuperGetMethod
+                | Op::SuperSet
+                | Op::SuperUpdate(_)
+                | Op::TemplateObject(_)
+                | Op::RequireCallable
+        ) {
+            return None;
+        }
         let upd = |k: &UpdKind| match k {
             UpdKind::IncDiscard | UpdKind::DecDiscard => 0,
             _ => 1,
@@ -6916,13 +11902,16 @@ impl Chunk {
             | Op::StoreCap(_)
             | Op::StoreCapInit(_)
             | Op::StoreName(_)
-            | Op::StoreNameCached(..) => (1, 0),
+            | Op::StoreNameCached(..)
+            | Op::StoreConstLocal(..)
+            | Op::StoreConstCap(_)
+            | Op::UpdateConst(..) => (1, 0),
             Op::UpdateLocal(_, k) | Op::UpdateCap(_, k) | Op::UpdateName(_, k) => (0, upd(k)),
             Op::UpdateNameCached(_, _, k) => (0, upd(k)),
             Op::UpdateProp(_, _, k) => (1, upd(k)),
             Op::UpdateElem(k) => (2, upd(k)),
             Op::Tdz(_) => (0, 0),
-            Op::GetProp(..) => (1, 1),
+            Op::GetProp(..) | Op::RequireObject => (1, 1),
             Op::GetPropThis(..) => (0, 1),
             Op::GetPropLocal(..) => (0, 1),
             Op::SetProp(..) => (2, 1),
@@ -6935,15 +11924,43 @@ impl Chunk {
             Op::AppendProp(..) => (3, 0),
             Op::DestructureGuard => (1, 1),
             Op::DestructureArr(n) => (1, *n as usize),
+            Op::AssignTarget(_) => (1, 0),
+            Op::EvalExpr(_) => (0, 1),
+            Op::ResolveNameRef(..) => (0, 0),
+            Op::LoadRef(_) => (0, 1),
+            Op::StoreRef(_) => (1, 0),
+            Op::PushWith => (1, 0),
+            Op::PushLex(_) | Op::CloneLex(_) => (0, 0),
+            Op::InitLex(_) => (1, 0),
+            Op::PopEnv => (0, 0),
+            Op::PushDisposeFrame | Op::DisposeNormal => (0, 0),
+            Op::AddDisposable(_) => (1, 1),
+            Op::DisposeThrow | Op::DisposeReturn | Op::DisposeResumeReturn => (1, 0),
+            Op::DisposeBareReturn => (0, 0),
+            Op::DisposeJump => (2, 0),
+            Op::ObjectRest(count) => (*count as usize + 1, 1),
             Op::DeleteProp(..) => (1, 1),
             Op::DeleteElem(_) => (2, 1),
+            Op::DeleteName(_) => (0, 1),
+            Op::DeleteSuper => (0, 0),
             Op::CallSpread(argc) => (*argc as usize + 1, 1),
             Op::CallSpreadThis(argc) => (*argc as usize + 2, 1),
+            Op::CallArgsArray => (2, 1),
+            Op::CallArgsArrayThis => (3, 1),
             Op::ToStr => (1, 1),
             Op::GetIter => (1, 2),
+            Op::GetAsyncIter => (1, 3),
+            Op::ForInKeys => (1, 1),
+            Op::ForInStepL(..) => (0, 2),
             Op::IterStepL(..) => (0, 2),
             Op::IterCloseL(_) => (0, 0),
             Op::IterAbortL(_) => (1, 0),
+            Op::DestructureStepL(..) | Op::DestructureRestL(..) => (0, 1),
+            Op::IterCloseIfNotDoneL(..) => (0, 0),
+            Op::IterAbortIfNotDoneL(..) => (1, 0),
+            Op::AsyncIterStepL(..) => (0, 1),
+            Op::AsyncIterResumeL(..) => (1, 2),
+            Op::AsyncIterCloseL(..) => (0, 0),
             Op::GetElemLocal(_) => (1, 1),
             Op::SetElemLocal(_) => (2, 1),
             Op::SetElemLocalDrop(_) => (2, 0),
@@ -6974,7 +11991,7 @@ impl Chunk {
             | Op::GenBin(_) => (2, 1),
             Op::Neg | Op::Plus | Op::Not | Op::BitNot | Op::Typeof | Op::Void => (1, 1),
             Op::TypeofName(_) => (0, 1),
-            Op::Jump(_) => (0, 0),
+            Op::Jump(_) | Op::AbruptJump(..) => (0, 0),
             Op::InlineGuard(..) => (0, 0),
             Op::ResetSlots(..) => (0, 0),
             Op::JumpIfFalse(_) => (1, 0),
@@ -6983,13 +12000,37 @@ impl Chunk {
             Op::LoadNameForCall(..) => (0, 2),
             Op::CallWithThis(argc, _) => (*argc as usize + 2, 1),
             Op::New(argc, _) => (*argc as usize + 1, 1),
+            Op::NewArgsArray => (2, 1),
             Op::MakeRegExp(..) => (0, 1),
             Op::MakeArray(n) => (*n as usize, 1),
+            Op::NewArray => (0, 1),
+            Op::ArrayPush | Op::ArraySpread => (2, 1),
+            Op::ArrayHole => (1, 1),
             Op::MakeObject(_, count, _) => (*count as usize, 1),
-            Op::Throw | Op::Return => (1, 0),
-            Op::ReturnUndef => (0, 0),
-            Op::Await => (1, 1),
-            Op::PushHandler(_) | Op::PopHandler => (0, 0),
+            Op::NewObject => (0, 1),
+            Op::ObjectData(_) => (3, 1),
+            Op::ObjectSpread | Op::ObjectProto | Op::ObjectMethod(..) => (2, 1),
+            Op::ImportMeta | Op::NewTarget | Op::TemplateObject(_) => (0, 1),
+            Op::DynamicImport(_, has_options) => (usize::from(*has_options) + 1, 1),
+            Op::PrivateIn(_) => (1, 1),
+            Op::GetPrivate(_) => (1, 1),
+            Op::GetPrivateKeep(_) | Op::GetPrivateMethod(_) => (1, 2),
+            Op::SetPrivate(_) => (2, 1),
+            Op::UpdatePrivate(_, kind) => (1, upd(kind)),
+            Op::SuperThis | Op::SuperBase => (0, 1),
+            Op::SuperGet => (3, 1),
+            Op::SuperGetKeep => (3, 4),
+            Op::SuperGetMethod => (3, 2),
+            Op::SuperSet => (4, 1),
+            Op::SuperUpdate(kind) => (3, upd(kind)),
+            Op::RequireCallable => (0, 0),
+            Op::Throw | Op::Return | Op::ResumeReturn => (1, 0),
+            Op::ResumeJump => (2, 0),
+            Op::ReturnBare | Op::ReturnUndef => (0, 0),
+            Op::Await | Op::Yield | Op::YieldStar => (1, 1),
+            Op::PushHandler(_) | Op::PushFinally(..) | Op::PushIterator(..) | Op::PopHandler => {
+                (0, 0)
+            }
         })
     }
 }
@@ -7047,9 +12088,11 @@ pub(crate) unsafe extern "C" fn jit_exec(
             | Op::SetElemLocal(_)
             | Op::SetElemLocalDrop(_)
             | Op::ToPropKeyLocal(_)
+            | Op::ForInStepL(..)
             | Op::IterStepL(..)
             | Op::IterCloseL(_)
             | Op::IterAbortL(_)
+            | Op::AssignTarget(_)
             | Op::ResetSlots(..)
     );
     let _wide_slots = if needs_wide_slots {
@@ -7219,7 +12262,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     let mut push_arg_moved = false;
     let mut call_args_moved = 0usize;
     i.depth += 1;
-    let r: Result<Value, Abrupt> = if i.depth > crate::interpreter::MAX_EVAL_DEPTH {
+    let r: Result<Value, Abrupt> = if i.depth > i.max_eval_depth {
         Err(i.throw("RangeError", "Maximum call stack size exceeded"))
     } else {
         i.gc_check_amortized().and_then(|()| {
@@ -7425,7 +12468,10 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         unreachable!("regexp exec intrinsic guards")
                     };
                     match crate::builtins::regexp_exec_discard_fast(i, &*base, input) {
-                        Some(r) => r.map(|_| Value::Undefined).map_err(Abrupt::Throw),
+                        Some(r) => {
+                            i.interrupt_poll_force()?;
+                            r.map(|_| Value::Undefined).map_err(Abrupt::Throw)
+                        }
                         None => crate::builtins::regexp_exec(
                             i,
                             (*base).clone(),
@@ -7441,7 +12487,10 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         &*base.add(2),
                         &*base.add(3),
                     ) {
-                        Some(r) => r.map_err(Abrupt::Throw),
+                        Some(r) => {
+                            i.interrupt_poll_force()?;
+                            r.map_err(Abrupt::Throw)
+                        }
                         None => crate::builtins::nf_string_replace(
                             i,
                             (*base).clone(),
@@ -7648,7 +12697,10 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
         match crate::builtins::regexp_exec_discard_direct(i, re_obj, &regexp_matcher, &subject) {
             Ok(_) => {}
             Err(v) => {
-                ctx.error = Some(Abrupt::Throw(v));
+                ctx.error = Some(match i.interrupt_poll_force() {
+                    Err(interrupt) => interrupt,
+                    Ok(()) => Abrupt::Throw(v),
+                });
                 return 2;
             }
         }
@@ -8620,9 +13672,9 @@ unsafe fn jit_call_inner(
                             if !i
                                 .global_env_pins
                                 .iter()
-                                .any(|g| Rc::ptr_eq(g, &i.global_env))
+                                .any(|g| g.as_ptr() == Rc::as_ptr(&i.global_env))
                             {
-                                let g = i.global_env.clone();
+                                let g = Rc::downgrade(&i.global_env);
                                 i.global_env_pins.push(g);
                             }
                             chunk.call_caches[c as usize].fill(CallIc {
@@ -8902,7 +13954,7 @@ unsafe fn jit_callstat(
                 break 'r "gate: callee refcount <= 1";
             }
         }
-        if i.depth >= crate::interpreter::MAX_EVAL_DEPTH {
+        if i.depth >= i.max_eval_depth {
             break 'r "gate: depth";
         }
         if (i.gc_tick + 1) & crate::interpreter::GC_CALL_POLL_MASK == 0 {
@@ -9194,6 +14246,16 @@ unsafe fn jit_exec_inner(
                 i.iterator_close_normal(&it)?;
             }
         }
+        Op::AssignTarget(target) => {
+            let value = pop!();
+            assign_target_with_slots(
+                i,
+                &chunk.assignment_targets[target as usize],
+                value,
+                env,
+                slots,
+            )?;
+        }
         Op::DeleteProp(n, strict) => {
             let base = pop!();
             let prop = &chunk.names[n as usize];
@@ -9219,6 +14281,12 @@ unsafe fn jit_exec_inner(
             let v = i.delete_prop_with(base, &key, strict)?;
             push!(v);
         }
+        Op::DeleteName(name) => {
+            push!(i.delete_ident(&chunk.names[name as usize], env)?);
+        }
+        Op::DeleteSuper => {
+            return Err(i.throw("ReferenceError", "cannot delete a super property"));
+        }
         Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
             let spread = pop!();
             let mut plain: Vec<Value> = (1..argc).map(|_| pop!()).collect();
@@ -9236,6 +14304,16 @@ unsafe fn jit_exec_inner(
             }
             let v = i.call(callee, this, &args)?;
             push!(v);
+        }
+        Op::CallArgsArray | Op::CallArgsArrayThis => {
+            let args = argument_array_values(i, pop!());
+            let callee = pop!();
+            let this = if matches!(chunk.ops[pc as usize], Op::CallArgsArrayThis) {
+                pop!()
+            } else {
+                Value::Undefined
+            };
+            push!(i.call(callee, this, &args)?);
         }
         Op::AppendProp(n, c) => {
             let v = pop!();
@@ -9391,28 +14469,32 @@ unsafe fn jit_exec_inner(
                 push!(v);
             }
         }
-        Op::ToPropKey => match &*sp.sub(1) {
-            Value::Num(_) | Value::Str(_) => {}
-            _ => {
-                let key = pop!();
-                if matches!(&*sp.sub(1), Value::Undefined | Value::Null) {
-                    return Err(i.throw("TypeError", "cannot access property of null or undefined"));
-                }
-                let k = i.to_property_key(&key)?;
-                push!(Value::str(k));
+        Op::ToPropKey => {
+            if matches!(&*sp.sub(2), Value::Undefined | Value::Null) {
+                return Err(i.throw("TypeError", "cannot access property of null or undefined"));
             }
-        },
-        Op::ToPropKeyLocal(s) => match &*sp.sub(1) {
-            Value::Num(_) | Value::Str(_) => {}
-            _ => {
-                let key = pop!();
-                if matches!(slots[s as usize], Value::Undefined | Value::Null) {
-                    return Err(i.throw("TypeError", "cannot access property of null or undefined"));
+            match &*sp.sub(1) {
+                Value::Num(_) | Value::Str(_) => {}
+                _ => {
+                    let key = pop!();
+                    let k = i.to_property_key(&key)?;
+                    push!(Value::str(k.into_string()));
                 }
-                let k = i.to_property_key(&key)?;
-                push!(Value::str(k));
             }
-        },
+        }
+        Op::ToPropKeyLocal(s) => {
+            if matches!(slots[s as usize], Value::Undefined | Value::Null) {
+                return Err(i.throw("TypeError", "cannot access property of null or undefined"));
+            }
+            match &*sp.sub(1) {
+                Value::Num(_) | Value::Str(_) => {}
+                _ => {
+                    let key = pop!();
+                    let k = i.to_property_key(&key)?;
+                    push!(Value::str(k.into_string()));
+                }
+            }
+        }
         Op::GetMethod(n, c) => {
             let obj = pop!();
             let m = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
@@ -9626,6 +14708,11 @@ unsafe fn jit_exec_inner(
         Op::New(argc, cache) => {
             unsafe { jit_new_inner(i, None, Some((chunk, cache)), argc as usize, sp) }?;
         }
+        Op::NewArgsArray => {
+            let args = argument_array_values(i, pop!());
+            let callee = pop!();
+            push!(i.construct(callee, &args)?);
+        }
         Op::MakeRegExp(body, flags) => {
             push!(chunk.make_regexp_literal(i, pc as usize, body, flags)?);
         }
@@ -9666,6 +14753,31 @@ unsafe fn jit_exec_inner(
             push!(it);
             push!(nx);
         }
+        Op::GetAsyncIter => {
+            let v = pop!();
+            let opened = VmDelegate::open(i, v, true)?;
+            push!(opened.iterator);
+            push!(opened.next);
+            push!(Value::Bool(opened.from_sync));
+        }
+        Op::ForInKeys => {
+            let source = pop!();
+            let keys = i
+                .for_in_keys(&source)?
+                .into_iter()
+                .map(Value::from_string)
+                .collect();
+            push!(i.make_array(keys));
+        }
+        Op::ForInStepL(keys, index, source) => {
+            if let Some(key) = for_in_step(i, slots, keys, index, source)? {
+                push!(key);
+                push!(Value::Bool(true));
+            } else {
+                push!(Value::Undefined);
+                push!(Value::Bool(false));
+            }
+        }
         Op::IterStepL(is, ns) => {
             let it = slots[is as usize].clone();
             let nx = slots[ns as usize].clone();
@@ -9700,15 +14812,79 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::Jump(_)
+        | Op::StoreConstLocal(..)
+        | Op::StoreConstCap(_)
+        | Op::UpdateConst(..)
+        | Op::RequireObject
+        | Op::DestructureStepL(..)
+        | Op::DestructureRestL(..)
+        | Op::IterCloseIfNotDoneL(..)
+        | Op::IterAbortIfNotDoneL(..)
+        | Op::ObjectRest(_)
+        | Op::EvalExpr(_)
+        | Op::PushWith
+        | Op::PushLex(_)
+        | Op::CloneLex(_)
+        | Op::InitLex(_)
+        | Op::PopEnv
+        | Op::ResolveNameRef(..)
+        | Op::LoadRef(_)
+        | Op::StoreRef(_)
+        | Op::PushDisposeFrame
+        | Op::AddDisposable(_)
+        | Op::DisposeNormal
+        | Op::DisposeThrow
+        | Op::DisposeReturn
+        | Op::DisposeBareReturn
+        | Op::DisposeResumeReturn
+        | Op::DisposeJump
+        | Op::NewArray
+        | Op::ArrayPush
+        | Op::ArrayHole
+        | Op::ArraySpread
+        | Op::NewObject
+        | Op::ObjectData(_)
+        | Op::ObjectSpread
+        | Op::ObjectProto
+        | Op::ObjectMethod(..)
+        | Op::ImportMeta
+        | Op::NewTarget
+        | Op::DynamicImport(..)
+        | Op::PrivateIn(_)
+        | Op::GetPrivate(_)
+        | Op::GetPrivateKeep(_)
+        | Op::GetPrivateMethod(_)
+        | Op::SetPrivate(_)
+        | Op::UpdatePrivate(..)
+        | Op::SuperThis
+        | Op::SuperBase
+        | Op::SuperGet
+        | Op::SuperGetKeep
+        | Op::SuperGetMethod
+        | Op::SuperSet
+        | Op::SuperUpdate(_)
+        | Op::TemplateObject(_)
+        | Op::RequireCallable
+        | Op::AbruptJump(..)
         | Op::JumpIfFalse(_)
         | Op::JumpIfFalsePeek(_)
         | Op::JumpIfTruePeek(_)
         | Op::JumpIfNotNullishPeek(_)
         | Op::InlineGuard(..)
         | Op::Return
+        | Op::ReturnBare
+        | Op::ResumeReturn
+        | Op::ResumeJump
         | Op::ReturnUndef
         | Op::Await
+        | Op::AsyncIterStepL(..)
+        | Op::AsyncIterResumeL(..)
+        | Op::AsyncIterCloseL(..)
+        | Op::Yield
+        | Op::YieldStar
         | Op::PushHandler(_)
+        | Op::PushFinally(..)
+        | Op::PushIterator(..)
         | Op::PopHandler => unreachable!("control-flow op reached jit_exec"),
     }
     Ok(())
@@ -9873,7 +15049,14 @@ pub(crate) unsafe extern "C" fn jit_unwind(
             sp: std::ptr::null_mut(),
             flag: sp as u64,
         },
-        Some((catch_pc, depth)) => {
+        Some((catch_pc, saved_depth)) => {
+            // A handler may be installed while operands needed for BindingInitialization are
+            // still live; the protected operation can consume them before throwing. Vec::truncate
+            // (used by the bytecode VM) keeps the smaller current depth in that case. Mirroring
+            // it here is essential: restoring the older, deeper depth would expose moved-out raw
+            // stack entries and later drop them a second time.
+            let current_depth = sp.offset_from(ctx.stack_base) as usize;
+            let depth = saved_depth.min(current_depth);
             let target = ctx.stack_base.add(depth);
             // Drop operands above the handler's depth.
             let mut p = target;

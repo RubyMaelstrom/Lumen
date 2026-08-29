@@ -22,7 +22,13 @@ function isValidProtocol(s) {
 
 function normalizeProtocols(protocols) {
   if (protocols === undefined) return [];
-  const list = Array.isArray(protocols) ? protocols : [protocols];
+  let list;
+  if (typeof protocols === "string") list = [protocols];
+  else if (protocols !== null && typeof protocols[Symbol.iterator] === "function") {
+    list = Array.from(protocols);
+  } else {
+    list = [protocols];
+  }
   const seen = new Set();
   for (const p of list) {
     const s = String(p);
@@ -37,14 +43,28 @@ function normalizeProtocols(protocols) {
   return list.map(String);
 }
 
+// Web IDL's `[Clamp] unsigned short` conversion: ToNumber, clamp, then ties-to-even rounding.
+function clampUnsignedShort(value) {
+  const number = Number(value);
+  if (Number.isNaN(number) || number <= 0) return 0;
+  if (number >= 65535) return 65535;
+  const floor = Math.floor(number);
+  const fraction = number - floor;
+  if (fraction < 0.5) return floor;
+  if (fraction > 0.5) return floor + 1;
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
 class WebSocket extends EventTarget {
   #url;
+  #origin;
   #id;
   #readyState;
   #binaryType;
   #extensions;
   #protocol;
   #bufferedAmount;
+  #sendTail;
 
   constructor(url, protocols) {
     super();
@@ -59,6 +79,10 @@ class WebSocket extends EventTarget {
         `invalid WebSocket URL: ${url}`,
         "SyntaxError",
       );
+    }
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      const scheme = parsed.protocol === "http:" ? "ws:" : "wss:";
+      parsed = new URL(scheme + parsed.href.slice(parsed.protocol.length));
     }
     if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
       throw new (globalThis.DOMException ?? SyntaxError)(
@@ -75,11 +99,13 @@ class WebSocket extends EventTarget {
     const list = normalizeProtocols(protocols);
 
     this.#url = parsed.href;
+    this.#origin = parsed.origin;
     this.#readyState = CONNECTING;
     this.#binaryType = "blob";
     this.#extensions = "";
     this.#protocol = "";
     this.#bufferedAmount = 0;
+    this.#sendTail = null;
 
     this.#id = __ws.connect(parsed.href, list.join(", "), (kind, ...args) =>
       this.#onDispatch(kind, args),
@@ -103,7 +129,7 @@ class WebSocket extends EventTarget {
   get binaryType() { return this.#binaryType; }
   set binaryType(v) {
     if (v === "blob" || v === "arraybuffer") this.#binaryType = v;
-    else throw new SyntaxError("binaryType must be 'blob' or 'arraybuffer'");
+    else throw new TypeError("binaryType must be 'blob' or 'arraybuffer'");
   }
 
   send(data) {
@@ -124,19 +150,23 @@ class WebSocket extends EventTarget {
         data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
       );
     } else if (data && typeof data.arrayBuffer === "function") {
-      // Blob: send its bytes once read (ordering preserved per-socket by the task queue).
-      data.arrayBuffer().then((buf) => {
-        if (this.#readyState === OPEN) __ws.send(this.#id, new Uint8Array(buf));
-      });
+      // Blob bytes arrive asynchronously. Queue this and all subsequent sends behind them so
+      // WebSocket message order remains the order in which send() was invoked.
+      this.#queueSend(() => data.arrayBuffer().then((buf) => {
+        __ws.send(this.#id, new Uint8Array(buf));
+      }));
       return;
     } else {
       payload = String(data);
     }
-    __ws.send(this.#id, payload);
+    if (this.#sendTail) this.#queueSend(() => __ws.send(this.#id, payload));
+    else __ws.send(this.#id, payload);
   }
 
   close(code, reason) {
-    if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) {
+    const codePresent = code !== undefined;
+    const convertedCode = codePresent ? clampUnsignedShort(code) : undefined;
+    if (codePresent && convertedCode !== 1000 && !(convertedCode >= 3000 && convertedCode <= 4999)) {
       throw new (globalThis.DOMException ?? Error)(
         "close code must be 1000 or in 3000-4999",
         "InvalidAccessError",
@@ -151,18 +181,24 @@ class WebSocket extends EventTarget {
     }
     if (this.#readyState === CLOSING || this.#readyState === CLOSED) return;
     this.#readyState = CLOSING;
-    __ws.close(this.#id, code ?? 1000, r);
+    // With neither argument, RFC 6455 carries an empty Close body (WebSocket Standard close()
+    // steps). A reason without a code needs the normal-closure code to precede its UTF-8 bytes.
+    const startClosingHandshake = () =>
+      __ws.close(this.#id, convertedCode ?? (reason === undefined ? undefined : 1000), r);
+    if (this.#sendTail) this.#queueSend(startClosingHandshake);
+    else startClosingHandshake();
   }
 
-  #fireEvent(type, event) {
-    const handler = this[`on${type}`];
-    if (typeof handler === "function") {
-      try {
-        handler.call(this, event);
-      } catch (e) {
-        reportError(e);
-      }
-    }
+  #queueSend(operation) {
+    const previous = this.#sendTail || Promise.resolve();
+    let tail;
+    tail = previous.then(operation).catch(reportError).finally(() => {
+      if (this.#sendTail === tail) this.#sendTail = null;
+    });
+    this.#sendTail = tail;
+  }
+
+  #fireEvent(_type, event) {
     this.dispatchEvent(event);
   }
 
@@ -178,7 +214,7 @@ class WebSocket extends EventTarget {
         if (this.#readyState !== OPEN) break;
         this.#fireEvent(
           "message",
-          new MessageEvent("message", { data: args[0], origin: this.#url }),
+          new MessageEvent("message", { data: args[0], origin: this.#origin }),
         );
         break;
       }
@@ -191,7 +227,7 @@ class WebSocket extends EventTarget {
             : new Blob([bytes]);
         this.#fireEvent(
           "message",
-          new MessageEvent("message", { data, origin: this.#url }),
+          new MessageEvent("message", { data, origin: this.#origin }),
         );
         break;
       }
@@ -232,15 +268,8 @@ class WebSocket extends EventTarget {
   }
 }
 
-// Event-handler IDL attributes (onopen/onmessage/onerror/onclose) — plain writable data
-// properties read by #fireEvent, matching the WebSocket interface.
 for (const name of ["open", "message", "error", "close"]) {
-  Object.defineProperty(WebSocket.prototype, `on${name}`, {
-    configurable: true,
-    enumerable: true,
-    writable: true,
-    value: null,
-  });
+  defineEventHandler(WebSocket.prototype, name);
 }
 
 globalThis.WebSocket = WebSocket;

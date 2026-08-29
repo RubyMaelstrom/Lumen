@@ -195,6 +195,14 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
         ns.sort_unstable();
         return Ok(i.make_array(ns.iter().map(|s| Value::str(*s)).collect()));
     }
+    if &*k == "currency" {
+        // ECMA-402 AvailableCurrencies contains every canonical ISO 4217 code for which both
+        // NumberFormat and DisplayNames provide functionality. The generated CLDR table is sorted.
+        let currencies = crate::cldr_numbers::currency_codes()
+            .map(Value::str)
+            .collect();
+        return Ok(i.make_array(currencies));
+    }
     let vals: &[&str] = match &*k {
         // "islamic" and "islamic-rgsa" resolve to islamic-civil, so they are not fixed points
         // of DateTimeFormat and are excluded (the era/monthCode proposal's required set).
@@ -216,12 +224,8 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
             "persian",
             "roc",
         ],
-        // Exactly the collations some locale's Collator resolves (see collator::supported_collation).
-        "collation" => &[
-            "big5han", "compat", "dict", "emoji", "eor", "gb2312", "phonebk", "phonetic", "pinyin",
-            "reformed", "searchjl", "stroke", "trad", "unihan", "zhuyin",
-        ],
-        "currency" => &["USD", "EUR", "GBP", "JPY", "CNY"],
+        // Exactly the collations some locale's Collator resolves.
+        "collation" => collator::available_collations(),
         "numberingSystem" => &[
             "adlm", "ahom", "arab", "arabext", "bali", "beng", "deva", "fullwide", "gujr", "guru",
             "hanidec", "khmr", "knda", "laoo", "latn", "mlym", "mymr", "orya", "tamldec", "telu",

@@ -24,6 +24,14 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
 const VERSION: u32 = 1;
+/// Snapshots are an optimization for trusted build-time glue, but the public embedding API can be
+/// handed arbitrary bytes. Keep corrupt data from turning its length fields into unbounded work.
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SNAPSHOT_ALLOC_BYTES: usize = 256 * 1024 * 1024;
+// Snapshot decoder frames contain large AST enum temporaries, so this must stay materially below
+// the parser's lighter recursion ceiling on the ordinary Rust test-thread stack.
+const MAX_SNAPSHOT_DEPTH: usize = 128;
+const ACCOUNTED_NODE_BYTES: usize = 64;
 
 // ---- writer / reader --------------------------------------------------------------------------
 
@@ -62,6 +70,8 @@ impl Writer {
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    allocated: usize,
+    depth: usize,
 }
 
 type R<T> = Result<T, String>;
@@ -77,6 +87,9 @@ impl Reader<'_> {
         let mut shift = 0;
         loop {
             let byte = self.u8()?;
+            if shift == 63 && byte & 0x7e != 0 {
+                return Err("snapshot: varint overflow".into());
+            }
             result |= ((byte & 0x7f) as u64) << shift;
             if byte & 0x80 == 0 {
                 return Ok(result);
@@ -88,7 +101,10 @@ impl Reader<'_> {
         }
     }
     fn f64(&mut self) -> R<f64> {
-        let end = self.pos + 8;
+        let end = self
+            .pos
+            .checked_add(8)
+            .ok_or("snapshot: position overflow")?;
         let bytes = self
             .buf
             .get(self.pos..end)
@@ -97,20 +113,86 @@ impl Reader<'_> {
         Ok(f64::from_le_bytes(bytes.try_into().unwrap()))
     }
     fn bool(&mut self) -> R<bool> {
-        Ok(self.u8()? != 0)
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("snapshot: invalid boolean".into()),
+        }
+    }
+    fn option(&mut self) -> R<bool> {
+        self.bool()
+    }
+    fn usize(&mut self) -> R<usize> {
+        usize::try_from(self.uv()?).map_err(|_| "snapshot: integer too large".into())
+    }
+    fn charge(&mut self, bytes: usize) -> R<()> {
+        self.allocated = self
+            .allocated
+            .checked_add(bytes)
+            .filter(|&total| total <= MAX_SNAPSHOT_ALLOC_BYTES)
+            .ok_or("snapshot: allocation budget exceeded")?;
+        Ok(())
+    }
+    fn collection<T>(&mut self) -> R<(usize, Vec<T>)> {
+        let len = self.usize()?;
+        // Every encoded collection element consumes at least one tag/field byte. This cheap check
+        // rejects hostile capacities before even consulting the wider allocation budget.
+        if len > self.buf.len().saturating_sub(self.pos) {
+            return Err("snapshot: collection length exceeds input".into());
+        }
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or("snapshot: allocation size overflow")?;
+        self.charge(bytes)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| "snapshot: allocation failed".to_string())?;
+        Ok((len, out))
+    }
+    fn enter_node(&mut self) -> R<()> {
+        let depth = self
+            .depth
+            .checked_add(1)
+            .filter(|&depth| depth <= MAX_SNAPSHOT_DEPTH)
+            .ok_or("snapshot: nesting limit exceeded")?;
+        self.charge(ACCOUNTED_NODE_BYTES)?;
+        self.depth = depth;
+        Ok(())
+    }
+    fn leave_node(&mut self) {
+        self.depth -= 1;
     }
     fn str(&mut self) -> R<String> {
-        let len = self.uv()? as usize;
-        let end = self.pos + len;
+        let len = self.usize()?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or("snapshot: position overflow")?;
         let bytes = self
             .buf
             .get(self.pos..end)
             .ok_or("snapshot: truncated str")?;
         self.pos = end;
-        String::from_utf8(bytes.to_vec()).map_err(|_| "snapshot: bad utf8".into())
+        self.charge(len)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| "snapshot: bad utf8".into())
     }
     fn rcstr(&mut self) -> R<Rc<str>> {
-        Ok(Rc::from(self.str()?.as_str()))
+        let len = self.usize()?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or("snapshot: position overflow")?;
+        let bytes = self
+            .buf
+            .get(self.pos..end)
+            .ok_or("snapshot: truncated str")?;
+        self.pos = end;
+        self.charge(len)?;
+        Ok(Rc::from(
+            std::str::from_utf8(bytes).map_err(|_| "snapshot: bad utf8")?,
+        ))
     }
 }
 
@@ -140,7 +222,15 @@ pub fn encode(body: &[Stmt]) -> Vec<u8> {
 /// Decode a snapshot blob back into a script body. `Err` (skew/truncation/corruption) tells the
 /// caller to fall back to parsing the original source.
 pub fn decode(bytes: &[u8]) -> R<Vec<Stmt>> {
-    let mut r = Reader { buf: bytes, pos: 0 };
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err("snapshot: input exceeds byte limit".into());
+    }
+    let mut r = Reader {
+        buf: bytes,
+        pos: 0,
+        allocated: 0,
+        depth: 0,
+    };
     if r.uv()? != MAGIC as u64 {
         return Err("snapshot: bad magic".into());
     }
@@ -148,6 +238,9 @@ pub fn decode(bytes: &[u8]) -> R<Vec<Stmt>> {
         return Err("snapshot: version mismatch".into());
     }
     let body = dec_stmts(&mut r)?;
+    if r.pos != bytes.len() {
+        return Err("snapshot: trailing bytes".into());
+    }
     Ok(body)
 }
 
@@ -160,8 +253,7 @@ fn enc_stmts(w: &mut Writer, v: &[Stmt]) {
     }
 }
 fn dec_stmts(r: &mut Reader) -> R<Vec<Stmt>> {
-    let n = r.uv()? as usize;
-    let mut out = Vec::with_capacity(n);
+    let (n, mut out) = r.collection()?;
     for _ in 0..n {
         out.push(dec_stmt(r)?);
     }
@@ -175,8 +267,7 @@ fn enc_exprs(w: &mut Writer, v: &[Expr]) {
     }
 }
 fn dec_exprs(r: &mut Reader) -> R<Vec<Expr>> {
-    let n = r.uv()? as usize;
-    let mut out = Vec::with_capacity(n);
+    let (n, mut out) = r.collection()?;
     for _ in 0..n {
         out.push(dec_expr(r)?);
     }
@@ -193,7 +284,7 @@ fn enc_opt_expr(w: &mut Writer, o: &Option<Expr>) {
     }
 }
 fn dec_opt_expr(r: &mut Reader) -> R<Option<Expr>> {
-    Ok(if r.u8()? == 1 {
+    Ok(if r.option()? {
         Some(dec_expr(r)?)
     } else {
         None
@@ -210,7 +301,7 @@ fn enc_opt_str(w: &mut Writer, o: &Option<String>) {
     }
 }
 fn dec_opt_str(r: &mut Reader) -> R<Option<String>> {
-    Ok(if r.u8()? == 1 { Some(r.str()?) } else { None })
+    Ok(if r.option()? { Some(r.str()?) } else { None })
 }
 
 fn enc_opt_rcstr(w: &mut Writer, o: &Option<Rc<str>>) {
@@ -223,7 +314,7 @@ fn enc_opt_rcstr(w: &mut Writer, o: &Option<Rc<str>>) {
     }
 }
 fn dec_opt_rcstr(r: &mut Reader) -> R<Option<Rc<str>>> {
-    Ok(if r.u8()? == 1 { Some(r.rcstr()?) } else { None })
+    Ok(if r.option()? { Some(r.rcstr()?) } else { None })
 }
 
 // ---- Stmt -------------------------------------------------------------------------------------
@@ -418,12 +509,22 @@ fn enc_stmt(w: &mut Writer, s: &Stmt) {
 }
 
 fn dec_stmt(r: &mut Reader) -> R<Stmt> {
+    Ok(*dec_boxed_stmt(r)?)
+}
+
+fn dec_boxed_stmt(r: &mut Reader) -> R<Box<Stmt>> {
+    r.enter_node()?;
+    let result = dec_stmt_inner(r).map(Box::new);
+    r.leave_node();
+    result
+}
+
+fn dec_stmt_inner(r: &mut Reader) -> R<Stmt> {
     Ok(match r.u8()? {
         0 => Stmt::Expr(dec_expr(r)?),
         1 => {
             let kind = dec_declkind(r)?;
-            let n = r.uv()? as usize;
-            let mut decls = Vec::with_capacity(n);
+            let (n, mut decls) = r.collection()?;
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));
             }
@@ -433,9 +534,9 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         3 => Stmt::Return(dec_opt_expr(r)?),
         4 => {
             let test = dec_expr(r)?;
-            let cons = Box::new(dec_stmt(r)?);
-            let alt = if r.u8()? == 1 {
-                Some(Box::new(dec_stmt(r)?))
+            let cons = dec_boxed_stmt(r)?;
+            let alt = if r.option()? {
+                Some(dec_boxed_stmt(r)?)
             } else {
                 None
             };
@@ -444,14 +545,14 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         5 => Stmt::Block(dec_stmts(r)?),
         6 => Stmt::While {
             test: dec_expr(r)?,
-            body: Box::new(dec_stmt(r)?),
+            body: dec_boxed_stmt(r)?,
         },
         7 => Stmt::DoWhile {
-            body: Box::new(dec_stmt(r)?),
+            body: dec_boxed_stmt(r)?,
             test: dec_expr(r)?,
         },
         8 => {
-            let init = if r.u8()? == 1 {
+            let init = if r.option()? {
                 Some(Box::new(dec_forinit(r)?))
             } else {
                 None
@@ -460,11 +561,11 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
                 init,
                 test: dec_opt_expr(r)?,
                 update: dec_opt_expr(r)?,
-                body: Box::new(dec_stmt(r)?),
+                body: dec_boxed_stmt(r)?,
             }
         }
         9 => {
-            let decl = if r.u8()? == 1 {
+            let decl = if r.option()? {
                 Some(dec_declkind(r)?)
             } else {
                 None
@@ -475,7 +576,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
                 right: dec_expr(r)?,
                 of: r.bool()?,
                 is_await: r.bool()?,
-                body: Box::new(dec_stmt(r)?),
+                body: dec_boxed_stmt(r)?,
             }
         }
         10 => Stmt::Break(dec_opt_str(r)?),
@@ -483,8 +584,8 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         12 => Stmt::Throw(dec_expr(r)?),
         13 => {
             let block = dec_stmts(r)?;
-            let handler = if r.u8()? == 1 {
-                let param = if r.u8()? == 1 {
+            let handler = if r.option()? {
+                let param = if r.option()? {
                     Some(dec_pattern(r)?)
                 } else {
                     None
@@ -493,7 +594,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             } else {
                 None
             };
-            let finalizer = if r.u8()? == 1 {
+            let finalizer = if r.option()? {
                 Some(dec_stmts(r)?)
             } else {
                 None
@@ -506,8 +607,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         }
         14 => {
             let disc = dec_expr(r)?;
-            let n = r.uv()? as usize;
-            let mut cases = Vec::with_capacity(n);
+            let (n, mut cases) = r.collection()?;
             for _ in 0..n {
                 cases.push(SwitchCase {
                     test: dec_opt_expr(r)?,
@@ -518,19 +618,18 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         }
         15 => Stmt::Labeled {
             label: r.str()?,
-            body: Box::new(dec_stmt(r)?),
+            body: dec_boxed_stmt(r)?,
         },
         16 => Stmt::With {
             obj: dec_expr(r)?,
-            body: Box::new(dec_stmt(r)?),
+            body: dec_boxed_stmt(r)?,
         },
         17 => Stmt::ClassDecl(Rc::new(dec_class(r)?)),
         18 => Stmt::Empty,
         19 => Stmt::Debugger,
         20 => {
             let source = r.rcstr()?;
-            let n = r.uv()? as usize;
-            let mut specs = Vec::with_capacity(n);
+            let (n, mut specs) = r.collection()?;
             for _ in 0..n {
                 specs.push(dec_importspec(r)?);
             }
@@ -541,8 +640,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             })
         }
         21 => {
-            let n = r.uv()? as usize;
-            let mut specs = Vec::with_capacity(n);
+            let (n, mut specs) = r.collection()?;
             for _ in 0..n {
                 specs.push(ExportSpec {
                     local: r.str()?,
@@ -554,8 +652,8 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
                 source: dec_opt_rcstr(r)?,
             }
         }
-        22 => Stmt::ExportDecl(Box::new(dec_stmt(r)?)),
-        23 => Stmt::ExportDefault(Box::new(dec_stmt(r)?)),
+        22 => Stmt::ExportDecl(dec_boxed_stmt(r)?),
+        23 => Stmt::ExportDefault(dec_boxed_stmt(r)?),
         24 => Stmt::ExportAll {
             source: r.rcstr()?,
             exported: dec_opt_str(r)?,
@@ -758,12 +856,23 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
 }
 
 fn dec_expr(r: &mut Reader) -> R<Expr> {
+    Ok(*dec_boxed_expr(r)?)
+}
+
+fn dec_boxed_expr(r: &mut Reader) -> R<Box<Expr>> {
+    r.enter_node()?;
+    let result = dec_expr_inner(r).map(Box::new);
+    r.leave_node();
+    result
+}
+
+fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
     Ok(match r.u8()? {
-        0 => Expr::Paren(Box::new(dec_expr(r)?)),
+        0 => Expr::Paren(dec_boxed_expr(r)?),
         1 => Expr::Num(r.f64()?),
         2 => Expr::BigInt(JsBigInt::parse_radix(&r.str()?, 16).ok_or("snapshot: bad bigint")?),
         3 => Expr::Str(r.rcstr()?),
-        4 => Expr::ToStr(Box::new(dec_expr(r)?)),
+        4 => Expr::ToStr(dec_boxed_expr(r)?),
         5 => Expr::Bool(r.bool()?),
         6 => Expr::Null,
         7 => Expr::Undefined,
@@ -775,8 +884,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         },
         11 => Expr::Array(dec_array_elems(r)?),
         12 => {
-            let n = r.uv()? as usize;
-            let mut props = Vec::with_capacity(n);
+            let (n, mut props) = r.collection()?;
             for _ in 0..n {
                 props.push(dec_propdef(r)?);
             }
@@ -786,68 +894,67 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         14 => Expr::Class(Rc::new(dec_class(r)?)),
         15 => {
             let delegate = r.bool()?;
-            let arg = if r.u8()? == 1 {
-                Some(Box::new(dec_expr(r)?))
+            let arg = if r.option()? {
+                Some(dec_boxed_expr(r)?)
             } else {
                 None
             };
             Expr::Yield { delegate, arg }
         }
-        16 => Expr::Await(Box::new(dec_expr(r)?)),
+        16 => Expr::Await(dec_boxed_expr(r)?),
         17 => Expr::Super,
         18 => Expr::Unary {
             op: intern_op(&r.str()?)?,
-            arg: Box::new(dec_expr(r)?),
+            arg: dec_boxed_expr(r)?,
         },
         19 => Expr::Update {
             op: intern_op(&r.str()?)?,
             prefix: r.bool()?,
-            arg: Box::new(dec_expr(r)?),
+            arg: dec_boxed_expr(r)?,
         },
         20 => Expr::Binary {
             op: intern_op(&r.str()?)?,
-            left: Box::new(dec_expr(r)?),
-            right: Box::new(dec_expr(r)?),
+            left: dec_boxed_expr(r)?,
+            right: dec_boxed_expr(r)?,
         },
         21 => Expr::Logical {
             op: intern_op(&r.str()?)?,
-            left: Box::new(dec_expr(r)?),
-            right: Box::new(dec_expr(r)?),
+            left: dec_boxed_expr(r)?,
+            right: dec_boxed_expr(r)?,
         },
         22 => Expr::Assign {
             op: intern_op(&r.str()?)?,
-            target: Box::new(dec_expr(r)?),
-            value: Box::new(dec_expr(r)?),
+            target: dec_boxed_expr(r)?,
+            value: dec_boxed_expr(r)?,
         },
         23 => Expr::Cond {
-            test: Box::new(dec_expr(r)?),
-            cons: Box::new(dec_expr(r)?),
-            alt: Box::new(dec_expr(r)?),
+            test: dec_boxed_expr(r)?,
+            cons: dec_boxed_expr(r)?,
+            alt: dec_boxed_expr(r)?,
         },
         24 => Expr::Call {
-            callee: Box::new(dec_expr(r)?),
+            callee: dec_boxed_expr(r)?,
             args: dec_array_elems(r)?,
             optional: r.bool()?,
         },
         25 => Expr::New {
-            callee: Box::new(dec_expr(r)?),
+            callee: dec_boxed_expr(r)?,
             args: dec_array_elems(r)?,
         },
         26 => Expr::Member {
-            obj: Box::new(dec_expr(r)?),
+            obj: dec_boxed_expr(r)?,
             prop: r.str()?,
             optional: r.bool()?,
         },
         27 => Expr::Index {
-            obj: Box::new(dec_expr(r)?),
-            index: Box::new(dec_expr(r)?),
+            obj: dec_boxed_expr(r)?,
+            index: dec_boxed_expr(r)?,
             optional: r.bool()?,
         },
         28 => Expr::Seq(dec_exprs(r)?),
         29 => {
-            let tag = Box::new(dec_expr(r)?);
-            let n = r.uv()? as usize;
-            let mut quasis = Vec::with_capacity(n);
+            let tag = dec_boxed_expr(r)?;
+            let (n, mut quasis) = r.collection()?;
             for _ in 0..n {
                 quasis.push((dec_opt_str(r)?, r.str()?));
             }
@@ -857,21 +964,21 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
                 subs: dec_exprs(r)?,
             }
         }
-        30 => Expr::OptionalChain(Box::new(dec_expr(r)?)),
+        30 => Expr::OptionalChain(dec_boxed_expr(r)?),
         31 => Expr::PrivateIn {
             name: r.str()?,
-            obj: Box::new(dec_expr(r)?),
+            obj: dec_boxed_expr(r)?,
         },
         32 => Expr::ImportCall {
-            spec: Box::new(dec_expr(r)?),
+            spec: dec_boxed_expr(r)?,
             phase: match r.u8()? {
                 0 => ImportPhase::Evaluation,
                 1 => ImportPhase::Source,
                 2 => ImportPhase::Defer,
                 t => return Err(format!("snapshot: bad ImportPhase {t}")),
             },
-            options: if r.u8()? == 1 {
-                Some(Box::new(dec_expr(r)?))
+            options: if r.option()? {
+                Some(dec_boxed_expr(r)?)
             } else {
                 None
             },
@@ -901,8 +1008,7 @@ fn enc_array_elems(w: &mut Writer, elems: &[ArrayElem]) {
     }
 }
 fn dec_array_elems(r: &mut Reader) -> R<Vec<ArrayElem>> {
-    let n = r.uv()? as usize;
-    let mut out = Vec::with_capacity(n);
+    let (n, mut out) = r.collection()?;
     for _ in 0..n {
         out.push(match r.u8()? {
             0 => ArrayElem::Item(dec_expr(r)?),
@@ -1050,11 +1156,17 @@ fn enc_pattern(w: &mut Writer, p: &Pattern) {
     }
 }
 fn dec_pattern(r: &mut Reader) -> R<Pattern> {
+    r.enter_node()?;
+    let result = dec_pattern_inner(r);
+    r.leave_node();
+    result
+}
+
+fn dec_pattern_inner(r: &mut Reader) -> R<Pattern> {
     Ok(match r.u8()? {
         0 => Pattern::Ident(r.str()?),
         1 => {
-            let n = r.uv()? as usize;
-            let mut elems = Vec::with_capacity(n);
+            let (n, mut elems) = r.collection()?;
             for _ in 0..n {
                 elems.push(match r.u8()? {
                     0 => ArrayPatElem::Hole,
@@ -1069,8 +1181,7 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
             Pattern::Array(elems)
         }
         2 => {
-            let n = r.uv()? as usize;
-            let mut props = Vec::with_capacity(n);
+            let (n, mut props) = r.collection()?;
             for _ in 0..n {
                 props.push(ObjPatProp {
                     key: dec_propkey(r)?,
@@ -1083,7 +1194,7 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
                 rest: dec_opt_str(r)?,
             })
         }
-        3 => Pattern::Member(Box::new(dec_expr(r)?)),
+        3 => Pattern::Member(dec_boxed_expr(r)?),
         t => return Err(format!("snapshot: bad Pattern {t}")),
     })
 }
@@ -1109,9 +1220,15 @@ fn enc_function(w: &mut Writer, f: &Function) {
     enc_opt_rcstr(w, &f.source);
 }
 fn dec_function(r: &mut Reader) -> R<Function> {
+    r.enter_node()?;
+    let result = dec_function_inner(r);
+    r.leave_node();
+    result
+}
+
+fn dec_function_inner(r: &mut Reader) -> R<Function> {
     let name = dec_opt_str(r)?;
-    let n = r.uv()? as usize;
-    let mut params = Vec::with_capacity(n);
+    let (n, mut params) = r.collection()?;
     for _ in 0..n {
         params.push(Param {
             pattern: dec_pattern(r)?,
@@ -1180,14 +1297,20 @@ fn enc_class(w: &mut Writer, c: &Class) {
     enc_opt_rcstr(w, &c.source);
 }
 fn dec_class(r: &mut Reader) -> R<Class> {
+    r.enter_node()?;
+    let result = dec_class_inner(r);
+    r.leave_node();
+    result
+}
+
+fn dec_class_inner(r: &mut Reader) -> R<Class> {
     let name = dec_opt_str(r)?;
-    let superclass = if r.u8()? == 1 {
-        Some(Box::new(dec_expr(r)?))
+    let superclass = if r.option()? {
+        Some(dec_boxed_expr(r)?)
     } else {
         None
     };
-    let n = r.uv()? as usize;
-    let mut members = Vec::with_capacity(n);
+    let (n, mut members) = r.collection()?;
     for _ in 0..n {
         let key = dec_propkey(r)?;
         let kind = match r.u8()? {
@@ -1201,7 +1324,7 @@ fn dec_class(r: &mut Reader) -> R<Class> {
             t => return Err(format!("snapshot: bad MemberKind {t}")),
         };
         let is_static = r.bool()?;
-        let func = if r.u8()? == 1 {
+        let func = if r.option()? {
             Some(Rc::new(dec_function(r)?))
         } else {
             None
@@ -1245,8 +1368,7 @@ fn dec_forinit(r: &mut Reader) -> R<ForInit> {
     Ok(match r.u8()? {
         0 => {
             let kind = dec_declkind(r)?;
-            let n = r.uv()? as usize;
-            let mut decls = Vec::with_capacity(n);
+            let (n, mut decls) = r.collection()?;
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));
             }
@@ -1318,7 +1440,14 @@ fn dec_declkind(r: &mut Reader) -> R<DeclKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, encode, Writer, MAGIC, VERSION};
+
+    fn snapshot_writer() -> Writer {
+        let mut writer = Writer { buf: Vec::new() };
+        writer.uv(MAGIC as u64);
+        writer.uv(VERSION as u64);
+        writer
+    }
 
     /// `encode` and `decode` must be exact inverses: re-encoding a decoded tree reproduces the
     /// bytes. This catches every tag/field-order asymmetry (a *dropped* field is caught instead
@@ -1363,5 +1492,46 @@ mod tests {
             let src = std::fs::read_to_string(format!("{dir}{file}")).unwrap();
             assert_roundtrips(&src);
         }
+    }
+
+    #[test]
+    fn corrupt_lengths_and_varints_fail_before_allocation() {
+        let mut huge_collection = snapshot_writer();
+        huge_collection.uv(u64::MAX);
+        assert!(decode(&huge_collection.buf)
+            .unwrap_err()
+            .contains("collection length"));
+
+        let mut overflowing_varint = snapshot_writer();
+        overflowing_varint.buf.extend_from_slice(&[0xff; 9]);
+        overflowing_varint.buf.push(2);
+        assert!(decode(&overflowing_varint.buf)
+            .unwrap_err()
+            .contains("varint overflow"));
+    }
+
+    #[test]
+    fn corrupt_structure_is_strictly_bounded() {
+        let mut trailing = encode(&[]);
+        trailing.push(0);
+        assert!(decode(&trailing).unwrap_err().contains("trailing bytes"));
+
+        let mut invalid_bool = snapshot_writer();
+        invalid_bool.uv(1); // one statement
+        invalid_bool.u8(0); // expression statement
+        invalid_bool.u8(5); // boolean expression
+        invalid_bool.u8(2); // invalid Boolean encoding
+        assert!(decode(&invalid_bool.buf)
+            .unwrap_err()
+            .contains("invalid boolean"));
+
+        let mut nested = snapshot_writer();
+        nested.uv(1); // one statement
+        nested.u8(0); // expression statement
+        for _ in 0..600 {
+            nested.u8(0); // parenthesized expression
+        }
+        nested.u8(6); // null
+        assert!(decode(&nested.buf).unwrap_err().contains("nesting limit"));
     }
 }

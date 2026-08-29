@@ -7,9 +7,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::parse::{FuncType, Module, ValType};
+use lumen_host::ArrayBufferBytes;
+
+use super::parse::{FuncType, Limits, Module, ValType};
 
 pub const PAGE_SIZE: usize = 65536;
+/// Agent-store resource budgets. WebAssembly Core Appendix "Implementation Limitations" permits
+/// bounded memory/table instances; allocation failure must be reported, never panic or abort.
+pub const MAX_STORE_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_STORE_TABLE_ELEMENTS: usize = 4_000_000;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Val {
@@ -96,16 +102,18 @@ pub struct Label {
 pub struct TableEntity {
     pub elems: Vec<Option<usize>>,
     pub max: Option<u32>,
+    pub elem_type: ValType,
 }
 
 pub struct MemEntity {
-    pub bytes: Vec<u8>,
+    pub bytes: ArrayBufferBytes,
     pub max: Option<u32>,
 }
 
 pub struct GlobalEntity {
     pub val: Val,
     pub mutable: bool,
+    pub ty: ValType,
 }
 
 /// Import values resolved by the op layer, as store addresses (for memory/table/globals — whether
@@ -133,11 +141,33 @@ pub struct Instance {
 /// globals (WebAssembly's Store). Execution and linking go through it.
 #[derive(Default)]
 pub struct Store {
-    pub funcs: Vec<FuncEntity>,
-    pub tables: Vec<TableEntity>,
-    pub memories: Vec<MemEntity>,
-    pub globals: Vec<GlobalEntity>,
-    pub instances: Vec<Rc<Instance>>,
+    pub funcs: Vec<Option<FuncEntity>>,
+    pub tables: Vec<Option<TableEntity>>,
+    pub memories: Vec<Option<MemEntity>>,
+    pub globals: Vec<Option<GlobalEntity>>,
+    pub instances: Vec<Option<Rc<Instance>>>,
+    memory_bytes: usize,
+    table_elements: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StoreCheckpoint {
+    funcs: usize,
+    tables: usize,
+    memories: usize,
+    globals: usize,
+    instances: usize,
+    memory_bytes: usize,
+    table_elements: usize,
+}
+
+fn trim_tombstones<T>(slots: &mut Vec<Option<T>>) {
+    while slots.last().is_some_and(Option::is_none) {
+        slots.pop();
+    }
+    if slots.capacity() > slots.len().saturating_mul(2).saturating_add(64) {
+        slots.shrink_to_fit();
+    }
 }
 
 /// The host bridge: the op layer implements this to call imported JS functions. `results` is the
@@ -149,6 +179,29 @@ pub trait Host {
         args: &[Val],
         results: &[ValType],
     ) -> Result<Vec<Val>, String>;
+
+    /// WebAssembly JS API §5.3 requires the corresponding fixed ArrayBuffer to be refreshed
+    /// immediately after a successful `memory.grow`, including before a later host callback.
+    fn memory_grew(&mut self, _memory_addr: usize) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Roots held by live JavaScript WebAssembly wrappers. Store addresses are stable tombstone slots;
+/// releasing a wrapper triggers a graph trace through instances, tables, and defining functions.
+#[derive(Clone, Copy, Debug)]
+pub enum StoreRoot {
+    Instance(usize),
+    Func(usize),
+    Table(usize),
+    Memory(usize),
+    Global(usize),
+}
+
+#[derive(Default)]
+pub struct SweepResult {
+    pub dead_memories: Vec<usize>,
+    pub live_host_funcs: std::collections::HashSet<usize>,
 }
 
 // ---- label pre-scan ---------------------------------------------------------------------------
@@ -178,22 +231,25 @@ pub fn scan_labels(code: &[u8]) -> Result<HashMap<usize, Label>, String> {
             }
             0x05 => {
                 // else — belongs to the innermost open `if`
-                if let Some(&pos) = open.last() {
-                    if let Some(l) = labels.get_mut(&pos) {
-                        l.else_ip = Some(ip);
-                    }
+                let &pos = open.last().ok_or("wasm: else without open block")?;
+                let l = labels.get_mut(&pos).ok_or("wasm: else without label")?;
+                if l.else_ip.replace(ip).is_some() {
+                    return Err("wasm: duplicate else".into());
                 }
             }
             0x0b => {
                 // end
-                if let Some(pos) = open.pop() {
-                    if let Some(l) = labels.get_mut(&pos) {
-                        l.end_ip = ip;
-                    }
-                }
+                let pos = open.pop().ok_or("wasm: end without open block")?;
+                labels
+                    .get_mut(&pos)
+                    .ok_or("wasm: end without label")?
+                    .end_ip = ip;
             }
             _ => skip_immediates(code, op, &mut ip)?,
         }
+    }
+    if !open.is_empty() {
+        return Err("wasm: unterminated structured control instruction".into());
     }
     Ok(labels)
 }
@@ -204,40 +260,88 @@ fn skip_blocktype(code: &[u8], ip: &mut usize) -> Result<(), String> {
         *ip += 1;
     } else {
         // s33 type index (signed LEB)
-        read_sleb(code, ip)?;
+        read_sleb_bits(code, ip, 33)?;
     }
     Ok(())
 }
 
 fn read_uleb(code: &[u8], ip: &mut usize) -> Result<u64, String> {
+    read_uleb_bits(code, ip, 32)
+}
+
+fn read_uleb_bits(code: &[u8], ip: &mut usize, bits: u32) -> Result<u64, String> {
+    let max_bytes = bits.div_ceil(7) as usize;
     let mut result = 0u64;
-    let mut shift = 0;
-    loop {
+    for byte_index in 0..max_bytes {
         let b = *code.get(*ip).ok_or("wasm: truncated LEB")?;
         *ip += 1;
-        result |= ((b & 0x7f) as u64) << shift;
+        let shift = byte_index * 7;
+        let payload = b & 0x7f;
+        let remaining = bits.saturating_sub(shift as u32);
+        if remaining < 7 && (payload as u64) >= (1u64 << remaining) {
+            return Err("wasm: unsigned LEB128 overflow".into());
+        }
+        result |= (payload as u64) << shift;
         if b & 0x80 == 0 {
             return Ok(result);
         }
-        shift += 7;
     }
+    Err("wasm: unsigned LEB128 too long".into())
 }
 
 fn read_sleb(code: &[u8], ip: &mut usize) -> Result<i64, String> {
+    read_sleb_bits(code, ip, 64)
+}
+
+fn read_sleb_bits(code: &[u8], ip: &mut usize, bits: u32) -> Result<i64, String> {
+    let max_bytes = bits.div_ceil(7) as usize;
     let mut result = 0i64;
-    let mut shift = 0;
-    loop {
+    for byte_index in 0..max_bytes {
         let b = *code.get(*ip).ok_or("wasm: truncated SLEB")?;
         *ip += 1;
-        result |= ((b & 0x7f) as i64) << shift;
-        shift += 7;
+        let shift = byte_index * 7;
+        let remaining = bits.saturating_sub(shift as u32);
+        let payload = b & 0x7f;
+        if remaining < 7 {
+            let value_mask = (1u8 << remaining) - 1;
+            let unused = payload & !value_mask;
+            let sign = payload & (1u8 << (remaining - 1)) != 0;
+            if (!sign && unused != 0) || (sign && unused != (!value_mask & 0x7f)) {
+                return Err("wasm: signed LEB128 overflow".into());
+            }
+        }
+        result |= (payload as i64) << shift;
         if b & 0x80 == 0 {
-            if shift < 64 && b & 0x40 != 0 {
-                result |= -1i64 << shift;
+            let consumed = ((byte_index + 1) * 7) as u32;
+            if consumed < bits && b & 0x40 != 0 {
+                result |= -1i64 << consumed;
             }
             return Ok(result);
         }
     }
+    Err("wasm: signed LEB128 too long".into())
+}
+
+fn skip_bytes(code: &[u8], ip: &mut usize, len: usize) -> Result<(), String> {
+    let end = ip
+        .checked_add(len)
+        .ok_or("wasm: immediate length overflow")?;
+    if end > code.len() {
+        return Err("wasm: truncated instruction immediate".into());
+    }
+    *ip = end;
+    Ok(())
+}
+
+fn read_fixed<const N: usize>(code: &[u8], ip: &mut usize) -> Result<[u8; N], String> {
+    let end = ip.checked_add(N).ok_or("wasm: immediate length overflow")?;
+    let bytes = code
+        .get(*ip..end)
+        .ok_or("wasm: truncated instruction immediate")?;
+    *ip = end;
+    bytes
+        .try_into()
+        .map_err(|_| "wasm: malformed fixed-width immediate".into())
 }
 
 /// Advance `ip` past the immediate operands of the instruction with opcode `op`.
@@ -265,8 +369,7 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
             Ok(())
         }
         0xd0 => {
-            *ip += 1; // ref.null t
-            Ok(())
+            skip_bytes(code, ip, 1) // ref.null t
         }
         0x41 => {
             read_sleb(code, ip)?; // i32.const
@@ -277,12 +380,10 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
             Ok(())
         }
         0x43 => {
-            *ip += 4; // f32.const
-            Ok(())
+            skip_bytes(code, ip, 4) // f32.const
         }
         0x44 => {
-            *ip += 8; // f64.const
-            Ok(())
+            skip_bytes(code, ip, 8) // f64.const
         }
         // memory load/store: memarg (align + offset)
         0x28..=0x3e => {
@@ -291,24 +392,23 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
             Ok(())
         }
         0x3f | 0x40 => {
-            *ip += 1; // memory.size / memory.grow (reserved byte)
-            Ok(())
+            skip_bytes(code, ip, 1) // memory.size / memory.grow (reserved byte)
         }
         0xfc => {
             let sub = read_uleb(code, ip)?;
             match sub {
                 8 => {
                     read_uleb(code, ip)?;
-                    *ip += 1;
+                    skip_bytes(code, ip, 1)?;
                 } // memory.init: dataidx, mem
                 9 => {
                     read_uleb(code, ip)?;
                 } // data.drop
                 10 => {
-                    *ip += 2;
+                    skip_bytes(code, ip, 2)?;
                 } // memory.copy: two mem indices
                 11 => {
-                    *ip += 1;
+                    skip_bytes(code, ip, 1)?;
                 } // memory.fill: mem
                 _ => {} // trunc_sat variants: no immediate
             }
@@ -345,6 +445,127 @@ struct Ctrl {
 }
 
 impl Store {
+    /// Trace store entities reachable from live JavaScript wrappers, then tombstone everything
+    /// else. Addresses are never renumbered, so a collection cannot invalidate another live
+    /// wrapper or a table slot. The byte/element budgets are released with the entities.
+    pub fn sweep(&mut self, roots: impl IntoIterator<Item = StoreRoot>) -> SweepResult {
+        let mut funcs = vec![false; self.funcs.len()];
+        let mut tables = vec![false; self.tables.len()];
+        let mut memories = vec![false; self.memories.len()];
+        let mut globals = vec![false; self.globals.len()];
+        let mut instances = vec![false; self.instances.len()];
+        let mut pending: Vec<StoreRoot> = roots.into_iter().collect();
+
+        while let Some(root) = pending.pop() {
+            match root {
+                StoreRoot::Instance(address) => {
+                    if address >= instances.len()
+                        || instances[address]
+                        || self.instances[address].is_none()
+                    {
+                        continue;
+                    }
+                    instances[address] = true;
+                    let instance = self.instances[address].as_ref().expect("checked above");
+                    pending.extend(instance.func_addrs.iter().copied().map(StoreRoot::Func));
+                    pending.extend(instance.table_addrs.iter().copied().map(StoreRoot::Table));
+                    pending.extend(instance.mem_addrs.iter().copied().map(StoreRoot::Memory));
+                    pending.extend(instance.global_addrs.iter().copied().map(StoreRoot::Global));
+                }
+                StoreRoot::Func(address) => {
+                    if address >= funcs.len() || funcs[address] || self.funcs[address].is_none() {
+                        continue;
+                    }
+                    funcs[address] = true;
+                    if let Some(FuncEntity::Wasm { instance, .. }) = &self.funcs[address] {
+                        pending.push(StoreRoot::Instance(*instance));
+                    }
+                }
+                StoreRoot::Table(address) => {
+                    if address >= tables.len() || tables[address] || self.tables[address].is_none()
+                    {
+                        continue;
+                    }
+                    tables[address] = true;
+                    pending.extend(
+                        self.tables[address]
+                            .as_ref()
+                            .expect("checked above")
+                            .elems
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .map(StoreRoot::Func),
+                    );
+                }
+                StoreRoot::Memory(address) => {
+                    if address < memories.len() && self.memories[address].is_some() {
+                        memories[address] = true;
+                    }
+                }
+                StoreRoot::Global(address) => {
+                    if address < globals.len() && self.globals[address].is_some() {
+                        globals[address] = true;
+                    }
+                }
+            }
+        }
+
+        let mut result = SweepResult::default();
+        for (address, entity) in self.funcs.iter_mut().enumerate() {
+            if funcs[address] {
+                if let Some(FuncEntity::Host { id, .. }) = entity {
+                    result.live_host_funcs.insert(*id);
+                }
+            } else {
+                *entity = None;
+            }
+        }
+        for (address, entity) in self.tables.iter_mut().enumerate() {
+            if !tables[address] {
+                if let Some(table) = entity.take() {
+                    self.table_elements = self.table_elements.saturating_sub(table.elems.len());
+                }
+            }
+        }
+        for (address, entity) in self.memories.iter_mut().enumerate() {
+            if !memories[address] {
+                if let Some(memory) = entity.take() {
+                    self.memory_bytes = self
+                        .memory_bytes
+                        .saturating_sub(memory.bytes.borrow().len());
+                    result.dead_memories.push(address);
+                }
+            }
+        }
+        for (address, entity) in self.globals.iter_mut().enumerate() {
+            if !globals[address] {
+                *entity = None;
+            }
+        }
+        for (address, entity) in self.instances.iter_mut().enumerate() {
+            if !instances[address] {
+                *entity = None;
+            }
+        }
+        trim_tombstones(&mut self.funcs);
+        trim_tombstones(&mut self.tables);
+        trim_tombstones(&mut self.memories);
+        trim_tombstones(&mut self.globals);
+        trim_tombstones(&mut self.instances);
+        result
+    }
+
+    pub fn live_entity_counts(&self) -> [usize; 5] {
+        [
+            self.instances.iter().flatten().count(),
+            self.funcs.iter().flatten().count(),
+            self.tables.iter().flatten().count(),
+            self.memories.iter().flatten().count(),
+            self.globals.iter().flatten().count(),
+        ]
+    }
+
     /// Call the store function at `func_addr` with `args`; returns its results.
     pub fn invoke(
         &mut self,
@@ -362,6 +583,7 @@ impl Store {
         let (compiled, inst) = match self
             .funcs
             .get(func_addr)
+            .and_then(Option::as_ref)
             .ok_or("wasm: bad function index")?
         {
             FuncEntity::Host { id, ty } => {
@@ -373,9 +595,14 @@ impl Store {
                 }
                 return Ok(r);
             }
-            FuncEntity::Wasm { compiled, instance } => {
-                (compiled.clone(), self.instances[*instance].clone())
-            }
+            FuncEntity::Wasm { compiled, instance } => (
+                compiled.clone(),
+                self.instances
+                    .get(*instance)
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .ok_or("wasm: dead function instance")?,
+            ),
         };
         let mem_addr = inst.mem_addrs.first().copied();
 
@@ -386,7 +613,15 @@ impl Store {
         }
 
         let mut stack: Vec<Val> = Vec::new();
-        let mut ctrl: Vec<Ctrl> = Vec::new();
+        // The function body has an implicit outer control label. Besides matching the validation
+        // model, this makes a top-level `br 0` a return instead of an out-of-range branch.
+        let mut ctrl = vec![Ctrl {
+            is_loop: false,
+            end_ip: compiled.code.len(),
+            start_ip: 0,
+            stack_height: 0,
+            arity: compiled.ty.results.len(),
+        }];
         let code = &compiled.code;
         let labels = &compiled.labels;
         let mut ip = 0;
@@ -412,6 +647,7 @@ impl Store {
                             match label.else_ip {
                                 Some(e) => ip = e,
                                 None => {
+                                    ctrl.pop();
                                     ip = label.end_ip;
                                     continue;
                                 }
@@ -428,15 +664,16 @@ impl Store {
                 }
                 0x05 => {
                     // else: reached only by falling out of the `then` arm → jump to end
-                    if let Some(c) = ctrl.last() {
+                    if let Some(c) = ctrl.pop() {
                         ip = c.end_ip;
                     }
                 }
                 0x0b => {
                     // end
-                    if ctrl.pop().is_none() {
-                        break; // function end
+                    if ctrl.len() <= 1 {
+                        return Err("wasm: unexpected function-level end".into());
                     }
+                    ctrl.pop();
                 }
                 0x0c => {
                     let l = read_uleb(code, &mut ip)? as usize;
@@ -471,7 +708,10 @@ impl Store {
                 0x10 => {
                     let f = read_uleb(code, &mut ip)? as usize;
                     let addr = *inst.func_addrs.get(f).ok_or("wasm: bad function index")?;
-                    let ty = self.funcs[addr].ty();
+                    let ty = self.funcs[addr]
+                        .as_ref()
+                        .ok_or("wasm: dead function address")?
+                        .ty();
                     let mut args = Vec::with_capacity(ty.params.len());
                     for _ in 0..ty.params.len() {
                         args.push(stack.pop().ok_or("wasm: stack underflow on call")?);
@@ -491,6 +731,8 @@ impl Store {
                     // Table slots hold store function addresses, so an imported/shared table can
                     // dispatch to functions from any instance.
                     let addr = self.tables[table_addr]
+                        .as_ref()
+                        .ok_or("wasm: dead table address")?
                         .elems
                         .get(elem as usize)
                         .copied()
@@ -501,7 +743,10 @@ impl Store {
                         .types
                         .get(type_idx)
                         .ok_or("wasm: bad type index")?;
-                    let actual = self.funcs[addr].ty();
+                    let actual = self.funcs[addr]
+                        .as_ref()
+                        .ok_or("wasm: dead indirect function")?
+                        .ty();
                     if !same_type(expected, &actual) {
                         return Err("wasm: indirect call type mismatch".into());
                     }
@@ -540,13 +785,21 @@ impl Store {
                 0x23 => {
                     let i = read_uleb(code, &mut ip)? as usize;
                     let addr = *inst.global_addrs.get(i).ok_or("wasm: bad global index")?;
-                    stack.push(self.globals[addr].val);
+                    stack.push(
+                        self.globals[addr]
+                            .as_ref()
+                            .ok_or("wasm: dead global address")?
+                            .val,
+                    );
                 }
                 0x24 => {
                     let i = read_uleb(code, &mut ip)? as usize;
                     let addr = *inst.global_addrs.get(i).ok_or("wasm: bad global index")?;
                     let v = stack.pop().ok_or("wasm: stack underflow")?;
-                    self.globals[addr].val = v;
+                    self.globals[addr]
+                        .as_mut()
+                        .ok_or("wasm: dead global address")?
+                        .val = v;
                 }
                 // memory loads/stores
                 0x28..=0x3e => {
@@ -554,26 +807,36 @@ impl Store {
                     self.mem_op(ma, op, code, &mut ip, &mut stack)?;
                 }
                 0x3f => {
-                    ip += 1; // reserved
+                    skip_bytes(code, &mut ip, 1)?; // reserved
                     let ma = mem_addr.ok_or("wasm: no memory")?;
-                    stack.push(Val::I32((self.memories[ma].bytes.len() / PAGE_SIZE) as i32));
+                    stack.push(Val::I32(
+                        (self.memories[ma]
+                            .as_ref()
+                            .ok_or("wasm: dead memory address")?
+                            .bytes
+                            .borrow()
+                            .len()
+                            / PAGE_SIZE) as i32,
+                    ));
                 }
                 0x40 => {
-                    ip += 1;
+                    skip_bytes(code, &mut ip, 1)?;
                     let ma = mem_addr.ok_or("wasm: no memory")?;
                     let delta = stack.pop().unwrap().i32();
-                    stack.push(Val::I32(self.mem_grow(ma, delta)));
+                    let previous = self.mem_grow(ma, delta);
+                    if previous >= 0 {
+                        host.memory_grew(ma)?;
+                    }
+                    stack.push(Val::I32(previous));
                 }
-                0x41 => stack.push(Val::I32(read_sleb(code, &mut ip)? as i32)),
+                0x41 => stack.push(Val::I32(read_sleb_bits(code, &mut ip, 32)? as i32)),
                 0x42 => stack.push(Val::I64(read_sleb(code, &mut ip)?)),
                 0x43 => {
-                    let bytes: [u8; 4] = code[ip..ip + 4].try_into().unwrap();
-                    ip += 4;
+                    let bytes = read_fixed::<4>(code, &mut ip)?;
                     stack.push(Val::F32(f32::from_le_bytes(bytes)));
                 }
                 0x44 => {
-                    let bytes: [u8; 8] = code[ip..ip + 8].try_into().unwrap();
-                    ip += 8;
+                    let bytes = read_fixed::<8>(code, &mut ip)?;
                     stack.push(Val::F64(f64::from_le_bytes(bytes)));
                 }
                 0xfc => {
@@ -595,9 +858,14 @@ impl Store {
         if delta < 0 {
             return -1;
         }
-        let mem = &mut self.memories[mem_addr];
-        let old_pages = (mem.bytes.len() / PAGE_SIZE) as u32;
-        let new_pages = old_pages.saturating_add(delta as u32);
+        let Some(mem) = self.memories.get(mem_addr).and_then(Option::as_ref) else {
+            return -1;
+        };
+        let old_len = mem.bytes.borrow().len();
+        let old_pages = (old_len / PAGE_SIZE) as u32;
+        let Some(new_pages) = old_pages.checked_add(delta as u32) else {
+            return -1;
+        };
         if let Some(max) = mem.max {
             if new_pages > max {
                 return -1;
@@ -606,26 +874,95 @@ impl Store {
         if new_pages > 65536 {
             return -1;
         }
-        mem.bytes.resize(new_pages as usize * PAGE_SIZE, 0);
+        let Some(new_bytes) = (new_pages as usize).checked_mul(PAGE_SIZE) else {
+            return -1;
+        };
+        let additional = new_bytes - old_len;
+        let Some(new_total) = self.memory_bytes.checked_add(additional) else {
+            return -1;
+        };
+        if new_total > MAX_STORE_MEMORY_BYTES {
+            return -1;
+        }
+        let mut bytes = self.memories[mem_addr]
+            .as_ref()
+            .expect("checked live memory above")
+            .bytes
+            .borrow_mut();
+        if bytes.try_reserve_exact(additional).is_err() {
+            return -1;
+        }
+        bytes.resize(new_bytes, 0);
+        self.memory_bytes = new_total;
         old_pages as i32
     }
 
-    pub fn alloc_memory(&mut self, min_pages: usize, max: Option<u32>) -> usize {
-        self.memories.push(MemEntity {
-            bytes: vec![0u8; min_pages * PAGE_SIZE],
+    pub fn alloc_memory(&mut self, min_pages: usize, max: Option<u32>) -> Result<usize, String> {
+        if min_pages > 65_536
+            || max.is_some_and(|maximum| maximum > 65_536 || min_pages > maximum as usize)
+        {
+            return Err("wasm: invalid memory limits".into());
+        }
+        let bytes_len = min_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or("wasm: memory size overflow")?;
+        let new_total = self
+            .memory_bytes
+            .checked_add(bytes_len)
+            .ok_or("wasm: store memory budget overflow")?;
+        if new_total > MAX_STORE_MEMORY_BYTES {
+            return Err("wasm: store memory budget exceeded".into());
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(bytes_len)
+            .map_err(|_| "wasm: memory allocation failed")?;
+        bytes.resize(bytes_len, 0);
+        self.memories.push(Some(MemEntity {
+            bytes: Rc::new(std::cell::RefCell::new(bytes)),
             max,
-        });
-        self.memories.len() - 1
+        }));
+        self.memory_bytes = new_total;
+        Ok(self.memories.len() - 1)
     }
-    pub fn alloc_table(&mut self, min: usize, max: Option<u32>) -> usize {
-        self.tables.push(TableEntity {
-            elems: vec![None; min],
+    pub fn alloc_table(&mut self, min: usize, max: Option<u32>) -> Result<usize, String> {
+        self.alloc_table_typed(min, max, ValType::FuncRef)
+    }
+
+    fn alloc_table_typed(
+        &mut self,
+        min: usize,
+        max: Option<u32>,
+        elem_type: ValType,
+    ) -> Result<usize, String> {
+        if min > u32::MAX as usize || max.is_some_and(|maximum| min > maximum as usize) {
+            return Err("wasm: invalid table limits".into());
+        }
+        if elem_type != ValType::FuncRef {
+            return Err("wasm: unsupported table element type".into());
+        }
+        let new_total = self
+            .table_elements
+            .checked_add(min)
+            .ok_or("wasm: store table budget overflow")?;
+        if new_total > MAX_STORE_TABLE_ELEMENTS {
+            return Err("wasm: store table budget exceeded".into());
+        }
+        let mut elems = Vec::new();
+        elems
+            .try_reserve_exact(min)
+            .map_err(|_| "wasm: table allocation failed")?;
+        elems.resize(min, None);
+        self.tables.push(Some(TableEntity {
+            elems,
             max,
-        });
-        self.tables.len() - 1
+            elem_type,
+        }));
+        self.table_elements = new_total;
+        Ok(self.tables.len() - 1)
     }
-    pub fn alloc_global(&mut self, val: Val, mutable: bool) -> usize {
-        self.globals.push(GlobalEntity { val, mutable });
+    pub fn alloc_global(&mut self, val: Val, mutable: bool, ty: ValType) -> usize {
+        self.globals.push(Some(GlobalEntity { val, mutable, ty }));
         self.globals.len() - 1
     }
 
@@ -633,6 +970,29 @@ impl Store {
     /// `self.instances`. Allocates the module's defined functions/memory/tables/globals into the
     /// store, references imported entities by address, and runs element/data segments.
     pub fn instantiate(&mut self, module: Rc<Module>, imports: Imports) -> Result<usize, String> {
+        let checkpoint = StoreCheckpoint {
+            funcs: self.funcs.len(),
+            tables: self.tables.len(),
+            memories: self.memories.len(),
+            globals: self.globals.len(),
+            instances: self.instances.len(),
+            memory_bytes: self.memory_bytes,
+            table_elements: self.table_elements,
+        };
+        let result = self.instantiate_inner(module, imports);
+        if result.is_err() {
+            self.funcs.truncate(checkpoint.funcs);
+            self.tables.truncate(checkpoint.tables);
+            self.memories.truncate(checkpoint.memories);
+            self.globals.truncate(checkpoint.globals);
+            self.instances.truncate(checkpoint.instances);
+            self.memory_bytes = checkpoint.memory_bytes;
+            self.table_elements = checkpoint.table_elements;
+        }
+        result
+    }
+
+    fn instantiate_inner(&mut self, module: Rc<Module>, imports: Imports) -> Result<usize, String> {
         let inst_idx = self.instances.len();
         let mut func_addrs = Vec::new();
         let mut table_addrs = Vec::new();
@@ -646,17 +1006,50 @@ impl Store {
             match &imp.kind {
                 crate::wasm::ImportKind::Func(_) => {
                     let (id, ty) = host_funcs.next().ok_or("wasm: missing function import")?;
-                    self.funcs.push(FuncEntity::Host { id, ty });
+                    self.funcs.push(Some(FuncEntity::Host { id, ty }));
                     func_addrs.push(self.funcs.len() - 1);
                 }
-                crate::wasm::ImportKind::Table(_) => {
-                    table_addrs.push(imports.table_addr.ok_or("wasm: missing table import")?);
+                crate::wasm::ImportKind::Table(expected) => {
+                    let addr = imports.table_addr.ok_or("wasm: missing table import")?;
+                    let actual = self
+                        .tables
+                        .get(addr)
+                        .and_then(Option::as_ref)
+                        .ok_or("wasm: imported table address out of range")?;
+                    if actual.elem_type != expected.elem
+                        || !limits_match(actual.elems.len() as u32, actual.max, expected.limits)
+                    {
+                        return Err("wasm: imported table type does not match".into());
+                    }
+                    table_addrs.push(addr);
                 }
-                crate::wasm::ImportKind::Memory(_) => {
-                    mem_addrs.push(imports.mem_addr.ok_or("wasm: missing memory import")?);
+                crate::wasm::ImportKind::Memory(expected) => {
+                    let addr = imports.mem_addr.ok_or("wasm: missing memory import")?;
+                    let actual = self
+                        .memories
+                        .get(addr)
+                        .and_then(Option::as_ref)
+                        .ok_or("wasm: imported memory address out of range")?;
+                    if !limits_match(
+                        (actual.bytes.borrow().len() / PAGE_SIZE) as u32,
+                        actual.max,
+                        *expected,
+                    ) {
+                        return Err("wasm: imported memory type does not match".into());
+                    }
+                    mem_addrs.push(addr);
                 }
-                crate::wasm::ImportKind::Global(_) => {
-                    global_addrs.push(imp_globals.next().ok_or("wasm: missing global import")?);
+                crate::wasm::ImportKind::Global(expected) => {
+                    let addr = imp_globals.next().ok_or("wasm: missing global import")?;
+                    let actual = self
+                        .globals
+                        .get(addr)
+                        .and_then(Option::as_ref)
+                        .ok_or("wasm: imported global address out of range")?;
+                    if actual.ty != expected.val || actual.mutable != expected.mutable {
+                        return Err("wasm: imported global type does not match".into());
+                    }
+                    global_addrs.push(addr);
                 }
             }
         }
@@ -666,7 +1059,7 @@ impl Store {
             let ty = module.types[type_idx as usize].clone();
             let body = &module.code[i];
             let labels = scan_labels(&body.code)?;
-            self.funcs.push(FuncEntity::Wasm {
+            self.funcs.push(Some(FuncEntity::Wasm {
                 compiled: Rc::new(Compiled {
                     ty,
                     locals: body.locals.clone(),
@@ -674,23 +1067,26 @@ impl Store {
                     labels,
                 }),
                 instance: inst_idx,
-            });
+            }));
             func_addrs.push(self.funcs.len() - 1);
         }
         // Defined memory (single, MVP) and tables.
         if let Some(l) = module.memories.first() {
-            let a = self.alloc_memory(l.min as usize, l.max);
+            let a = self.alloc_memory(l.min as usize, l.max)?;
             mem_addrs.push(a);
         }
         for t in &module.tables {
-            let a = self.alloc_table(t.limits.min as usize, t.limits.max);
+            let a = self.alloc_table_typed(t.limits.min as usize, t.limits.max, t.elem)?;
             table_addrs.push(a);
         }
         // Defined globals: each init expr sees the globals resolved so far (by value).
         for g in &module.globals {
-            let seen: Vec<Val> = global_addrs.iter().map(|&a| self.globals[a].val).collect();
+            let seen: Vec<Val> = global_addrs
+                .iter()
+                .map(|&a| self.globals[a].as_ref().expect("live global").val)
+                .collect();
             let v = eval_const_expr(&g.init, &seen)?;
-            let a = self.alloc_global(v, g.ty.mutable);
+            let a = self.alloc_global(v, g.ty.mutable, g.ty.val);
             global_addrs.push(a);
         }
 
@@ -701,33 +1097,41 @@ impl Store {
             mem_addrs,
             global_addrs,
         });
-        self.instances.push(Rc::clone(&inst));
         let seen_globals: Vec<Val> = inst
             .global_addrs
             .iter()
-            .map(|&a| self.globals[a].val)
+            .map(|&a| self.globals[a].as_ref().expect("live global").val)
             .collect();
 
-        // Active element segments: local function indices → store func addresses.
+        // Instantiation is transactional: preflight every active segment before mutating an
+        // imported table/memory. Core validation deliberately leaves these bounds checks to
+        // instantiation because offsets and imported entity sizes are runtime values.
         for seg in &module.elems {
-            let offset = eval_const_expr(&seg.offset, &seen_globals)?.i32() as usize;
+            let offset = eval_const_expr(&seg.offset, &seen_globals)?.i32() as u32 as usize;
             let table_addr = *inst
                 .table_addrs
                 .get(seg.table as usize)
                 .ok_or("wasm: element segment references missing table")?;
-            for (k, &f) in seg.func_indices.iter().enumerate() {
-                let slot = offset + k;
-                let faddr = *inst
-                    .func_addrs
-                    .get(f as usize)
-                    .ok_or("wasm: elem func index out of range")?;
-                if slot >= self.tables[table_addr].elems.len() {
-                    return Err("wasm: element segment out of table bounds".into());
-                }
-                self.tables[table_addr].elems[slot] = Some(faddr);
+            let end = offset
+                .checked_add(seg.func_indices.len())
+                .ok_or("wasm: element segment offset overflow")?;
+            if end
+                > self.tables[table_addr]
+                    .as_ref()
+                    .expect("live table")
+                    .elems
+                    .len()
+            {
+                return Err("wasm: element segment out of table bounds".into());
+            }
+            if seg
+                .func_indices
+                .iter()
+                .any(|&f| f as usize >= inst.func_addrs.len())
+            {
+                return Err("wasm: elem func index out of range".into());
             }
         }
-        // Active data segments.
         for seg in &module.data {
             if let Some((_mem, offset_expr)) = &seg.active {
                 let offset = eval_const_expr(offset_expr, &seen_globals)?.i32() as u32 as usize;
@@ -735,14 +1139,40 @@ impl Store {
                     .mem_addrs
                     .first()
                     .ok_or("wasm: data segment but no memory")?;
-                let mem = &mut self.memories[mem_addr].bytes;
+                let mem = self.memories[mem_addr]
+                    .as_ref()
+                    .expect("live memory")
+                    .bytes
+                    .borrow();
                 let end = offset
                     .checked_add(seg.bytes.len())
                     .ok_or("wasm: data offset overflow")?;
                 if end > mem.len() {
                     return Err("wasm: data segment out of memory bounds".into());
                 }
-                mem[offset..end].copy_from_slice(&seg.bytes);
+            }
+        }
+
+        self.instances.push(Some(Rc::clone(&inst)));
+        for seg in &module.elems {
+            let offset = eval_const_expr(&seg.offset, &seen_globals)?.i32() as u32 as usize;
+            let table_addr = inst.table_addrs[seg.table as usize];
+            for (slot, &func_index) in seg.func_indices.iter().enumerate() {
+                self.tables[table_addr].as_mut().expect("live table").elems[offset + slot] =
+                    Some(inst.func_addrs[func_index as usize]);
+            }
+        }
+        for seg in &module.data {
+            if let Some((_memory, offset_expr)) = &seg.active {
+                let offset = eval_const_expr(offset_expr, &seen_globals)?.i32() as u32 as usize;
+                let memory_addr = inst.mem_addrs[0];
+                let end = offset + seg.bytes.len();
+                self.memories[memory_addr]
+                    .as_ref()
+                    .expect("live memory")
+                    .bytes
+                    .borrow_mut()[offset..end]
+                    .copy_from_slice(&seg.bytes);
             }
         }
         Ok(inst_idx)
@@ -754,7 +1184,7 @@ impl Store {
         inst_idx: usize,
         name: &str,
     ) -> Option<(crate::wasm::ExportKind, usize)> {
-        let inst = self.instances.get(inst_idx)?;
+        let inst = self.instances.get(inst_idx)?.as_ref()?;
         let e = inst.module.exports.iter().find(|e| e.name == name)?;
         let addr = match e.kind {
             crate::wasm::ExportKind::Func => *inst.func_addrs.get(e.index as usize)?,
@@ -778,7 +1208,7 @@ impl Store {
         let addr = base
             .checked_add(offset)
             .ok_or("wasm: memory address overflow")?;
-        if addr + size > mem_len {
+        if addr.checked_add(size).is_none_or(|end| end > mem_len) {
             return Err("wasm: out of bounds memory access".into());
         }
         Ok(addr)
@@ -792,7 +1222,13 @@ impl Store {
         ip: &mut usize,
         stack: &mut Vec<Val>,
     ) -> Result<(), String> {
-        let mem = &mut self.memories[mem_addr].bytes;
+        let storage = Rc::clone(
+            &self.memories[mem_addr]
+                .as_ref()
+                .ok_or("wasm: dead memory address")?
+                .bytes,
+        );
+        let mut mem = storage.borrow_mut();
         macro_rules! load {
             ($size:expr, $conv:expr) => {{
                 let a = Self::mem_effective_addr(mem.len(), code, ip, stack, $size)?;
@@ -901,24 +1337,38 @@ impl Store {
             }
             10 => {
                 // memory.copy
-                *ip += 2;
-                let mem = &mut self.memories[mem_addr.ok_or("wasm: no memory")?].bytes;
+                skip_bytes(code, ip, 2)?;
+                let storage = Rc::clone(
+                    &self.memories[mem_addr.ok_or("wasm: no memory")?]
+                        .as_ref()
+                        .ok_or("wasm: dead memory address")?
+                        .bytes,
+                );
+                let mut mem = storage.borrow_mut();
                 let n = stack.pop().unwrap().i32() as usize;
                 let src = stack.pop().unwrap().i32() as u32 as usize;
                 let dst = stack.pop().unwrap().i32() as u32 as usize;
-                if src + n > mem.len() || dst + n > mem.len() {
+                if src.checked_add(n).is_none_or(|end| end > mem.len())
+                    || dst.checked_add(n).is_none_or(|end| end > mem.len())
+                {
                     return Err("wasm: out of bounds memory.copy".into());
                 }
                 mem.copy_within(src..src + n, dst);
             }
             11 => {
                 // memory.fill
-                *ip += 1;
-                let mem = &mut self.memories[mem_addr.ok_or("wasm: no memory")?].bytes;
+                skip_bytes(code, ip, 1)?;
+                let storage = Rc::clone(
+                    &self.memories[mem_addr.ok_or("wasm: no memory")?]
+                        .as_ref()
+                        .ok_or("wasm: dead memory address")?
+                        .bytes,
+                );
+                let mut mem = storage.borrow_mut();
                 let n = stack.pop().unwrap().i32() as usize;
                 let val = stack.pop().unwrap().i32() as u8;
                 let dst = stack.pop().unwrap().i32() as u32 as usize;
-                if dst + n > mem.len() {
+                if dst.checked_add(n).is_none_or(|end| end > mem.len()) {
                     return Err("wasm: out of bounds memory.fill".into());
                 }
                 for b in &mut mem[dst..dst + n] {
@@ -950,7 +1400,11 @@ fn do_branch(
         ctrl[target_idx].end_ip
     };
     // Keep the top `arity` values, drop the rest down to the label's base height.
-    let kept: Vec<Val> = stack.split_off(stack.len() - arity);
+    let keep_start = stack
+        .len()
+        .checked_sub(arity)
+        .ok_or("wasm: branch stack underflow")?;
+    let kept: Vec<Val> = stack.split_off(keep_start);
     stack.truncate(height);
     stack.extend(kept);
     // Popping to (and including) the target frame; a loop keeps its own frame.
@@ -961,7 +1415,7 @@ fn do_branch(
 
 /// Parse a block's type immediate and return (param_count, result_count).
 fn block_arity(module: &Module, code: &[u8], ip: &mut usize) -> Result<(usize, usize), String> {
-    let b = code[*ip];
+    let b = *code.get(*ip).ok_or("wasm: truncated block type")?;
     if b == 0x40 {
         *ip += 1;
         Ok((0, 0))
@@ -969,7 +1423,7 @@ fn block_arity(module: &Module, code: &[u8], ip: &mut usize) -> Result<(usize, u
         *ip += 1;
         Ok((0, 1))
     } else {
-        let idx = read_sleb(code, ip)? as usize;
+        let idx = read_sleb_bits(code, ip, 33)? as usize;
         let ty = module.types.get(idx).ok_or("wasm: bad block type index")?;
         Ok((ty.params.len(), ty.results.len()))
     }
@@ -977,6 +1431,15 @@ fn block_arity(module: &Module, code: &[u8], ip: &mut usize) -> Result<(usize, u
 
 fn same_type(a: &FuncType, b: &FuncType) -> bool {
     a.params == b.params && a.results == b.results
+}
+
+/// WebAssembly Core § Import Matching: an actual limit must provide at least the expected minimum;
+/// when the expected type has a maximum, the actual type must also have one no greater than it.
+fn limits_match(actual_min: u32, actual_max: Option<u32>, expected: Limits) -> bool {
+    actual_min >= expected.min
+        && expected
+            .max
+            .is_none_or(|expected_max| actual_max.is_some_and(|max| max <= expected_max))
 }
 
 fn sat_i32(v: f64) -> i32 {
@@ -1292,15 +1755,13 @@ pub fn eval_const_expr(code: &[u8], globals: &[Val]) -> Result<Val, String> {
         let op = code[ip];
         ip += 1;
         match op {
-            0x41 => result = Val::I32(read_sleb(code, &mut ip)? as i32),
+            0x41 => result = Val::I32(read_sleb_bits(code, &mut ip, 32)? as i32),
             0x42 => result = Val::I64(read_sleb(code, &mut ip)?),
             0x43 => {
-                result = Val::F32(f32::from_le_bytes(code[ip..ip + 4].try_into().unwrap()));
-                ip += 4;
+                result = Val::F32(f32::from_le_bytes(read_fixed::<4>(code, &mut ip)?));
             }
             0x44 => {
-                result = Val::F64(f64::from_le_bytes(code[ip..ip + 8].try_into().unwrap()));
-                ip += 8;
+                result = Val::F64(f64::from_le_bytes(read_fixed::<8>(code, &mut ip)?));
             }
             0x23 => {
                 let g = read_uleb(code, &mut ip)? as usize;
@@ -1309,7 +1770,7 @@ pub fn eval_const_expr(code: &[u8], globals: &[Val]) -> Result<Val, String> {
                     .ok_or("wasm: const expr global out of range")?;
             }
             0xd0 => {
-                ip += 1;
+                skip_bytes(code, &mut ip, 1)?;
                 result = Val::Ref(None);
             }
             0xd2 => {

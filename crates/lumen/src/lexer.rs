@@ -3,6 +3,7 @@
 //! tracking whether the previously emitted token can end an expression.
 
 use crate::token::{Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
+use std::rc::Rc;
 
 pub struct LexError {
     pub message: String,
@@ -12,9 +13,8 @@ pub struct LexError {
     pub at_eof: bool,
 }
 
-struct Lexer<'a> {
-    src: &'a [u8],
-    chars: Vec<char>,
+struct Lexer {
+    chars: Rc<Vec<char>>,
     pos: usize,
     line: u32,
     out: Vec<Token>,
@@ -56,9 +56,27 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
 /// Tokenize with an explicit goal: `html_comments` is true for Scripts (Annex B `<!--`/`-->`
 /// comments apply) and false for Modules (where they are ordinary punctuation, i.e. errors).
 pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexError> {
+    tokenize_goal_with_source(src, html_comments).map(|lexed| lexed.tokens)
+}
+
+/// Token stream plus the one code-point index built while lexing. The parser shares this index for
+/// exact `[[SourceText]]` slices instead of scanning and allocating a second `Vec<char>`.
+pub(crate) struct LexedSource {
+    pub(crate) tokens: Vec<Token>,
+    pub(crate) chars: Rc<Vec<char>>,
+}
+
+pub(crate) fn tokenize_with_source(src: &str) -> Result<LexedSource, LexError> {
+    tokenize_goal_with_source(src, true)
+}
+
+pub(crate) fn tokenize_goal_with_source(
+    src: &str,
+    html_comments: bool,
+) -> Result<LexedSource, LexError> {
+    let chars: Rc<Vec<char>> = Rc::new(src.chars().collect());
     let mut lx = Lexer {
-        src: src.as_bytes(),
-        chars: src.chars().collect(),
+        chars: chars.clone(),
         pos: 0,
         line: 1,
         out: Vec::new(),
@@ -75,10 +93,13 @@ pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexEr
         last_close_control: false,
     };
     lx.run()?;
-    Ok(lx.out)
+    Ok(LexedSource {
+        tokens: lx.out,
+        chars,
+    })
 }
 
-impl<'a> Lexer<'a> {
+impl Lexer {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
     }
@@ -1162,7 +1183,6 @@ impl<'a> Lexer<'a> {
                 return Ok(());
             }
         }
-        let _ = self.src; // keep field used; byte view reserved for future fast paths
         Err(self.err(format!(
             "unexpected character {:?}",
             self.peek().unwrap_or('\0')

@@ -21,9 +21,10 @@ fn dv_bytes(i: &Interp, buf: usize, start: usize, n: usize) -> Option<Vec<u8>> {
             (start + n <= g.len()).then(|| g[start..start + n].to_vec())
         });
     }
-    i.array_buffers
-        .get(&buf)
-        .and_then(|b| (start + n <= b.len()).then(|| b[start..start + n].to_vec()))
+    i.array_buffers.get(&buf).and_then(|storage| {
+        let b = storage.borrow();
+        (start + n <= b.len()).then(|| b[start..start + n].to_vec())
+    })
 }
 
 /// Write raw bytes into a (possibly shared) buffer (bounds-checked, silently dropped otherwise).
@@ -37,15 +38,18 @@ fn dv_put(i: &mut Interp, buf: usize, start: usize, bytes: &[u8]) {
         }
         return;
     }
-    if let Some(b) = i.array_buffers.get_mut(&buf) {
+    if let Some(storage) = i.array_buffers.get(&buf).cloned() {
+        let mut b = storage.borrow_mut();
         if start + bytes.len() <= b.len() {
             b[start..start + bytes.len()].copy_from_slice(bytes);
+            drop(b);
+            i.mark_array_buffer_dirty_range(buf, start, bytes.len());
         }
     }
 }
 
 fn dv_view_len(i: &Interp, buf: usize, off: usize, len: usize, track: bool) -> Option<usize> {
-    let blen = i.array_buffers.get(&buf)?.len();
+    let blen = i.array_buffers.get(&buf)?.borrow().len();
     if track {
         if off > blen {
             None
@@ -287,7 +291,7 @@ pub(super) fn install_dataview(it: &mut Interp) {
         if !i.array_buffers.contains_key(&bp) {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
         }
-        let buflen = i.array_buffers[&bp].len();
+        let buflen = i.array_buffers[&bp].borrow().len();
         if offset > buflen {
             return Err(i.make_error("RangeError", "DataView byteOffset is out of bounds"));
         }
@@ -304,7 +308,7 @@ pub(super) fn install_dataview(it: &mut Interp) {
         if !i.array_buffers.contains_key(&bp) {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
         }
-        let buflen = i.array_buffers[&bp].len();
+        let buflen = i.array_buffers[&bp].borrow().len();
         if offset > buflen {
             return Err(i.make_error("RangeError", "DataView byteOffset is out of bounds"));
         }

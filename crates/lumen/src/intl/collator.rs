@@ -1,4 +1,4 @@
-//! `Intl.Collator` (a locale-independent case-aware comparison; option surface complete).
+//! `Intl.Collator`: Unicode 17 UCA root weights with CLDR 48 locale tailorings.
 
 use super::service::{
     brand_slot, get_option, install_supported_locales, instance_proto, read_locale_matcher,
@@ -8,10 +8,16 @@ use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, set_data, Gc, Value};
 
-const COLLATIONS: [&str; 15] = [
-    "compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "reformed", "searchjl",
-    "stroke", "trad", "unihan", "zhuyin", "big5han", "gb2312",
+const COLLATIONS: [&str; 12] = [
+    "compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "searchjl", "stroke",
+    "trad", "unihan", "zhuyin",
 ];
+
+/// AvailableCollations: exactly the collation identifiers for which at least one locale's
+/// Collator resolves the requested functionality. The table is already code-unit sorted.
+pub(super) fn available_collations() -> &'static [&'static str] {
+    &COLLATIONS
+}
 
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "Collator", 0, construct);
@@ -189,6 +195,8 @@ fn compare(i: &mut Interp, this: &Value, a: &Value, b: &Value) -> Result<Value, 
     let sa = ab(i.to_string(a))?.to_string();
     let sb = ab(i.to_string(b))?.to_string();
     let opts = CollateOpts {
+        locale: get("__co_locale"),
+        collation: get("__co_collation"),
         sensitivity: get("__co_sensitivity"),
         numeric: getb("__co_numeric"),
         ignore_punct: getb("__co_ignorepunct"),
@@ -209,6 +217,8 @@ fn compare(i: &mut Interp, this: &Value, a: &Value, b: &Value) -> Result<Value, 
 }
 
 struct CollateOpts {
+    locale: String,
+    collation: String,
     sensitivity: String,
     numeric: bool,
     ignore_punct: bool,
@@ -216,143 +226,364 @@ struct CollateOpts {
     expand_umlaut: bool,
 }
 
-/// Per-primary-slot collation element: a lowercased base code point, its attached marks
-/// (secondary), and a case weight (tertiary).
-struct El {
-    prim: u32,
-    marks: Vec<u32>,
-    upper: bool,
+struct CollationElements {
+    elements: Vec<crate::unicode_collation::Element>,
+    case: Vec<bool>,
 }
 
-fn elements(s: &str, opts: &CollateOpts) -> Vec<El> {
+fn normalized_input(s: &str, opts: &CollateOpts) -> Vec<u32> {
     let cps = crate::jstr::code_points(s);
     let nfd = crate::unicode_norm_impl::decompose(&cps, false);
-    let mut els: Vec<El> = Vec::with_capacity(nfd.len());
-    let mut k = 0;
-    while k < nfd.len() {
-        let cp = nfd[k];
-        k += 1;
-        if crate::unicode_norm_impl::ccc(cp) != 0 {
-            if let Some(last) = els.last_mut() {
-                last.marks.push(cp);
+    if !opts.expand_umlaut {
+        return nfd;
+    }
+    let mut output = Vec::with_capacity(nfd.len());
+    let mut index = 0;
+    while index < nfd.len() {
+        let code_point = nfd[index];
+        output.push(code_point);
+        if matches!(code_point, 0x41 | 0x4f | 0x55 | 0x61 | 0x6f | 0x75)
+            && nfd.get(index + 1) == Some(&0x308)
+        {
+            // CLDR de-phonebook: AE/ae << Ä/ä, OE/oe << Ö/ö, UE/ue << Ü/ü. Keep the
+            // diaeresis as a secondary element after the primary expansion.
+            output.push(if matches!(code_point, 0x41 | 0x4f | 0x55) {
+                'E' as u32
+            } else {
+                'e' as u32
+            });
+            output.push(0x308);
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    output
+}
+
+fn append_numeric_run(
+    input: &[u32],
+    at: usize,
+    output: &mut Vec<crate::unicode_collation::Element>,
+) -> Option<usize> {
+    if !(0x30..=0x39).contains(input.get(at)?) {
+        return None;
+    }
+    let mut end = at;
+    while input.get(end).is_some_and(|cp| (0x30..=0x39).contains(cp)) {
+        end += 1;
+    }
+    let significant = input[at..end]
+        .iter()
+        .position(|cp| *cp != 0x30)
+        .map(|offset| &input[at + offset..end])
+        .unwrap_or(&input[end - 1..end]);
+    let mut push = |primary: u64| {
+        output.push(crate::unicode_collation::Element {
+            primary,
+            secondary: 0x20,
+            tertiary: 2,
+            variable: false,
+        });
+    };
+    // A marker at the DUCET digit position, followed by length and digit pseudo-weights, makes
+    // arbitrary-size digit runs compare by mathematical value without integer conversion.
+    push(0x21e6_0000_0000);
+    push(0x1_0000_0000_0000 + significant.len() as u64);
+    for digit in significant {
+        push(0x2_0000_0000_0000 + u64::from(digit - 0x30));
+    }
+    Some(end - at)
+}
+
+fn tailoring_fold(code_point: u32) -> u32 {
+    char::from_u32(code_point)
+        .and_then(|character| character.to_lowercase().next())
+        .map_or(code_point, |character| character as u32)
+}
+
+fn append_tailored_if(
+    input: &[u32],
+    at: usize,
+    source: &[u32],
+    anchor: u32,
+    primary_rank: u32,
+    secondary_rank: u16,
+    output: &mut Vec<crate::unicode_collation::Element>,
+) -> Option<usize> {
+    let candidate = input.get(at..at + source.len())?;
+    if !candidate
+        .iter()
+        .zip(source)
+        .all(|(actual, expected)| tailoring_fold(*actual) == *expected)
+    {
+        return None;
+    }
+    let uppercase = candidate
+        .iter()
+        .filter_map(|code_point| char::from_u32(*code_point))
+        .find(|character| character.is_alphabetic())
+        .is_some_and(char::is_uppercase);
+    let anchor = crate::unicode_collation::first_primary(anchor)
+        .expect("CLDR tailoring reset anchors are present in DUCET");
+    output.push(crate::unicode_collation::Element {
+        primary: anchor + u64::from(primary_rank),
+        secondary: 0x20 + secondary_rank,
+        tertiary: if uppercase { 8 } else { 2 },
+        variable: false,
+    });
+    Some(source.len())
+}
+
+/// Apply the compact CLDR 48 rules whose relations differ from the root collation for Lumen's
+/// advertised locales. Sources are NFD because both UTS #10 and the LDML tailoring syntax operate
+/// on canonically decomposed input. Longest contractions are tested before singleton relations.
+fn append_cldr_tailoring(
+    input: &[u32],
+    at: usize,
+    opts: &CollateOpts,
+    output: &mut Vec<crate::unicode_collation::Element>,
+) -> Option<usize> {
+    let language = opts.locale.split('-').next().unwrap_or("en");
+    let collation = opts.collation.as_str();
+
+    // CLDR's large `<*...` Japanese and Chinese primary chains are generated into a compact
+    // code-point/rank map. The reset is `[last regular]`, immediately before implicit Han.
+    let han_order = match (language, collation) {
+        ("ja", "default") => Some(crate::cldr_collation::HanOrder::Japanese),
+        ("zh", "pinyin") => Some(crate::cldr_collation::HanOrder::Pinyin),
+        ("zh", "stroke") => Some(crate::cldr_collation::HanOrder::Stroke),
+        ("zh", "zhuyin") => Some(crate::cldr_collation::HanOrder::Zhuyin),
+        ("zh", "default") if opts.locale.split('-').any(|subtag| subtag == "Hant") => {
+            Some(crate::cldr_collation::HanOrder::Stroke)
+        }
+        ("zh", "default") => Some(crate::cldr_collation::HanOrder::Pinyin),
+        _ => None,
+    };
+    if let Some(rank) =
+        han_order.and_then(|order| crate::cldr_collation::primary_rank(order, *input.get(at)?))
+    {
+        output.push(crate::unicode_collation::Element {
+            primary: 0xfa00_0000_0000 + u64::from(rank),
+            secondary: 0x20,
+            tertiary: 2,
+            variable: false,
+        });
+        return Some(1);
+    }
+
+    let mut rule = |source: &[u32], anchor, primary, secondary| {
+        append_tailored_if(input, at, source, anchor, primary, secondary, output)
+    };
+
+    // es.xml: &N<n-tilde; traditional additionally has C<ch and L<ll.
+    if language == "es" {
+        if collation == "trad" {
+            if let Some(length) = rule(&[0x63, 0x68], 'c' as u32, 1, 0) {
+                return Some(length);
+            }
+            if let Some(length) = rule(&[0x6c, 0x6c], 'l' as u32, 1, 0) {
+                return Some(length);
+            }
+        }
+        if let Some(length) = rule(&[0x6e, 0x303], 'n' as u32, 1, 0) {
+            return Some(length);
+        }
+    }
+
+    // ln.xml phonetic digraphs. Equal-primary case variants are handled by the case level.
+    if language == "ln" && collation == "phonetic" {
+        const DIGRAPHS: &[(&[u32], u32, u32)] = &[
+            (&[0x6e, 0x67, 0x62], 0x6e, 3),
+            (&[0x67, 0x62], 0x67, 1),
+            (&[0x6b, 0x70], 0x6b, 1),
+            (&[0x6d, 0x62], 0x6d, 1),
+            (&[0x6d, 0x66], 0x6d, 2),
+            (&[0x6d, 0x70], 0x6d, 3),
+            (&[0x6d, 0x76], 0x6d, 4),
+            (&[0x6e, 0x64], 0x6e, 1),
+            (&[0x6e, 0x67], 0x6e, 2),
+            (&[0x6e, 0x6b], 0x6e, 4),
+            (&[0x6e, 0x73], 0x6e, 5),
+            (&[0x6e, 0x74], 0x6e, 6),
+            (&[0x6e, 0x79], 0x6e, 7),
+            (&[0x6e, 0x7a], 0x6e, 8),
+            (&[0x73, 0x68], 0x73, 1),
+            (&[0x74, 0x73], 0x74, 1),
+        ];
+        for &(source, anchor, primary) in DIGRAPHS {
+            if let Some(length) = rule(source, anchor, primary, 0) {
+                return Some(length);
+            }
+        }
+    }
+
+    let rules: &[(&[u32], u32, u32, u16)] = match language {
+        // pl.xml: each accented letter is a distinct primary after its base.
+        "pl" => &[
+            (&[0x61, 0x328], 0x61, 1, 0),
+            (&[0x63, 0x301], 0x63, 1, 0),
+            (&[0x65, 0x328], 0x65, 1, 0),
+            (&[0x142], 0x6c, 1, 0),
+            (&[0x6e, 0x301], 0x6e, 1, 0),
+            (&[0x6f, 0x301], 0x6f, 1, 0),
+            (&[0x73, 0x301], 0x73, 1, 0),
+            (&[0x7a, 0x301], 0x7a, 1, 0),
+            (&[0x7a, 0x307], 0x7a, 2, 0),
+        ],
+        // sl.xml: C<caron C<acute, D<stroke, S<caron, Z<caron.
+        "sl" => &[
+            (&[0x63, 0x30c], 0x63, 1, 0),
+            (&[0x63, 0x301], 0x63, 2, 0),
+            (&[0x111], 0x64, 1, 0),
+            (&[0x73, 0x30c], 0x73, 1, 0),
+            (&[0x7a, 0x30c], 0x7a, 1, 0),
+        ],
+        // sv.xml: the three primary groups after Z, plus its secondary-equivalent letters.
+        "sv" => &[
+            (&[0x61, 0x30a], 0x7a, 1, 0),
+            (&[0x61, 0x308], 0x7a, 2, 0),
+            (&[0xe6], 0x7a, 2, 1),
+            (&[0x65, 0x328], 0x7a, 2, 2),
+            (&[0x6f, 0x308], 0x7a, 3, 0),
+            (&[0xf8], 0x7a, 3, 1),
+            (&[0x6f, 0x30b], 0x7a, 3, 2),
+            (&[0x153], 0x7a, 3, 3),
+            (&[0x6f, 0x302], 0x7a, 3, 4),
+            (&[0x111], 0x64, 0, 1),
+            (&[0xf0], 0x64, 0, 2),
+            (&[0xfe], 0x74, 0, 1),
+            (&[0x75, 0x308], 0x79, 0, 1),
+            (&[0x75, 0x30b], 0x79, 0, 2),
+        ],
+        // ln.xml standard relations; the phonetic rules above extend these.
+        "ln" => &[(&[0x25b], 0x65, 1, 0), (&[0x254], 0x6f, 0, 1)],
+        // hi.xml: OM < ANUSVARA << CANDRABINDU < VISARGA.
+        "hi" => &[
+            (&[0x902], 0x950, 1, 0),
+            (&[0x901], 0x950, 1, 1),
+            (&[0x903], 0x950, 2, 0),
+        ],
+        // si.xml: AU < ANUSVARAYA < VISARGAYA and JNYA < TAALUJA NAASIKYAYA.
+        "si" => &[
+            (&[0xd82], 0xd96, 1, 0),
+            (&[0xd83], 0xd96, 2, 0),
+            (&[0xda4], 0xda5, 1, 0),
+        ],
+        _ => &[],
+    };
+    for &(source, anchor, primary, secondary) in rules {
+        if let Some(length) = rule(source, anchor, primary, secondary) {
+            return Some(length);
+        }
+    }
+    None
+}
+
+fn elements(s: &str, opts: &CollateOpts) -> CollationElements {
+    let input = normalized_input(s, opts);
+    let case = input
+        .iter()
+        .filter_map(|code_point| char::from_u32(*code_point))
+        .filter(|character| character.is_uppercase() || character.is_lowercase())
+        .map(char::is_uppercase)
+        .collect();
+    let mut elements = Vec::with_capacity(input.len());
+    let mut at = 0;
+    while at < input.len() {
+        if opts.numeric {
+            if let Some(length) = append_numeric_run(&input, at, &mut elements) {
+                at += length;
                 continue;
             }
         }
-        if opts.ignore_punct && is_collation_ignorable(cp) {
+        if let Some(length) = append_cldr_tailoring(&input, at, opts, &mut elements) {
+            at += length;
             continue;
         }
-        let ch = char::from_u32(cp);
-        let upper = ch.map(|c| c.is_uppercase()).unwrap_or(false);
-        let prim = ch
-            .and_then(|c| c.to_lowercase().next())
-            .map(|c| c as u32)
-            .unwrap_or(cp);
-        // German phonebook/search expansion: ä → "ae" at the primary level, with the umlaut
-        // kept as a secondary difference (so AE < Ä).
-        if opts.expand_umlaut && matches!(prim, 0x61 | 0x6F | 0x75) && nfd.get(k) == Some(&0x308) {
-            k += 1;
-            els.push(El {
-                prim,
-                marks: vec![0x308],
-                upper,
-            });
-            els.push(El {
-                prim: 'e' as u32,
-                marks: Vec::new(),
-                upper: false,
-            });
+        #[cfg(test)]
+        if opts.locale == "und" {
+            at += crate::unicode_collation::append_ducet_mapping(&input, at, &mut elements);
             continue;
         }
-        els.push(El {
-            prim,
-            marks: Vec::new(),
-            upper,
-        });
+        at += crate::unicode_collation::append_mapping(&input, at, &mut elements);
     }
-    els
+    CollationElements { elements, case }
 }
 
-fn is_collation_ignorable(cp: u32) -> bool {
-    match char::from_u32(cp) {
-        Some(c) => c.is_whitespace() || c.is_ascii_punctuation() || (0x2000..=0x206F).contains(&cp),
-        None => false,
-    }
-}
-
-/// A three-level (primary letters / secondary accents / tertiary case) comparison, with an
-/// optional numeric mode that compares digit runs by value at the primary level.
+/// UTS #10 comparison: NFD, longest-match DUCET collation-element production, then successive
+/// non-zero primary, secondary, and tertiary weights according to ECMA-402 sensitivity.
 fn collate(a: &str, b: &str, opts: &CollateOpts) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let ea = elements(a, opts);
     let eb = elements(b, opts);
-    // Primary.
-    let prim = if opts.numeric {
-        cmp_primary_numeric(&ea, &eb)
-    } else {
-        ea.iter().map(|e| e.prim).cmp(eb.iter().map(|e| e.prim))
-    };
+    let active =
+        |element: &&crate::unicode_collation::Element| !(opts.ignore_punct && element.variable);
+    let prim = ea
+        .elements
+        .iter()
+        .filter(&active)
+        .map(|element| element.primary)
+        .filter(|weight| *weight != 0)
+        .cmp(
+            eb.elements
+                .iter()
+                .filter(&active)
+                .map(|element| element.primary)
+                .filter(|weight| *weight != 0),
+        );
     if prim != Ordering::Equal {
         return prim;
     }
     let sens = opts.sensitivity.as_str();
-    // Secondary (accents).
     if sens == "accent" || sens == "variant" {
-        let sec = ea.iter().map(|e| &e.marks).cmp(eb.iter().map(|e| &e.marks));
+        let sec = ea
+            .elements
+            .iter()
+            .filter(&active)
+            .map(|element| element.secondary)
+            .filter(|weight| *weight != 0)
+            .cmp(
+                eb.elements
+                    .iter()
+                    .filter(&active)
+                    .map(|element| element.secondary)
+                    .filter(|weight| *weight != 0),
+            );
         if sec != Ordering::Equal {
             return sec;
         }
     }
-    // Tertiary (case): lowercase first unless caseFirst is "upper".
-    if sens == "case" || sens == "variant" {
-        let w = |u: bool| u != opts.upper_first;
-        let ter = ea
+    if sens == "case" || (sens == "variant" && opts.upper_first) {
+        let case_weight = |upper: &bool| *upper != opts.upper_first;
+        let case = ea
+            .case
             .iter()
-            .map(|e| w(e.upper))
-            .cmp(eb.iter().map(|e| w(e.upper)));
+            .map(case_weight)
+            .cmp(eb.case.iter().map(case_weight));
+        if case != Ordering::Equal {
+            return case;
+        }
+    }
+    if sens == "variant" {
+        let ter = ea
+            .elements
+            .iter()
+            .filter(&active)
+            .map(|element| element.tertiary)
+            .filter(|weight| *weight != 0)
+            .cmp(
+                eb.elements
+                    .iter()
+                    .filter(&active)
+                    .map(|element| element.tertiary)
+                    .filter(|weight| *weight != 0),
+            );
         if ter != Ordering::Equal {
             return ter;
         }
     }
     Ordering::Equal
-}
-
-fn cmp_primary_numeric(a: &[El], b: &[El]) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let is_digit = |e: &El| (0x30..=0x39).contains(&e.prim);
-    let (mut i, mut j) = (0, 0);
-    loop {
-        match (a.get(i), b.get(j)) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
-                if is_digit(x) && is_digit(y) {
-                    // Compare whole digit runs by numeric value, then by run position.
-                    let (si, sj) = (i, j);
-                    while a.get(i).map(is_digit).unwrap_or(false) {
-                        i += 1;
-                    }
-                    while b.get(j).map(is_digit).unwrap_or(false) {
-                        j += 1;
-                    }
-                    let da: String = a[si..i].iter().map(|e| (e.prim as u8) as char).collect();
-                    let db: String = b[sj..j].iter().map(|e| (e.prim as u8) as char).collect();
-                    let (ta, tb) = (da.trim_start_matches('0'), db.trim_start_matches('0'));
-                    let c = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
-                    if c != Ordering::Equal {
-                        return c;
-                    }
-                } else {
-                    let c = x.prim.cmp(&y.prim);
-                    if c != Ordering::Equal {
-                        return c;
-                    }
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-    }
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
@@ -385,9 +616,8 @@ fn supported_collation(lang: &str, c: &str) -> bool {
         "trad" => lang == "es",
         "dict" => lang == "si",
         "phonetic" => lang == "ln",
-        "reformed" => lang == "sv",
         "searchjl" => lang == "ko",
-        "pinyin" | "stroke" | "zhuyin" | "big5han" | "gb2312" | "unihan" => lang == "zh",
+        "pinyin" | "stroke" | "zhuyin" | "unihan" => lang == "zh",
         _ => false,
     }
 }
@@ -402,4 +632,88 @@ pub(super) fn supported_collations(lang: &str) -> Vec<&'static str> {
         .collect::<Vec<_>>();
     collations.sort_unstable();
     collations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UCA_NON_IGNORABLE: &str =
+        include_str!("../../tests/unicode-17.0.0/CollationTest_NON_IGNORABLE_SHORT.txt");
+    const CLDR_NON_IGNORABLE: &str =
+        include_str!("../../tests/cldr-48/CollationTest_CLDR_NON_IGNORABLE_SHORT.txt");
+
+    fn from_code_points(line: &str) -> String {
+        let code_points = line
+            .split_whitespace()
+            .map(|value| u32::from_str_radix(value, 16).unwrap())
+            .collect::<Vec<_>>();
+        crate::jstr::from_code_points(&code_points)
+    }
+
+    #[test]
+    fn unicode_17_uca_non_ignorable_conformance() {
+        let options = CollateOpts {
+            locale: "und".to_string(),
+            collation: "default".to_string(),
+            sensitivity: "variant".to_string(),
+            numeric: false,
+            ignore_punct: false,
+            upper_first: false,
+            expand_umlaut: false,
+        };
+        let mut previous: Option<(usize, String)> = None;
+        let mut checked = 0;
+        for (index, raw) in UCA_NON_IGNORABLE.lines().enumerate() {
+            let line = raw.split('#').next().unwrap().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let current = from_code_points(line);
+            if let Some((previous_index, previous_value)) = &previous {
+                assert!(
+                    collate(previous_value, &current, &options) != std::cmp::Ordering::Greater,
+                    "UCA order regression between corpus lines {} and {}",
+                    previous_index + 1,
+                    index + 1
+                );
+            }
+            previous = Some((index, current));
+            checked += 1;
+        }
+        assert!(checked > 10_000, "official short UCA corpus was truncated");
+    }
+
+    #[test]
+    fn cldr_48_root_non_ignorable_conformance() {
+        let options = CollateOpts {
+            locale: "en".to_string(),
+            collation: "default".to_string(),
+            sensitivity: "variant".to_string(),
+            numeric: false,
+            ignore_punct: false,
+            upper_first: false,
+            expand_umlaut: false,
+        };
+        let mut previous: Option<(usize, String)> = None;
+        let mut checked = 0;
+        for (index, raw) in CLDR_NON_IGNORABLE.lines().enumerate() {
+            let line = raw.split('#').next().unwrap().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let current = from_code_points(line);
+            if let Some((previous_index, previous_value)) = &previous {
+                assert!(
+                    collate(previous_value, &current, &options) != std::cmp::Ordering::Greater,
+                    "CLDR root order regression between corpus lines {} and {}",
+                    previous_index + 1,
+                    index + 1
+                );
+            }
+            previous = Some((index, current));
+            checked += 1;
+        }
+        assert!(checked > 10_000, "official short CLDR corpus was truncated");
+    }
 }

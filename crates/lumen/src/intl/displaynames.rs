@@ -1,4 +1,4 @@
-//! `Intl.DisplayNames` (English data subset).
+//! `Intl.DisplayNames` backed by CLDR 48 names for every locale Lumen advertises.
 
 use super::service::{
     brand_slot, get_option, install_supported_locales, read_locale_matcher, resolve_locale,
@@ -69,26 +69,35 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     set_builtin(&obj, "__dn", Value::Bool(true));
     set_builtin(&obj, "__dn_locale", Value::from_string(resolved.locale));
     set_builtin(&obj, "__dn_style", Value::from_string(style));
+    let is_language = kind == "language";
     set_builtin(&obj, "__dn_type", Value::from_string(kind));
     set_builtin(&obj, "__dn_fallback", Value::from_string(fallback));
-    set_builtin(
-        &obj,
-        "__dn_langdisplay",
-        Value::from_string(language_display),
-    );
+    if is_language {
+        set_builtin(
+            &obj,
+            "__dn_langdisplay",
+            Value::from_string(language_display),
+        );
+    }
     Ok(Value::Obj(obj))
+}
+
+fn string_slot(object: &Gc, key: &str, fallback: &str) -> String {
+    match object
+        .borrow()
+        .props
+        .get(key)
+        .map(|property| property.value())
+    {
+        Some(Value::Str(value)) => value.to_string(),
+        _ => fallback.to_string(),
+    }
 }
 
 fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
     let o = brand_slot(i, this, "__dn")?;
-    let kind = match o.borrow().props.get("__dn_type").map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
-        _ => String::new(),
-    };
-    let fallback = match o.borrow().props.get("__dn_fallback").map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
-        _ => "code".to_string(),
-    };
+    let kind = string_slot(&o, "__dn_type", "");
+    let fallback = string_slot(&o, "__dn_fallback", "code");
     let s = ab(i.to_string(code))?.to_string();
     // Validate the code per type.
     let canonical = match kind.as_str() {
@@ -138,8 +147,7 @@ fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
             if !ok {
                 return Err(i.make_error("RangeError", format!("invalid calendar code: {s}")));
             }
-            let lc = s.to_lowercase();
-            crate::intl::tags::canonical_ca(&lc).unwrap_or(lc)
+            s.to_ascii_lowercase()
         }
         "dateTimeField" => {
             const FIELDS: &[&str] = &[
@@ -163,9 +171,17 @@ fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
         }
         _ => s.clone(),
     };
-    let name = display_name(&kind, &canonical);
+    let locale = string_slot(&o, "__dn_locale", "en-US");
+    let language = locale.split('-').next().unwrap_or("en");
+    let style = string_slot(&o, "__dn_style", "long");
+    let name = if kind == "language" {
+        let language_display = string_slot(&o, "__dn_langdisplay", "dialect");
+        display_language(language, &style, &language_display, &canonical)
+    } else {
+        crate::cldr_display_names::name(language, &kind, &style, &canonical).map(str::to_string)
+    };
     match name {
-        Some(n) => Ok(Value::str(n)),
+        Some(name) => Ok(Value::from_string(name)),
         None => {
             if fallback == "code" {
                 Ok(Value::from_string(canonical))
@@ -176,83 +192,121 @@ fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
     }
 }
 
-fn display_name(kind: &str, code: &str) -> Option<&'static str> {
-    match kind {
-        "language" => Some(match code {
-            "en" => "English",
-            "en-GB" => "British English",
-            "en-US" => "American English",
-            "de" => "German",
-            "fr" => "French",
-            "es" => "Spanish",
-            "it" => "Italian",
-            "pt" => "Portuguese",
-            "nl" => "Dutch",
-            "ja" => "Japanese",
-            "zh" => "Chinese",
-            "ko" => "Korean",
-            "ru" => "Russian",
-            "ar" => "Arabic",
-            _ => return None,
-        }),
-        "region" => Some(match code {
-            "US" => "United States",
-            "GB" => "United Kingdom",
-            "DE" => "Germany",
-            "FR" => "France",
-            "ES" => "Spain",
-            "IT" => "Italy",
-            "PT" => "Portugal",
-            "NL" => "Netherlands",
-            "JP" => "Japan",
-            "CN" => "China",
-            "KR" => "South Korea",
-            "RU" => "Russia",
-            "BR" => "Brazil",
-            "419" => "Latin America",
-            _ => return None,
-        }),
-        "script" => Some(match code {
-            "Latn" => "Latin",
-            "Cyrl" => "Cyrillic",
-            "Hans" => "Simplified Han",
-            "Hant" => "Traditional Han",
-            "Arab" => "Arabic",
-            "Jpan" => "Japanese",
-            "Kore" => "Korean",
-            _ => return None,
-        }),
-        "calendar" => Some(match code {
-            "buddhist" => "Buddhist Calendar",
-            "chinese" => "Chinese Calendar",
-            "coptic" => "Coptic Calendar",
-            "dangi" => "Dangi Calendar",
-            "ethioaa" => "Ethiopic Amete Alem Calendar",
-            "ethiopic" => "Ethiopic Calendar",
-            "gregory" => "Gregorian Calendar",
-            "hebrew" => "Hebrew Calendar",
-            "indian" => "Indian National Calendar",
-            "islamic" => "Islamic Calendar",
-            "islamic-civil" => "Islamic Calendar (tabular, civil epoch)",
-            "islamic-rgsa" => "Islamic Calendar (Saudi Arabia, sighting)",
-            "islamic-tbla" => "Islamic Calendar (tabular, astronomical epoch)",
-            "islamic-umalqura" => "Islamic Calendar (Umm al-Qura)",
-            "iso8601" => "ISO-8601 Calendar",
-            "japanese" => "Japanese Calendar",
-            "persian" => "Persian Calendar",
-            "roc" => "Minguo Calendar",
-            _ => return None,
-        }),
-        "currency" => Some(match code {
-            "USD" => "US Dollar",
-            "EUR" => "Euro",
-            "GBP" => "British Pound",
-            "JPY" => "Japanese Yen",
-            "CNY" => "Chinese Yuan",
-            _ => return None,
-        }),
-        _ => None,
+fn display_language(
+    locale: &str,
+    style: &str,
+    language_display: &str,
+    code: &str,
+) -> Option<String> {
+    let tag = tags::parse(code)?;
+
+    // UTS #35 Locale Display Name Algorithm: dialect mode first takes the longest available
+    // compound language match. Direct full matches cover the common path without any assembly.
+    if language_display == "dialect" {
+        if let Some(name) = crate::cldr_display_names::name(locale, "language", style, code) {
+            return Some(name.to_string());
+        }
     }
+
+    let mut used_script = false;
+    let mut used_region = false;
+    let mut used_variant: Option<usize> = None;
+    let mut base = None;
+
+    if language_display == "dialect" {
+        let mut consider =
+            |candidate: String, script: bool, region: bool, variant: Option<usize>| {
+                if base.is_none() {
+                    if let Some(name) =
+                        crate::cldr_display_names::name(locale, "language", style, &candidate)
+                    {
+                        base = Some(name.to_string());
+                        used_script = script;
+                        used_region = region;
+                        used_variant = variant;
+                    }
+                }
+            };
+
+        // CLDR compound language records primarily specialize language+script+region,
+        // language+region, language+script, or language+variant. Check in descending number of
+        // consumed fields, without an exponential subset search for adversarial variant lists.
+        if !tag.script.is_empty() && !tag.region.is_empty() {
+            consider(
+                format!("{}-{}-{}", tag.language, tag.script, tag.region),
+                true,
+                true,
+                None,
+            );
+        }
+        if !tag.region.is_empty() {
+            consider(
+                format!("{}-{}", tag.language, tag.region),
+                false,
+                true,
+                None,
+            );
+        }
+        if !tag.script.is_empty() {
+            consider(
+                format!("{}-{}", tag.language, tag.script),
+                true,
+                false,
+                None,
+            );
+        }
+        for (index, variant) in tag.variants.iter().enumerate() {
+            consider(
+                format!("{}-{}", tag.language, variant),
+                false,
+                false,
+                Some(index),
+            );
+        }
+    }
+
+    let base = base.or_else(|| {
+        crate::cldr_display_names::name(locale, "language", style, &tag.language)
+            .map(str::to_string)
+    })?;
+    let mut qualifiers = Vec::new();
+    if !tag.script.is_empty() && !used_script {
+        qualifiers.push(
+            crate::cldr_display_names::name(locale, "script", style, &tag.script)
+                .unwrap_or(&tag.script)
+                .to_string(),
+        );
+    }
+    if !tag.region.is_empty() && !used_region {
+        qualifiers.push(
+            crate::cldr_display_names::name(locale, "region", style, &tag.region)
+                .unwrap_or(&tag.region)
+                .to_string(),
+        );
+    }
+    for (index, variant) in tag.variants.iter().enumerate() {
+        if used_variant != Some(index) {
+            qualifiers.push(
+                crate::cldr_display_names::name(locale, "variant", style, variant)
+                    .unwrap_or(variant)
+                    .to_string(),
+            );
+        }
+    }
+    if qualifiers.is_empty() {
+        return Some(base);
+    }
+
+    let (pattern, separator) = crate::cldr_display_names::locale_patterns(locale);
+    let mut joined = qualifiers.remove(0);
+    for qualifier in qualifiers {
+        joined = apply_pattern(separator, &joined, &qualifier);
+    }
+    Some(apply_pattern(pattern, &base, &joined))
+}
+
+fn apply_pattern(pattern: &str, first: &str, second: &str) -> String {
+    pattern.replace("{0}", first).replace("{1}", second)
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
@@ -269,6 +323,9 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     set_data(&res, "style", get("__dn_style"));
     set_data(&res, "type", get("__dn_type"));
     set_data(&res, "fallback", get("__dn_fallback"));
-    set_data(&res, "languageDisplay", get("__dn_langdisplay"));
+    let language_display = get("__dn_langdisplay");
+    if !matches!(language_display, Value::Undefined) {
+        set_data(&res, "languageDisplay", language_display);
+    }
     Ok(Value::Obj(res))
 }

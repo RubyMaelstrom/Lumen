@@ -33,15 +33,26 @@ fn server_handles_multiplexed_node_requests() {
         let source = format!(
             r#"
           const http2 = require("node:http2");
-          const client = http2.connect("http://127.0.0.1:{port}");
-          let complete = 0;
-          for (const [path, body] of [["/one", ""], ["/two", "payload"]]) {{
-            const request = client.request({{ ":method": body ? "POST" : "GET", ":path": path }});
-            let response = "";
-            request.on("data", chunk => response += chunk);
-            request.on("end", () => {{ console.log(path, response); if (++complete === 2) client.close(); }});
-            request.end(body);
+          function connect() {{
+            const client = http2.connect("http://127.0.0.1:{port}");
+            client.once("error", error => {{
+              if (error && error.code === "ECONNREFUSED") {{ setTimeout(connect, 25); return; }}
+              throw error;
+            }});
+            client.once("connect", () => {{
+              let complete = 0;
+              for (const [path, body] of [["/one", ""], ["/two", "payload"]]) {{
+                const request = client.request({{ ":method": body ? "POST" : "GET", ":path": path }});
+                let response = "";
+                request.on("data", chunk => response += chunk);
+                request.on("end", () => {{ console.log(path, response); if (++complete === 2) client.close(); }});
+                // Node creates GET/HEAD streams with END_STREAM already set. Supplying even an
+                // empty chunk to end() is a write-after-end; only body-bearing requests write.
+                if (body) request.end(body); else request.end();
+              }}
+            }});
           }}
+          connect();
         "#
         );
         Command::new("node").args(["-e", &source]).output().unwrap()
@@ -135,13 +146,22 @@ fn secure_server_negotiates_h2_with_node_client() {
         let source = format!(
             r#"
           const http2 = require("node:http2");
-          const client = http2.connect("https://localhost:{port}", {{ rejectUnauthorized: false }});
-          client.on("connect", () => console.log("alpn", client.socket.alpnProtocol));
-          const request = client.request({{ ":path": "/secure" }});
-          let body = "";
-          request.on("data", chunk => body += chunk);
-          request.on("end", () => {{ console.log("body", body); client.close(); }});
-          request.end();
+          function connect() {{
+            const client = http2.connect("https://localhost:{port}", {{ rejectUnauthorized: false }});
+            client.once("error", error => {{
+              if (error && error.code === "ECONNREFUSED") {{ setTimeout(connect, 25); return; }}
+              throw error;
+            }});
+            client.once("connect", () => {{
+              console.log("alpn", client.socket.alpnProtocol);
+              const request = client.request({{ ":path": "/secure" }});
+              let body = "";
+              request.on("data", chunk => body += chunk);
+              request.on("end", () => {{ console.log("body", body); client.close(); }});
+              request.end();
+            }});
+          }}
+          connect();
         "#
         );
         Command::new("node").args(["-e", &source]).output().unwrap()

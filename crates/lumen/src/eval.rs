@@ -120,7 +120,7 @@ impl Interp {
                 let mut used: Vec<String> = Vec::new();
                 for prop in &objpat.props {
                     let key = self.eval_prop_key(&prop.key, env)?;
-                    used.push(key.clone());
+                    used.push(key.to_string());
                     // KeyedBindingInitialization order for a var-mode identifier target:
                     // ResolveBinding *before* GetV (observable through a `with` env's has trap).
                     let var_ref = if matches!(mode, BindMode::Var) {
@@ -251,31 +251,44 @@ impl Interp {
     /// Capture a `using` resource's dispose method for disposal at scope exit. `null`/`undefined`
     /// resources are ignored; a non-callable dispose method is a TypeError.
     fn add_disposable(&mut self, value: &Value, is_async: bool) -> Result<(), Abrupt> {
+        let Some(resource) = self.create_disposable(value, is_async)? else {
+            return Ok(());
+        };
+        if self.using_stack.is_empty() {
+            self.using_stack.push(Vec::new());
+        }
+        self.using_stack.last_mut().unwrap().push(resource);
+        Ok(())
+    }
+
+    /// Create one DisposableResource record. Bytecode continuations keep these records in their
+    /// own scope stack rather than the interpreter-global tree-walker stack, so two suspended
+    /// coroutines cannot accidentally dispose each other's resources.
+    pub(crate) fn create_disposable(
+        &mut self,
+        value: &Value,
+        is_async: bool,
+    ) -> Result<Option<Disposable>, Abrupt> {
         if matches!(value, Value::Undefined | Value::Null) {
             // An evaluated `await using x = null` still records a pending Await for the
             // block's end (an empty async disposal awaits once).
             if is_async {
-                if self.using_stack.is_empty() {
-                    self.using_stack.push(Vec::new());
-                }
-                self.using_stack.last_mut().unwrap().push(Disposable {
+                return Ok(Some(Disposable {
                     value: Value::Undefined,
                     method: Value::Undefined,
-                    method_is_async: true,
-                });
+                    kind_is_async: true,
+                    method_is_async: false,
+                }));
             }
-            return Ok(());
+            return Ok(None);
         }
         let (method, method_is_async) = self.dispose_method(value, is_async)?;
-        if self.using_stack.is_empty() {
-            self.using_stack.push(Vec::new());
-        }
-        self.using_stack.last_mut().unwrap().push(Disposable {
+        Ok(Some(Disposable {
             value: value.clone(),
             method,
+            kind_is_async: is_async,
             method_is_async,
-        });
-        Ok(())
+        }))
     }
 
     /// GetDisposeMethod: `@@asyncDispose` (falling back to `@@dispose`) for `await using`, else
@@ -313,41 +326,50 @@ impl Interp {
         if matches!(result, Err(Abrupt::Interrupt(_))) {
             return result;
         }
-        // A null/undefined `await using` resource left an await-only marker (no method): the
-        // block's end still performs one Await even with nothing to dispose.
-        let mut await_pending = false;
-        frame.retain(|d| {
-            if d.method_is_async && !d.method.is_callable() {
-                await_pending = true;
-                return false;
-            }
-            true
-        });
+        // ECMA-262 DisposeResources tracks an await-only marker separately so a nullish
+        // `await using` still yields at least one job turn, at the precise point before a later
+        // synchronous resource (or at the end when there is no such resource).
+        let mut needs_await = false;
+        let mut has_awaited = false;
         let mut completion = result;
         while let Some(r) = frame.pop() {
-            // Only an `@@asyncDispose` method's result is awaited; a sync `@@dispose` (even the
-            // fallback inside `await using`) has any returned promise ignored. Inside a
-            // coroutine the await genuinely parks, so job interleaving matches Await.
-            let disposed = self
-                .call(r.method.clone(), r.value.clone(), &[])
-                .and_then(|p| {
-                    if r.method_is_async {
-                        if crate::coroutine::in_coroutine() {
-                            match crate::coroutine::coroutine_await(self, p) {
-                                crate::coroutine::Resume::Next(x) => Ok(x),
-                                crate::coroutine::Resume::Throw(e) => Err(Abrupt::Throw(e)),
-                                crate::coroutine::Resume::Return(rv) => Err(Abrupt::Return(rv)),
-                                crate::coroutine::Resume::Terminate => {
-                                    Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
-                                }
-                            }
-                        } else {
-                            self.await_value(p)
-                        }
-                    } else {
-                        Ok(p)
+            if !r.kind_is_async && needs_await && !has_awaited {
+                self.coro_await(Value::Undefined)?;
+                needs_await = false;
+            }
+
+            if !r.method.is_callable() {
+                debug_assert!(r.kind_is_async);
+                needs_await = true;
+                continue;
+            }
+
+            let called = self.call(r.method.clone(), r.value.clone(), &[]);
+            let disposed = if r.kind_is_async && r.method_is_async {
+                // A directly selected @@asyncDispose method is awaited only when Call completed
+                // normally. A synchronous throw becomes the disposal result immediately.
+                match called {
+                    Ok(value) => {
+                        has_awaited = true;
+                        self.coro_await(value)
                     }
-                });
+                    Err(error) => Err(error),
+                }
+            } else if r.kind_is_async {
+                // GetDisposeMethod's sync fallback is an unobservable async wrapper: ignore the
+                // sync method's return value, translate a synchronous throw to rejection, and
+                // Await the wrapper promise.
+                let promise = self.new_promise();
+                match called {
+                    Ok(_) => self.resolve_promise(&promise, Value::Undefined),
+                    Err(Abrupt::Throw(error)) => self.reject_promise(&promise, error),
+                    Err(other) => return Err(other),
+                }
+                has_awaited = true;
+                self.coro_await(promise)
+            } else {
+                called
+            };
             match disposed {
                 Ok(_) => {}
                 Err(Abrupt::Throw(new_err)) => {
@@ -355,19 +377,21 @@ impl Interp {
                         Err(Abrupt::Throw(prev)) => {
                             Err(Abrupt::Throw(self.make_suppressed(new_err, prev)))
                         }
-                        // Disposal throwing over a normal / return / break completion: the throw wins.
-                        Ok(_) => Err(Abrupt::Throw(new_err)),
-                        Err(other) => Err(other),
+                        // DisposeResources replaces every non-throw completion (normal, return,
+                        // break, or continue) with the disposal throw. Only two throw completions
+                        // form a SuppressedError chain.
+                        Ok(_)
+                        | Err(Abrupt::Return(_))
+                        | Err(Abrupt::Break(..))
+                        | Err(Abrupt::Continue(..)) => Err(Abrupt::Throw(new_err)),
+                        Err(Abrupt::Interrupt(reason)) => Err(Abrupt::Interrupt(reason)),
                     };
                 }
                 Err(other) => return Err(other),
             }
         }
-        if await_pending && crate::coroutine::in_coroutine() {
-            // Await(undefined) — one real tick.
-            let tick = self.new_promise();
-            self.resolve_promise(&tick, Value::Undefined);
-            self.coro_await(tick)?;
+        if needs_await && !has_awaited {
+            self.coro_await(Value::Undefined)?;
         }
         completion
     }
@@ -414,7 +438,7 @@ impl Interp {
     }
 
     /// Build a `SuppressedError(error, suppressed)`.
-    fn make_suppressed(&mut self, error: Value, suppressed: Value) -> Value {
+    pub(crate) fn make_suppressed(&mut self, error: Value, suppressed: Value) -> Value {
         let err = self.make_error("SuppressedError", "");
         if let Some(o) = err.as_obj() {
             o.borrow_mut().proto = self.error_protos.get("SuppressedError").cloned();
@@ -673,12 +697,17 @@ impl Interp {
             Stmt::Switch { disc, cases } => self.exec_switch(disc, cases, env),
             Stmt::Labeled { label, body } => self.exec_labeled(label, body, env),
             Stmt::With { obj, body } => {
-                let o = self.eval(obj, env)?;
-                if matches!(o, Value::Undefined | Value::Null) {
+                let value = self.eval(obj, env)?;
+                if matches!(value, Value::Undefined | Value::Null) {
                     return Err(
                         self.throw("TypeError", "Cannot convert undefined or null to object")
                     );
                 }
+                // WithStatement Evaluation performs ToObject before creating the Object
+                // Environment Record. Keep the resulting wrapper alive for the whole statement:
+                // it supplies both HasBinding and WithBaseObject (the receiver of an identifier
+                // call such as `charAt(0)`).
+                let o = crate::builtins::box_primitive_pub(self, value);
                 let with_env = crate::interpreter::new_with_scope(env.clone(), o);
                 match self.exec_stmt(body, &with_env) {
                     Ok(v) => Ok(crate::interpreter::update_empty(v)),
@@ -1172,21 +1201,8 @@ impl Interp {
             }
             return result;
         }
-        // for-in: enumerable string keys along the prototype chain (own first, deduped).
-        // A module namespace's [[GetOwnProperty]] runs during enumeration, so an uninitialized export
-        // makes the loop throw ReferenceError before any iteration.
-        if let Value::Obj(o) = &rhs {
-            let ptr = std::rc::Rc::as_ptr(o) as usize;
-            if self.is_namespace(ptr) {
-                for k in self.enum_keys(&rhs)? {
-                    if let Some(res) = self.namespace_own_property(ptr, &k) {
-                        res?;
-                    }
-                }
-            }
-        }
         let items: Vec<Value> = self
-            .enum_keys(&rhs)?
+            .for_in_keys(&rhs)?
             .into_iter()
             .map(Value::from_string)
             .collect();
@@ -1224,7 +1240,7 @@ impl Interp {
                 crate::coroutine::Resume::Throw(e) => return Err(Abrupt::Throw(e)),
                 crate::coroutine::Resume::Return(v) => return Err(Abrupt::Return(v)),
                 crate::coroutine::Resume::Terminate => {
-                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled));
                 }
             }
         } else {
@@ -1291,7 +1307,7 @@ impl Interp {
                     (self.call(ret, iterator.clone(), &[v])?, true)
                 }
                 Resume::Terminate => {
-                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled));
                 }
             };
             if !matches!(result, Value::Obj(_)) {
@@ -1468,7 +1484,7 @@ impl Interp {
                     received = self.async_gen_yield_resume(inner)?;
                 }
                 Resume::Terminate => {
-                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled))
+                    return Err(Abrupt::Interrupt(crate::InterruptReason::Cancelled));
                 }
             }
         }
@@ -1600,6 +1616,25 @@ impl Interp {
             }
         }
         Ok(out)
+    }
+
+    /// Snapshot the candidate keys for EnumerateObjectProperties. Each prototype level's
+    /// [[OwnPropertyKeys]] is consulted once; the loop rechecks deletion before yielding a key.
+    pub(crate) fn for_in_keys(&mut self, v: &Value) -> Result<Vec<String>, Abrupt> {
+        let keys = self.enum_keys(v)?;
+        // A module namespace's [[GetOwnProperty]] runs during enumeration, so an uninitialized
+        // export makes the loop throw before any iteration.
+        if let Value::Obj(object) = v {
+            let ptr = std::rc::Rc::as_ptr(object) as usize;
+            if self.is_namespace(ptr) {
+                for key in &keys {
+                    if let Some(result) = self.namespace_own_property(ptr, key) {
+                        result?;
+                    }
+                }
+            }
+        }
+        Ok(keys)
     }
 
     fn enum_keys(&mut self, v: &Value) -> Result<Vec<String>, Abrupt> {
@@ -2503,13 +2538,8 @@ impl Interp {
             }
             Expr::Paren(inner) => self.eval(inner, env),
             Expr::Assign { op, target, value } => self.eval_assign(op, target, value, env),
-            Expr::ImportMeta => Ok(self
-                .peek_binding("%importmeta%", env)
-                .or_else(|| self.import_meta.clone())
-                .unwrap_or(Value::Undefined)),
-            Expr::NewTarget => Ok(self
-                .peek_binding("%newtarget%", env)
-                .unwrap_or(Value::Undefined)),
+            Expr::ImportMeta => Ok(self.import_meta_vm(env)),
+            Expr::NewTarget => Ok(self.new_target_vm(env)),
             Expr::ImportCall {
                 spec,
                 phase,
@@ -2522,74 +2552,11 @@ impl Interp {
                     Some(o) => Some(self.eval(o, env)?),
                     None => None,
                 };
-                // ToString abruptness rejects the promise (IfAbruptRejectPromise), not a sync throw.
-                let s = match self.to_string(&specifier) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let p = self.new_promise();
-                        let reason = crate::interpreter::abrupt_value(e);
-                        self.reject_promise(&p, reason);
-                        return Ok(p);
-                    }
-                };
-                match phase {
-                    // ContinueDynamicImport at the source phase resolves with [[ModuleSource]] or
-                    // rejects when that field is empty. The Test262 host exposes one concrete
-                    // source module; ordinary Source Text Module Records have no source object.
-                    ImportPhase::Source => {
-                        let p = self.new_promise();
-                        if &*s == "<module source>" {
-                            let source = self.module_source_of(&s);
-                            self.resolve_promise(&p, source);
-                        } else {
-                            let reason = crate::interpreter::abrupt_value(
-                                self.throw("SyntaxError", "source phase import is not available"),
-                            );
-                            self.reject_promise(&p, reason);
-                        }
-                        Ok(p)
-                    }
-                    // `import.defer(x)` defers evaluation of the module; for specifier handling it
-                    // behaves like a plain dynamic import.
-                    ImportPhase::Evaluation | ImportPhase::Defer => {
-                        // `{ with: { type: ... } }` selects a JSON/text/bytes module. An abrupt
-                        // attributes validation rejects the promise like the specifier coercion.
-                        let mut attr_type = None;
-                        if let Some(o) = &opts_val {
-                            match self.import_attributes(o) {
-                                Ok(t) => attr_type = t,
-                                Err(e) => {
-                                    let p = self.new_promise();
-                                    let reason = crate::interpreter::abrupt_value(e);
-                                    self.reject_promise(&p, reason);
-                                    return Ok(p);
-                                }
-                            }
-                        }
-                        // Capture the importing module's `import.meta` lexically (the
-                        // `%importmeta%` binding), so the referrer is correct even when this
-                        // `import()` runs from an async continuation after `await`.
-                        let referrer = self.peek_binding("%importmeta%", env);
-                        Ok(self.dynamic_import(
-                            &s,
-                            attr_type.as_deref(),
-                            matches!(phase, ImportPhase::Defer),
-                            referrer,
-                        ))
-                    }
-                }
+                self.import_call_vm(specifier, opts_val, *phase, env)
             }
             Expr::PrivateIn { name, obj } => {
                 let o = self.eval(obj, env)?;
-                let k = self.resolve_private(name, env);
-                match o {
-                    // Private fields, methods and accessors are all own properties.
-                    Value::Obj(obj) => Ok(Value::Bool(obj.borrow().props.contains(k.as_str()))),
-                    _ => {
-                        Err(self
-                            .throw("TypeError", "the right-hand side of 'in' must be an object"))
-                    }
-                }
+                self.private_in_vm(name, o, env)
             }
             Expr::OptionalChain(inner) => {
                 let saved = self.short_circuit;
@@ -2695,6 +2662,151 @@ impl Interp {
         }
     }
 
+    /// Meta-property reads used by both the tree-walker and heap bytecode continuations. The
+    /// importing module is carried lexically so an async continuation keeps its original
+    /// referrer after suspension.
+    pub(crate) fn import_meta_vm(&self, env: &Env) -> Value {
+        self.peek_binding("%importmeta%", env)
+            .or_else(|| self.import_meta.clone())
+            .unwrap_or(Value::Undefined)
+    }
+
+    pub(crate) fn new_target_vm(&self, env: &Env) -> Value {
+        self.peek_binding("%newtarget%", env)
+            .unwrap_or_else(|| self.new_target.clone())
+    }
+
+    /// EvaluateImportCall after the specifier and optional options expressions have already run.
+    /// Those expressions can suspend in a VM coroutine, but every operation from
+    /// NewPromiseCapability onward is shared with the ordinary evaluator. In particular,
+    /// ToString/options validation failures reject the returned promise rather than throwing
+    /// synchronously.
+    pub(crate) fn import_call_vm(
+        &mut self,
+        specifier: Value,
+        options: Option<Value>,
+        phase: ImportPhase,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let specifier = match self.to_string(&specifier) {
+            Ok(specifier) => specifier,
+            Err(error) => {
+                let promise = self.new_promise();
+                let reason = crate::interpreter::abrupt_value(error);
+                self.reject_promise(&promise, reason);
+                return Ok(promise);
+            }
+        };
+        match phase {
+            // ContinueDynamicImport at the source phase resolves with [[ModuleSource]] or
+            // rejects when that field is empty. The Test262 host exposes one concrete source
+            // module; ordinary Source Text Module Records have no source object.
+            ImportPhase::Source => {
+                let promise = self.new_promise();
+                if &*specifier == "<module source>" {
+                    let source = self.module_source_of(&specifier);
+                    self.resolve_promise(&promise, source);
+                } else {
+                    let reason = crate::interpreter::abrupt_value(
+                        self.throw("SyntaxError", "source phase import is not available"),
+                    );
+                    self.reject_promise(&promise, reason);
+                }
+                Ok(promise)
+            }
+            // `import.defer(x)` defers evaluation of the module; for specifier handling it
+            // behaves like a plain dynamic import.
+            ImportPhase::Evaluation | ImportPhase::Defer => {
+                let mut attr_type = None;
+                if let Some(options) = &options {
+                    match self.import_attributes(options) {
+                        Ok(value) => attr_type = value,
+                        Err(error) => {
+                            let promise = self.new_promise();
+                            let reason = crate::interpreter::abrupt_value(error);
+                            self.reject_promise(&promise, reason);
+                            return Ok(promise);
+                        }
+                    }
+                }
+                let referrer = self.peek_binding("%importmeta%", env);
+                Ok(self.dynamic_import(
+                    &specifier,
+                    attr_type.as_deref(),
+                    matches!(phase, ImportPhase::Defer),
+                    referrer,
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn private_in_vm(
+        &mut self,
+        name: &str,
+        value: Value,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let key = self.resolve_private(name, env);
+        match value {
+            // Private fields, methods and accessors are all own properties.
+            Value::Obj(object) => Ok(Value::Bool(object.borrow().props.contains(key.as_str()))),
+            _ => Err(self.throw("TypeError", "the right-hand side of 'in' must be an object")),
+        }
+    }
+
+    pub(crate) fn private_get_vm(
+        &mut self,
+        name: &str,
+        value: &Value,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let key = self.resolve_private(name, env);
+        self.get_private_member(value, &key)
+    }
+
+    pub(crate) fn private_set_vm(
+        &mut self,
+        name: &str,
+        base: &Value,
+        value: Value,
+        env: &Env,
+    ) -> Result<(), Abrupt> {
+        let key = self.resolve_private(name, env);
+        self.set_private_member(base, &key, value)
+    }
+
+    pub(crate) fn super_base_vm(&mut self, env: &Env) -> Result<Value, Abrupt> {
+        self.super_base(env)
+    }
+
+    pub(crate) fn super_get_vm(
+        &mut self,
+        base: &Value,
+        receiver: Value,
+        key: Value,
+    ) -> Result<Value, Abrupt> {
+        if matches!(base, Value::Null | Value::Undefined) {
+            return Err(self.throw("TypeError", "cannot read property of null super base"));
+        }
+        let key = self.to_property_key(&key)?;
+        self.get_member_recv(base, &key, receiver)
+    }
+
+    pub(crate) fn super_set_vm(
+        &mut self,
+        base: &Value,
+        receiver: Value,
+        key: Value,
+        value: Value,
+    ) -> Result<(), Abrupt> {
+        if matches!(base, Value::Null | Value::Undefined) {
+            return Err(self.throw("TypeError", "cannot set property on null super base"));
+        }
+        let key = self.to_property_key(&key)?;
+        self.set_member_recv(base, &key, value, receiver)
+            .map(|_| ())
+    }
+
     fn eval_array(&mut self, elems: &[ArrayElem], env: &Env) -> Result<Value, Abrupt> {
         // Holes leave the index absent (a real elision), not `undefined`.
         // Elements are created as own data properties (CreateDataProperty), so accessors on
@@ -2731,7 +2843,7 @@ impl Interp {
 
     /// The NamedEvaluation name for a property key: a symbol key names the function "[desc]"
     /// (or "" without a description); a string key is used as-is.
-    fn fn_name_for_key(&self, key: &str) -> String {
+    pub(crate) fn fn_name_for_key(&self, key: &str) -> String {
         if Interp::is_sym_key(key) {
             match self.sym_from_key(key) {
                 Some(Value::Sym(d)) => match &d.description {
@@ -2785,14 +2897,18 @@ impl Interp {
                         let name = self.fn_name_for_key(&k);
                         self.set_fn_name(&v, &name);
                     }
-                    obj.borrow_mut().props.insert(k, Property::plain(v));
+                    obj.borrow_mut()
+                        .props
+                        .insert(k.as_str(), Property::plain(v));
                 }
                 PropDef::Method { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
                     let f = self.make_function(func.clone(), home_env.clone());
                     let name = self.fn_name_for_key(&k);
                     self.set_fn_name(&f, &name);
-                    obj.borrow_mut().props.insert(k, Property::plain(f));
+                    obj.borrow_mut()
+                        .props
+                        .insert(k.as_str(), Property::plain(f));
                 }
                 PropDef::Getter { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
@@ -2829,7 +2945,13 @@ impl Interp {
         Ok(Value::Obj(obj))
     }
 
-    fn define_accessor(&self, obj: &Gc, key: &str, get: Option<Value>, set: Option<Value>) {
+    pub(crate) fn define_accessor(
+        &self,
+        obj: &Gc,
+        key: &str,
+        get: Option<Value>,
+        set: Option<Value>,
+    ) {
         let mut b = obj.borrow_mut();
         if let Some(p) = b.props.get_mut(key) {
             if p.accessor() {
@@ -2846,11 +2968,15 @@ impl Interp {
             .insert(key, Property::accessor_prop(get, set, true, true));
     }
 
-    fn eval_prop_key(&mut self, key: &PropKey, env: &Env) -> Result<String, Abrupt> {
+    fn eval_prop_key(
+        &mut self,
+        key: &PropKey,
+        env: &Env,
+    ) -> Result<crate::value::PropertyKey, Abrupt> {
         match key {
-            PropKey::Ident(s) => Ok(s.clone()),
-            PropKey::Str(s) => Ok(s.to_string()),
-            PropKey::Num(n) => Ok(self.num_to_str(*n)),
+            PropKey::Ident(s) => Ok(crate::value::PropertyKey::string(s.clone())),
+            PropKey::Str(s) => Ok(crate::value::PropertyKey::string(s.to_string())),
+            PropKey::Num(n) => Ok(crate::value::PropertyKey::string(self.num_to_str(*n))),
             PropKey::Computed(e) => {
                 let v = self.eval(e, env)?;
                 self.to_property_key(&v)
@@ -2923,7 +3049,10 @@ impl Interp {
 
     /// GetTemplateObject: one frozen strings array (with a frozen `.raw`) per template *site* —
     /// re-evaluating the same site passes the identical object.
-    fn template_object(&mut self, quasis: &[(Option<String>, String)]) -> Result<Value, Abrupt> {
+    pub(crate) fn template_object(
+        &mut self,
+        quasis: &[(Option<String>, String)],
+    ) -> Result<Value, Abrupt> {
         let site = quasis.as_ptr() as usize;
         let strings = match self.template_cache.get(&site) {
             Some(v) => v.clone(),
@@ -3588,8 +3717,10 @@ impl Interp {
             });
             for f in due {
                 if let Err(Abrupt::Interrupt(reason)) = self.call(f, Value::Undefined, &[]) {
+                    self.kept_alive.clear();
                     return Err(reason);
                 }
+                self.kept_alive.clear();
                 resolved_any = true;
             }
             if resolved_any {
@@ -3613,9 +3744,19 @@ impl Interp {
 
     pub(crate) fn drain_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
         let mut budget = 100_000u32;
-        while let Some(job) = self.microtasks.pop_front() {
+        // The script/callback that preceded this checkpoint is a completed synchronous job.
+        self.kept_alive.clear();
+        loop {
+            let Some(job) = self.microtasks.pop_front() else {
+                let Some(registry) = self.pending_finalization_cleanup.pop_front() else {
+                    break;
+                };
+                self.run_finalization_cleanup_job(registry)?;
+                continue;
+            };
             if let Err(abrupt) = self.interrupt_poll_force() {
                 self.microtasks.clear();
+                self.kept_alive.clear();
                 let Abrupt::Interrupt(reason) = abrupt else {
                     unreachable!("a host-control poll only produces Interrupt")
                 };
@@ -3624,14 +3765,60 @@ impl Interp {
             budget -= 1;
             if budget == 0 {
                 self.microtasks.clear();
+                self.kept_alive.clear();
                 break;
             }
             if let Err(reason) = self.run_job_interruptible(job) {
                 self.microtasks.clear();
+                self.kept_alive.clear();
                 return Err(reason);
             }
+            self.kept_alive.clear();
         }
         Ok(())
+    }
+
+    /// HostEnqueueFinalizationRegistryCleanupJob / CleanupFinalizationRegistry (ECMA-262
+    /// §9.9.4.1 and §9.12). A callback is a separate job; its target cell is removed before
+    /// invocation and any promise reactions it queues run on the following checkpoint iteration.
+    pub(crate) fn run_finalization_cleanup_job(
+        &mut self,
+        registry: Value,
+    ) -> Result<(), crate::InterruptReason> {
+        let Some(ptr) = registry.as_obj().map(|object| Rc::as_ptr(object) as usize) else {
+            return Ok(());
+        };
+        if let Some(state) = self.finalization_registries.get_mut(&ptr) {
+            state.cleanup_scheduled = false;
+        }
+        loop {
+            let next = self
+                .finalization_registries
+                .get_mut(&ptr)
+                .and_then(|state| {
+                    let index = state.cells.iter().position(|cell| cell.target.is_none())?;
+                    let cell = state.cells.remove(index);
+                    Some((state.cleanup_callback.clone(), cell.held_value))
+                });
+            let Some((callback, held_value)) = next else {
+                return Ok(());
+            };
+            match self.call(callback, Value::Undefined, &[held_value]) {
+                Ok(_) => {}
+                // CleanupFinalizationRegistry uses `?`: the first callback throw ends this job.
+                // The bare engine has no host error reporter; browser/Node embedders can add one
+                // without changing the cell-removal semantics here.
+                Err(Abrupt::Throw(_))
+                | Err(Abrupt::Return(_))
+                | Err(Abrupt::Break(_, _))
+                | Err(Abrupt::Continue(_, _)) => return Ok(()),
+                Err(Abrupt::Interrupt(reason)) => {
+                    self.kept_alive.clear();
+                    return Err(reason);
+                }
+            }
+            self.kept_alive.clear();
+        }
     }
 
     /// Run one promise-reaction job (settle `job.result` from the handler, or pass the
@@ -3728,26 +3915,23 @@ impl Interp {
         source: &str,
         flags: &str,
     ) -> Result<Rc<crate::regex::Regex>, Abrupt> {
-        if let Some(re) = self
-            .regexp_programs
-            .get(source)
-            .and_then(|by_flags| by_flags.get(flags))
-        {
-            return Ok(re.clone());
+        if let Some(re) = self.regexp_programs.get(source, flags) {
+            return Ok(re);
         }
         let re = Rc::new(
             crate::regex::Regex::new(source, flags).map_err(|e| self.throw("SyntaxError", e))?,
         );
-        // This is mainly a literal-site cache. Keep dynamic `RegExp(string)` workloads bounded;
-        // clearing at the limit is rare and avoids maintaining a second LRU data structure on the
-        // hot lookup path.
-        if self.regexp_programs.len() >= 256 {
-            self.regexp_programs.clear();
-        }
+        let bytes = re
+            .heap_bytes()
+            .saturating_add(source.len())
+            .saturating_add(flags.len())
+            .saturating_add(std::mem::size_of::<(
+                Rc<str>,
+                Rc<str>,
+                Rc<crate::regex::Regex>,
+            )>());
         self.regexp_programs
-            .entry(source.to_owned())
-            .or_default()
-            .insert(flags.to_owned(), re.clone());
+            .insert(source, flags, re.clone(), bytes);
         Ok(re)
     }
 
@@ -4308,7 +4492,12 @@ impl Interp {
         let mut priv_members: Vec<(String, Property)> = Vec::new();
         // Static elements (field initializers and static blocks) defer until every member's
         // computed key has been evaluated, then run in declaration order.
-        type StaticEl = (Option<Rc<Function>>, String, Option<Expr>, Vec<Value>);
+        type StaticEl = (
+            Option<Rc<Function>>,
+            crate::value::PropertyKey,
+            Option<Expr>,
+            Vec<Value>,
+        );
         let mut static_els: Vec<StaticEl> = Vec::new();
         let mut instance_inits: Vec<Value> = Vec::new();
         let mut static_inits: Vec<Value> = Vec::new();
@@ -4331,7 +4520,7 @@ impl Interp {
             // evaluates to a "#..." string is an ordinary property name.
             let is_private = matches!(&m.key, PropKey::Ident(n) if n.starts_with('#'));
             let key = if is_private {
-                self.resolve_private(&key, &class_env)
+                crate::value::PropertyKey::string(self.resolve_private(&key, &class_env))
             } else {
                 key
             };
@@ -4373,17 +4562,22 @@ impl Interp {
                     }
                     if is_private && !m.is_static {
                         priv_members.push((
-                            key.clone(),
+                            key.to_string(),
                             Property::accessor_prop(Some(getter), Some(setter), false, false),
                         ));
                     } else {
                         self.define_class_accessor(&target, &key, Some(getter), Some(setter));
                     }
                     if m.is_static {
-                        static_els.push((None, backing.to_string(), m.value.clone(), transforms));
+                        static_els.push((
+                            None,
+                            crate::value::PropertyKey::string(backing.to_string()),
+                            m.value.clone(),
+                            transforms,
+                        ));
                     } else {
                         inst_fields.push(FieldInit {
-                            key: backing.to_string(),
+                            key: crate::value::PropertyKey::string(backing.to_string()),
                             init: m.value.clone(),
                             transforms,
                         });
@@ -4422,9 +4616,9 @@ impl Interp {
                         Property::builtin(f)
                     };
                     if is_private && !m.is_static {
-                        priv_members.push((key, prop));
+                        priv_members.push((key.into_string(), prop));
                     } else {
-                        target.borrow_mut().props.insert(key, prop);
+                        target.borrow_mut().props.insert(key.as_str(), prop);
                     }
                 }
                 MemberKind::Get | MemberKind::Set => {
@@ -4467,7 +4661,10 @@ impl Interp {
                         (None, Some(f))
                     };
                     if is_private && !m.is_static {
-                        if let Some((_, p)) = priv_members.iter_mut().find(|(k, _)| *k == key) {
+                        if let Some((_, p)) = priv_members
+                            .iter_mut()
+                            .find(|(k, _)| k.as_str() == key.as_str())
+                        {
                             if get.is_some() {
                                 p.set_getter(get);
                             }
@@ -4475,8 +4672,10 @@ impl Interp {
                                 p.set_setter(set);
                             }
                         } else {
-                            priv_members
-                                .push((key, Property::accessor_prop(get, set, false, false)));
+                            priv_members.push((
+                                key.into_string(),
+                                Property::accessor_prop(get, set, false, false),
+                            ));
                         }
                     } else {
                         self.define_class_accessor(&target, &key, get, set);
@@ -4512,7 +4711,12 @@ impl Interp {
                 }
                 MemberKind::StaticBlock => {
                     if let Some(func) = &m.func {
-                        static_els.push((Some(func.clone()), String::new(), None, Vec::new()));
+                        static_els.push((
+                            Some(func.clone()),
+                            crate::value::PropertyKey::string(String::new()),
+                            None,
+                            Vec::new(),
+                        ));
                     }
                 }
                 MemberKind::Constructor => {}
@@ -4589,7 +4793,10 @@ impl Interp {
                     "cannot add a private field to a non-extensible object",
                 ));
             }
-            ctor_obj.borrow_mut().props.insert(key, Property::plain(v));
+            ctor_obj
+                .borrow_mut()
+                .props
+                .insert(key.as_str(), Property::plain(v));
         }
 
         self.gc_pin(&ctor_obj);
@@ -4958,11 +5165,25 @@ impl Interp {
                         // onto `this`, so a subclass instance carries the built-in's state.
                         let (sp, dp) = (Rc::as_ptr(src) as usize, Rc::as_ptr(dst) as usize);
                         self.gc_pin(dst);
+                        let mut moved_collection = false;
                         if let Some(v) = self.map_data.remove(&sp) {
                             self.map_data.insert(dp, v);
+                            moved_collection = true;
+                        }
+                        // WeakMap/WeakSet's [[WeakMapData]]/[[WeakSetData]] and its acceleration
+                        // index are one internal slot implementation and must move together to the
+                        // subclass instance created by super() (ECMA-262 §§24.3.1, 24.4.1).
+                        if let Some(v) = self.weak_collection_data.remove(&sp) {
+                            self.weak_collection_data.insert(dp, v);
+                            moved_collection = true;
                         }
                         if let Some(v) = self.weak_collection_index.remove(&sp) {
                             self.weak_collection_index.insert(dp, v);
+                        }
+                        if moved_collection {
+                            // The temporary object returned by the native constructor no longer
+                            // owns side-table state; the actual subclass instance is pinned above.
+                            self.gc_pins.remove(&sp);
                         }
                         if let Some(v) = self.typed_arrays.remove(&sp) {
                             dst.borrow().ic_plain.set(false);
@@ -4978,6 +5199,9 @@ impl Interp {
                         }
                         if let Some(v) = self.array_buffers.remove(&sp) {
                             self.array_buffers.insert(dp, v);
+                        }
+                        if let Some(v) = self.array_buffer_dirty_ranges.remove(&sp) {
+                            self.array_buffer_dirty_ranges.insert(dp, v);
                         }
                         if let Some(v) = self.regexps.remove(&sp) {
                             self.regexps.insert(dp, v);
@@ -5011,7 +5235,7 @@ impl Interp {
         Ok(rest)
     }
 
-    fn copy_data_properties_into(
+    pub(crate) fn copy_data_properties_into(
         &mut self,
         rest: &Gc,
         value: &Value,
@@ -5035,7 +5259,7 @@ impl Interp {
                     let v = self.get_member(value, &pk)?;
                     rest.borrow_mut()
                         .props
-                        .insert(pk, crate::value::Property::plain(v));
+                        .insert(pk.as_str(), crate::value::Property::plain(v));
                 }
             }
             return Ok(());
@@ -5544,7 +5768,7 @@ impl Interp {
     /// `delete <identifier>`: an environment binding is removable only if it is `deletable`
     /// (a `var`/function created by a sloppy `eval`); a global-object property follows its own
     /// configurability. An unresolvable reference deletes to `true`.
-    fn delete_ident(&mut self, name: &str, env: &Env) -> Result<Value, Abrupt> {
+    pub(crate) fn delete_ident(&mut self, name: &str, env: &Env) -> Result<Value, Abrupt> {
         {
             {
                 let mut cur = Some(env.clone());
@@ -5830,7 +6054,12 @@ impl Interp {
         Ok(result)
     }
 
-    fn assign_to_target(&mut self, target: &Expr, value: Value, env: &Env) -> Result<(), Abrupt> {
+    pub(crate) fn assign_to_target(
+        &mut self,
+        target: &Expr,
+        value: Value,
+        env: &Env,
+    ) -> Result<(), Abrupt> {
         match target {
             Expr::Ident(name) => self.assign_var(name, value, env),
             Expr::Member { obj, prop, .. } => {
@@ -6068,7 +6297,7 @@ impl Interp {
             PropKey::Num(n) => self.num_to_str(*n),
             PropKey::Computed(e) => {
                 let kv = self.eval(e, env)?;
-                self.to_property_key(&kv)?
+                self.to_property_key(&kv)?.into_string()
             }
         })
     }
@@ -6698,19 +6927,24 @@ impl Interp {
         })
     }
 
-    pub(crate) fn to_property_key(&mut self, v: &Value) -> Result<String, Abrupt> {
+    pub(crate) fn to_property_key(
+        &mut self,
+        v: &Value,
+    ) -> Result<crate::value::PropertyKey, Abrupt> {
         // A symbol key maps to its internal NUL-prefixed key; everything else is its string form.
         if let Value::Sym(s) = v {
-            return Ok(Interp::sym_key(s));
+            return Ok(crate::value::PropertyKey::symbol(s.clone()));
         }
         // ToPropertyKey: ToPrimitive(hint String) first — a Symbol result stays a symbol key (rather
         // than being stringified, which would throw), so `obj[wrapperWhoseToStringReturnsASymbol]`
         // is a symbol-keyed access.
         let prim = self.to_primitive(v, Hint::String)?;
         if let Value::Sym(s) = &prim {
-            return Ok(Interp::sym_key(s));
+            return Ok(crate::value::PropertyKey::symbol(s.clone()));
         }
-        Ok(self.to_string(&prim)?.to_string())
+        Ok(crate::value::PropertyKey::string(
+            self.to_string(&prim)?.to_string(),
+        ))
     }
 
     /// The internal property key for a well-known symbol (e.g. `Symbol.toPrimitive`).
@@ -7097,6 +7331,7 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
         Expr::Unary { arg, .. }
         | Expr::Update { arg, .. }
         | Expr::Await(arg)
+        | Expr::ToStr(arg)
         | Expr::Paren(arg) => e(arg),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => e(left) || e(right),
         Expr::Assign { target, value, .. } => e(target) || e(value),
@@ -7106,15 +7341,27 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
         Expr::Seq(v) => v.iter().any(e),
         Expr::Array(elems) => arr_elems_contain(elems, pred),
         Expr::Yield { arg, .. } => arg.as_deref().is_some_and(e),
-        Expr::ImportCall { spec, .. } => e(spec),
+        Expr::ImportCall { spec, options, .. } => e(spec) || options.as_deref().is_some_and(e),
         Expr::PrivateIn { obj, .. } => e(obj),
         Expr::TaggedTemplate { tag, subs, .. } => e(tag) || subs.iter().any(e),
         Expr::Object(props) => props.iter().any(|p| match p {
-            PropDef::KeyValue { value, .. } | PropDef::Cover { value, .. } => e(value),
+            PropDef::KeyValue { key, value } | PropDef::Cover { key, value } => {
+                matches!(key, PropKey::Computed(key) if e(key)) || e(value)
+            }
             PropDef::Spread(x) => e(x),
-            // Methods/getters/setters open their own context.
-            _ => false,
+            PropDef::Method { key, .. }
+            | PropDef::Getter { key, .. }
+            | PropDef::Setter { key, .. } => matches!(key, PropKey::Computed(key) if e(key)),
+            PropDef::Proto(value) => e(value),
         }),
+        Expr::Class(class) => {
+            class.decorators.iter().any(e)
+                || class.superclass.as_deref().is_some_and(e)
+                || class.members.iter().any(|member| {
+                    member.decorators.iter().any(e)
+                        || matches!(&member.key, PropKey::Computed(key) if e(key))
+                })
+        }
         // `Contains` descends into arrow functions; an ordinary function/class does not.
         Expr::Func(f) if f.is_arrow => {
             f.params.iter().any(|p| p.default.as_ref().is_some_and(&e))
@@ -7524,6 +7771,7 @@ enum RefBase {
 /// RequireObjectCoercible check (a null base throws before the key's `toString` runs) and only once.
 enum RefKey {
     Static(String),
+    Coerced(crate::value::PropertyKey),
     Raw(Value),
 }
 
@@ -7541,37 +7789,71 @@ enum Reference {
     },
 }
 
+/// Opaque Environment/Property Reference retained by a heap VM continuation across an
+/// intervening `yield`/`await`. Keeping this wrapper private-fielded prevents bytecode from
+/// reimplementing GetValue/PutValue details while still preserving the spec's resolve-once rule.
+pub(crate) struct PreparedReference(Reference);
+
 impl Interp {
+    pub(crate) fn prepare_name_reference(
+        &mut self,
+        name: &str,
+        env: &Env,
+    ) -> Result<PreparedReference, Abrupt> {
+        let mut cur = Some(env.clone());
+        while let Some(scope) = cur {
+            let (has_binding, with_obj, parent) = {
+                let binding = scope.borrow();
+                (
+                    binding.vars.contains_key(name),
+                    binding.with_obj.clone(),
+                    binding.parent.clone(),
+                )
+            };
+            if has_binding {
+                return Ok(PreparedReference(Reference::Var(
+                    RefBase::Scope(scope),
+                    name.to_string(),
+                )));
+            }
+            if let Some(object @ Value::Obj(_)) = &with_obj {
+                if self.with_has_binding(object, name)? {
+                    return Ok(PreparedReference(Reference::Var(
+                        RefBase::With(object.clone()),
+                        name.to_string(),
+                    )));
+                }
+            }
+            cur = parent;
+        }
+        let base = if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
+            RefBase::Global
+        } else {
+            RefBase::Unresolvable
+        };
+        Ok(PreparedReference(Reference::Var(base, name.to_string())))
+    }
+
+    pub(crate) fn read_prepared_reference(
+        &mut self,
+        reference: &mut PreparedReference,
+    ) -> Result<Value, Abrupt> {
+        self.get_reference(&mut reference.0)
+    }
+
+    pub(crate) fn write_prepared_reference(
+        &mut self,
+        reference: &mut PreparedReference,
+        value: Value,
+    ) -> Result<(), Abrupt> {
+        self.put_reference(&mut reference.0, value)
+    }
+
     /// Evaluate `target` to a `Reference` exactly once (its base object/binding location and,
     /// for member/index targets, its property key).
     fn resolve_reference(&mut self, target: &Expr, env: &Env) -> Result<Reference, Abrupt> {
         match target {
-            Expr::Ident(name) => {
-                let mut cur = Some(env.clone());
-                while let Some(s) = cur {
-                    let (has_binding, with_obj, parent) = {
-                        let b = s.borrow();
-                        (
-                            b.vars.contains_key(name.as_str()),
-                            b.with_obj.clone(),
-                            b.parent.clone(),
-                        )
-                    };
-                    if has_binding {
-                        return Ok(Reference::Var(RefBase::Scope(s), name.clone()));
-                    }
-                    if let Some(obj @ Value::Obj(_)) = &with_obj {
-                        if self.with_has_binding(obj, name)? {
-                            return Ok(Reference::Var(RefBase::With(obj.clone()), name.clone()));
-                        }
-                    }
-                    cur = parent;
-                }
-                if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
-                    return Ok(Reference::Var(RefBase::Global, name.clone()));
-                }
-                Ok(Reference::Var(RefBase::Unresolvable, name.clone()))
-            }
+            Expr::Ident(name) => Ok(self.prepare_name_reference(name, env)?.0),
             Expr::Member { obj, prop, .. } => {
                 if matches!(**obj, Expr::Super) {
                     let proto = self.super_base(env)?;
@@ -7618,13 +7900,14 @@ impl Interp {
     }
 
     /// Coerce a reference key via `ToPropertyKey`, caching the result so it runs at most once.
-    fn coerce_ref_key(&mut self, key: &mut RefKey) -> Result<String, Abrupt> {
+    fn coerce_ref_key(&mut self, key: &mut RefKey) -> Result<crate::value::PropertyKey, Abrupt> {
         match key {
-            RefKey::Static(s) => Ok(s.clone()),
+            RefKey::Static(s) => Ok(crate::value::PropertyKey::string(s.clone())),
+            RefKey::Coerced(key) => Ok(key.clone()),
             RefKey::Raw(v) => {
                 let v = v.clone();
                 let k = self.to_property_key(&v)?;
-                *key = RefKey::Static(k.clone());
+                *key = RefKey::Coerced(k.clone());
                 Ok(k)
             }
         }
@@ -7632,7 +7915,11 @@ impl Interp {
 
     /// Coerce a member reference's property key, deferring `ToPropertyKey` until after the base's
     /// RequireObjectCoercible check and caching the result so it runs at most once.
-    fn ref_prop_key(&mut self, base: &Value, key: &mut RefKey) -> Result<String, Abrupt> {
+    fn ref_prop_key(
+        &mut self,
+        base: &Value,
+        key: &mut RefKey,
+    ) -> Result<crate::value::PropertyKey, Abrupt> {
         if matches!(key, RefKey::Raw(_)) && matches!(base, Value::Null | Value::Undefined) {
             return Err(self.throw("TypeError", "cannot access property of null or undefined"));
         }

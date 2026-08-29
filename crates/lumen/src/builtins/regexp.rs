@@ -1089,7 +1089,14 @@ pub(super) fn re_sym_split_discard_fast(
     let text = i.re_text(search_re.unicode, input);
     let size = text.unit_index(text.len());
     if size == 0 {
-        if let Some(whole) = search_re.find_text_shared(&text, 0) {
+        let found = match regexp_match_result(
+            i,
+            search_re.find_text_shared(&text, 0, &i.runtime_interrupt),
+        ) {
+            Ok(found) => found,
+            Err(error) => return Some(Err(error)),
+        };
+        if let Some(whole) = found {
             update_regexp_legacy_statics_lazy(i, &search_re, whole, 0, &text, input);
         }
         return Some(Ok(Value::Undefined));
@@ -1100,7 +1107,14 @@ pub(super) fn re_sym_split_discard_fast(
     let mut q = 0usize;
     while q < size {
         let search_start = text.elem_at_unit(q);
-        let Some(whole @ (a, e)) = search_re.find_text_shared(&text, search_start) else {
+        let found = match regexp_match_result(
+            i,
+            search_re.find_text_shared(&text, search_start, &i.runtime_interrupt),
+        ) {
+            Ok(found) => found,
+            Err(error) => return Some(Err(error)),
+        };
+        let Some(whole @ (a, e)) = found else {
             break;
         };
         let a = text.unit_index(a);

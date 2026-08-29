@@ -4,6 +4,7 @@
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
 use crate::value::*;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -337,7 +338,7 @@ pub(crate) fn proxy_own_keys(
             return Err(i.make_error("TypeError", "ownKeys trap must return an array-like object"));
         }
         let keys = ab(i.create_list_from_arraylike(&res))?;
-        let mut key_strs: Vec<String> = Vec::with_capacity(keys.len());
+        let mut key_strs: Vec<crate::value::PropertyKey> = Vec::with_capacity(keys.len());
         for k in &keys {
             if !matches!(k, Value::Str(_) | Value::Sym(_)) {
                 return Err(i.make_error(
@@ -1559,10 +1560,7 @@ fn proxy_uncallable(i: &mut Interp, _t: Value, _a: &[Value]) -> Result<Value, Va
 fn can_be_held_weakly(i: &Interp, v: &Value) -> bool {
     match v {
         Value::Obj(_) => true,
-        Value::Sym(s) => {
-            let _ = i;
-            !crate::interpreter::sym_for_contains(s)
-        }
+        Value::Sym(s) => !i.symbol_is_registered(s),
         _ => false,
     }
 }
@@ -1657,7 +1655,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         }
     }
     let proxy = proxy_pair(i, obj);
-    let keys: Vec<String> = if let Some((t, h)) = &proxy {
+    let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = &proxy {
         let mut ks = Vec::new();
         for k in proxy_own_keys(i, t, h)? {
             ks.push(ab(i.to_property_key(&k))?);
@@ -1671,7 +1669,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
             .ordered_keys()
             .iter()
             .filter(|k| !Interp::is_private_key(k))
-            .map(|k| k.to_string())
+            .map(|k| crate::value::PropertyKey::string(k.to_string()))
             .collect()
     };
     for key in keys {
@@ -1759,7 +1757,7 @@ fn object_define_properties(
     who: &str,
 ) -> Result<(), Value> {
     let props = Value::Obj(to_object_arg(i, props_arg, who)?);
-    let keys: Vec<String> = if let Some((t, h)) = proxy_pair(i, &props) {
+    let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = proxy_pair(i, &props) {
         let mut ks = Vec::new();
         for k in proxy_own_keys(i, &t, &h)? {
             ks.push(ab(i.to_property_key(&k))?);
@@ -1774,11 +1772,11 @@ fn object_define_properties(
             .ordered_keys()
             .iter()
             .filter(|k| !Interp::is_private_key(k))
-            .map(|k| k.to_string())
+            .map(|k| crate::value::PropertyKey::string(k.to_string()))
             .collect()
     };
     // Collect descriptor objects for enumerable own keys first (so all Gets precede any Defines).
-    let mut descs: Vec<(String, Value)> = Vec::new();
+    let mut descs: Vec<(crate::value::PropertyKey, Value)> = Vec::new();
     for key in keys {
         let enumerable = if let Some((t, h)) = proxy_pair(i, &props) {
             let d = proxy_gopd_value(i, &t, &h, &key)?;
@@ -1930,15 +1928,49 @@ fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Resu
 }
 
 /// Coerce `v` to a RegExp object (returning it unchanged if already one).
+fn regexp_match_error_value(i: &Interp, error: crate::regex::MatchError) -> Value {
+    match error {
+        crate::regex::MatchError::ResourceExhausted => i.make_error(
+            "RangeError",
+            "regular expression execution exceeded engine resource limits",
+        ),
+        // NativeFn's Value-shaped error channel cannot carry host control flow. Every native
+        // dispatch polls again immediately after returning and replaces this placeholder with the
+        // original non-catchable interruption completion.
+        crate::regex::MatchError::Interrupted(reason) => i.make_error("Error", reason.message()),
+    }
+}
+
+fn regexp_match_result<T>(
+    i: &Interp,
+    result: crate::regex::MatchResult<T>,
+) -> Result<Option<T>, Value> {
+    result.map_err(|error| regexp_match_error_value(i, error))
+}
+
+fn regexp_match_abrupt<T>(
+    i: &Interp,
+    result: crate::regex::MatchResult<T>,
+) -> Result<Option<T>, Abrupt> {
+    result.map_err(|error| match error {
+        crate::regex::MatchError::ResourceExhausted => Abrupt::Throw(i.make_error(
+            "RangeError",
+            "regular expression execution exceeded engine resource limits",
+        )),
+        crate::regex::MatchError::Interrupted(reason) => Abrupt::Interrupt(reason),
+    })
+}
+
 /// All non-overlapping matches of `re` in `text`, each as capture spans (element indices).
 fn regex_find_all(
+    i: &Interp,
     re: &crate::regex::Regex,
     text: &crate::regex::ReText,
-) -> Vec<Vec<Option<(usize, usize)>>> {
+) -> Result<Vec<Vec<Option<(usize, usize)>>>, Value> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos <= text.len() {
-        match re.exec_text_shared(text, pos) {
+        match regexp_match_result(i, re.exec_text_shared(text, pos, &i.runtime_interrupt))? {
             None => break,
             Some(caps) => {
                 let (a, b) = caps[0].unwrap();
@@ -1950,7 +1982,7 @@ fn regex_find_all(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// ToLength of a value (clamped to a non-negative integer).
@@ -2008,7 +2040,10 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
         return Ok(Value::Null);
     }
     let last = text.elem_at_unit(last_units);
-    match re.exec_text_discard_shared(&text, last) {
+    match regexp_match_result(
+        i,
+        re.exec_text_discard_shared(&text, last, &i.runtime_interrupt),
+    )? {
         None => {
             if use_last {
                 set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
@@ -2185,7 +2220,7 @@ pub(crate) fn regexp_exec_discard_direct(
         return Ok(false);
     }
     let last = text.elem_at_unit(last_units);
-    match re.find_text_shared(&text, last) {
+    match regexp_match_result(i, re.find_text_shared(&text, last, &i.runtime_interrupt))? {
         None => {
             if use_last {
                 set_last(0);
@@ -2237,7 +2272,9 @@ pub(crate) fn regexp_literal_exec_discard(
     input: &crate::lstr::LStr,
 ) -> Result<(), Abrupt> {
     let text = i.re_text(re.unicode, input);
-    if let Some(whole) = re.find_text_shared(&text, 0) {
+    if let Some(whole) =
+        regexp_match_abrupt(i, re.find_text_shared(&text, 0, &i.runtime_interrupt))?
+    {
         update_regexp_legacy_statics_lazy(i, re, whole, 0, &text, input);
     }
     Ok(())
@@ -2307,7 +2344,11 @@ pub(crate) fn regexp_literal_replace_discard(
     let mut position = 0usize;
     loop {
         let search_start = position;
-        let Some((start, end)) = re.find_text_shared(&text, position) else {
+        let Some((start, end)) = regexp_match_abrupt(
+            i,
+            re.find_text_shared(&text, position, &i.runtime_interrupt),
+        )?
+        else {
             break;
         };
         update_regexp_legacy_statics_lazy(i, re, (start, end), search_start, &text, input);
@@ -2387,7 +2428,11 @@ pub(crate) fn regexp_literal_match_discard(
     let mut position = 0usize;
     loop {
         let search_start = position;
-        let Some((start, end)) = re.find_text_shared(&text, position) else {
+        let Some((start, end)) = regexp_match_abrupt(
+            i,
+            re.find_text_shared(&text, position, &i.runtime_interrupt),
+        )?
+        else {
             break;
         };
         update_regexp_legacy_statics_lazy(i, re, (start, end), search_start, &text, input);
@@ -2580,7 +2625,7 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
         return;
     };
     if let Some((re, start)) = m.lazy_captures.take() {
-        if let Some(captures) = re.exec_text_shared(&m.text, start) {
+        if let Ok(Some(captures)) = re.exec_text_shared(&m.text, start, &i.runtime_interrupt) {
             m.caps.clear();
             m.caps.extend_from_slice(&captures);
         }
@@ -3790,7 +3835,7 @@ fn install_object(it: &mut Interp) {
             return Err(i.make_error("TypeError", "Object.groupBy callback is not callable"));
         }
         let elems = ab(i.iterate(&arg(args, 0)))?;
-        let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
+        let mut groups: Vec<(crate::value::PropertyKey, Vec<Value>)> = Vec::new();
         for (idx, el) in elems.into_iter().enumerate() {
             let key_v = ab(i.call(
                 cb.clone(),
@@ -3798,7 +3843,7 @@ fn install_object(it: &mut Interp) {
                 &[el.clone(), Value::Num(idx as f64)],
             ))?;
             let key = ab(i.to_property_key(&key_v))?;
-            match groups.iter_mut().find(|(k, _)| *k == key) {
+            match groups.iter_mut().find(|(k, _)| k.as_str() == key.as_str()) {
                 Some(g) => g.1.push(el),
                 None => groups.push((key, vec![el])),
             }
@@ -3807,7 +3852,10 @@ fn install_object(it: &mut Interp) {
         result.borrow_mut().proto = None; // groupBy returns a null-prototype object
         for (k, v) in groups {
             let arr = i.make_array(v);
-            result.borrow_mut().props.insert(k, Property::plain(arr));
+            result
+                .borrow_mut()
+                .props
+                .insert(k.as_str(), Property::plain(arr));
         }
         Ok(Value::Obj(result))
     });
@@ -4800,6 +4848,62 @@ fn same_value(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Whether `value` is one exact built-in native function. Function-pointer identity is used only
+/// as a guard for semantics-preserving fast paths; wrappers, bound functions, and user functions
+/// always take the observable algorithm.
+fn is_native_function(value: &Value, expected: NativeFn) -> bool {
+    matches!(
+        value,
+        Value::Obj(object)
+            if matches!(object.borrow().call, Callable::Native(actual)
+                if std::ptr::fn_addr_eq(actual, expected))
+    )
+}
+
+fn is_intrinsic_array_constructor(i: &Interp, value: &Value) -> bool {
+    matches!((i.array_ctor.as_ref(), value), (Some(expected), Value::Obj(actual)) if Rc::ptr_eq(expected, actual))
+}
+
+/// Array iteration also performs `Get(iterator, "next")`; retaining the original `values`
+/// function is insufficient if `%ArrayIteratorPrototype%.next` was replaced.
+fn intrinsic_array_iterator_is_unmodified(i: &Interp) -> bool {
+    i.extra_protos
+        .get("%ArrayIteratorPrototype%")
+        .and_then(|prototype| prototype.borrow().props.get("next").map(|p| p.value()))
+        .is_some_and(|next| is_native_function(&next, array_iter_next))
+}
+
+/// Snapshot an Array whose current iteration cannot execute ECMAScript code: every index below
+/// `length` is an own plain data property. Callers separately prove that the selected iterator is
+/// the intrinsic Array iterator. Holes and accessors deliberately miss so prototype lookup and
+/// side effects retain the ordinary iterator path.
+fn dense_array_snapshot(i: &Interp, value: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(object) = value else {
+        return None;
+    };
+    if !matches!(object.borrow().exotic, Exotic::Array)
+        || !i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+    {
+        return None;
+    }
+    let length = i.array_length(object);
+    let object = object.borrow();
+    let mut values = Vec::with_capacity(length);
+    for index in 0..length {
+        let property = object.props.get_index(index as u32)?;
+        if property.accessor() {
+            return None;
+        }
+        values.push(property.value());
+    }
+    Some(values)
+}
+
+fn nf_array_values(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    arr_require_coercible(i, &this)?;
+    Ok(make_array_iterator(i, this, 0))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Array
 // ---------------------------------------------------------------------------------------------
@@ -5483,6 +5587,35 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         {
             return Err(i.make_error("RangeError", "array length exceeds engine limit"));
         }
+        // A fresh holey Array with its standard sole `length` property has no indexed writes
+        // that can invoke ECMAScript code once the prototype-index protector is valid. This is a
+        // frequent initialization idiom (`new Array(n).fill(v)`); materialize its dense property
+        // map in one allocation instead of doing n decimal conversions and OrdinarySet walks.
+        let can_materialize = start == 0
+            && end == len
+            && len > 0
+            && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+            && i.array_append_unshadowed(&o)
+            && {
+                let object = o.borrow();
+                object.extensible
+                    && object.props.iter().count() == 1
+                    && object.props.get("length").is_some_and(|length| {
+                        !length.accessor()
+                            && length.writable()
+                            && !length.enumerable()
+                            && !length.configurable()
+                            && matches!(length.value(), Value::Num(n) if n == len as f64)
+                    })
+            };
+        if can_materialize {
+            let Value::Obj(materialized) = i.make_array(vec![v; len as usize]) else {
+                unreachable!("make_array returns an Array object")
+            };
+            let properties = std::mem::take(&mut materialized.borrow_mut().props);
+            o.borrow_mut().props = properties;
+            return Ok(Value::Obj(o));
+        }
         let ov = Value::Obj(o.clone());
         for k in start..end {
             set_throw(i, &ov, &k.to_string(), v.clone())?;
@@ -5764,10 +5897,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         Ok(ov)
     });
-    it.def_method(&ap, "values", 0, |i, this, _| {
-        arr_require_coercible(i, &this)?;
-        Ok(make_array_iterator(i, this, 0))
-    });
+    it.def_method(&ap, "values", 0, nf_array_values);
     it.def_method(&ap, "keys", 0, |i, this, _| {
         arr_require_coercible(i, &this)?;
         Ok(make_array_iterator(i, this, 1))
@@ -5785,6 +5915,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     }
 
     let ctor = it.make_native("Array", 1, nf_array_ctor);
+    it.array_ctor = Some(ctor.clone());
     ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(ap.clone()), false, false, false),
@@ -5855,6 +5986,18 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         let use_ctor = i.value_is_constructor(&this);
         if iter_method.is_callable() {
+            // With the intrinsic Array constructor and iterator, a fully dense own-data source
+            // has no per-element observable calls. Build the identical result in one pass rather
+            // than allocating an iterator result and a property descriptor for every element.
+            if matches!(mapfn, Value::Undefined)
+                && is_intrinsic_array_constructor(i, &this)
+                && is_native_function(&iter_method, nf_array_values)
+                && intrinsic_array_iterator_is_unmodified(i)
+            {
+                if let Some(items) = dense_array_snapshot(i, &source) {
+                    return Ok(i.make_array(items));
+                }
+            }
             // Iterator path: the target is constructed BEFORE iteration (constructor errors
             // propagate as-is), then elements are defined one at a time; a map/define failure
             // closes the iterator.
@@ -7392,7 +7535,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         Value::Undefined
     };
     // Open the inputs in order, GetIteratorFlattenable each as it is read.
-    let mut keys: Vec<String> = Vec::new();
+    let mut keys: Vec<crate::value::PropertyKey> = Vec::new();
     let mut iters: Vec<Value> = Vec::new();
     let mut nexts: Vec<Value> = Vec::new();
     let open_one = |i: &mut Interp,
@@ -7418,7 +7561,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     };
     if keyed {
         // zipKeyed: each own enumerable non-undefined-valued key of `iterables` is an input.
-        let all_keys: Vec<String> = if let Some((t, h)) = proxy_pair(i, &input) {
+        let all_keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = proxy_pair(i, &input) {
             let mut ks = Vec::new();
             for k in proxy_own_keys(i, &t, &h)? {
                 ks.push(ab(i.to_property_key(&k))?);
@@ -7427,6 +7570,9 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         } else {
             let o = input.as_obj().unwrap();
             ordinary_own_keys_ordered(i, o)
+                .into_iter()
+                .map(crate::value::PropertyKey::string)
+                .collect()
         };
         for k in all_keys {
             // [[GetOwnProperty]] fresh per key: skip missing or non-enumerable properties.
@@ -7554,7 +7700,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     set_builtin(&obj, "__zip_pad", i.make_array(padding));
     set_builtin(&obj, "__zip_finished", Value::Bool(false));
     if keyed {
-        let karr = i.make_array(keys.into_iter().map(Value::from_string).collect());
+        let karr = i.make_array(keys.into_iter().map(|key| key.into_value()).collect());
         set_builtin(&obj, "__zip_keys", karr);
     }
     i.def_method(&obj, "next", 0, zip_next);
@@ -7797,13 +7943,10 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
         let o = Object::new(None);
         for (j, v) in values.into_iter().enumerate() {
             let k = ab(i.get_member(&keys, &j.to_string()))?;
-            let k = match k {
-                Value::Str(s) => s.to_string(),
-                other => ab(i.to_string(&other))?.to_string(),
-            };
+            let k = ab(i.to_property_key(&k))?;
             o.borrow_mut()
                 .props
-                .insert(k, Property::data(v, true, true, true));
+                .insert(k.as_str(), Property::data(v, true, true, true));
         }
         Value::Obj(o)
     } else {
@@ -8967,7 +9110,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
             let text = i.re_text(re.unicode, &s);
             let mut parts = Vec::new();
             let mut last = 0;
-            'outer: for caps in regex_find_all(&re, &text) {
+            'outer: for caps in regex_find_all(i, &re, &text)? {
                 let (a, b) = caps[0].unwrap();
                 // Skip a zero-width match at the very start or end of the string.
                 if a == b && (b == 0 || a >= text.len()) {

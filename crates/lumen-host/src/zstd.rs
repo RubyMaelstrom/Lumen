@@ -690,6 +690,7 @@ fn execute_sequences(
     out: &mut Vec<u8>,
     rep: &mut [usize; 3],
     block_start: usize,
+    limit: usize,
 ) -> Result<(), String> {
     let mut rev = RevBits::new(stream)?;
     // Initial states, in literals-length / offset / match-length order.
@@ -750,12 +751,17 @@ fn execute_sequences(
         if lit_pos + ll_val > literals.len() {
             return Err("zstd: sequence literals overrun".into());
         }
+        let after_literals = crate::checked_decompressed_len(out.len(), ll_val, limit, "zstd")?;
+        if after_literals - block_start > MAX_BLOCK_SIZE {
+            return Err("zstd: block regenerated size too large".into());
+        }
         out.extend_from_slice(&literals[lit_pos..lit_pos + ll_val]);
         lit_pos += ll_val;
         if offset == 0 || offset > out.len() {
             return Err("zstd: sequence offset too far back".into());
         }
-        if out.len() + ml_val - block_start > MAX_BLOCK_SIZE {
+        let after_match = crate::checked_decompressed_len(out.len(), ml_val, limit, "zstd")?;
+        if after_match - block_start > MAX_BLOCK_SIZE {
             return Err("zstd: block regenerated size too large".into());
         }
         let start = out.len() - offset;
@@ -779,6 +785,11 @@ fn execute_sequences(
     if !rev.finished() {
         return Err("zstd: sequences bitstream not fully consumed".into());
     }
+    let tail = literals.len() - lit_pos;
+    let after_tail = crate::checked_decompressed_len(out.len(), tail, limit, "zstd")?;
+    if after_tail - block_start > MAX_BLOCK_SIZE {
+        return Err("zstd: block regenerated size too large".into());
+    }
     out.extend_from_slice(&literals[lit_pos..]);
     Ok(())
 }
@@ -798,6 +809,7 @@ fn decode_compressed_block(
     block: &[u8],
     out: &mut Vec<u8>,
     ctx: &mut FrameCtx,
+    limit: usize,
 ) -> Result<(), String> {
     let block_start = out.len();
     let (literals, used) = decode_literals(block, ctx)?;
@@ -822,7 +834,8 @@ fn decode_compressed_block(
         if seq.len() != pos {
             return Err("zstd: trailing bytes after empty sequences section".into());
         }
-        if out.len() + literals.len() - block_start > MAX_BLOCK_SIZE {
+        let after = crate::checked_decompressed_len(out.len(), literals.len(), limit, "zstd")?;
+        if after - block_start > MAX_BLOCK_SIZE {
             return Err("zstd: block regenerated size too large".into());
         }
         out.extend_from_slice(&literals);
@@ -879,12 +892,18 @@ fn decode_compressed_block(
         out,
         &mut rep,
         block_start,
+        limit,
     )?;
     ctx.rep = rep;
     Ok(())
 }
 
-fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize, String> {
+fn decode_frame(
+    data: &[u8],
+    mut pos: usize,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<usize, String> {
     let frame_out_start = out.len();
     let byte = |pos: &mut usize| -> Result<u8, String> {
         let b = *data.get(*pos).ok_or("zstd: truncated frame header")?;
@@ -899,13 +918,22 @@ fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize,
     let has_checksum = fhd & 0x04 != 0;
     let did_len = [0usize, 1, 2, 4][(fhd & 3) as usize];
     let fcs_flag = fhd >> 6;
-    if !single_segment {
+    let window_size = if !single_segment {
         let wd = byte(&mut pos)?;
         let wlog = 10 + u32::from(wd >> 3);
-        if wlog > 41 {
+        let base = 1usize
+            .checked_shl(wlog)
+            .ok_or("zstd: window size too large")?;
+        let window = base
+            .checked_add(base / 8 * usize::from(wd & 7))
+            .ok_or("zstd: window size too large")?;
+        if window > limit {
             return Err("zstd: window size too large".into());
         }
-    }
+        Some(window)
+    } else {
+        None
+    };
     if did_len > 0 {
         let mut did = 0u64;
         for i in 0..did_len {
@@ -933,6 +961,14 @@ fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize,
     } else {
         None
     };
+    if let Some(size) = fcs {
+        let size = usize::try_from(size).map_err(|_| "zstd: frame content size too large")?;
+        crate::checked_decompressed_len(frame_out_start, size, limit, "zstd")?;
+        if single_segment && size > limit {
+            return Err("zstd: window size too large".into());
+        }
+    }
+    let _ = window_size;
     let mut ctx = FrameCtx {
         huf: None,
         ll: None,
@@ -955,23 +991,27 @@ fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize,
         }
         match btype {
             0 => {
-                if pos + bsize > data.len() {
-                    return Err("zstd: truncated raw block".into());
-                }
-                out.extend_from_slice(&data[pos..pos + bsize]);
-                pos += bsize;
+                let end = pos
+                    .checked_add(bsize)
+                    .filter(|&end| end <= data.len())
+                    .ok_or("zstd: truncated raw block")?;
+                crate::checked_decompressed_len(out.len(), bsize, limit, "zstd")?;
+                out.extend_from_slice(&data[pos..end]);
+                pos = end;
             }
             1 => {
                 let b = *data.get(pos).ok_or("zstd: truncated RLE block")?;
                 pos += 1;
-                out.resize(out.len() + bsize, b);
+                let new_len = crate::checked_decompressed_len(out.len(), bsize, limit, "zstd")?;
+                out.resize(new_len, b);
             }
             2 => {
-                if pos + bsize > data.len() {
-                    return Err("zstd: truncated compressed block".into());
-                }
-                decode_compressed_block(&data[pos..pos + bsize], out, &mut ctx)?;
-                pos += bsize;
+                let end = pos
+                    .checked_add(bsize)
+                    .filter(|&end| end <= data.len())
+                    .ok_or("zstd: truncated compressed block")?;
+                decode_compressed_block(&data[pos..end], out, &mut ctx, limit)?;
+                pos = end;
             }
             _ => return Err("zstd: reserved block type".into()),
         }
@@ -1000,6 +1040,10 @@ fn decode_frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize,
 
 /// Decompress one or more concatenated Zstandard frames (skippable frames are skipped).
 pub fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    zstd_decompress_with_limit(data, crate::MAX_DECOMPRESSED_BYTES)
+}
+
+pub fn zstd_decompress_with_limit(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     if data.is_empty() {
         return Err("zstd: empty input".into());
     }
@@ -1017,16 +1061,16 @@ pub fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
             }
             let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            if pos + size > data.len() {
-                return Err("zstd: truncated skippable frame".into());
-            }
-            pos += size;
+            pos = pos
+                .checked_add(size)
+                .filter(|&end| end <= data.len())
+                .ok_or("zstd: truncated skippable frame")?;
             continue;
         }
         if magic != ZSTD_MAGIC {
             return Err("zstd: bad magic number".into());
         }
-        pos = decode_frame(data, pos, &mut out)?;
+        pos = decode_frame(data, pos, &mut out, limit)?;
     }
     Ok(out)
 }
@@ -1153,6 +1197,15 @@ mod tests {
             })
             .collect();
         roundtrip(&big);
+    }
+
+    #[test]
+    fn regenerated_output_and_window_are_byte_bounded() {
+        let input = b"zstd output limit".repeat(100);
+        let encoded = zstd_compress(&input);
+        assert!(zstd_decompress_with_limit(&encoded, input.len() - 1)
+            .unwrap_err()
+            .contains("byte limit"));
     }
 
     #[test]

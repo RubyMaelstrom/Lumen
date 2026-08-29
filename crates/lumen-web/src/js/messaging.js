@@ -52,33 +52,6 @@ class PromiseRejectionEvent extends Event {
   }
 }
 
-// Event-handler IDL attribute (`onmessage` and friends): the assigned function participates in
-// dispatch as a real listener, so handler + addEventListener fire in registration order.
-function defineEventHandler(proto, name, afterSet) {
-  const listeners = new WeakMap();
-  const handlers = new WeakMap();
-  Object.defineProperty(proto, `on${name}`, {
-    configurable: true,
-    get() {
-      return handlers.get(this) ?? null;
-    },
-    set(fn) {
-      const old = listeners.get(this);
-      if (old) this.removeEventListener(name, old);
-      if (typeof fn === "function") {
-        handlers.set(this, fn);
-        const wrapped = (e) => fn.call(this, e);
-        listeners.set(this, wrapped);
-        this.addEventListener(name, wrapped);
-      } else {
-        handlers.delete(this);
-        listeners.delete(this);
-      }
-      if (afterSet) afterSet(this);
-    },
-  });
-}
-
 const kPortCreate = Symbol("MessagePort-create");
 
 class MessagePort extends EventTarget {
@@ -92,14 +65,10 @@ class MessagePort extends EventTarget {
   }
   postMessage(message, options) {
     if (this._closed) return;
-    const transfer = Array.isArray(options)
-      ? options
-      : options && typeof options === "object" && options.transfer
-        ? options.transfer
-        : [];
+    const transfer = postMessageTransferList(options);
     // Serialize NOW (spec order — later mutations of `message` are invisible to the receiver);
     // a DataCloneError propagates to the caller.
-    const data = transfer.length ? structuredClone(message, { transfer }) : structuredClone(message);
+    const data = structuredClone(message, { transfer });
     const target = this._other;
     if (!target || target._closed) return;
     setTimeout(() => target._deliver(data), 0);

@@ -77,6 +77,17 @@ struct WorkerEntry {
     inbox_task: Option<TaskId>,
 }
 
+impl Drop for WorkerRegistry {
+    fn drop(&mut self) {
+        for worker in self.workers.values_mut() {
+            worker.parent_terminated = true;
+            worker.stop.store(true, Ordering::Release);
+            worker.interrupt.cancel();
+            worker.to_worker.take();
+        }
+    }
+}
+
 fn registry(ctx: &mut Ctx) -> &mut WorkerRegistry {
     ctx.host_mut::<WorkerRegistry>()
         .expect("worker registry installed")
@@ -629,10 +640,10 @@ const WORKER_JS: &str = r#"
       if (path.startsWith("file://")) path = path.slice(7);
       this.#id = __worker.spawn(path, isModule, (kind, ...args) => this.#onEvent(kind, args)).id;
     }
-    postMessage(message, _transfer) {
+    postMessage(message, transferOrOptions) {
       if (this.#terminated) return;
       let bytes;
-      try { bytes = serialize(message); }
+      try { bytes = serialize(message, transferOrOptions); }
       catch (e) { throw e; } // DataCloneError surfaces to the caller
       __worker.post(this.#id, bytes);
     }
@@ -641,9 +652,7 @@ const WORKER_JS: &str = r#"
       this.#terminated = true;
       __worker.terminate(this.#id);
     }
-    #fire(type, event) {
-      const h = this["on" + type];
-      if (typeof h === "function") { try { h.call(this, event); } catch (e) { reportError(e); } }
+    #fire(_type, event) {
       this.dispatchEvent(event);
     }
     #onEvent(kind, args) {
@@ -663,8 +672,30 @@ const WORKER_JS: &str = r#"
     }
   }
   for (const name of ["message", "messageerror", "error"]) {
+    const handlers = new WeakMap();
+    const listeners = new WeakMap();
     Object.defineProperty(Worker.prototype, "on" + name, {
-      configurable: true, enumerable: true, writable: true, value: null,
+      configurable: true,
+      enumerable: true,
+      get() { return handlers.get(this) ?? null; },
+      set(value) {
+        if (typeof value === "function") {
+          handlers.set(this, value);
+          if (!listeners.has(this)) {
+            const wrapped = (event) => {
+              const handler = handlers.get(this);
+              if (handler && handler.call(this, event) === false) event.preventDefault();
+            };
+            listeners.set(this, wrapped);
+            this.addEventListener(name, wrapped);
+          }
+        } else {
+          handlers.delete(this);
+          const wrapped = listeners.get(this);
+          if (wrapped) this.removeEventListener(name, wrapped);
+          listeners.delete(this);
+        }
+      },
     });
   }
   globalThis.Worker = Worker;
@@ -689,7 +720,9 @@ const WORKER_SCOPE_JS: &str = r#"
   globalThis.removeEventListener = target.removeEventListener.bind(target);
   globalThis.dispatchEvent = target.dispatchEvent.bind(target);
 
-  globalThis.postMessage = (message, _transfer) => { post(serialize(message)); };
+  globalThis.postMessage = (message, transferOrOptions) => {
+    post(serialize(message, transferOrOptions));
+  };
   globalThis.close = () => closeSelf();
   globalThis.onmessage = null;
   globalThis.onmessageerror = null;

@@ -7,8 +7,8 @@
 //!
 //! ## How it runs on the loop
 //! The engine is single-threaded and `!Send`, so the JS handler must run on the loop thread.
-//! We reuse the runtime's only async primitive — `spawn_blocking` + a `TaskRegistry`
-//! completion — with a **re-arm** pattern: one accept task runs on a pool thread, blocks in
+//! We use the runtime's dedicated blocking executor + a `TaskRegistry` completion with a
+//! **re-arm** pattern: one accept task runs on an isolated thread, blocks in
 //! `accept()`, reads+parses one request, and comes back to the loop as a completion. The
 //! completion decoder ([`decode_accept`]) hands the request to JS *and* arms the next accept,
 //! so the listener keeps running for the life of the process (an always-registered task is
@@ -17,7 +17,7 @@
 //!
 //! ## What's intentionally missing (v1 — cold-start / low-concurrency focus)
 //! - **Concurrency**: exactly one `accept()` is in flight at a time, and it holds one of the
-//!   pool's worker threads while blocked. Fine for cold-start latency and light load; a real
+//!   bounded dedicated-executor slot while blocked. Fine for cold-start latency and light load; a real
 //!   readiness reactor (epoll/kqueue) or a dedicated listener thread is future work and would
 //!   need raw syscalls (out of scope under the zero-dep policy) or a new host primitive.
 //! - **Keep-alive**: every response is `Connection: close`; one request per connection.
@@ -28,24 +28,22 @@
 //!   STOP-AND-FLAG as the client: TLS can't be built on std alone).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io::{BufReader, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use lumen_host::{Ctx, SpawnHandle, TaskRegistry, Value};
+use lumen_host::{CompletionSender, Ctx, SpawnHandle, TaskRegistry, Value};
 
-use crate::http::read_chunked;
+use crate::http_syntax::{
+    self, body_framing, field_value_bytes, header_values, read_body, read_fields, read_line,
+    MAX_BODY, MAX_HEADER_BYTES,
+};
 use crate::read_header_pairs;
 
 /// A slow or idle client must not pin a pool worker forever: bound the header/body read.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Request-line + headers size cap (a hostile client can't balloon the worker).
-const MAX_HEADER_BYTES: usize = 64 << 10;
-/// Request-body cap, matching the client's response cap in `http.rs`.
-const MAX_BODY: u64 = 32 << 20;
-
 /// Live servers, keyed by the id handed to JS. Lives in `OpState`; the accept decoder reads it
 /// to re-arm and the `close` op flips the `closed` flag. JS values (`dispatch`) are `!Send` and
 /// so only ever touched on the loop thread — never moved into a pool closure.
@@ -65,6 +63,15 @@ struct ServerEntry {
     dispatch: Value,
 }
 
+impl Drop for ServerRegistry {
+    fn drop(&mut self) {
+        for entry in self.servers.values() {
+            entry.closed.store(true, Ordering::Release);
+            wake_listener(entry.local_addr);
+        }
+    }
+}
+
 /// What one accept task sends back to the loop (all fields `Send`).
 struct AcceptTaskResult {
     server_id: u64,
@@ -76,6 +83,35 @@ enum AcceptOutcome {
     Request(Accepted),
     /// The listener was shut down (or `accept()` failed): stop serving this server.
     Closed,
+}
+
+#[derive(Debug)]
+struct RequestError {
+    status: u16,
+    reason: &'static str,
+    message: String,
+}
+
+impl RequestError {
+    fn new(status: u16, reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for RequestError {
+    fn from(message: String) -> Self {
+        Self::new(400, "Bad Request", message)
+    }
+}
+
+impl From<&str> for RequestError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
 }
 
 struct Accepted {
@@ -101,7 +137,9 @@ pub(crate) fn op_server_listen(
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
     let port = match args.get(1) {
-        Some(Value::Num(n)) if *n >= 0.0 && *n <= 65535.0 => *n as u16,
+        Some(Value::Num(n)) if n.is_finite() && n.fract() == 0.0 && (0.0..=65535.0).contains(n) => {
+            *n as u16
+        }
         _ => return Err(ctx.make_error("TypeError", "listen: port must be 0..=65535")),
     };
     let dispatch = match args.get(2) {
@@ -143,7 +181,8 @@ pub(crate) fn op_server_listen(
     ]))
 }
 
-/// `__http_server.respond(connId, status, statusText, headers, body, resolve, reject)`.
+/// `__http_server.respond(connId, status, statusText, headers, body, requestMethod, resolve,
+/// reject)`.
 /// Serializes the response and writes it on the pool; the promise settles when the write
 /// finishes (or the client hung up). The socket is taken out of the resource table here, so a
 /// second respond on the same connection rejects.
@@ -157,8 +196,10 @@ pub(crate) fn op_server_respond(
         _ => return Err(ctx.make_error("TypeError", "respond: bad connection id")),
     };
     let status = match args.get(1) {
-        Some(Value::Num(n)) if *n >= 100.0 && *n <= 599.0 => *n as u16,
-        _ => return Err(ctx.make_error("TypeError", "respond: status must be 100..=599")),
+        Some(Value::Num(n)) if n.is_finite() && n.fract() == 0.0 && (200.0..=599.0).contains(n) => {
+            *n as u16
+        }
+        _ => return Err(ctx.make_error("TypeError", "respond: status must be 200..=599")),
     };
     let status_text = ctx
         .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
@@ -168,7 +209,13 @@ pub(crate) fn op_server_respond(
         None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
         Some(v) => ctx.typed_array_bytes(v).unwrap_or_default(),
     };
-    let (resolve, reject) = match (args.get(5), args.get(6)) {
+    if body.len() as u64 > MAX_BODY {
+        return Err(ctx.make_error("RangeError", "respond: body exceeds 32 MiB limit"));
+    }
+    let request_method = ctx
+        .coerce_string(args.get(5).unwrap_or(&Value::Undefined))?
+        .to_string();
+    let (resolve, reject) = match (args.get(6), args.get(7)) {
         (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
             (res.clone(), rej.clone())
         }
@@ -189,7 +236,8 @@ pub(crate) fn op_server_respond(
         ));
     };
 
-    let bytes = build_response(status, &status_text, &headers, &body);
+    let bytes = build_response(status, &status_text, &headers, &body, &request_method)
+        .map_err(|error| ctx.make_error("TypeError", format!("respond: {error}")))?;
 
     let id = ctx
         .host_mut::<TaskRegistry>()
@@ -220,14 +268,23 @@ pub(crate) fn op_server_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
         closed.store(true, Ordering::SeqCst);
         // Connect to a concrete loopback address when bound to the wildcard, so the wake
         // actually reaches our listener.
-        let wake_addr = if local_addr.ip().is_unspecified() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_addr.port())
-        } else {
-            local_addr
-        };
-        let _ = TcpStream::connect(wake_addr);
+        wake_listener(local_addr);
     }
     Ok(Value::Undefined)
+}
+
+fn wake_listener(local_addr: SocketAddr) {
+    let wake_addr = if local_addr.ip().is_unspecified() {
+        let ip = if local_addr.is_ipv6() {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        };
+        SocketAddr::new(ip, local_addr.port())
+    } else {
+        local_addr
+    };
+    let _ = TcpStream::connect(wake_addr);
 }
 
 /// `__http_server.version()` -> the runtime version string (backs `Lumen.version`).
@@ -337,11 +394,11 @@ fn arm_accept(
         .register(dispatch, None, decode_accept);
     let spawn = ctx
         .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
+        .get::<CompletionSender>()
+        .expect("runtime installs the dedicated executor")
         .clone();
     let fallback_host = local_addr.to_string();
-    spawn.spawn_blocking(id, move || {
+    spawn.run_blocking(id, move || {
         Box::new(AcceptTaskResult {
             server_id,
             outcome: accept_one(&listener, &closed, &fallback_host),
@@ -372,8 +429,13 @@ fn accept_one(listener: &TcpListener, closed: &AtomicBool, fallback_host: &str) 
                     body,
                 })
             }
-            Err(msg) => {
-                let _ = write_simple(&stream, 400, "Bad Request", msg.as_bytes());
+            Err(error) => {
+                let _ = write_simple(
+                    &stream,
+                    error.status,
+                    error.reason,
+                    error.message.as_bytes(),
+                );
                 // Keep serving: fall through to accept the next connection.
             }
         }
@@ -386,81 +448,125 @@ fn accept_one(listener: &TcpListener, closed: &AtomicBool, fallback_host: &str) 
 fn read_request(
     stream: &TcpStream,
     fallback_host: &str,
-) -> Result<(String, String, Vec<(String, String)>, Vec<u8>), String> {
+) -> Result<(String, String, Vec<(String, String)>, Vec<u8>), RequestError> {
     let mut reader = BufReader::new(stream);
+    let mut metadata = 0;
+    // RFC 9112 §2.2 recommends ignoring at least one empty line before a request-line.
+    let request_line = loop {
+        let line = read_line(&mut reader, &mut metadata, MAX_HEADER_BYTES)?;
+        if !line.is_empty() {
+            break line;
+        }
+    };
+    let (method, target, version) = parse_request_line(&request_line)?;
+    let headers = read_fields(&mut reader, &mut metadata, false)?;
 
-    let mut request_line = String::new();
-    let n = reader
-        .read_line(&mut request_line)
-        .map_err(|e| format!("read request line: {e}"))?;
-    if n == 0 {
-        return Err("empty request".to_string());
+    let hosts: Vec<_> = header_values(&headers, "host").collect();
+    if (version == "HTTP/1.1" && hosts.len() != 1) || hosts.len() > 1 {
+        return Err("HTTP/1.1 requires exactly one Host field".into());
     }
-    let mut parts = request_line.trim_end().split(' ');
-    let method = parts.next().unwrap_or("").to_string();
-    let target = parts.next().unwrap_or("/").to_string();
-    if method.is_empty() {
-        return Err("malformed request line".to_string());
-    }
-
-    let mut headers = Vec::new();
-    let mut header_bytes = request_line.len();
-    loop {
-        let mut line = String::new();
-        let hn = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read headers: {e}"))?;
-        if hn == 0 {
-            break; // EOF before the blank line: tolerate it
-        }
-        header_bytes += hn;
-        if header_bytes > MAX_HEADER_BYTES {
-            return Err("request headers too large".to_string());
-        }
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        if let Some(i) = line.find(':') {
-            headers.push((line[..i].to_string(), line[i + 1..].trim().to_string()));
-        }
+    let host = hosts
+        .first()
+        .copied()
+        .filter(|value| valid_host(value))
+        .unwrap_or(fallback_host);
+    if version == "HTTP/1.1" && hosts.first().is_none_or(|value| !valid_host(value)) {
+        return Err("invalid Host field".into());
     }
 
-    let host = header(&headers, "host").unwrap_or_else(|| fallback_host.to_string());
+    if target.contains('#') {
+        return Err("request-target must not contain a fragment".into());
+    }
     let url = if target.starts_with("http://") || target.starts_with("https://") {
-        target // absolute-form (proxy requests)
+        // RFC 9112 §3.2.2: absolute-form authority overrides Host.
+        let absolute = crate::url::parse(&target, None)?;
+        if !absolute.username.is_empty() || !absolute.password.is_empty() {
+            return Err("absolute-form request-target contains userinfo".into());
+        }
+        absolute.href()
     } else if target.starts_with('/') {
         format!("http://{host}{target}")
+    } else if target == "*" && method == "OPTIONS" {
+        format!("http://{host}/")
+    } else if method == "CONNECT" && valid_host(&target) {
+        format!("http://{target}/")
     } else {
-        // authority-form (CONNECT) or asterisk-form: not meaningfully routable; give a URL the
-        // Request constructor still accepts.
-        format!("http://{host}/{target}")
+        return Err("invalid request-target form".into());
     };
 
-    let body = read_request_body(&mut reader, &headers, &method)?;
-    Ok((method.to_ascii_uppercase(), url, headers, body))
+    let framing = body_framing(&headers, true, false)?;
+    if matches!(framing, http_syntax::BodyFraming::Length(length) if length > MAX_BODY) {
+        return Err(RequestError::new(
+            413,
+            "Content Too Large",
+            "HTTP body too large",
+        ));
+    }
+
+    let expectations: Vec<_> = header_values(&headers, "expect")
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if expectations
+        .iter()
+        .any(|expectation| !expectation.eq_ignore_ascii_case("100-continue"))
+    {
+        return Err(RequestError::new(
+            417,
+            "Expectation Failed",
+            "unsupported HTTP expectation",
+        ));
+    }
+    let content_follows = !matches!(
+        framing,
+        http_syntax::BodyFraming::None | http_syntax::BodyFraming::Length(0)
+    );
+    if version == "HTTP/1.1" && !expectations.is_empty() && content_follows {
+        // RFC 9110 §10.1.1: an origin server must answer the expectation before waiting for the
+        // content. All header-only errors and known size violations have already been handled.
+        let mut writer = stream;
+        writer
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .map_err(|error| format!("write 100 Continue: {error}"))?;
+    }
+    let body = read_body(&mut reader, framing).map_err(|message| {
+        if message == "HTTP body too large" {
+            RequestError::new(413, "Content Too Large", message)
+        } else {
+            RequestError::from(message)
+        }
+    })?;
+    Ok((method, url, headers, body))
 }
 
-fn read_request_body(
-    reader: &mut impl BufRead,
-    headers: &[(String, String)],
-    method: &str,
-) -> Result<Vec<u8>, String> {
-    if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
-        return Ok(Vec::new());
+fn parse_request_line(line: &[u8]) -> Result<(String, String, String), String> {
+    if !line.is_ascii() {
+        return Err("non-ASCII request-line".into());
     }
-    if header(headers, "transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
-        return read_chunked(reader).map_err(|e| format!("chunked body: {e}"));
+    let line = std::str::from_utf8(line).unwrap();
+    let mut parts = line.split(' ');
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || !http_syntax::is_token(method)
+        || target.is_empty()
+        || target
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+    {
+        return Err("malformed HTTP request-line".into());
     }
-    match header(headers, "content-length").and_then(|v| v.parse::<u64>().ok()) {
-        Some(len) => {
-            let mut body = vec![0u8; len.min(MAX_BODY) as usize];
-            std::io::Read::read_exact(reader, &mut body).map_err(|e| format!("read body: {e}"))?;
-            Ok(body)
-        }
-        // No framing on a request means no body (unlike a response, there is no read-to-EOF).
-        None => Ok(Vec::new()),
-    }
+    Ok((method.to_string(), target.to_string(), version.to_string()))
+}
+
+fn valid_host(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(['/', '\\', '@', ',', ' ', '\t'])
+        && !value.chars().any(char::is_control)
+        && crate::url::parse(&format!("http://{value}/"), None).is_ok()
 }
 
 /// Serialize a response. We own `Connection`/`Transfer-Encoding` and add `Content-Length` and a
@@ -471,26 +577,47 @@ fn build_response(
     status_text: &str,
     headers: &[(String, String)],
     body: &[u8],
-) -> Vec<u8> {
+    request_method: &str,
+) -> Result<Vec<u8>, String> {
+    http_syntax::validate_headers(headers)?;
+    if status_text.chars().any(|character| {
+        character == '\r'
+            || character == '\n'
+            || character == '\0'
+            || character > '\u{ff}'
+            || character.is_control() && character != '\t'
+    }) {
+        return Err("invalid HTTP reason phrase".into());
+    }
     let reason = if status_text.is_empty() {
         reason_phrase(status)
     } else {
         status_text
     };
     let mut out = Vec::with_capacity(body.len() + 256);
-    out.extend_from_slice(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes());
+    out.extend_from_slice(format!("HTTP/1.1 {status} ").as_bytes());
+    out.extend_from_slice(&field_value_bytes(reason)?);
+    out.extend_from_slice(b"\r\n");
 
-    let (mut has_content_length, mut has_server) = (false, false);
+    let mut has_server = false;
     for (k, v) in headers {
-        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("transfer-encoding") {
+        if k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("transfer-encoding")
+            || k.eq_ignore_ascii_case("content-length")
+        {
             continue; // we own connection framing
         }
-        has_content_length |= k.eq_ignore_ascii_case("content-length");
         has_server |= k.eq_ignore_ascii_case("server");
-        out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(&field_value_bytes(v)?);
+        out.extend_from_slice(b"\r\n");
     }
-    if !has_content_length {
-        out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    let head_response = request_method == "HEAD";
+    let null_body_status = matches!(status, 204 | 304);
+    if !null_body_status {
+        let content_length = if status == 205 { 0 } else { body.len() };
+        out.extend_from_slice(format!("Content-Length: {content_length}\r\n").as_bytes());
     }
     if !has_server {
         out.extend_from_slice(
@@ -498,8 +625,13 @@ fn build_response(
         );
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
-    out.extend_from_slice(body);
-    out
+    if out.len() > MAX_HEADER_BYTES {
+        return Err("HTTP response metadata too large".into());
+    }
+    if !head_response && !matches!(status, 204 | 205 | 304) {
+        out.extend_from_slice(body);
+    }
+    Ok(out)
 }
 
 /// A bare status-only response used for the inline 400 path.
@@ -512,7 +644,7 @@ fn write_simple(stream: &TcpStream, status: u16, reason: &str, body: &[u8]) -> s
     s.write_all(head.as_bytes())?;
     s.write_all(body)?;
     s.flush()?;
-    let _ = stream.shutdown(Shutdown::Both);
+    let _ = stream.shutdown(Shutdown::Write);
     Ok(())
 }
 
@@ -521,15 +653,8 @@ fn write_all_and_close(stream: TcpStream, bytes: &[u8]) -> Result<(), String> {
     s.write_all(bytes)
         .map_err(|e| format!("response write: {e}"))?;
     s.flush().ok();
-    let _ = stream.shutdown(Shutdown::Both);
+    let _ = stream.shutdown(Shutdown::Write);
     Ok(())
-}
-
-fn header(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
 }
 
 fn header_pairs_to_js(ctx: &Ctx, headers: &[(String, String)]) -> Value {
@@ -573,5 +698,116 @@ fn reason_phrase(status: u16) -> &'static str {
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::thread;
+
+    fn parse_raw_request(
+        raw: &[u8],
+    ) -> Result<(String, String, Vec<(String, String)>, Vec<u8>), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let raw = raw.to_vec();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(&raw).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let result = read_request(&stream, "fallback.invalid").map_err(|error| error.message);
+        client.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn server_reads_framed_bodies_independently_of_method() {
+        let (method, url, _, body) = parse_raw_request(
+            b"GET /resource HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\n\r\ndata",
+        )
+        .unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(url, "http://example.test/resource");
+        assert_eq!(body, b"data");
+    }
+
+    #[test]
+    fn server_answers_100_continue_before_waiting_for_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .write_all(
+                    b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n",
+                )
+                .unwrap();
+            let mut interim = [0; 25];
+            stream.read_exact(&mut interim).unwrap();
+            assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+            stream.write_all(b"data").unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let (_, _, _, body) = read_request(&stream, "fallback.invalid").unwrap();
+        client.join().unwrap();
+        assert_eq!(body, b"data");
+    }
+
+    #[test]
+    fn server_rejects_ambiguous_framing_and_invalid_host_fields() {
+        for raw in [
+            &b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx"[..],
+            &b"POST / HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n0\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: one.test\r\nHost: two.test\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: bad/path\r\n\r\n"[..],
+        ] {
+            assert!(parse_raw_request(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn response_serialization_owns_framing_and_obeys_null_body_rules() {
+        let caller_headers = vec![
+            ("Content-Length".into(), "999".into()),
+            ("Transfer-Encoding".into(), "chunked".into()),
+            ("Connection".into(), "keep-alive".into()),
+            ("X-Test".into(), "yes".into()),
+        ];
+        let head = build_response(200, "", &caller_headers, b"body", "HEAD").unwrap();
+        let head = String::from_utf8(head).unwrap();
+        assert!(head.contains("Content-Length: 4\r\n"));
+        assert!(head.contains("Connection: close\r\n"));
+        assert!(head.contains("X-Test: yes\r\n"));
+        assert!(!head.ends_with("body"));
+        assert!(!head.contains("Transfer-Encoding:"));
+        assert!(!head.contains("Content-Length: 999"));
+
+        let no_content = build_response(204, "", &[], b"ignored", "GET").unwrap();
+        let no_content = String::from_utf8(no_content).unwrap();
+        assert!(!no_content.contains("Content-Length:"));
+        assert!(!no_content.ends_with("ignored"));
+
+        let reset = build_response(205, "", &[], b"ignored", "GET").unwrap();
+        let reset = String::from_utf8(reset).unwrap();
+        assert!(reset.contains("Content-Length: 0\r\n"));
+        assert!(!reset.ends_with("ignored"));
+    }
+
+    #[test]
+    fn response_serialization_rejects_injection_and_oversized_metadata() {
+        assert!(build_response(200, "ok\r\ninjected", &[], b"", "GET").is_err());
+        assert!(build_response(
+            200,
+            "",
+            &[("X-Test".into(), "x".repeat(MAX_HEADER_BYTES))],
+            b"",
+            "GET"
+        )
+        .is_err());
     }
 }

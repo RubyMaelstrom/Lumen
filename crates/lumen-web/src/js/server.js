@@ -40,10 +40,7 @@ async function __dispatch(serverId, connId, method, url, headerPairs, bodyBytes,
   let response;
   let conn;
   try {
-    const init = { method, headers: headerPairs };
-    // The Request constructor rejects a body on GET/HEAD; only attach one otherwise.
-    if (method !== "GET" && method !== "HEAD" && bodyBytes !== undefined) init.body = bodyBytes;
-    const request = new Request(url, init);
+    const request = createIncomingRequest(method, url, headerPairs, bodyBytes);
     conn = { connId, upgraded: false, remoteAddress: remoteHost };
     request[__conn] = conn;
     const info = { remoteAddr: { transport: "tcp", hostname: remoteHost, port: remotePort } };
@@ -78,7 +75,16 @@ async function __dispatch(serverId, connId, method, url, headerPairs, bodyBytes,
   // Resolve/reject settle when the socket write finishes; a write failure means the client hung
   // up, which is not actionable here.
   await new Promise((resolve, reject) => {
-    __http_server.respond(connId, response.status, response.statusText, headerPairsOut, bodyOut, resolve, reject);
+    __http_server.respond(
+      connId,
+      response.status,
+      response.statusText,
+      headerPairsOut,
+      bodyOut,
+      method,
+      resolve,
+      reject,
+    );
   }).catch(() => {});
 }
 
@@ -98,9 +104,32 @@ function upgradeWebSocket(request, options = {}) {
     throw new TypeError("upgradeWebSocket: the request was not delivered by Lumen.serve");
   }
   if (conn.upgraded) throw new Error("upgradeWebSocket: connection already upgraded");
+  const hasToken = (value, token) => value !== null && value
+    .split(",")
+    .some((part) => part.trim().toLowerCase() === token);
   const upgrade = request.headers.get("upgrade");
+  const connection = request.headers.get("connection");
+  const version = request.headers.get("sec-websocket-version");
   const key = request.headers.get("sec-websocket-key");
-  if (!upgrade || upgrade.toLowerCase() !== "websocket" || !key) return null;
+  let keyIsValid = false;
+  if (key !== null) {
+    try {
+      const decoded = atob(key);
+      keyIsValid = decoded.length === 16 && btoa(decoded) === key;
+    } catch {}
+  }
+  if (request.method !== "GET" || !hasToken(upgrade, "websocket") ||
+      !hasToken(connection, "upgrade") || version !== "13" || !keyIsValid) return null;
+
+  const protocol = String(options.protocol || "");
+  if (protocol !== "") {
+    const offered = (request.headers.get("sec-websocket-protocol") || "")
+      .split(",")
+      .map((value) => value.trim());
+    if (!offered.includes(protocol)) {
+      throw new TypeError("upgradeWebSocket: selected protocol was not offered by the client");
+    }
+  }
 
   // Extra response headers: Headers | plain object | [name, value] pairs.
   const pairs = [];
@@ -122,11 +151,11 @@ function upgradeWebSocket(request, options = {}) {
     closed = true;
     if (typeof handle.onclose === "function") handle.onclose(code, reason, wasClean);
   };
-  const id = __ws.upgrade(conn.connId, key, String(options.protocol || ""), pairs, (kind, a, b) => {
+  const id = __ws.upgrade(conn.connId, key, protocol, pairs, (kind, a, b, c) => {
     if (kind === "text" || kind === "binary") {
       if (typeof handle.onmessage === "function") handle.onmessage(a, kind === "binary");
     } else if (kind === "close") {
-      fireClose(a, b, true);
+      fireClose(a, b, c);
     } else if (kind === "fail") {
       fireClose(a, String(b), false);
     } else if (kind === "io") {

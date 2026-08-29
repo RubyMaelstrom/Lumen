@@ -2,23 +2,27 @@
 
 use super::*;
 
-/// WeakRef / FinalizationRegistry. lumen's collector never observably reclaims during a test, so
-/// WeakRef holds its target (deref always returns it) and FinalizationRegistry callbacks never fire.
+/// WeakRef / FinalizationRegistry (ECMA-262 §9.9–9.13 and §26.1–26.2). Targets and unregister
+/// tokens are real weak handles; held values and cleanup callbacks remain strong edges of a live
+/// registry, and successful dereferences enter the Agent's kept-alive list for the current job.
 pub(super) fn install_weak_refs(it: &mut Interp) {
     let wr_proto = Object::new(Some(it.object_proto.clone()));
     it.def_method(&wr_proto, "deref", 0, |i, this, _| {
-        if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("\u{0}weakref-target")) {
+        let Some(ptr) = map_ptr(&this).filter(|ptr| i.weak_refs.contains_key(ptr)) else {
             return Err(i.make_error("TypeError", "deref called on a non-WeakRef"));
+        };
+        let target = i
+            .weak_refs
+            .get(&ptr)
+            .and_then(Option::as_ref)
+            .and_then(crate::interpreter::WeakTarget::upgrade);
+        if let Some(target) = target {
+            // WeakRefDeref -> AddToKeptObjects. The host clears this at the next job boundary.
+            i.kept_alive.push(target.clone());
+            Ok(target)
+        } else {
+            Ok(Value::Undefined)
         }
-        Ok(this
-            .as_obj()
-            .and_then(|o| {
-                o.borrow()
-                    .props
-                    .get("\u{0}weakref-target")
-                    .map(|p| p.value())
-            })
-            .unwrap_or(Value::Undefined))
     });
     let wr_ctor = it.make_native("WeakRef", 1, |i, _t, a| {
         if !i.constructing {
@@ -29,8 +33,16 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             return Err(i.make_error("TypeError", "WeakRef target must be an object or symbol"));
         }
         let obj = new_from_ctor(i, "WeakRef")?;
-        // The key is \0-prefixed so it is invisible to every own-property enumeration path.
-        set_internal(&obj, "\u{0}weakref-target", target);
+        let ptr = Rc::as_ptr(&obj) as usize;
+        i.gc_pin(&obj);
+        i.kept_alive.push(target.clone());
+        i.weak_refs.insert(
+            ptr,
+            Some(
+                crate::interpreter::WeakTarget::of(&target)
+                    .expect("CanBeHeldWeakly accepted the WeakRef target"),
+            ),
+        );
         Ok(Value::Obj(obj))
     });
     it.extra_protos.insert("WeakRef", wr_proto.clone());
@@ -54,9 +66,10 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
     it.def_method(&fr_proto, "register", 2, |i, this, a| {
         // Brand check, then: target must be registerable, distinct from its held value, and any
         // unregister token must itself be registerable.
-        if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("\u{0}fr")) {
+        let Some(ptr) = map_ptr(&this).filter(|ptr| i.finalization_registries.contains_key(ptr))
+        else {
             return Err(i.make_error("TypeError", "register called on a non-FinalizationRegistry"));
-        }
+        };
         let target = arg(a, 0);
         if !can_be_held_weakly(i, &target) {
             return Err(i.make_error("TypeError", "target cannot be held weakly"));
@@ -68,38 +81,45 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         if !matches!(token, Value::Undefined) && !can_be_held_weakly(i, &token) {
             return Err(i.make_error("TypeError", "unregister token cannot be held weakly"));
         }
-        // Track the registration so unregister can report whether anything matched. (Cleanup
-        // callbacks never fire — nothing is collected during a run — but the cell bookkeeping
-        // is still observable.)
-        if !matches!(token, Value::Undefined) {
-            if let Value::Obj(o) = &this {
-                i.fr_tokens
-                    .entry(Rc::as_ptr(o) as usize)
-                    .or_default()
-                    .push(token);
-            }
-        }
+        let state = i
+            .finalization_registries
+            .get_mut(&ptr)
+            .expect("brand check found FinalizationRegistry state");
+        state.cells.push(crate::interpreter::FinalizationCell {
+            target: crate::interpreter::WeakTarget::of(&target),
+            held_value: arg(a, 1),
+            unregister_token: (!matches!(token, Value::Undefined))
+                .then(|| crate::interpreter::WeakTarget::of(&token))
+                .flatten(),
+        });
         Ok(Value::Undefined)
     });
     it.def_method(&fr_proto, "unregister", 1, |i, this, a| {
-        if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("\u{0}fr")) {
+        let Some(ptr) = map_ptr(&this).filter(|ptr| i.finalization_registries.contains_key(ptr))
+        else {
             return Err(i.make_error(
                 "TypeError",
                 "unregister called on a non-FinalizationRegistry",
             ));
-        }
+        };
         let token = arg(a, 0);
         if !can_be_held_weakly(i, &token) {
             return Err(i.make_error("TypeError", "unregister token cannot be held weakly"));
         }
-        let mut removed = false;
-        if let Value::Obj(o) = &this {
-            if let Some(tokens) = i.fr_tokens.get_mut(&(Rc::as_ptr(o) as usize)) {
-                let before = tokens.len();
-                tokens.retain(|t| !same_value(t, &token));
-                removed = tokens.len() != before;
-            }
-        }
+        let cells = &mut i
+            .finalization_registries
+            .get_mut(&ptr)
+            .expect("brand check found FinalizationRegistry state")
+            .cells;
+        let before = cells.len();
+        cells.retain(|cell| {
+            !cell
+                .unregister_token
+                .as_ref()
+                .and_then(crate::interpreter::WeakTarget::upgrade)
+                .is_some_and(|registered| same_value(&registered, &token))
+        });
+        let removed = cells.len() != before;
         Ok(Value::Bool(removed))
     });
     let fr_ctor = it.make_native("FinalizationRegistry", 1, |i, _t, a| {
@@ -110,7 +130,16 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             return Err(i.make_error("TypeError", "cleanup callback must be callable"));
         }
         let obj = new_from_ctor(i, "FinalizationRegistry")?;
-        set_internal(&obj, "\u{0}fr", Value::Bool(true));
+        let ptr = Rc::as_ptr(&obj) as usize;
+        i.gc_pin(&obj);
+        i.finalization_registries.insert(
+            ptr,
+            crate::interpreter::FinalizationState {
+                cleanup_callback: arg(a, 0),
+                cells: Vec::new(),
+                cleanup_scheduled: false,
+            },
+        );
         Ok(Value::Obj(obj))
     });
     it.extra_protos

@@ -60,6 +60,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
             let p = Rc::as_ptr(&o) as usize;
             // Truly detach: drop the backing store (so views see it as detached) and zero the views.
             i.array_buffers.remove(&p);
+            i.array_buffer_dirty_ranges.remove(&p);
             let views: Vec<usize> = i
                 .typed_arrays
                 .iter()
@@ -127,7 +128,8 @@ fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, vec![0u8; len]); // length placeholder; bytes live in the registry
+    i.array_buffers
+        .insert(p, Rc::new(RefCell::new(vec![0u8; len]))); // length placeholder
     set_internal(&obj, "__abMaxByteLength", Value::Num(len as f64));
     set_internal(&obj, "__abResizable", Value::Bool(false));
     set_internal(&obj, "__sab_id", Value::Num(id as f64));
@@ -179,7 +181,11 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
             .shared_buffers
             .get(&p)
             .ok_or_else(|| i.make_error("TypeError", "broadcast requires a SharedArrayBuffer"))?;
-        let len = i.array_buffers.get(&p).map(|b| b.len()).unwrap_or(0);
+        let len = i
+            .array_buffers
+            .get(&p)
+            .map(|b| b.borrow().len())
+            .unwrap_or(0);
         if let Some(ag) = &i.agent {
             for tx in &ag.agent_broadcast_txs {
                 let _ = tx.send((id, len));

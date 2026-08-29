@@ -1,4 +1,4 @@
-//! `Intl.NumberFormat` (standard notation; decimal/percent/currency/unit; English grouping).
+//! `Intl.NumberFormat` with ECMA-402 rounding and generated CLDR 48 locale data.
 
 use super::service::{
     brand_slot, get_option, install_supported_locales, instance_proto, read_locale_matcher,
@@ -53,12 +53,22 @@ fn format_range(i: &mut Interp, this: &Value, x: &Value, y: &Value) -> Result<Va
     let (o, a, b) = range_endpoints(i, this, x, y)?;
     let sa = assemble_number_exact(i, &o, a, exact_of(x));
     let sb = assemble_number_exact(i, &o, b, exact_of(y));
+    let nu = get_str(&o, "__nf_nu");
     // Endpoints that FORMAT identically collapse to a single approximate value.
     if sa == sb {
-        return Ok(Value::from_string(format!("~{sa}")));
+        return Ok(Value::from_string(format!(
+            "{}{}",
+            cldr_number_symbols(&o).approximately,
+            xlate_digits(&sa, &nu)
+        )));
     }
     let (start, sep, end) = range_join(&o, &sa, &sb);
-    Ok(Value::from_string(format!("{start}{sep}{end}")))
+    Ok(Value::from_string(format!(
+        "{}{}{}",
+        xlate_digits(&start, &nu),
+        sep,
+        xlate_digits(&end, &nu)
+    )))
 }
 
 /// The locale's range join: separator plus the ICU affix-collapsing rules (a prefix-sign start
@@ -104,13 +114,16 @@ fn format_range_to_parts(
 ) -> Result<Value, Value> {
     let (o, a, b) = range_endpoints(i, this, x, y)?;
     let stype = suffix_type_of(&o);
-    let (dec, grp) = loc_seps(&o);
-    let nan = loc_nan(&o);
+    let symbols = cldr_number_symbols(&o);
+    let nu = get_str(&o, "__nf_nu");
     let mut out: Vec<Value> = Vec::new();
     let push_parts = |i: &mut Interp, whole: &str, source: &str, out: &mut Vec<Value>| {
-        for (t, v) in decompose_parts(whole, &stype, dec, grp, nan) {
+        for (t, mut v) in decompose_parts(whole, &stype, &symbols) {
             let ob = i.new_object();
             set_data(&ob, "type", Value::str(t));
+            if matches!(t, "integer" | "fraction" | "exponentInteger") {
+                v = xlate_digits(&v, &nu);
+            }
             set_data(&ob, "value", Value::from_string(v));
             set_data(&ob, "source", Value::str(source));
             out.push(Value::Obj(ob));
@@ -121,7 +134,11 @@ fn format_range_to_parts(
     if sa == sb {
         let approx = i.new_object();
         set_data(&approx, "type", Value::str("approximatelySign"));
-        set_data(&approx, "value", Value::str("~"));
+        set_data(
+            &approx,
+            "value",
+            Value::str(cldr_number_symbols(&o).approximately),
+        );
         set_data(&approx, "source", Value::str("shared"));
         out.push(Value::Obj(approx));
         push_parts(i, &sa, "shared", &mut out);
@@ -175,18 +192,18 @@ pub(crate) fn bind_this(i: &mut Interp, target: Value, this_arg: Value) -> Value
     target
 }
 
-struct DigitOpts {
-    min_int: u32,
-    min_frac: u32,
-    max_frac: u32,
-    min_sig: Option<u32>,
-    max_sig: Option<u32>,
+pub(super) struct DigitOpts {
+    pub(super) min_int: u32,
+    pub(super) min_frac: u32,
+    pub(super) max_frac: u32,
+    pub(super) min_sig: Option<u32>,
+    pub(super) max_sig: Option<u32>,
     /// "significant" | "fraction" | "morePrecision" | "lessPrecision".
-    rounding_type: &'static str,
+    pub(super) rounding_type: &'static str,
 }
 
 /// The raw significant/fraction-digit options, read in spec order before the rounding options.
-struct RawDigits {
+pub(super) struct RawDigits {
     min_int: u32,
     mnfd: Option<u32>,
     mxfd: Option<u32>,
@@ -439,18 +456,13 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
 
 /// The CLDR default fraction-digit count for a currency (ISO 4217 minor units).
 fn currency_fraction_digits(code: &str) -> u32 {
-    match code {
-        "JPY" | "KRW" | "CLP" | "ISK" | "HUF" | "VND" | "TWD" | "UGX" | "XOF" | "XAF" | "XPF"
-        | "PYG" | "RWF" | "DJF" | "GNF" | "KMF" | "VUV" => 0,
-        "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => 3,
-        _ => 2,
-    }
+    crate::cldr_numbers::currency_digits(code)
 }
 
 /// SetNumberFormatDigitOptions, phase 1: read the raw digit options (spec order: minInt, minFrac,
 /// maxFrac, minSig, maxSig). The rounding options are read by the caller afterwards; interpretation
 /// happens in `interpret_digits` once the rounding priority is known.
-fn read_raw_digits(i: &mut Interp, options: &Value) -> Result<RawDigits, Value> {
+pub(super) fn read_raw_digits(i: &mut Interp, options: &Value) -> Result<RawDigits, Value> {
     let min_int = read_range(i, options, "minimumIntegerDigits", 1, 21, 1)?;
     let mnfd = read_range_opt(i, options, "minimumFractionDigits", 0, 100)?;
     let mxfd = read_range_opt(i, options, "maximumFractionDigits", 0, 100)?;
@@ -467,7 +479,7 @@ fn read_raw_digits(i: &mut Interp, options: &Value) -> Result<RawDigits, Value> 
 
 /// SetNumberFormatDigitOptions, phase 2: derive the effective digit bounds and rounding type from the
 /// raw options, the style/notation defaults, and the rounding priority.
-fn interpret_digits(
+pub(super) fn interpret_digits(
     i: &mut Interp,
     raw: &RawDigits,
     style: &str,
@@ -661,6 +673,34 @@ fn get_str(o: &Gc, k: &str) -> String {
         _ => String::new(),
     }
 }
+
+fn cldr_number_locale(o: &Gc) -> &'static str {
+    let locale = get_str(o, "__nf_locale");
+    let mut parts = locale.split('-');
+    let lang = parts.next().unwrap_or("en");
+    let mut script = "";
+    let mut region = "";
+    for part in parts {
+        if script.is_empty()
+            && part.len() == 4
+            && part.as_bytes()[0].is_ascii_uppercase()
+            && part.as_bytes()[1..].iter().all(u8::is_ascii_lowercase)
+        {
+            script = part;
+        } else if region.is_empty()
+            && ((part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_uppercase()))
+                || (part.len() == 3 && part.bytes().all(|byte| byte.is_ascii_digit())))
+        {
+            region = part;
+        }
+    }
+    crate::cldr_numbers::locale(lang, script, region)
+}
+
+fn cldr_number_symbols(o: &Gc) -> crate::cldr_numbers::Symbols {
+    crate::cldr_numbers::symbols(cldr_number_locale(o), &get_str(o, "__nf_nu"))
+}
+
 fn get_num(o: &Gc, k: &str) -> Option<u32> {
     match o.borrow().props.get(k).map(|p| p.value()) {
         Some(Value::Num(n)) => Some(n as u32),
@@ -678,15 +718,31 @@ fn format_magnitude(x: f64, o: &Gc) -> String {
 
     let increment = get_num(o, "__nf_roundingincrement").unwrap_or(1);
     let mode = get_str(o, "__nf_roundingmode");
-    let mode = if mode.is_empty() {
-        "halfExpand".to_string()
-    } else {
-        mode
-    };
+    let mode = if mode.is_empty() { "halfExpand" } else { &mode };
     let rtype = get_str(o, "__nf_roundingtype");
-    let mut s = match rtype.as_str() {
+    format_magnitude_options(
+        x, min_int, min_frac, max_frac, min_sig, max_sig, increment, mode, &rtype,
+    )
+}
+
+/// `FormatNumericToString`'s decimal rounding and minimum-integer padding, shared with
+/// `Intl.PluralRules`. Keeping this path common prevents plural selection from drifting from the
+/// number that the same digit options format.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn format_magnitude_options(
+    x: f64,
+    min_int: u32,
+    min_frac: u32,
+    max_frac: u32,
+    min_sig: Option<u32>,
+    max_sig: Option<u32>,
+    increment: u32,
+    mode: &str,
+    rtype: &str,
+) -> String {
+    let mut s = match rtype {
         "significant" => {
-            round_significant_dec(x, max_sig.unwrap_or(21), min_sig.unwrap_or(1), &mode)
+            round_significant_dec(x, max_sig.unwrap_or(21), min_sig.unwrap_or(1), mode)
         }
         "morePrecision" | "lessPrecision" => round_priority(
             x,
@@ -695,15 +751,15 @@ fn format_magnitude(x: f64, o: &Gc) -> String {
             min_frac,
             max_frac,
             increment,
-            &mode,
+            mode,
             rtype == "morePrecision",
         ),
-        "fraction" => round_fraction_dec(x, min_frac, max_frac, increment, &mode),
+        "fraction" => round_fraction_dec(x, min_frac, max_frac, increment, mode),
         // Fallback for formatters created without a stored rounding type.
         _ if max_sig.is_some() => {
-            round_significant_dec(x, max_sig.unwrap(), min_sig.unwrap_or(1), &mode)
+            round_significant_dec(x, max_sig.unwrap(), min_sig.unwrap_or(1), mode)
         }
-        _ => round_fraction_dec(x, min_frac, max_frac, increment, &mode),
+        _ => round_fraction_dec(x, min_frac, max_frac, increment, mode),
     };
     // Pad integer digits to min_int.
     {
@@ -948,9 +1004,16 @@ fn round_significant_dec(x: f64, max_sig: u32, min_sig: u32, mode: &str) -> Stri
     s
 }
 
-fn group_integer(int_part: &str, grouping: &Value, sep: &str, sizes: (usize, usize)) -> String {
+fn group_integer(
+    int_part: &str,
+    grouping: &Value,
+    sep: &str,
+    sizes: (usize, usize),
+    minimum_grouping: usize,
+) -> String {
     let enabled = !matches!(grouping, Value::Bool(false));
-    let min2 = matches!(grouping, Value::Str(s) if &**s == "min2");
+    let min2 = matches!(grouping, Value::Str(s) if &**s == "min2")
+        || (minimum_grouping >= 2 && matches!(grouping, Value::Str(s) if &**s == "auto"));
     let (primary, secondary) = sizes;
     if !enabled || int_part.len() <= primary || (min2 && int_part.len() <= primary + 1) {
         return int_part.to_string();
@@ -978,6 +1041,7 @@ fn group_integer(int_part: &str, grouping: &Value, sep: &str, sizes: (usize, usi
 pub(crate) struct ExactDec {
     pub int: String,
     pub frac: String,
+    pub negative: bool,
 }
 
 impl ExactDec {
@@ -985,6 +1049,7 @@ impl ExactDec {
     /// anything fancier (exponents, hex, Infinity) falls back to the f64 path.
     fn parse(s: &str) -> Option<ExactDec> {
         let t = s.trim();
+        let negative = t.starts_with('-');
         let t = t.strip_prefix(['-', '+']).unwrap_or(t);
         let (int, frac) = match t.split_once('.') {
             Some((a, b)) => (a, b),
@@ -1003,6 +1068,7 @@ impl ExactDec {
         Some(ExactDec {
             int: i,
             frac: frac.to_string(),
+            negative,
         })
     }
 }
@@ -1010,153 +1076,247 @@ impl ExactDec {
 /// The exact value a format argument carries, when it has one.
 pub(crate) fn exact_of(x: &Value) -> Option<ExactDec> {
     match x {
-        Value::BigInt(b) => Some(ExactDec {
-            int: b.to_string_radix(10).trim_start_matches('-').to_string(),
-            frac: String::new(),
-        }),
+        Value::BigInt(b) => ExactDec::parse(&b.to_string_radix(10)),
         Value::Str(s) => ExactDec::parse(s),
         _ => None,
     }
 }
 
-/// Round-half-away-from-zero increment of a digit string (carries; may grow by one digit).
-fn digits_increment(head: &mut Vec<u8>) {
-    let mut k = head.len();
-    loop {
-        if k == 0 {
-            head.insert(0, b'1');
-            break;
-        }
-        k -= 1;
-        if head[k] == b'9' {
-            head[k] = b'0';
-        } else {
-            head[k] += 1;
-            break;
-        }
+fn exact_msd(ed: &ExactDec) -> i32 {
+    let integer = ed.int.trim_start_matches('0');
+    if !integer.is_empty() {
+        integer.len().saturating_sub(1).min(i32::MAX as usize) as i32
+    } else if let Some(first) = ed.frac.bytes().position(|byte| byte != b'0') {
+        -(first.min(i32::MAX as usize - 1) as i32) - 1
+    } else {
+        0
     }
 }
 
-/// The unsigned digit string for an exact decimal magnitude in standard notation:
-/// significant-digit rounding (halfExpand, integer-only), fraction rounding (trunc/halfExpand),
-/// and minimum-fraction zero padding directly on the decimal digits. None falls back to the f64
-/// path (non-standard notation or an unsupported rounding shape).
-fn exact_magnitude(ed: &ExactDec, o: &Gc) -> Option<String> {
-    if get_str(o, "__nf_notation") != "standard" {
-        return None;
-    }
-    if get_num(o, "__nf_roundingincrement").unwrap_or(1) != 1 {
-        return None;
-    }
-    let rtype = get_str(o, "__nf_roundingtype");
-    if rtype.contains("Precision") {
-        return None;
-    }
-    let mut digits = ed.int.clone();
-    let mut frac = ed.frac.clone();
-    let has_sig =
-        o.borrow().props.contains("__nf_minsig") || o.borrow().props.contains("__nf_maxsig");
-    if has_sig {
-        // Significant-digit mode: integer-valued inputs only (a fractional exact string under
-        // sig rounding falls back to the f64 path).
-        if !frac.is_empty() {
-            return None;
-        }
-        let ms = get_num(o, "__nf_maxsig").unwrap_or(21).max(1) as usize;
-        if digits.len() > ms {
-            if get_str(o, "__nf_roundingmode") != "halfExpand" {
-                return None;
-            }
-            let bytes = digits.as_bytes();
-            let total = digits.len();
-            let round_up = bytes[ms] >= b'5';
-            let mut head: Vec<u8> = bytes[..ms].to_vec();
-            if round_up {
-                digits_increment(&mut head);
-            }
-            digits = String::from_utf8(head).unwrap();
-            for _ in 0..(total - ms) {
-                digits.push('0');
-            }
-        }
-        // minimumSignificantDigits padding shows up as fraction zeros.
-        let min_sig = get_num(o, "__nf_minsig").unwrap_or(1).max(1) as usize;
-        let shown = if digits.trim_start_matches('0').is_empty() {
-            1
-        } else {
-            digits.trim_start_matches('0').len()
-        };
-        for _ in shown..min_sig {
-            frac.push('0');
-        }
-        // minimumIntegerDigits zero padding.
-        let min_int = get_num(o, "__nf_minint").unwrap_or(1) as usize;
-        while digits.len() < min_int {
-            digits.insert(0, '0');
-        }
-        return if frac.is_empty() {
-            Some(digits)
-        } else {
-            Some(format!("{digits}.{frac}"))
-        };
-    }
-    {
-        // Fraction rounding at maximumFractionDigits.
-        let max_frac =
-            get_num(o, "__nf_maxfrac").unwrap_or(if frac.is_empty() { 0 } else { 21 }) as usize;
-        if frac.len() > max_frac {
-            let mode = get_str(o, "__nf_roundingmode");
-            let round_up = match mode.as_str() {
-                "trunc" => false,
-                "halfExpand" | "" => frac.as_bytes()[max_frac] >= b'5',
-                _ => return None,
-            };
-            frac.truncate(max_frac);
-            if round_up {
-                let mut all: Vec<u8> = format!("{digits}{frac}").into_bytes();
-                digits_increment(&mut all);
-                let split = all.len() - max_frac;
-                frac = String::from_utf8(all.split_off(split)).unwrap();
-                digits = String::from_utf8(all).unwrap();
-            }
-        }
-    }
-    // Trailing fraction zeros only survive up to minimumFractionDigits.
-    let min_frac = get_num(o, "__nf_minfrac").unwrap_or(0) as usize;
-    while frac.len() > min_frac && frac.ends_with('0') {
-        frac.pop();
-    }
-    while frac.len() < min_frac {
-        frac.push('0');
-    }
-    // minimumIntegerDigits zero padding.
-    let min_int = get_num(o, "__nf_minint").unwrap_or(1) as usize;
-    while digits.len() < min_int {
-        digits.insert(0, '0');
-    }
-    if frac.is_empty() {
-        Some(digits)
+fn exact_zero(ed: &ExactDec) -> bool {
+    ed.int.bytes().all(|byte| byte == b'0') && ed.frac.bytes().all(|byte| byte == b'0')
+}
+
+fn exact_f64(ed: &ExactDec) -> f64 {
+    let sign = if ed.negative { "-" } else { "" };
+    let text = if ed.frac.is_empty() {
+        format!("{sign}{}", ed.int)
     } else {
-        Some(format!("{digits}.{frac}"))
+        format!("{sign}{}.{}", ed.int, ed.frac)
+    };
+    text.parse().unwrap_or(if ed.negative {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    })
+}
+
+/// Multiply an exact decimal by 10^places by moving its radix point without touching its digits.
+fn shift_exact(ed: &ExactDec, places: i32) -> ExactDec {
+    let mut digits = format!("{}{}", ed.int, ed.frac);
+    let point = ed.int.len() as i64 + places as i64;
+    let (int, frac) = if point <= 0 {
+        (
+            "0".to_string(),
+            format!("{}{}", "0".repeat((-point) as usize), digits),
+        )
+    } else if point as usize >= digits.len() {
+        digits.push_str(&"0".repeat(point as usize - digits.len()));
+        (digits, String::new())
+    } else {
+        let frac = digits.split_off(point as usize);
+        (digits, frac)
+    };
+    let int = int.trim_start_matches('0');
+    ExactDec {
+        int: if int.is_empty() { "0" } else { int }.to_string(),
+        frac,
+        negative: ed.negative,
     }
+}
+
+/// Format an exact magnitude after any percent/notation scaling has moved its radix point.
+fn exact_magnitude(ed: &ExactDec, o: &Gc) -> Option<String> {
+    exact_magnitude_options(
+        ed,
+        get_num(o, "__nf_minint").unwrap_or(1),
+        get_num(o, "__nf_minfrac").unwrap_or(0),
+        get_num(o, "__nf_maxfrac").unwrap_or(3),
+        get_num(o, "__nf_minsig"),
+        get_num(o, "__nf_maxsig"),
+        get_num(o, "__nf_roundingincrement").unwrap_or(1),
+        &get_str(o, "__nf_roundingmode"),
+        &get_str(o, "__nf_roundingtype"),
+        "standard",
+    )
+}
+
+/// Exact-decimal counterpart of [`format_magnitude_options`]. It covers the standard rounding
+/// shapes without converting BigInt or decimal-string inputs through `f64`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn exact_magnitude_options(
+    ed: &ExactDec,
+    min_int: u32,
+    min_frac: u32,
+    max_frac: u32,
+    min_sig: Option<u32>,
+    max_sig: Option<u32>,
+    increment: u32,
+    mode: &str,
+    rtype: &str,
+    notation: &str,
+) -> Option<String> {
+    if notation != "standard" {
+        return None;
+    }
+    if matches!(rtype, "morePrecision" | "lessPrecision") {
+        let significant = exact_magnitude_options(
+            ed,
+            min_int,
+            0,
+            0,
+            Some(min_sig.unwrap_or(1)),
+            Some(max_sig.unwrap_or(21)),
+            1,
+            mode,
+            "significant",
+            "standard",
+        )?;
+        let fraction = exact_magnitude_options(
+            ed, min_int, min_frac, max_frac, None, None, increment, mode, "fraction", "standard",
+        )?;
+        let significant_magnitude = exact_msd(ed) - max_sig.unwrap_or(21) as i32 + 1;
+        let fraction_magnitude = -(max_frac as i32);
+        let fixed_is_more_precise = fraction_magnitude < significant_magnitude;
+        return Some(
+            if (rtype == "morePrecision" && fixed_is_more_precise)
+                || (rtype == "lessPrecision" && !fixed_is_more_precise)
+            {
+                fraction
+            } else {
+                significant
+            },
+        );
+    }
+
+    let significant = rtype == "significant" || min_sig.is_some() || max_sig.is_some();
+    let mut rounded = if significant && exact_zero(ed) {
+        let minimum = min_sig.unwrap_or(1).max(1);
+        if minimum == 1 {
+            "0".to_string()
+        } else {
+            format!("0.{}", "0".repeat((minimum - 1) as usize))
+        }
+    } else if significant {
+        let maximum = max_sig.unwrap_or(21).max(1);
+        let keep = maximum as i32 - 1 - exact_msd(ed);
+        round_decimal(&ed.int, &ed.frac, keep, 1, mode, ed.negative)
+    } else {
+        round_decimal(
+            &ed.int,
+            &ed.frac,
+            max_frac as i32,
+            increment.max(1),
+            mode,
+            ed.negative,
+        )
+    };
+
+    let minimum = if significant {
+        min_sig.unwrap_or(1).max(1)
+    } else {
+        min_frac
+    } as usize;
+    if significant && !exact_zero(ed) {
+        let significant_digits = |text: &str| {
+            text.chars()
+                .filter(char::is_ascii_digit)
+                .skip_while(|character| *character == '0')
+                .count()
+                .max(1)
+        };
+        while rounded.ends_with('0')
+            && rounded.contains('.')
+            && significant_digits(&rounded) > minimum
+        {
+            rounded.pop();
+        }
+    } else {
+        while rounded.ends_with('0')
+            && rounded.contains('.')
+            && rounded.split_once('.').unwrap().1.len() > minimum
+        {
+            rounded.pop();
+        }
+    }
+    if rounded.ends_with('.') {
+        rounded.pop();
+    }
+
+    let (mut integer, mut fraction) = rounded
+        .split_once('.')
+        .map(|(integer, fraction)| (integer.to_string(), fraction.to_string()))
+        .unwrap_or_else(|| (rounded, String::new()));
+    if significant {
+        let shown = if exact_zero(ed) {
+            1 + fraction.len()
+        } else {
+            integer
+                .chars()
+                .chain(fraction.chars())
+                .skip_while(|character| *character == '0')
+                .count()
+                .max(1)
+        };
+        if shown < minimum {
+            fraction.push_str(&"0".repeat(minimum - shown));
+        }
+    } else if fraction.len() < minimum {
+        fraction.push_str(&"0".repeat(minimum - fraction.len()));
+    }
+    if integer.len() < min_int as usize {
+        integer.insert_str(0, &"0".repeat(min_int as usize - integer.len()));
+    }
+    Some(if fraction.is_empty() {
+        integer
+    } else {
+        format!("{integer}.{fraction}")
+    })
 }
 
 /// `exact` carries a BigInt or decimal-string input whose digits must not round through f64.
 fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>) -> String {
     let style = get_str(o, "__nf_style");
+    let cldr_locale = cldr_number_locale(o);
+    let number_system = get_str(o, "__nf_nu");
+    let symbols = crate::cldr_numbers::symbols(cldr_locale, &number_system);
     let mut value = x;
     let mut exact = exact;
     if style == "percent" {
         value *= 100.0;
-        // Percent scaling of an exact value is not digit-preserved; fall back to f64.
-        exact = None;
+        exact = exact.as_ref().map(|decimal| shift_exact(decimal, 2));
     }
     // Negative zero counts as negative for sign display (so -0 formats as "-0").
-    let negative = value.is_sign_negative() && !value.is_nan();
+    let negative = exact
+        .as_ref()
+        .map(|decimal| decimal.negative)
+        .unwrap_or_else(|| value.is_sign_negative() && !value.is_nan());
     // scientific / engineering notation: mantissa in [1,10) or [1,1000), plus an exponent.
     let notation = get_str(o, "__nf_notation");
     let mut exponent: Option<i32> = None;
-    if (notation == "scientific" || notation == "engineering") && value != 0.0 && value.is_finite()
+    if (notation == "scientific" || notation == "engineering")
+        && exact.as_ref().is_some_and(|decimal| !exact_zero(decimal))
+    {
+        let mut e = exact_msd(exact.as_ref().unwrap());
+        if notation == "engineering" {
+            e -= e.rem_euclid(3);
+        }
+        exact = exact.as_ref().map(|decimal| shift_exact(decimal, -e));
+        value = exact.as_ref().map(exact_f64).unwrap_or(value);
+        exponent = Some(e);
+    } else if (notation == "scientific" || notation == "engineering")
+        && value != 0.0
+        && value.is_finite()
     {
         let mut e = value.abs().log10().floor() as i32;
         if notation == "engineering" {
@@ -1176,47 +1336,54 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
         }
         exponent = Some(e);
     }
-    // compact notation: divide into a K/M/B/T tier and append the compact suffix (English data).
-    let mut compact_suffix = String::new();
-    let mut compact = false;
-    if notation == "compact" && value.is_finite() {
-        let long = get_str(o, "__nf_compactdisplay") == "long";
-        let loc = get_str(o, "__nf_locale");
-        let mut lp = loc.split('-');
-        let clang = lp.next().unwrap_or("en").to_string();
-        let cregion = lp
-            .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
-            .unwrap_or("")
-            .to_string();
-        // Pick the largest compact tier whose divisor does not exceed the value; below the smallest
-        // tier the number is formatted normally (locales differ: de starts at 1e6, CJK at 1e4, ko 1e3).
-        if let Some(&(div, suffix)) = compact_tiers(&clang, &cregion, long)
-            .iter()
-            .find(|(t, _)| value.abs() >= *t)
-        {
-            value /= div;
-            compact_suffix = suffix.to_string();
-            compact = true;
+    // ComputeExponentForMagnitude selects the CLDR compact pattern for the input magnitude; the
+    // pattern's zero count determines the scaling exponent.
+    let compact_input = value;
+    let compact_exact_input = exact.clone();
+    let mut compact: Option<(u8, crate::cldr_numbers::Compact)> = None;
+    if notation == "compact" && (value.is_finite() || exact.is_some()) {
+        let magnitude = exact
+            .as_ref()
+            .map(|decimal| exact_msd(decimal).max(0).min(u8::MAX as i32) as u8)
+            .unwrap_or_else(|| {
+                if value.abs() >= 1.0 {
+                    value.abs().log10().floor().clamp(0.0, u8::MAX as f64) as u8
+                } else {
+                    0
+                }
+            });
+        let display = get_str(o, "__nf_compactdisplay");
+        if let Some(pattern) = crate::cldr_numbers::compact(
+            cldr_locale,
+            &number_system,
+            &display,
+            magnitude,
+            "other",
+            false,
+        ) {
+            if pattern.exponent != 0 {
+                value /= 10f64.powi(pattern.exponent);
+                exact = exact
+                    .as_ref()
+                    .map(|decimal| shift_exact(decimal, -pattern.exponent));
+                if let Some(decimal) = &exact {
+                    value = exact_f64(decimal);
+                }
+            }
+            compact = Some((magnitude, pattern));
         }
     }
-    let (int_part, frac_part) = if value.is_nan() {
-        let loc = get_str(o, "__nf_locale");
-        let mut lp = loc.split('-');
-        let lang = lp.next().unwrap_or("en");
-        let region = lp
-            .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
-            .unwrap_or("");
-        (
-            crate::intl::data::nan_symbol(lang, region).to_string(),
-            None,
-        )
-    } else if value.is_infinite() {
-        ("\u{221e}".to_string(), None)
+    let (mut int_part, mut frac_part) = if value.is_nan() && exact.is_none() {
+        (symbols.nan.to_string(), None)
+    } else if value.is_infinite() && exact.is_none() {
+        (symbols.infinity.to_string(), None)
     } else {
         // Compact notation rounds with the default "morePrecision" of 2 significant / 0 fraction
         // digits: keep max(0, 2 - integerDigits) fraction digits (unless digit options were given).
         let has_sig = o.borrow().props.contains("__nf_minsig");
-        let mag = if notation == "compact" && !has_sig {
+        let mag = if let Some(magnitude) = exact.as_ref().and_then(|ed| exact_magnitude(ed, o)) {
+            magnitude
+        } else if compact.is_some() && !has_sig {
             // roundingPriority "morePrecision" over (max 0 fraction) and (max 2 significant): pick
             // whichever shows more fraction digits (ties keep the integer/fraction result).
             let s_frac = round_fraction_dec(value.abs(), 0, 0, 1, "halfExpand");
@@ -1227,8 +1394,6 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
             } else {
                 s_frac
             }
-        } else if let Some(mag) = exact.as_ref().and_then(|ed| exact_magnitude(ed, o)) {
-            mag
         } else {
             // Pass the signed value so the sign-sensitive rounding modes (ceil/floor and their
             // half-variants) see the true sign; the returned magnitude is unsigned.
@@ -1239,6 +1404,66 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
             None => (mag.clone(), None),
         }
     };
+    // ComputeExponent repeats after rounding when a compact result crosses into the next
+    // magnitude (for example 999,500 → 1M rather than 1000K).
+    if let Some((magnitude, seed)) = compact {
+        let rounded = match &frac_part {
+            Some(fraction) => format!("{int_part}.{fraction}"),
+            None => int_part.clone(),
+        };
+        let threshold_power = magnitude as i32 - seed.exponent + 1;
+        let crossed = rounded
+            .parse::<f64>()
+            .is_ok_and(|number| number >= 10f64.powi(threshold_power));
+        if crossed {
+            let next_magnitude = magnitude.saturating_add(1);
+            if let Some(next) = crate::cldr_numbers::compact(
+                cldr_locale,
+                &number_system,
+                &get_str(o, "__nf_compactdisplay"),
+                next_magnitude,
+                "other",
+                false,
+            ) {
+                exact = compact_exact_input
+                    .as_ref()
+                    .map(|decimal| shift_exact(decimal, -next.exponent));
+                value = exact
+                    .as_ref()
+                    .map(exact_f64)
+                    .unwrap_or_else(|| compact_input / 10f64.powi(next.exponent));
+                let remade = if let Some(magnitude) = exact
+                    .as_ref()
+                    .and_then(|decimal| exact_magnitude(decimal, o))
+                {
+                    magnitude
+                } else if o.borrow().props.contains("__nf_minsig") {
+                    format_magnitude(value, o)
+                } else {
+                    let fraction = round_fraction_dec(value.abs(), 0, 0, 1, "halfExpand");
+                    let significant = round_significant_dec(value.abs(), 2, 1, "halfExpand");
+                    let digits =
+                        |number: &str| number.split('.').nth(1).map(str::len).unwrap_or_default();
+                    if digits(&significant) > digits(&fraction) {
+                        significant
+                    } else {
+                        fraction
+                    }
+                };
+                match remade.split_once('.') {
+                    Some((integer, fraction)) => {
+                        int_part = integer.to_string();
+                        frac_part = Some(fraction.to_string());
+                    }
+                    None => {
+                        int_part = remade;
+                        frac_part = None;
+                    }
+                }
+                compact = Some((next_magnitude, next));
+            }
+        }
+    }
     // A value that rounds to zero (e.g. -0.0001 with the default 3 fraction digits) is "zero" for
     // the purpose of the `exceptZero`/`negative` sign rules, even though its sign bit is negative.
     let rounded_zero = value.is_finite()
@@ -1250,30 +1475,59 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
         .get("__nf_grouping")
         .map(|p| p.value())
         .unwrap_or(Value::str("auto"));
-    // Locale number symbols (decimal separator, grouping separator + sizes).
-    let locale = get_str(o, "__nf_locale");
-    let mut lparts = locale.split('-');
-    let lang = lparts.next().unwrap_or("en");
-    let region = lparts
-        .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
-        .unwrap_or("");
-    let (dec_sep, grp_sep, sizes) = crate::intl::data::number_symbols(lang, region);
     // Grouping is suppressed in scientific/engineering notation.
-    let grouped = if exponent.is_some() || !value.is_finite() {
+    let grouped = if exponent.is_some() || (!value.is_finite() && exact.is_none()) {
         int_part.clone()
     } else {
-        group_integer(&int_part, &grouping, grp_sep, sizes)
+        group_integer(
+            &int_part,
+            &grouping,
+            symbols.group,
+            (symbols.primary_group, symbols.secondary_group),
+            symbols.minimum_grouping,
+        )
     };
     let mut num = match frac_part {
-        Some(f) => format!("{grouped}{dec_sep}{f}"),
+        Some(ref f) => format!("{grouped}{}{f}", symbols.decimal),
         None => grouped,
     };
     if let Some(e) = exponent {
-        // CLDR: "E" then the exponent with its sign ("E-6", "E6").
-        num = format!("{num}E{e}");
+        let exponent_digits = if e < 0 {
+            format!("{}{}", symbols.minus, e.unsigned_abs())
+        } else {
+            e.to_string()
+        };
+        num = format!("{num}{}{exponent_digits}", symbols.exponential);
+        let scientific = crate::cldr_numbers::pattern(cldr_locale, &number_system, "scientific");
+        num = format!(
+            "{}{num}{}",
+            scientific.positive_prefix, scientific.positive_suffix
+        );
     }
-    if compact {
-        num.push_str(&compact_suffix);
+    if let Some((magnitude, seed)) = compact {
+        let rounded = match &frac_part {
+            Some(fraction) => format!("{int_part}.{fraction}"),
+            None => int_part.clone(),
+        };
+        let compact_exponent = seed.exponent.max(0) as u32;
+        let category = crate::cldr_plurals::select_cardinal(o_lang(o), &rounded, compact_exponent);
+        let exact_one = rounded
+            .parse::<f64>()
+            .is_ok_and(|rounded_value| rounded_value == 1.0);
+        let selected = crate::cldr_numbers::compact(
+            cldr_locale,
+            &number_system,
+            &get_str(o, "__nf_compactdisplay"),
+            magnitude,
+            category,
+            exact_one,
+        )
+        .unwrap_or(seed);
+        num = if selected.has_number {
+            format!("{}{num}{}", selected.prefix, selected.suffix)
+        } else {
+            format!("{}{}", selected.prefix, selected.suffix)
+        };
     }
 
     // Sign display. `auto`/`always` key off the sign bit (so -0 and values rounding to zero still
@@ -1281,158 +1535,184 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
     let sign_display = get_str(o, "__nf_signdisplay");
     let zeroish = rounded_zero || value.is_nan();
     let sign = match sign_display.as_str() {
-        "never" => "",
+        "never" => 0,
         "always" => {
             if negative {
-                "-"
+                -1
             } else {
-                "+"
+                1
             }
         }
         "exceptZero" => {
             if zeroish {
-                ""
+                0
             } else if negative {
-                "-"
+                -1
             } else {
-                "+"
+                1
             }
         }
         "negative" => {
             if negative && !zeroish {
-                "-"
+                -1
             } else {
-                ""
+                0
             }
         }
         _ => {
             if negative {
-                "-"
+                -1
             } else {
-                ""
+                0
             }
         }
     };
 
-    // Style wrapping.
+    let rounded = match &frac_part {
+        Some(fraction) => format!("{int_part}.{fraction}"),
+        None => int_part.clone(),
+    };
+    let compact_exponent = compact
+        .map(|(_, pattern)| pattern.exponent.max(0) as u32)
+        .unwrap_or(0);
+
+    // GetNumberFormatPattern selects the localized sign/style affixes around the notation
+    // subpattern. Currency names use CLDR's plural currency unit pattern instead of a symbol slot.
     match style.as_str() {
         "percent" => {
-            // Most European locales separate the percent sign with a NBSP (CLDR "#,##0 %").
-            let lang = get_str(o, "__nf_locale");
-            let lang = lang.split('-').next().unwrap_or("en");
-            let sep = if matches!(
-                lang,
-                "de" | "fr"
-                    | "sv"
-                    | "fi"
-                    | "cs"
-                    | "ru"
-                    | "nb"
-                    | "no"
-                    | "da"
-                    | "pl"
-                    | "uk"
-                    | "hu"
-                    | "sk"
-                    | "lv"
-                    | "lt"
-                    | "et"
-                    | "bg"
-                    | "is"
-            ) {
-                "\u{a0}"
-            } else {
-                ""
-            };
-            num = format!("{sign}{num}{sep}%");
+            num = apply_number_pattern(
+                crate::cldr_numbers::pattern(cldr_locale, &number_system, "percent"),
+                sign,
+                &num,
+                &symbols,
+                "",
+            );
         }
         "currency" => {
             let code = get_str(o, "__nf_currency");
-            let disp = get_str(o, "__nf_currencydisplay");
-            let loc = get_str(o, "__nf_locale");
-            let lang = loc.split('-').next().unwrap_or("en");
-            let sym = currency_symbol_loc(lang, &code, &disp);
-            // Symbol placement is locale-specific (de puts it after with a NBSP).
-            let after = curr_symbol_after(lang);
-            let body = if after {
-                format!("{num}\u{a0}{sym}")
+            let display = get_str(o, "__nf_currencydisplay");
+            let category =
+                crate::cldr_plurals::select_cardinal(o_lang(o), &rounded, compact_exponent);
+            let currency = crate::cldr_numbers::currency(cldr_locale, &code, category);
+            if display == "name" {
+                let signed = apply_number_pattern(
+                    crate::cldr_numbers::pattern(cldr_locale, &number_system, "decimal"),
+                    sign,
+                    &num,
+                    &symbols,
+                    "",
+                );
+                let name = currency.map(|value| value.name).unwrap_or(&code);
+                num = crate::cldr_numbers::currency_unit(cldr_locale, category)
+                    .replace("{0}", &signed)
+                    .replace("{1}", name);
             } else {
-                format!("{sym}{num}")
-            };
-            // Accounting wraps a negative in parentheses in symbol-before locales; symbol-after
-            // locales (de) keep the minus sign.
-            let accounting = get_str(o, "__nf_currencysign") == "accounting";
-            if accounting && sign == "-" && !after {
-                num = format!("({body})");
-            } else {
-                num = format!("{sign}{body}");
+                let text = match display.as_str() {
+                    "code" => code.as_str(),
+                    "narrowSymbol" => currency.map(|value| value.narrow).unwrap_or(&code),
+                    _ => currency.map(|value| value.symbol).unwrap_or(&code),
+                };
+                let accounting = get_str(o, "__nf_currencysign") == "accounting";
+                let base_kind = if accounting { "accounting" } else { "currency" };
+                let base_pattern =
+                    crate::cldr_numbers::pattern(cldr_locale, &number_system, base_kind);
+                // UTS #35's alphaNextToNumber variant applies only when the edge of the
+                // substituted currency string adjacent to the number is alphabetic. A symbol
+                // such as `US$` contains letters but ends in `$`, so a prefix pattern must not
+                // insert the alphabetic spacing used by a currency code such as `USD`.
+                let alpha = if base_pattern.positive_prefix.contains("{currency}") {
+                    text.chars().next_back().is_some_and(char::is_alphabetic)
+                } else if base_pattern.positive_suffix.contains("{currency}") {
+                    text.chars().next().is_some_and(char::is_alphabetic)
+                } else {
+                    false
+                };
+                let kind = match (accounting, alpha) {
+                    (false, false) => "currency",
+                    (false, true) => "currencyAlpha",
+                    (true, false) => "accounting",
+                    (true, true) => "accountingAlpha",
+                };
+                num = apply_number_pattern(
+                    crate::cldr_numbers::pattern(cldr_locale, &number_system, kind),
+                    sign,
+                    &num,
+                    &symbols,
+                    text,
+                );
             }
         }
         "unit" => {
-            let signed = format!("{sign}{num}");
+            let signed = apply_number_pattern(
+                crate::cldr_numbers::pattern(cldr_locale, &number_system, "decimal"),
+                sign,
+                &num,
+                &symbols,
+                "",
+            );
             num = match unit_pattern_of(o, value) {
                 Some(p) => p.replace("{0}", &signed),
                 None => {
                     let unit = get_str(o, "__nf_unit");
                     let disp = get_str(o, "__nf_unitdisplay");
-                    let cat = crate::intl::data::plural_cardinal(
-                        o_lang(o),
-                        value.abs().trunc() as u64,
-                        value.fract() != 0.0,
-                        0,
-                    );
-                    format!("{sign}{}", unit_wrap(&num, &unit, &disp, cat != "one"))
+                    let cat = crate::intl::data::plural_cardinal(o_lang(o), value, 0);
+                    unit_wrap(&signed, &unit, &disp, cat != "one")
                 }
             };
         }
         _ => {
-            num = format!("{sign}{num}");
+            num = apply_number_pattern(
+                crate::cldr_numbers::pattern(cldr_locale, &number_system, "decimal"),
+                sign,
+                &num,
+                &symbols,
+                "",
+            );
         }
     }
     let _ = i;
     num
 }
 
-/// Whether the currency symbol follows the amount (with a NBSP) in this locale.
-fn curr_symbol_after(lang: &str) -> bool {
-    matches!(
-        lang,
-        "de" | "fr" | "fi" | "sv" | "cs" | "sk" | "hu" | "pl" | "ru" | "pt"
+fn apply_number_pattern(
+    pattern: crate::cldr_numbers::Pattern,
+    sign: i8,
+    number: &str,
+    symbols: &crate::cldr_numbers::Symbols,
+    currency: &str,
+) -> String {
+    let (mut prefix, suffix) = if sign < 0 {
+        (pattern.negative_prefix.to_string(), pattern.negative_suffix)
+    } else {
+        (pattern.positive_prefix.to_string(), pattern.positive_suffix)
+    };
+    if sign > 0 {
+        // CLDR derives the plus pattern from the positive pattern. Keep leading bidi controls ahead
+        // of the localized plus sign so Arabic and other RTL affixes remain well-ordered.
+        let byte = prefix
+            .char_indices()
+            .find(|(_, character)| !matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}'))
+            .map(|(index, _)| index)
+            .unwrap_or(prefix.len());
+        prefix.insert_str(byte, "{plusSign}");
+    }
+    format!(
+        "{}{number}{}",
+        render_number_affix(&prefix, symbols, currency),
+        render_number_affix(suffix, symbols, currency)
     )
 }
 
-/// The locale-aware currency symbol. For USD the default "symbol" form is "$" in en/de but "US$"
-/// elsewhere; "narrowSymbol" is always the plain "$".
-fn currency_symbol_loc(lang: &str, code: &str, display: &str) -> String {
-    if code == "USD" && (display == "symbol" || display.is_empty()) {
-        return if matches!(lang, "en" | "de" | "ja") {
-            "$"
-        } else {
-            "US$"
-        }
-        .to_string();
-    }
-    if code == "USD" && display == "narrowSymbol" {
-        return "$".to_string();
-    }
-    currency_symbol(code, display)
-}
-
-fn currency_symbol(code: &str, display: &str) -> String {
-    if display == "code" {
-        return format!("{code}\u{00a0}");
-    }
-    let sym = match code {
-        "USD" => "$",
-        "EUR" => "€",
-        "GBP" => "£",
-        "JPY" => "¥",
-        "CNY" => "CN¥",
-        "AUD" => "A$",
-        "CAD" => "CA$",
-        _ => return format!("{code}\u{00a0}"),
-    };
-    sym.to_string()
+fn render_number_affix(
+    affix: &str,
+    symbols: &crate::cldr_numbers::Symbols,
+    currency: &str,
+) -> String {
+    affix
+        .replace("{currency}", currency)
+        .replace("{percentSign}", symbols.percent)
+        .replace("{minusSign}", symbols.minus)
+        .replace("{plusSign}", symbols.plus)
 }
 
 fn unit_short_name(u: &str) -> Option<&'static str> {
@@ -1449,52 +1729,6 @@ fn unit_short_name(u: &str) -> Option<&'static str> {
         "fahrenheit" => "°F",
         _ => return None,
     })
-}
-
-/// The compact-notation tiers (threshold divisor, suffix) for a locale, largest first. The suffix
-/// includes any leading spacing. Below the smallest tier the number is not compacted.
-fn compact_tiers(lang: &str, region: &str, long: bool) -> &'static [(f64, &'static str)] {
-    match lang {
-        "ja" => &[(1e12, "兆"), (1e8, "億"), (1e4, "万")],
-        "zh" => {
-            if matches!(region, "TW" | "HK" | "MO") {
-                &[(1e12, "兆"), (1e8, "億"), (1e4, "萬")]
-            } else {
-                &[(1e12, "兆"), (1e8, "亿"), (1e4, "万")]
-            }
-        }
-        "ko" => &[(1e12, "조"), (1e8, "억"), (1e4, "만"), (1e3, "천")],
-        "de" => {
-            if long {
-                &[
-                    (1e12, " Billionen"),
-                    (1e9, " Milliarden"),
-                    (1e6, " Millionen"),
-                    (1e3, " Tausend"),
-                ]
-            } else {
-                &[
-                    (1e12, "\u{a0}Bio."),
-                    (1e9, "\u{a0}Mrd."),
-                    (1e6, "\u{a0}Mio."),
-                ]
-            }
-        }
-        // Indian English uses the lakh/crore system in short notation.
-        "en" if region == "IN" && !long => &[(1e7, "Cr"), (1e5, "L"), (1e3, "K")],
-        _ => {
-            if long {
-                &[
-                    (1e12, " trillion"),
-                    (1e9, " billion"),
-                    (1e6, " million"),
-                    (1e3, " thousand"),
-                ]
-            } else {
-                &[(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]
-            }
-        }
-    }
 }
 
 fn unit_wrap(num: &str, unit: &str, display: &str, plural: bool) -> String {
@@ -1568,7 +1802,7 @@ fn suffix_type_of(o: &Gc) -> String {
     }
 }
 
-fn to_intl_number(i: &mut Interp, x: &Value) -> Result<f64, Value> {
+pub(super) fn to_intl_number(i: &mut Interp, x: &Value) -> Result<f64, Value> {
     // ToIntlMathematicalValue — we approximate with ToNumber (BigInt handled as its value).
     match x {
         Value::BigInt(b) => Ok(b.to_f64()),
@@ -1581,25 +1815,29 @@ fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Val
     let n = to_intl_number(i, x)?;
     let whole = assemble_number_exact(i, &o, n, exact_of(x));
     let nu = get_str(&o, "__nf_nu");
-    let (dec, grp) = loc_seps(&o);
+    let symbols = cldr_number_symbols(&o);
     // Unit style: rebuild from the CLDR pattern so a unit prefix/suffix (e.g. ko "시속 {0}킬로미터")
     // is tagged as unit/literal around the number's own parts.
     let parts = if get_str(&o, "__nf_style") == "unit" && n.is_finite() {
         if let Some(pat) = unit_pattern_of(&o, n) {
-            let (pre, post) = pat.split_once("{0}").unwrap_or(("", ""));
-            let num_only = whole
-                .strip_prefix(pre)
-                .and_then(|s| s.strip_suffix(post))
-                .unwrap_or(&whole);
-            let mut p = unit_affix_parts(pre, true);
-            p.extend(decompose_parts(num_only, "literal", dec, grp, loc_nan(&o)));
-            p.extend(unit_affix_parts(post, false));
-            p
+            if !pat.contains("{0}") {
+                vec![("unit", whole)]
+            } else {
+                let (pre, post) = pat.split_once("{0}").unwrap();
+                let num_only = whole
+                    .strip_prefix(pre)
+                    .and_then(|s| s.strip_suffix(post))
+                    .unwrap_or(&whole);
+                let mut p = unit_affix_parts(pre, true);
+                p.extend(decompose_parts(num_only, "literal", &symbols));
+                p.extend(unit_affix_parts(post, false));
+                p
+            }
         } else {
-            decompose_parts(&whole, &suffix_type_of(&o), dec, grp, loc_nan(&o))
+            decompose_parts(&whole, &suffix_type_of(&o), &symbols)
         }
     } else {
-        decompose_parts(&whole, &suffix_type_of(&o), dec, grp, loc_nan(&o))
+        decompose_parts(&whole, &suffix_type_of(&o), &symbols)
     };
     let arr: Vec<Value> = parts
         .into_iter()
@@ -1607,7 +1845,7 @@ fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Val
             let ob = i.new_object();
             set_data(&ob, "type", Value::str(t));
             // Localize the digits of numeric parts to the numbering system.
-            let v = if matches!(t, "integer" | "fraction") {
+            let v = if matches!(t, "integer" | "fraction" | "exponentInteger") {
                 xlate_digits(&v, &nu)
             } else {
                 v
@@ -1624,22 +1862,7 @@ fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Val
 /// classifies the trailing affix ("compact" for compact notation, else percent/literal by content).
 /// The formatter locale's primary language subtag.
 fn o_lang(o: &Gc) -> &'static str {
-    let loc = get_str(o, "__nf_locale");
-    match loc.split('-').next().unwrap_or("en") {
-        "de" => "de",
-        "fr" => "fr",
-        "es" => "es",
-        "it" => "it",
-        "pt" => "pt",
-        "nl" => "nl",
-        "ja" => "ja",
-        "ko" => "ko",
-        "zh" => "zh",
-        "ru" => "ru",
-        "ar" => "ar",
-        "pl" => "pl",
-        _ => "en",
-    }
+    cldr_number_locale(o).split('-').next().unwrap_or("en")
 }
 
 /// The CLDR unit-display pattern ("{0} km/h") for a formatter and value (plural category from the
@@ -1652,24 +1875,10 @@ fn unit_pattern_of(o: &Gc, value: f64) -> Option<String> {
     } else {
         disp.as_str()
     };
-    let loc = get_str(o, "__nf_locale");
-    let mut lp = loc.split('-');
-    let lang = lp.next().unwrap_or("en");
-    let region = lp
-        .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
-        .unwrap_or("");
-    let cldr_loc = match (lang, region) {
-        ("zh", "TW" | "HK" | "MO") => "zh-Hant",
-        ("zh", _) => "zh-Hans",
-        ("en", "IN") => "en-IN",
-        _ => lang,
-    };
-    let cat = crate::intl::data::plural_cardinal(
-        o_lang(o),
-        value.abs().trunc() as u64,
-        value.fract() != 0.0,
-        0,
-    );
+    let locale = cldr_number_locale(o);
+    let cldr_loc = if locale == "zh" { "zh-Hans" } else { locale };
+    let lang = o_lang(o);
+    let cat = crate::intl::data::plural_cardinal(o_lang(o), value, 0);
     crate::cldr_units::unit_pattern(cldr_loc, &unit, style, cat)
         .or_else(|| crate::cldr_units::unit_pattern(cldr_loc, &unit, style, "other"))
         .or_else(|| crate::cldr_units::unit_pattern(lang, &unit, style, "other"))
@@ -1707,190 +1916,211 @@ fn unit_affix_parts(text: &str, is_pre: bool) -> Vec<(&'static str, String)> {
     v
 }
 
-/// The (decimal, group) separator chars for a formatter's locale.
-fn loc_seps(o: &Gc) -> (char, char) {
-    let loc = get_str(o, "__nf_locale");
-    let mut lp = loc.split('-');
-    let lang = lp.next().unwrap_or("en");
-    let region = lp
-        .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
-        .unwrap_or("");
-    let (dec, grp, _) = crate::intl::data::number_symbols(lang, region);
-    (
-        dec.chars().next().unwrap_or('.'),
-        grp.chars().next().unwrap_or(','),
-    )
-}
-
-/// The localized NaN symbol for a formatter's locale.
-fn loc_nan(o: &Gc) -> &'static str {
-    let loc = get_str(o, "__nf_locale");
-    let mut lp = loc.split('-');
-    let lang = lp.next().unwrap_or("en");
-    let region = lp
-        .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
-        .unwrap_or("");
-    crate::intl::data::nan_symbol(lang, region)
-}
-
 fn decompose_parts(
     s: &str,
     suffix_type: &str,
-    dec: char,
-    grp: char,
-    nan_sym: &str,
+    symbols: &crate::cldr_numbers::Symbols,
 ) -> Vec<(&'static str, String)> {
     let mut parts: Vec<(&'static str, String)> = Vec::new();
-    // Split off the exponent tail, if any.
-    let (main, exp) = match s.split_once('E') {
-        Some((m, e)) => (m, Some(e)),
-        None => (s, None),
+    let numeric_start = s
+        .char_indices()
+        .find(|(index, character)| {
+            character.is_ascii_digit()
+                || s[*index..].starts_with(symbols.infinity)
+                || s[*index..].starts_with(symbols.nan)
+        })
+        .map(|(index, _)| index);
+    let Some(mut idx) = numeric_start else {
+        // CLDR has placeholder-free compact/unit forms such as French `mille` and Arabic `متر`.
+        push_affix_parts(&mut parts, s, suffix_type, symbols);
+        return parts;
     };
-    let bytes: Vec<char> = main.chars().collect();
-    let nan_chars: Vec<char> = nan_sym.chars().collect();
-    let mut idx = 0;
-    // Leading affix: a sign, then any non-digit prefix (currency symbol).
-    if idx < bytes.len() && (bytes[idx] == '-' || bytes[idx] == '+') {
-        parts.push((
-            if bytes[idx] == '-' {
-                "minusSign"
-            } else {
-                "plusSign"
-            },
-            bytes[idx].to_string(),
-        ));
-        idx += 1;
-    }
-    // Accounting notation's opening parenthesis is its own literal part.
-    if idx < bytes.len() && bytes[idx] == '(' {
-        parts.push(("literal", "(".to_string()));
-        idx += 1;
-    }
-    // The number body is either digits, the infinity glyph, or the (possibly localized) NaN symbol;
-    // the prefix loop stops there.
-    let is_nan_at =
-        |b: &[char], k: usize| !nan_chars.is_empty() && b[k..].starts_with(&nan_chars[..]);
-    let mut prefix = String::new();
-    while idx < bytes.len()
-        && !bytes[idx].is_ascii_digit()
-        && bytes[idx] != '.'
-        && bytes[idx] != '\u{221e}'
-        && !is_nan_at(&bytes, idx)
-    {
-        prefix.push(bytes[idx]);
-        idx += 1;
-    }
-    if !prefix.is_empty() {
-        // A leading currency symbol vs. a stray literal — classify a $ / letters as currency.
-        let t = if prefix.chars().all(|c| c == ' ' || c == '\u{00a0}') {
-            "literal"
-        } else {
-            "currency"
-        };
-        parts.push((t, prefix));
-    }
+    push_affix_parts(&mut parts, &s[..idx], suffix_type, symbols);
+
     // Non-finite body: emit a single infinity/nan part, then fall through to any trailing affix.
-    if idx < bytes.len() && bytes[idx] == '\u{221e}' {
-        parts.push(("infinity", "\u{221e}".to_string()));
-        idx += 1;
-    } else if is_nan_at(&bytes, idx) {
-        parts.push(("nan", nan_sym.to_string()));
-        idx += nan_chars.len();
+    if s[idx..].starts_with(symbols.infinity) {
+        push_part(&mut parts, "infinity", symbols.infinity);
+        idx += symbols.infinity.len();
+    } else if s[idx..].starts_with(symbols.nan) {
+        push_part(&mut parts, "nan", symbols.nan);
+        idx += symbols.nan.len();
     }
-    // Integer digits (with grouping commas).
-    let int_start = idx;
-    while idx < bytes.len() && (bytes[idx].is_ascii_digit() || bytes[idx] == grp) {
-        idx += 1;
+
+    // Integer digits and grouping separators. Generated CLDR symbols are strings rather than
+    // assumed one-byte punctuation, so token matching stays correct for every numbering system.
+    let mut integer = String::new();
+    while idx < s.len() {
+        let rest = &s[idx..];
+        if let Some(character) = rest.chars().next().filter(char::is_ascii_digit) {
+            integer.push(character);
+            idx += character.len_utf8();
+        } else if rest.starts_with(symbols.group) {
+            if !integer.is_empty() {
+                push_part(&mut parts, "integer", &integer);
+                integer.clear();
+            }
+            push_part(&mut parts, "group", symbols.group);
+            idx += symbols.group.len();
+        } else {
+            break;
+        }
     }
-    let int_str: String = bytes[int_start..idx].iter().collect();
-    for seg in split_grouped(&int_str, grp) {
-        parts.push(seg);
+    if !integer.is_empty() {
+        push_part(&mut parts, "integer", &integer);
     }
     // Decimal + fraction.
-    if idx < bytes.len() && bytes[idx] == dec {
-        parts.push(("decimal", dec.to_string()));
-        idx += 1;
-        let frac_start = idx;
-        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        parts.push(("fraction", bytes[frac_start..idx].iter().collect()));
-    }
-    // Trailing affix (percent sign, unit, compact suffix, or literal).
-    let suffix: String = bytes[idx..].iter().collect();
-    if !suffix.is_empty() {
-        if suffix_type == "unit" || suffix_type == "currency" {
-            // The leading separator space(s) are a literal; the rest is the unit/currency symbol
-            // (a trailing ")" from accounting notation stays a literal).
-            let tag = if suffix_type == "unit" {
-                "unit"
-            } else {
-                "currency"
+    if idx < s.len() && s[idx..].starts_with(symbols.decimal) {
+        push_part(&mut parts, "decimal", symbols.decimal);
+        idx += symbols.decimal.len();
+        let start = idx;
+        while idx < s.len() {
+            let Some(character) = s[idx..].chars().next() else {
+                break;
             };
-            let trimmed = suffix.trim_start_matches([' ', '\u{a0}']);
-            let lead = &suffix[..suffix.len() - trimmed.len()];
-            if !lead.is_empty() {
-                parts.push(("literal", lead.to_string()));
+            if !character.is_ascii_digit() {
+                break;
             }
-            if let Some(rest) = trimmed.strip_suffix(')') {
-                if !rest.is_empty() {
-                    parts.push((tag, rest.to_string()));
-                }
-                parts.push(("literal", ")".to_string()));
-            } else if !trimmed.is_empty() {
-                parts.push((tag, trimmed.to_string()));
-            }
-        } else if suffix.contains('%') {
-            parts.push(("percentSign", suffix));
-        } else if suffix_type == "compact" {
-            // A leading space (regular or NBSP, as in de "988 Mio.") separates the number from the
-            // compact word and is its own literal.
-            let trimmed = suffix.trim_start_matches([' ', '\u{a0}']);
-            let lead = &suffix[..suffix.len() - trimmed.len()];
-            if !lead.is_empty() {
-                parts.push(("literal", lead.to_string()));
-            }
-            if trimmed == ")" {
-                parts.push(("literal", ")".to_string()));
-            } else if !trimmed.is_empty() {
-                parts.push(("compact", trimmed.to_string()));
-            }
-        } else {
-            parts.push(("literal", suffix));
+            idx += character.len_utf8();
         }
+        push_part(&mut parts, "fraction", &s[start..idx]);
     }
-    // Exponent group.
-    if let Some(e) = exp {
-        parts.push(("exponentSeparator", "E".to_string()));
-        let mut ec = e.chars().peekable();
-        if ec.peek() == Some(&'-') {
-            parts.push(("exponentMinusSign", "-".to_string()));
-            ec.next();
+
+    // Scientific/engineering exponent, followed by any style affix (currency/unit/percent).
+    if idx < s.len() && s[idx..].starts_with(symbols.exponential) {
+        push_part(&mut parts, "exponentSeparator", symbols.exponential);
+        idx += symbols.exponential.len();
+        if s[idx..].starts_with(symbols.minus) {
+            push_symbol_parts(&mut parts, symbols.minus, "exponentMinusSign");
+            idx += symbols.minus.len();
+        } else if s[idx..].starts_with(symbols.plus) {
+            push_symbol_parts(&mut parts, symbols.plus, "exponentPlusSign");
+            idx += symbols.plus.len();
         }
-        let digits: String = ec.collect();
-        parts.push(("exponentInteger", digits));
+        let start = idx;
+        while idx < s.len() {
+            let Some(character) = s[idx..].chars().next() else {
+                break;
+            };
+            if !character.is_ascii_digit() {
+                break;
+            }
+            idx += character.len_utf8();
+        }
+        push_part(&mut parts, "exponentInteger", &s[start..idx]);
     }
+    push_affix_parts(&mut parts, &s[idx..], suffix_type, symbols);
     parts
 }
 
-/// Split a grouped integer like "12,345" into integer/group parts (group char is locale-specific).
-fn split_grouped(int_str: &str, grp: char) -> Vec<(&'static str, String)> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for c in int_str.chars() {
-        if c == grp {
-            if !cur.is_empty() {
-                out.push(("integer", std::mem::take(&mut cur)));
-            }
-            out.push(("group", grp.to_string()));
-        } else {
-            cur.push(c);
+fn is_affix_literal(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(character, '(' | ')' | '\u{061c}' | '\u{200e}' | '\u{200f}')
+}
+
+fn push_part(parts: &mut Vec<(&'static str, String)>, kind: &'static str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if let Some((last_kind, last_value)) = parts.last_mut() {
+        if *last_kind == kind && kind == "literal" {
+            last_value.push_str(value);
+            return;
         }
     }
-    if !cur.is_empty() {
-        out.push(("integer", cur));
+    parts.push((kind, value.to_string()));
+}
+
+/// Split directional controls out of a localized sign/percent symbol. ECMA-402 emits the visible
+/// field as the semantic part while the controls remain literal parts preserving bidi ordering.
+fn push_symbol_parts(parts: &mut Vec<(&'static str, String)>, symbol: &str, kind: &'static str) {
+    let mut run = String::new();
+    let mut run_literal = None;
+    for character in symbol.chars() {
+        let literal = matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}');
+        if run_literal.is_some_and(|previous| previous != literal) {
+            push_part(
+                parts,
+                if run_literal.unwrap() {
+                    "literal"
+                } else {
+                    kind
+                },
+                &run,
+            );
+            run.clear();
+        }
+        run_literal = Some(literal);
+        run.push(character);
     }
-    out
+    if !run.is_empty() {
+        push_part(
+            parts,
+            if run_literal.unwrap() {
+                "literal"
+            } else {
+                kind
+            },
+            &run,
+        );
+    }
+}
+
+/// Tokenize a prefix/suffix from a CLDR pattern. Spaces, parentheses and bidi controls are
+/// literals; the remaining field is currency/unit/compact data. Localized signs and percent signs
+/// are recognized even when their CLDR symbol contains directional controls.
+fn push_affix_parts(
+    parts: &mut Vec<(&'static str, String)>,
+    mut text: &str,
+    semantic: &str,
+    symbols: &crate::cldr_numbers::Symbols,
+) {
+    while !text.is_empty() {
+        if text.starts_with(symbols.minus) {
+            push_symbol_parts(parts, symbols.minus, "minusSign");
+            text = &text[symbols.minus.len()..];
+            continue;
+        }
+        if text.starts_with(symbols.plus) {
+            push_symbol_parts(parts, symbols.plus, "plusSign");
+            text = &text[symbols.plus.len()..];
+            continue;
+        }
+        if text.starts_with(symbols.percent) {
+            push_symbol_parts(parts, symbols.percent, "percentSign");
+            text = &text[symbols.percent.len()..];
+            continue;
+        }
+        let first = text.chars().next().unwrap();
+        if is_affix_literal(first) {
+            let end = text
+                .char_indices()
+                .find(|(_, character)| !is_affix_literal(*character))
+                .map(|(index, _)| index)
+                .unwrap_or(text.len());
+            push_part(parts, "literal", &text[..end]);
+            text = &text[end..];
+            continue;
+        }
+        let end = text
+            .char_indices()
+            .skip(1)
+            .find(|(index, character)| {
+                is_affix_literal(*character)
+                    || text[*index..].starts_with(symbols.minus)
+                    || text[*index..].starts_with(symbols.plus)
+                    || text[*index..].starts_with(symbols.percent)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(text.len());
+        let kind = match semantic {
+            "currency" => "currency",
+            "unit" => "unit",
+            "compact" => "compact",
+            _ => "literal",
+        };
+        push_part(parts, kind, &text[..end]);
+        text = &text[end..];
+    }
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {

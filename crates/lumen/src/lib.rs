@@ -24,6 +24,7 @@ mod ast;
 mod bigint;
 mod builtins;
 pub mod bytecode;
+mod cache;
 mod coroutine;
 mod eval;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
@@ -67,14 +68,39 @@ mod cldr_locale_info;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_dates;
+#[cfg(feature = "intl")]
+mod cldr_collation;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod cldr_datetime_patterns;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_units;
 #[rustfmt::skip]
 mod units;
+#[cfg(feature = "intl")]
+mod unicode_collation;
 mod unicode_norm;
 mod unicode_norm_impl;
 mod unicode_props;
+#[cfg(feature = "intl")]
+#[rustfmt::skip]
+mod unicode_segment;
+#[cfg(feature = "intl")]
+#[rustfmt::skip]
+mod cldr_plurals;
+#[cfg(feature = "intl")]
+#[rustfmt::skip]
+mod cldr_lists;
+#[cfg(feature = "intl")]
+#[rustfmt::skip]
+mod cldr_relative_time;
+#[cfg(feature = "intl")]
+#[rustfmt::skip]
+mod cldr_display_names;
+#[cfg(feature = "intl")]
+#[rustfmt::skip]
+mod cldr_numbers;
 mod value;
 
 use interpreter::Interp;
@@ -175,7 +201,6 @@ impl Engine {
     /// before the worker thread has finished constructing its realm or begun evaluating its
     /// entry script.
     pub fn new_with_interrupt(interrupt: std::sync::Arc<RuntimeInterrupt>) -> Engine {
-        interpreter::sym_for_reset();
         let mut interp = Interp::new();
         interp.runtime_interrupt = interrupt;
         Engine {
@@ -457,6 +482,16 @@ impl Engine {
         self.interp.tier_threshold = threshold;
     }
 
+    /// Set this realm's bounded interpreter/JIT recursion budget.
+    ///
+    /// The default is deliberately conservative for 2 MiB test and worker threads. An embedder
+    /// may raise it only when every thread entering this realm has a larger native stack; values
+    /// are clamped to the engine's hard ceiling. ECMA-262 §9.4 defines execution-context stacking
+    /// but leaves the finite implementation capacity to the engine and host.
+    pub fn set_max_eval_depth(&mut self, depth: u32) {
+        self.interp.max_eval_depth = depth.clamp(1, interpreter::MAX_CONFIGURED_EVAL_DEPTH);
+    }
+
     /// Drain anything written to `console.*` since the last call.
     pub fn take_console(&mut self) -> Vec<String> {
         std::mem::take(&mut self.interp.console)
@@ -521,7 +556,7 @@ pub mod embed {
     pub use crate::host::{OpState, ResourceId, ResourceTable};
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
-    pub use crate::interpreter::Interp as Ctx;
+    pub use crate::interpreter::{ArrayBufferBytes, Interp as Ctx, WeakValue};
     /// JS values. Matching/constructing the primitive variants is supported API; object
     /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
@@ -543,6 +578,7 @@ impl Engine {
     /// Direct access to the native-function context (also where [`embed::OpState`] lives, via
     /// [`embed::Ctx::op_state`]).
     pub fn ctx(&mut self) -> &mut embed::Ctx {
+        self.interp.activate_gc_heap();
         &mut self.interp
     }
 
@@ -603,7 +639,7 @@ impl Engine {
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
         self.interp.strict = directive_strict;
-        Ok(match self.interp.run_program(&body) {
+        let result = match self.interp.run_program(&body) {
             Ok(Value::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
@@ -612,7 +648,11 @@ impl Engine {
                 Err(embed::EvalError::Interrupted(reason))
             }
             Err(_) => Ok(Value::Undefined),
-        })
+        };
+        // This embedding entry runs one synchronous ECMAScript job. Promise jobs, if any, are
+        // deliberately owned by the caller and begin with a fresh [[KeptAlive]] list.
+        self.interp.kept_alive.clear();
+        Ok(result)
     }
 
     /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
@@ -677,6 +717,7 @@ impl Engine {
                 interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
                 _ => embed::EvalError::Throw(Value::Undefined),
             });
+        self.interp.kept_alive.clear();
         if matches!(result, Err(embed::EvalError::Interrupted(_))) {
             self.interp.gc_task_boundary();
         }
@@ -732,7 +773,7 @@ impl Engine {
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is
     /// really over).
     pub fn has_pending_jobs(&self) -> bool {
-        !self.interp.microtasks.is_empty()
+        !self.interp.microtasks.is_empty() || !self.interp.pending_finalization_cleanup.is_empty()
     }
 
     /// Run a single queued job; `false` when the queue was empty.
@@ -745,9 +786,16 @@ impl Engine {
         match self.interp.microtasks.pop_front() {
             Some(job) => {
                 self.interp.run_job_interruptible(job)?;
+                self.interp.kept_alive.clear();
                 Ok(true)
             }
-            None => Ok(false),
+            None => match self.interp.pending_finalization_cleanup.pop_front() {
+                Some(registry) => {
+                    self.interp.run_finalization_cleanup_job(registry)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
         }
     }
 }

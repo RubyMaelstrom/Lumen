@@ -1,33 +1,34 @@
-//! `Intl.PluralRules` (a subset: default digit options, cardinal + a coarse ordinal).
+//! `Intl.PluralRules` following ECMA-402 ResolvePlural with CLDR 48 cardinal, ordinal, and range
+//! rules for every locale Lumen advertises.
 
 use super::service::{
     brand_slot, get_option, install_supported_locales, instance_proto, read_locale_matcher,
     resolve_locale,
 };
 use super::{
-    ab, arg, canonicalize_locale_list, data, get_options_object as coerce_options, make_service,
+    ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Value};
+use crate::value::{set_builtin, set_data, Gc, Value};
 
-pub fn install(it: &mut Interp, ns: &crate::value::Gc) {
+pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "PluralRules", 0, construct);
     install_supported_locales(it, &ctor);
-    it.def_method(&proto, "select", 1, |i, this, a| {
-        select(i, &this, &arg(a, 0))
+    it.def_method(&proto, "select", 1, |i, this, args| {
+        select(i, &this, &arg(args, 0))
     });
-    it.def_method(&proto, "selectRange", 2, |i, this, a| {
-        select_range(i, &this, &arg(a, 0), &arg(a, 1))
+    it.def_method(&proto, "selectRange", 2, |i, this, args| {
+        select_range(i, &this, &arg(args, 0), &arg(args, 1))
     });
     it.def_method(&proto, "resolvedOptions", 0, resolved_options);
 }
 
-fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
     if !i.constructing {
         return Err(i.make_error("TypeError", "Intl.PluralRules requires 'new'"));
     }
-    let requested = canonicalize_locale_list(i, &arg(a, 0))?;
-    let options = coerce_options(i, &arg(a, 1))?;
+    let requested = canonicalize_locale_list(i, &arg(args, 0))?;
+    let options = coerce_options(i, &arg(args, 1))?;
     read_locale_matcher(i, &options)?;
     let kind = get_option(
         i,
@@ -37,7 +38,6 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         Some("cardinal"),
     )?
     .unwrap();
-    // Read order: type, notation, compactDisplay, then the digit + rounding options.
     let notation = get_option(
         i,
         &options,
@@ -46,6 +46,8 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         Some("standard"),
     )?
     .unwrap();
+    // ECMA-402 reads compactDisplay even when notation is not compact; it is only omitted from
+    // resolvedOptions in that case.
     let compact_display = get_option(
         i,
         &options,
@@ -54,31 +56,21 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         Some("short"),
     )?
     .unwrap();
-    let min_int = read_digits(i, &options, "minimumIntegerDigits", 1, 21, 1)?;
-    let min_frac = read_digits(i, &options, "minimumFractionDigits", 0, 100, 0)?;
-    let max_frac_default = min_frac.max(3);
-    let max_frac = read_digits(
-        i,
-        &options,
-        "maximumFractionDigits",
-        min_frac,
-        100,
-        max_frac_default,
-    )?;
-    let mnsd = read_digits_opt(i, &options, "minimumSignificantDigits", 1, 21)?;
-    let mxsd = read_digits_opt(i, &options, "maximumSignificantDigits", 1, 21)?;
-    // When either significant-digit bound is present, both are resolved (min->1, max->21).
-    let (min_sig, max_sig) = if mnsd.is_some() || mxsd.is_some() {
-        (Some(mnsd.unwrap_or(1)), Some(mxsd.unwrap_or(21)))
-    } else {
-        (None, None)
-    };
-    let _rinc = {
-        let v = ab(i.get_member(&options, "roundingIncrement"))?;
-        if matches!(v, Value::Undefined) {
-            1.0
+
+    let raw_digits = super::numberformat::read_raw_digits(i, &options)?;
+    let rounding_increment = {
+        let value = ab(i.get_member(&options, "roundingIncrement"))?;
+        if matches!(value, Value::Undefined) {
+            1
         } else {
-            ab(i.to_number(&v))?
+            let number = ab(i.to_number(&value))?;
+            const ALLOWED: &[u32] = &[
+                1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000,
+            ];
+            if !number.is_finite() || number.fract() != 0.0 || !ALLOWED.contains(&(number as u32)) {
+                return Err(i.make_error("RangeError", "invalid roundingIncrement"));
+            }
+            number as u32
         }
     };
     let rounding_mode = get_option(
@@ -99,181 +91,280 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         Some("halfExpand"),
     )?
     .unwrap();
-    let _rprio = get_option(
+    let rounding_priority = get_option(
         i,
         &options,
         "roundingPriority",
         &["auto", "morePrecision", "lessPrecision"],
         Some("auto"),
+    )?
+    .unwrap();
+    let digits = super::numberformat::interpret_digits(
+        i,
+        &raw_digits,
+        "decimal",
+        &notation,
+        &rounding_priority,
+        0,
+        rounding_increment,
     )?;
-    let _tzd = get_option(
+    if rounding_increment != 1 {
+        if digits.rounding_type != "fraction" {
+            return Err(i.make_error(
+                "TypeError",
+                "roundingIncrement requires fraction-digits rounding",
+            ));
+        }
+        if digits.min_frac != digits.max_frac {
+            return Err(i.make_error(
+                "RangeError",
+                "maximumFractionDigits must equal minimumFractionDigits with roundingIncrement",
+            ));
+        }
+    }
+    let trailing_zero_display = get_option(
         i,
         &options,
         "trailingZeroDisplay",
         &["auto", "stripIfInteger"],
         Some("auto"),
-    )?;
+    )?
+    .unwrap();
     let resolved = resolve_locale(i, &requested, &[]);
 
-    let obj = i.new_object();
+    let object = i.new_object();
     if let Some(proto) = instance_proto(i, "Intl.PluralRules")? {
-        obj.borrow_mut().proto = Some(proto);
+        object.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "__pr", Value::Bool(true));
-    set_builtin(&obj, "__pr_locale", Value::from_string(resolved.locale));
-    set_builtin(&obj, "__pr_type", Value::from_string(kind));
-    set_builtin(&obj, "__pr_minint", Value::Num(min_int as f64));
-    set_builtin(&obj, "__pr_minfrac", Value::Num(min_frac as f64));
-    set_builtin(&obj, "__pr_maxfrac", Value::Num(max_frac as f64));
-    set_builtin(&obj, "__pr_notation", Value::from_string(notation.clone()));
+    set_builtin(&object, "__pr", Value::Bool(true));
+    set_builtin(&object, "__pr_locale", Value::from_string(resolved.locale));
+    set_builtin(&object, "__pr_type", Value::from_string(kind));
+    set_builtin(&object, "__pr_notation", Value::from_string(notation));
     set_builtin(
-        &obj,
+        &object,
         "__pr_compactdisplay",
         Value::from_string(compact_display),
     );
-    set_builtin(&obj, "__pr_roundingmode", Value::from_string(rounding_mode));
-    if let (Some(mn), Some(mx)) = (min_sig, max_sig) {
-        set_builtin(&obj, "__pr_minsig", Value::Num(mn as f64));
-        set_builtin(&obj, "__pr_maxsig", Value::Num(mx as f64));
+    set_builtin(&object, "__pr_minint", Value::Num(digits.min_int as f64));
+    set_builtin(&object, "__pr_minfrac", Value::Num(digits.min_frac as f64));
+    set_builtin(&object, "__pr_maxfrac", Value::Num(digits.max_frac as f64));
+    if let Some(value) = digits.min_sig {
+        set_builtin(&object, "__pr_minsig", Value::Num(value as f64));
     }
-    Ok(Value::Obj(obj))
-}
-
-fn read_digits(
-    i: &mut Interp,
-    options: &Value,
-    prop: &str,
-    lo: u32,
-    hi: u32,
-    fallback: u32,
-) -> Result<u32, Value> {
-    let v = ab(i.get_member(options, prop))?;
-    if matches!(v, Value::Undefined) {
-        return Ok(fallback);
+    if let Some(value) = digits.max_sig {
+        set_builtin(&object, "__pr_maxsig", Value::Num(value as f64));
     }
-    let n = ab(i.to_number(&v))?;
-    if n.is_nan() || n < lo as f64 || n > hi as f64 {
-        return Err(i.make_error("RangeError", format!("{prop} out of range")));
-    }
-    Ok(n.floor() as u32)
-}
-
-fn read_digits_opt(
-    i: &mut Interp,
-    options: &Value,
-    prop: &str,
-    lo: u32,
-    hi: u32,
-) -> Result<Option<u32>, Value> {
-    let v = ab(i.get_member(options, prop))?;
-    if matches!(v, Value::Undefined) {
-        return Ok(None);
-    }
-    let n = ab(i.to_number(&v))?;
-    if n.is_nan() || n < lo as f64 || n > hi as f64 {
-        return Err(i.make_error("RangeError", format!("{prop} out of range")));
-    }
-    Ok(Some(n.floor() as u32))
-}
-
-fn select(i: &mut Interp, this: &Value, n: &Value) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "__pr")?;
-    let locale = match o.borrow().props.get("__pr_locale").map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
-        _ => "en".to_string(),
-    };
-    let x = ab(i.to_number(n))?;
-    let compact = matches!(
-        o.borrow().props.get("__pr_notation").map(|p| p.value()),
-        Some(Value::Str(s)) if &*s == "compact"
+    set_builtin(
+        &object,
+        "__pr_roundingincrement",
+        Value::Num(rounding_increment as f64),
     );
-    let lang = locale.split('-').next().unwrap_or("en");
-    let cat = if x.is_nan() || x.is_infinite() {
-        "other"
-    } else {
-        let ax = x.abs();
-        let int = ax.trunc() as u64;
-        let has_fraction = ax.fract() != 0.0;
-        // The compact exponent operand `e`: the largest 10^(3k) tier not exceeding the magnitude.
-        let e = if compact {
-            let mut v = ax;
-            let mut ex = 0i32;
-            while v >= 1000.0 {
-                v /= 1000.0;
-                ex += 3;
-            }
-            ex
-        } else {
-            0
-        };
-        data::plural_cardinal(lang, int, has_fraction, e)
-    };
-    Ok(Value::str(cat))
+    set_builtin(
+        &object,
+        "__pr_roundingmode",
+        Value::from_string(rounding_mode),
+    );
+    set_builtin(
+        &object,
+        "__pr_roundingpriority",
+        Value::from_string(rounding_priority),
+    );
+    set_builtin(
+        &object,
+        "__pr_roundingtype",
+        Value::str(digits.rounding_type),
+    );
+    set_builtin(
+        &object,
+        "__pr_trailingzero",
+        Value::from_string(trailing_zero_display),
+    );
+    Ok(Value::Obj(object))
 }
 
-/// PluralRules.prototype.selectRange: both endpoints are required and must be numbers (NaN throws
-/// RangeError). We resolve the category of the end value (CLDR range rules collapse to the end
-/// category for the locales we ship).
-fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "__pr")?;
-    if matches!(start, Value::Undefined) || matches!(end, Value::Undefined) {
-        return Err(i.make_error("TypeError", "selectRange requires two numbers"));
+fn string_slot(object: &Gc, key: &str) -> String {
+    match object
+        .borrow()
+        .props
+        .get(key)
+        .map(|property| property.value())
+    {
+        Some(Value::Str(value)) => value.to_string(),
+        _ => String::new(),
     }
-    let x = ab(i.to_number(start))?;
-    let y = ab(i.to_number(end))?;
-    if x.is_nan() || y.is_nan() {
+}
+
+fn number_slot(object: &Gc, key: &str) -> Option<u32> {
+    match object
+        .borrow()
+        .props
+        .get(key)
+        .map(|property| property.value())
+    {
+        Some(Value::Num(value)) => Some(value as u32),
+        _ => None,
+    }
+}
+
+fn compact_exponent(decimal: &str) -> u32 {
+    let decimal = decimal.strip_prefix(['+', '-']).unwrap_or(decimal);
+    let integer = decimal
+        .split_once('.')
+        .map_or(decimal, |(integer, _)| integer);
+    let significant = integer.trim_start_matches('0');
+    if significant.len() < 4 {
+        0
+    } else {
+        ((significant.len() - 1) / 3 * 3) as u32
+    }
+}
+
+/// ECMA-402 ResolvePlural: round first through FormatNumericToString, then apply the locale's
+/// cardinal/ordinal rule to that decimal string. This ordering makes visible trailing zeros and
+/// digit options participate in CLDR's v/f/t operands.
+fn resolve_plural(
+    i: &mut Interp,
+    object: &Gc,
+    value: &Value,
+) -> Result<(&'static str, String), Value> {
+    let exact = super::numberformat::exact_of(value);
+    let number = super::numberformat::to_intl_number(i, value)?;
+    if number.is_nan() {
+        return Ok(("other", "NaN".to_string()));
+    }
+    if number.is_infinite() && exact.is_none() {
+        return Ok((
+            "other",
+            if number.is_sign_negative() {
+                "-Infinity"
+            } else {
+                "Infinity"
+            }
+            .to_string(),
+        ));
+    }
+
+    let min_int = number_slot(object, "__pr_minint").unwrap_or(1);
+    let min_frac = number_slot(object, "__pr_minfrac").unwrap_or(0);
+    let max_frac = number_slot(object, "__pr_maxfrac").unwrap_or(3);
+    let min_sig = number_slot(object, "__pr_minsig");
+    let max_sig = number_slot(object, "__pr_maxsig");
+    let increment = number_slot(object, "__pr_roundingincrement").unwrap_or(1);
+    let mode = string_slot(object, "__pr_roundingmode");
+    let rounding_type = string_slot(object, "__pr_roundingtype");
+    let notation = string_slot(object, "__pr_notation");
+    let decimal = exact
+        .as_ref()
+        .and_then(|exact| {
+            // FormatNumericToString itself is notation-independent. Passing standard here allows
+            // exact BigInt/decimal digits while the already-resolved compact digit defaults still
+            // control rounding.
+            super::numberformat::exact_magnitude_options(
+                exact,
+                min_int,
+                min_frac,
+                max_frac,
+                min_sig,
+                max_sig,
+                increment,
+                &mode,
+                &rounding_type,
+                "standard",
+            )
+        })
+        .unwrap_or_else(|| {
+            super::numberformat::format_magnitude_options(
+                number,
+                min_int,
+                min_frac,
+                max_frac,
+                min_sig,
+                max_sig,
+                increment,
+                &mode,
+                &rounding_type,
+            )
+        });
+    let exponent = if notation == "compact" {
+        compact_exponent(&decimal)
+    } else {
+        0
+    };
+    let locale = string_slot(object, "__pr_locale");
+    let language = locale.split('-').next().unwrap_or("en");
+    let category = if string_slot(object, "__pr_type") == "ordinal" {
+        crate::cldr_plurals::select_ordinal(language, &decimal, exponent)
+    } else {
+        crate::cldr_plurals::select_cardinal(language, &decimal, exponent)
+    };
+    Ok((category, decimal))
+}
+
+fn select(i: &mut Interp, this: &Value, value: &Value) -> Result<Value, Value> {
+    let object = brand_slot(i, this, "__pr")?;
+    let (category, _) = resolve_plural(i, &object, value)?;
+    Ok(Value::str(category))
+}
+
+fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Result<Value, Value> {
+    let object = brand_slot(i, this, "__pr")?;
+    if matches!(start, Value::Undefined) || matches!(end, Value::Undefined) {
+        return Err(i.make_error("TypeError", "selectRange requires two values"));
+    }
+    let (start_category, start_decimal) = resolve_plural(i, &object, start)?;
+    let (end_category, end_decimal) = resolve_plural(i, &object, end)?;
+    if start_decimal == "NaN" || end_decimal == "NaN" {
         return Err(i.make_error("RangeError", "selectRange arguments must not be NaN"));
     }
-    let locale = match o.borrow().props.get("__pr_locale").map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
-        _ => "en".to_string(),
-    };
-    let lang = locale.split('-').next().unwrap_or("en");
-    let cat = if y.is_infinite() {
-        "other"
-    } else {
-        let ay = y.abs();
-        data::plural_cardinal(lang, ay.trunc() as u64, ay.fract() != 0.0, 0)
-    };
-    Ok(Value::str(cat))
+    // ResolvePluralRange returns the first category immediately when both formatted strings are
+    // equal; only distinct formatted endpoints enter the CLDR plural-range table.
+    if start_decimal == end_decimal {
+        return Ok(Value::str(start_category));
+    }
+    let locale = string_slot(&object, "__pr_locale");
+    let language = locale.split('-').next().unwrap_or("en");
+    Ok(Value::str(crate::cldr_plurals::select_range(
+        language,
+        start_category,
+        end_category,
+    )))
 }
 
-fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = brand_slot(i, &this, "__pr")?;
-    let get = |k: &str| {
-        o.borrow()
+fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let object = brand_slot(i, &this, "__pr")?;
+    let result = i.new_object();
+    let get = |key: &str| {
+        object
+            .borrow()
             .props
-            .get(k)
-            .map(|p| p.value())
+            .get(key)
+            .map(|property| property.value())
             .unwrap_or(Value::Undefined)
     };
-    let res = i.new_object();
-    set_data(&res, "locale", get("__pr_locale"));
-    set_data(&res, "type", get("__pr_type"));
-    set_data(&res, "notation", get("__pr_notation"));
-    // compactDisplay is present only for compact notation.
-    if matches!(get("__pr_notation"), Value::Str(s) if &*s == "compact") {
-        set_data(&res, "compactDisplay", get("__pr_compactdisplay"));
+    set_data(&result, "locale", get("__pr_locale"));
+    set_data(&result, "type", get("__pr_type"));
+    set_data(&result, "notation", get("__pr_notation"));
+    if matches!(get("__pr_notation"), Value::Str(value) if &*value == "compact") {
+        set_data(&result, "compactDisplay", get("__pr_compactdisplay"));
     }
-    set_data(&res, "minimumIntegerDigits", get("__pr_minint"));
-    set_data(&res, "minimumFractionDigits", get("__pr_minfrac"));
-    set_data(&res, "maximumFractionDigits", get("__pr_maxfrac"));
-    // Significant-digit bounds, when significant-digit rounding is in effect, precede pluralCategories.
+    set_data(&result, "minimumIntegerDigits", get("__pr_minint"));
+    set_data(&result, "minimumFractionDigits", get("__pr_minfrac"));
+    set_data(&result, "maximumFractionDigits", get("__pr_maxfrac"));
     if !matches!(get("__pr_minsig"), Value::Undefined) {
-        set_data(&res, "minimumSignificantDigits", get("__pr_minsig"));
-        set_data(&res, "maximumSignificantDigits", get("__pr_maxsig"));
+        set_data(&result, "minimumSignificantDigits", get("__pr_minsig"));
+        set_data(&result, "maximumSignificantDigits", get("__pr_maxsig"));
     }
-    let locale = match get("__pr_locale") {
-        Value::Str(s) => s.to_string(),
-        _ => "en".to_string(),
-    };
-    let lang = locale.split('-').next().unwrap_or("en").to_string();
-    let cats: Vec<Value> = data::plural_categories(&lang)
+    let locale = string_slot(&object, "__pr_locale");
+    let language = locale.split('-').next().unwrap_or("en");
+    let kind = string_slot(&object, "__pr_type");
+    let categories = crate::cldr_plurals::categories(language, &kind)
         .iter()
-        .map(|s| Value::str(*s))
+        .map(|category| Value::str(*category))
         .collect();
-    // pluralCategories precedes roundingMode in the resolvedOptions key order.
-    set_data(&res, "pluralCategories", i.make_array(cats));
-    set_data(&res, "roundingMode", get("__pr_roundingmode"));
-    Ok(Value::Obj(res))
+    set_data(&result, "pluralCategories", i.make_array(categories));
+    set_data(&result, "roundingIncrement", get("__pr_roundingincrement"));
+    set_data(&result, "roundingMode", get("__pr_roundingmode"));
+    set_data(&result, "roundingPriority", get("__pr_roundingpriority"));
+    set_data(&result, "trailingZeroDisplay", get("__pr_trailingzero"));
+    Ok(Value::Obj(result))
 }

@@ -1,7 +1,7 @@
 //! lumen-runtime — the event loop that turns the lumen engine into a runtime.
 //!
 //! One [`Runtime`] = one engine (one realm) + the installed extensions (timers, console,
-//! process) + a threadpool for blocking work. The engine is `!Send`, so the thread that
+//! process) + bounded executors for finite and long-lived blocking work. The engine is `!Send`, so the thread that
 //! creates the runtime owns it; everything asynchronous funnels back to that thread as
 //! either a queued JS callback or an mpsc [`TaskCompletion`].
 //!
@@ -19,7 +19,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use lumen_host::{
-    install, CallbackQueue, CompletionSender, Engine, EvalError, RuntimeInterrupt, TaskCompletion,
+    install, CallbackQueue, DedicatedExecutor, Engine, EvalError, RuntimeInterrupt, TaskCompletion,
     TaskDecoder, TaskRegistry, ThreadPool, Value,
 };
 
@@ -32,11 +32,16 @@ mod worker;
 pub use console::{describe_error, render_value, ConsoleOut};
 pub use lumen_host::{Completion, Ctx};
 
-/// Workers for blocking work. libuv's default; revisit when async fs lands and has numbers.
-const POOL_SIZE: usize = 4;
+/// Conservative defaults; deployments can tune them without rebuilding. All values are clamped
+/// so an accidental environment setting cannot recreate unbounded queues/stacks/threads.
+const DEFAULT_POOL_SIZE: usize = 4;
+const DEFAULT_WORKER_STACK_SIZE: usize = 1 << 20;
+const DEFAULT_DEDICATED_THREAD_LIMIT: usize = 256;
+const DEFAULT_DEDICATED_STACK_SIZE: usize = 512 << 10;
 
 pub struct Runtime {
     engine: Engine,
+    _dedicated: DedicatedExecutor,
     pool: ThreadPool,
     completions: mpsc::Receiver<TaskCompletion>,
     /// The error-reporting shims (see `Runtime::new`): `(error) -> suppressed` for the global
@@ -62,7 +67,32 @@ impl Runtime {
     /// use this to make termination effective even during realm/bootstrap startup.
     pub fn new_with_interrupt(interrupt: Arc<RuntimeInterrupt>) -> Runtime {
         let (tx, rx) = mpsc::channel();
-        let pool = ThreadPool::new(POOL_SIZE, tx.clone());
+        let pool_size = env_usize("LUMEN_BLOCKING_THREADS", DEFAULT_POOL_SIZE, 1, 64);
+        let queue_capacity = env_usize("LUMEN_BLOCKING_QUEUE_CAPACITY", pool_size * 64, 1, 65_536);
+        let worker_stack = env_usize(
+            "LUMEN_BLOCKING_STACK_BYTES",
+            DEFAULT_WORKER_STACK_SIZE,
+            64 << 10,
+            64 << 20,
+        );
+        let pool = ThreadPool::with_limits(pool_size, queue_capacity, worker_stack, tx.clone());
+        let canceller = pool.canceller();
+        let dedicated = DedicatedExecutor::new(
+            env_usize(
+                "LUMEN_DEDICATED_THREAD_LIMIT",
+                DEFAULT_DEDICATED_THREAD_LIMIT,
+                1,
+                4096,
+            ),
+            env_usize(
+                "LUMEN_DEDICATED_STACK_BYTES",
+                DEFAULT_DEDICATED_STACK_SIZE,
+                64 << 10,
+                64 << 20,
+            ),
+            tx.clone(),
+            canceller.clone(),
+        );
         // Install the runtime's finite trusted bootstrap before attaching the externally
         // cancellable handle. Otherwise an early Worker.terminate() can interrupt an extension's
         // own initialization and make the installer mistake host control flow for broken glue.
@@ -71,8 +101,11 @@ impl Runtime {
         engine.ctx().op_state().put(pool.handle());
         // Dedicated-thread completions for unbounded-blocking work (child stdio) that must not
         // occupy a shared pool worker.
-        engine.ctx().op_state().put(CompletionSender::new(tx));
-        engine.ctx().op_state().put(TaskRegistry::default());
+        engine.ctx().op_state().put(dedicated.handle());
+        engine
+            .ctx()
+            .op_state()
+            .put(TaskRegistry::with_canceller(canceller));
         install(
             &mut engine,
             &[
@@ -177,6 +210,7 @@ impl Runtime {
         engine.set_interrupt_handle(interrupt);
         Runtime {
             engine,
+            _dedicated: dedicated,
             pool,
             completions: rx,
             fire_error,
@@ -316,9 +350,9 @@ impl Runtime {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
-                for (cb, args) in self.take_due_timers() {
+                for task in self.take_due_timers() {
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.fire_timer(task);
                 }
                 while let Ok(done) = self.completions.try_recv() {
                     progressed = true;
@@ -418,9 +452,9 @@ impl Runtime {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
-                for (cb, args) in self.take_due_timers() {
+                for task in self.take_due_timers() {
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.fire_timer(task);
                 }
                 while let Ok(done) = self.completions.try_recv() {
                     progressed = true;
@@ -433,6 +467,11 @@ impl Runtime {
 
             if self.idle() {
                 self.engine.collect_garbage_at_idle();
+                // Collection may enqueue a FinalizationRegistry cleanup job. It is a future JS
+                // job, never an interruption of the task whose unreachable target was found.
+                if self.engine.has_pending_jobs() {
+                    continue;
+                }
                 return;
             }
 
@@ -480,7 +519,7 @@ impl Runtime {
         }
     }
 
-    fn take_due_timers(&mut self) -> Vec<(Value, Vec<Value>)> {
+    fn take_due_timers(&mut self) -> Vec<lumen_timers::TimerTask> {
         let now = Instant::now();
         match self.engine.ctx().host_mut::<lumen_timers::Timers>() {
             Some(t) => t.take_due(now),
@@ -506,7 +545,11 @@ impl Runtime {
         let Some(entry) = entry else {
             return; // cancelled while in flight
         };
-        match (entry.decode)(self.engine.ctx(), done.result) {
+        let result = match done.result {
+            Ok(payload) => (entry.decode)(self.engine.ctx(), payload),
+            Err(failure) => Err(self.engine.ctx().make_error("Error", failure.message)),
+        };
+        match result {
             Ok(args) => self.fire(&entry.on_ok, &args),
             Err(e) => match &entry.on_err {
                 Some(reject) => self.fire(reject, std::slice::from_ref(&e)),
@@ -528,6 +571,56 @@ impl Runtime {
             Ok(_) => {}
             Err(EvalError::Throw(error)) => self.report_uncaught(&error),
             Err(EvalError::Interrupted(_)) => return,
+        }
+        if self.engine.run_microtasks_interruptible().is_err() {
+            return;
+        }
+        self.report_unhandled_rejections();
+    }
+
+    /// Run one HTML timer task. Interval reinitialization and nesting-state teardown happen after
+    /// the handler (including exception reporting) but before the microtask checkpoint, matching
+    /// HTML §8.7's timer task algorithm and the event-loop task boundary.
+    fn fire_timer(&mut self, task: lumen_timers::TimerTask) {
+        let valid = self
+            .engine
+            .ctx()
+            .host_mut::<lumen_timers::Timers>()
+            .is_some_and(|timers| timers.begin_task(&task));
+        if !valid {
+            return;
+        }
+
+        let thrown = match &task.handler {
+            lumen_timers::TimerHandler::Function(callback) => {
+                let this = self.engine.global_this();
+                match self
+                    .engine
+                    .call_function_interruptible(callback, this, &task.args)
+                {
+                    Ok(_) => None,
+                    Err(EvalError::Throw(error)) => Some(error),
+                    Err(EvalError::Interrupted(_)) => None,
+                }
+            }
+            lumen_timers::TimerHandler::Code(code) => {
+                match self.engine.eval_value_interruptible(code) {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(EvalError::Throw(error))) => Some(error),
+                    Ok(Err(EvalError::Interrupted(_))) => None,
+                    Err(error) => Some(self.engine.ctx().make_error(
+                        "SyntaxError",
+                        format!("{} (line {})", error.message, error.line),
+                    )),
+                }
+            }
+        };
+        if let Some(error) = thrown {
+            self.report_uncaught(&error);
+        }
+
+        if let Some(timers) = self.engine.ctx().host_mut::<lumen_timers::Timers>() {
+            timers.finish_task(&task, Instant::now());
         }
         if self.engine.run_microtasks_interruptible().is_err() {
             return;
@@ -573,6 +666,14 @@ impl Runtime {
             console::write_err_line(self.engine.ctx(), format!("Uncaught (in promise) {text}"));
         }
     }
+}
+
+fn env_usize(name: &str, default: usize, minimum: usize, maximum: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(minimum, maximum)
 }
 
 #[cfg(test)]

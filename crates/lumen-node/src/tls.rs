@@ -82,9 +82,35 @@ struct ListenerEntry {
     listener: Arc<TcpListener>,
     closed: Arc<AtomicBool>,
     local: SocketAddr,
-    certificate: Arc<Vec<u8>>,
-    private_key: Arc<Vec<u8>>,
-    alpn: Arc<Vec<String>>,
+    context: lumen_tls::ServerContext,
+}
+
+impl Drop for TlsRegistry {
+    fn drop(&mut self) {
+        for entry in self.sockets.values() {
+            entry.closed.store(true, Ordering::Release);
+        }
+        for entry in self.listeners.values() {
+            entry.closed.store(true, Ordering::Release);
+            wake_listener(entry.local);
+        }
+    }
+}
+
+fn wake_listener(local: SocketAddr) {
+    let address = if local.ip().is_unspecified() {
+        SocketAddr::new(
+            if local.is_ipv6() {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            },
+            local.port(),
+        )
+    } else {
+        local
+    };
+    let _ = TcpStream::connect_timeout(&address, Duration::from_millis(100));
 }
 
 struct Connected {
@@ -242,6 +268,10 @@ fn op_listen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect();
+    // One SSL_CTX owns the server certificate, ALPN callback, and session cache for the listener;
+    // accepted sockets only allocate their per-connection SSL object.
+    let context = lumen_tls::ServerContext::new(&certificate, &private_key, &alpn)
+        .map_err(|error| ctx.make_error("Error", format!("TLS listen: {error}")))?;
     let listener = TcpListener::bind((if host.is_empty() { "0.0.0.0" } else { &host }, port))
         .map_err(|error| ctx.make_error("Error", format!("TLS listen: {error}")))?;
     let local = listener
@@ -256,9 +286,7 @@ fn op_listen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
             listener: Arc::new(listener),
             closed: Arc::new(AtomicBool::new(false)),
             local,
-            certificate: Arc::new(certificate),
-            private_key: Arc::new(private_key),
-            alpn: Arc::new(alpn),
+            context,
         },
     );
     let result = Value::Obj(ctx.new_object());
@@ -288,12 +316,10 @@ fn op_accept(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
             (
                 entry.listener.clone(),
                 entry.closed.clone(),
-                entry.certificate.clone(),
-                entry.private_key.clone(),
-                entry.alpn.clone(),
+                entry.context.clone(),
             )
         });
-    let Some((listener, closed, certificate, private_key, alpn)) = found else {
+    let Some((listener, closed, context)) = found else {
         CallbackQueue::enqueue(ctx.op_state(), resolve, vec![Value::Null]);
         return Ok(Value::Undefined);
     };
@@ -308,8 +334,7 @@ fn op_accept(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
                     .local_addr()
                     .unwrap_or_else(|_| listener.local_addr().unwrap());
                 tcp.set_read_timeout(Some(Duration::from_millis(100))).ok();
-                match lumen_tls::TlsStream::accept_with_alpn(tcp, &certificate, &private_key, &alpn)
-                {
+                match lumen_tls::TlsStream::accept_with_context(tcp, &context) {
                     Ok(stream) => {
                         let protocol = stream.protocol();
                         let cipher = stream.cipher();
@@ -354,19 +379,7 @@ fn op_close_server(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         .and_then(|registry| registry.listeners.remove(&id));
     if let Some(entry) = entry {
         entry.closed.store(true, Ordering::SeqCst);
-        let address = if entry.local.ip().is_unspecified() {
-            SocketAddr::new(
-                if entry.local.is_ipv6() {
-                    IpAddr::V6(Ipv6Addr::LOCALHOST)
-                } else {
-                    IpAddr::V4(Ipv4Addr::LOCALHOST)
-                },
-                entry.local.port(),
-            )
-        } else {
-            entry.local
-        };
-        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(100));
+        wake_listener(entry.local);
     }
     Ok(Value::Undefined)
 }
@@ -405,7 +418,18 @@ fn op_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
                     bytes.truncate(length);
                     break Ok(bytes);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                // RFC 8446 §5 permits handshake/control records between application-data
+                // records. OpenSSL consequently documents SSL_ERROR_WANT_READ/WANT_WRITE as
+                // retry conditions even for a blocking BIO; lumen-tls maps those to WouldBlock
+                // and Interrupted. The socket timeout is only our cancellation poll interval.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
                     std::thread::sleep(Duration::from_millis(1))
                 }
                 Err(error) => break Err(error.to_string()),

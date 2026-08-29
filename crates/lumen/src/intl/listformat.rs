@@ -5,7 +5,7 @@ use super::service::{
     resolve_locale,
 };
 use super::{
-    ab, arg, canonicalize_locale_list, data, def_getter, get_options_object as coerce_options,
+    ab, arg, canonicalize_locale_list, def_getter, get_options_object as coerce_options,
     make_service,
 };
 use crate::interpreter::Interp;
@@ -85,30 +85,93 @@ fn string_list(i: &mut Interp, list: &Value) -> Result<Vec<String>, Value> {
     Ok(out)
 }
 
-/// The literal between `{0}` and `{1}` in a two-placeholder list pattern.
-fn pat_sep(pat: &str) -> &str {
-    pat.trim_start_matches("{0}").trim_end_matches("{1}")
+type Segment = (bool, String);
+
+/// UTS #35's context-sensitive Spanish list alternations. ECMA-402 explicitly permits template
+/// selection based on the substituted values; keeping it here avoids changing or duplicating the
+/// generated CLDR data.
+fn contextual_pattern<'a>(lang: &str, pattern: &'a str, second: &str) -> std::borrow::Cow<'a, str> {
+    if lang != "es" {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let lower = second.to_lowercase();
+    let use_e = pattern.contains(" y ")
+        && (lower.starts_with('i')
+            || (lower.starts_with("hi") && !lower.starts_with("hie") && !lower.starts_with("hia")));
+    if use_e {
+        return std::borrow::Cow::Owned(pattern.replacen(" y ", " e ", 1));
+    }
+    let numeric_eleven = lower.starts_with("11")
+        && lower
+            .chars()
+            .nth(2)
+            .is_none_or(|character| !character.is_ascii_digit());
+    let use_u = pattern.contains(" o ")
+        && (lower.starts_with('o')
+            || lower.starts_with("ho")
+            || lower.starts_with('8')
+            || numeric_eleven);
+    if use_u {
+        return std::borrow::Cow::Owned(pattern.replacen(" o ", " u ", 1));
+    }
+    std::borrow::Cow::Borrowed(pattern)
 }
 
-/// CreatePartsFromList: alternating element/literal segments (`true` = element).
-fn assemble_segments(parts: &[String], pats: [&'static str; 4]) -> Vec<(bool, String)> {
-    let mut out = Vec::new();
-    let n = parts.len();
-    for (idx, p) in parts.iter().enumerate() {
-        if idx > 0 {
-            let sep = match (n, idx) {
-                (2, _) => pat_sep(pats[0]),               // pair
-                (_, 1) => pat_sep(pats[1]),               // start
-                (_, i) if i == n - 1 => pat_sep(pats[3]), // end
-                _ => pat_sep(pats[2]),                    // middle
-            };
-            if !sep.is_empty() {
-                out.push((false, sep.to_string()));
-            }
+/// DeconstructPattern for the two list placeables. Unlike the old separator extraction this
+/// preserves the prefix permitted on pair/start patterns and suffix permitted on pair/end patterns.
+fn deconstruct_pattern(pattern: &str, first: Segment, second: Vec<Segment>) -> Vec<Segment> {
+    fn push_literal(output: &mut Vec<Segment>, text: &str) {
+        if !text.is_empty() {
+            output.push((false, text.to_string()));
         }
-        out.push((true, p.clone()));
     }
-    out
+
+    let first_marker = pattern.find("{0}").expect("generated CLDR pattern has {0}");
+    let second_marker = pattern.find("{1}").expect("generated CLDR pattern has {1}");
+    debug_assert!(first_marker < second_marker);
+    let mut output = Vec::with_capacity(second.len() + 4);
+    push_literal(&mut output, &pattern[..first_marker]);
+    output.push(first);
+    push_literal(&mut output, &pattern[first_marker + 3..second_marker]);
+    output.extend(second);
+    push_literal(&mut output, &pattern[second_marker + 3..]);
+    output
+}
+
+/// ECMA-402 CreatePartsFromList / UTS #35 List Patterns, evaluated back-to-front so nested
+/// substitutions retain their element/literal records without constructing intermediate strings.
+fn assemble_segments(parts: &[String], patterns: [&'static str; 4], lang: &str) -> Vec<Segment> {
+    match parts {
+        [] => Vec::new(),
+        [only] => vec![(true, only.clone())],
+        [first, second] => {
+            let pattern = contextual_pattern(lang, patterns[0], second);
+            deconstruct_pattern(
+                &pattern,
+                (true, first.clone()),
+                vec![(true, second.clone())],
+            )
+        }
+        _ => {
+            let mut output = vec![(true, parts.last().unwrap().clone())];
+            for index in (0..parts.len() - 1).rev() {
+                let pattern = if index == 0 {
+                    patterns[1]
+                } else if index == parts.len() - 2 {
+                    patterns[3]
+                } else {
+                    patterns[2]
+                };
+                let pattern = if index == parts.len() - 2 {
+                    contextual_pattern(lang, pattern, parts.last().unwrap())
+                } else {
+                    std::borrow::Cow::Borrowed(pattern)
+                };
+                output = deconstruct_pattern(&pattern, (true, parts[index].clone()), output);
+            }
+            output
+        }
+    }
 }
 
 fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<Value, Value> {
@@ -120,8 +183,8 @@ fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<
     let (locale, kind, style) = (get("__lf_locale"), get("__lf_type"), get("__lf_style"));
     let lang = locale.split('-').next().unwrap_or("en");
     let parts = string_list(i, list)?;
-    let pats = data::list_patterns(lang, &kind, &style);
-    let segments = assemble_segments(&parts, pats);
+    let patterns = crate::cldr_lists::patterns(lang, &kind, &style);
+    let segments = assemble_segments(&parts, patterns, lang);
     if !to_parts {
         return Ok(Value::from_string(
             segments.iter().map(|(_, s)| s.as_str()).collect::<String>(),

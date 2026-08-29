@@ -160,9 +160,160 @@ fn threadpool_completions_arrive() {
     let mut seen = std::collections::HashMap::new();
     for _ in 0..16 {
         let done = rx.recv().expect("completion");
-        seen.insert(done.task, *done.result.downcast::<u64>().unwrap());
+        seen.insert(
+            done.task,
+            *done
+                .result
+                .expect("task succeeds")
+                .downcast::<u64>()
+                .unwrap(),
+        );
     }
     assert_eq!(seen.len(), 16);
     assert!((0..16).all(|id| seen[&id] == id * 2));
     drop(pool); // joins workers; must not deadlock
+}
+
+#[test]
+fn threadpool_contains_panics_and_keeps_the_worker_alive() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pool = ThreadPool::with_limits(1, 4, 128 << 10, tx);
+    pool.spawn_blocking(1, || panic!("contained worker panic"));
+    pool.spawn_blocking(2, || Box::new(42u64));
+
+    let first = rx.recv().unwrap();
+    assert_eq!(first.task, 1);
+    assert!(first
+        .result
+        .err()
+        .unwrap()
+        .message
+        .contains("contained worker panic"));
+    let second = rx.recv().unwrap();
+    assert_eq!(second.task, 2);
+    assert_eq!(*second.result.unwrap().downcast::<u64>().unwrap(), 42);
+}
+
+#[test]
+fn threadpool_queue_is_bounded_and_reports_overload() {
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let pool = ThreadPool::with_limits(1, 1, 128 << 10, completion_tx);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    pool.spawn_blocking(1, move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        Box::new(())
+    });
+    started_rx.recv().unwrap();
+    pool.spawn_blocking(2, || Box::new(()));
+    pool.spawn_blocking(3, || Box::new(()));
+
+    let overloaded = completion_rx.recv().unwrap();
+    assert_eq!(overloaded.task, 3);
+    assert!(overloaded
+        .result
+        .err()
+        .unwrap()
+        .message
+        .contains("queue is full"));
+    release_tx.send(()).unwrap();
+    assert!(completion_rx.recv().unwrap().result.is_ok());
+    assert!(completion_rx.recv().unwrap().result.is_ok());
+}
+
+#[test]
+fn threadpool_drop_has_a_bounded_grace_period() {
+    let (completion_tx, _completion_rx) = std::sync::mpsc::channel();
+    let pool = ThreadPool::with_limits(1, 1, 128 << 10, completion_tx);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    pool.spawn_blocking(1, move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        Box::new(())
+    });
+    started_rx.recv().unwrap();
+    let start = std::time::Instant::now();
+    drop(pool);
+    assert!(start.elapsed() < std::time::Duration::from_millis(750));
+    release_tx.send(()).unwrap();
+}
+
+#[test]
+fn dedicated_executor_bounds_threads_and_contains_panics() {
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let executor = DedicatedExecutor::new(1, 128 << 10, completion_tx, TaskCanceller::default());
+    let handle = executor.handle();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    handle.run_blocking(1, move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        Box::new(())
+    });
+    started_rx.recv().unwrap();
+    handle.run_blocking(2, || Box::new(()));
+    let limited = completion_rx.recv().unwrap();
+    assert_eq!(limited.task, 2);
+    assert!(limited
+        .result
+        .err()
+        .unwrap()
+        .message
+        .contains("thread limit"));
+    release_tx.send(()).unwrap();
+    assert!(completion_rx.recv().unwrap().result.is_ok());
+
+    handle.run_blocking(3, || panic!("dedicated panic"));
+    let panicked = completion_rx.recv().unwrap();
+    assert_eq!(panicked.task, 3);
+    assert!(panicked
+        .result
+        .err()
+        .unwrap()
+        .message
+        .contains("dedicated panic"));
+
+    drop(executor);
+    handle.run_blocking(4, || Box::new(()));
+    let stopped = completion_rx.recv().unwrap();
+    assert_eq!(stopped.task, 4);
+    assert!(stopped
+        .result
+        .err()
+        .unwrap()
+        .message
+        .contains("shutting down"));
+}
+
+#[test]
+fn task_registry_cancellation_prevents_queued_work_from_starting() {
+    fn decode(
+        _ctx: &mut Ctx,
+        _payload: Box<dyn std::any::Any + Send>,
+    ) -> Result<Vec<Value>, Value> {
+        Ok(vec![])
+    }
+
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let pool = ThreadPool::with_limits(1, 2, 128 << 10, completion_tx);
+    let mut registry = TaskRegistry::with_canceller(pool.canceller());
+    let first = registry.register(Value::Undefined, None, decode);
+    let second = registry.register(Value::Undefined, None, decode);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    pool.spawn_blocking(first, move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        Box::new(())
+    });
+    started_rx.recv().unwrap();
+    pool.spawn_blocking(second, || panic!("cancelled task must not run"));
+    assert!(registry.cancel(second).is_some());
+    release_tx.send(()).unwrap();
+    assert_eq!(completion_rx.recv().unwrap().task, first);
+    assert!(completion_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
 }

@@ -1,8 +1,8 @@
-//! Unicode normalization data (generated from Python's unicodedata, UCD 16.0.0).
-//! Non-recursive canonical decompositions, compat (NFKD) expansions, nonzero combining
-//! classes, and the derived canonical composition pairs. Hangul is handled algorithmically.
+//! Unicode normalization data generated from the official UCD 17.0.0 files.
+//! Canonical/compatibility decomposition, nonzero combining classes, and composition
+//! pairs implement UAX #15; Hangul is handled algorithmically by unicode_norm_impl.
 
-/// (cp, first, second) — canonical decomposition; second == 0 means a singleton.
+#[rustfmt::skip]
 pub static CANON_DECOMP: &[(u32, u32, u32)] = &[
     (0xC0, 0x41, 0x300),
     (0xC1, 0x41, 0x301),
@@ -2087,7 +2087,7 @@ pub static CANON_DECOMP: &[(u32, u32, u32)] = &[
     (0x2FA1D, 0x2A600, 0x0),
 ];
 
-/// (cp, fully-expanded NFKD code points) for characters with a compatibility decomposition.
+#[rustfmt::skip]
 pub static COMPAT_DECOMP: &[(u32, &[u32])] = &[
     (0xA0, &[0x20]),
     (0xA8, &[0x20, 0x308]),
@@ -2953,10 +2953,7 @@ pub static COMPAT_DECOMP: &[(u32, &[u32])] = &[
     (0x321A, &[0x28, 0x1111, 0x1161, 0x29]),
     (0x321B, &[0x28, 0x1112, 0x1161, 0x29]),
     (0x321C, &[0x28, 0x110C, 0x116E, 0x29]),
-    (
-        0x321D,
-        &[0x28, 0x110B, 0x1169, 0x110C, 0x1165, 0x11AB, 0x29],
-    ),
+    (0x321D, &[0x28, 0x110B, 0x1169, 0x110C, 0x1165, 0x11AB, 0x29]),
     (0x321E, &[0x28, 0x110B, 0x1169, 0x1112, 0x116E, 0x29]),
     (0x3220, &[0x28, 0x4E00, 0x29]),
     (0x3221, &[0x28, 0x4E8C, 0x29]),
@@ -3432,6 +3429,7 @@ pub static COMPAT_DECOMP: &[(u32, &[u32])] = &[
     (0xA69C, &[0x44A]),
     (0xA69D, &[0x44C]),
     (0xA770, &[0xA76F]),
+    (0xA7F1, &[0x53]),
     (0xA7F2, &[0x43]),
     (0xA7F3, &[0x46]),
     (0xA7F4, &[0x51]),
@@ -4054,17 +4052,8 @@ pub static COMPAT_DECOMP: &[(u32, &[u32])] = &[
     (0xFDF7, &[0x639, 0x644, 0x64A, 0x647]),
     (0xFDF8, &[0x648, 0x633, 0x644, 0x645]),
     (0xFDF9, &[0x635, 0x644, 0x649]),
-    (
-        0xFDFA,
-        &[
-            0x635, 0x644, 0x649, 0x20, 0x627, 0x644, 0x644, 0x647, 0x20, 0x639, 0x644, 0x64A,
-            0x647, 0x20, 0x648, 0x633, 0x644, 0x645,
-        ],
-    ),
-    (
-        0xFDFB,
-        &[0x62C, 0x644, 0x20, 0x62C, 0x644, 0x627, 0x644, 0x647],
-    ),
+    (0xFDFA, &[0x635, 0x644, 0x649, 0x20, 0x627, 0x644, 0x644, 0x647, 0x20, 0x639, 0x644, 0x64A, 0x647, 0x20, 0x648, 0x633, 0x644, 0x645]),
+    (0xFDFB, &[0x62C, 0x644, 0x20, 0x62C, 0x644, 0x627, 0x644, 0x647]),
     (0xFDFC, &[0x631, 0x6CC, 0x627, 0x644]),
     (0xFE10, &[0x2C]),
     (0xFE11, &[0x3001]),
@@ -5935,7 +5924,7 @@ pub static COMPAT_DECOMP: &[(u32, &[u32])] = &[
     (0x1FBF9, &[0x39]),
 ];
 
-/// (cp, canonical combining class) for every nonzero-class character.
+#[rustfmt::skip]
 pub static CCC: &[(u32, u8)] = &[
     (0x300, 230),
     (0x301, 230),
@@ -6397,6 +6386,33 @@ pub static CCC: &[(u32, u8)] = &[
     (0x1ACC, 230),
     (0x1ACD, 230),
     (0x1ACE, 230),
+    (0x1ACF, 230),
+    (0x1AD0, 230),
+    (0x1AD1, 230),
+    (0x1AD2, 230),
+    (0x1AD3, 230),
+    (0x1AD4, 230),
+    (0x1AD5, 230),
+    (0x1AD6, 230),
+    (0x1AD7, 230),
+    (0x1AD8, 230),
+    (0x1AD9, 230),
+    (0x1ADA, 230),
+    (0x1ADB, 230),
+    (0x1ADC, 230),
+    (0x1ADD, 220),
+    (0x1AE0, 230),
+    (0x1AE1, 230),
+    (0x1AE2, 230),
+    (0x1AE3, 230),
+    (0x1AE4, 230),
+    (0x1AE5, 230),
+    (0x1AE6, 220),
+    (0x1AE7, 230),
+    (0x1AE8, 230),
+    (0x1AE9, 230),
+    (0x1AEA, 230),
+    (0x1AEB, 234),
     (0x1B34, 7),
     (0x1B44, 9),
     (0x1B6B, 230),
@@ -6671,6 +6687,8 @@ pub static CCC: &[(u32, u8)] = &[
     (0x10D6D, 230),
     (0x10EAB, 230),
     (0x10EAC, 230),
+    (0x10EFA, 220),
+    (0x10EFB, 220),
     (0x10EFD, 220),
     (0x10EFE, 220),
     (0x10EFF, 220),
@@ -6857,6 +6875,11 @@ pub static CCC: &[(u32, u8)] = &[
     (0x1E4EF, 230),
     (0x1E5EE, 230),
     (0x1E5EF, 220),
+    (0x1E6E3, 230),
+    (0x1E6E6, 230),
+    (0x1E6EE, 230),
+    (0x1E6EF, 230),
+    (0x1E6F5, 230),
     (0x1E8D0, 220),
     (0x1E8D1, 220),
     (0x1E8D2, 220),
@@ -6873,7 +6896,7 @@ pub static CCC: &[(u32, u8)] = &[
     (0x1E94A, 7),
 ];
 
-/// (starter, combining, composed) — primary canonical composites (exclusions removed).
+#[rustfmt::skip]
 pub static COMPOSE: &[(u32, u32, u32)] = &[
     (0x3C, 0x338, 0x226E),
     (0x3D, 0x338, 0x2260),

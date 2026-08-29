@@ -55,6 +55,10 @@ fn tls_server_accepts_verified_client_and_exchanges_data() {
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
 
+    // Runtime bootstrap can legitimately take longer than the old fixed client delay on a busy
+    // debug builder. Construct it before starting the one-shot OpenSSL client so a transient
+    // ECONNREFUSED cannot strand the server's accept loop.
+    let mut runtime = Runtime::new();
     let client_cert = certificate.clone();
     let client = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(750));
@@ -78,7 +82,6 @@ fn tls_server_accepts_verified_client_and_exchanges_data() {
         child.wait_with_output().unwrap()
     });
 
-    let mut runtime = Runtime::new();
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
@@ -151,7 +154,8 @@ fn tls_client_upgrades_a_paused_tcp_socket() {
         const raw = new net.Socket({{ _deferRead: true }});
         raw.connect({port}, "127.0.0.1", () => {{
           const secure = new tls.TLSSocket(raw, {{ servername: "localhost", rejectUnauthorized: false }});
-          secure.once("secureConnect", () => secure.write("ping"));
+          // Exceed the native TLS read poll interval so SSL_ERROR_WANT_READ must be retried.
+          secure.once("secureConnect", () => setTimeout(() => secure.write("ping"), 250));
           secure.on("data", data => {{ console.log(data.toString()); secure.end(); server.close(); }});
         }});
       }});

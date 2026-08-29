@@ -5,13 +5,35 @@
 //! the commonly-used syntax: literals, `.`, character classes (`[...]`, `\d\w\s` and negations),
 //! anchors (`^ $ \b \B`), quantifiers (`* + ? {n} {n,} {n,m}`, greedy + lazy), groups (capturing,
 //! `(?:)`), alternation, backreferences, and lookahead (`(?= )` / `(?! )`), with the `g i m s y`
-//! flags. Backtracking is bounded by a step budget so pathological patterns fail instead of hanging.
+//! flags. Backtracking is bounded by a step budget so pathological patterns terminate with an
+//! explicit resource error instead of hanging or being mistaken for an ordinary no-match.
 
 use std::rc::Rc;
 
 const MAX_REPEAT: usize = 1000;
 const STEP_LIMIT: u64 = 2_000_000;
 const INLINE_CAPTURES: usize = 4;
+const INTERRUPT_POLL_MASK: usize = 0x3fff;
+
+/// A matcher implementation limit is not an ECMAScript match failure. RegExpBuiltinExec may
+/// return `null` only after its matcher returns failure (ECMA-262 §22.2.7.2); collapsing exhausted
+/// backtracking into failure can silently choose the wrong program branch. Host interruption is
+/// likewise control flow, not a JavaScript no-match result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatchError {
+    ResourceExhausted,
+    Interrupted(crate::InterruptReason),
+}
+
+pub(crate) type MatchResult<T> = Result<Option<T>, MatchError>;
+
+#[inline]
+fn poll_interrupt(control: &crate::RuntimeInterrupt) -> Result<(), MatchError> {
+    match control.current_reason() {
+        Some(reason) => Err(MatchError::Interrupted(reason)),
+        None => Ok(()),
+    }
+}
 
 pub(crate) enum Captures {
     Inline {
@@ -84,6 +106,9 @@ pub struct Regex {
     /// Capture-free, case-sensitive ASCII literal program. Searching it directly is equivalent
     /// to executing `Save(0), Char*, Save(1), Match`, without paying the backtracking VM dispatch.
     literal_ascii: Option<Box<[u8]>>,
+    /// Capture-free programs containing a string-valued UnicodeSets class can memoize failed
+    /// continuation states without changing observable captures.
+    memo_string_failures: bool,
     /// [`FirstFilter::Atoms`] baked into a byte-indexed table (elements < 256): the scan loop
     /// becomes one load per position.
     first_lut: Option<Box<[bool; 256]>>,
@@ -105,6 +130,13 @@ enum Inst {
     Char(u32),
     Any,
     Class(Rc<CharClass>),
+    StringSet(Rc<StringSet>),
+    StringSetRepeat {
+        set: Rc<StringSet>,
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+    },
     Save(usize),
     Split(usize, usize),
     Jmp(usize),
@@ -190,6 +222,18 @@ fn first_filter(prog: &[Inst], multiline: bool) -> FirstFilter {
             Inst::Char(c) => atoms.push(Rep::Char(*c)),
             Inst::Any => atoms.push(Rep::Any),
             Inst::Class(cc) => atoms.push(Rep::Class(cc.clone())),
+            Inst::StringSet(set) => {
+                atoms.push(Rep::Class(Rc::new(clone_class(&set.first))));
+                if set.empty {
+                    stack.push(pc + 1);
+                }
+            }
+            Inst::StringSetRepeat { set, min, .. } => {
+                atoms.push(Rep::Class(Rc::new(clone_class(&set.first))));
+                if *min == 0 || set.empty {
+                    stack.push(pc + 1);
+                }
+            }
             Inst::Many { rep, min, .. } => {
                 atoms.push(rep.clone());
                 if *min == 0 {
@@ -292,6 +336,89 @@ impl CharClass {
             }
         }
         false
+    }
+}
+
+#[derive(Clone, Default)]
+struct StringTrieNode {
+    edges: Vec<(u32, usize)>,
+    terminal: bool,
+}
+
+#[derive(Clone)]
+struct StringTrie {
+    nodes: Vec<StringTrieNode>,
+    max_depth: usize,
+}
+
+impl StringTrie {
+    fn build(strings: &[Vec<char>], backwards: bool) -> Self {
+        let mut trie = Self {
+            nodes: vec![StringTrieNode::default()],
+            max_depth: 0,
+        };
+        for string in strings {
+            debug_assert!(string.len() > 1);
+            trie.max_depth = trie.max_depth.max(string.len());
+            let mut node = 0usize;
+            if backwards {
+                for character in string.iter().rev() {
+                    node = trie.insert_edge(node, *character as u32);
+                }
+            } else {
+                for character in string {
+                    node = trie.insert_edge(node, *character as u32);
+                }
+            }
+            trie.nodes[node].terminal = true;
+        }
+        trie
+    }
+
+    fn insert_edge(&mut self, node: usize, code_point: u32) -> usize {
+        match self.nodes[node]
+            .edges
+            .binary_search_by_key(&code_point, |edge| edge.0)
+        {
+            Ok(index) => self.nodes[node].edges[index].1,
+            Err(index) => {
+                let child = self.nodes.len();
+                self.nodes.push(StringTrieNode::default());
+                self.nodes[node].edges.insert(index, (code_point, child));
+                child
+            }
+        }
+    }
+}
+
+/// ECMA-262 §22.2.2.7 compiles a UnicodeSets class's string elements as alternatives sorted by
+/// descending length, followed by its singleton class and then its empty element. Two tries share
+/// common prefixes for forward and backwards matching while [`Matcher::run_inner`] still invokes
+/// the continuation at every matching length in that normative order.
+#[derive(Clone)]
+struct StringSet {
+    forward: StringTrie,
+    backward: StringTrie,
+    singles: CharClass,
+    first: CharClass,
+    empty: bool,
+}
+
+impl StringSet {
+    fn new(strings: Vec<Vec<char>>, singles: CharClass, empty: bool) -> Self {
+        let forward = StringTrie::build(&strings, false);
+        let backward = StringTrie::build(&strings, true);
+        let mut first = clone_class(&singles);
+        for &(code_point, _) in &forward.nodes[0].edges {
+            first.ranges.push((code_point, code_point));
+        }
+        Self {
+            forward,
+            backward,
+            singles,
+            first,
+            empty,
+        }
     }
 }
 
@@ -433,6 +560,9 @@ enum Node {
     Char(u32),
     Any,
     Class(CharClass),
+    /// A UnicodeSets character class containing multi-code-point strings. The compact trie keeps
+    /// the specification's descending-length alternatives without a flat O(strings) Split chain.
+    StringSet(Rc<StringSet>),
     Concat(Vec<Node>),
     Alt(Vec<Node>),
     Group(Option<usize>, Box<Node>),
@@ -533,6 +663,22 @@ pub struct ReText {
 }
 
 impl ReText {
+    /// Retained allocation size excluding the source string itself (the identity cache owns and
+    /// accounts that allocation once alongside this prepared view).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.elems
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.unit_of.as_ref().map_or(0, |offsets| {
+                offsets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>())
+            }))
+    }
+
     /// Prepare `s` for matching, keeping the caller's `Rc` for zero-copy ASCII slicing.
     pub fn new_rc(unicode: bool, s: &crate::lstr::LStr) -> ReText {
         // Engine strings maintain an exact one-way ASCII hint in their allocation header.
@@ -690,6 +836,37 @@ fn has_named_group(pattern: &str) -> bool {
 }
 
 impl Regex {
+    /// Conservative retained heap size of this immutable compiled matcher. Shared character
+    /// classes/lookaround programs may be counted more than once; over-accounting only evicts a
+    /// reconstructible cache entry sooner and avoids an expensive graph-dedup pass on insertion.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let first = match &self.first {
+            FirstFilter::Atoms(atoms) => atoms
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Rep>())
+                .saturating_add(atoms.iter().map(rep_heap_bytes).sum::<usize>()),
+            _ => 0,
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(program_heap_bytes(&self.prog, self.prog.capacity()))
+            .saturating_add(first)
+            .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
+            .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.flags.capacity())
+            .saturating_add(
+                self.names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, usize)>()),
+            )
+            .saturating_add(
+                self.names
+                    .iter()
+                    .map(|(name, _)| name.capacity())
+                    .sum::<usize>(),
+            )
+    }
+
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
         let mut seen = String::new();
         for f in flags.chars() {
@@ -784,12 +961,14 @@ impl Regex {
         } else {
             None
         };
+        let memo_string_failures = p.ngroups == 0 && program_contains_string_set(&prog);
         let mut re = Regex {
             unicode,
             nmarks,
             first,
             first_byte,
             literal_ascii,
+            memo_string_failures,
             first_lut: None,
             prog,
             ngroups: p.ngroups,
@@ -846,36 +1025,60 @@ impl Regex {
     }
 
     /// Match a prepared subject and return shared capture spans.
-    pub fn exec_text_shared(&self, text: &ReText, start: usize) -> Option<Captures> {
+    pub fn exec_text_shared(
+        &self,
+        text: &ReText,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<Captures> {
         match &text.ascii_src {
             Some(s) => {
                 if let Some(literal) = &self.literal_ascii {
-                    let span = find_ascii_literal(s.as_bytes(), start, literal, self.sticky)?;
-                    Some(Captures::one(span))
+                    Ok(
+                        find_ascii_literal(s.as_bytes(), start, literal, self.sticky, control)?
+                            .map(Captures::one),
+                    )
                 } else {
-                    self.exec_impl(s.as_bytes(), start)
+                    self.exec_impl(s.as_bytes(), start, control)
                 }
             }
-            None => self.exec_impl(&text.elems[..], start),
+            None => self.exec_impl(&text.elems[..], start, control),
         }
     }
 
     /// Match for a caller that only observes matcher side effects.
-    pub fn exec_text_discard_shared(&self, text: &ReText, start: usize) -> Option<Captures> {
-        self.exec_text_shared(text, start)
+    pub fn exec_text_discard_shared(
+        &self,
+        text: &ReText,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<Captures> {
+        self.exec_text_shared(text, start, control)
     }
 
     /// Whole-match-only search for operations whose JavaScript result is dead. Capture groups
     /// can be recovered lazily if a legacy RegExp static is subsequently observed.
-    pub(crate) fn find_text_shared(&self, text: &ReText, start: usize) -> Option<(usize, usize)> {
-        self.exec_text_shared(text, start)
-            .and_then(|captures| captures[0])
+    pub(crate) fn find_text_shared(
+        &self,
+        text: &ReText,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<(usize, usize)> {
+        Ok(self
+            .exec_text_shared(text, start, control)?
+            .and_then(|captures| captures[0]))
     }
 
-    fn exec_impl<I: ReInput>(&self, input: I, start: usize) -> Option<Captures> {
+    fn exec_impl<I: ReInput>(
+        &self,
+        input: I,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<Captures> {
         if start > input.len() {
-            return None;
+            return Ok(None);
         }
+        poll_interrupt(control)?;
         // One matcher for the whole scan, its working buffers recycled across `exec` calls via a
         // thread-local (the engine is single-threaded per Interp).
         let mut scratch = MATCH_SCRATCH
@@ -898,18 +1101,25 @@ impl Regex {
             back: false,
             flags: scratch.flags,
             unicode: self.flags.contains('u') || self.flags.contains('v'),
+            control,
+            abort: None,
+            // With no observable capture groups, failure at a StringSet instruction depends only
+            // on program position, subject position, direction, and active flags. Memoizing those
+            // failures turns ambiguous emoji-sequence repetition into dynamic programming while
+            // preserving the specification's alternative order.
+            string_failures: self.memo_string_failures.then(Default::default),
         };
         let mut from = start;
         let result = 'scan: loop {
             if from > input.len() {
-                break 'scan None;
+                break 'scan Ok(None);
             }
             // Prescan: skip positions that cannot begin a match. Sticky regexes get exactly one
             // attempt at `start`, so the filter only ever saves that single attempt for them.
             if !self.sticky {
                 if let Some(byte) = self.first_byte {
-                    let Some(found) = input.find_byte(from, byte) else {
-                        break 'scan None;
+                    let Some(found) = input.find_byte(from, byte, control)? else {
+                        break 'scan Ok(None);
                     };
                     from = found;
                 } else {
@@ -918,7 +1128,7 @@ impl Regex {
                             // `^` (non-multiline) can only match at position 0: one attempt at
                             // `from` decides the scan (any later position fails the assert too).
                             if from > 0 {
-                                break 'scan None;
+                                break 'scan Ok(None);
                             }
                         }
                         FirstFilter::Atoms(atoms) => {
@@ -927,7 +1137,7 @@ impl Regex {
                             let len = input.len();
                             loop {
                                 if from >= len {
-                                    break 'scan None;
+                                    break 'scan Ok(None);
                                 }
                                 let c = input.at(from);
                                 let viable = match &self.first_lut {
@@ -938,6 +1148,9 @@ impl Regex {
                                     break;
                                 }
                                 from += 1;
+                                if from & INTERRUPT_POLL_MASK == 0 {
+                                    poll_interrupt(control)?;
+                                }
                             }
                         }
                         FirstFilter::None => {}
@@ -947,13 +1160,19 @@ impl Regex {
             m.caps.fill(None);
             m.marks.fill(None);
             m.flags.truncate(1);
+            // The implementation limit bounds one invocation of the compiled matcher, matching
+            // RegExpBuiltinExec's repeated invocation of the matcher at successive input indices.
+            // Keeping it per candidate avoids rejecting an otherwise linear scan of a long input.
             m.steps = 0;
             m.depth = 0;
             if m.run(&self.prog, 0, from) {
-                break 'scan Some(Captures::from_slots(&m.caps, self.ngroups));
+                break 'scan Ok(Some(Captures::from_slots(&m.caps, self.ngroups)));
+            }
+            if let Some(error) = m.abort {
+                break 'scan Err(error);
             }
             if self.sticky {
-                break 'scan None;
+                break 'scan Ok(None);
             }
             from += 1;
         };
@@ -966,6 +1185,88 @@ impl Regex {
         });
         result
     }
+}
+
+fn program_heap_bytes(program: &[Inst], capacity: usize) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<Inst>())
+        .saturating_add(program.iter().map(inst_heap_bytes).sum::<usize>())
+}
+
+fn program_contains_string_set(program: &[Inst]) -> bool {
+    program.iter().any(|instruction| match instruction {
+        Inst::StringSet(_) | Inst::StringSetRepeat { .. } => true,
+        Inst::Look { prog, .. } | Inst::LookBehind { prog, .. } => {
+            program_contains_string_set(prog)
+        }
+        _ => false,
+    })
+}
+
+fn inst_heap_bytes(inst: &Inst) -> usize {
+    match inst {
+        Inst::Class(class) => char_class_heap_bytes(class),
+        Inst::StringSet(set) => string_set_heap_bytes(set),
+        Inst::StringSetRepeat { set, .. } => string_set_heap_bytes(set),
+        Inst::BackrefAlt(groups) => std::mem::size_of::<Vec<usize>>().saturating_add(
+            groups
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        ),
+        Inst::Look { prog, .. } | Inst::LookBehind { prog, .. } => std::mem::size_of::<Vec<Inst>>()
+            .saturating_add(program_heap_bytes(prog, prog.capacity())),
+        Inst::Many { rep, .. } => rep_heap_bytes(rep),
+        _ => 0,
+    }
+}
+
+fn string_set_heap_bytes(set: &StringSet) -> usize {
+    let trie_bytes = |trie: &StringTrie| {
+        trie.nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<StringTrieNode>())
+            .saturating_add(trie.nodes.iter().fold(0usize, |bytes, node| {
+                bytes.saturating_add(
+                    node.edges
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(u32, usize)>()),
+                )
+            }))
+    };
+    std::mem::size_of::<StringSet>()
+        .saturating_add(trie_bytes(&set.forward))
+        .saturating_add(trie_bytes(&set.backward))
+        .saturating_add(char_class_heap_bytes(&set.singles))
+        .saturating_add(char_class_heap_bytes(&set.first))
+}
+
+fn rep_heap_bytes(rep: &Rep) -> usize {
+    match rep {
+        Rep::Class(class) => char_class_heap_bytes(class),
+        _ => 0,
+    }
+}
+
+fn char_class_heap_bytes(class: &CharClass) -> usize {
+    std::mem::size_of::<CharClass>()
+        .saturating_add(
+            class
+                .ranges
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u32, u32)>()),
+        )
+        .saturating_add(
+            class
+                .builtins
+                .capacity()
+                .saturating_mul(std::mem::size_of::<char>()),
+        )
+        .saturating_add(
+            class
+                .props
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(bool, &'static [(u32, u32)])>()),
+        )
 }
 
 /// Recycled matcher working buffers (see `Regex::exec_at`).
@@ -2039,6 +2340,7 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), 
         Node::Char(c) => prog.push(Inst::Char(*c)),
         Node::Any => prog.push(Inst::Any),
         Node::Class(cc) => prog.push(Inst::Class(Rc::new(clone_class(cc)))),
+        Node::StringSet(set) => prog.push(Inst::StringSet(set.clone())),
         Node::Start => prog.push(Inst::AssertStart),
         Node::End => prog.push(Inst::AssertEnd),
         Node::WordB(b) => prog.push(Inst::WordBoundary(*b)),
@@ -2133,6 +2435,18 @@ fn compile_repeat(
     prog: &mut Vec<Inst>,
     nmarks: &mut usize,
 ) -> Result<(), String> {
+    // A variable-length UnicodeSets atom needs explicit heap state: compiling it through the
+    // general Split/SetMark loop recurses once per matched string and exhausts the native matcher
+    // stack on otherwise linear, standards-generated emoji corpora.
+    if let Node::StringSet(set) = inner {
+        prog.push(Inst::StringSetRepeat {
+            set: set.clone(),
+            min,
+            max,
+            greedy,
+        });
+        return Ok(());
+    }
     // Fast path: a repeated single-character atom consumes iteratively (no per-character
     // recursion), so arbitrarily large counts (up to 2^53-1) cost nothing to compile.
     if let Some(rep) = single_char_rep(inner) {
@@ -2378,27 +2692,31 @@ fn find_ascii_literal(
     start: usize,
     literal: &[u8],
     sticky: bool,
-) -> Option<(usize, usize)> {
+    control: &crate::RuntimeInterrupt,
+) -> MatchResult<(usize, usize)> {
     if start > subject.len() || literal.len() > subject.len().saturating_sub(start) {
-        return None;
+        return Ok(None);
     }
+    poll_interrupt(control)?;
     if sticky {
-        return subject[start..]
+        return Ok(subject[start..]
             .starts_with(literal)
-            .then_some((start, start + literal.len()));
+            .then_some((start, start + literal.len())));
     }
     let mut from = start;
     while from + literal.len() <= subject.len() {
-        let found = subject.find_byte(from, literal[0])?;
+        let Some(found) = subject.find_byte(from, literal[0], control)? else {
+            return Ok(None);
+        };
         if found + literal.len() > subject.len() {
-            return None;
+            return Ok(None);
         }
         if subject[found..].starts_with(literal) {
-            return Some((found, found + literal.len()));
+            return Ok(Some((found, found + literal.len())));
         }
         from = found + 1;
     }
-    None
+    Ok(None)
 }
 
 /// The matcher's view of a subject: element `i` as a code point / code unit. Monomorphized for
@@ -2409,14 +2727,22 @@ pub trait ReInput: Copy {
     fn at(&self, i: usize) -> u32;
 
     #[inline]
-    fn find_byte(&self, mut from: usize, byte: u8) -> Option<usize> {
+    fn find_byte(
+        &self,
+        mut from: usize,
+        byte: u8,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
         while from < self.len() {
             if self.at(from) == byte as u32 {
-                return Some(from);
+                return Ok(Some(from));
             }
             from += 1;
+            if from & INTERRUPT_POLL_MASK == 0 {
+                poll_interrupt(control)?;
+            }
         }
-        None
+        Ok(None)
     }
 }
 
@@ -2431,26 +2757,36 @@ impl ReInput for &[u8] {
     }
 
     #[inline]
-    fn find_byte(&self, from: usize, byte: u8) -> Option<usize> {
-        let bytes = self.get(from..)?;
+    fn find_byte(
+        &self,
+        from: usize,
+        byte: u8,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<usize> {
+        let Some(bytes) = self.get(from..) else {
+            return Ok(None);
+        };
         let repeated = u64::from_ne_bytes([byte; 8]);
         let low_bits = 0x0101_0101_0101_0101u64;
         let high_bits = 0x8080_8080_8080_8080u64;
         let bulk_len = bytes.len() / 8 * 8;
         for (chunk_index, chunk) in bytes[..bulk_len].chunks(8).enumerate() {
+            if chunk_index & (INTERRUPT_POLL_MASK / 8) == 0 {
+                poll_interrupt(control)?;
+            }
             let word = u64::from_ne_bytes(chunk.try_into().unwrap());
             let different = word ^ repeated;
             if different.wrapping_sub(low_bits) & !different & high_bits != 0 {
                 if let Some(offset) = chunk.iter().position(|candidate| *candidate == byte) {
-                    return Some(from + chunk_index * 8 + offset);
+                    return Ok(Some(from + chunk_index * 8 + offset));
                 }
             }
         }
         let tail_start = from + bulk_len;
-        bytes[bulk_len..]
+        Ok(bytes[bulk_len..]
             .iter()
             .position(|candidate| *candidate == byte)
-            .map(|offset| tail_start + offset)
+            .map(|offset| tail_start + offset))
     }
 }
 
@@ -2465,7 +2801,7 @@ impl ReInput for &[u32] {
     }
 }
 
-struct Matcher<I: ReInput> {
+struct Matcher<'a, I: ReInput> {
     input: I,
     caps: Vec<Option<usize>>,
     marks: Vec<Option<usize>>,
@@ -2479,9 +2815,53 @@ struct Matcher<I: ReInput> {
     /// Unicode mode (`u`/`v`): case-insensitive matching uses full case folding instead of the
     /// legacy Canonicalize (simple uppercase, never folding non-ASCII to ASCII).
     unicode: bool,
+    control: &'a crate::RuntimeInterrupt,
+    abort: Option<MatchError>,
+    string_failures: Option<std::collections::HashSet<(usize, usize, usize, usize, bool, u8)>>,
 }
 
-impl<I: ReInput> Matcher<I> {
+impl<I: ReInput> Matcher<'_, I> {
+    #[inline(always)]
+    fn tick(&mut self) -> bool {
+        if self.abort.is_some() {
+            return false;
+        }
+        self.steps += 1;
+        if self.steps > STEP_LIMIT {
+            self.abort = Some(MatchError::ResourceExhausted);
+            return false;
+        }
+        if self.steps as usize & INTERRUPT_POLL_MASK == 0 {
+            if let Err(error) = poll_interrupt(self.control) {
+                self.abort = Some(error);
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    fn poll_linear(&mut self, index: usize) -> bool {
+        if index == 0 || index & INTERRUPT_POLL_MASK != 0 {
+            return self.abort.is_none();
+        }
+        if let Err(error) = poll_interrupt(self.control) {
+            self.abort = Some(error);
+            return false;
+        }
+        true
+    }
+
+    fn input_ranges_eq(&mut self, left: usize, right: usize, len: usize) -> bool {
+        for index in 0..len {
+            if !self.poll_linear(index)
+                || !self.eqc_uu(self.input.at(left + index), self.input.at(right + index))
+            {
+                return false;
+            }
+        }
+        true
+    }
     #[inline(always)]
     fn icase(&self) -> bool {
         self.flags.last().unwrap().0
@@ -2539,6 +2919,207 @@ impl<I: ReInput> Matcher<I> {
         }
     }
 
+    /// Return every matching UnicodeSets string length in the normative order: multi-code-point
+    /// elements by descending length, then a singleton, then the empty element. The exact-mode
+    /// path follows one trie edge per subject code point; ignore-case mode retains the small set
+    /// of canonically equivalent branches.
+    fn string_set_lengths(&self, set: &StringSet, pos: usize) -> Vec<usize> {
+        let trie = if self.back {
+            &set.backward
+        } else {
+            &set.forward
+        };
+        let mut lengths = Vec::new();
+        if self.icase() {
+            let mut nodes = vec![0usize];
+            let mut cursor = pos;
+            for depth in 1..=trie.max_depth {
+                let Some((found, next)) = self.step(cursor) else {
+                    break;
+                };
+                let mut next_nodes = Vec::new();
+                for node in nodes {
+                    for &(expected, child) in &trie.nodes[node].edges {
+                        if self.eqc_uu(found, expected) && !next_nodes.contains(&child) {
+                            next_nodes.push(child);
+                        }
+                    }
+                }
+                if next_nodes.is_empty() {
+                    break;
+                }
+                if next_nodes.iter().any(|node| trie.nodes[*node].terminal) {
+                    lengths.push(depth);
+                }
+                nodes = next_nodes;
+                cursor = next;
+            }
+        } else {
+            let mut node = 0usize;
+            let mut cursor = pos;
+            for depth in 1..=trie.max_depth {
+                let Some((found, next)) = self.step(cursor) else {
+                    break;
+                };
+                let Ok(edge) = trie.nodes[node]
+                    .edges
+                    .binary_search_by_key(&found, |edge| edge.0)
+                else {
+                    break;
+                };
+                node = trie.nodes[node].edges[edge].1;
+                if trie.nodes[node].terminal {
+                    lengths.push(depth);
+                }
+                cursor = next;
+            }
+        }
+        lengths.reverse();
+        if self
+            .step(pos)
+            .is_some_and(|(found, _)| set.singles.matches(found, self.icase(), self.unicode))
+        {
+            lengths.push(1);
+        }
+        if set.empty {
+            lengths.push(0);
+        }
+        lengths
+    }
+
+    /// RepeatMatcher for a variable-length UnicodeSets atom, using an explicit DFS stack rather
+    /// than one Rust call per repetition. Candidate order and continuation order are exactly the
+    /// greedy/lazy algorithms from ECMA-262; capture-free failures share the same memo table as a
+    /// standalone StringSet instruction.
+    fn run_string_set_repeat(
+        &mut self,
+        prog: &[Inst],
+        pc: usize,
+        pos: usize,
+        set: &Rc<StringSet>,
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+    ) -> bool {
+        struct Frame {
+            pos: usize,
+            count: usize,
+            candidates: Option<Vec<usize>>,
+            next_candidate: usize,
+            continuation_tried: bool,
+            entered: bool,
+        }
+
+        let flags =
+            (self.icase() as u8) | ((self.multiline() as u8) << 1) | ((self.dotall() as u8) << 2);
+        let memo_count = |count: usize| match max {
+            None if count >= min => min,
+            _ => count,
+        };
+        let memo_key = |position: usize, count: usize, back: bool| {
+            (
+                prog.as_ptr() as usize,
+                pc,
+                position,
+                memo_count(count),
+                back,
+                flags,
+            )
+        };
+        let mut stack = vec![Frame {
+            pos,
+            count: 0,
+            candidates: None,
+            next_candidate: 0,
+            continuation_tried: false,
+            entered: false,
+        }];
+
+        'search: while !stack.is_empty() {
+            let index = stack.len() - 1;
+            if !stack[index].entered {
+                if !self.tick() {
+                    return false;
+                }
+                let key = memo_key(stack[index].pos, stack[index].count, self.back);
+                if self
+                    .string_failures
+                    .as_ref()
+                    .is_some_and(|failures| failures.contains(&key))
+                {
+                    stack.pop();
+                    continue 'search;
+                }
+                stack[index].entered = true;
+            }
+
+            // Lazy RepeatMatcher tries its sequel as soon as the minimum is satisfied.
+            if !greedy && stack[index].count >= min && !stack[index].continuation_tried {
+                stack[index].continuation_tried = true;
+                if self.run(prog, pc + 1, stack[index].pos) {
+                    return true;
+                }
+                if self.abort.is_some() {
+                    return false;
+                }
+            }
+
+            let can_expand = max.is_none_or(|limit| stack[index].count < limit);
+            if can_expand {
+                if stack[index].candidates.is_none() {
+                    stack[index].candidates = Some(self.string_set_lengths(set, stack[index].pos));
+                }
+                while stack[index].next_candidate < stack[index].candidates.as_ref().unwrap().len()
+                {
+                    let candidate =
+                        stack[index].candidates.as_ref().unwrap()[stack[index].next_candidate];
+                    stack[index].next_candidate += 1;
+                    // RepeatMatcher rejects a further empty iteration once min is satisfied,
+                    // allowing the atom to try any later candidate before the repeat exits.
+                    if candidate == 0 && stack[index].count >= min {
+                        continue;
+                    }
+                    let next_pos = if self.back {
+                        stack[index].pos - candidate
+                    } else {
+                        stack[index].pos + candidate
+                    };
+                    let Some(next_count) = stack[index].count.checked_add(1) else {
+                        self.abort = Some(MatchError::ResourceExhausted);
+                        return false;
+                    };
+                    stack.push(Frame {
+                        pos: next_pos,
+                        count: next_count,
+                        candidates: None,
+                        next_candidate: 0,
+                        continuation_tried: false,
+                        entered: false,
+                    });
+                    continue 'search;
+                }
+            }
+
+            // Greedy RepeatMatcher tries its sequel only after every further repetition choice.
+            if greedy && stack[index].count >= min && !stack[index].continuation_tried {
+                stack[index].continuation_tried = true;
+                if self.run(prog, pc + 1, stack[index].pos) {
+                    return true;
+                }
+                if self.abort.is_some() {
+                    return false;
+                }
+            }
+
+            let failed = stack.pop().unwrap();
+            let key = memo_key(failed.pos, failed.count, self.back);
+            if let Some(failures) = &mut self.string_failures {
+                failures.insert(key);
+            }
+        }
+        false
+    }
+
     /// Conservative viability test for the continuation at `pc` and `pos`.
     ///
     /// `Some(false)` proves that its first consuming instruction cannot match here; `Some(true)`
@@ -2569,6 +3150,22 @@ impl<I: ReInput> Matcher<I> {
                 Inst::Class(class) => {
                     return Some(self.step(pos).is_some_and(|(found, _)| {
                         class.matches(found, self.icase(), self.unicode)
+                    }));
+                }
+                Inst::StringSet(set) => {
+                    if set.empty {
+                        return None;
+                    }
+                    return Some(self.step(pos).is_some_and(|(found, _)| {
+                        set.first.matches(found, self.icase(), self.unicode)
+                    }));
+                }
+                Inst::StringSetRepeat { set, min, .. } => {
+                    if *min == 0 || set.empty {
+                        return None;
+                    }
+                    return Some(self.step(pos).is_some_and(|(found, _)| {
+                        set.first.matches(found, self.icase(), self.unicode)
                     }));
                 }
                 Inst::Many { rep, min, .. } => {
@@ -2697,7 +3294,11 @@ impl<I: ReInput> Matcher<I> {
     }
 
     fn run(&mut self, prog: &[Inst], pc: usize, pos: usize) -> bool {
+        if self.abort.is_some() {
+            return false;
+        }
         if self.depth > MAX_MATCH_DEPTH {
+            self.abort = Some(MatchError::ResourceExhausted);
             return false;
         }
         self.depth += 1;
@@ -2711,8 +3312,7 @@ impl<I: ReInput> Matcher<I> {
         // reserve Rust recursion for genuine backtracking points and state that needs rollback.
         // Besides avoiding a host call per character, this keeps the semantic step budget exact.
         loop {
-            self.steps += 1;
-            if self.steps > STEP_LIMIT {
+            if !self.tick() {
                 return false;
             }
             match &prog[pc] {
@@ -2741,6 +3341,53 @@ impl<I: ReInput> Matcher<I> {
                     }
                     _ => return false,
                 },
+                Inst::StringSet(set) => {
+                    let flags = (self.icase() as u8)
+                        | ((self.multiline() as u8) << 1)
+                        | ((self.dotall() as u8) << 2);
+                    let memo_key = (
+                        prog.as_ptr() as usize,
+                        pc,
+                        pos,
+                        usize::MAX,
+                        self.back,
+                        flags,
+                    );
+                    if self
+                        .string_failures
+                        .as_ref()
+                        .is_some_and(|failures| failures.contains(&memo_key))
+                    {
+                        return false;
+                    }
+                    let set = set.clone();
+                    for length in self.string_set_lengths(&set, pos) {
+                        let next = if self.back {
+                            pos - length
+                        } else {
+                            pos + length
+                        };
+                        if self.run(prog, pc + 1, next) {
+                            return true;
+                        }
+                        if self.abort.is_some() {
+                            return false;
+                        }
+                    }
+                    if let Some(failures) = &mut self.string_failures {
+                        failures.insert(memo_key);
+                    }
+                    return false;
+                }
+                Inst::StringSetRepeat {
+                    set,
+                    min,
+                    max,
+                    greedy,
+                } => {
+                    let (set, min, max, greedy) = (set.clone(), *min, *max, *greedy);
+                    return self.run_string_set_repeat(prog, pc, pos, &set, min, max, greedy);
+                }
                 Inst::Save(slot) => {
                     let slot = *slot;
                     let old = self.caps[slot];
@@ -2789,13 +3436,17 @@ impl<I: ReInput> Matcher<I> {
                     } else {
                         self.input.len() - pos
                     };
-                    let idx = |k: usize| if self.back { pos - 1 - k } else { pos + k };
+                    let back = self.back;
+                    let idx = |k: usize| if back { pos - 1 - k } else { pos + k };
                     let mut avail = 0;
                     while avail < cap
                         && avail < room
                         && self.rep_matches(rep, self.input.at(idx(avail)))
                     {
                         avail += 1;
+                        if !self.poll_linear(avail) {
+                            return false;
+                        }
                     }
                     if avail < min {
                         return false;
@@ -2812,6 +3463,9 @@ impl<I: ReInput> Matcher<I> {
                             if cont(self, n) {
                                 return true;
                             }
+                            if self.abort.is_some() {
+                                return false;
+                            }
                             if n == min {
                                 return false;
                             }
@@ -2826,6 +3480,9 @@ impl<I: ReInput> Matcher<I> {
                                 && cont(self, n)
                             {
                                 return true;
+                            }
+                            if self.abort.is_some() {
+                                return false;
                             }
                             if n == avail {
                                 return false;
@@ -2909,9 +3566,7 @@ impl<I: ReInput> Matcher<I> {
                                 }
                                 pos
                             };
-                            if !(0..n).all(|index| {
-                                self.eqc_uu(self.input.at(start + index), self.input.at(a + index))
-                            }) {
+                            if !self.input_ranges_eq(start, a, n) {
                                 return false;
                             }
                             pos = if self.back { pos - n } else { pos + n };
@@ -2951,9 +3606,7 @@ impl<I: ReInput> Matcher<I> {
                                 }
                                 pos
                             };
-                            if !(0..n).all(|index| {
-                                self.eqc_uu(self.input.at(start + index), self.input.at(a + index))
-                            }) {
+                            if !self.input_ranges_eq(start, a, n) {
                                 return false;
                             }
                             pos = if self.back { pos - n } else { pos + n };
@@ -3304,33 +3957,102 @@ fn class_set_to_node(mut set: ClassSet) -> Node {
             push(lo.clamp(0, 0x10FFFF), hi.min(0x10FFFF));
         }
     }
-    let class = Node::Class(CharClass {
+    let class = CharClass {
         negate: false,
         ranges,
         builtins: Vec::new(),
         props: Vec::new(),
-    });
+    };
     if set.strings.is_empty() {
-        return class;
+        return Node::Class(class);
     }
-    let mut strings = set.strings;
-    strings.sort_by_key(|b| std::cmp::Reverse(b.len()));
-    let mut alts: Vec<Node> = strings
+    let empty = set.strings.iter().any(Vec::is_empty);
+    let strings: Vec<Vec<char>> = set
+        .strings
         .into_iter()
-        .map(|cs| {
-            if cs.is_empty() {
-                Node::Empty
-            } else {
-                Node::Concat(cs.into_iter().map(|c| Node::Char(c as u32)).collect())
-            }
-        })
+        .filter(|string| string.len() > 1)
         .collect();
-    alts.push(class);
-    Node::Group(None, Box::new(Node::Alt(alts)))
+    if strings.is_empty() && !empty {
+        return Node::Class(class);
+    }
+    Node::StringSet(Rc::new(StringSet::new(strings, class, empty)))
 }
 
 #[cfg(test)]
 mod internal_engine_diagnostics {
+    #[test]
+    fn backtracking_exhaustion_is_distinct_from_no_match() {
+        let re = super::Regex::new("(a|aa)*b", "y").unwrap();
+        let input = crate::lstr::LStr::from("a".repeat(40));
+        let text = super::ReText::new_rc(false, &input);
+        assert!(matches!(
+            re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default()),
+            Err(super::MatchError::ResourceExhausted)
+        ));
+    }
+
+    #[test]
+    fn repeated_string_properties_use_heap_backtracking_state() {
+        for property in ["Basic_Emoji", "RGI_Emoji"] {
+            let set = super::property_of_strings(property).expect("known string property");
+            let mut subject = String::new();
+            for (start, end) in set.ranges {
+                for code_point in start..=end {
+                    if let Some(character) = char::from_u32(code_point) {
+                        subject.push(character);
+                    }
+                }
+            }
+            for string in set.strings {
+                subject.extend(string);
+            }
+            let re = super::Regex::new(&format!(r"^\p{{{property}}}+$"), "v").unwrap();
+            let input = crate::lstr::LStr::from(subject.as_str());
+            let text = super::ReText::new_rc(true, &input);
+            assert!(matches!(
+                re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default()),
+                Ok(Some(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn matcher_honors_deadlines_and_cross_thread_cancellation() {
+        let re = super::Regex::new("needle", "").unwrap();
+
+        let deadline = crate::RuntimeInterrupt::default();
+        deadline.set_deadline(Some(std::time::Instant::now()));
+        let short_input = crate::lstr::LStr::from("haystack");
+        let short_text = super::ReText::new_rc(false, &short_input);
+        assert!(matches!(
+            re.exec_text_shared(&short_text, 0, &deadline),
+            Err(super::MatchError::Interrupted(
+                crate::InterruptReason::DeadlineExceeded
+            ))
+        ));
+
+        // The first poll occurs before scanning. Cancelling after the call has started therefore
+        // proves the literal prescan continues to poll while processing a long subject.
+        let control = std::sync::Arc::new(crate::RuntimeInterrupt::default());
+        let canceller = std::thread::spawn({
+            let control = control.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                control.cancel();
+            }
+        });
+        let long_input = crate::lstr::LStr::from("a".repeat(32 * 1024 * 1024));
+        let long_text = super::ReText::new_rc(false, &long_input);
+        let outcome = re.exec_text_shared(&long_text, 0, &control);
+        canceller.join().expect("canceller thread");
+        assert!(matches!(
+            outcome,
+            Err(super::MatchError::Interrupted(
+                crate::InterruptReason::Cancelled
+            ))
+        ));
+    }
+
     #[test]
     fn escaped_open_bracket_patterns_compile() {
         for pattern in [r"\s*([+>~\s])\s*([a-zA-Z#.*:\[])", r"^[\s[]?shapgvba"] {
@@ -3351,7 +4073,10 @@ mod internal_engine_diagnostics {
             super::Regex::new(r#"^(\[) *@?([\w-]+) *([!*$^~=]*) *('?"?)(.*?)\4 *\]"#, "").unwrap();
         let input = crate::lstr::LStr::from("[glcr=fhozvg]");
         let text = super::ReText::new_rc(false, &input);
-        let caps = re.exec_text_shared(&text, 0).unwrap();
+        let caps = re
+            .exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(caps[0], Some((0, 13)));
     }
 
@@ -3360,7 +4085,12 @@ mod internal_engine_diagnostics {
         let re = super::Regex::new("HF(?=;)", "i").unwrap();
         let input = crate::lstr::LStr::from("xhf;y");
         let text = super::ReText::new_rc(false, &input);
-        assert_eq!(re.exec_text_shared(&text, 0).unwrap()[0], Some((1, 3)));
+        assert_eq!(
+            re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default())
+                .unwrap()
+                .unwrap()[0],
+            Some((1, 3))
+        );
     }
 
     #[test]
@@ -3368,7 +4098,10 @@ mod internal_engine_diagnostics {
         let re = super::Regex::new(r"Qngr\((-?[0-9]+)\)", "").unwrap();
         let input = crate::lstr::LStr::from("‰Qngr(-12)");
         let text = super::ReText::new_rc(false, &input);
-        let caps = re.exec_text_shared(&text, 0).unwrap();
+        let caps = re
+            .exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(caps[0], Some((1, 10)));
         assert_eq!(caps[1], Some((6, 9)));
     }
@@ -3379,14 +4112,23 @@ mod internal_engine_diagnostics {
         let text = super::ReText::new_rc(false, &input);
         let search = super::Regex::new("needle", "").unwrap();
         assert_eq!(
-            search.exec_text_shared(&text, 3).unwrap()[0],
+            search
+                .exec_text_shared(&text, 3, &crate::RuntimeInterrupt::default())
+                .unwrap()
+                .unwrap()[0],
             Some((10, 16))
         );
 
         let sticky = super::Regex::new("needle", "y").unwrap();
-        assert!(sticky.exec_text_shared(&text, 3).is_none());
+        assert!(sticky
+            .exec_text_shared(&text, 3, &crate::RuntimeInterrupt::default())
+            .unwrap()
+            .is_none());
         assert_eq!(
-            sticky.exec_text_shared(&text, 10).unwrap()[0],
+            sticky
+                .exec_text_shared(&text, 10, &crate::RuntimeInterrupt::default())
+                .unwrap()
+                .unwrap()[0],
             Some((10, 16))
         );
     }
