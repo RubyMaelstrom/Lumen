@@ -335,7 +335,18 @@ conformance-style tests and the broader affected suite pass.
     containment, and passive data-segment initialization/drop semantics found by the suite.
   - [x] Add a deterministic malformed-binary decoder/validator corpus; 100,000 mutations pass
     without a panic, including strict custom-section name and LEB128 decoding.
-- [ ] Run Autobahn WebSocket tests and adversarial RFC 9112 framing tests.
+- [x] Run Autobahn WebSocket tests and adversarial RFC 9112 framing tests.
+  - [x] Run Autobahn Testsuite 25.10.1/AutobahnPython 0.10.9's 247 applicable client cases
+    (excluding the mass-performance and unimplemented compression-extension categories): 244
+    normative cases pass strictly, 3 close-race/code cases are informational, and none fail or
+    report non-strict behavior. Add a reproducible in-tree testee and gate.
+  - [x] Validate RFC 6455 text incrementally across transport and continuation-frame boundaries,
+    failing a provably invalid prefix with close code 1007 before buffering the remainder. This
+    changed Autobahn cases 6.4.1--6.4.4 from non-strict to strict passes.
+  - [x] Add adversarial RFC 9110/9112 list, TE/CL precedence, line syntax, chunk extension,
+    trailer, overflow, incomplete-body, and resource-limit coverage. Accept recipient-side empty
+    list elements and chunk-extension BWS, and consume a declared 205 wire body before discarding
+    its Fetch-null body so a persistent connection cannot desynchronize.
 - [x] Resolve the HTTP/2 interoperability regressions.
   - [x] Queue all client frames created before transport connection so the wire order is the
     RFC 9113 client preface, SETTINGS, HEADERS, then DATA.

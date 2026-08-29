@@ -412,11 +412,16 @@ fn exchange(
         break (version, status, status_text, fields);
     };
 
-    let no_body = method == "HEAD" || matches!(status, 204 | 205 | 304);
-    let framing = body_framing(&headers, false, no_body).map_err(|error| ExchangeError {
-        message: format!("fetch '{}': {error}", u.href()),
-        retryable: false,
-    })?;
+    // RFC 9112 §6.3 gives HEAD/204/304 special wire framing. A 205 is a Fetch null-body status,
+    // but it is not one of those HTTP framing exceptions: consume any declared wire body before
+    // reuse, then discard it below. This keeps a violating origin from desynchronizing the pool.
+    let framing_forbidden = method == "HEAD" || matches!(status, 204 | 304);
+    let discard_body = status == 205;
+    let framing =
+        body_framing(&headers, false, framing_forbidden).map_err(|error| ExchangeError {
+            message: format!("fetch '{}': {error}", u.href()),
+            retryable: false,
+        })?;
     let follows_redirect = matches!(status, 301 | 302 | 303 | 307 | 308)
         && single_header(&headers, "location")
             .map_err(|error| ExchangeError {
@@ -435,7 +440,7 @@ fn exchange(
             message: format!("fetch '{}': body: {error}", u.href()),
             retryable: false,
         })?;
-        if follows_redirect {
+        if follows_redirect || discard_body {
             Vec::new()
         } else {
             body
@@ -728,6 +733,42 @@ mod tests {
             .windows(19)
             .any(|window| window == b"connection: close\r\n"));
         assert!(second.starts_with(b"GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn reset_content_discards_declared_bytes_before_connection_reuse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            // Fetch exposes a null body for 205, but RFC 9112 does not make 205 a wire-framing
+            // exception. Consume these nonconforming bytes so they cannot prefix the next reply.
+            stream
+                .write_all(b"HTTP/1.1 205 Reset Content\r\nContent-Length: 4\r\n\r\nevil")
+                .unwrap();
+            let second = read_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            second
+        });
+
+        let client = HttpClient::default();
+        let url = format!("http://{address}/");
+        let first = client
+            .request("GET".into(), url.clone(), vec![], None, false)
+            .unwrap();
+        assert_eq!(first.status, 205);
+        assert!(first.body.is_empty());
+        assert_eq!(
+            client
+                .request("GET".into(), url, vec![], None, false)
+                .unwrap()
+                .body,
+            b"ok"
+        );
+        assert!(server.join().unwrap().starts_with(b"GET / HTTP/1.1\r\n"));
     }
 
     #[test]

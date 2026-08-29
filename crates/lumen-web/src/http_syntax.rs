@@ -9,6 +9,7 @@ use std::io::{BufRead, Read};
 pub(crate) const MAX_HEADER_BYTES: usize = 64 << 10;
 pub(crate) const MAX_BODY: u64 = 32 << 20;
 const MAX_FIELDS: usize = 1024;
+const MAX_LIST_MEMBERS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BodyFraming {
@@ -89,13 +90,25 @@ pub(crate) fn single_header(
 }
 
 /// Parse RFC 9110 §8.6 / RFC 9112 §6.3 Content-Length, including repeated or combined
-/// identical values. Any disagreement, empty member, non-digit, or overflow is fatal.
+/// identical values. RFC 9110 §5.6.1.2 requires recipients to ignore a reasonable number of
+/// empty list elements; disagreement, non-digits, overflow, and an effectively empty value are
+/// fatal.
 pub(crate) fn content_length(headers: &[(String, String)]) -> Result<Option<u64>, String> {
     let mut parsed = None;
+    let mut saw_field = false;
+    let mut members = 0;
     for field in header_values(headers, "content-length") {
+        saw_field = true;
         for member in field.split(',') {
+            members += 1;
+            if members > MAX_LIST_MEMBERS {
+                return Err("too many Content-Length list members".into());
+            }
             let member = member.trim_matches([' ', '\t']);
-            if member.is_empty() || !member.bytes().all(|byte| byte.is_ascii_digit()) {
+            if member.is_empty() {
+                continue;
+            }
+            if !member.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err("invalid Content-Length field".into());
             }
             let value = member
@@ -107,6 +120,9 @@ pub(crate) fn content_length(headers: &[(String, String)]) -> Result<Option<u64>
             parsed = Some(value);
         }
     }
+    if saw_field && parsed.is_none() {
+        return Err("invalid Content-Length field".into());
+    }
     Ok(parsed)
 }
 
@@ -116,8 +132,13 @@ fn transfer_codings(headers: &[(String, String)]) -> Result<Option<Vec<String>>,
         return Ok(None);
     }
     let mut codings = Vec::new();
+    let mut members = 0;
     for field in fields {
         for member in field.split(',') {
+            members += 1;
+            if members > MAX_LIST_MEMBERS {
+                return Err("too many Transfer-Encoding list members".into());
+            }
             let member = member.trim_matches([' ', '\t']);
             if member.is_empty() {
                 continue;
@@ -317,12 +338,19 @@ fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
     let mut metadata = 0;
     loop {
         let line = read_line(reader, &mut metadata, MAX_HEADER_BYTES)?;
-        let (size, extension) = line
+        let (mut size, extension) = line
             .iter()
             .position(|byte| *byte == b';')
             .map_or((line.as_slice(), None), |separator| {
                 (&line[..separator], Some(&line[separator + 1..]))
             });
+        // `chunk-ext` begins with BWS before its semicolon (RFC 9112 §7.1.1), while leading
+        // whitespace and trailing whitespace without an extension remain invalid chunk-size.
+        if extension.is_some() {
+            while size.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+                size = &size[..size.len() - 1];
+            }
+        }
         if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
             return Err("invalid chunk size".into());
         }
@@ -469,11 +497,35 @@ mod tests {
     fn duplicate_content_lengths_must_be_identical() {
         let equal = vec![
             ("Content-Length".into(), "42".into()),
-            ("content-length".into(), "42, 42".into()),
+            ("content-length".into(), ", 42, , 042,".into()),
         ];
         assert_eq!(content_length(&equal).unwrap(), Some(42));
         let conflicting = vec![("Content-Length".into(), "42, 43".into())];
         assert!(content_length(&conflicting).is_err());
+    }
+
+    #[test]
+    fn content_length_rejects_adversarial_values_and_excessive_lists() {
+        for value in [
+            "",
+            " , \t, ",
+            "-1",
+            "+1",
+            "0x10",
+            "1 0",
+            "1.0",
+            "４２",
+            "18446744073709551616",
+            "42, 43",
+        ] {
+            assert!(
+                content_length(&[("Content-Length".into(), value.into())]).is_err(),
+                "accepted {value:?}"
+            );
+        }
+
+        let excessive = ",".repeat(MAX_LIST_MEMBERS);
+        assert!(content_length(&[("Content-Length".into(), excessive)]).is_err());
     }
 
     #[test]
@@ -487,21 +539,94 @@ mod tests {
     }
 
     #[test]
+    fn body_framing_follows_rfc_9112_precedence() {
+        assert_eq!(body_framing(&[], true, false).unwrap(), BodyFraming::None);
+        assert_eq!(
+            body_framing(&[], false, false).unwrap(),
+            BodyFraming::CloseDelimited
+        );
+        assert_eq!(
+            body_framing(&[("Content-Length".into(), "7".into())], false, false).unwrap(),
+            BodyFraming::Length(7)
+        );
+        assert_eq!(
+            body_framing(
+                &[("Transfer-Encoding".into(), ", ChUnKeD, ".into())],
+                true,
+                false
+            )
+            .unwrap(),
+            BodyFraming::Chunked
+        );
+
+        // Responses forbidden from carrying a body terminate at the field section regardless
+        // of misleading framing fields (RFC 9112 §6.3 steps 1 and 2).
+        let ambiguous = vec![
+            ("Transfer-Encoding".into(), "chunked".into()),
+            ("Content-Length".into(), "3".into()),
+        ];
+        assert_eq!(
+            body_framing(&ambiguous, false, true).unwrap(),
+            BodyFraming::None
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_order_and_grammar_are_unambiguous() {
+        for value in [
+            "",
+            " , \t, ",
+            "chunked;parameter=value",
+            "chunked, chunked",
+            "gzip, chunked",
+            "chunked, gzip",
+            "not a coding",
+        ] {
+            assert!(
+                body_framing(&[("Transfer-Encoding".into(), value.into())], true, false).is_err(),
+                "accepted {value:?}"
+            );
+        }
+
+        let excessive = ",".repeat(MAX_LIST_MEMBERS);
+        assert!(body_framing(&[("Transfer-Encoding".into(), excessive)], true, false).is_err());
+    }
+
+    #[test]
     fn chunked_requires_crlf_and_enforces_limits() {
-        let mut valid =
-            BufReader::new(&b"4; name=value; quoted=\"a;b\"\r\nWiki\r\n0\r\nX-Ok: yes\r\n\r\n"[..]);
+        let mut valid = BufReader::new(
+            &b"4 \t; name=value; quoted=\"a\\\";b\"; observed=\"\x80\"\r\nWiki\r\n\
+               00; done\r\nX-Ok: yes\r\n\r\n"[..],
+        );
         assert_eq!(
             read_body(&mut valid, BodyFraming::Chunked).unwrap(),
             b"Wiki"
         );
-        let mut bad = BufReader::new(&b"1\r\nxXX0\r\n\r\n"[..]);
-        assert!(read_body(&mut bad, BodyFraming::Chunked).is_err());
-        let mut spaced = BufReader::new(&b" 1\r\nx\r\n0\r\n\r\n"[..]);
-        assert!(read_body(&mut spaced, BodyFraming::Chunked).is_err());
-        let mut bad_extension = BufReader::new(&b"1;=bad\r\nx\r\n0\r\n\r\n"[..]);
-        assert!(read_body(&mut bad_extension, BodyFraming::Chunked).is_err());
-        let mut huge = BufReader::new(&b"fffffffffffffffff\r\n"[..]);
-        assert!(read_body(&mut huge, BodyFraming::Chunked).is_err());
+
+        for raw in [
+            &b"1\r\nxXX0\r\n\r\n"[..],
+            &b"1\nx\n0\n\n"[..], // chunk-data still requires its exact CRLF delimiter
+            &b" 1\r\nx\r\n0\r\n\r\n"[..],
+            &b"1 \r\nx\r\n0\r\n\r\n"[..],
+            &b"+1\r\nx\r\n0\r\n\r\n"[..],
+            &b"0x1\r\nx\r\n0\r\n\r\n"[..],
+            &b"1;=bad\r\nx\r\n0\r\n\r\n"[..],
+            &b"1; name=\r\nx\r\n0\r\n\r\n"[..],
+            &b"1; name=\"unterminated\r\nx\r\n0\r\n\r\n"[..],
+            &b"1; name=\"bad\x01\"\r\nx\r\n0\r\n\r\n"[..],
+            &b"1; first;;second\r\nx\r\n0\r\n\r\n"[..],
+            &b"1; trailing;\r\nx\r\n0\r\n\r\n"[..],
+            &b"1\r\nx\r\n0\r\nBad : trailer\r\n\r\n"[..],
+            &b"1\r\nx\r\n0\r\n Folded: trailer\r\n\r\n"[..],
+            &b"fffffffffffffffff\r\n"[..],
+            &b"2000001\r\n"[..],
+        ] {
+            let mut reader = BufReader::new(raw);
+            assert!(
+                read_body(&mut reader, BodyFraming::Chunked).is_err(),
+                "accepted {raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -516,5 +641,48 @@ mod tests {
             let mut reader = BufReader::new(raw);
             assert!(read_fields(&mut reader, &mut 0, false).is_err());
         }
+    }
+
+    #[test]
+    fn field_parser_handles_only_the_permitted_line_robustness() {
+        let mut bare_lf = BufReader::new(&b"One: 1\nTwo:\t2 \t\n\n"[..]);
+        assert_eq!(
+            read_fields(&mut bare_lf, &mut 0, false).unwrap(),
+            vec![("One".into(), "1".into()), ("Two".into(), "2".into())]
+        );
+
+        let mut folded = BufReader::new(&b"X: first\r\n\t second \r\n\r\n"[..]);
+        assert_eq!(
+            read_fields(&mut folded, &mut 0, true).unwrap(),
+            vec![("X".into(), "first second".into())]
+        );
+
+        let mut folded_request = BufReader::new(&b"X: first\r\n second\r\n\r\n"[..]);
+        assert!(read_fields(&mut folded_request, &mut 0, false).is_err());
+    }
+
+    #[test]
+    fn metadata_and_body_budgets_fail_before_unbounded_reads() {
+        let mut oversized_line = vec![b'x'; MAX_HEADER_BYTES];
+        oversized_line.push(b'\n');
+        assert!(read_line(
+            &mut BufReader::new(oversized_line.as_slice()),
+            &mut 0,
+            MAX_HEADER_BYTES
+        )
+        .is_err());
+
+        let mut fields = Vec::new();
+        for _ in 0..=MAX_FIELDS {
+            fields.extend_from_slice(b"X: y\r\n");
+        }
+        fields.extend_from_slice(b"\r\n");
+        assert!(read_fields(&mut BufReader::new(fields.as_slice()), &mut 0, false).is_err());
+
+        assert!(read_body(
+            &mut BufReader::new(&b""[..]),
+            BodyFraming::Length(MAX_BODY + 1)
+        )
+        .is_err());
     }
 }

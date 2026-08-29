@@ -192,6 +192,58 @@ struct RawFrame {
     payload: Vec<u8>,
 }
 
+/// Incremental RFC 3629 UTF-8 validation for RFC 6455 §8.1. WebSocket text can split a scalar
+/// value across both transport reads and continuation frames, so validating only the assembled
+/// message needlessly buffers hostile input after its first provably-invalid byte.
+#[derive(Default)]
+struct Utf8Validator {
+    continuation_bytes: u8,
+    next_min: u8,
+    next_max: u8,
+}
+
+impl Utf8Validator {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), WsError> {
+        for &byte in bytes {
+            if self.continuation_bytes != 0 {
+                if !(self.next_min..=self.next_max).contains(&byte) {
+                    return Err(WsError::Protocol(1007, "text message is not UTF-8"));
+                }
+                self.continuation_bytes -= 1;
+                self.next_min = 0x80;
+                self.next_max = 0xbf;
+                continue;
+            }
+            match byte {
+                0x00..=0x7f => {}
+                0xc2..=0xdf => self.begin(1, 0x80, 0xbf),
+                0xe0 => self.begin(2, 0xa0, 0xbf),
+                0xe1..=0xec | 0xee..=0xef => self.begin(2, 0x80, 0xbf),
+                0xed => self.begin(2, 0x80, 0x9f),
+                0xf0 => self.begin(3, 0x90, 0xbf),
+                0xf1..=0xf3 => self.begin(3, 0x80, 0xbf),
+                0xf4 => self.begin(3, 0x80, 0x8f),
+                _ => return Err(WsError::Protocol(1007, "text message is not UTF-8")),
+            }
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self, continuation_bytes: u8, next_min: u8, next_max: u8) {
+        self.continuation_bytes = continuation_bytes;
+        self.next_min = next_min;
+        self.next_max = next_max;
+    }
+
+    fn finish(&self) -> Result<(), WsError> {
+        if self.continuation_bytes == 0 {
+            Ok(())
+        } else {
+            Err(WsError::Protocol(1007, "text message is not UTF-8"))
+        }
+    }
+}
+
 fn read_exact_buf(r: &mut impl Read, n: usize) -> Result<Vec<u8>, WsError> {
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)
@@ -200,6 +252,16 @@ fn read_exact_buf(r: &mut impl Read, n: usize) -> Result<Vec<u8>, WsError> {
 }
 
 fn read_raw_frame(r: &mut impl Read, max: usize, expect_masked: bool) -> Result<RawFrame, WsError> {
+    read_raw_frame_with_utf8(r, max, expect_masked, None, None)
+}
+
+fn read_raw_frame_with_utf8(
+    r: &mut impl Read,
+    max: usize,
+    expect_masked: bool,
+    fragmented_opcode: Option<u8>,
+    mut utf8: Option<&mut Utf8Validator>,
+) -> Result<RawFrame, WsError> {
     let head = read_exact_buf(r, 2)?;
     let fin = head[0] & 0x80 != 0;
     if head[0] & 0x70 != 0 {
@@ -249,11 +311,36 @@ fn read_raw_frame(r: &mut impl Read, max: usize, expect_masked: bool) -> Result<
     } else {
         None
     };
-    let mut payload = read_exact_buf(r, len)?;
-    if let Some(m) = mask {
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= m[i % 4];
+    let validates_text = utf8.is_some()
+        && (opcode == 0x1 && fragmented_opcode.is_none()
+            || opcode == 0x0 && fragmented_opcode == Some(0x1));
+    let mut payload = vec![0; len];
+    let mut offset = 0;
+    while offset < len {
+        // A direct read makes validation track available transport data. `read_exact` over the
+        // whole frame would wait for attacker-controlled trailing bytes after an invalid prefix.
+        let end = (offset + 8 * 1024).min(len);
+        match r.read(&mut payload[offset..end]) {
+            Ok(0) => return Err(WsError::Io("failed to fill whole buffer".into())),
+            Ok(read) => {
+                if let Some(mask) = mask {
+                    for (index, byte) in payload[offset..offset + read].iter_mut().enumerate() {
+                        *byte ^= mask[(offset + index) % 4];
+                    }
+                }
+                if validates_text {
+                    utf8.as_deref_mut()
+                        .unwrap()
+                        .push(&payload[offset..offset + read])?;
+                }
+                offset += read;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(WsError::Io(error.to_string())),
         }
+    }
+    if validates_text && fin {
+        utf8.as_deref().unwrap().finish()?;
     }
     Ok(RawFrame {
         fin,
@@ -421,10 +508,17 @@ impl WsReader {
     /// Block until one complete MESSAGE (or close), answering pings and skipping pongs inline.
     pub(crate) fn read_message(&mut self) -> Result<WsEvent, WsError> {
         let mut partial: Option<(u8, Vec<u8>)> = None;
+        let mut utf8 = Utf8Validator::default();
         loop {
             // RFC 6455 §5.1: a client expects unmasked server frames; a server expects masked
             // client frames. This is the inverse of whether this endpoint masks its own output.
-            let frame = read_raw_frame(&mut self.stream, MAX_MESSAGE, !self.masked)?;
+            let frame = read_raw_frame_with_utf8(
+                &mut self.stream,
+                MAX_MESSAGE,
+                !self.masked,
+                partial.as_ref().map(|(opcode, _)| *opcode),
+                Some(&mut utf8),
+            )?;
             match frame.opcode {
                 0x9 => {
                     // Ping → pong with the same payload (§5.5.3); masked only from the client end.
@@ -1502,6 +1596,87 @@ mod tests {
         assert!(matches!(
             read_raw_frame(&mut &high_bit[..], MAX_MESSAGE, true),
             Err(WsError::Protocol(1002, _))
+        ));
+    }
+
+    #[test]
+    fn streaming_utf8_validator_covers_scalar_boundaries() {
+        let valid = "\0\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{ffff}\u{10000}\u{10ffff}";
+        let mut validator = Utf8Validator::default();
+        for byte in valid.as_bytes() {
+            validator.push(std::slice::from_ref(byte)).unwrap();
+        }
+        validator.finish().unwrap();
+
+        for invalid in [
+            &[0x80][..],
+            &[0xc0, 0x80],
+            &[0xe0, 0x9f, 0xbf],
+            &[0xed, 0xa0, 0x80],
+            &[0xf0, 0x8f, 0xbf, 0xbf],
+            &[0xf4, 0x90, 0x80, 0x80],
+            &[0xf5, 0x80, 0x80, 0x80],
+        ] {
+            assert!(matches!(
+                Utf8Validator::default().push(invalid),
+                Err(WsError::Protocol(1007, _))
+            ));
+        }
+
+        let mut incomplete = Utf8Validator::default();
+        incomplete.push(&[0xe2, 0x82]).unwrap();
+        assert!(matches!(
+            incomplete.finish(),
+            Err(WsError::Protocol(1007, _))
+        ));
+    }
+
+    #[test]
+    fn text_scalar_may_cross_fragment_boundaries() {
+        let mut first = encode_frame(0x1, &[0xf0, 0x9f], [1, 2, 3, 4]);
+        first[0] &= !0x80;
+        let second = encode_frame(0x0, &[0x92, 0xa9], [5, 6, 7, 8]);
+        first.extend_from_slice(&second);
+        assert!(matches!(read_as_server(first), Ok(WsEvent::Text(text)) if text == "💩"));
+
+        let mut incomplete = encode_frame(0x1, &[0xf0, 0x9f], [1, 2, 3, 4]);
+        incomplete[0] &= !0x80;
+        incomplete.extend_from_slice(&encode_frame(0x0, &[0x92], [5, 6, 7, 8]));
+        assert!(matches!(
+            read_as_server(incomplete),
+            Err(WsError::Protocol(1007, _))
+        ));
+    }
+
+    #[test]
+    fn invalid_text_prefix_fails_before_the_rest_of_its_frame_arrives() {
+        struct PrefixThenError {
+            bytes: Cursor<Vec<u8>>,
+        }
+
+        impl Read for PrefixThenError {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.bytes.position() < self.bytes.get_ref().len() as u64 {
+                    self.bytes.read(output)
+                } else {
+                    Err(std::io::Error::other(
+                        "the rest of the frame has not arrived",
+                    ))
+                }
+            }
+        }
+
+        // Declare a 126-byte masked text frame but provide only the first, already-invalid byte.
+        // A whole-frame read would report I/O; streaming RFC 6455 §8.1 validation reports 1007.
+        let mut wire = vec![0x81, 0xfe, 0, 126, 0, 0, 0, 0];
+        wire.push(0xc0);
+        let mut source = PrefixThenError {
+            bytes: Cursor::new(wire),
+        };
+        let mut validator = Utf8Validator::default();
+        assert!(matches!(
+            read_raw_frame_with_utf8(&mut source, MAX_MESSAGE, true, None, Some(&mut validator)),
+            Err(WsError::Protocol(1007, _))
         ));
     }
 
