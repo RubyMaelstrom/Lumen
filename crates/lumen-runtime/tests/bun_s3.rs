@@ -77,7 +77,7 @@ fn s3_client_executes_signed_object_lifecycle() {
             return new Response(`<?xml version="1.0"?><ListBucketResult><Name>bucket</Name><Prefix>folder/</Prefix><MaxKeys>2</MaxKeys><KeyCount>1</KeyCount><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken><Contents><Key>folder/a&amp;b.txt</Key><LastModified>2025-01-07T00:19:10Z</LastModified><ETag>&quot;list-etag&quot;</ETag><Size>7</Size><StorageClass>STANDARD</StorageClass><Owner><ID>owner-id</ID><DisplayName>Owner</DisplayName></Owner></Contents><CommonPrefixes><Prefix>folder/sub/</Prefix></CommonPrefixes></ListBucketResult>`, { status: 200 });
           }
           if (request.method === "PUT") { objects.set(key, await request.text()); return new Response("", { status: 200 }); }
-          if (request.method === "DELETE") { objects.delete(key); return new Response("", { status: 204 }); }
+          if (request.method === "DELETE") { objects.delete(key); return new Response(null, { status: 204 }); }
           if (!objects.has(key)) return new Response("", { status: 404 });
           const value = objects.get(key), headers = { "content-length": String(Buffer.byteLength(value)), "content-type": "text/plain", etag: '"etag"', "last-modified": "Tue, 07 Jan 2025 00:19:10 GMT" };
           return new Response(request.method === "HEAD" ? null : value, { status: 200, headers });

@@ -569,9 +569,8 @@ fn valid_host(value: &str) -> bool {
         && crate::url::parse(&format!("http://{value}/"), None).is_ok()
 }
 
-/// Serialize a response. We own `Connection`/`Transfer-Encoding` and add `Content-Length` and a
-/// `Server` header when the handler didn't set them; everything else the handler chose passes
-/// through verbatim.
+/// Serialize a response. We own connection framing while retaining representation-length
+/// metadata where RFC 9110 §8.6 permits it for HEAD and 304 responses.
 fn build_response(
     status: u16,
     status_text: &str,
@@ -580,6 +579,7 @@ fn build_response(
     request_method: &str,
 ) -> Result<Vec<u8>, String> {
     http_syntax::validate_headers(headers)?;
+    let supplied_content_length = http_syntax::content_length(headers)?;
     if status_text.chars().any(|character| {
         character == '\r'
             || character == '\n'
@@ -613,10 +613,26 @@ fn build_response(
         out.extend_from_slice(&field_value_bytes(v)?);
         out.extend_from_slice(b"\r\n");
     }
-    let head_response = request_method == "HEAD";
-    let null_body_status = matches!(status, 204 | 304);
-    if !null_body_status {
-        let content_length = if status == 205 { 0 } else { body.len() };
+    let head_response = request_method.eq_ignore_ascii_case("HEAD");
+    let successful_connect =
+        request_method.eq_ignore_ascii_case("CONNECT") && (200..300).contains(&status);
+    let content_length = if status == 204 || successful_connect {
+        // RFC 9110 §8.6: neither 204 nor a successful CONNECT response may carry this field.
+        None
+    } else if status == 205 {
+        Some(0)
+    } else if status == 304 {
+        // An explicit value describes the selected 200 response representation; without one the
+        // server is allowed to omit it.
+        supplied_content_length
+    } else if head_response && body.is_empty() {
+        // A HEAD handler can avoid generating the GET body while still providing its known size.
+        // If it did generate a body below, its exact byte length remains the framing authority.
+        supplied_content_length.or(Some(0))
+    } else {
+        Some(body.len() as u64)
+    };
+    if let Some(content_length) = content_length {
         out.extend_from_slice(format!("Content-Length: {content_length}\r\n").as_bytes());
     }
     if !has_server {
@@ -628,7 +644,7 @@ fn build_response(
     if out.len() > MAX_HEADER_BYTES {
         return Err("HTTP response metadata too large".into());
     }
-    if !head_response && !matches!(status, 204 | 205 | 304) {
+    if !head_response && !successful_connect && !matches!(status, 204 | 205 | 304) {
         out.extend_from_slice(body);
     }
     Ok(out)
@@ -787,7 +803,25 @@ mod tests {
         assert!(!head.contains("Transfer-Encoding:"));
         assert!(!head.contains("Content-Length: 999"));
 
-        let no_content = build_response(204, "", &[], b"ignored", "GET").unwrap();
+        let metadata_head = build_response(
+            200,
+            "",
+            &[("Content-Length".into(), "5".into())],
+            b"",
+            "HEAD",
+        )
+        .unwrap();
+        let metadata_head = String::from_utf8(metadata_head).unwrap();
+        assert!(metadata_head.contains("Content-Length: 5\r\n"));
+
+        let no_content = build_response(
+            204,
+            "",
+            &[("Content-Length".into(), "7".into())],
+            b"ignored",
+            "GET",
+        )
+        .unwrap();
         let no_content = String::from_utf8(no_content).unwrap();
         assert!(!no_content.contains("Content-Length:"));
         assert!(!no_content.ends_with("ignored"));
@@ -796,6 +830,30 @@ mod tests {
         let reset = String::from_utf8(reset).unwrap();
         assert!(reset.contains("Content-Length: 0\r\n"));
         assert!(!reset.ends_with("ignored"));
+
+        let not_modified = build_response(
+            304,
+            "",
+            &[("Content-Length".into(), "11".into())],
+            b"ignored",
+            "GET",
+        )
+        .unwrap();
+        let not_modified = String::from_utf8(not_modified).unwrap();
+        assert!(not_modified.contains("Content-Length: 11\r\n"));
+        assert!(!not_modified.ends_with("ignored"));
+
+        let tunnel = build_response(
+            200,
+            "",
+            &[("Content-Length".into(), "7".into())],
+            b"ignored",
+            "CONNECT",
+        )
+        .unwrap();
+        let tunnel = String::from_utf8(tunnel).unwrap();
+        assert!(!tunnel.contains("Content-Length:"));
+        assert!(!tunnel.ends_with("ignored"));
     }
 
     #[test]
