@@ -75,7 +75,7 @@ conformance-style tests and the broader affected suite pass.
 
 ## Efficiency and lifecycle
 
-- [ ] Replace one-native-thread-per-live-coroutine with explicit VM
+- [x] Replace one-native-thread-per-live-coroutine with explicit VM
   continuations.
   - [x] Run compiler-supported sync and async `yield`/`await` bodies as
     heap-owned VM continuations with no native stack or channel handoff.
@@ -115,7 +115,7 @@ conformance-style tests and the broader affected suite pass.
   - [x] Lower labelled non-loop statements as break-only control contexts, including stacked
     labels and labelled breaks crossing suspending finalizers, without stealing unlabelled
     break/continue from nested loops or switches.
-  - [ ] Remove the bounded native fallback for generator/async bodies containing
+  - [x] Remove the bounded native fallback for generator/async bodies containing
     other constructs the bytecode compiler still cannot lower.
     - [x] Lower `for await…of` with async iterator acquisition, awaited stepping/closing, and
       completion-aware disposal. Native and async-from-sync paths retain their distinct Call/Await
@@ -209,9 +209,9 @@ conformance-style tests and the broader affected suite pass.
     - [x] Move compiler-supported Source Text Module top-level-await evaluation into a strict,
       continuation-owned AsyncBlock over the already-instantiated module environment. Preserve
       live imports/exports, TDZ and immutable cells, default-export naming, module completion
-      cascades, including top-level await in proposal-decorator expressions without returning to
-      a native worker. The focused Test262 `language/module-code/top-level-await` suite passes
-      251/251.
+      cascades, top-level await in proposal-decorator expressions, and fresh lexical `for…in`,
+      `for…of`, and `for await…of` heads that shadow same-spelled module bindings. The focused
+      Test262 `language/module-code/top-level-await` suite passes 251/251.
     - [x] Replace the native `Array.fromAsync` iterator worker with an explicit heap continuation
       that preserves normative Await boundaries, async-from-sync wrapping, iterator closing, and
       promise rejection ordering. The focused Test262 `built-ins/Array/fromAsync` suite passes
@@ -247,11 +247,13 @@ conformance-style tests and the broader affected suite pass.
         function-wide declaration identity.
     - [x] Materialize a parameterless synchronous function's `arguments` object in its activation
       only when an inner arrow captures it, preserving object identity without taxing uncaptured
-      variadic helpers. The official forced-bytecode lexical-arguments regression now passes, and
-      the complete generator/async Test262 directories pass 1,707/1,707 with no native-fallback
-      audit signal.
-  - [x] Until the continuation conversion is complete, cap live native workers
-    and make stack reservations bounded and configurable.
+      variadic helpers. The official forced-bytecode lexical-arguments regression now passes.
+  - [x] Delete the legacy worker pool, channel handoff, unsafe cross-thread interpreter transfer,
+    lazy native generator bodies, stack-size/live-worker configuration, and module fallback.
+    Future compiler coverage regressions produce a contained JavaScript rejection from a
+    bodyless suspended-start sentinel instead of executing source on a native stack. The combined
+    forced-bytecode generator/async/top-level-await Test262 gate passes 1,958/1,958 with zero
+    sentinel audit events.
 - [x] Share WebAssembly memory backing directly with JS and reclaim store
   modules/entities when their handles die.
   - [x] Identify `Memory.buffer` with the store's linear-memory Data Block and

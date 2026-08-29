@@ -1053,18 +1053,6 @@ fn active_symbol(id: u64) -> Option<Rc<SymbolData>> {
     })
 }
 
-/// Release a worker thread's last surrounding Agent after a coroutine job. Objects retain their
-/// own heap handle, so this only prevents an idle pooled worker from retaining a dead Agent's weak
-/// registries indefinitely.
-pub(crate) fn deactivate_gc_heap() {
-    ACTIVE_GC_HEAP.with(|active| {
-        active.borrow_mut().take();
-    });
-    ACTIVE_SYMBOL_AGENT.with(|active| {
-        active.borrow_mut().take();
-    });
-}
-
 pub(crate) fn deactivate_gc_heap_if(heap: &GcHeap) {
     ACTIVE_GC_HEAP.with(|active| {
         let mut active = active.borrow_mut();

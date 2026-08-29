@@ -248,13 +248,11 @@ pub type Env = Rc<RefCell<Scope>>;
 pub struct FnFrame {
     /// `Rc::as_ptr` of the callee. No strong handle is kept: every frame is pushed while its
     /// caller holds the callee alive (the callee `Value` sits on the caller's operand stack or in
-    /// the dispatch chain for the whole call — for frames owned by a parked coroutine, the
-    /// worker's frozen stack; realm teardown explicitly wakes and unwinds that stack,
-    /// which this invariant depends on), so the rare reflective reads reconstruct one via
+    /// the dispatch chain for the whole call), so the rare reflective reads reconstruct one via
     /// [`FnFrame::callee`] instead of paying a refcount round-trip on every call.
     pub fn_ptr: usize,
-    /// Owning coroutine body (`Interp::cur_coro`; 0 = the main driver): a worker-thread panic
-    /// evicts the dead body's frames by this tag (see `ThreadCoro::resume`).
+    /// Reserved execution-owner tag. Heap VM continuations finish each interpreter call slice
+    /// before parking, so this remains zero; retaining the field preserves the JIT frame ABI.
     pub coro: u32,
     pub strict: bool,
     /// The rare per-frame state (a live `arguments` object, or what a reflective `fn.arguments`
@@ -1101,8 +1099,8 @@ pub struct Interp {
     /// address raw, so its allocation header must not be recycled while the cache survives. A
     /// strong `Env` here would make every realm touched by JIT code immortal.
     pub(crate) global_env_pins: Vec<std::rc::Weak<RefCell<Scope>>>,
-    /// The coroutine body currently executing through this interpreter (0 = the main driver);
-    /// stamps `FnFrame::coro` so a dead worker's frames can be evicted precisely.
+    /// Reserved execution-owner tag paired with `FnFrame::coro`; source continuations no longer
+    /// transfer the interpreter to a worker thread.
     pub(crate) cur_coro: u32,
     /// The JIT's helper function table, built once (a stable address the machine code indexes
     /// through x21) instead of re-materialized on every call.
@@ -5412,7 +5410,7 @@ impl Interp {
             }
         }
         // Roots: nodes with a reference from outside the heap graph (the Rust call stack, the
-        // Interp's own fields, module/realm registries, coroutine threads). `strong_count`
+        // Interp's own fields and module/realm registries). `strong_count`
         // includes exactly one clone held by the snapshot, so external refs == strong - internal - 1.
         let mut stack: Vec<Gc> = Vec::new();
         let mut sstack: Vec<Env> = Vec::new();
@@ -8175,7 +8173,7 @@ impl Interp {
                 self.reject_promise(&promise, reason);
                 return Ok(promise);
             }
-            let r = self.run_async(func, &body, param_seed, args);
+            let r = self.run_async(func, &body, args);
             self.strict = saved_strict;
             self.new_target = saved_new_target;
             self.in_field_init_code = saved_field_init;
@@ -8195,7 +8193,7 @@ impl Interp {
         if func.is_generator {
             // The generator object's [[Prototype]] comes from the function's own `.prototype`.
             let gen_proto = fn_obj.borrow().props.get("prototype").map(|p| p.value());
-            let gen = self.run_generator(func, &body, param_seed, gen_proto, args);
+            let gen = self.run_generator(func, &body, gen_proto, args);
             self.strict = saved_strict;
             self.new_target = saved_new_target;
             self.in_field_init_code = saved_field_init;
@@ -8299,30 +8297,26 @@ impl Interp {
         result
     }
 
-    /// Start a generator in suspended-start and return its object. Its continuation is allocated
-    /// lazily on the first `next`; a never-resumed generator therefore consumes no VM or native
-    /// stack, matching ECMA-262 GeneratorStart/GeneratorResume.
+    /// Start a generator in suspended-start and return its object. The heap VM continuation owns
+    /// the execution context without reserving a native stack.
     fn run_generator(
         &mut self,
         func: &Rc<Function>,
         scope: &Env,
-        param_seed: Option<Env>,
         gen_proto: Option<Value>,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        // Compiler-supported generators, including delegated `yield*`, use the same explicit VM
-        // continuation as async `await`. Other uncompilable bodies use the bounded fallback below.
         if func.code.get().is_none() {
             let _ = func.code.set(crate::bytecode::compile(func));
         }
-        if let Some(Some(chunk)) = func.code.get() {
+        let continuation = if let Some(Some(chunk)) = func.code.get() {
             let this_val = if chunk.needs_frame_this() {
                 self.get_var("this", scope)?
             } else {
                 Value::Undefined
             };
             let params = self.coroutine_parameter_values(func, scope)?;
-            let continuation = if func.is_async {
+            let vm = if func.is_async {
                 crate::bytecode::VmCoro::new_async_generator(
                     self,
                     chunk.clone(),
@@ -8341,89 +8335,29 @@ impl Interp {
                     args,
                 )
             };
-            let obj = self.make_generator(func.is_async, gen_proto);
-            if let Value::Obj(object) = &obj {
-                self.gc_pin(object);
-                self.generators.insert(
-                    Rc::as_ptr(object) as usize,
-                    crate::coroutine::Coroutine::Vm(Box::new(continuation)),
+            crate::coroutine::Coroutine::Vm(Box::new(vm))
+        } else {
+            if std::env::var_os("LUMEN_TIER_LOG").is_some() {
+                let source = func.source.as_deref().unwrap_or("<no source>");
+                let head: String = source.chars().take(90).collect();
+                eprintln!(
+                    "[tier] unavailable VM coroutine: {}",
+                    head.replace('\n', " ")
                 );
-                if func.is_async {
-                    self.async_gens.insert(Rc::as_ptr(object) as usize);
-                }
             }
-            return Ok(obj);
-        }
-        if std::env::var_os("LUMEN_TIER_LOG").is_some() {
-            let source = func.source.as_deref().unwrap_or("<no source>");
-            let head: String = source.chars().take(90).collect();
-            eprintln!(
-                "[tier] native coroutine fallback: {}",
-                head.replace('\n', " ")
-            );
-        }
-        let func = func.clone();
-        let scope = scope.clone();
-        let is_async = func.is_async;
-        let body: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> = Box::new(move |i| {
-            let saved_strict = i.strict;
-            i.strict = func.is_strict;
-            // A coroutine body runs outside `Interp::call`'s tail-call trampoline, so its top-level
-            // `return f(...)` are never proper tail calls; force `tco_ok` off before each statement
-            // (it can leak back to `true` across a `yield`/`await` resume) so a return here can't be
-            // parked as a pending tail call that nothing runs. See the note in `run_async`.
-            let saved_tco = std::mem::replace(&mut i.tco_ok, false);
-            let mut pn = param_bound_names(&func.params);
-            if !func.is_arrow {
-                pn.push("arguments".to_string());
-            }
-            i.hoist(&func.body, &scope, &pn);
-            if let Some(ps) = &param_seed {
-                i.seed_param_vars(ps, &scope);
-            }
-            i.declare_block_lexicals(&func.body, &scope, false);
-            crate::coroutine::set_async_gen(is_async);
-            let saved_agb = std::mem::replace(&mut i.in_async_gen_body, is_async);
-            let has_using = func.body.iter().any(crate::eval::stmt_declares_using);
-            if has_using {
-                i.using_stack.push(Vec::new());
-            }
-            let mut result: Result<Value, Abrupt> = Ok(Value::Undefined);
-            for stmt in &func.body {
-                i.tco_ok = false;
-                match i.exec_stmt(stmt, &scope) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                }
-            }
-            if has_using {
-                let frame = i.using_stack.pop().unwrap_or_default();
-                result = i.dispose_frame(frame, result);
-            }
-            let outcome = match result {
-                Ok(_) => crate::coroutine::Suspend::Done(Value::Undefined),
-                Err(Abrupt::Return(v)) => crate::coroutine::Suspend::Done(v),
-                Err(Abrupt::Throw(e)) => crate::coroutine::Suspend::Throw(e),
-                Err(_) => crate::coroutine::Suspend::Done(Value::Undefined),
-            };
-            i.in_async_gen_body = saved_agb;
-            i.strict = saved_strict;
-            i.tco_ok = saved_tco;
-            outcome
-        });
-        let coro = crate::coroutine::lazy_coroutine(crate::coroutine::SendBody(body));
-        let obj = self.make_generator(is_async, gen_proto);
-        if let Value::Obj(o) = &obj {
-            self.gc_pin(o);
-            self.generators.insert(Rc::as_ptr(o) as usize, coro);
-            if is_async {
-                self.async_gens.insert(Rc::as_ptr(o) as usize);
+            let error = self.make_error("Error", crate::coroutine::VM_UNAVAILABLE_MSG);
+            crate::coroutine::unavailable(error)
+        };
+        let object = self.make_generator(func.is_async, gen_proto);
+        if let Value::Obj(value) = &object {
+            self.gc_pin(value);
+            self.generators
+                .insert(Rc::as_ptr(value) as usize, continuation);
+            if func.is_async {
+                self.async_gens.insert(Rc::as_ptr(value) as usize);
             }
         }
-        Ok(obj)
+        Ok(object)
     }
 
     /// Read the already-instantiated formal parameter bindings for a generator/async VM frame.
@@ -8465,12 +8399,10 @@ impl Interp {
         &mut self,
         func: &Rc<Function>,
         scope: &Env,
-        param_seed: Option<Env>,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        // Fast path: an async body that compiles runs on the bytecode VM, suspending at each `await`
-        // without an OS-thread coroutine (see `bytecode::VmCoro`). Already-instantiated parameter
-        // values seed its slots; the original `args` are retained only for the arguments object.
+        // The bytecode VM suspends at each `await` with already-instantiated parameter values in
+        // its slots; the original `args` are retained only for the arguments object.
         let coro = if let Some(chunk) = self.async_vm_chunk(func) {
             let this_val = if chunk.needs_frame_this() {
                 self.get_var("this", scope)?
@@ -8491,11 +8423,12 @@ impl Interp {
                 let source = func.source.as_deref().unwrap_or("<no source>");
                 let head: String = source.chars().take(90).collect();
                 eprintln!(
-                    "[tier] native coroutine fallback: {}",
+                    "[tier] unavailable VM coroutine: {}",
                     head.replace('\n', " ")
                 );
             }
-            self.spawn_async_thread(func, scope, param_seed)?
+            let error = self.make_error("Error", crate::coroutine::VM_UNAVAILABLE_MSG);
+            crate::coroutine::unavailable(error)
         };
         let promise = self.new_promise();
         if let Value::Obj(o) = &promise {
@@ -8512,73 +8445,6 @@ impl Interp {
             crate::coroutine::Resume::Next(Value::Undefined),
         );
         Ok(promise)
-    }
-
-    /// The tree-walker fallback for an async body that did not compile: run it on a pooled OS-thread
-    /// coroutine.
-    fn spawn_async_thread(
-        &mut self,
-        func: &Rc<Function>,
-        scope: &Env,
-        param_seed: Option<Env>,
-    ) -> Result<crate::coroutine::Coroutine, Abrupt> {
-        let func = func.clone();
-        let scope = scope.clone();
-        let body: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> = Box::new(move |i| {
-            let saved_strict = i.strict;
-            i.strict = func.is_strict;
-            // A coroutine body runs outside `Interp::call`'s tail-call trampoline, so none of its
-            // top-level `return f(...)` are proper tail calls: parking one as a pending tail call
-            // would leave nothing to run it and resolve the body to `undefined`. `tco_ok` can leak
-            // back to `true` across an `await`/resume (it is ambient interpreter state), so force it
-            // off before *each* statement rather than just once — a `return` reads `tco_ok` at its
-            // very start, so this makes the body's own returns take the ordinary path.
-            let saved_tco = std::mem::replace(&mut i.tco_ok, false);
-            let mut pn = param_bound_names(&func.params);
-            if !func.is_arrow {
-                pn.push("arguments".to_string());
-            }
-            i.hoist(&func.body, &scope, &pn);
-            if let Some(ps) = &param_seed {
-                i.seed_param_vars(ps, &scope);
-            }
-            i.declare_block_lexicals(&func.body, &scope, false);
-            let has_using = func.body.iter().any(crate::eval::stmt_declares_using);
-            if has_using {
-                i.using_stack.push(Vec::new());
-            }
-            let mut result: Result<Value, Abrupt> = Ok(Value::Undefined);
-            for stmt in &func.body {
-                i.tco_ok = false;
-                match i.exec_stmt(stmt, &scope) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                }
-            }
-            if has_using {
-                let frame = i.using_stack.pop().unwrap_or_default();
-                result = i.dispose_frame(frame, result);
-            }
-            let outcome = match result {
-                Ok(_) => crate::coroutine::Suspend::Done(Value::Undefined),
-                Err(Abrupt::Return(v)) => crate::coroutine::Suspend::Done(v),
-                Err(Abrupt::Throw(e)) => crate::coroutine::Suspend::Throw(e),
-                Err(_) => crate::coroutine::Suspend::Done(Value::Undefined),
-            };
-            i.strict = saved_strict;
-            i.tco_ok = saved_tco;
-            outcome
-        });
-        let ptr = self as *mut Interp;
-        match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)) {
-            Ok(c) => Ok(c),
-            Err(_) => Err(Abrupt::Throw(
-                self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG),
-            )),
-        }
     }
 
     /// Resume an async coroutine and react to how it parks: an `await` (Yield) attaches a microtask

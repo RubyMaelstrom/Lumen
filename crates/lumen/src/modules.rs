@@ -1354,39 +1354,16 @@ impl Interp {
                 );
                 crate::coroutine::Coroutine::Module(Box::new(ModuleCoro::new(vm, module_key)))
             } else {
-                // Decorated classes and any still-unlowered syntax retain the bounded native
-                // compatibility path until their dedicated continuation work lands.
-                let closure: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> =
-                    Box::new(move |i| {
-                        let saved_meta = i.import_meta.take();
-                        let saved_strict = i.strict;
-                        i.import_meta = Some(meta);
-                        i.strict = true;
-                        let result = i.run_stmt_list(&body, &env);
-                        i.import_meta = saved_meta;
-                        i.strict = saved_strict;
-                        match result {
-                            Ok(_) => {
-                                i.finish_dynamic_module(&module_key, None);
-                                crate::coroutine::Suspend::Done(Value::Undefined)
-                            }
-                            Err(a) => {
-                                let value = crate::interpreter::abrupt_value(a);
-                                i.finish_dynamic_module(&module_key, Some(value.clone()));
-                                crate::coroutine::Suspend::Throw(value)
-                            }
-                        }
-                    });
-                let ptr = self as *mut Interp;
-                match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(closure)) {
-                    Ok(coroutine) => coroutine,
-                    Err(_) => {
-                        let error = self.make_error("Error", crate::coroutine::UNSUPPORTED_MSG);
-                        self.finish_dynamic_module(key, Some(error.clone()));
-                        self.reject_promise(&top, error);
-                        return;
-                    }
+                // Compiler coverage is a prerequisite for AsyncBlock execution. Contain a future
+                // regression as a rejected module capability; never recreate a native-stack
+                // execution path for source text.
+                if std::env::var_os("LUMEN_TIER_LOG").is_some() {
+                    eprintln!("[tier] unavailable VM module coroutine: {key}");
                 }
+                let error = self.make_error("Error", crate::coroutine::VM_UNAVAILABLE_MSG);
+                self.finish_dynamic_module(key, Some(error.clone()));
+                self.reject_promise(&top, error);
+                return;
             };
             if let Value::Obj(o) = &top {
                 self.generators.insert(Rc::as_ptr(o) as usize, coro);

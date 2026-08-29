@@ -1671,13 +1671,13 @@ fn gc_registry_remains_valid_across_repeated_sweeps() {
 }
 
 #[test]
-fn gc_registry_follows_an_agent_across_generator_thread_handoffs() {
+fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
     use std::rc::Rc;
 
     // ECMA-262 §9.7 Agents makes the executing thread a replaceable component of an Agent, and
     // §27.5.3.3 GeneratorResume runs the suspended [[GeneratorContext]]. An object and lexical
     // environment allocated by that context therefore remain owned by the same Agent when Lumen
-    // happens to execute it on a pooled native worker.
+    // is resumed through its heap-owned VM execution context.
     let mut engine = Engine::new();
     let scopes_before = crate::value::gc_scope_snapshot(&engine.interp.gc_heap).len();
     match engine
@@ -1800,7 +1800,7 @@ fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
 }
 
 #[test]
-fn object_shapes_follow_the_agent_across_generator_thread_handoffs() {
+fn object_shapes_follow_the_agent_across_generator_vm_resumptions() {
     // Shape identity is an implementation guard for ECMA-262 §§10.1.5, 10.1.8, and 10.1.9:
     // equal identities must prove the same ordered own-property layout before a cached slot can
     // stand in for [[GetOwnProperty]]. Native-thread-local tables both lost convergence at a
@@ -1982,7 +1982,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 
     engine
         .eval(
@@ -1994,7 +1994,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "`${varIterator.next().value},${varIterator.next().value},${varIterator.next().value},${varIterator.next().done}`",
@@ -2020,7 +2020,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 
     // FunctionDeclarationInstantiation evaluates a coroutine's parameter defaults exactly once,
     // before its resumable body starts. VM entry consumes those bound values rather than replaying
@@ -2068,7 +2068,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_patterned
         .eval("out", false)
         .expect("async patterned parameter result parses")
@@ -2090,7 +2090,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match logical
         .eval(
             "let a=assignmentIterator.next();let b=assignmentIterator.next(3);let c=assignmentIterator.next(4);`${a.value},${b.value},${c.value},${c.done}`",
@@ -2209,7 +2209,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match for_in
         .eval(
             "var first=keyIterator.next(),last=keyIterator.next();`${first.value},${first.done}|${last.value},${last.done}`",
@@ -2249,7 +2249,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_for_in
         .eval("out", false)
         .expect("async for-in result parses")
@@ -2270,7 +2270,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match member_loop_heads
         .eval(
             "var a=memberHeadIterator.next(),b=memberHeadIterator.next(),c=memberHeadIterator.next(),d=memberHeadIterator.next();`${a.value},${b.value},${c.value},${d.done}|${baseCalls},${keyCalls}`",
@@ -2295,7 +2295,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_finally
         .eval("out", false)
         .expect("async finally result parses")
@@ -2317,7 +2317,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_loop_finally
         .eval("out", false)
         .expect("async loop-finally result parses")
@@ -2345,7 +2345,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_generator_finally
         .eval("out", false)
         .expect("async-generator injected return result parses")
@@ -2371,7 +2371,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_generator_source_return
         .eval("out", false)
         .expect("async-generator source return result parses")
@@ -2415,7 +2415,7 @@ fn yield_and_yield_star_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_generator_loop_return
         .eval("out", false)
         .expect("async-generator loop return result parses")
@@ -4727,7 +4727,7 @@ fn destructuring_assignment_loop_heads_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=assignmentPatternIterator.next(),b=assignmentPatternIterator.next(),c=assignmentPatternIterator.next();`${a.value}|${b.value}|${c.done}`",
@@ -4783,7 +4783,7 @@ fn destructuring_assignment_loop_heads_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match suspending
         .eval(
             "var i=suspendingAssignment;
@@ -4842,7 +4842,7 @@ fn destructuring_assignment_loop_heads_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match awaiting
         .eval("out", false)
         .expect("awaiting assignment result parses")
@@ -4871,7 +4871,7 @@ fn destructuring_assignment_loop_heads_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match bindings
         .eval(
             "var i=bindingPatternIterator,a=i.next(),b=i.next(1),c=i.next(),d=i.next('p'),
@@ -4912,7 +4912,7 @@ fn destructuring_assignment_loop_heads_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match async_bindings
         .eval("out", false)
         .expect("awaiting binding-pattern result parses")
@@ -4963,7 +4963,7 @@ fn literal_forms_use_vm_continuations_and_preserve_evaluation_order() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match generator
         .eval(
             "var i=literalIterator,
@@ -5010,7 +5010,7 @@ fn literal_forms_use_vm_continuations_and_preserve_evaluation_order() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match awaiting
         .eval("out", false)
         .expect("awaiting literal result parses")
@@ -5045,7 +5045,7 @@ fn tagged_import_meta_and_private_forms_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match generators
         .eval(
             "var a=taggedIterator.next(),b=taggedIterator.next(3),c=taggedIterator.next(4),
@@ -5087,7 +5087,7 @@ fn tagged_import_meta_and_private_forms_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match module
         .eval("importResult", false)
         .expect("module continuation result parses")
@@ -5121,7 +5121,7 @@ fn new_target_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match generator
         .eval(
             "[String(firstTarget.value),firstTarget.done,
@@ -5162,7 +5162,7 @@ fn new_target_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     arrow
         .eval("release()", false)
         .expect("lexical new.target async-arrow release parses");
@@ -5218,7 +5218,7 @@ fn unmapped_and_lexical_arguments_use_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match generator
         .eval(
             "[firstArguments.value,valuesIterator.next().value].join('|')",
@@ -5251,7 +5251,7 @@ fn unmapped_and_lexical_arguments_use_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     asynchronous
         .eval("release()", false)
         .expect("strict async arguments release parses");
@@ -5285,7 +5285,7 @@ fn unmapped_and_lexical_arguments_use_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     arrow
         .eval("release()", false)
         .expect("lexical arguments async-arrow release parses");
@@ -5367,7 +5367,7 @@ fn mapped_arguments_use_heap_vm_continuations_and_share_parameter_storage() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     asynchronous
         .eval("release()", false)
         .expect("mapped arguments async release parses");
@@ -5484,7 +5484,7 @@ fn async_arrows_keep_lexical_this_in_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     engine
         .eval("release()", false)
         .expect("lexical this async-arrow release parses");
@@ -5538,7 +5538,7 @@ fn async_arrow_super_calls_follow_derived_constructor_order_on_heap_vm() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     suspended
         .eval("release([7])", false)
         .expect("suspended async-arrow super release parses");
@@ -5755,7 +5755,7 @@ fn direct_eval_uses_the_retained_coroutine_activation() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     asynchronous
         .eval("release()", false)
         .expect("direct eval async release parses");
@@ -5869,7 +5869,7 @@ fn direct_eval_retains_runtime_lexicals_and_suspending_arguments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match result {
         Completion::Value(value) => assert_eq!(
             value,
@@ -5912,7 +5912,7 @@ fn direct_eval_retains_runtime_lexicals_and_suspending_arguments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     asynchronous
         .eval("releaseFinish()", false)
         .expect("async direct-eval final release parses");
@@ -5953,7 +5953,7 @@ fn direct_eval_destructuring_default_retains_its_earlier_reference() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match result {
         Completion::Value(value) => assert_eq!(value, "20,3"),
         Completion::Throw { name, message } => {
@@ -6027,7 +6027,7 @@ fn non_suspending_with_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -6136,7 +6136,7 @@ fn suspending_with_uses_heap_vm_environment_cursor() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -6198,7 +6198,7 @@ fn with_assignment_references_survive_suspension() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -6298,7 +6298,7 @@ fn sync_using_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -6345,7 +6345,7 @@ fn super_and_private_references_survive_vm_suspension() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var i=superIterator,
@@ -6374,7 +6374,7 @@ fn super_and_private_references_survive_vm_suspension() {
     }
 }
 #[test]
-fn class_definitions_do_not_force_native_coroutines() {
+fn class_definitions_remain_in_heap_vm_continuations() {
     let mut engine = Engine::new();
     engine
         .eval(
@@ -6408,7 +6408,7 @@ fn class_definitions_do_not_force_native_coroutines() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var i=classIterator,a=i.next(),b=i.next(),c=i.next();
@@ -6462,7 +6462,7 @@ fn suspending_class_heritage_and_computed_names_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var iterator=stagedClassIterator,
@@ -6516,7 +6516,7 @@ fn suspending_decorator_expressions_use_class_continuation_state() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var iterator=decoratedClassIterator,
@@ -6565,7 +6565,7 @@ fn suspending_class_abrupt_completion_restores_the_vm_environment() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var inferred=inferredClassIterator,abandoned=abandonedClassIterator,
@@ -6622,7 +6622,7 @@ fn suspending_classes_preserve_strict_tdz_and_heritage_abrupt_order() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var t=classTdzIterator,s=classStrictIterator,p=classPrototypeIterator,
@@ -6677,7 +6677,7 @@ fn async_class_heritage_and_keys_park_in_vm_state() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     engine
         .eval("releaseClassHeritage(AsyncClassParent)", false)
         .expect("async class heritage release parses");
@@ -6685,7 +6685,7 @@ fn async_class_heritage_and_keys_park_in_vm_state() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     engine
         .eval("releaseClassKey('method')", false)
         .expect("async class key release parses");
@@ -6723,7 +6723,7 @@ fn interleaved_call_and_construct_spreads_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var i=spreadIterator,a=i.next(),b=i.next(1),c=i.next([2,3]),d=i.next(4),
@@ -6770,7 +6770,7 @@ fn switch_lexical_environment_survives_vm_suspension() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=switchIterator.next(),b=switchIterator.next(1),c=switchIterator.next(9),
@@ -6833,7 +6833,7 @@ fn captured_reentered_switch_uses_fresh_heap_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -6864,7 +6864,7 @@ fn optional_calls_with_spreads_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var i=optionalCallIterator,a=i.next(),b=i.next(optionalPlain),c=i.next(1),
@@ -6917,7 +6917,7 @@ fn delete_references_use_vm_continuations_and_super_throws() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=deleteIterator.next(),b=deleteIterator.next('x'),
@@ -6980,7 +6980,7 @@ fn immutable_writes_use_vm_continuations_and_preserve_error_order() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=immutableIterator.next(),b=immutableIterator.next(9),
@@ -7047,7 +7047,7 @@ fn destructuring_catch_parameters_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=objectCatchIterator.next(),b=objectCatchIterator.next(4),
@@ -7108,7 +7108,7 @@ fn classic_for_destructuring_initializers_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=classicForIterator.next(),b=classicForIterator.next(0),
@@ -7156,7 +7156,7 @@ fn captured_body_lexical_patterns_use_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=capturedPatternIterator.next(),b=capturedPatternIterator.next(1),
@@ -7210,7 +7210,7 @@ fn strict_block_functions_use_vm_continuations_and_instantiate_at_scope_entry() 
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var a=blockFunctionIterator.next(),b=blockFunctionIterator.next(),
@@ -7268,7 +7268,7 @@ fn annexb_block_functions_use_vm_continuations_and_keep_distinct_bindings() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     match engine
         .eval(
             "var i=annexFunctionIterator,a=i.next(),b=i.next(),c=i.next(),
@@ -12797,7 +12797,7 @@ fn array_from_async_uses_heap_state_and_normative_close_order() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     assert!(engine
         .interp
         .generators
@@ -13566,7 +13566,7 @@ fn captured_block_using_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 
     let mut asynchronous = Engine::new();
     asynchronous
@@ -13598,7 +13598,7 @@ fn captured_block_using_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -13641,7 +13641,7 @@ fn captured_reentered_blocks_use_fresh_heap_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 
     let mut abrupt = Engine::new();
     abrupt
@@ -13673,7 +13673,7 @@ fn captured_reentered_blocks_use_fresh_heap_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -13715,7 +13715,7 @@ fn captured_classic_for_let_uses_per_iteration_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -13766,7 +13766,7 @@ fn captured_for_in_of_heads_use_fresh_heap_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 
     let mut asynchronous = Engine::new();
     asynchronous
@@ -13789,7 +13789,7 @@ fn captured_for_in_of_heads_use_fresh_heap_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -13857,7 +13857,7 @@ fn captured_catch_parameters_use_fresh_heap_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 
     let mut asynchronous = Engine::new();
     asynchronous
@@ -13881,7 +13881,7 @@ fn captured_catch_parameters_use_fresh_heap_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -13934,7 +13934,7 @@ fn repeated_spelling_captured_lexicals_use_distinct_vm_environments() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -14018,7 +14018,7 @@ fn await_using_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     function
         .eval("release('settled')", false)
         .expect("await using async function release parses");
@@ -14067,7 +14067,7 @@ fn await_using_uses_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     generator
         .eval("release('settled')", false)
         .expect("await using async generator release parses");
@@ -14132,7 +14132,7 @@ fn using_loop_heads_use_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 
     let mut asynchronous = Engine::new();
     asynchronous
@@ -14163,7 +14163,7 @@ fn using_loop_heads_use_heap_vm_continuations() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     asynchronous
         .eval("release()", false)
         .expect("await using loop-head release parses");
@@ -14349,7 +14349,7 @@ fn await_using_for_await_disposes_before_async_iterator_close() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     assert_eq!(
         run_in(&mut ordered, "result+'|'+log.join(',')"),
         "pending|body,dispose:start"
@@ -14410,7 +14410,7 @@ fn await_using_for_await_disposes_before_async_iterator_close() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -15304,7 +15304,7 @@ fn top_level_await_uses_module_continuation_and_live_environment() {
         .interp
         .generators
         .values()
-        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
     assert!(engine
         .interp
         .generators
@@ -15328,6 +15328,46 @@ fn top_level_await_uses_module_continuation_and_live_environment() {
         Completion::Value(value) => assert_eq!(value, "5:3:5:5:default:TypeError"),
         Completion::Throw { name, message } => panic!("module result threw {name}: {message}"),
     }
+}
+
+#[test]
+fn top_level_await_loop_lexicals_shadow_module_bindings_in_vm_state() {
+    // ECMA-262 §14.7.5.5/§14.7.5.8 create fresh loop-head lexical Environment Records. A
+    // same-spelled module var remains an outer binding and must neither absorb nor block them.
+    let mut engine = Engine::new();
+    engine.set_module_loader(|specifier, _| {
+        (specifier == "tla-loop").then(|| {
+            (
+                specifier.to_string(),
+                r#"
+                    var binding='outer', reads=[];
+                    for (let binding of [await 1,await 2]) {
+                        reads.push(()=>binding);await 0
+                    }
+                    for (const binding in {key:true}) {
+                        reads.push(()=>binding);await 0
+                    }
+                    for await (const binding of [await 3]) {
+                        reads.push(()=>binding)
+                    }
+                    globalThis.tlaLoopResult=reads.map(read=>read()).join(',')+'|'+binding;
+                "#
+                .to_string(),
+            )
+        })
+    });
+    engine
+        .eval(
+            "globalThis.tlaLoopResult='pending';import('tla-loop');",
+            false,
+        )
+        .expect("top-level-await loop module parses");
+    assert_eq!(run_in(&mut engine, "tlaLoopResult"), "1,2,key,3|outer");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
 }
 
 #[test]
@@ -16249,7 +16289,7 @@ fn for_await_of_uses_vm_continuations_and_normative_async_close() {
             .interp
             .generators
             .values()
-            .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+            .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Unavailable(_))));
         match engine.eval(read, false).expect("read") {
             Completion::Value(value) => value,
             Completion::Throw { name, message } => panic!("threw {name}: {message}"),

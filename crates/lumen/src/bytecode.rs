@@ -5348,13 +5348,10 @@ impl Compiler {
                         if self.current_lexical_env_has(name) {
                             Bind::Lex(self.name_idx(name))
                         } else {
-                            // An env-homed name blocks a head slot — except a homed block `let`
-                            // (`Compiler::homed_lets`), which a fresh slot shadows correctly.
-                            if self.env_names.contains_key(name) && !self.homed_lets.contains(name)
-                            {
-                                self.pop_compile_scope();
-                                return Err(Bail);
-                            }
+                            // ECMA-262 §14.7.5.5/§14.7.5.8 creates the loop-head lexical in a
+                            // fresh Environment Record. An outer activation/module binding with
+                            // the same spelling is therefore shadowed, never a reason to reuse or
+                            // reject the new slot.
                             let slot = self.fresh_slot(name);
                             self.scope_bind(name, slot, matches!(kind, DeclKind::Const));
                             if matches!(kind, DeclKind::Let | DeclKind::Const) {
@@ -5369,14 +5366,9 @@ impl Compiler {
                         // declared (in TDZ) before `right` like the ident path. `var` patterns
                         // would have to write hoisted function-scope bindings — those stay in
                         // the oracle.
-                        let mut leaf_names = std::collections::HashSet::new();
-                        pat_idents(pat, &mut leaf_names);
-                        if leaf_names
-                            .iter()
-                            .any(|n| self.env_names.contains_key(n) && !self.homed_lets.contains(n))
-                            || self
-                                .declare_lexical_pattern(pat, matches!(kind, DeclKind::Const))
-                                .is_err()
+                        if self
+                            .declare_lexical_pattern(pat, matches!(kind, DeclKind::Const))
+                            .is_err()
                         {
                             self.pop_compile_scope();
                             return Err(Bail);
@@ -11156,8 +11148,8 @@ impl VmDelegate {
 }
 
 /// An async function or generator body running as a heap-owned bytecode continuation. It presents
-/// the same `resume(&mut Interp, Resume) -> Suspend` shape as the thread-backed fallback, so the
-/// promise/generator drivers treat both uniformly.
+/// the shared `resume(&mut Interp, Resume) -> Suspend` interface used by the promise/generator
+/// drivers and owns every suspension point explicitly.
 pub struct VmCoro {
     chunk: Rc<Chunk>,
     /// Fixed activation containing compiler-homed captures. `env` may temporarily point at a
