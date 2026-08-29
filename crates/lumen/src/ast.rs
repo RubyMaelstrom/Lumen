@@ -690,6 +690,12 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
             if matches!(&**callee, Expr::Ident(n) if n == "eval") {
                 *flags |= SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS;
             }
+            // SuperCall begins with GetNewTarget. An arrow is transparent to that lookup, so a
+            // constructor containing an async arrow with `super(...)` must retain its own
+            // new.target binding after the constructor invocation returns.
+            if matches!(&**callee, Expr::Super) {
+                *flags |= SCAN_NEW_TARGET;
+            }
             scan_expr(callee, flags);
             for a in args {
                 match a {

@@ -5179,6 +5179,26 @@ fn new_target_uses_heap_vm_continuations() {
 
 #[test]
 fn unmapped_and_lexical_arguments_use_heap_vm_continuations() {
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut synchronous = Engine::new();
+        synchronous.set_tier(tier);
+        synchronous.set_tier_threshold(0);
+        match synchronous
+            .eval(
+                "function outer(){var direct=arguments,read=()=>arguments;
+                   return [direct===read(),read()[0],read().length].join('|')}
+                 outer(5)",
+                false,
+            )
+            .expect("lexical arguments synchronous-arrow case parses")
+        {
+            Completion::Value(value) => assert_eq!(value, "true|5|1", "tier {tier:?}"),
+            Completion::Throw { name, message } => {
+                panic!("lexical arguments synchronous-arrow tier {tier:?} threw {name}: {message}")
+            }
+        }
+    }
+
     let mut generator = Engine::new();
     generator
         .eval(
@@ -5477,6 +5497,169 @@ fn async_arrows_keep_lexical_this_in_heap_vm_continuations() {
             panic!("lexical this async-arrow drive threw {name}: {message}")
         }
     }
+}
+
+#[test]
+fn async_arrow_super_calls_follow_derived_constructor_order_on_heap_vm() {
+    // ECMA-262 §13.3.7.1: GetNewTarget/GetSuperConstructor precede argument evaluation;
+    // Construct precedes BindThisValue, and instance elements follow a successful bind. The
+    // defining derived-constructor environment remains live after its explicit object return.
+    let mut suspended = Engine::new();
+    suspended
+        .eval(
+            "var release,result='pending',events=[],gate=new Promise(resolve=>release=resolve);
+             class First{constructor(value){this.base='first:'+value;events.push('first')}}
+             class Second{constructor(value){this.base='second:'+value;events.push('second')}}
+             class Derived extends First{
+               own=3;
+               constructor(){
+                 (async()=>{
+                   var made=super(...await gate);
+                   return [made===this,this.base,this.own,
+                     Object.getPrototypeOf(this)===Further.prototype,
+                     new.target===Further].join(',')
+                 })().then(value=>result=value+'|'+events.join(','),
+                           error=>result=error.name+':'+error.message);
+                 Object.setPrototypeOf(Derived,Second);
+                 return {}
+               }
+             }
+             class Further extends Derived{}
+             new Further();",
+            false,
+        )
+        .expect("suspended async-arrow super setup parses");
+    assert!(suspended
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(suspended
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    suspended
+        .eval("release([7])", false)
+        .expect("suspended async-arrow super release parses");
+    match suspended
+        .eval("result", false)
+        .expect("suspended async-arrow super result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true,first:7,3,true,true|first"),
+        Completion::Throw { name, message } => {
+            panic!("suspended async-arrow super drive threw {name}: {message}")
+        }
+    }
+
+    // IsConstructor is deliberately after ArgumentListEvaluation, including an await. A second
+    // SuperCall also constructs first and only then fails BindThisValue on the initialized
+    // derived `this` binding.
+    let mut ordering = Engine::new();
+    ordering
+        .eval(
+            "var result='pending',effects=[];
+             class Base{constructor(value){effects.push('base'+value);this.value=value}}
+             class Bad extends Base{
+               constructor(){
+                 Object.setPrototypeOf(Bad,{});
+                 (async()=>{try{super(await (effects.push('arg'),0))}
+                   catch(error){result=effects.join(',')+'|'+error.name}})();
+                 return {}
+               }
+             }
+             new Bad();",
+            false,
+        )
+        .expect("non-constructor super ordering parses");
+    match ordering
+        .eval("result", false)
+        .expect("non-constructor super ordering result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "arg|TypeError"),
+        Completion::Throw { name, message } => {
+            panic!("non-constructor super ordering threw {name}: {message}")
+        }
+    }
+
+    let mut repeated = Engine::new();
+    repeated
+        .eval(
+            "var result='pending',calls=[];
+             class Base{constructor(value){calls.push(value);this.value=value}}
+             class Derived extends Base{
+               constructor(){
+                 (async()=>{
+                   var first=super(await 1);
+                   try{super(await 2)}catch(error){
+                     result=[first===this,this.value,calls.join(','),error.name].join('|')
+                   }
+                 })();
+                 return {}
+               }
+             }
+             new Derived();",
+            false,
+        )
+        .expect("repeated async-arrow super setup parses");
+    match repeated
+        .eval("result", false)
+        .expect("repeated async-arrow super result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "true|1|1,2|ReferenceError"),
+        Completion::Throw { name, message } => {
+            panic!("repeated async-arrow super drive threw {name}: {message}")
+        }
+    }
+
+    let mut tdz = Engine::new();
+    tdz.eval(
+        "var result='pending',calls=0;
+         class Base{constructor(){calls++}}
+         class Derived extends Base{
+           constructor(){
+             (async()=>{try{this.value=(super(),1)}catch(error){
+               result=error.name+'|'+calls}})();
+             return {}
+           }
+         }
+         new Derived();",
+        false,
+    )
+    .expect("lexical-this TDZ ordering parses");
+    match tdz
+        .eval("result", false)
+        .expect("lexical-this TDZ result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "ReferenceError|0"),
+        Completion::Throw { name, message } => {
+            panic!("lexical-this TDZ ordering threw {name}: {message}")
+        }
+    }
+    assert!(ordering
+        .interp
+        .generators
+        .values()
+        .chain(repeated.interp.generators.values())
+        .chain(tdz.interp.generators.values())
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+
+    // Direct eval inherits SuperCall capability through an arrow, while an intervening ordinary
+    // function's Function Environment Record shields the surrounding derived constructor.
+    assert_eq!(
+        run("var shield='none';
+             class Base{}
+             class Derived extends Base{
+               constructor(){
+                 function ordinary(){try{eval('super()')}catch(error){shield=error.name}}
+                 ordinary();
+                 var call=()=>eval('super()'),made=call();
+                 made.shield=shield;return made
+               }
+             }
+             var made=new Derived();[made instanceof Derived,made.shield].join('|')"),
+        "true|SyntaxError"
+    );
 }
 
 #[test]

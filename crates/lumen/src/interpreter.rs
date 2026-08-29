@@ -8094,6 +8094,16 @@ impl Interp {
                     },
                 );
             }
+            // A SuperCall is syntactically valid in a derived constructor and arrows nested
+            // within it. The Function Environment Record outlives the call when such an arrow
+            // escapes, so retain that lexical capability explicitly instead of relying only on
+            // the interpreter's transient `super_call_ok` execution flag.
+            if derived_tdz {
+                scope.borrow_mut().vars.insert(
+                    "%supercallok%".to_string(),
+                    Binding::data(Value::Bool(true), false, true),
+                );
+            }
             // The `arguments` exotic object is built only when the body (or a nested arrow, or a
             // possible direct eval) can name it. Otherwise a plain sloppy function stashes what a
             // reflective `fn.arguments` read would need to materialize it on demand.
@@ -8306,7 +8316,7 @@ impl Interp {
             let _ = func.code.set(crate::bytecode::compile(func));
         }
         if let Some(Some(chunk)) = func.code.get() {
-            let this_val = if chunk.uses_this() {
+            let this_val = if chunk.needs_frame_this() {
                 self.get_var("this", scope)?
             } else {
                 Value::Undefined
@@ -8343,6 +8353,14 @@ impl Interp {
                 }
             }
             return Ok(obj);
+        }
+        if std::env::var_os("LUMEN_TIER_LOG").is_some() {
+            let source = func.source.as_deref().unwrap_or("<no source>");
+            let head: String = source.chars().take(90).collect();
+            eprintln!(
+                "[tier] native coroutine fallback: {}",
+                head.replace('\n', " ")
+            );
         }
         let func = func.clone();
         let scope = scope.clone();
@@ -8454,7 +8472,7 @@ impl Interp {
         // without an OS-thread coroutine (see `bytecode::VmCoro`). Already-instantiated parameter
         // values seed its slots; the original `args` are retained only for the arguments object.
         let coro = if let Some(chunk) = self.async_vm_chunk(func) {
-            let this_val = if chunk.uses_this() {
+            let this_val = if chunk.needs_frame_this() {
                 self.get_var("this", scope)?
             } else {
                 Value::Undefined
@@ -8469,6 +8487,14 @@ impl Interp {
                 args,
             )))
         } else {
+            if std::env::var_os("LUMEN_TIER_LOG").is_some() {
+                let source = func.source.as_deref().unwrap_or("<no source>");
+                let head: String = source.chars().take(90).collect();
+                eprintln!(
+                    "[tier] native coroutine fallback: {}",
+                    head.replace('\n', " ")
+                );
+            }
             self.spawn_async_thread(func, scope, param_seed)?
         };
         let promise = self.new_promise();

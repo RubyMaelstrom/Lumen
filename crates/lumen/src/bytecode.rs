@@ -455,6 +455,10 @@ pub enum Op {
     /// its TDZ check in the normative order.
     UpdateConst(u32, UpdKind),
     LoadThis,
+    /// Resolve the lexical `this` binding at the point of evaluation. Async arrows can outlive
+    /// a derived constructor and observe its binding change from uninitialized to initialized
+    /// after a suspended `super()` call, so entry-time frame seeding is not equivalent.
+    LoadLexicalThis,
     /// RequireObjectCoercible on the top stack value while retaining it as a Reference base.
     RequireObject,
     /// `obj.name`. First operand is the name index; second is the per-site inline-cache index into
@@ -706,6 +710,13 @@ pub enum Op {
     GetPrivateMethod(u32),
     SetPrivate(u32),
     UpdatePrivate(u32, UpdKind),
+    /// SuperCall steps 1–3: push the lexically inherited new.target and live superclass before
+    /// ArgumentListEvaluation. Both values stay on the continuation stack across suspension.
+    SuperCallStart,
+    /// Complete SuperCall from `[newTarget, superConstructor, privateArgsArray]`: Construct,
+    /// BindThisValue on the retained derived-constructor environment, initialize instance
+    /// elements, and push the constructed object.
+    SuperCallArgsArray,
     /// Split SuperProperty reference construction. The compiler emits SuperThis, then the key,
     /// then SuperBase, matching GetThisBinding → computed key → GetSuperBase ordering.
     SuperThis,
@@ -874,6 +885,9 @@ pub struct Chunk {
     /// covering common variadic helpers.
     arguments_slot: Option<u16>,
     uses_this: bool,
+    /// Arrow functions have lexical `this`; their bytecode reads the defining Environment Record
+    /// rather than an OrdinaryCallBindThis frame value.
+    lexical_this: bool,
     /// The source function's strictness. Heap continuations resume outside their original call
     /// stack, so operations whose Reference semantics depend on strict mode restore this value
     /// for every VM slice.
@@ -908,6 +922,9 @@ pub struct Chunk {
     reuse_activation: bool,
     /// An inner arrow chain reads the outer `this`: the activation carries a `this` binding.
     env_this: bool,
+    /// A parameterless synchronous function whose `arguments` is captured by an inner arrow.
+    /// The object is materialized once into the activation rather than a frame-only slot.
+    env_arguments: bool,
     /// One inline-cache slot per property-access op (`GetProp`/`SetProp`/`SetPropDrop`/`GetMethod`),
     /// holding the (prototype depth, `entries` slot) last seen for that site (see [`IcState`]). The
     /// `Chunk` is shared across calls via `Rc`, so these persist. `Cell` is fine: the VM runs one
@@ -1155,6 +1172,12 @@ impl Chunk {
         self.uses_this || self.env_this
     }
 
+    /// Whether the caller must bind or eagerly resolve a frame receiver. Arrow functions retain
+    /// their defining environment and read its `this` binding only when the expression executes.
+    pub(crate) fn needs_frame_this(&self) -> bool {
+        self.uses_this() && !self.lexical_this
+    }
+
     pub(crate) fn instance_capacity_hint(&self) -> usize {
         self.instance_capacity_hint
             .max(self.forwarded_capacity_hint.get()) as usize
@@ -1180,7 +1203,7 @@ impl Chunk {
     }
     /// Whether calls need a real activation environment (captured locals / lexical `this`).
     fn makes_env(&self) -> bool {
-        !self.cap_inits.is_empty() || self.env_this
+        !self.cap_inits.is_empty() || (self.env_this && !self.lexical_this) || self.env_arguments
     }
 
     /// Whether the JIT-to-JIT moved-frame path must stand down. An `arguments` object observes
@@ -1195,7 +1218,7 @@ impl Chunk {
     /// parameter homes and the arguments ParameterMap address the same bindings. Free names and
     /// `MakeClosure` environments route through the result. Returns `env` untouched when nothing
     /// needs seeding.
-    fn make_run_env(&self, i: &Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
+    fn make_run_env(&self, i: &mut Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
         if !self.makes_env() {
             return env.clone();
         }
@@ -1204,7 +1227,9 @@ impl Chunk {
         } else {
             crate::interpreter::new_var_scope_with_capacity(
                 Some(env.clone()),
-                self.cap_inits.len() + usize::from(self.env_this),
+                self.cap_inits.len()
+                    + usize::from(self.env_this && !self.lexical_this)
+                    + usize::from(self.env_arguments),
             )
         };
         // Function-declaration closures capture the activation itself, so they are created after
@@ -1262,7 +1287,7 @@ impl Chunk {
                     }
                 }
             }
-            if self.env_this {
+            if self.env_this && !self.lexical_this {
                 b.vars.insert(
                     "this",
                     crate::interpreter::Binding {
@@ -1288,6 +1313,13 @@ impl Chunk {
                     import_ref: None,
                     deletable: false,
                 },
+            );
+        }
+        if self.env_arguments {
+            let arguments = Value::Obj(i.make_compiled_arguments_object(args, &act));
+            act.borrow_mut().vars.insert(
+                "arguments".to_string(),
+                crate::interpreter::Binding::data(arguments, true, true),
             );
         }
         act
@@ -2548,6 +2580,7 @@ fn compile_inner(
         // A module already has its own `this` binding, initialized to undefined. Reuse that
         // environment for nested arrows instead of synthesizing a function activation.
         env_this: env_this && module_bindings.is_none(),
+        lexical_this: func.is_arrow,
         strict: func.is_strict,
         is_coroutine,
         module_body: module_bindings.is_some(),
@@ -2579,9 +2612,17 @@ fn compile_inner(
         if has_mapped_parameter_aliases {
             c.env_bind("arguments", false);
         } else if !is_coroutine {
-            let slot = c.fresh_slot("arguments");
-            c.scope_bind("arguments", slot, false);
-            c.arguments_slot = Some(slot);
+            if captured.contains("arguments") {
+                // ECMA-262 §15.3.4: an arrow has no own arguments binding. Materialize the
+                // enclosing function's one arguments object in its activation so both the outer
+                // body and every captured arrow resolve the same identity.
+                c.env_bind("arguments", false);
+                c.env_arguments = true;
+            } else {
+                let slot = c.fresh_slot("arguments");
+                c.scope_bind("arguments", slot, false);
+                c.arguments_slot = Some(slot);
+            }
         }
         // Other coroutines deliberately leave `arguments` unresolved in the chunk. The normal
         // name operation walks the retained activation installed by FunctionDeclarationInstantiation,
@@ -2850,6 +2891,7 @@ fn compile_inner(
         n_params: c.n_params,
         arguments_slot: c.arguments_slot,
         uses_this: c.uses_this,
+        lexical_this: c.lexical_this,
         strict: c.strict,
         instance_capacity_hint,
         forwarded_capacity_hint: std::cell::Cell::new(0),
@@ -2862,6 +2904,7 @@ fn compile_inner(
         cap_inits: c.cap_inits,
         reuse_activation: c.reuse_activation,
         env_this: c.env_this,
+        env_arguments: c.env_arguments,
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),
@@ -3188,6 +3231,8 @@ struct Compiler {
     cap_inits: Vec<CapInit>,
     reuse_activation: bool,
     env_this: bool,
+    env_arguments: bool,
+    lexical_this: bool,
     /// Speculative-inline plan stack (second-stage only): one frame per active splice, each
     /// mapping that frame's call-site ordinal (== the function's first-compile `CallIc` index —
     /// same AST, same emission order) to the callees to splice. See [`plan_inlines`].
@@ -6857,7 +6902,7 @@ impl Compiler {
             } if op == "="
                 && !prop.starts_with('#')
                 && match &**mobj {
-                    Expr::This => true,
+                    Expr::This => !self.lexical_this,
                     Expr::Ident(name) => {
                         matches!(self.home(name), Some(Home::Slot(..))) && no_assign_to(value, name)
                     }
@@ -7176,7 +7221,11 @@ impl Compiler {
     /// OrdinaryCallBindThis and `SuperThis` could resolve an enclosing/global `this` instead.
     fn emit_super_this(&mut self) {
         self.uses_this = true;
-        self.emit(Op::SuperThis);
+        self.emit(if self.lexical_this {
+            Op::LoadLexicalThis
+        } else {
+            Op::SuperThis
+        });
     }
 
     fn expr(&mut self, e: &Expr) -> CResult {
@@ -7247,7 +7296,11 @@ impl Compiler {
                     }
                 }
                 self.uses_this = true;
-                self.emit(Op::LoadThis);
+                self.emit(if self.lexical_this {
+                    Op::LoadLexicalThis
+                } else {
+                    Op::LoadThis
+                });
                 Ok(())
             }
             Expr::Paren(inner) => self.expr(inner),
@@ -7277,7 +7330,7 @@ impl Compiler {
                             return Ok(());
                         }
                     }
-                    Expr::This => {
+                    Expr::This if !self.lexical_this => {
                         self.uses_this = true;
                         let i = self.name_idx(prop);
                         let c = self.new_cache(i);
@@ -7677,7 +7730,28 @@ impl Compiler {
                         self.emit(Op::GetMethodElem);
                         self.finish_call(args, true, true)?;
                     }
-                    Expr::Super => return Err(Bail),
+                    Expr::Super => {
+                        // ECMA-262 §13.3.7.1 obtains new.target and the live superclass before
+                        // ArgumentListEvaluation. Keep both on the continuation stack while any
+                        // argument or spread suspends, then perform Construct/BindThisValue/field
+                        // initialization as one non-suspending completion step.
+                        self.emit(Op::SuperCallStart);
+                        self.emit(Op::NewArray);
+                        for arg in args {
+                            match arg {
+                                ArrayElem::Item(expression) => {
+                                    self.expr(expression)?;
+                                    self.emit(Op::ArrayPush);
+                                }
+                                ArrayElem::Spread(expression) => {
+                                    self.expr(expression)?;
+                                    self.emit(Op::ArraySpread);
+                                }
+                                ArrayElem::Hole => return Err(Bail),
+                            }
+                        }
+                        self.emit(Op::SuperCallArgsArray);
+                    }
                     Expr::Ident(name) if self.home(name).is_none() => {
                         // Free-name callee: resolved before the arguments (spec order), and a
                         // `with (obj) f()` hit supplies obj as `this`.
@@ -9055,6 +9129,7 @@ fn run_vm(
                 unreachable!("immutable update always completes abruptly");
             }
             Op::LoadThis => stack.push(this_val.clone()),
+            Op::LoadLexicalThis => stack.push(i.get_var("this", env)?),
             Op::RequireObject => {
                 if matches!(
                     stack.last().expect("vm stack underflow"),
@@ -10105,6 +10180,17 @@ fn run_vm(
                 })? {
                     stack.push(value);
                 }
+            }
+            Op::SuperCallStart => {
+                let (new_target, super_constructor) = i.prepare_super_call(env)?;
+                stack.push(new_target);
+                stack.push(super_constructor);
+            }
+            Op::SuperCallArgsArray => {
+                let args = argument_array_values(i, pop!());
+                let super_constructor = pop!();
+                let new_target = pop!();
+                stack.push(i.finish_super_call(new_target, super_constructor, &args, env)?);
             }
             // ECMA-262 §13.3.7.1 creates a Super Reference with the current function's actual
             // this binding as [[ThisValue]]. Compiled calls keep that binding in the VM frame
@@ -12348,7 +12434,7 @@ impl Chunk {
     }
     pub(crate) fn jit_make_run_env(
         &self,
-        i: &Interp,
+        i: &mut Interp,
         env: &Env,
         this_val: &Value,
         args: &[Value],
@@ -12417,6 +12503,9 @@ impl Chunk {
                 | Op::GetPrivateMethod(_)
                 | Op::SetPrivate(_)
                 | Op::UpdatePrivate(..)
+                | Op::SuperCallStart
+                | Op::SuperCallArgsArray
+                | Op::LoadLexicalThis
                 | Op::SuperThis
                 | Op::SuperBase
                 | Op::SuperGet
@@ -12446,6 +12535,7 @@ impl Chunk {
             | Op::LoadCap(_)
             | Op::LoadName(..)
             | Op::LoadThis
+            | Op::LoadLexicalThis
             | Op::MakeClosure(..) => (0, 1),
             Op::Dup => (1, 2),
             Op::Dup2 => (2, 4),
@@ -12576,6 +12666,8 @@ impl Chunk {
             Op::GetPrivateKeep(_) | Op::GetPrivateMethod(_) => (1, 2),
             Op::SetPrivate(_) => (2, 1),
             Op::UpdatePrivate(_, kind) => (1, upd(kind)),
+            Op::SuperCallStart => (0, 2),
+            Op::SuperCallArgsArray => (3, 1),
             Op::SuperThis | Op::SuperBase => (0, 1),
             Op::SuperGet => (3, 1),
             Op::SuperGetKeep => (3, 4),
@@ -15417,6 +15509,9 @@ unsafe fn jit_exec_inner(
         | Op::GetPrivateMethod(_)
         | Op::SetPrivate(_)
         | Op::UpdatePrivate(..)
+        | Op::SuperCallStart
+        | Op::SuperCallArgsArray
+        | Op::LoadLexicalThis
         | Op::SuperThis
         | Op::SuperBase
         | Op::SuperGet

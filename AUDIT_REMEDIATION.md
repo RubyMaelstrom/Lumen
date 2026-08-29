@@ -189,6 +189,11 @@ conformance-style tests and the broader affected suite pass.
       - [x] Resolve async-arrow `this` lexically through the retained defining environment and seed
         the heap continuation with that value, ignoring later call-site receivers and preserving it
         for nested arrows after suspension.
+      - [x] Lower `super(...)` in async arrows nested within derived constructors. Retain
+        GetNewTarget/GetSuperConstructor before suspending argument evaluation, resolve lexical
+        `this` at the actual access point, construct before BindThisValue, initialize instance
+        elements after binding, and shield the capability at intervening ordinary-function
+        environments. The forced-bytecode Test262 super/arrow/direct-eval gate passes 723/723.
       - [x] Run atomic direct eval through the normative evaluator against a fully observable
         coroutine activation, homing function-scope parameters/vars/lexicals so sloppy eval-created
         bindings and closures persist while strict eval remains isolated. Preserve a free
@@ -240,6 +245,11 @@ conformance-style tests and the broader affected suite pass.
         the same spelling. Keep sibling, nested, re-entered block, loop-head, and catch records
         distinct while rejecting only captures that also resolve through an unsupported or
         function-wide declaration identity.
+    - [x] Materialize a parameterless synchronous function's `arguments` object in its activation
+      only when an inner arrow captures it, preserving object identity without taxing uncaptured
+      variadic helpers. The official forced-bytecode lexical-arguments regression now passes, and
+      the complete generator/async Test262 directories pass 1,707/1,707 with no native-fallback
+      audit signal.
   - [x] Until the continuation conversion is complete, cap live native workers
     and make stack reservations bounded and configurable.
 - [x] Share WebAssembly memory backing directly with JS and reclaim store

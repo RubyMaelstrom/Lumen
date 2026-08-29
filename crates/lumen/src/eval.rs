@@ -3264,6 +3264,90 @@ impl Interp {
         Ok(Some((func, this, argv)))
     }
 
+    fn super_call_context_available(&self, env: &Env) -> bool {
+        // HasDirectSuper/MakeSuperPropertyReference inherit through arrows, but not through an
+        // intervening ordinary function. Model GetThisEnvironment: the first Environment Record
+        // with a `this` binding is the only one whose derived-constructor marker can authorize
+        // SuperCall. A blind lexical lookup would incorrectly reach an outer constructor from a
+        // nested ordinary function's direct eval.
+        let mut cursor = Some(env.clone());
+        while let Some(scope) = cursor {
+            let binding = scope.borrow();
+            if binding.vars.contains_key("this") {
+                return matches!(
+                    binding.vars.get("%supercallok%"),
+                    Some(marker) if marker.initialized && matches!(&marker.value, Value::Bool(true))
+                );
+            }
+            cursor = binding.parent.clone();
+        }
+        false
+    }
+
+    /// SuperCall steps 1–3 (ECMA-262 §13.3.7.1): retain GetNewTarget and the live
+    /// GetSuperConstructor result before ArgumentListEvaluation begins. Keeping these as Values
+    /// on the VM operand stack preserves that ordering across an argument's `yield`/`await`.
+    pub(crate) fn prepare_super_call(&mut self, env: &Env) -> Result<(Value, Value), Abrupt> {
+        if !self.super_call_context_available(env) {
+            return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
+        }
+        let new_target = self.new_target_vm(env);
+        let active_function = self.get_var("%thisctor%", env)?;
+        let super_constructor =
+            crate::builtins::js_get_prototype_of(self, &active_function).map_err(Abrupt::Throw)?;
+        Ok((new_target, super_constructor))
+    }
+
+    /// Complete SuperCall after ArgumentListEvaluation (ECMA-262 §13.3.7.1 steps 5–13):
+    /// Construct with the retained new.target, bind the derived constructor's lexical `this`,
+    /// then initialize that constructor's instance elements. The environment walk deliberately
+    /// skips any intervening arrow activations and remains valid after the constructor returned.
+    pub(crate) fn finish_super_call(
+        &mut self,
+        new_target: Value,
+        super_constructor: Value,
+        args: &[Value],
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        // IsConstructor follows ArgumentListEvaluation, even when the retained value is null or
+        // otherwise obviously invalid.
+        if !self.value_is_constructor(&super_constructor) {
+            return Err(self.throw("TypeError", "super constructor is not a constructor"));
+        }
+        let result = self.construct_nt(super_constructor, args, new_target)?;
+
+        // GetThisEnvironment and BindThisValue occur after Construct. A second super() therefore
+        // still constructs its parent before the already-initialized binding raises ReferenceError.
+        let mut cursor = Some(env.clone());
+        let mut this_env = None;
+        while let Some(scope) = cursor {
+            if scope.borrow().vars.contains_key("this") {
+                this_env = Some(scope);
+                break;
+            }
+            cursor = scope.borrow().parent.clone();
+        }
+        let Some(this_env) = this_env else {
+            return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
+        };
+        if this_env
+            .borrow()
+            .vars
+            .get("this")
+            .is_some_and(|binding| binding.initialized)
+        {
+            return Err(self.throw("ReferenceError", "super() may only be called once"));
+        }
+        if let Some(binding) = this_env.borrow_mut().vars.get_mut("this") {
+            binding.value = result.clone();
+            binding.initialized = true;
+        }
+
+        let active_function = self.get_var("%thisctor%", env)?;
+        self.init_instance_fields(&active_function, &result)?;
+        Ok(result)
+    }
+
     fn eval_call(
         &mut self,
         callee: &Expr,
@@ -3291,104 +3375,12 @@ impl Interp {
             }
             return self.call(func, receiver.unwrap_or(Value::Undefined), &argv);
         }
-        // `super(...)`: invoke the parent constructor on the current `this`, then run this class's
-        // instance-field initializers.
+        // SuperCall deliberately stages GetNewTarget/GetSuperConstructor before arguments; the
+        // bytecode VM uses the same two helpers with suspension between those phases.
         if matches!(callee, Expr::Super) {
-            // A super-call outside a derived constructor body (a method, a field initializer, or
-            // anything reached via a direct `eval` from those) is illegal — but an arrow created
-            // inside the constructor keeps its lexical super-call capability even when invoked
-            // later (BindThisValue then throws ReferenceError instead).
-            if !self.super_call_ok
-                && (self.peek_binding("%superclass%", env).is_none()
-                    || self.peek_binding("%thisctor%", env).is_none())
-            {
-                return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
-            }
-            if matches!(self.get_var("%superclass%", env)?, Value::Undefined) {
-                return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
-            }
-            // GetSuperConstructor: the *live* [[GetPrototypeOf]] of the running class
-            // constructor (Object.setPrototypeOf(C, ...) between definition and the call is
-            // honored). The IsConstructor check waits until the arguments have evaluated.
-            let this_ctor_for_parent = self.get_var("%thisctor%", env)?;
-            let parent = crate::builtins::js_get_prototype_of(self, &this_ctor_for_parent)
-                .map_err(Abrupt::Throw)?;
-            // Read the `this` binding directly (it is in TDZ until this very call completes);
-            // an already-initialized binding means super() ran twice.
-            let this_env = {
-                let mut cur = Some(env.clone());
-                let mut found = None;
-                while let Some(scope) = cur {
-                    if scope.borrow().vars.contains_key("this") {
-                        found = Some(scope);
-                        break;
-                    }
-                    let parent_scope = scope.borrow().parent.clone();
-                    cur = parent_scope;
-                }
-                found
-            };
-            let Some(this_env) = this_env else {
-                return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
-            };
-            let this = this_env
-                .borrow()
-                .vars
-                .get("this")
-                .map(|b| b.value.clone())
-                .unwrap();
+            let (new_target, super_constructor) = self.prepare_super_call(env)?;
             let argv = self.eval_args(args, env)?;
-            // A null (extends null) or non-constructor parent is a TypeError — after
-            // ArgumentListEvaluation.
-            if !self.value_is_constructor(&parent) {
-                return Err(self.throw("TypeError", "super constructor is not a constructor"));
-            }
-            // Construct(parent, args, GetNewTarget()): the parent runs with the derived
-            // constructor's active newTarget.
-            self.pending_new_target = self.new_target.clone();
-            let returned = self.run_constructor_on(&parent, &this, &argv)?;
-            // BindThisValue: an already-initialized `this` (a second super()) is a
-            // ReferenceError — but only after the arguments and parent construct ran.
-            {
-                let b = this_env.borrow();
-                let bd = b.vars.get("this").unwrap();
-                if bd.initialized {
-                    return Err(self.throw("ReferenceError", "super() may only be called once"));
-                }
-            }
-            // A base constructor that returns an object overrides `this` for the derived
-            // constructor (and everything downstream: field initializers, super.x accesses,
-            // the implicit return).
-            let this = match (&returned, &this) {
-                (Value::Obj(r), Value::Obj(t)) if !Rc::ptr_eq(r, t) => {
-                    let mut cur = Some(env.clone());
-                    while let Some(scope) = cur {
-                        let done = {
-                            let mut b = scope.borrow_mut();
-                            if let Some(bd) = b.vars.get_mut("this") {
-                                bd.value = returned.clone();
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if done {
-                            break;
-                        }
-                        let parent_scope = scope.borrow().parent.clone();
-                        cur = parent_scope;
-                    }
-                    returned.clone()
-                }
-                _ => this,
-            };
-            if let Some(bd) = this_env.borrow_mut().vars.get_mut("this") {
-                bd.initialized = true;
-            }
-            let this_ctor = self.get_var("%thisctor%", env)?;
-            self.init_instance_fields(&this_ctor, &this)?;
-            // The value of a `super(...)` expression is the (possibly overridden) `this`.
-            return Ok(this);
+            return self.finish_super_call(new_target, super_constructor, &argv, env);
         }
         // `super.m(...)` / `super[k](...)`: method on the super prototype, called with current `this`.
         if let Expr::Member { obj, prop, .. } = callee {
@@ -4029,10 +4021,11 @@ impl Interp {
             &private_names,
         )
         .map_err(|e| self.throw("SyntaxError", e.message))?;
-        // A direct `eval` inherits the caller's super-call context: a `super(...)` in the eval is an
-        // early SyntaxError unless the eval sits directly inside a derived constructor body. (Caught
-        // here, before any of the eval body runs, so side effects preceding the `super()` don't.)
-        if direct && !self.super_call_ok && stmts_have_super_call(&body) {
+        // A direct `eval` inherits the caller's lexical super-call context: a `super(...)` in the
+        // eval is an early SyntaxError unless GetThisEnvironment reaches a derived constructor
+        // (possibly through arrows). Check before any eval-body side effect.
+        if direct && !self.super_call_context_available(caller_env) && stmts_have_super_call(&body)
+        {
             return Err(self.throw("SyntaxError", "'super' keyword unexpected here"));
         }
         // Likewise a `super.x` reference requires the eval to sit (lexically) in method or class
