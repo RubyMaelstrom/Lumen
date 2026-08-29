@@ -5588,6 +5588,163 @@ fn direct_eval_uses_the_retained_coroutine_activation() {
 }
 
 #[test]
+fn direct_eval_retains_runtime_lexicals_and_suspending_arguments() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "var argumentEffects=0;
+             function* lexicalScopes(){
+               var value=1,closures=[];
+               {let value=2;
+                 yield eval('value');
+                 eval('value=3;var made=4');
+                 yield [value,made].join(',')
+               }
+               yield [value,made,eval('typeof value')].join(',');
+               for(let item of [5,6]){closures.push(()=>item);yield eval('item')}
+               return closures.map(read=>read()).join(',')
+             }
+             function* catchScope(){
+               try{throw 1}catch(e){
+                 yield eval('e');eval('var e=4');yield e;yield eval('e')
+               }
+               return typeof e
+             }
+             function* suspendedDirect(){
+               let local=7,source=yield 'source';
+               let first=eval(source,argumentEffects++);
+               let second=eval(...(yield 'spread'));
+               return [first,second,argumentEffects].join(',')
+             }
+             function* shadowedEval(){
+               let eval=value=>'shadow:'+value;
+               return eval(yield 'shadow-source')
+             }
+             function* aliasedIntrinsic(){
+               let eval=globalThis.eval,local=9;
+               return eval(yield 'intrinsic-source')
+             }
+             function* withPropertyEval(){
+               let local=11;
+               with({eval:globalThis.eval}){return eval(yield 'with-source')}
+             }
+             globalThis.oracleWithEval=(function(){
+               let local=13;
+               with({eval:globalThis.eval}){return eval('typeof local')}
+             })();
+             globalThis.lexicalIterator=lexicalScopes();
+             globalThis.catchIterator=catchScope();
+             globalThis.suspendedIterator=suspendedDirect();
+             globalThis.shadowedIterator=shadowedEval();
+             globalThis.aliasedIterator=aliasedIntrinsic();
+             globalThis.withIterator=withPropertyEval();",
+            false,
+        )
+        .expect("runtime lexical direct-eval setup parses");
+    match engine
+        .eval("oracleWithEval", false)
+        .expect("tree-walker with-property eval result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "undefined"),
+        Completion::Throw { name, message } => {
+            panic!("tree-walker with-property eval threw {name}: {message}")
+        }
+    }
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+
+    let result = engine
+        .eval(
+            "var values=[];
+             values.push(lexicalIterator.next().value);
+             values.push(lexicalIterator.next().value);
+             values.push(lexicalIterator.next().value);
+             values.push(lexicalIterator.next().value);
+             values.push(lexicalIterator.next().value);
+             values.push(lexicalIterator.next().value);
+             values.push(catchIterator.next().value);
+             values.push(catchIterator.next().value);
+             values.push(catchIterator.next().value);
+             values.push(catchIterator.next().value);
+             values.push(suspendedIterator.next().value);
+             values.push(suspendedIterator.next('local+1').value);
+             values.push(suspendedIterator.next(['local+2','ignored']).value);
+             values.push(shadowedIterator.next().value);
+             values.push(shadowedIterator.next('ok').value);
+             values.push(aliasedIterator.next().value);
+             values.push(aliasedIterator.next('local+1').value);
+             values.push(withIterator.next().value);
+             values.push(withIterator.next('typeof local').value);
+             values.join('|')",
+            false,
+        )
+        .expect("runtime lexical direct-eval drive parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match result {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "2|3,4|1,4,number|5|6|5,6|1|4|4|undefined|source|spread|8,9,1|shadow-source|shadow:ok|intrinsic-source|10|with-source|undefined"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("runtime lexical direct-eval drive threw {name}: {message}")
+        }
+    }
+
+    let mut asynchronous = Engine::new();
+    asynchronous
+        .eval(
+            "var releaseSource,releaseFinish,result='pending';
+             var sourceGate=new Promise(resolve=>releaseSource=resolve);
+             var finishGate=new Promise(resolve=>releaseFinish=resolve);
+             async function suspendedEval(){
+               let local=3,answer=eval(await sourceGate);
+               await finishGate;
+               return answer
+             }
+             suspendedEval().then(value=>result=value);",
+            false,
+        )
+        .expect("async suspended direct-eval setup parses");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    asynchronous
+        .eval("releaseSource('local+2')", false)
+        .expect("async direct-eval source release parses");
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+    assert!(asynchronous
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    asynchronous
+        .eval("releaseFinish()", false)
+        .expect("async direct-eval final release parses");
+    match asynchronous
+        .eval("result", false)
+        .expect("async suspended direct-eval result parses")
+    {
+        Completion::Value(value) => assert_eq!(value, "5"),
+        Completion::Throw { name, message } => {
+            panic!("async suspended direct-eval drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
 fn direct_eval_destructuring_default_retains_its_earlier_reference() {
     let mut engine = Engine::new();
     engine

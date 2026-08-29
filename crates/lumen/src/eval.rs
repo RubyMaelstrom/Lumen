@@ -3271,21 +3271,25 @@ impl Interp {
         optional: bool,
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        // Direct eval: `eval(src)` called by that exact name runs the code in the *caller's* scope
-        // (so it can see/define local bindings). Any other way of reaching eval is indirect and runs
-        // in the global scope (handled by the global `eval` native).
-        if let Expr::Ident(name) = callee {
-            // `eval?.(...)` is NOT a direct eval — it runs indirectly, in the global scope.
-            if name == "eval" && !optional {
-                if let (Ok(Value::Obj(f)), Some(ef)) =
-                    (self.get_var("eval", env), self.eval_fn.clone())
-                {
-                    if Rc::ptr_eq(&f, &ef) {
-                        let argv = self.eval_args(args, env)?;
-                        return self.direct_eval(argv.first(), env);
-                    }
-                }
+        // ECMA-262 §13.3.6 recognizes direct eval only from a non-property Reference whose
+        // [[ReferencedName]] is "eval" and whose value is this Realm's %eval%. Resolve that
+        // Reference exactly once before arguments: a `with` hit supplies a base object and is
+        // therefore indirect even when the property value happens to be %eval%.
+        if !optional && matches!(callee, Expr::Ident(name) if name == "eval") {
+            let (func, receiver) = self.get_var_with("eval", env)?;
+            let direct = receiver.is_none()
+                && matches!(
+                    (&func, &self.eval_fn),
+                    (Value::Obj(function), Some(intrinsic)) if Rc::ptr_eq(function, intrinsic)
+                );
+            let argv = self.eval_args(args, env)?;
+            if direct {
+                return self.direct_eval(argv.first(), env);
             }
+            if !func.is_callable() {
+                return Err(self.throw("TypeError", "eval is not a function"));
+            }
+            return self.call(func, receiver.unwrap_or(Value::Undefined), &argv);
         }
         // `super(...)`: invoke the parent constructor on the current `this`, then run this class's
         // instance-field initializers.
@@ -3970,7 +3974,7 @@ impl Interp {
     }
 
     /// Direct eval: a non-string argument is returned unchanged; a string is parsed and executed.
-    fn direct_eval(&mut self, arg: Option<&Value>, env: &Env) -> Result<Value, Abrupt> {
+    pub(crate) fn direct_eval(&mut self, arg: Option<&Value>, env: &Env) -> Result<Value, Abrupt> {
         let code = match arg {
             Some(Value::Str(s)) => s.clone(),
             Some(other) => return Ok(other.clone()),

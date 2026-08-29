@@ -192,10 +192,15 @@ conformance-style tests and the broader affected suite pass.
       - [x] Run atomic direct eval through the normative evaluator against a fully observable
         coroutine activation, homing function-scope parameters/vars/lexicals so sloppy eval-created
         bindings and closures persist while strict eval remains isolated. Preserve a free
-        assignment's pre-RHS Environment Reference when eval creates a nearer `var`; keep
-        dynamically visible per-block lexical environments, assignments spanning suspension, and
-        destructuring defaults whose direct eval can change a previously resolved free-name target
-        by retaining opaque Environment References directly in the heap continuation.
+        assignment's pre-RHS Environment Reference when eval creates a nearer `var`, and preserve
+        assignments spanning suspension plus destructuring defaults whose eval can change a
+        previously resolved free-name target by retaining opaque Environment References directly
+        in the heap continuation.
+      - [x] Retain exact block, loop, switch, and catch lexical environments for direct eval;
+        distinguish a `with` property Reference from a direct call; and lower arbitrary suspended
+        ArgumentListEvaluation (including spreads) before choosing direct PerformEval versus an
+        ordinary shadowed call. The complete forced-bytecode Test262 `language/eval-code/direct`
+        slice passes 286/286.
     - [x] Move compiler-supported Source Text Module top-level-await evaluation into a strict,
       continuation-owned AsyncBlock over the already-instantiated module environment. Preserve
       live imports/exports, TDZ and immutable cells, default-export naming, module completion

@@ -564,6 +564,12 @@ pub enum Op {
     CallArgsArray,
     /// [`Op::CallArgsArray`] with a receiver beneath the callee.
     CallArgsArrayThis,
+    /// A syntactic `eval(...)` call after its Reference and complete argument list have been
+    /// evaluated in source order. If the retained receiver proves a non-property Reference and
+    /// the callee is this Realm's `%eval%`, run PerformEval against the live VM environment;
+    /// otherwise make the ordinary call. The arguments travel in the same private dense array as
+    /// [`Op::CallArgsArrayThis`], so arbitrary suspension and spreads remain explicit bytecode.
+    EvalCallArgsArray,
     /// Statement-position `obj.name += v` (pops v, the compound-read lval, obj): appends IN
     /// PLACE when the property still holds the exact string the read produced and everything is
     /// plain (see `Interp::append_prop_fast`); otherwise runs the generic Add + IC store —
@@ -741,6 +747,9 @@ pub enum Op {
     /// Uncaptured bindings in the same source scope remain VM slots; `InitLex` performs the
     /// declaration's InitializeBinding against this record.
     PushLex(u32),
+    /// [`Op::PushLex`] for a CatchClause parameter environment. The distinct marker implements
+    /// the Annex B.3.4 EvalDeclarationInstantiation exemption for `catch (e)`.
+    PushCatchLex(u32),
     /// CreatePerIterationEnvironment for the captured subset of a classic `for (let ...)` head:
     /// replace the current lexical record with a fresh sibling and copy its live binding values.
     CloneLex(u32),
@@ -1349,8 +1358,8 @@ struct CaptureScan {
     /// Whether `this` is read from an inner arrow chain rooted at the outer function.
     env_this: bool,
     /// A direct eval can dynamically name every binding in the surrounding function. Coroutine
-    /// compilation may retain the real activation and home all function-scope names there, but
-    /// per-block environments still require the conservative fallback.
+    /// compilation retains the function activation and every exact block/catch/loop environment
+    /// that can be visible at the call site.
     allow_direct_eval: bool,
     saw_direct_eval: bool,
     /// Coroutine bytecode carries a resumable lexical-environment cursor and can therefore
@@ -1527,15 +1536,32 @@ impl CaptureScan {
             arrow_path: vec![func.is_arrow],
         };
         sc.fn_body(func)?;
-        // A direct eval at any nested function depth may dynamically reference any binding in the
-        // outer function. Function-wide params/vars/body lexicals can share one retained
-        // activation. A depth-0 inner lexical (block/catch/loop/class scope) needs a distinct
-        // runtime environment and is not flattened here.
+        // ECMA-262 PerformEval starts a direct eval from the running context's LexicalEnvironment
+        // and VariableEnvironment. A syntactic eval at any nested function depth may therefore
+        // dynamically reference any binding in the outer function. Retain every function-wide
+        // binding in the activation and every depth-0 inner binding in its exact runtime scope.
+        // This is deliberately function-wide over-approximation: direct eval is rare, while
+        // flattening even a once-only block into the activation would make it visible to eval
+        // after that block has exited.
         if sc.saw_direct_eval {
-            if !sc.depth0_inner_decls.is_empty() {
-                return None;
+            let top_serial = sc.top_serial?;
+            for name in &sc.top_names {
+                sc.captured.insert(name.clone());
+                sc.captured_serials
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(top_serial);
             }
-            sc.captured.extend(sc.top_names.iter().cloned());
+            for name in &sc.depth0_inner_decls {
+                let serials = sc.runtime_candidates.get(name)?;
+                sc.captured.insert(name.clone());
+                sc.captured_serials
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(serials.iter().copied());
+                // Direct eval requires source-scope visibility, never activation homing.
+                sc.candidates.remove(name);
+            }
         }
         // Every function-scope binding visible beneath a with object must have an Environment
         // Record home; direct slots would bypass HasBinding/@@unscopables. Inner block lexicals
@@ -2225,8 +2251,12 @@ impl CaptureScan {
                 self.expr(cons)?;
                 self.expr(alt)
             }
-            Expr::Call { callee, args, .. } => {
-                if matches!(&**callee, Expr::Ident(n) if n == "eval") {
+            Expr::Call {
+                callee,
+                args,
+                optional,
+            } => {
+                if !optional && matches!(&**callee, Expr::Ident(n) if n == "eval") {
                     if !self.allow_direct_eval {
                         return None;
                     }
@@ -2788,6 +2818,7 @@ fn compile_inner(
             | Op::DisposeJump
             | Op::PushWith
             | Op::PushLex(_)
+            | Op::PushCatchLex(_)
             | Op::CloneLex(_)
             | Op::InitLex(_)
             | Op::PopEnv
@@ -3000,6 +3031,7 @@ fn plan_inlines_at(
                         | Op::DisposeJump
                         | Op::PushWith
                         | Op::PushLex(_)
+                        | Op::PushCatchLex(_)
                         | Op::CloneLex(_)
                         | Op::InitLex(_)
                         | Op::PopEnv
@@ -3076,10 +3108,11 @@ struct Compiler {
     /// fresh FunctionDeclarationInstantiation environment.
     module_body: bool,
     /// This coroutine contains direct eval and CaptureScan proved every dynamically visible
-    /// depth-0 binding can live in the retained function activation.
+    /// depth-0 binding has an exact retained activation or runtime lexical-environment home.
     direct_eval: bool,
-    /// Inner lexical names whose closure-visible binding must live in the resumable environment
-    /// chain. CaptureScan admits only an unambiguous declaring scope for each spelling.
+    /// Inner lexical names whose closure- or eval-visible bindings must live in the resumable
+    /// environment chain. Every admitted source scope receives its own Environment Record even
+    /// when several declarations reuse the same spelling.
     runtime_lexicals: std::collections::HashSet<String>,
     /// Captured once-per-call block `let`s homed in the activation (see CaptureScan's
     /// `candidates`). `homed_pending` holds the ones whose declaring block hasn't been reached
@@ -4417,8 +4450,8 @@ impl Compiler {
     fn env_has(&self, name: &str) -> bool {
         self.env_names.contains_key(name)
     }
-    /// Resolve a local: innermost slot scope first (block lexicals shadow captured names — a
-    /// captured block lexical bails compile, so every env name is function-scope-wide).
+    /// Resolve a local: innermost slot scope first, then runtime lexical environments (reported
+    /// as `None` so the emitter uses dynamic name resolution), then the function activation.
     fn home(&self, name: &str) -> Option<Home> {
         if let Some(floor) = self.with_scope_floors.last().copied() {
             for (scope, environment) in self.scopes[floor..]
@@ -6211,10 +6244,10 @@ impl Compiler {
                 self.catch_clause_body(pattern, body)
             } else {
                 // NewDeclarativeEnvironment precedes BindingInitialization, and the environment
-                // remains current through evaluation of the nested Block. Direct eval is excluded
-                // by CaptureScan whenever an inner lexical is present, so the catch-parameter-only
-                // Annex B flag is unobservable on this compiled path.
-                let scope = self.push_runtime_lexical_scope(bindings);
+                // remains current through evaluation of the nested Block. Keep the catch marker:
+                // Annex B.3.4 exempts this one environment when sloppy eval checks whether a var
+                // declaration may cross intervening lexical environments.
+                let scope = self.push_runtime_catch_scope(bindings);
                 self.environment_scope(|compiler| compiler.catch_clause_body(pattern, body), scope)
             };
             self.pop_compile_scope();
@@ -6319,6 +6352,14 @@ impl Compiler {
     }
 
     fn push_runtime_lexical_scope(&mut self, bindings: Vec<(String, bool)>) -> u32 {
+        self.push_runtime_scope(bindings, false)
+    }
+
+    fn push_runtime_catch_scope(&mut self, bindings: Vec<(String, bool)>) -> u32 {
+        self.push_runtime_scope(bindings, true)
+    }
+
+    fn push_runtime_scope(&mut self, bindings: Vec<(String, bool)>, catch_param: bool) -> u32 {
         for (name, is_const) in &bindings {
             self.lexical_env_bind(name, *is_const);
         }
@@ -6332,7 +6373,11 @@ impl Compiler {
                 })
                 .collect(),
         );
-        self.emit(Op::PushLex(scope));
+        self.emit(if catch_param {
+            Op::PushCatchLex(scope)
+        } else {
+            Op::PushLex(scope)
+        });
         scope
     }
 
@@ -7546,25 +7591,40 @@ impl Compiler {
                 optional: false,
             } => {
                 if matches!(&**callee, Expr::Ident(n) if n == "eval") {
-                    // PerformEval is atomic with respect to this coroutine. Run the uncommon call
-                    // through the normative evaluator against the retained activation; every
-                    // statically declared function-scope binding was env-homed by CaptureScan, so
-                    // sloppy eval var/function declarations and later closures see shared storage.
-                    // An await/yield in argument evaluation must still be lowered around the call
-                    // rather than hidden inside the retained evaluator, so keep that shape out.
-                    if !self.direct_eval
-                        || args.iter().any(|arg| match arg {
-                            ArrayElem::Item(expr) | ArrayElem::Spread(expr) => {
-                                crate::eval::expr_contains(expr, |nested| {
-                                    matches!(nested, Expr::Yield { .. } | Expr::Await(_))
-                                })
-                            }
-                            ArrayElem::Hole => false,
-                        })
-                    {
+                    if !self.direct_eval {
                         return Err(Bail);
                     }
-                    self.retain_eval_expr(e);
+
+                    // ECMA-262 §13.3.6 evaluates the identifier Reference/GetValue before
+                    // ArgumentListEvaluation, then recognizes direct eval only when that exact
+                    // non-property Reference still names this Realm's %eval%. Retain the
+                    // with-object receiver (if any) alongside the callee, stage every argument
+                    // and spread in source order, and decide direct-vs-ordinary only after the
+                    // complete list exists. PerformEval itself is atomic, but yield/await in its
+                    // arguments stays visible to this heap continuation.
+                    if self.home("eval").is_none() {
+                        let name = self.name_idx("eval");
+                        let cache = self.new_name_cache(name);
+                        self.emit(Op::LoadNameForCall(name, cache));
+                    } else {
+                        self.emit(Op::Undef);
+                        self.expr(callee)?;
+                    }
+                    self.emit(Op::NewArray);
+                    for arg in args {
+                        match arg {
+                            ArrayElem::Item(expr) => {
+                                self.expr(expr)?;
+                                self.emit(Op::ArrayPush);
+                            }
+                            ArrayElem::Spread(expr) => {
+                                self.expr(expr)?;
+                                self.emit(Op::ArraySpread);
+                            }
+                            ArrayElem::Hole => return Err(Bail),
+                        }
+                    }
+                    self.emit(Op::EvalCallArgsArray);
                     return Ok(());
                 }
                 match &**callee {
@@ -9209,8 +9269,12 @@ fn run_vm(
                 let object = crate::builtins::box_primitive_pub(i, value);
                 *env = crate::interpreter::new_with_scope(env.clone(), object);
             }
-            Op::PushLex(scope) => {
-                let next = crate::interpreter::new_scope(Some(env.clone()));
+            Op::PushLex(scope) | Op::PushCatchLex(scope) => {
+                let next = if matches!(op, Op::PushCatchLex(_)) {
+                    crate::interpreter::new_catch_scope(env.clone())
+                } else {
+                    crate::interpreter::new_scope(Some(env.clone()))
+                };
                 {
                     let mut record = next.borrow_mut();
                     for binding in &chunk.lexical_scopes[scope as usize] {
@@ -9468,6 +9532,23 @@ fn run_vm(
                     Value::Undefined
                 };
                 let value = i.call(callee, this, &args)?;
+                stack.push(value);
+            }
+            Op::EvalCallArgsArray => {
+                let args = argument_array_values(i, pop!());
+                let callee = pop!();
+                let receiver = pop!();
+                let direct = matches!(receiver, Value::Undefined)
+                    && matches!(
+                        (&callee, &i.eval_fn),
+                        (Value::Obj(function), Some(intrinsic))
+                            if Rc::ptr_eq(function, intrinsic)
+                    );
+                let value = if direct {
+                    i.direct_eval(args.first(), env)?
+                } else {
+                    i.call(callee, receiver, &args)?
+                };
                 stack.push(value);
             }
             Op::AppendProp(n, c) => {
@@ -12288,6 +12369,7 @@ impl Chunk {
                 | Op::EvalExpr(_)
                 | Op::PushWith
                 | Op::PushLex(_)
+                | Op::PushCatchLex(_)
                 | Op::CloneLex(_)
                 | Op::InitLex(_)
                 | Op::PopEnv
@@ -12319,6 +12401,7 @@ impl Chunk {
                 | Op::ArraySpread
                 | Op::CallArgsArray
                 | Op::CallArgsArrayThis
+                | Op::EvalCallArgsArray
                 | Op::NewArgsArray
                 | Op::NewObject
                 | Op::ObjectData(_)
@@ -12405,7 +12488,7 @@ impl Chunk {
             Op::LoadRef(_) => (0, 1),
             Op::StoreRef(_) => (1, 0),
             Op::PushWith => (1, 0),
-            Op::PushLex(_) | Op::CloneLex(_) => (0, 0),
+            Op::PushLex(_) | Op::PushCatchLex(_) | Op::CloneLex(_) => (0, 0),
             Op::InitLex(_) => (1, 0),
             Op::PopEnv => (0, 0),
             Op::PushDisposeFrame | Op::DisposeNormal => (0, 0),
@@ -12422,6 +12505,7 @@ impl Chunk {
             Op::CallSpreadThis(argc) => (*argc as usize + 2, 1),
             Op::CallArgsArray => (2, 1),
             Op::CallArgsArrayThis => (3, 1),
+            Op::EvalCallArgsArray => (3, 1),
             Op::ToStr => (1, 1),
             Op::GetIter => (1, 2),
             Op::GetAsyncIter => (1, 3),
@@ -15299,6 +15383,7 @@ unsafe fn jit_exec_inner(
         | Op::EvalExpr(_)
         | Op::PushWith
         | Op::PushLex(_)
+        | Op::PushCatchLex(_)
         | Op::CloneLex(_)
         | Op::InitLex(_)
         | Op::PopEnv
@@ -15317,6 +15402,7 @@ unsafe fn jit_exec_inner(
         | Op::ArrayPush
         | Op::ArrayHole
         | Op::ArraySpread
+        | Op::EvalCallArgsArray
         | Op::NewObject
         | Op::ObjectData(_)
         | Op::ObjectSpread
