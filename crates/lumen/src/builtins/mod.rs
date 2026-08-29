@@ -6944,35 +6944,531 @@ fn regexp_string_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Res
     Ok(i.iter_result_obj(m, false))
 }
 
-/// `Array.fromAsync(source, mapFn?, thisArg?)`: build an array from a sync/async iterable or an
-/// array-like, awaiting each element, and return a promise of the result. lumen drains microtasks
-/// synchronously, so the whole thing runs eagerly and settles the returned promise.
-fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    // Array.fromAsync runs as a genuine async coroutine: it executes synchronously up to the
-    // first await, then parks, so concurrent mutations of the input interleave per spec.
+/// `Array.fromAsync` is specified as an async function (ECMA-262 §23.1.2.2), but it is a built-in
+/// rather than source text the bytecode compiler can lower. Keep its execution context as this
+/// explicit heap state machine and let the ordinary async driver park it at each normative Await.
+pub(crate) struct FromAsyncCoro {
+    stage: FromAsyncStage,
+    started: bool,
+    done: bool,
+}
+
+struct FromAsyncIter {
+    array: Value,
+    iterator: Value,
+    next: Value,
+    mapper: Value,
+    this_arg: Value,
+    index: u64,
+    from_sync: bool,
+}
+
+struct FromAsyncArrayLike {
+    array: Value,
+    source: Value,
+    mapper: Value,
+    this_arg: Value,
+    index: usize,
+    length: usize,
+}
+
+enum FromAsyncStage {
+    Start {
+        ctor: Value,
+        source: Value,
+        mapper: Value,
+        this_arg: Value,
+    },
+    IteratorNext(FromAsyncIter),
+    IteratorResult(FromAsyncIter),
+    IteratorMapped(FromAsyncIter),
+    ArrayLikeNext(FromAsyncArrayLike),
+    ArrayLikeValue(FromAsyncArrayLike),
+    ArrayLikeMapped(FromAsyncArrayLike),
+    Closing {
+        error: Value,
+        iterator: Value,
+    },
+    Done,
+}
+
+impl FromAsyncCoro {
+    fn new(ctor: Value, source: Value, mapper: Value, this_arg: Value) -> Self {
+        Self {
+            stage: FromAsyncStage::Start {
+                ctor,
+                source,
+                mapper,
+                this_arg,
+            },
+            started: false,
+            done: false,
+        }
+    }
+
+    pub(crate) fn done(&self) -> bool {
+        self.done
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        self.started
+    }
+
+    pub(crate) fn terminate(&mut self) {
+        self.stage = FromAsyncStage::Done;
+        self.done = true;
+    }
+
+    fn finish(&mut self, result: crate::coroutine::Suspend) -> crate::coroutine::Suspend {
+        self.stage = FromAsyncStage::Done;
+        self.done = true;
+        result
+    }
+
+    fn close_after_error(
+        &mut self,
+        i: &mut Interp,
+        state: FromAsyncIter,
+        error: Value,
+    ) -> crate::coroutine::Suspend {
+        use crate::coroutine::Suspend;
+        let iterator = state.iterator;
+        if state.from_sync {
+            // The iterator record is the spec's async-from-sync wrapper. Its `return()` always
+            // returns a promise, and AsyncIteratorClose awaits that promise even though the
+            // original throw completion ultimately wins.
+            let awaited = from_async_sync_close(i, &iterator);
+            self.stage = FromAsyncStage::Closing { error, iterator };
+            return Suspend::Await(awaited);
+        }
+
+        // AsyncIteratorClose(iteratorRecord, ThrowCompletion(error)), ECMA-262 §7.4.15. An abrupt
+        // return getter/call is discarded in favour of the original throw; only a normal call
+        // result introduces the required Await.
+        let ret = match i.get_member(&iterator, "return") {
+            Ok(value) => value,
+            Err(_) => return self.finish(Suspend::Throw(error)),
+        };
+        if matches!(ret, Value::Undefined | Value::Null) {
+            return self.finish(Suspend::Throw(error));
+        }
+        if !ret.is_callable() {
+            return self.finish(Suspend::Throw(error));
+        }
+        let awaited = match i.call(ret, iterator.clone(), &[]) {
+            Ok(value) => value,
+            Err(_) => return self.finish(Suspend::Throw(error)),
+        };
+        self.stage = FromAsyncStage::Closing { error, iterator };
+        Suspend::Await(awaited)
+    }
+
+    pub(crate) fn resume(
+        &mut self,
+        i: &mut Interp,
+        signal: crate::coroutine::Resume,
+    ) -> crate::coroutine::Suspend {
+        use crate::coroutine::{Resume, Suspend};
+        if self.done {
+            return Suspend::Done(Value::Undefined);
+        }
+        if matches!(signal, Resume::Terminate) {
+            self.terminate();
+            return Suspend::Done(Value::Undefined);
+        }
+        self.started = true;
+        let mut input = Some(signal);
+
+        loop {
+            let stage = std::mem::replace(&mut self.stage, FromAsyncStage::Done);
+            match stage {
+                FromAsyncStage::Start {
+                    ctor,
+                    source,
+                    mapper,
+                    this_arg,
+                } => {
+                    // The initial drive is AsyncFunctionStart rather than an Await resumption.
+                    let _ = input.take();
+                    match from_async_start(i, ctor, source, mapper, this_arg) {
+                        Ok(stage) => self.stage = stage,
+                        Err(error) => return self.finish(Suspend::Throw(error)),
+                    }
+                }
+                FromAsyncStage::IteratorNext(state) => {
+                    if state.index >= 9_007_199_254_740_991 {
+                        let error =
+                            i.make_error("TypeError", "Array.fromAsync result is too large");
+                        return self.close_after_error(i, state, error);
+                    }
+                    let awaited = if state.from_sync {
+                        from_async_sync_next(i, &state.iterator, &state.next)
+                    } else {
+                        match i.call(state.next.clone(), state.iterator.clone(), &[]) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return self.finish(Suspend::Throw(
+                                    crate::interpreter::abrupt_value(error),
+                                ));
+                            }
+                        }
+                    };
+                    self.stage = FromAsyncStage::IteratorResult(state);
+                    return Suspend::Await(awaited);
+                }
+                FromAsyncStage::IteratorResult(mut state) => {
+                    let result = match input.take().expect("an Await stage resumes with a signal") {
+                        Resume::Next(value) | Resume::Return(value) => value,
+                        Resume::Throw(error) => return self.finish(Suspend::Throw(error)),
+                        Resume::Terminate => unreachable!(),
+                    };
+                    if !matches!(result, Value::Obj(_)) {
+                        let error = i.make_error("TypeError", "iterator result is not an object");
+                        return self.finish(Suspend::Throw(error));
+                    }
+                    let done = match i.get_member(&result, "done") {
+                        Ok(value) => i.to_boolean(&value),
+                        Err(error) => {
+                            return self
+                                .finish(Suspend::Throw(crate::interpreter::abrupt_value(error)));
+                        }
+                    };
+                    if done {
+                        if let Err(error) = set_length_throw(i, &state.array, state.index as f64) {
+                            return self.finish(Suspend::Throw(error));
+                        }
+                        return self.finish(Suspend::Done(state.array));
+                    }
+                    let value = match i.get_member(&result, "value") {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return self
+                                .finish(Suspend::Throw(crate::interpreter::abrupt_value(error)));
+                        }
+                    };
+                    if state.mapper.is_callable() {
+                        let mapped = match i.call(
+                            state.mapper.clone(),
+                            state.this_arg.clone(),
+                            &[value, Value::Num(state.index as f64)],
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let error = crate::interpreter::abrupt_value(error);
+                                return self.close_after_error(i, state, error);
+                            }
+                        };
+                        self.stage = FromAsyncStage::IteratorMapped(state);
+                        return Suspend::Await(mapped);
+                    }
+                    if let Err(error) =
+                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
+                    {
+                        return self.close_after_error(i, state, error);
+                    }
+                    state.index += 1;
+                    self.stage = FromAsyncStage::IteratorNext(state);
+                }
+                FromAsyncStage::IteratorMapped(mut state) => {
+                    let value = match input.take().expect("an Await stage resumes with a signal") {
+                        Resume::Next(value) | Resume::Return(value) => value,
+                        Resume::Throw(error) => return self.close_after_error(i, state, error),
+                        Resume::Terminate => unreachable!(),
+                    };
+                    if let Err(error) =
+                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
+                    {
+                        return self.close_after_error(i, state, error);
+                    }
+                    state.index += 1;
+                    self.stage = FromAsyncStage::IteratorNext(state);
+                }
+                FromAsyncStage::ArrayLikeNext(state) => {
+                    if state.index >= state.length {
+                        if let Err(error) = set_length_throw(i, &state.array, state.length as f64) {
+                            return self.finish(Suspend::Throw(error));
+                        }
+                        return self.finish(Suspend::Done(state.array));
+                    }
+                    let value = match i.get_member(&state.source, &state.index.to_string()) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return self
+                                .finish(Suspend::Throw(crate::interpreter::abrupt_value(error)));
+                        }
+                    };
+                    self.stage = FromAsyncStage::ArrayLikeValue(state);
+                    return Suspend::Await(value);
+                }
+                FromAsyncStage::ArrayLikeValue(mut state) => {
+                    let value = match input.take().expect("an Await stage resumes with a signal") {
+                        Resume::Next(value) | Resume::Return(value) => value,
+                        Resume::Throw(error) => return self.finish(Suspend::Throw(error)),
+                        Resume::Terminate => unreachable!(),
+                    };
+                    if state.mapper.is_callable() {
+                        let mapped = match i.call(
+                            state.mapper.clone(),
+                            state.this_arg.clone(),
+                            &[value, Value::Num(state.index as f64)],
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return self.finish(Suspend::Throw(
+                                    crate::interpreter::abrupt_value(error),
+                                ));
+                            }
+                        };
+                        self.stage = FromAsyncStage::ArrayLikeMapped(state);
+                        return Suspend::Await(mapped);
+                    }
+                    if let Err(error) =
+                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
+                    {
+                        return self.finish(Suspend::Throw(error));
+                    }
+                    state.index += 1;
+                    self.stage = FromAsyncStage::ArrayLikeNext(state);
+                }
+                FromAsyncStage::ArrayLikeMapped(mut state) => {
+                    let value = match input.take().expect("an Await stage resumes with a signal") {
+                        Resume::Next(value) | Resume::Return(value) => value,
+                        Resume::Throw(error) => return self.finish(Suspend::Throw(error)),
+                        Resume::Terminate => unreachable!(),
+                    };
+                    if let Err(error) =
+                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
+                    {
+                        return self.finish(Suspend::Throw(error));
+                    }
+                    state.index += 1;
+                    self.stage = FromAsyncStage::ArrayLikeNext(state);
+                }
+                FromAsyncStage::Closing { error, iterator } => {
+                    // AsyncIteratorClose with a throw completion awaits a normal return-call
+                    // result, then preserves the original throw regardless of settlement/shape.
+                    let _ = input.take();
+                    drop(iterator);
+                    return self.finish(Suspend::Throw(error));
+                }
+                FromAsyncStage::Done => return self.finish(Suspend::Done(Value::Undefined)),
+            }
+        }
+    }
+}
+
+/// GetMethod with the well-known iterator key.
+fn from_async_get_method(i: &mut Interp, source: &Value, name: &str) -> Result<Value, Value> {
+    let method = match well_known_key(i, name) {
+        Some(key) => ab(i.get_member(source, &key))?,
+        None => Value::Undefined,
+    };
+    if matches!(method, Value::Undefined | Value::Null) {
+        Ok(Value::Undefined)
+    } else if method.is_callable() {
+        Ok(method)
+    } else {
+        Err(i.make_error("TypeError", "iterator method is not callable"))
+    }
+}
+
+/// Run Array.fromAsync through iterator acquisition/array-like preparation, stopping immediately
+/// before its first Await. GetIteratorFromMethod precedes result construction per §23.1.2.2.
+fn from_async_start(
+    i: &mut Interp,
+    ctor: Value,
+    source: Value,
+    mapper: Value,
+    this_arg: Value,
+) -> Result<FromAsyncStage, Value> {
+    if !matches!(mapper, Value::Undefined) && !mapper.is_callable() {
+        return Err(i.make_error("TypeError", "Array.fromAsync: mapFn is not callable"));
+    }
+    let async_method = from_async_get_method(i, &source, "asyncIterator")?;
+    let sync_method = if async_method.is_callable() {
+        Value::Undefined
+    } else {
+        from_async_get_method(i, &source, "iterator")?
+    };
+    if async_method.is_callable() || sync_method.is_callable() {
+        let from_sync = !async_method.is_callable();
+        let method = if from_sync { sync_method } else { async_method };
+        let iterator = ab(i.call(method, source, &[]))?;
+        if !matches!(iterator, Value::Obj(_)) {
+            return Err(i.make_error("TypeError", "iterator method returned a non-object"));
+        }
+        let next = ab(i.get_member(&iterator, "next"))?;
+        let array = if i.value_is_constructor(&ctor) {
+            ab(i.construct(ctor, &[]))?
+        } else {
+            i.make_array(Vec::new())
+        };
+        return Ok(FromAsyncStage::IteratorNext(FromAsyncIter {
+            array,
+            iterator,
+            next,
+            mapper,
+            this_arg,
+            index: 0,
+            from_sync,
+        }));
+    }
+
+    let object = to_object_arg(i, source, "Array.fromAsync")?;
+    let length = ab(i.to_length(&object))?;
+    let array = if i.value_is_constructor(&ctor) {
+        ab(i.construct(ctor, &[Value::Num(length as f64)]))?
+    } else {
+        if length as u64 > u32::MAX as u64 {
+            return Err(i.make_error("RangeError", "invalid array length"));
+        }
+        i.make_array(Vec::new())
+    };
+    Ok(FromAsyncStage::ArrayLikeNext(FromAsyncArrayLike {
+        array,
+        source: Value::Obj(object),
+        mapper,
+        this_arg,
+        index: 0,
+        length,
+    }))
+}
+
+/// AsyncFromSyncIteratorContinuation's unwrap closure: package the awaited value with the saved
+/// `done` flag into a fresh IteratorResult object.
+fn from_async_sync_unwrap(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let done = matches!(arg(args, 0), Value::Bool(true));
+    Ok(i.iter_result_obj(arg(args, 1), done))
+}
+
+/// AsyncFromSyncIteratorContinuation's closeOnRejection closure. IteratorClose receives a throw
+/// completion, so close failures are discarded and the yielded-value rejection remains primary.
+fn from_async_sync_reject(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    i.iterator_close(&arg(args, 0));
+    Err(arg(args, 1))
+}
+
+/// Emulate %AsyncFromSyncIteratorPrototype%.next plus AsyncFromSyncIteratorContinuation, returning
+/// its intrinsic promise for the outer Array.fromAsync Await.
+fn from_async_sync_next(i: &mut Interp, iterator: &Value, next: &Value) -> Value {
     let promise = i.new_promise();
-    let source = arg(a, 0);
-    let mapfn = arg(a, 1);
-    let this_arg = arg(a, 2);
-    let body: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> = Box::new(
-        move |i: &mut Interp| match from_async_body(i, this, source, mapfn, this_arg) {
-            Ok(v) => crate::coroutine::Suspend::Done(v),
-            Err(e) => crate::coroutine::Suspend::Throw(e),
-        },
-    );
-    let ptr = i as *mut Interp;
-    let coro = match crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)) {
-        Ok(c) => c,
-        Err(_) => {
-            // No threads (wasm32): reject the returned promise rather than trapping.
-            let e = i.make_error("Error", crate::coroutine::UNSUPPORTED_MSG);
-            i.reject_promise(&promise, e);
-            return Ok(promise);
+    let result = match i.call(next.clone(), iterator.clone(), &[]) {
+        Ok(value) => value,
+        Err(error) => {
+            i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+            return promise;
         }
     };
-    if let Value::Obj(o) = &promise {
-        let key = Rc::as_ptr(o) as usize;
-        i.generators.insert(key, coro);
+    if !matches!(result, Value::Obj(_)) {
+        let error = i.make_error("TypeError", "iterator result is not an object");
+        i.reject_promise(&promise, error);
+        return promise;
+    }
+    let done = match i.get_member(&result, "done") {
+        Ok(value) => i.to_boolean(&value),
+        Err(error) => {
+            i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+            return promise;
+        }
+    };
+    let value = match i.get_member(&result, "value") {
+        Ok(value) => value,
+        Err(error) => {
+            i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+            return promise;
+        }
+    };
+    let value_wrapper = match i.promise_resolve_checked(value) {
+        Ok(promise) => promise,
+        Err(error) => {
+            if !done {
+                i.iterator_close(iterator);
+            }
+            i.reject_promise(&promise, error);
+            return promise;
+        }
+    };
+    let on_f = make_bound_len(i, from_async_sync_unwrap, vec![Value::Bool(done)], 1.0);
+    let on_r = if done {
+        Value::Undefined
+    } else {
+        make_bound_len(i, from_async_sync_reject, vec![iterator.clone()], 1.0)
+    };
+    i.promise_then_into(&value_wrapper, on_f, on_r, promise.clone());
+    promise
+}
+
+/// %AsyncFromSyncIteratorPrototype%.return() for AsyncIteratorClose. This wrapper uses
+/// closeOnRejection=false, exactly as ECMA-262 §27.1.5.2.2 requires.
+fn from_async_sync_close(i: &mut Interp, iterator: &Value) -> Value {
+    let promise = i.new_promise();
+    let ret = match i.get_member(iterator, "return") {
+        Ok(value) => value,
+        Err(error) => {
+            i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+            return promise;
+        }
+    };
+    if matches!(ret, Value::Undefined | Value::Null) {
+        let result = i.iter_result_obj(Value::Undefined, true);
+        i.resolve_promise(&promise, result);
+        return promise;
+    }
+    if !ret.is_callable() {
+        let error = i.make_error("TypeError", "iterator return method is not callable");
+        i.reject_promise(&promise, error);
+        return promise;
+    }
+    let result = match i.call(ret, iterator.clone(), &[]) {
+        Ok(value) => value,
+        Err(error) => {
+            i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+            return promise;
+        }
+    };
+    if !matches!(result, Value::Obj(_)) {
+        let error = i.make_error("TypeError", "iterator return result is not an object");
+        i.reject_promise(&promise, error);
+        return promise;
+    }
+    let done = match i.get_member(&result, "done") {
+        Ok(value) => i.to_boolean(&value),
+        Err(error) => {
+            i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+            return promise;
+        }
+    };
+    let value = match i.get_member(&result, "value") {
+        Ok(value) => value,
+        Err(error) => {
+            i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+            return promise;
+        }
+    };
+    let value_wrapper = match i.promise_resolve_checked(value) {
+        Ok(promise) => promise,
+        Err(error) => {
+            i.reject_promise(&promise, error);
+            return promise;
+        }
+    };
+    let on_f = make_bound_len(i, from_async_sync_unwrap, vec![Value::Bool(done)], 1.0);
+    i.promise_then_into(&value_wrapper, on_f, Value::Undefined, promise.clone());
+    promise
+}
+
+/// Start the explicit Array.fromAsync state machine and return its result promise.
+fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let promise = i.new_promise();
+    let coroutine = crate::coroutine::Coroutine::FromAsync(Box::new(FromAsyncCoro::new(
+        this,
+        arg(a, 0),
+        arg(a, 1),
+        arg(a, 2),
+    )));
+    if let Value::Obj(object) = &promise {
+        let key = Rc::as_ptr(object) as usize;
+        i.generators.insert(key, coroutine);
         i.drive_async(
             key,
             promise.clone(),
@@ -6980,146 +7476,6 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
         );
     }
     Ok(promise)
-}
-
-/// Await inside the fromAsync coroutine: parks until the value settles.
-fn fa_await(i: &mut Interp, v: Value) -> Result<Value, Value> {
-    match crate::coroutine::coroutine_await(i, v) {
-        crate::coroutine::Resume::Next(x) => Ok(x),
-        crate::coroutine::Resume::Throw(e) => Err(e),
-        crate::coroutine::Resume::Return(x) => Ok(x),
-        // Realm teardown drops the promise immediately after the worker acknowledges; this value
-        // is internal and cannot become a JavaScript rejection.
-        crate::coroutine::Resume::Terminate => Err(Value::Undefined),
-    }
-}
-
-fn from_async_body(
-    i: &mut Interp,
-    this: Value,
-    source: Value,
-    mapfn: Value,
-    this_arg: Value,
-) -> Result<Value, Value> {
-    if !matches!(mapfn, Value::Undefined) && !mapfn.is_callable() {
-        return Err(i.make_error("TypeError", "Array.fromAsync: mapFn is not callable"));
-    }
-    let use_ctor = i.value_is_constructor(&this);
-    // Prefer @@asyncIterator, then a sync iterator; otherwise treat `source` as array-like.
-    // GetMethod: a present-but-non-callable @@asyncIterator/@@iterator is a TypeError.
-    let get_method = |i: &mut Interp, key: &str| -> Result<Value, Value> {
-        let m = match well_known_key(i, key) {
-            Some(k) if !matches!(source, Value::Undefined | Value::Null) => {
-                ab(i.get_member(&source, &k))?
-            }
-            _ => Value::Undefined,
-        };
-        if matches!(m, Value::Undefined | Value::Null) {
-            Ok(Value::Undefined)
-        } else if !m.is_callable() {
-            Err(i.make_error("TypeError", "iterator method is not callable"))
-        } else {
-            Ok(m)
-        }
-    };
-    let async_it = get_method(i, "asyncIterator")?;
-    let sync_it = if async_it.is_callable() {
-        Value::Undefined
-    } else {
-        get_method(i, "iterator")?
-    };
-    // AsyncIteratorClose/IteratorClose with a throw completion: errors are swallowed.
-    let close_iter = |i: &mut Interp, iter: &Value, is_async: bool| {
-        if !is_async {
-            i.iterator_close(iter);
-            return;
-        }
-        if let Ok(ret) = i.get_member(iter, "return") {
-            if ret.is_callable() {
-                if let Ok(r) = i.call(ret, iter.clone(), &[]) {
-                    let _ = fa_await(i, r);
-                }
-            }
-        }
-    };
-    if async_it.is_callable() || sync_it.is_callable() {
-        let is_async = async_it.is_callable();
-        // A constructor receiver builds the result via `new C()`; else a plain array.
-        let arr = if use_ctor {
-            ab(i.construct(this.clone(), &[]))?
-        } else {
-            i.make_array(Vec::new())
-        };
-        let method = if is_async { async_it } else { sync_it };
-        let iter = ab(i.call(method, source.clone(), &[]))?;
-        let next = ab(i.get_member(&iter, "next"))?;
-        let mut k = 0u64;
-        loop {
-            // Step errors (next call / result shape / done read) reject without closing.
-            let res = ab(i.call(next.clone(), iter.clone(), &[]))?;
-            let res = if is_async { fa_await(i, res)? } else { res };
-            if !matches!(res, Value::Obj(_)) {
-                return Err(i.make_error("TypeError", "iterator result is not an object"));
-            }
-            let done = ab(i.get_member(&res, "done"))?;
-            if i.to_boolean(&done) {
-                break;
-            }
-            let raw = ab(i.get_member(&res, "value"))?;
-            // A sync iterator's value is awaited (async-from-sync); an async iterator's value is
-            // used as-is. Mapping results are always awaited. Failures close the iterator.
-            let step = (|i: &mut Interp| -> Result<Value, Value> {
-                let mut v = if is_async { raw } else { fa_await(i, raw)? };
-                if mapfn.is_callable() {
-                    let mapped =
-                        ab(i.call(mapfn.clone(), this_arg.clone(), &[v, Value::Num(k as f64)]))?;
-                    v = fa_await(i, mapped)?;
-                }
-                Ok(v)
-            })(i);
-            let v = match step {
-                Ok(v) => v,
-                Err(e) => {
-                    close_iter(i, &iter, is_async);
-                    return Err(e);
-                }
-            };
-            if let Err(e) = cdp_or_throw(i, &arr, &k.to_string(), v) {
-                close_iter(i, &iter, is_async);
-                return Err(e);
-            }
-            k += 1;
-        }
-        set_length_throw(i, &arr, k as f64)?;
-        Ok(arr)
-    } else {
-        // Not (async/sync) iterable: treat as array-like. ToObject wraps primitives
-        // (a number/boolean/symbol/bigint has no `length`, yielding an empty array);
-        // null/undefined throw a TypeError.
-        let o = to_object_arg(i, source.clone(), "Array.fromAsync")?;
-        let ov = Value::Obj(o.clone());
-        let len = ab(i.to_length(&o))?;
-        let arr = if use_ctor {
-            ab(i.construct(this.clone(), &[Value::Num(len as f64)]))?
-        } else {
-            if len as u64 > 4294967295 {
-                return Err(i.make_error("RangeError", "invalid array length"));
-            }
-            i.make_array(Vec::new())
-        };
-        for k in 0..len {
-            let raw = ab(i.get_member(&ov, &k.to_string()))?;
-            let mut v = fa_await(i, raw)?;
-            if mapfn.is_callable() {
-                let mapped =
-                    ab(i.call(mapfn.clone(), this_arg.clone(), &[v, Value::Num(k as f64)]))?;
-                v = fa_await(i, mapped)?;
-            }
-            cdp_or_throw(i, &arr, &k.to_string(), v)?;
-        }
-        set_length_throw(i, &arr, len as f64)?;
-        Ok(arr)
-    }
 }
 
 /// CreateDataPropertyOrThrow (trap-aware for proxy targets).

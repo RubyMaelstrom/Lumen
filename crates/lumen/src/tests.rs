@@ -12189,6 +12189,155 @@ fn array_from_async_getmethod_and_arraylike() {
 }
 
 #[test]
+fn array_from_async_uses_heap_state_and_normative_close_order() {
+    fn settled(setup: &str, read: &str) -> String {
+        let mut engine = Engine::new();
+        engine.eval(setup, false).expect("setup parses");
+        run_in(&mut engine, read)
+    }
+
+    // ECMA-262 §23.1.2.2 gets the iterator record (including `next`) before constructing the
+    // result. This is observable with a borrowed constructor.
+    assert_eq!(
+        run(r#"
+            var log=[];
+            function C(){ log.push("ctor"); return []; }
+            var source={
+                [Symbol.asyncIterator](){
+                    log.push("iterator");
+                    return {
+                        get next(){
+                            log.push("next");
+                            return function(){ return Promise.resolve({done:true}); };
+                        }
+                    };
+                }
+            };
+            Array.fromAsync.call(C,source);
+            log.join(",")
+        "#),
+        "iterator,next,ctor"
+    );
+
+    // A failure in the awaited iteration step itself does not pass through
+    // IfAbruptCloseAsyncIterator; the async iterator is not closed.
+    assert_eq!(
+        settled(
+            r#"
+            var log=[];
+            var source={
+                [Symbol.asyncIterator](){ return {
+                    next(){ return Promise.reject(new Error("next")); },
+                    return(){ log.push("return"); return Promise.resolve({done:true}); }
+                }; }
+            };
+            Array.fromAsync(source).catch(e=>log.push(e.message));
+        "#,
+            "log.join(',')",
+        ),
+        "next"
+    );
+
+    // Mapper failures close and await an async iterator before rejecting. AsyncIteratorClose with
+    // a throw Completion preserves the mapper error even if the close promise rejects.
+    assert_eq!(
+        settled(
+            r#"
+            var log=[];
+            var source={
+                [Symbol.asyncIterator](){ return {
+                    next(){ return Promise.resolve({done:false,value:1}); },
+                    return(){
+                        log.push("return");
+                        return Promise.resolve().then(()=>{ log.push("closed"); });
+                    }
+                }; }
+            };
+            Array.fromAsync(source,()=>{ throw new RangeError("map"); })
+                .catch(e=>log.push(e.message));
+        "#,
+            "log.join(',')",
+        ),
+        "return,closed,map"
+    );
+    assert_eq!(
+        settled(
+            r#"
+            var result;
+            var source={
+                [Symbol.asyncIterator](){ return {
+                    next(){ return Promise.resolve({done:false,value:1}); },
+                    return(){ return Promise.reject(new Error("close")); }
+                }; }
+            };
+            Array.fromAsync(source,()=>{ throw new RangeError("map"); })
+                .catch(e=>result=e.name+":"+e.message);
+        "#,
+            "result",
+        ),
+        "RangeError:map"
+    );
+
+    // CreateAsyncFromSyncIterator closes a still-live sync iterator when awaiting its yielded
+    // value rejects, before Array.fromAsync observes that rejection.
+    assert_eq!(
+        settled(
+            r#"
+            var log=[];
+            var source={
+                [Symbol.iterator](){ return {
+                    next(){ return {done:false,value:Promise.reject(new Error("value"))}; },
+                    return(){ log.push("return"); return {done:true}; }
+                }; }
+            };
+            Array.fromAsync(source).catch(e=>log.push(e.message));
+        "#,
+            "log.join(',')",
+        ),
+        "return,value"
+    );
+
+    // A pending built-in async operation retains only heap state; it consumes no native worker.
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            r#"
+                var release;
+                var source={
+                    [Symbol.asyncIterator](){ return {
+                        next(){ return new Promise(resolve=>release=resolve); }
+                    }; }
+                };
+                globalThis.pendingFromAsync=Array.fromAsync(source)
+            "#,
+            false,
+        )
+        .expect("pending Array.fromAsync setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .any(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::FromAsync(_))));
+    engine
+        .eval(
+            "release({done:true});globalThis.fromAsyncLength='pending';pendingFromAsync.then(a=>fromAsyncLength=a.length)",
+            false,
+        )
+        .expect("pending Array.fromAsync resumes");
+    match engine.eval("fromAsyncLength", false).unwrap() {
+        Completion::Value(value) => assert_eq!(value, "0"),
+        Completion::Throw { name, message } => {
+            panic!("pending Array.fromAsync result threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
 fn super_call_in_ordinary_function_is_early_error() {
     // A super() call in a function/generator/async(-generator) that is not a derived constructor
     // is an early SyntaxError.

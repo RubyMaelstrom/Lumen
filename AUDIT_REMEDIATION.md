@@ -190,8 +190,10 @@ conformance-style tests and the broader affected suite pass.
         by retaining opaque Environment References directly in the heap continuation.
     - [ ] Move Source Text Module top-level-await evaluation from the bounded native compatibility
       path into continuation-owned module execution state.
-    - [ ] Replace the native `Array.fromAsync` iterator worker with an explicit job/continuation
-      state machine that preserves async-iterator closing and promise rejection ordering.
+    - [x] Replace the native `Array.fromAsync` iterator worker with an explicit heap continuation
+      that preserves normative Await boundaries, async-from-sync wrapping, iterator closing, and
+      promise rejection ordering. The focused Test262 `built-ins/Array/fromAsync` suite passes
+      95/95.
     - [x] Model `using`/`await using`, `with`, and switch lexical environments in resumable frames.
       - [x] Keep synchronous and asynchronous DisposableResource stacks on each heap continuation
         and lower function-body/block, classic-`for`, and per-iteration `for…of` declarations

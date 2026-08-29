@@ -104,6 +104,9 @@ pub enum Coroutine {
     Lazy(LazyCoro),
     Thread(ThreadCoro),
     Vm(Box<crate::bytecode::VmCoro>),
+    /// The explicit state machine for the built-in async algorithm Array.fromAsync. Unlike a
+    /// source async function it has no bytecode body, but it parks at the same Await boundaries.
+    FromAsync(Box<crate::builtins::FromAsyncCoro>),
 }
 
 impl Coroutine {
@@ -113,6 +116,7 @@ impl Coroutine {
             Coroutine::Lazy(_) => self.resume_lazy(i, signal),
             Coroutine::Thread(c) => c.resume(i, signal),
             Coroutine::Vm(c) => c.resume(i, signal),
+            Coroutine::FromAsync(c) => c.resume(i, signal),
         }
     }
 
@@ -160,6 +164,7 @@ impl Coroutine {
             Coroutine::Lazy(c) => c.done,
             Coroutine::Thread(c) => c.done,
             Coroutine::Vm(c) => c.done,
+            Coroutine::FromAsync(c) => c.done(),
         }
     }
     /// Whether the first resume has happened (distinguishes suspendedStart from a suspended yield).
@@ -169,6 +174,7 @@ impl Coroutine {
             Coroutine::Lazy(c) => c.started,
             Coroutine::Thread(c) => c.started,
             Coroutine::Vm(c) => c.started,
+            Coroutine::FromAsync(c) => c.started(),
         }
     }
 
@@ -181,6 +187,7 @@ impl Coroutine {
             }
             Coroutine::Thread(c) => c.terminate(i),
             Coroutine::Vm(_) => {}
+            Coroutine::FromAsync(c) => c.terminate(),
         }
     }
 }
