@@ -151,6 +151,10 @@ conformance-style tests and the broader affected suite pass.
     - [x] Instantiate uncaptured strict block and switch function declarations at scope entry in
       heap continuations, preserving pre-declaration visibility, fresh identity on repeated block
       entry, and switch-wide initialization before case tests.
+    - [x] Lower sloppy Annex B.3.2 block functions with distinct lexical and promoted-var homes,
+      declaration-time synchronization, synthetic if-clause blocks, parameter/`arguments` and
+      early-error blockers, and simultaneous closure captures of both bindings. The focused
+      official Test262 function-code/if slice passes 160/160 in forced bytecode mode.
     - [x] Lower classes (`super`, private names, fields/static blocks), dynamic import metadata,
       tagged templates, and other remaining expression forms.
       - [x] Lower tagged templates, `import.meta`, dynamic/import-source calls, private references,

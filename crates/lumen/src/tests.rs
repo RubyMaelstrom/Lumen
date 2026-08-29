@@ -6894,6 +6894,61 @@ fn strict_block_functions_use_vm_continuations_and_instantiate_at_scope_entry() 
 }
 
 #[test]
+fn annexb_block_functions_use_vm_continuations_and_keep_distinct_bindings() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "function* annexFunctions(flag){
+               let outer=7;
+               const initially=typeof promoted;
+               if(flag) function promoted(delta){
+                 const old=promoted;
+                 promoted=()=>outer+delta;
+                 return [old===promoted,promoted()].join(':')
+               }
+               const synced=promoted,read=()=>promoted;
+               yield [initially,typeof synced,read()===synced].join(':');
+               const result=synced(5),stable=promoted===synced;
+               {
+                 function promoted(){return outer+20}
+                 yield [promoted(),read()===promoted].join(':')
+               }
+               return [result,stable,promoted(),read()===promoted].join(':')
+             }
+             function* parameterBlocksPromotion(promoted){
+               {function promoted(){return 99} yield promoted()}
+               yield promoted
+             }
+             globalThis.annexFunctionIterator=annexFunctions(true);
+             globalThis.annexBlockedIterator=parameterBlocksPromotion(123);",
+            false,
+        )
+        .expect("Annex B block-function continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var i=annexFunctionIterator,a=i.next(),b=i.next(),c=i.next(),
+                 j=annexBlockedIterator,d=j.next(),e=j.next(),f=j.next();
+             [a.value,b.value,c.value,c.done,d.value,e.value,f.done].join('|')",
+            false,
+        )
+        .expect("Annex B block-function continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "undefined:function:true|27:true|false:12:true:27:true|true|99|123|true"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("Annex B block-function continuation drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
 fn jit_iterator_abort_unwinds_only_live_operands() {
     let mut engine = Engine::new();
     engine.set_tier(crate::bytecode::Tier::Jit);

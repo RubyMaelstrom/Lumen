@@ -1343,6 +1343,9 @@ struct CaptureScan {
     with_depth: u32,
     /// Scope-push counter (the serial stored per scope for capture attribution).
     next_serial: u32,
+    /// Serial of the compiled function's own top scope. A spelling can legitimately need both
+    /// this activation home and a distinct runtime block environment (notably Annex B functions).
+    top_serial: Option<u32>,
     /// Whether `this` is read from an inner arrow chain rooted at the outer function.
     env_this: bool,
     /// A direct eval can dynamically name every binding in the surrounding function. Coroutine
@@ -1390,7 +1393,7 @@ fn pat_idents(p: &Pattern, out: &mut std::collections::HashSet<String>) {
 /// Collect the function-scoped `var` names (and direct top-level function-declaration names) of a
 /// body: recurses through blocks/loops/switch/try but never into nested functions or classes.
 /// `top` distinguishes direct body statements (whose FuncDecls hoist) from block-level ones.
-/// Returns false on a construct whose hoisting we don't model (sloppy Annex B block functions).
+/// Annex B promotion names are added from the shared standards-aware hoist plan in `fn_body`.
 fn hoisted_vars(
     stmts: &[Stmt],
     top: bool,
@@ -1429,12 +1432,10 @@ fn hoisted_vars_stmt(
                 if let Some(n) = &f.name {
                     out.insert(n.clone());
                 }
-                true
-            } else {
-                // Block-level function declaration: strict = block-scoped lexical (handled by the
-                // block scope in the walker); sloppy = Annex B promotion we don't model — bail.
-                strict
             }
+            // Block-level declarations are lexical in both modes. A qualifying sloppy plain
+            // function gets its additional var binding from ECMA-262 Annex B.3.2 below.
+            true
         }
         Stmt::Block(b) => hoisted_vars(b, false, strict, out),
         Stmt::If { cons, alt, .. } => {
@@ -1515,6 +1516,7 @@ impl CaptureScan {
             loop_depth: 0,
             with_depth: 0,
             next_serial: 0,
+            top_serial: None,
             env_this: false,
             allow_direct_eval,
             saw_direct_eval: false,
@@ -1551,6 +1553,7 @@ impl CaptureScan {
         // homes activation-wide instead.
         let mut homed: Vec<(String, bool)> = Vec::new();
         let mut runtime = std::collections::HashSet::new();
+        let mut runtime_and_activation = std::collections::HashSet::new();
         for n in &sc.captured {
             if sc.depth0_inner_decls.contains(n) {
                 let candidate = sc.candidates.get(n).copied();
@@ -1565,20 +1568,32 @@ impl CaptureScan {
                     homed.push((n.clone(), candidate.expect("checked candidate").1));
                     continue;
                 }
-                let runtime_serials = sc.runtime_candidates.get(n)?;
+                let runtime_serials = sc.runtime_candidates.get(n);
                 let captured_serials = sc.captured_serials.get(n)?;
-                if captured_serials
-                    .iter()
-                    .any(|serial| !runtime_serials.contains(serial))
-                {
-                    return None;
+                let mut needs_runtime = false;
+                let mut needs_activation = false;
+                for serial in captured_serials {
+                    if runtime_serials.is_some_and(|supported| supported.contains(serial)) {
+                        needs_runtime = true;
+                    } else if Some(*serial) == sc.top_serial {
+                        needs_activation = true;
+                    } else {
+                        return None;
+                    }
                 }
-                // The emitter selects runtime lexicals by spelling, so promote every supported
-                // declaration of this spelling. Each source scope still gets its own PushLex
-                // record; promoting an uncaptured sibling costs one small record but cannot merge
-                // identities or change resolution. A capture through a function-wide or otherwise
-                // unsupported declaration fails the serial-subset check above.
-                runtime.insert(n.clone());
+                if needs_runtime {
+                    // The emitter selects runtime lexicals by spelling, so promote every supported
+                    // declaration of this spelling. Each source scope still gets its own PushLex
+                    // record; promoting an uncaptured sibling costs one small record but cannot
+                    // merge identities or change resolution.
+                    runtime.insert(n.clone());
+                }
+                if needs_runtime && needs_activation {
+                    // Slot/env lookup still respects lexical shadowing, so retaining both homes is
+                    // exact. Annex B relies on this when a block function and its promoted var are
+                    // both closed over by different functions.
+                    runtime_and_activation.insert(n.clone());
+                }
             }
         }
         // Homed names leave `captured`: the remaining consumers (param/var/body-lexical
@@ -1588,7 +1603,9 @@ impl CaptureScan {
             sc.captured.remove(n);
         }
         for n in &runtime {
-            sc.captured.remove(n);
+            if !runtime_and_activation.contains(n) {
+                sc.captured.remove(n);
+            }
         }
         homed.sort_by(|left, right| left.0.cmp(&right.0)); // deterministic cap_init order
         Some((sc.captured, sc.env_this, homed, runtime, sc.saw_direct_eval))
@@ -1609,6 +1626,9 @@ impl CaptureScan {
     ) {
         let serial = self.next_serial;
         self.next_serial += 1;
+        if self.fn_depth == 0 && self.scopes.is_empty() {
+            self.top_serial = Some(serial);
+        }
         if self.fn_depth == 0 && !self.scopes.is_empty() {
             for n in &names {
                 self.depth0_inner_decls.insert(n.clone());
@@ -1662,6 +1682,20 @@ impl CaptureScan {
         }
         if !hoisted_vars(&func.body, true, func.is_strict, &mut names) {
             return None;
+        }
+        // ECMA-262 Annex B.3.2 extends FunctionDeclarationInstantiation with a mutable
+        // function-scope binding for each qualifying sloppy block FunctionDeclaration. Reuse the
+        // interpreter's shared hoist plan so capture analysis observes exactly the same early-error
+        // and parameter/`arguments` blockers as execution.
+        let mut annexb_blocked = crate::interpreter::param_bound_names(&func.params);
+        if !func.is_arrow {
+            annexb_blocked.push("arguments".to_string());
+        }
+        for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &annexb_blocked)
+        {
+            if let HoistOp::AnnexB(name, _) = op {
+                names.insert(name);
+            }
         }
         self.declare_lexicals(&func.body, &mut names);
         if self.fn_depth == 0 {
@@ -2609,7 +2643,11 @@ fn compile_inner(
         }
     }
     // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
-    for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &[]) {
+    let mut annexb_blocked = crate::interpreter::param_bound_names(&func.params);
+    if !func.is_arrow {
+        annexb_blocked.push("arguments".to_string());
+    }
+    for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &annexb_blocked) {
         match op {
             HoistOp::Var(name) => {
                 if c.env_has(&name) {
@@ -2651,8 +2689,24 @@ fn compile_inner(
                     c.emit(Op::StoreLocal(slot));
                 }
             }
-            // Annex B promotions have declaration-time sync the VM doesn't model — bail.
-            HoistOp::AnnexB(..) => return None,
+            HoistOp::AnnexB(name, function) => {
+                // Annex B.3.2 FunctionDeclarationInstantiation creates/reuses a mutable var home
+                // initialized to undefined. The block's distinct lexical binding is instantiated
+                // later; evaluating its declaration copies that function object into this home.
+                let target = if let Some(home) = c.home(&name) {
+                    home
+                } else if captured.contains(&name) {
+                    c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
+                    c.env_bind(&name, false);
+                    Home::Env(false)
+                } else {
+                    let slot = c.fresh_slot(&name);
+                    c.scope_bind(&name, slot, false);
+                    Home::Slot(slot, false)
+                };
+                c.annexb_targets
+                    .insert(Rc::as_ptr(&function) as usize, target);
+            }
         }
     }
     // Body-level lexicals: captured ones home in the activation (inserted in TDZ by
@@ -3089,6 +3143,9 @@ struct Compiler {
     tdz_slots: std::collections::HashSet<u16>,
     /// Captured (env-homed) function-scope-wide names → is_const. Slot scopes shadow these.
     env_names: std::collections::HashMap<String, bool>,
+    /// Annex B block FunctionDeclaration AST identity → its distinct function-scope var home.
+    /// The current lexical home has the same spelling when the declaration statement executes.
+    annexb_targets: crate::fasthash::FastMap<usize, Home>,
     funcs: Vec<Rc<Function>>,
     templates: Vec<Vec<(Option<String>, String)>>,
     eval_exprs: Vec<EvalExprPlan>,
@@ -4592,8 +4649,31 @@ impl Compiler {
             Stmt::Expr(e) => self.expr_stmt(e),
             Stmt::Empty | Stmt::Debugger => Ok(()),
             // Top-level function declarations were hoisted at function entry; block-level ones
-            // were initialized by BlockDeclarationInstantiation at block entry.
-            Stmt::FuncDecl(_) => Ok(()),
+            // were initialized by BlockDeclarationInstantiation at block entry. Annex B.3.2 adds
+            // one declaration-time step: copy that lexical function object into its separate
+            // function-scope var binding.
+            Stmt::FuncDecl(function) => {
+                let Some(target) = self
+                    .annexb_targets
+                    .get(&(Rc::as_ptr(function) as usize))
+                    .copied()
+                else {
+                    return Ok(());
+                };
+                let name = function.name.as_ref().ok_or(Bail)?;
+                self.expr(&Expr::Ident(name.clone()))?;
+                match target {
+                    Home::Slot(slot, false) => self.emit(Op::StoreLocal(slot)),
+                    Home::Env(false) => {
+                        let name = self.name_idx(name);
+                        self.emit(Op::StoreCap(name))
+                    }
+                    Home::Slot(_, true) | Home::Env(true) => {
+                        unreachable!("Annex B promotion target is mutable")
+                    }
+                };
+                Ok(())
+            }
             Stmt::ClassDecl(class) => {
                 self.expr(&Expr::Class(class.clone()))?;
                 let name = class.name.as_ref().ok_or(Bail)?;

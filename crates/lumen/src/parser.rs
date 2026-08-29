@@ -1194,6 +1194,7 @@ impl Parser {
             labelled = true;
             inner = body;
         }
+        let annexb_implicit_block = matches!(inner, Stmt::FuncDecl(_));
         match inner {
             Stmt::VarDecl {
                 kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
@@ -1210,7 +1211,14 @@ impl Parser {
             }
             _ => {}
         }
-        Ok(s)
+        // ECMA-262 Annex B.3.3 evaluates an allowed if-clause FunctionDeclaration as the sole
+        // StatementListItem of a synthetic BlockStatement. Keeping that block explicit in the AST
+        // gives both execution tiers the required fresh lexical function binding.
+        if annexb_implicit_block {
+            Ok(Stmt::Block(vec![s]))
+        } else {
+            Ok(s)
+        }
     }
 
     /// Parse a loop body inside an iteration context (so `break`/`continue` are legal).
