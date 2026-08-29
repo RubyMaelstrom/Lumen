@@ -27,7 +27,7 @@ pub enum ValType {
     ExternRef,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncType {
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,
@@ -374,7 +374,13 @@ pub fn decode(data: &[u8]) -> Result<Rc<Module>, String> {
             last_section_order = order;
         }
         match id {
-            0 => section.pos = section.data.len(), // custom section — skip
+            0 => {
+                // Core binary format §5.5.3: a custom section always begins with a valid name.
+                // Its payload is uninterpreted, but skipping the whole section would accept a
+                // missing name or an overlong/overflowing name-length LEB.
+                section.name()?;
+                section.pos = section.data.len();
+            }
             1 => decode_types(&mut section, &mut m)?,
             2 => decode_imports(&mut section, &mut m)?,
             3 => decode_functions(&mut section, &mut m)?,

@@ -16,6 +16,10 @@ pub const PAGE_SIZE: usize = 65536;
 /// bounded memory/table instances; allocation failure must be reported, never panic or abort.
 pub const MAX_STORE_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_STORE_TABLE_ELEMENTS: usize = 4_000_000;
+// Core allows implementations to report call-stack exhaustion. Keep the recursive baseline
+// interpreter below the smallest native test-thread stack; 1024 Rust frames could overflow before
+// the explicit check was reached in debug and embedded builds.
+const MAX_CALL_DEPTH: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Val {
@@ -122,7 +126,14 @@ pub struct GlobalEntity {
 #[derive(Default)]
 pub struct Imports {
     pub funcs: Vec<(usize, FuncType)>,
+    /// Existing store addresses for imported WebAssembly functions. A `None` entry means the
+    /// corresponding entry in `funcs` is a host function. Keeping the address preserves function
+    /// identity when one instance re-exports a function to another instance.
+    pub func_addrs: Vec<Option<usize>>,
     pub mem_addr: Option<usize>,
+    /// Table imports in table-index order. `table_addr` remains as the single-table convenience
+    /// used by the JavaScript embedding.
+    pub table_addrs: Vec<usize>,
     pub table_addr: Option<usize>,
     pub global_addrs: Vec<usize>,
 }
@@ -135,6 +146,9 @@ pub struct Instance {
     pub table_addrs: Vec<usize>,
     pub mem_addrs: Vec<usize>,
     pub global_addrs: Vec<usize>,
+    /// Passive data segments remain in the module; this per-instance bitset records whether each
+    /// segment is still available to `memory.init`. Active segments start dropped.
+    pub data_live: std::cell::RefCell<Vec<bool>>,
 }
 
 /// The shared store: flat address spaces for every instance's functions, tables, memories, and
@@ -348,7 +362,7 @@ fn read_fixed<const N: usize>(code: &[u8], ip: &mut usize) -> Result<[u8; N], St
 fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
     match op {
         // no immediates
-        0x00 | 0x01 | 0x0f | 0x1a | 0x1b => Ok(()),
+        0x00 | 0x01 | 0x0f | 0x1a | 0x1b | 0xd1 => Ok(()),
         // single LEB immediate (branch depth, call, local/global idx, ref.func)
         0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0xd2 => {
             read_uleb(code, ip)?;
@@ -367,6 +381,10 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
             read_uleb(code, ip)?;
             read_uleb(code, ip)?;
             Ok(())
+        }
+        0x1c => {
+            let count = read_uleb(code, ip)?;
+            skip_bytes(code, ip, count as usize)
         }
         0xd0 => {
             skip_bytes(code, ip, 1) // ref.null t
@@ -574,7 +592,7 @@ impl Store {
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Vec<Val>, String> {
-        if depth > 1024 {
+        if depth >= MAX_CALL_DEPTH {
             return Err("wasm: call stack exhausted".into());
         }
         // Host functions run immediately; wasm functions run below, in their defining instance's
@@ -647,7 +665,6 @@ impl Store {
                             match label.else_ip {
                                 Some(e) => ip = e,
                                 None => {
-                                    ctrl.pop();
                                     ip = label.end_ip;
                                     continue;
                                 }
@@ -768,6 +785,15 @@ impl Store {
                     let a = stack.pop().unwrap();
                     stack.push(if c != 0 { a } else { b });
                 }
+                0x1c => {
+                    // Typed select carries a singleton result-type vector.
+                    let count = read_uleb(code, &mut ip)? as usize;
+                    skip_bytes(code, &mut ip, count)?;
+                    let c = stack.pop().unwrap().i32();
+                    let b = stack.pop().unwrap();
+                    let a = stack.pop().unwrap();
+                    stack.push(if c != 0 { a } else { b });
+                }
                 0x20 => {
                     let i = read_uleb(code, &mut ip)? as usize;
                     stack.push(*locals.get(i).ok_or("wasm: bad local index")?);
@@ -839,8 +865,16 @@ impl Store {
                     let bytes = read_fixed::<8>(code, &mut ip)?;
                     stack.push(Val::F64(f64::from_le_bytes(bytes)));
                 }
+                0xd0 => {
+                    skip_bytes(code, &mut ip, 1)?;
+                    stack.push(Val::Ref(None));
+                }
+                0xd1 => {
+                    let value = stack.pop().unwrap();
+                    stack.push(Val::I32(matches!(value, Val::Ref(None)) as i32));
+                }
                 0xfc => {
-                    self.op_fc(mem_addr, code, &mut ip, &mut stack)?;
+                    self.op_fc(&inst, mem_addr, code, &mut ip, &mut stack)?;
                 }
                 _ => numeric(op, &mut stack)?,
             }
@@ -968,7 +1002,8 @@ impl Store {
 
     /// Link `module` against resolved `imports` into a new instance; returns its index in
     /// `self.instances`. Allocates the module's defined functions/memory/tables/globals into the
-    /// store, references imported entities by address, and runs element/data segments.
+    /// store, references imported entities by address, and runs element/data segments. Per the
+    /// Core instantiation algorithm, store mutations made before a later trap are not rolled back.
     pub fn instantiate(&mut self, module: Rc<Module>, imports: Imports) -> Result<usize, String> {
         let checkpoint = StoreCheckpoint {
             funcs: self.funcs.len(),
@@ -980,12 +1015,14 @@ impl Store {
             table_elements: self.table_elements,
         };
         let result = self.instantiate_inner(module, imports);
-        if result.is_err() {
+        // Import matching and allocation finish before the instance enters the store. Failures in
+        // those phases expose no store mutation. Once initialization starts, however, earlier
+        // segment writes and allocated entities remain observable after a later trap.
+        if result.is_err() && self.instances.len() == checkpoint.instances {
             self.funcs.truncate(checkpoint.funcs);
             self.tables.truncate(checkpoint.tables);
             self.memories.truncate(checkpoint.memories);
             self.globals.truncate(checkpoint.globals);
-            self.instances.truncate(checkpoint.instances);
             self.memory_bytes = checkpoint.memory_bytes;
             self.table_elements = checkpoint.table_elements;
         }
@@ -1001,16 +1038,41 @@ impl Store {
 
         // Imports first (they occupy the low indices of each space).
         let mut host_funcs = imports.funcs.into_iter();
+        let mut imported_func_addrs = imports.func_addrs.into_iter();
+        let mut imported_table_addrs = imports.table_addrs.into_iter();
+        let mut imported_table_fallback = imports.table_addr;
         let mut imp_globals = imports.global_addrs.into_iter();
         for imp in &module.imports {
             match &imp.kind {
-                crate::wasm::ImportKind::Func(_) => {
+                crate::wasm::ImportKind::Func(type_index) => {
                     let (id, ty) = host_funcs.next().ok_or("wasm: missing function import")?;
-                    self.funcs.push(Some(FuncEntity::Host { id, ty }));
-                    func_addrs.push(self.funcs.len() - 1);
+                    let expected = module
+                        .types
+                        .get(*type_index as usize)
+                        .ok_or("wasm: function import type index out of range")?;
+                    if &ty != expected {
+                        return Err("wasm: imported function type does not match".into());
+                    }
+                    if let Some(address) = imported_func_addrs.next().flatten() {
+                        let actual = self
+                            .funcs
+                            .get(address)
+                            .and_then(Option::as_ref)
+                            .ok_or("wasm: imported function address out of range")?;
+                        if actual.ty() != ty {
+                            return Err("wasm: imported function type does not match".into());
+                        }
+                        func_addrs.push(address);
+                    } else {
+                        self.funcs.push(Some(FuncEntity::Host { id, ty }));
+                        func_addrs.push(self.funcs.len() - 1);
+                    }
                 }
                 crate::wasm::ImportKind::Table(expected) => {
-                    let addr = imports.table_addr.ok_or("wasm: missing table import")?;
+                    let addr = imported_table_addrs
+                        .next()
+                        .or_else(|| imported_table_fallback.take())
+                        .ok_or("wasm: missing table import")?;
                     let actual = self
                         .tables
                         .get(addr)
@@ -1096,6 +1158,13 @@ impl Store {
             table_addrs,
             mem_addrs,
             global_addrs,
+            data_live: std::cell::RefCell::new(
+                module
+                    .data
+                    .iter()
+                    .map(|segment| segment.active.is_none())
+                    .collect(),
+            ),
         });
         let seen_globals: Vec<Val> = inst
             .global_addrs
@@ -1103,9 +1172,10 @@ impl Store {
             .map(|&a| self.globals[a].as_ref().expect("live global").val)
             .collect();
 
-        // Instantiation is transactional: preflight every active segment before mutating an
-        // imported table/memory. Core validation deliberately leaves these bounds checks to
-        // instantiation because offsets and imported entity sizes are runtime values.
+        // Allocation precedes initialization in the normative algorithm. Keep the instance in the
+        // store even if a later segment traps: an earlier segment may already have exposed one of
+        // its functions through an imported table.
+        self.instances.push(Some(Rc::clone(&inst)));
         for seg in &module.elems {
             let offset = eval_const_expr(&seg.offset, &seen_globals)?.i32() as u32 as usize;
             let table_addr = *inst
@@ -1131,32 +1201,6 @@ impl Store {
             {
                 return Err("wasm: elem func index out of range".into());
             }
-        }
-        for seg in &module.data {
-            if let Some((_mem, offset_expr)) = &seg.active {
-                let offset = eval_const_expr(offset_expr, &seen_globals)?.i32() as u32 as usize;
-                let mem_addr = *inst
-                    .mem_addrs
-                    .first()
-                    .ok_or("wasm: data segment but no memory")?;
-                let mem = self.memories[mem_addr]
-                    .as_ref()
-                    .expect("live memory")
-                    .bytes
-                    .borrow();
-                let end = offset
-                    .checked_add(seg.bytes.len())
-                    .ok_or("wasm: data offset overflow")?;
-                if end > mem.len() {
-                    return Err("wasm: data segment out of memory bounds".into());
-                }
-            }
-        }
-
-        self.instances.push(Some(Rc::clone(&inst)));
-        for seg in &module.elems {
-            let offset = eval_const_expr(&seg.offset, &seen_globals)?.i32() as u32 as usize;
-            let table_addr = inst.table_addrs[seg.table as usize];
             for (slot, &func_index) in seg.func_indices.iter().enumerate() {
                 self.tables[table_addr].as_mut().expect("live table").elems[offset + slot] =
                     Some(inst.func_addrs[func_index as usize]);
@@ -1165,8 +1209,23 @@ impl Store {
         for seg in &module.data {
             if let Some((_memory, offset_expr)) = &seg.active {
                 let offset = eval_const_expr(offset_expr, &seen_globals)?.i32() as u32 as usize;
-                let memory_addr = inst.mem_addrs[0];
-                let end = offset + seg.bytes.len();
+                let memory_addr = *inst
+                    .mem_addrs
+                    .first()
+                    .ok_or("wasm: data segment but no memory")?;
+                let end = offset
+                    .checked_add(seg.bytes.len())
+                    .ok_or("wasm: data offset overflow")?;
+                if end
+                    > self.memories[memory_addr]
+                        .as_ref()
+                        .expect("live memory")
+                        .bytes
+                        .borrow()
+                        .len()
+                {
+                    return Err("wasm: data segment out of memory bounds".into());
+                }
                 self.memories[memory_addr]
                     .as_ref()
                     .expect("live memory")
@@ -1295,6 +1354,7 @@ impl Store {
 
     fn op_fc(
         &mut self,
+        inst: &Instance,
         mem_addr: Option<usize>,
         code: &[u8],
         ip: &mut usize,
@@ -1334,6 +1394,49 @@ impl Store {
             7 => {
                 let v = stack.pop().unwrap().f64();
                 stack.push(Val::I64(sat_u64(v) as i64));
+            }
+            8 => {
+                // memory.init dataidx memidx
+                let data_index = read_uleb(code, ip)? as usize;
+                if read_uleb(code, ip)? != 0 {
+                    return Err("wasm: unsupported memory index".into());
+                }
+                let n = stack.pop().unwrap().i32() as u32 as usize;
+                let src = stack.pop().unwrap().i32() as u32 as usize;
+                let dst = stack.pop().unwrap().i32() as u32 as usize;
+                let segment = inst
+                    .module
+                    .data
+                    .get(data_index)
+                    .ok_or("wasm: data segment index out of range")?;
+                let live = *inst
+                    .data_live
+                    .borrow()
+                    .get(data_index)
+                    .ok_or("wasm: data segment index out of range")?;
+                let source: &[u8] = if live { &segment.bytes } else { &[] };
+                if src.checked_add(n).is_none_or(|end| end > source.len()) {
+                    return Err("wasm: out of bounds memory.init source".into());
+                }
+                let storage = Rc::clone(
+                    &self.memories[mem_addr.ok_or("wasm: no memory")?]
+                        .as_ref()
+                        .ok_or("wasm: dead memory address")?
+                        .bytes,
+                );
+                let mut memory = storage.borrow_mut();
+                if dst.checked_add(n).is_none_or(|end| end > memory.len()) {
+                    return Err("wasm: out of bounds memory.init destination".into());
+                }
+                memory[dst..dst + n].copy_from_slice(&source[src..src + n]);
+            }
+            9 => {
+                // data.drop dataidx
+                let data_index = read_uleb(code, ip)? as usize;
+                let mut live = inst.data_live.borrow_mut();
+                *live
+                    .get_mut(data_index)
+                    .ok_or("wasm: data segment index out of range")? = false;
             }
             10 => {
                 // memory.copy
@@ -1483,6 +1586,95 @@ fn sat_u64(v: f64) -> u64 {
     }
 }
 
+// WebAssembly Core 2.0, Numeric Instructions: the non-saturating truncation operators trap when
+// the truncated integer is outside the destination range. Rust float-to-int casts deliberately
+// saturate, so using `as` without these checks changes observable Wasm behavior.
+fn trunc_i32(v: f64) -> Result<i32, String> {
+    let v = v.trunc();
+    if !v.is_finite() || !(-((1u64 << 31) as f64)..(1u64 << 31) as f64).contains(&v) {
+        Err("wasm: invalid conversion to integer".into())
+    } else {
+        Ok(v as i32)
+    }
+}
+
+fn trunc_u32(v: f64) -> Result<u32, String> {
+    let v = v.trunc();
+    if !v.is_finite() || !(0.0..(1u64 << 32) as f64).contains(&v) {
+        Err("wasm: invalid conversion to integer".into())
+    } else {
+        Ok(v as u32)
+    }
+}
+
+fn trunc_i64(v: f64) -> Result<i64, String> {
+    let v = v.trunc();
+    if !v.is_finite() || !(-((1u128 << 63) as f64)..(1u128 << 63) as f64).contains(&v) {
+        Err("wasm: invalid conversion to integer".into())
+    } else {
+        Ok(v as i64)
+    }
+}
+
+fn trunc_u64(v: f64) -> Result<u64, String> {
+    let v = v.trunc();
+    if !v.is_finite() || !(0.0..(1u128 << 64) as f64).contains(&v) {
+        Err("wasm: invalid conversion to integer".into())
+    } else {
+        Ok(v as u64)
+    }
+}
+
+// WebAssembly propagates NaNs for min/max, unlike Rust's `f32::min`/`max`, and specifies the sign
+// selected when the operands are equal zeros.
+fn wasm_min_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        f32::from_bits(a.to_bits() | b.to_bits())
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+fn wasm_max_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        f32::from_bits(a.to_bits() & b.to_bits())
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+fn wasm_min_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        f64::from_bits(a.to_bits() | b.to_bits())
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+fn wasm_max_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        f64::from_bits(a.to_bits() & b.to_bits())
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
 /// Numeric, comparison, and conversion opcodes (no immediates, no memory/control).
 fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
     match op {
@@ -1590,8 +1782,8 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0x93 => binop!(stack, f32, F32, |a: f32, b: f32| a - b),
         0x94 => binop!(stack, f32, F32, |a: f32, b: f32| a * b),
         0x95 => binop!(stack, f32, F32, |a: f32, b: f32| a / b),
-        0x96 => binop!(stack, f32, F32, f32::min),
-        0x97 => binop!(stack, f32, F32, f32::max),
+        0x96 => binop!(stack, f32, F32, wasm_min_f32),
+        0x97 => binop!(stack, f32, F32, wasm_max_f32),
         0x98 => binop!(stack, f32, F32, |a: f32, b: f32| a.copysign(b)),
         // f64 arithmetic
         0x99 => unf64(stack, |a: f64| a.abs()),
@@ -1605,21 +1797,45 @@ fn numeric(op: u8, stack: &mut Vec<Val>) -> Result<(), String> {
         0xa1 => binop!(stack, f64, F64, |a: f64, b: f64| a - b),
         0xa2 => binop!(stack, f64, F64, |a: f64, b: f64| a * b),
         0xa3 => binop!(stack, f64, F64, |a: f64, b: f64| a / b),
-        0xa4 => binop!(stack, f64, F64, f64::min),
-        0xa5 => binop!(stack, f64, F64, f64::max),
+        0xa4 => binop!(stack, f64, F64, wasm_min_f64),
+        0xa5 => binop!(stack, f64, F64, wasm_max_f64),
         0xa6 => binop!(stack, f64, F64, |a: f64, b: f64| a.copysign(b)),
         // conversions
         0xa7 => conv(stack, |v: Val| Val::I32(v.i64() as i32)), // i32.wrap_i64
-        0xa8 => conv(stack, |v: Val| Val::I32(v.f32().trunc() as i32)), // i32.trunc_f32_s
-        0xa9 => conv(stack, |v: Val| Val::I32(v.f32().trunc() as u32 as i32)),
-        0xaa => conv(stack, |v: Val| Val::I32(v.f64().trunc() as i32)),
-        0xab => conv(stack, |v: Val| Val::I32(v.f64().trunc() as u32 as i32)),
+        0xa8 => {
+            let value = trunc_i32(stack.pop().unwrap().f32() as f64)?;
+            stack.push(Val::I32(value));
+        }
+        0xa9 => {
+            let value = trunc_u32(stack.pop().unwrap().f32() as f64)?;
+            stack.push(Val::I32(value as i32));
+        }
+        0xaa => {
+            let value = trunc_i32(stack.pop().unwrap().f64())?;
+            stack.push(Val::I32(value));
+        }
+        0xab => {
+            let value = trunc_u32(stack.pop().unwrap().f64())?;
+            stack.push(Val::I32(value as i32));
+        }
         0xac => conv(stack, |v: Val| Val::I64(v.i32() as i64)), // i64.extend_i32_s
         0xad => conv(stack, |v: Val| Val::I64(v.i32() as u32 as i64)), // i64.extend_i32_u
-        0xae => conv(stack, |v: Val| Val::I64(v.f32().trunc() as i64)),
-        0xaf => conv(stack, |v: Val| Val::I64(v.f32().trunc() as u64 as i64)),
-        0xb0 => conv(stack, |v: Val| Val::I64(v.f64().trunc() as i64)),
-        0xb1 => conv(stack, |v: Val| Val::I64(v.f64().trunc() as u64 as i64)),
+        0xae => {
+            let value = trunc_i64(stack.pop().unwrap().f32() as f64)?;
+            stack.push(Val::I64(value));
+        }
+        0xaf => {
+            let value = trunc_u64(stack.pop().unwrap().f32() as f64)?;
+            stack.push(Val::I64(value as i64));
+        }
+        0xb0 => {
+            let value = trunc_i64(stack.pop().unwrap().f64())?;
+            stack.push(Val::I64(value));
+        }
+        0xb1 => {
+            let value = trunc_u64(stack.pop().unwrap().f64())?;
+            stack.push(Val::I64(value as i64));
+        }
         0xb2 => conv(stack, |v: Val| Val::F32(v.i32() as f32)),
         0xb3 => conv(stack, |v: Val| Val::F32(v.i32() as u32 as f32)),
         0xb4 => conv(stack, |v: Val| Val::F32(v.i64() as f32)),
@@ -1667,20 +1883,10 @@ fn conv(stack: &mut Vec<Val>, f: impl Fn(Val) -> Val) {
 }
 
 fn round_ties_even_f32(a: f32) -> f32 {
-    let r = a.round();
-    if (a - a.trunc()).abs() == 0.5 && (r as i64) % 2 != 0 {
-        r - a.signum()
-    } else {
-        r
-    }
+    a.round_ties_even()
 }
 fn round_ties_even_f64(a: f64) -> f64 {
-    let r = a.round();
-    if (a - a.trunc()).abs() == 0.5 && (r as i64) % 2 != 0 {
-        r - a.signum()
-    } else {
-        r
-    }
+    a.round_ties_even()
 }
 
 fn idiv_i32(stack: &mut Vec<Val>, signed: bool) -> Result<(), String> {

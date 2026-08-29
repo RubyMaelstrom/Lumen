@@ -28,7 +28,6 @@ pub(crate) fn validate_module(module: &Module) -> R<()> {
         .try_reserve(module.imported_func_count as usize + module.func_types.len())
         .map_err(|_| "wasm: cannot allocate function validation context")?;
 
-    let mut imported_tables = 0usize;
     for import in &module.imports {
         match import.kind {
             ImportKind::Func(type_index) => funcs.push(
@@ -38,17 +37,16 @@ pub(crate) fn validate_module(module: &Module) -> R<()> {
                     .ok_or("wasm: imported function type index out of range")?,
             ),
             ImportKind::Table(table) => {
-                imported_tables += 1;
                 tables.push(table);
             }
             ImportKind::Memory(memory) => memories.push(memory),
             ImportKind::Global(global) => globals.push(global),
         }
     }
-    // The current linker represents imported memory/table addresses as single slots. Reject an
-    // unsupported index-space shape rather than aliasing two imports to one entity.
-    if module.imported_mem_count > 1 || imported_tables > 1 {
-        return Err("wasm: multiple imported memories or tables are not supported".into());
+    // The current executor implements the single-memory model. Reject an unsupported index-space
+    // shape rather than silently aliasing two memory imports.
+    if module.imported_mem_count > 1 {
+        return Err("wasm: multiple imported memories are not supported".into());
     }
     for &type_index in &module.func_types {
         funcs.push(
@@ -148,6 +146,7 @@ pub(crate) fn validate_module(module: &Module) -> R<()> {
         tables: &tables,
         memories: memories.len(),
         globals: &globals,
+        data_count: module.data_count.map(|count| count as usize),
     };
     for (defined_index, body) in module.code.iter().enumerate() {
         let type_index = module.func_types[defined_index] as usize;
@@ -254,6 +253,7 @@ struct ModuleContext<'a> {
     tables: &'a [TableType],
     memories: usize,
     globals: &'a [GlobalType],
+    data_count: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,6 +426,7 @@ impl<'a> FunctionValidator<'a> {
                 Ok(())
             }
             0x1b => self.validate_select(),
+            0x1c => self.validate_typed_select(),
             0x20..=0x22 => self.validate_local(opcode),
             0x23 | 0x24 => self.validate_global(opcode),
             0x28..=0x3e => self.validate_memory_op(opcode),
@@ -455,6 +456,19 @@ impl<'a> FunctionValidator<'a> {
             0x44 => {
                 self.reader.bytes(8)?;
                 self.push(ValType::F64)
+            }
+            0xd0 => {
+                let ty = self.read_reference_type()?;
+                self.push(ty)
+            }
+            0xd1 => {
+                match self.pop_any()? {
+                    StackType::Known(ValType::FuncRef | ValType::ExternRef) | StackType::Bot => {}
+                    StackType::Known(_) => {
+                        return Err("wasm: ref.is_null operand must be a reference".into())
+                    }
+                }
+                self.push(ValType::I32)
             }
             0x45..=0xc4 => self.validate_numeric(opcode),
             0xfc => self.validate_fc(),
@@ -504,6 +518,38 @@ impl<'a> FunctionValidator<'a> {
             _ => return Err("wasm: select operands must have the same numeric type".into()),
         };
         self.push(selected)
+    }
+
+    fn validate_typed_select(&mut self) -> R<()> {
+        if self.reader.u32()? != 1 {
+            return Err("wasm: typed select must have one result type".into());
+        }
+        let ty = self.read_value_type()?;
+        self.pop_expect(ValType::I32)?;
+        self.pop_expect(ty)?;
+        self.pop_expect(ty)?;
+        self.push(ty)
+    }
+
+    fn read_value_type(&mut self) -> R<ValType> {
+        match self.reader.byte()? {
+            0x7f => Ok(ValType::I32),
+            0x7e => Ok(ValType::I64),
+            0x7d => Ok(ValType::F32),
+            0x7c => Ok(ValType::F64),
+            0x70 => Ok(ValType::FuncRef),
+            0x6f => Ok(ValType::ExternRef),
+            byte => Err(format!("wasm: unknown value type 0x{byte:x}")),
+        }
+    }
+
+    fn read_reference_type(&mut self) -> R<ValType> {
+        let ty = self.read_value_type()?;
+        if matches!(ty, ValType::FuncRef | ValType::ExternRef) {
+            Ok(ty)
+        } else {
+            Err("wasm: invalid reference type".into())
+        }
     }
 
     fn validate_local(&mut self, opcode: u8) -> R<()> {
@@ -621,8 +667,32 @@ impl<'a> FunctionValidator<'a> {
             2 | 3 => self.unary(ValType::F64, ValType::I32),
             4 | 5 => self.unary(ValType::F32, ValType::I64),
             6 | 7 => self.unary(ValType::F64, ValType::I64),
-            8 | 9 => {
-                Err("wasm: memory.init/data.drop are not supported by the current executor".into())
+            8 => {
+                self.require_memory()?;
+                let data_index = self.reader.u32()? as usize;
+                let count = self
+                    .context
+                    .data_count
+                    .ok_or("wasm: memory.init requires a data count section")?;
+                if data_index >= count {
+                    return Err("wasm: data segment index out of range".into());
+                }
+                self.require_zero_byte("memory.init memory index")?;
+                self.pop_expect(ValType::I32)?;
+                self.pop_expect(ValType::I32)?;
+                self.pop_expect(ValType::I32).map(|_| ())
+            }
+            9 => {
+                let data_index = self.reader.u32()? as usize;
+                let count = self
+                    .context
+                    .data_count
+                    .ok_or("wasm: data.drop requires a data count section")?;
+                if data_index >= count {
+                    Err("wasm: data segment index out of range".into())
+                } else {
+                    Ok(())
+                }
             }
             10 => {
                 self.require_memory()?;

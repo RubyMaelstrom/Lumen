@@ -323,8 +323,18 @@ conformance-style tests and the broader affected suite pass.
     17 IDNA processing through every runner-compatible URL WPT file. The combined 64-file manifest
     passes 6,306/6,306 subtests at revision
     `54078e9ec9d5c73f8815ff38b42b8fcbf1f3200b`.
-- [ ] Run the WebAssembly core specification tests for the supported feature
+- [x] Run the WebAssembly core specification tests for the supported feature
   set and add malformed-binary/validation fuzzing.
+  - [x] Pin the official WebAssembly 2.0 core suite at revision
+    `05ca4182176763112561ae20153975c12bd689e4`; the 75-suite scalar,
+    control-flow, linking, single-memory, funcref-table, multi-value, sign-extension,
+    non-trapping-conversion, and bulk-memory manifest passes 24,197/24,197 directives.
+  - [x] Correct trapping float-to-integer conversions, Wasm NaN/signed-zero `min`/`max` and
+    nearest behavior, start functions, cross-instance function identity, multiple table imports,
+    ordered instantiation side effects, typed select/reference-null instructions, stack-exhaustion
+    containment, and passive data-segment initialization/drop semantics found by the suite.
+  - [x] Add a deterministic malformed-binary decoder/validator corpus; 100,000 mutations pass
+    without a panic, including strict custom-section name and LEB128 decoding.
 - [ ] Run Autobahn WebSocket tests and adversarial RFC 9112 framing tests.
 - [x] Resolve the HTTP/2 interoperability regressions.
   - [x] Queue all client frames created before transport connection so the wire order is the

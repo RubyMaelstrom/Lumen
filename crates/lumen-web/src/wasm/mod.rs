@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn instantiation_matches_import_types_and_rolls_back_failed_allocations() {
+    fn instantiation_matches_import_types_and_preserves_store_changes_before_a_trap() {
         use parse::{DataSegment, GlobalType, Import, Limits, Module, ValType};
 
         let mut store = Store::default();
@@ -416,7 +416,9 @@ mod tests {
         assert!(store
             .instantiate(Rc::new(out_of_bounds_data), Imports::default())
             .is_err());
-        assert_eq!(store.memories.len(), memories_before);
-        assert_eq!(store.instances.len(), instances_before);
+        // WebAssembly Core 2.0 §4.5.10: allocation precedes segment initialization and a trap does
+        // not roll the store back. This is observable when earlier segments mutate imports.
+        assert_eq!(store.memories.len(), memories_before + 1);
+        assert_eq!(store.instances.len(), instances_before + 1);
     }
 }

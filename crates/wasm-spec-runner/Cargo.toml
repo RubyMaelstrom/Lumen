@@ -1,0 +1,14 @@
+[package]
+name = "wasm-spec-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+lumen-web = { path = "../lumen-web" }
+wast = { version = "=246.0.2", default-features = false, features = ["wasm-module"] }
+
+[lints]
+workspace = true

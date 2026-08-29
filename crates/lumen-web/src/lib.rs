@@ -48,7 +48,8 @@ pub use sse::testing as sse_testing;
 // (reserved value-type data, mutability flags, etc.), and a few opcode matches read cleaner as
 // explicit lists than ranges.
 #[allow(dead_code, clippy::manual_range_patterns)]
-mod wasm;
+#[doc(hidden)]
+pub mod wasm;
 mod wasm_ops;
 
 pub fn extension() -> Extension {
