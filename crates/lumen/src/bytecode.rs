@@ -717,13 +717,18 @@ pub enum Op {
     /// projected view of this VM frame. Direct yield/await never enters this bridge.
     EvalExpr(u32),
     /// Staged ECMA-262 ClassDefinitionEvaluation for a heritage or computed name which suspends.
-    /// The plan index also selects one continuation-local in-progress state slot.
-    ClassStart(u32),
+    /// The plan index also selects one continuation-local in-progress state slot; the count
+    /// consumes proposal class-decorator (receiver, callback) records evaluated before the class
+    /// environment opens.
+    ClassStart(u32, u16),
     /// Consume the evaluated heritage (the bool says it was syntactically present), validate it,
     /// perform the observable `prototype` read, and activate the retained private environment.
     ClassHeritage(u32, bool),
     /// Consume and ToPropertyKey one computed member name in source order.
     ClassKey(u32, u16),
+    /// Consume one proposal member-decorator (receiver, callback) record in source order for later
+    /// reverse application. The member index selects its continuation-owned value list.
+    ClassDecorator(u32, u16),
     /// Finish the non-suspending class body and push its constructor value.
     ClassFinish(u32),
     /// Abandon a partially evaluated class on any abrupt completion and restore the outer env.
@@ -6863,15 +6868,12 @@ impl Compiler {
     /// after heritage and every computed key have completed exactly once.
     fn staged_class(&mut self, class: &Rc<Class>, inferred_name: Option<&str>) -> CResult {
         if !self.is_coroutine
-            || !class.decorators.is_empty()
+            || class.decorators.len() > u16::MAX as usize
             || class
                 .members
                 .iter()
-                .any(|member| !member.decorators.is_empty())
+                .any(|member| member.decorators.len() > u16::MAX as usize)
         {
-            // Decorator evaluation is interleaved with element definition in Lumen's current
-            // proposal implementation; keep that rarer shape on the compatibility path until it
-            // has its own explicit continuation records.
             return Err(Bail);
         }
         if class.members.len() > u16::MAX as usize {
@@ -6882,7 +6884,13 @@ impl Compiler {
             class: class.clone(),
             inferred_name: inferred_name.map(str::to_string),
         });
-        self.emit(Op::ClassStart(plan));
+
+        // TC39 decorators proposal, "Evaluating decorators": class decorator expressions run in
+        // the surrounding environment before ClassDefinitionEvaluation opens the class-name TDZ.
+        for decorator in &class.decorators {
+            self.decorator_expression(decorator)?;
+        }
+        self.emit(Op::ClassStart(plan, class.decorators.len() as u16));
 
         let cleanup = self.emit(Op::PushFinally(0, 0, 0, 0, 0));
         self.try_depth += 1;
@@ -6905,6 +6913,10 @@ impl Compiler {
                 self.emit(Op::ClassHeritage(plan, false));
             }
             for (index, member) in class.members.iter().enumerate() {
+                for decorator in &member.decorators {
+                    self.decorator_expression(decorator)?;
+                    self.emit(Op::ClassDecorator(plan, index as u16));
+                }
                 if member.kind == MemberKind::Constructor {
                     continue;
                 }
@@ -6959,6 +6971,34 @@ impl Compiler {
         }
         self.patch(normal_exit);
         Ok(())
+    }
+
+    /// Evaluate a proposal decorator to its retained (receiver, callback) pair. Ordinary
+    /// expression evaluation performs GetValue and loses the Reference base; `GetMethod` keeps it
+    /// so `@holder.decorator` has the proposal's natural `this` when application occurs later.
+    fn decorator_expression(&mut self, expression: &Expr) -> CResult {
+        match expression {
+            Expr::Paren(inner) => self.decorator_expression(inner),
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) => {
+                self.expr(obj)?;
+                let name = self.name_idx(prop);
+                if prop.starts_with('#') {
+                    self.emit(Op::GetPrivateMethod(name));
+                } else {
+                    let cache = self.new_cache(name);
+                    self.emit(Op::GetMethod(name, cache));
+                }
+                Ok(())
+            }
+            _ => {
+                self.emit(Op::Undef);
+                self.expr(expression)
+            }
+        }
     }
 
     /// Evaluate an ObjectLiteral property name while the fresh object remains immediately below
@@ -8985,8 +9025,24 @@ fn run_vm(
                 let value = eval_expr_with_slots(i, &chunk.eval_exprs[plan as usize], env, slots)?;
                 stack.push(value);
             }
-            Op::ClassStart(plan) => {
-                let state = i.begin_class_evaluation(&chunk.class_plans[plan as usize].class, env);
+            Op::ClassStart(plan, decorator_count) => {
+                let class_plan = &chunk.class_plans[plan as usize];
+                let value_count = (decorator_count as usize)
+                    .checked_mul(2)
+                    .expect("class decorator count overflow");
+                let split = stack
+                    .len()
+                    .checked_sub(value_count)
+                    .expect("compiled class decorator stack underflow");
+                let decorator_values = stack.split_off(split);
+                let mut state = i.begin_class_evaluation(&class_plan.class, env);
+                let mut decorator_values = decorator_values.into_iter();
+                while let Some(this_value) = decorator_values.next() {
+                    let callback = decorator_values
+                        .next()
+                        .expect("compiled class decorator record is complete");
+                    i.prepare_class_decorator(&mut state, None, callback, this_value);
+                }
                 *env = state.outer_class_env.clone();
                 assert!(
                     class_states[plan as usize].replace(state).is_none(),
@@ -9013,6 +9069,14 @@ fn run_vm(
                     member as usize,
                     value,
                 )?;
+            }
+            Op::ClassDecorator(plan, member) => {
+                let callback = pop!();
+                let this_value = pop!();
+                let state = class_states[plan as usize]
+                    .as_mut()
+                    .expect("ClassStart precedes decorator evaluation");
+                i.prepare_class_decorator(state, Some(member as usize), callback, this_value);
             }
             Op::ClassFinish(plan) => {
                 let state = class_states[plan as usize]
@@ -12193,9 +12257,10 @@ impl Chunk {
                 | Op::SuperUpdate(_)
                 | Op::TemplateObject(_)
                 | Op::RequireCallable
-                | Op::ClassStart(_)
+                | Op::ClassStart(..)
                 | Op::ClassHeritage(..)
                 | Op::ClassKey(..)
+                | Op::ClassDecorator(..)
                 | Op::ClassFinish(_)
                 | Op::ClassAbort(_)
         ) {
@@ -12244,9 +12309,11 @@ impl Chunk {
             Op::DestructureArr(n) => (1, *n as usize),
             Op::AssignTarget(_) => (1, 0),
             Op::EvalExpr(_) => (0, 1),
-            Op::ClassStart(_) | Op::ClassAbort(_) => (0, 0),
+            Op::ClassStart(_, count) => (*count as usize * 2, 0),
+            Op::ClassAbort(_) => (0, 0),
             Op::ClassHeritage(_, present) => (usize::from(*present), 0),
             Op::ClassKey(..) => (1, 0),
+            Op::ClassDecorator(..) => (2, 0),
             Op::ClassFinish(_) => (0, 1),
             Op::ResolveNameRef(..) => (0, 0),
             Op::LoadRef(_) => (0, 1),
@@ -15187,9 +15254,10 @@ unsafe fn jit_exec_inner(
         | Op::SuperUpdate(_)
         | Op::TemplateObject(_)
         | Op::RequireCallable
-        | Op::ClassStart(_)
+        | Op::ClassStart(..)
         | Op::ClassHeritage(..)
         | Op::ClassKey(..)
+        | Op::ClassDecorator(..)
         | Op::ClassFinish(_)
         | Op::ClassAbort(_)
         | Op::AbruptJump(..)

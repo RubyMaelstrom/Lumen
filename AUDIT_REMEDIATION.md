@@ -151,7 +151,7 @@ conformance-style tests and the broader affected suite pass.
     - [x] Instantiate uncaptured strict block and switch function declarations at scope entry in
       heap continuations, preserving pre-declaration visibility, fresh identity on repeated block
       entry, and switch-wide initialization before case tests.
-    - [ ] Lower classes (`super`, private names, fields/static blocks), dynamic import metadata,
+    - [x] Lower classes (`super`, private names, fields/static blocks), dynamic import metadata,
       tagged templates, and other remaining expression forms.
       - [x] Lower tagged templates, `import.meta`, dynamic/import-source calls, private references,
         and `new.target` through suspension, preserving tag receiver/early-callability ordering,
@@ -161,9 +161,10 @@ conformance-style tests and the broader affected suite pass.
         Preserve strict mode, class-name TDZ, superclass validation and prototype access,
         ToPropertyKey, private-name captures, inferred names, abrupt cleanup, and computed static
         `prototype` error ordering.
-      - [ ] Model suspending proposal-decorator expressions and application with explicit
-        continuation records. Decorated coroutine classes remain on the bounded native
-        compatibility path.
+      - [x] Model proposal-decorator evaluation with continuation-owned `(this, callback)` records:
+        class expressions run before heritage, member expressions interleave with computed names,
+        reverse application retains natural receivers, and every stage may suspend without a
+        native worker. Focused official decorator syntax/staging coverage passes 23/23.
       - [x] Lower arbitrary/interleaved spread argument lists for calls, optional calls, and
         constructors while preserving receiver binding, short-circuiting, and evaluation order.
       - [x] Lower delete references, including optional-chain short-circuiting, environment
@@ -191,9 +192,9 @@ conformance-style tests and the broader affected suite pass.
     - [x] Move compiler-supported Source Text Module top-level-await evaluation into a strict,
       continuation-owned AsyncBlock over the already-instantiated module environment. Preserve
       live imports/exports, TDZ and immutable cells, default-export naming, module completion
-      cascades, and the bounded native fallback only for the same explicitly unlowered syntax
-      (currently proposal decorators). The focused Test262 `language/module-code/top-level-await`
-      suite passes 251/251.
+      cascades, including top-level await in proposal-decorator expressions without returning to
+      a native worker. The focused Test262 `language/module-code/top-level-await` suite passes
+      251/251.
     - [x] Replace the native `Array.fromAsync` iterator worker with an explicit heap continuation
       that preserves normative Await boundaries, async-from-sync wrapping, iterator closing, and
       promise rejection ordering. The focused Test262 `built-ins/Array/fromAsync` suite passes

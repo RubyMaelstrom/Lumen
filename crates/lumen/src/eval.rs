@@ -16,6 +16,19 @@ pub(crate) struct PreparedClassEvaluation {
     ctor_parent: Option<Value>,
     derived: bool,
     keys: Vec<Option<crate::value::PropertyKey>>,
+    /// TC39 decorators proposal, "Evaluating decorators": expression values are captured in
+    /// source order, interspersed with computed names, and called only after that phase finishes.
+    decorator_values: Option<PreparedDecoratorValues>,
+}
+
+struct PreparedDecoratorValues {
+    class: Vec<PreparedDecoratorValue>,
+    members: Vec<Vec<PreparedDecoratorValue>>,
+}
+
+struct PreparedDecoratorValue {
+    callback: Value,
+    this_value: Value,
 }
 
 impl Interp {
@@ -4338,40 +4351,60 @@ impl Interp {
     // ----- classes ----------------------------------------------------------------------------
 
     fn eval_class(&mut self, class: &Rc<Class>, env: &Env) -> Result<Value, Abrupt> {
+        // The decorators proposal evaluates class decorator expressions before
+        // ClassDefinitionEvaluation (and therefore before the class name's TDZ and heritage).
+        let mut class_decorators = Vec::with_capacity(class.decorators.len());
+        for decorator in &class.decorators {
+            class_decorators.push(self.eval_decorator_expression(decorator, env)?);
+        }
         // ClassDefinitionEvaluation is strict code throughout — the heritage expression and
         // computed member keys included, whatever the surrounding mode.
         let saved_strict = self.strict;
         self.strict = true;
-        let r = self.eval_class_strict(class, env);
+        let r = self.eval_class_strict(class, env, class_decorators);
         self.strict = saved_strict;
         r
     }
 
-    fn eval_class_strict(&mut self, class: &Rc<Class>, env: &Env) -> Result<Value, Abrupt> {
+    fn eval_class_strict(
+        &mut self,
+        class: &Rc<Class>,
+        env: &Env,
+        class_decorators: Vec<PreparedDecoratorValue>,
+    ) -> Result<Value, Abrupt> {
         let mut prepared = self.begin_class_evaluation(class, env);
+        for decorator in class_decorators {
+            self.prepare_class_decorator(
+                &mut prepared,
+                None,
+                decorator.callback,
+                decorator.this_value,
+            );
+        }
         let parent = match &class.superclass {
             Some(expression) => Some(self.eval(expression, &prepared.outer_class_env)?),
             None => None,
         };
         self.prepare_class_heritage(&mut prepared, parent)?;
-        // Lumen's decorator syntax is an extension while the TC39 proposal remains separate from
-        // ECMA-262. Preserve its established key/decorator interleaving here. Standards classes
-        // have all ClassElementNames evaluated before their definitions are installed, so their
-        // keys can be prepared up front (and suspending classes use the same staged boundary).
-        let decorated = !class.decorators.is_empty()
-            || class
-                .members
-                .iter()
-                .any(|member| !member.decorators.is_empty());
-        if !decorated {
-            for (index, member) in class.members.iter().enumerate() {
-                if member.kind == MemberKind::Constructor {
-                    continue;
-                }
-                if let PropKey::Computed(expression) = &member.key {
-                    let value = self.eval(expression, &prepared.class_env)?;
-                    self.prepare_class_key(&mut prepared, class, index, value)?;
-                }
+        // TC39 decorators proposal, "Evaluating decorators": visit each element top-to-bottom,
+        // evaluating its decorators left-to-right before its computed ClassElementName. Retain
+        // those values for the later application phase rather than re-evaluating their syntax.
+        for (index, member) in class.members.iter().enumerate() {
+            for decorator in &member.decorators {
+                let value = self.eval_decorator_expression(decorator, &prepared.class_env)?;
+                self.prepare_class_decorator(
+                    &mut prepared,
+                    Some(index),
+                    value.callback,
+                    value.this_value,
+                );
+            }
+            if member.kind == MemberKind::Constructor {
+                continue;
+            }
+            if let PropKey::Computed(expression) = &member.key {
+                let value = self.eval(expression, &prepared.class_env)?;
+                self.prepare_class_key(&mut prepared, class, index, value)?;
             }
         }
         self.finish_class_evaluation(class, prepared)
@@ -4421,6 +4454,76 @@ impl Interp {
             ctor_parent: None,
             derived: false,
             keys: (0..class.members.len()).map(|_| None).collect(),
+            decorator_values: (!class.decorators.is_empty()
+                || class
+                    .members
+                    .iter()
+                    .any(|member| !member.decorators.is_empty()))
+            .then(|| PreparedDecoratorValues {
+                class: Vec::with_capacity(class.decorators.len()),
+                members: class
+                    .members
+                    .iter()
+                    .map(|member| Vec::with_capacity(member.decorators.len()))
+                    .collect(),
+            }),
+        }
+    }
+
+    /// Retain one already-evaluated decorator expression in source order. The proposal separates
+    /// this observable expression-evaluation phase from reverse-order decorator application.
+    pub(crate) fn prepare_class_decorator(
+        &mut self,
+        prepared: &mut PreparedClassEvaluation,
+        member: Option<usize>,
+        callback: Value,
+        this_value: Value,
+    ) {
+        let value = PreparedDecoratorValue {
+            callback,
+            this_value,
+        };
+        let values = prepared
+            .decorator_values
+            .as_mut()
+            .expect("decorated classes allocate decorator continuation state");
+        match member {
+            Some(index) => values.members[index].push(value),
+            None => values.class.push(value),
+        }
+    }
+
+    /// Evaluate one proposal Decorator expression and preserve the Reference receiver separately
+    /// from GetValue. This is observable when `@holder.decorator` is later invoked: the March 2023
+    /// normative update calls it with `holder`, whereas a bare/call expression uses `undefined`.
+    fn eval_decorator_expression(
+        &mut self,
+        expression: &Expr,
+        env: &Env,
+    ) -> Result<PreparedDecoratorValue, Abrupt> {
+        match expression {
+            Expr::Paren(inner) => self.eval_decorator_expression(inner, env),
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if !matches!(**obj, Expr::Super) => {
+                let this_value = self.eval(obj, env)?;
+                let callback = if prop.starts_with('#') {
+                    let key = self.resolve_private(prop, env);
+                    self.get_private_member(&this_value, &key)?
+                } else {
+                    self.get_member(&this_value, prop)?
+                };
+                Ok(PreparedDecoratorValue {
+                    callback,
+                    this_value,
+                })
+            }
+            _ => Ok(PreparedDecoratorValue {
+                callback: self.eval(expression, env)?,
+                this_value: Value::Undefined,
+            }),
         }
     }
 
@@ -4494,7 +4597,6 @@ impl Interp {
         let proto_parent = prepared.proto_parent;
         let ctor_parent = prepared.ctor_parent;
         let derived = prepared.derived;
-        let env = &outer_class_env;
 
         let proto = Object::new(proto_parent.clone());
 
@@ -4648,14 +4750,18 @@ impl Interp {
                     let mut setter = self.make_accessor_fn(&key, &backing, false);
                     let mut transforms = Vec::new();
                     if !m.decorators.is_empty() {
+                        let decorators = &prepared
+                            .decorator_values
+                            .as_ref()
+                            .expect("decorated class retains evaluated expressions")
+                            .members[member_index];
                         let sink = if m.is_static {
                             &mut static_inits
                         } else {
                             &mut instance_inits
                         };
                         let (g, s, t) = self.decorate_accessor(
-                            &m.decorators,
-                            env,
+                            decorators,
                             &key,
                             m.is_static,
                             getter,
@@ -4699,14 +4805,18 @@ impl Interp {
                         );
                     }
                     if !m.decorators.is_empty() {
+                        let decorators = &prepared
+                            .decorator_values
+                            .as_ref()
+                            .expect("decorated class retains evaluated expressions")
+                            .members[member_index];
                         let sink = if m.is_static {
                             &mut static_inits
                         } else {
                             &mut instance_inits
                         };
                         f = self.decorate_callable(
-                            &m.decorators,
-                            env,
+                            decorators,
                             f,
                             "method",
                             &key,
@@ -4744,6 +4854,11 @@ impl Interp {
                         );
                     }
                     if !m.decorators.is_empty() {
+                        let decorators = &prepared
+                            .decorator_values
+                            .as_ref()
+                            .expect("decorated class retains evaluated expressions")
+                            .members[member_index];
                         let sink = if m.is_static {
                             &mut static_inits
                         } else {
@@ -4751,8 +4866,7 @@ impl Interp {
                         };
                         let kind = if is_get { "getter" } else { "setter" };
                         f = self.decorate_callable(
-                            &m.decorators,
-                            env,
+                            decorators,
                             f,
                             kind,
                             &key,
@@ -4791,19 +4905,17 @@ impl Interp {
                     let transforms = if m.decorators.is_empty() {
                         Vec::new()
                     } else {
+                        let decorators = &prepared
+                            .decorator_values
+                            .as_ref()
+                            .expect("decorated class retains evaluated expressions")
+                            .members[member_index];
                         let sink = if m.is_static {
                             &mut static_inits
                         } else {
                             &mut instance_inits
                         };
-                        self.decorate_field(
-                            &m.decorators,
-                            env,
-                            &key,
-                            m.is_static,
-                            is_private,
-                            sink,
-                        )?
+                        self.decorate_field(decorators, &key, m.is_static, is_private, sink)?
                     };
                     if m.is_static {
                         static_els.push((None, key, m.value.clone(), transforms));
@@ -4921,9 +5033,13 @@ impl Interp {
         let mut class_value = ctor_val;
         if !class.decorators.is_empty() {
             let name = class.name.clone().unwrap_or_default();
+            let decorators = &prepared
+                .decorator_values
+                .as_ref()
+                .expect("decorated class retains evaluated expressions")
+                .class;
             class_value = self.decorate_callable(
-                &class.decorators,
-                env,
+                decorators,
                 class_value,
                 "class",
                 &name,
@@ -5065,8 +5181,7 @@ impl Interp {
     /// or whole class), folding each non-undefined callable return in as the replacement.
     fn decorate_callable(
         &mut self,
-        decorators: &[Expr],
-        env: &Env,
+        decorators: &[PreparedDecoratorValue],
         mut value: Value,
         kind: &str,
         key: &str,
@@ -5074,13 +5189,16 @@ impl Interp {
         is_private: bool,
         inits: &mut Vec<Value>,
     ) -> Result<Value, Abrupt> {
-        for d in decorators.iter().rev() {
-            let dec = self.eval(d, env)?;
-            if !dec.is_callable() {
+        for decorator in decorators.iter().rev() {
+            if !decorator.callback.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
             }
             let ctx = self.make_decorator_context(kind, key, is_static, is_private);
-            let r = self.call(dec, Value::Undefined, &[value.clone(), ctx])?;
+            let r = self.call(
+                decorator.callback.clone(),
+                decorator.this_value.clone(),
+                &[value.clone(), ctx],
+            )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
             match r {
                 Value::Undefined => {}
@@ -5098,21 +5216,23 @@ impl Interp {
     /// Apply field decorators, returning the initializer transforms they contribute.
     fn decorate_field(
         &mut self,
-        decorators: &[Expr],
-        env: &Env,
+        decorators: &[PreparedDecoratorValue],
         key: &str,
         is_static: bool,
         is_private: bool,
         inits: &mut Vec<Value>,
     ) -> Result<Vec<Value>, Abrupt> {
         let mut transforms = Vec::new();
-        for d in decorators.iter().rev() {
-            let dec = self.eval(d, env)?;
-            if !dec.is_callable() {
+        for decorator in decorators.iter().rev() {
+            if !decorator.callback.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
             }
             let ctx = self.make_decorator_context("field", key, is_static, is_private);
-            let r = self.call(dec, Value::Undefined, &[Value::Undefined, ctx])?;
+            let r = self.call(
+                decorator.callback.clone(),
+                decorator.this_value.clone(),
+                &[Value::Undefined, ctx],
+            )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
             match r {
                 Value::Undefined => {}
@@ -5132,8 +5252,7 @@ impl Interp {
     #[allow(clippy::type_complexity)]
     fn decorate_accessor(
         &mut self,
-        decorators: &[Expr],
-        env: &Env,
+        decorators: &[PreparedDecoratorValue],
         key: &str,
         is_static: bool,
         mut get: Value,
@@ -5142,9 +5261,8 @@ impl Interp {
     ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
         let is_private = Interp::is_private_key(key);
         let mut transforms = Vec::new();
-        for d in decorators.iter().rev() {
-            let dec = self.eval(d, env)?;
-            if !dec.is_callable() {
+        for decorator in decorators.iter().rev() {
+            if !decorator.callback.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
             }
             let ctx = self.make_decorator_context("accessor", key, is_static, is_private);
@@ -5155,7 +5273,11 @@ impl Interp {
             pair.borrow_mut()
                 .props
                 .insert("set", Property::plain(set.clone()));
-            let r = self.call(dec, Value::Undefined, &[Value::Obj(pair), ctx])?;
+            let r = self.call(
+                decorator.callback.clone(),
+                decorator.this_value.clone(),
+                &[Value::Obj(pair), ctx],
+            )?;
             inits.append(&mut std::mem::take(&mut self.decorator_initializers));
             match r {
                 Value::Undefined => {}

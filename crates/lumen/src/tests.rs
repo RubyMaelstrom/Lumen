@@ -6133,6 +6133,67 @@ fn suspending_class_heritage_and_computed_names_use_vm_continuations() {
 }
 
 #[test]
+fn suspending_decorator_expressions_use_class_continuation_state() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.decoratorContinuationLog=[];
+             function decoratorFor(name){
+               return function(value,context){decoratorContinuationLog.push('call:'+name)}
+             }
+             function receiverFor(name){
+               return {name,get dec(){
+                 decoratorContinuationLog.push('eval:receiver');
+                 return function(value,context){decoratorContinuationLog.push('call:'+this.name)}
+               }}
+             }
+             function* decoratedClass(){
+               @((decoratorContinuationLog.push('eval:class'),yield 'class-decorator'))
+               class C extends (decoratorContinuationLog.push('heritage'),yield 'heritage'){
+                 @((decoratorContinuationLog.push('eval:outer'),yield 'outer-decorator'))
+                 @((decoratorContinuationLog.push('eval:inner'),yield 'inner-decorator'))
+                 [(decoratorContinuationLog.push('key'),yield 'method')](){return 7}
+                 @((yield 'receiver-object').dec)
+                 other(){}
+               }
+               return [new C().method(),C.name].join(',');
+             }
+             globalThis.decoratedClassIterator=decoratedClass();",
+            false,
+        )
+        .expect("decorated class continuation setup parses");
+    assert!(engine
+        .interp
+        .generators
+        .values()
+        .all(|coroutine| !matches!(coroutine, crate::coroutine::Coroutine::Thread(_))));
+    match engine
+        .eval(
+            "var iterator=decoratedClassIterator,
+                 a=iterator.next(),
+                 b=iterator.next(decoratorFor('class')),
+                 c=iterator.next(Object),
+                 d=iterator.next(decoratorFor('outer')),
+                 e=iterator.next(decoratorFor('inner')),
+                 f=iterator.next('method'),
+                 g=iterator.next(receiverFor('receiver'));
+             [a.value,b.value,c.value,d.value,e.value,f.value,g.value,g.done,
+              decoratorContinuationLog.join(',')].join('|')",
+            false,
+        )
+        .expect("decorated class continuation drive parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "class-decorator|heritage|outer-decorator|inner-decorator|method|receiver-object|7,C|true|eval:class,heritage,eval:outer,eval:inner,key,eval:receiver,call:inner,call:outer,call:receiver,call:class"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("decorated class continuation drive threw {name}: {message}")
+        }
+    }
+}
+
+#[test]
 fn suspending_class_abrupt_completion_restores_the_vm_environment() {
     let mut engine = Engine::new();
     engine
@@ -9075,19 +9136,33 @@ fn decorators_runtime() {
         "#),
         "105"
     );
-    // The decorator extension evaluates a member's decorators after that member's key and before
-    // the following key. Class continuation staging must not reorder ordinary decorated classes.
+    // Proposal decorator expressions are captured left-to-right/top-to-bottom alongside computed
+    // names, then called later in reverse composition order. Class decorators precede heritage;
+    // each member's decorators precede its computed name.
     assert_eq!(
         run(r#"
             let order = [];
-            function dec(value, context) {}
-            class C {
-                @(order.push("decorator"), dec) [(order.push("key1"), "a")]() {}
-                [(order.push("key2"), "b")]() {}
+            function expr(name) {
+                order.push("eval:" + name);
+                return function(value, context) { order.push("call:" + name); };
+            }
+            @expr("class") class C extends (order.push("heritage"), Object) {
+                @expr("outer") @expr("inner") [(order.push("key1"), "a")]() {}
+                @expr("second") [(order.push("key2"), "b")]() {}
             }
             order.join(",")
         "#),
-        "key1,decorator,key2"
+        "eval:class,heritage,eval:outer,eval:inner,key1,eval:second,key2,call:inner,call:outer,call:second,call:class"
+    );
+    // A member-expression decorator retains its Reference receiver until the later call phase.
+    assert_eq!(
+        run(r#"
+            let receiver;
+            const holder = { dec(value, context) { receiver = this; } };
+            class C { @holder.dec method() {} }
+            String(receiver === holder)
+        "#),
+        "true"
     );
 }
 
@@ -14795,7 +14870,9 @@ fn top_level_await_uses_module_continuation_and_live_environment() {
                 export const fixed = 3;
                 export const read = () => live;
                 export default function() { return live; }
-                globalThis.moduleBefore = String(live) + ':' + String(value);
+                function markClass(value, context) { globalThis.moduleDecorator = context.name; }
+                @((await Promise.resolve(markClass))) class Decorated {}
+                globalThis.moduleBefore = String(live) + ':' + String(value) + ':' + moduleDecorator;
                 await globalThis.moduleGate;
                 live += value;
                 try { fixed = 4; } catch (error) { globalThis.moduleConstError = error.name; }
@@ -14832,7 +14909,7 @@ fn top_level_await_uses_module_continuation_and_live_environment() {
         .eval("moduleBefore", false)
         .expect("pending state reads")
     {
-        Completion::Value(value) => assert_eq!(value, "2:2"),
+        Completion::Value(value) => assert_eq!(value, "2:2:Decorated"),
         Completion::Throw { name, message } => panic!("pending read threw {name}: {message}"),
     }
 
