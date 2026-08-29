@@ -275,5 +275,12 @@ conformance-style tests and the broader affected suite pass.
   - [x] Prevent servers from advertising the forbidden `SETTINGS_ENABLE_PUSH = 1` value and make
     the Node server-interoperability fixtures readiness-driven. Cleartext/TLS client, server,
     frame, and HPACK tests all pass.
-- [ ] Run formatting, Clippy, workspace tests, release Lumen, and release TRust
+- [x] Run formatting, Clippy, workspace tests, release Lumen, and release TRust
   before acceptance handoff.
+  - [x] Lumen formatting and warnings-denied all-target Clippy are clean; the full workspace suite
+    passes, including the runtime, HTTP/TLS, Node/Bun compatibility, WebAssembly, and doc-test
+    targets (two explicitly documented tests remain ignored).
+  - [x] The complete optimized Lumen workspace builds successfully.
+  - [x] TRust formatting and warnings-denied all-target Clippy are clean; 944 library tests and 28
+    desktop tests pass (16 explicitly documented manual/diagnostic tests remain ignored), and the
+    optimized `trust` and `trust-desktop` binaries build successfully against this Lumen tree.

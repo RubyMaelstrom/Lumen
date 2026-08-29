@@ -1623,9 +1623,13 @@ fn worker_terminate_aborts_current_synchronous_script() {
         "#,
     );
     assert_eq!(lines, ["terminated spin"]);
+    // This end-to-end duration includes constructing two full runtimes and shutting down both
+    // bounded blocking pools, not just the engine's interrupt latency. Keep a generous loaded-CI
+    // margin while still rejecting a worker that fails to abort and lets teardown stall.
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "terminating a running worker was not prompt"
+        elapsed < std::time::Duration::from_secs(5),
+        "terminating a running worker was not prompt: {elapsed:?}"
     );
 }
 

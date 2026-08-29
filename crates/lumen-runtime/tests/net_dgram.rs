@@ -451,15 +451,22 @@ fn dgram_loopback_echo_with_rinfo() {
         server.bind(0, "127.0.0.1");
         "#,
     );
-    assert_eq!(
-        out.lines(),
-        [
-            "listening: 127.0.0.1 IPv4 number",
-            "sent: true 4",
-            "server got: ping IPv4 true",
-            "client got: pong:ping",
-        ]
-    );
+    let lines = out.lines();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[0], "listening: 127.0.0.1 IPv4 number");
+    // Node's dgram.send callback confirms that the send completed but does not order that
+    // callback against the peer socket's independently queued `message` event. Loopback can make
+    // either runnable first. The reply still causally follows the server's receive.
+    assert!(lines.iter().any(|line| line == "sent: true 4"));
+    let server = lines
+        .iter()
+        .position(|line| line == "server got: ping IPv4 true")
+        .expect("server receive event");
+    let client = lines
+        .iter()
+        .position(|line| line == "client got: pong:ping")
+        .expect("client reply event");
+    assert!(server < client);
 }
 
 #[test]
