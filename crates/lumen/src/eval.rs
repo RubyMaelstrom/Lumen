@@ -1707,6 +1707,23 @@ impl Interp {
             }
             // for-in visits own enumerable string keys in spec order, then up the prototype chain.
             // TypedArray elements enumerate first (they live outside the property map).
+            let level_keys: Vec<String> = o
+                .borrow()
+                .props
+                .ordered_keys()
+                .into_iter()
+                .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
+                .map(|key| key.to_string())
+                .collect();
+            if let Some(length) = self.host_indexed_len(&o) {
+                for index in 0..length {
+                    let key = index.to_string();
+                    let _ = self.host_indexed_own_value(&o, &key)?;
+                    if seen.insert(key.clone()) {
+                        out.push(key);
+                    }
+                }
+            }
             if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(&o) as usize)).copied() {
                 for idx in 0..self.ta_len(&info).unwrap_or(0) {
                     let k = idx.to_string();
@@ -1715,27 +1732,20 @@ impl Interp {
                     }
                 }
             }
-            let (level, parent) = {
-                let b = o.borrow();
-                let level: Vec<(String, bool)> = b
+            for k in level_keys {
+                let descriptor = o
+                    .borrow()
                     .props
-                    .ordered_keys()
-                    .into_iter()
-                    .filter(|k| !Interp::is_sym_key(k) && !Interp::is_private_key(k))
-                    .map(|k| {
-                        let e = b.props.get(&k).map(|p| p.enumerable()).unwrap_or(false);
-                        (k.to_string(), e)
-                    })
-                    .collect();
-                (level, b.proto.clone())
-            };
-            for (k, enumerable) in level {
-                // A non-enumerable own property still *shadows* an enumerable prototype one.
-                if seen.insert(k.clone()) && enumerable {
-                    out.push(k);
+                    .get(&k)
+                    .map(|property| property.enumerable());
+                if let Some(enumerable) = descriptor {
+                    // A non-enumerable own property still *shadows* an enumerable prototype one.
+                    if seen.insert(k.clone()) && enumerable {
+                        out.push(k);
+                    }
                 }
             }
-            cur = parent;
+            cur = o.borrow().proto.clone();
         }
         Ok(out)
     }
@@ -2132,22 +2142,31 @@ impl Interp {
             }
             return Ok(ty);
         }
-        let keys: Vec<std::rc::Rc<str>> = with
-            .as_obj()
-            .map(|obj| {
-                obj.borrow()
-                    .props
-                    .ordered_keys()
-                    .into_iter()
-                    .filter(|k| !Interp::is_sym_key(k))
+        let object = with.as_obj().unwrap().clone();
+        let mut keys: Vec<std::rc::Rc<str>> = self
+            .host_indexed_len(&object)
+            .map(|length| {
+                (0..length)
+                    .map(|index| std::rc::Rc::<str>::from(index.to_string()))
                     .collect()
             })
             .unwrap_or_default();
+        keys.extend(
+            object
+                .borrow()
+                .props
+                .ordered_keys()
+                .into_iter()
+                .filter(|key| !Interp::is_sym_key(key)),
+        );
         for k in keys {
-            let live = with
-                .as_obj()
-                .and_then(|obj| obj.borrow().props.get(&k).map(|p| p.enumerable()));
-            if live != Some(true) {
+            let enumerable = self.host_indexed_own_value(&object, &k)?.is_some()
+                || object
+                    .borrow()
+                    .props
+                    .get(&k)
+                    .is_some_and(|property| property.enumerable());
+            if !enumerable {
                 continue;
             }
             let v = self.get_member(&with, &k)?;
@@ -2403,7 +2422,13 @@ impl Interp {
             let present = self.to_boolean(&res);
             if !present {
                 if let Value::Obj(t) = &target {
-                    let p = t.borrow().props.get(key).cloned();
+                    let ordinary = t.borrow().props.get(key).cloned();
+                    let p = match ordinary {
+                        some @ Some(_) => some,
+                        None => self
+                            .host_indexed_own_value(t, key)?
+                            .map(|value| crate::value::Property::data(value, false, true, true)),
+                    };
                     if let Some(p) = p {
                         if !p.configurable() || !t.borrow().extensible {
                             return Err(self.throw(
@@ -2422,6 +2447,11 @@ impl Interp {
                 TaIndex::Exotic => return Ok(false),
                 TaIndex::Ordinary => {}
             }
+        }
+        // HasProperty calls the Web IDL legacy object's [[GetOwnProperty]], so observing a
+        // supported index also runs the platform getter and propagates an abrupt completion.
+        if self.host_indexed_own_value(&o, key)?.is_some() {
+            return Ok(true);
         }
         // A String wrapper's `length` and in-range indices are own exotic properties.
         if let crate::value::Exotic::StrWrap(s) = o.borrow().exotic.clone() {
@@ -5602,7 +5632,23 @@ impl Interp {
         }
         match value {
             Value::Obj(src) => {
+                // CopyDataProperties snapshots [[OwnPropertyKeys]] before any descriptor getter
+                // runs. Indexed platform getters may mutate expandos, but cannot add newly-created
+                // keys to this operation's snapshot.
                 let keys = src.borrow().props.ordered_keys();
+                if let Some(length) = self.host_indexed_len(src) {
+                    for index in 0..length {
+                        let key = index.to_string();
+                        if is_excluded(&key) {
+                            continue;
+                        }
+                        let _ = self.host_indexed_own_value(src, &key)?;
+                        let property_value = self.get_member(value, &key)?;
+                        rest.borrow_mut()
+                            .props
+                            .insert(key.as_str(), crate::value::Property::plain(property_value));
+                    }
+                }
                 for k in keys {
                     if is_excluded(&k) {
                         continue;
@@ -6063,6 +6109,19 @@ impl Interp {
                             TaIndex::Ordinary => {}
                         }
                     }
+                    // Web IDL legacy platform object [[Delete]]: supported indices are
+                    // undeletable; an unsupported array-index key succeeds immediately.
+                    if self.host_indexed_array_key(o, prop) {
+                        let ok = crate::value::canonical_index(prop)
+                            .is_some_and(|index| index >= self.host_indexed_len(o).unwrap_or(0));
+                        if !ok && strict {
+                            return Err(self.throw(
+                                "TypeError",
+                                format!("cannot delete indexed property '{prop}'"),
+                            ));
+                        }
+                        return Ok(Value::Bool(ok));
+                    }
                     let configurable = o
                         .borrow()
                         .props
@@ -6180,6 +6239,11 @@ impl Interp {
                 if let Some((t2, h2)) = self.proxies.get(&tptr).cloned() {
                     return self.proxy_delete(t2, h2, key);
                 }
+                if self.host_indexed_array_key(t, key) {
+                    let supported = crate::value::canonical_index(key)
+                        .is_some_and(|index| index < self.host_indexed_len(t).unwrap_or(0));
+                    return Ok(!supported);
+                }
                 let configurable = t
                     .borrow()
                     .props
@@ -6207,7 +6271,13 @@ impl Interp {
         // Invariant: a non-configurable property, or any property of a non-extensible target,
         // can't be reported as deleted.
         if let Value::Obj(t) = &target {
-            let p = t.borrow().props.get(key).cloned();
+            let ordinary = t.borrow().props.get(key).cloned();
+            let p = match ordinary {
+                some @ Some(_) => some,
+                None => self
+                    .host_indexed_own_value(t, key)?
+                    .map(|value| crate::value::Property::data(value, false, true, true)),
+            };
             if let Some(p) = p {
                 if !p.configurable() {
                     return Err(self.throw(

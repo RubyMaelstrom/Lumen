@@ -240,10 +240,15 @@ not an acceptable cost of conformance.
     length-only selector microbenchmark improved 392.32 -> 108.99 ms (72.2%),
     total workload wall time improved 2.685 -> 2.406 seconds, and peak RSS fell
     168.5 -> 156.5 MiB.
-  - [ ] Replace the JavaScript Proxy-backed indexed collection with a native
-    Lumen/Web IDL exotic object fast path. Fully consuming every node remains
-    about 7% slower than the former nonstandard eager Array; native indexed
-    access should remove that residual cost without undoing lazy length queries.
+  - [x] Replace the JavaScript Proxy-backed indexed collection with a native
+    Lumen/Web IDL exotic object fast path. The implementation follows Web IDL
+    legacy platform-object `[[GetOwnProperty]]`, `[[Set]]`,
+    `[[DefineOwnProperty]]`, `[[Delete]]`, `[[PreventExtensions]]`, and
+    `[[OwnPropertyKeys]]` behavior, including proxy invariants and key snapshots
+    across getter side effects. Against the Proxy checkpoint, the length-only
+    browser workload improved 108.99 -> 88.05 ms (19.2%); against the former
+    eager Array baseline, fully consuming every node improved 391.94 -> 374.19
+    ms (4.5%), eliminating the prior approximately 7% regression.
   - [x] Repeat the optimized semantic gates after both DOM passes. YouTube's
     real consent Reject action closes the dialog and retains search (954 nodes,
     24 updates), Twitch retains search/carousel/channel cards (1,924 nodes), and

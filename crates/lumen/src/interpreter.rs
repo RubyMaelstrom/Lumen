@@ -207,6 +207,17 @@ pub struct AgentChannels {
     pub broadcast_rx: Option<std::sync::mpsc::Receiver<(u64, usize)>>,
 }
 
+/// A contiguous, getter-backed set of read-only indexed properties installed by an embedder.
+///
+/// This is the native representation of Web IDL's legacy platform-object indexed properties for
+/// collection interfaces such as `NodeList`. The values remain lazy: the getter is called only
+/// when Web IDL's `LegacyPlatformObjectGetOwnProperty` algorithm observes a supported index.
+#[derive(Clone)]
+pub(crate) struct HostIndexedProperties {
+    pub(crate) length: u32,
+    pub(crate) getter: Value,
+}
+
 /// Process-global backing store for SharedArrayBuffer memory, keyed by a unique id so it can be
 /// shared across agent threads (each agent runs its own single-threaded `Interp`).
 pub type SharedMem = Arc<Mutex<Vec<u8>>>;
@@ -1487,6 +1498,9 @@ pub struct Interp {
     pub(crate) regexp_programs: crate::cache::RegexpProgramCache,
     /// Proxy `(target, handler)` pairs, keyed by the proxy object's pointer.
     pub(crate) proxies: crate::fasthash::FastMap<usize, (Value, Value)>,
+    /// Embedder-installed Web IDL indexed properties, keyed by the platform object's pointer.
+    /// The object is pinned in `gc_pins`; `getter` is an internal GC edge owned by that object.
+    pub(crate) host_indexed: crate::fasthash::FastMap<usize, HostIndexedProperties>,
     /// The active `new.target` for the function currently executing (Undefined outside a `new`).
     pub(crate) new_target: Value,
     /// The `new.target` to install for the next constructor invocation (set by `construct`).
@@ -2302,6 +2316,7 @@ impl Interp {
             regexps: Default::default(),
             regexp_programs: crate::cache::RegexpProgramCache::new(16 << 20, 512),
             proxies: Default::default(),
+            host_indexed: Default::default(),
             new_target: Value::Undefined,
             pending_new_target: Value::Undefined,
             htmldda: Default::default(),
@@ -2942,6 +2957,56 @@ impl Interp {
     /// creating instances with a class's prototype.
     pub fn new_object_with_proto(&self, proto: &Value) -> Value {
         Value::Obj(Object::new(proto.as_obj().cloned()))
+    }
+
+    /// Install a contiguous set of lazy, read-only indexed properties on a host-created object.
+    ///
+    /// The resulting object implements the indexed portions of Web IDL's legacy platform-object
+    /// internal methods. `getter` is called as `getter.call(target, index)` only when a supported
+    /// property is observed. The target must be a fresh ordinary, extensible, non-callable object
+    /// with no existing array-index properties; named expandos remain ordinary properties.
+    pub fn install_readonly_indexed_properties(
+        &mut self,
+        target: &Value,
+        length: u32,
+        getter: Value,
+    ) -> Result<(), Value> {
+        let Some(object) = target.as_obj().cloned() else {
+            return Err(self.make_error("TypeError", "indexed-property target must be an object"));
+        };
+        if !getter.is_callable() {
+            return Err(self.make_error("TypeError", "indexed-property getter must be callable"));
+        }
+        let ptr = Rc::as_ptr(&object) as usize;
+        if self.host_indexed.contains_key(&ptr) {
+            return Err(self.make_error(
+                "TypeError",
+                "indexed properties are already installed on this object",
+            ));
+        }
+        {
+            let borrowed = object.borrow();
+            let ordinary = matches!(borrowed.exotic, Exotic::None)
+                && matches!(borrowed.call, Callable::None)
+                && borrowed.extensible
+                && self.ordinary_get_ptr(ptr);
+            let has_index = borrowed.props.keys().iter().any(|key| {
+                !Self::is_sym_key(key)
+                    && !Self::is_private_key(key)
+                    && crate::value::canonical_index(key).is_some()
+            });
+            if !ordinary || has_index {
+                return Err(self.make_error(
+                    "TypeError",
+                    "indexed-property target must be a fresh ordinary extensible object",
+                ));
+            }
+        }
+        self.gc_pin(&object);
+        object.borrow().ic_plain.set(false);
+        self.host_indexed
+            .insert(ptr, HostIndexedProperties { length, getter });
+        Ok(())
     }
 
     /// Mark a native function as a constructor and wire up its `prototype`/`constructor` link, so
@@ -4481,6 +4546,56 @@ impl Interp {
             && (self.typed_arrays.is_empty() || !self.typed_arrays.contains_key(&ptr))
             && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
             && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
+            && (self.host_indexed.is_empty() || !self.host_indexed.contains_key(&ptr))
+    }
+
+    /// Number of contiguous Web IDL supported property indices on `object`, if installed.
+    #[inline(always)]
+    pub(crate) fn host_indexed_len(&self, object: &Gc) -> Option<u32> {
+        if self.host_indexed.is_empty() {
+            return None;
+        }
+        self.host_indexed
+            .get(&(Rc::as_ptr(object) as usize))
+            .map(|properties| properties.length)
+    }
+
+    /// Whether `key` is one of Web IDL's array-index property names on an indexed host object.
+    /// This deliberately includes unsupported indices: read-only collections reject defining any
+    /// array-index property, not only the indices currently exposed by the getter.
+    #[inline(always)]
+    pub(crate) fn host_indexed_array_key(&self, object: &Gc, key: &str) -> bool {
+        !self.host_indexed.is_empty()
+            && self
+                .host_indexed
+                .contains_key(&(Rc::as_ptr(object) as usize))
+            && crate::value::canonical_index(key).is_some()
+    }
+
+    /// Run Web IDL's indexed property getter for a supported own index. `Ok(None)` means the key
+    /// is not a supported indexed own property (including an out-of-range array-index key).
+    pub(crate) fn host_indexed_own_value(
+        &mut self,
+        object: &Gc,
+        key: &str,
+    ) -> Result<Option<Value>, Abrupt> {
+        let Some(index) = crate::value::canonical_index(key) else {
+            return Ok(None);
+        };
+        let ptr = Rc::as_ptr(object) as usize;
+        let Some(properties) = self.host_indexed.get(&ptr) else {
+            return Ok(None);
+        };
+        if index >= properties.length {
+            return Ok(None);
+        }
+        let getter = properties.getter.clone();
+        self.call(
+            getter,
+            Value::Obj(object.clone()),
+            &[Value::Num(index as f64)],
+        )
+        .map(Some)
     }
 
     /// [[Get]](P, Receiver): like [`get_member`] but with an explicit `receiver` — the `this` a
@@ -4679,6 +4794,11 @@ impl Interp {
                         _ => {}
                     }
                 }
+                // Web IDL legacy platform object [[GetOwnProperty]]: a supported indexed
+                // property is a lazy, enumerable/configurable, read-only data property.
+                if let Some(value) = self.host_indexed_own_value(&o, key)? {
+                    return Ok(value);
+                }
                 self.get_from_chain(&o, key, &receiver)
             }
         }
@@ -4713,6 +4833,9 @@ impl Interp {
                 )?;
                 self.proxy_get_invariant(&target, key, &res)?;
                 return Ok(res);
+            }
+            if let Some(value) = self.host_indexed_own_value(&obj, key)? {
+                return Ok(value);
             }
             // Clone only the fields the branches read (value / accessor-get), not the whole
             // Property — data reads are the hot path and were paying for three Rc bumps.
@@ -5139,6 +5262,19 @@ impl Interp {
                     }
                 }
             }
+            // Web IDL legacy platform object [[Set]] first obtains the indexed own descriptor.
+            // A supported read-only index therefore runs its getter and then rejects the write.
+            if self.host_indexed_array_key(&o, key)
+                && self.host_indexed_own_value(&o, key)?.is_some()
+            {
+                if self.strict {
+                    return Err(self.throw(
+                        "TypeError",
+                        format!("cannot assign to read-only indexed property '{key}'"),
+                    ));
+                }
+                return Ok(false);
+            }
             let prop = o.borrow().props.get(key).cloned();
             if let Some(p) = prop {
                 if p.accessor() {
@@ -5223,6 +5359,18 @@ impl Interp {
             }
             _ => obj,
         };
+        // OrdinarySet ultimately creates an own property through the receiver's
+        // [[DefineOwnProperty]]. A read-only Web IDL collection rejects every array-index key,
+        // including currently unsupported indices.
+        if self.host_indexed_array_key(&obj, key) {
+            if self.strict {
+                return Err(self.throw(
+                    "TypeError",
+                    format!("cannot define indexed property '{key}'"),
+                ));
+            }
+            return Ok(false);
+        }
         let is_array = matches!(obj.borrow().exotic, Exotic::Array);
         if is_array {
             return self.array_set(&obj, key, value);
@@ -5763,6 +5911,9 @@ impl Interp {
             Self::push_value_object(target, refs);
             Self::push_value_object(handler, refs);
         }
+        if let Some(properties) = self.host_indexed.get(&ptr) {
+            Self::push_value_object(&properties.getter, refs);
+        }
         if let Some(promise) = self.promises.get(&ptr) {
             Self::push_value_object(&promise.value, refs);
             for (fulfilled, rejected, result, _) in &promise.reactions {
@@ -6301,6 +6452,7 @@ impl Interp {
                 self.data_views.remove(&ptr);
                 self.regexps.remove(&ptr);
                 self.proxies.remove(&ptr);
+                self.host_indexed.remove(&ptr);
                 self.promises.remove(&ptr);
                 self.temporal.remove(&ptr);
                 self.array_buffers.remove(&ptr);
@@ -9742,7 +9894,15 @@ impl Interp {
         result: &Value,
     ) -> Result<(), Abrupt> {
         let prop = match target {
-            Value::Obj(t) => t.borrow().props.get(key).cloned(),
+            Value::Obj(t) => {
+                let ordinary = t.borrow().props.get(key).cloned();
+                match ordinary {
+                    some @ Some(_) => some,
+                    None => self
+                        .host_indexed_own_value(t, key)?
+                        .map(|value| Property::data(value, false, true, true)),
+                }
+            }
             _ => None,
         };
         if let Some(p) = prop {
@@ -9773,7 +9933,15 @@ impl Interp {
         value: &Value,
     ) -> Result<(), Abrupt> {
         let prop = match target {
-            Value::Obj(t) => t.borrow().props.get(key).cloned(),
+            Value::Obj(t) => {
+                let ordinary = t.borrow().props.get(key).cloned();
+                match ordinary {
+                    some @ Some(_) => some,
+                    None => self
+                        .host_indexed_own_value(t, key)?
+                        .map(|indexed| Property::data(indexed, false, true, true)),
+                }
+            }
             _ => None,
         };
         if let Some(p) = prop {

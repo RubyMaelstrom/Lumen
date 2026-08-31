@@ -357,10 +357,7 @@ pub(crate) fn proxy_own_keys(
         // Invariants relative to the target's own keys / extensibility.
         if let Value::Obj(t) = target {
             let extensible = t.borrow().extensible;
-            let target_keys: Vec<(String, bool)> = t
-                .borrow()
-                .props
-                .keys()
+            let target_keys: Vec<(String, bool)> = ordinary_own_keys_ordered(i, t)
                 .into_iter()
                 .map(|k| {
                     let conf = t
@@ -368,8 +365,9 @@ pub(crate) fn proxy_own_keys(
                         .props
                         .get(&k)
                         .map(|p| p.configurable())
+                        // Web IDL indexed properties are configurable.
                         .unwrap_or(true);
-                    (k.to_string(), conf)
+                    (k, conf)
                 })
                 .collect();
             for (tk, conf) in &target_keys {
@@ -563,6 +561,10 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         return Ok(ok);
     }
     if let Value::Obj(o) = obj {
+        // Web IDL §3.9.5: legacy platform objects must remain extensible.
+        if i.host_indexed_len(o).is_some() {
+            return Ok(false);
+        }
         // TypedArray [[PreventExtensions]] refuses unless IsTypedArrayFixedLength: length-tracking
         // views, and any view over a resizable (non-shared) buffer, can change length.
         if let Some(info) = ta_info(i, o) {
@@ -698,6 +700,11 @@ pub(crate) fn has_own_property_trapped(
             Value::Undefined
         ));
     }
+    if let Value::Obj(o) = v {
+        if ab(i.host_indexed_own_value(o, key))?.is_some() {
+            return Ok(true);
+        }
+    }
     Ok(matches!(v, Value::Obj(o) if o.borrow().props.contains(key)))
 }
 
@@ -716,6 +723,12 @@ pub(crate) fn proxy_gopd_value(
             return proxy_gopd_value(i, &t2, &h2, key);
         }
         if let Value::Obj(t) = target {
+            if let Some(value) = ab(i.host_indexed_own_value(t, key))? {
+                return Ok(descriptor_from_prop(
+                    i,
+                    Property::data(value, false, true, true),
+                ));
+            }
             let prop = t.borrow().props.get(key).cloned();
             return Ok(prop
                 .map(|p| descriptor_from_prop(i, p))
@@ -733,10 +746,23 @@ pub(crate) fn proxy_gopd_value(
         .sym_from_key(key)
         .unwrap_or_else(|| Value::from_string(key.to_string()));
     let res = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
+    // Proxy [[GetOwnProperty]] always obtains the target's descriptor after the trap. For a Web
+    // IDL indexed property that step invokes the target's platform getter.
+    let host_target_prop = if let Value::Obj(target_object) = target {
+        ab(i.host_indexed_own_value(target_object, key))?
+            .map(|value| Property::data(value, false, true, true))
+    } else {
+        None
+    };
     if matches!(res, Value::Undefined) {
         // The trap may report a property absent only if the target permits it.
         if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).cloned();
+            let tprop = t
+                .borrow()
+                .props
+                .get(key)
+                .cloned()
+                .or_else(|| host_target_prop.clone());
             if let Some(p) = tprop {
                 if !p.configurable() {
                     return Err(i.make_error(
@@ -763,7 +789,7 @@ pub(crate) fn proxy_gopd_value(
     let pd = ab(build_partial(i, &res))?;
     // A descriptor may be reported for a property the target lacks only on an extensible target.
     if let Value::Obj(t) = target {
-        if !t.borrow().props.contains(key) && !t.borrow().extensible {
+        if !t.borrow().props.contains(key) && host_target_prop.is_none() && !t.borrow().extensible {
             return Err(i.make_error(
                 "TypeError",
                 "gOPD trap reported a property missing from a non-extensible target",
@@ -838,7 +864,12 @@ pub(crate) fn proxy_gopd_value(
     // A reported non-configurable descriptor must be backed by the target.
     if matches!(pd.configurable, Some(false)) {
         if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).cloned();
+            let tprop = t
+                .borrow()
+                .props
+                .get(key)
+                .cloned()
+                .or_else(|| host_target_prop.clone());
             match tprop {
                 None => {
                     return Err(i.make_error(
@@ -887,6 +918,9 @@ fn proxy_key_enumerable(
         // Absent gOPD trap over a proxy target: forward to the target's [[GetOwnProperty]].
         proxy_key_enumerable(i, &t2, &h2, key)
     } else if let Value::Obj(t) = target {
+        if ab(i.host_indexed_own_value(t, key))?.is_some() {
+            return Ok(true);
+        }
         Ok(t.borrow()
             .props
             .get(key)
@@ -954,7 +988,10 @@ fn proxy_define_property(
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
     if let Value::Obj(t) = target {
-        let tprop = t.borrow().props.get(key).cloned();
+        let host_property = i
+            .host_indexed_own_value(t, key)?
+            .map(|value| Property::data(value, false, true, true));
+        let tprop = t.borrow().props.get(key).cloned().or(host_property);
         let extensible = t.borrow().extensible;
         match tprop {
             None => {
@@ -1147,6 +1184,38 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
                 }
             }
         }
+    } else if let Some((object, length)) = o.as_obj().and_then(|object| {
+        i.host_indexed_len(object)
+            .map(|length| (object.clone(), length))
+    }) {
+        debug_assert_eq!(i.host_indexed_len(&object), Some(length));
+        let keys = ordinary_own_keys_ordered(i, &object);
+        for key in keys
+            .into_iter()
+            .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
+        {
+            // EnumerableOwnProperties snapshots [[OwnPropertyKeys]], then observes each current
+            // descriptor and performs a separate Get. An earlier indexed getter can therefore
+            // delete or change a later expando, but cannot add it to the snapshot.
+            let enumerable = if ab(i.host_indexed_own_value(&object, &key))?.is_some() {
+                true
+            } else {
+                object
+                    .borrow()
+                    .props
+                    .get(&key)
+                    .is_some_and(|property| property.enumerable())
+            };
+            if !enumerable {
+                continue;
+            }
+            let value = ab(i.get_member(o, &key))?;
+            out.push(if entries {
+                i.make_array(vec![Value::from_string(key), value])
+            } else {
+                value
+            });
+        }
     } else if let Some(info) = o.as_obj().and_then(|obj| ta_info(i, obj)) {
         // A TypedArray's enumerable own properties are its integer indices (plus any expandos).
         let n = i.ta_len(&info).unwrap_or(0);
@@ -1319,6 +1388,10 @@ fn reflect_ordinary_set(
             Value::Obj(o) => o.clone(),
             _ => return Ok(false),
         };
+        if i.host_indexed_array_key(&obj, key) && ab(i.host_indexed_own_value(&obj, key))?.is_some()
+        {
+            return Ok(false);
+        }
         let own = obj.borrow().props.get(key).cloned();
         match own {
             Some(p) if p.accessor() => {
@@ -1408,6 +1481,9 @@ pub(crate) fn reflect_define_on_receiver(
             };
         }
     }
+    if i.host_indexed_array_key(&ro, key) {
+        return Ok(false);
+    }
     // An Array receiver's `length` (and index writes) go through the exotic [[Set]] semantics
     // (double coercion, RangeError, truncation) rather than a raw property write.
     if matches!(ro.borrow().exotic, Exotic::Array) {
@@ -1473,6 +1549,9 @@ pub(crate) fn reflect_ordinary_get(
                 TaIndex::Ordinary => {}
             }
         }
+        if let Some(value) = ab(i.host_indexed_own_value(&obj, key))? {
+            return Ok(value);
+        }
         let own = obj.borrow().props.get(key).cloned();
         match own {
             Some(p) if p.accessor() => {
@@ -1504,6 +1583,14 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
         return Ok(());
     }
     if let Value::Obj(o) = holder {
+        if i.host_indexed_array_key(o, key) {
+            let supported = crate::value::canonical_index(key)
+                .is_some_and(|index| index < i.host_indexed_len(o).unwrap_or(0));
+            if supported {
+                return Err(i.make_error("TypeError", format!("Cannot delete property '{key}'")));
+            }
+            return Ok(());
+        }
         let present = o.borrow().props.contains(key);
         if !present {
             return Ok(());
@@ -1764,15 +1851,10 @@ fn object_define_properties(
         }
         ks
     } else {
-        props
-            .as_obj()
-            .unwrap()
-            .borrow()
-            .props
-            .ordered_keys()
-            .iter()
+        ordinary_own_keys_ordered(i, props.as_obj().unwrap())
+            .into_iter()
             .filter(|k| !Interp::is_private_key(k))
-            .map(|k| crate::value::PropertyKey::string(k.to_string()))
+            .map(crate::value::PropertyKey::string)
             .collect()
     };
     // Collect descriptor objects for enumerable own keys first (so all Gets precede any Defines).
@@ -1788,14 +1870,17 @@ fn object_define_properties(
                 _ => false,
             }
         } else {
-            props
-                .as_obj()
-                .unwrap()
-                .borrow()
-                .props
-                .get(&key)
-                .map(|p| p.enumerable())
-                .unwrap_or(false)
+            let object = props.as_obj().unwrap();
+            if ab(i.host_indexed_own_value(object, &key))?.is_some() {
+                true
+            } else {
+                object
+                    .borrow()
+                    .props
+                    .get(&key)
+                    .map(|p| p.enumerable())
+                    .unwrap_or(false)
+            }
         };
         if enumerable {
             let desc_obj = ab(i.get_member(&props, &key))?;
@@ -3372,20 +3457,22 @@ fn promise_keyed_combinator(
                 }
             } else if let Value::Obj(o) = &input {
                 // Enumerable own keys — strings AND symbols, in [[OwnPropertyKeys]] order.
-                let borrowed = o.borrow();
                 let mut strs: Vec<String> = Vec::new();
                 let mut syms: Vec<String> = Vec::new();
-                for k in borrowed.props.ordered_keys() {
-                    let Some(p) = borrowed.props.get(&k) else {
-                        continue;
-                    };
-                    if !p.enumerable() {
+                for k in ordinary_own_keys_ordered(i, o) {
+                    let indexed = ab(i.host_indexed_own_value(o, &k))?.is_some();
+                    let enumerable = indexed
+                        || o.borrow()
+                            .props
+                            .get(&k)
+                            .is_some_and(|property| property.enumerable());
+                    if !enumerable {
                         continue;
                     }
                     if Interp::is_sym_key(&k) {
-                        syms.push(k.to_string());
+                        syms.push(k);
                     } else {
-                        strs.push(k.to_string());
+                        strs.push(k);
                     }
                 }
                 out.extend(strs);
@@ -3611,6 +3698,9 @@ fn install_object(it: &mut Interp) {
                 crate::value::TaIndex::Ordinary => {}
             }
         }
+        if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
+            return Ok(Value::Bool(true));
+        }
         // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             let desc = proxy_gopd_value(i, &target, &handler, &key)?;
@@ -3755,6 +3845,9 @@ fn install_object(it: &mut Interp) {
                 }
             };
             return Ok(Value::Bool(e));
+        }
+        if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
+            return Ok(Value::Bool(true));
         }
         let e = o
             .borrow()
@@ -3903,6 +3996,30 @@ fn install_object(it: &mut Interp) {
             let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;
             return Ok(i.make_array(keys));
         }
+        if let Some(length) = i.host_indexed_len(&o) {
+            let own_keys = ordinary_own_keys_ordered(i, &o);
+            let mut keys = Vec::with_capacity(own_keys.len().max(length as usize));
+            // EnumerableOwnProperties asks [[GetOwnProperty]] for each key. For a Web IDL
+            // indexed property that operation invokes the platform getter even though
+            // Object.keys ultimately keeps only the key.
+            for key in own_keys
+                .into_iter()
+                .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
+            {
+                let enumerable = if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
+                    true
+                } else {
+                    o.borrow()
+                        .props
+                        .get(&key)
+                        .is_some_and(|property| property.enumerable())
+                };
+                if enumerable {
+                    keys.push(Value::from_string(key));
+                }
+            }
+            return Ok(i.make_array(keys));
+        }
         // A TypedArray's enumerable own keys are its integer indices plus string expandos.
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
@@ -3955,13 +4072,10 @@ fn install_object(it: &mut Interp) {
             return Ok(i.make_array(keys));
         }
         // Spec order: array-index keys ascending, then other string keys in insertion order.
-        let keys: Vec<Value> = o
-            .borrow()
-            .props
-            .ordered_keys()
+        let keys: Vec<Value> = ordinary_own_keys_ordered(i, &o)
             .into_iter()
-            .filter(|k| !Interp::is_sym_key(k) && !Interp::is_private_key(k))
-            .map(|k| Value::Str(k.into()))
+            .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
+            .map(Value::from_string)
             .collect();
         Ok(i.make_array(keys))
     });
@@ -4108,6 +4222,12 @@ fn install_object(it: &mut Interp) {
                 });
             }
         }
+        if let Some(value) = ab(i.host_indexed_own_value(&o, &key))? {
+            return Ok(descriptor_from_prop(
+                i,
+                Property::data(value, false, true, true),
+            ));
+        }
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             return proxy_gopd_value(i, &target, &handler, &key);
         }
@@ -4142,17 +4262,21 @@ fn install_object(it: &mut Interp) {
             }
             return Ok(Value::Obj(result));
         }
-        for key in o.borrow().props.ordered_keys() {
+        let keys = ordinary_own_keys_ordered(i, &o);
+        for key in keys {
             if Interp::is_private_key(&key) {
                 continue;
             }
-            let prop = o.borrow().props.get(&key).cloned();
+            let prop = match ab(i.host_indexed_own_value(&o, &key))? {
+                Some(value) => Some(Property::data(value, false, true, true)),
+                None => o.borrow().props.get(&key).cloned(),
+            };
             if let Some(p) = prop {
                 let d = descriptor_from_prop(i, p);
                 result
                     .borrow_mut()
                     .props
-                    .insert(key.as_ref(), Property::plain(d));
+                    .insert(key.as_str(), Property::plain(d));
             }
         }
         Ok(Value::Obj(result))
@@ -4201,17 +4325,23 @@ fn install_object(it: &mut Interp) {
                 continue;
             }
             let o = from.as_obj().unwrap();
-            let keys: Vec<Rc<str>> = {
-                let b = o.borrow();
-                b.props
-                    .ordered_keys()
-                    .into_iter()
-                    .filter(|k| b.props.get(k).map(|p| p.enumerable()).unwrap_or(false))
-                    .collect()
-            };
+            let keys = ordinary_own_keys_ordered(i, o);
             for k in keys {
-                let v = ab(i.get_member(&from, &k))?;
-                assign_set(i, &to_val, &k, v)?;
+                if Interp::is_private_key(&k) {
+                    continue;
+                }
+                let enumerable = if ab(i.host_indexed_own_value(o, &k))?.is_some() {
+                    true
+                } else {
+                    o.borrow()
+                        .props
+                        .get(&k)
+                        .is_some_and(|property| property.enumerable())
+                };
+                if enumerable {
+                    let v = ab(i.get_member(&from, &k))?;
+                    assign_set(i, &to_val, &k, v)?;
+                }
             }
         }
         Ok(to_val)
@@ -4305,6 +4435,9 @@ pub(crate) fn nf_object_has_own(
         _ => return Err(i.make_error("TypeError", "Object.hasOwn called on non-object")),
     };
     let key = ab(i.to_property_key(&arg(args, 1)))?;
+    if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
+        return Ok(Value::Bool(true));
+    }
     let has = o.borrow().props.contains(&key);
     Ok(Value::Bool(has))
 }
@@ -4608,6 +4741,11 @@ fn define_own_property_ordinary(
             crate::value::TaIndex::Exotic => return Ok(false),
             crate::value::TaIndex::Ordinary => {}
         }
+    }
+    // Web IDL legacy platform object [[DefineOwnProperty]] rejects every array-index key when
+    // the interface has an indexed getter but no indexed setter, supported or not.
+    if i.host_indexed_array_key(o, key) {
+        return Ok(false);
     }
     let is_array = matches!(o.borrow().exotic, crate::value::Exotic::Array);
     // Array exotic [[DefineOwnProperty]]: `length` and array indices have special rules.
@@ -7982,10 +8120,17 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                     }
                 }
             } else {
-                input
-                    .as_obj()
-                    .and_then(|o| o.borrow().props.get(&k).map(|p| p.enumerable()))
-                    .unwrap_or(false)
+                let object = input.as_obj().unwrap();
+                if ab(i.host_indexed_own_value(object, &k))?.is_some() {
+                    true
+                } else {
+                    object
+                        .borrow()
+                        .props
+                        .get(&k)
+                        .map(|property| property.enumerable())
+                        .unwrap_or(false)
+                }
             };
             if !enumerable {
                 continue;
@@ -8138,9 +8283,12 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
 
 /// OrdinaryOwnPropertyKeys as internal key strings: array indices ascending, then other string
 /// keys in insertion order, then symbol keys in insertion order.
-fn ordinary_own_keys_ordered(_i: &Interp, o: &Gc) -> Vec<String> {
+fn ordinary_own_keys_ordered(i: &Interp, o: &Gc) -> Vec<String> {
     let all = o.borrow().props.ordered_keys();
-    let mut indices: Vec<u32> = Vec::new();
+    let mut indices: Vec<u32> = i
+        .host_indexed_len(o)
+        .map(|length| (0..length).collect())
+        .unwrap_or_default();
     let mut strings: Vec<String> = Vec::new();
     let mut symbols: Vec<String> = Vec::new();
     for k in all {
@@ -8157,6 +8305,7 @@ fn ordinary_own_keys_ordered(_i: &Interp, o: &Gc) -> Vec<String> {
         }
     }
     indices.sort_unstable();
+    indices.dedup();
     let mut out: Vec<String> = indices.into_iter().map(|n| n.to_string()).collect();
     out.extend(strings);
     out.extend(symbols);

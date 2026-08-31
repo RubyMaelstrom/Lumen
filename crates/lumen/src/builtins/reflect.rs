@@ -123,6 +123,12 @@ pub(super) fn install_reflect(it: &mut Interp) {
                 });
             }
         }
+        if let Some(value) = ab(i.host_indexed_own_value(&o, &key))? {
+            return Ok(descriptor_from_prop(
+                i,
+                Property::data(value, false, true, true),
+            ));
+        }
         // A proxy's [[GetOwnProperty]] goes through its getOwnPropertyDescriptor trap.
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             return proxy_gopd_value(i, &target, &handler, &key);
@@ -152,6 +158,11 @@ pub(super) fn install_reflect(it: &mut Interp) {
                     crate::value::TaIndex::Exotic => return Ok(Value::Bool(true)),
                     crate::value::TaIndex::Ordinary => {}
                 }
+            }
+            if i.host_indexed_array_key(&o, &key) {
+                let supported = crate::value::canonical_index(&key)
+                    .is_some_and(|index| index < i.host_indexed_len(&o).unwrap_or(0));
+                return Ok(Value::Bool(!supported));
             }
             let configurable = o
                 .borrow()
@@ -187,14 +198,14 @@ pub(super) fn install_reflect(it: &mut Interp) {
         };
         // Spec [[OwnPropertyKeys]] order: array-index keys ascending, then string keys (insertion
         // order), then symbol keys (insertion order) — exactly what `ordered_keys` produces.
-        let ordered = o.borrow().props.ordered_keys();
+        let ordered = ordinary_own_keys_ordered(i, &o);
         for k in ordered {
             if Interp::is_sym_key(&k) {
                 if let Some(s) = i.sym_from_key(&k) {
                     out.push(s);
                 }
             } else {
-                out.push(Value::Str(k.into()));
+                out.push(Value::from_string(k));
             }
         }
         Ok(i.make_array(out))

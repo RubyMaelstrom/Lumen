@@ -112,6 +112,207 @@ fn host_reentrant_classic_scripts_use_script_evaluation_not_eval() {
     assert_eq!(run_in(&mut engine, "readHostClassicLexical()"), "41");
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_readonly_indexed_properties_follow_web_idl_internal_methods() {
+    let mut engine = Engine::new();
+    let getter = engine
+        .eval_value(
+            "globalThis.indexedGetterCalls = 0;\
+             (function(index) { indexedGetterCalls++; return index + 10; })",
+        )
+        .expect("getter parses")
+        .unwrap_or_else(|_| panic!("getter evaluates"));
+    let target = Value::Obj(engine.ctx().new_object());
+    engine
+        .ctx()
+        .install_readonly_indexed_properties(&target, 3, getter)
+        .unwrap_or_else(|_| panic!("fresh ordinary host object accepts indexed properties"));
+    let global = engine.ctx().global_this();
+    engine
+        .ctx()
+        .member_set(&global, "indexedList", target.clone())
+        .unwrap_or_else(|_| panic!("publish indexed host object"));
+
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             let descriptor = Object.getOwnPropertyDescriptor(indexedList, '1');\
+             [indexedList[0], indexedList[3] === undefined,\
+              1 in indexedList, 3 in indexedList,\
+              Object.hasOwn(indexedList, '2'),\
+              indexedList.propertyIsEnumerable('2'),\
+              descriptor.value, descriptor.writable, descriptor.enumerable,\
+              descriptor.configurable, indexedGetterCalls].join('|')"
+        ),
+        "10|true|true|false|true|true|11|false|true|true|5"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedList.extra = 7; indexedGetterCalls = 0;\
+             let own = Reflect.ownKeys(indexedList).join(',');\
+             let names = Object.getOwnPropertyNames(indexedList).join(',');\
+             let keys = Object.keys(indexedList).join(',');\
+             [own, names, keys, indexedGetterCalls].join('|')"
+        ),
+        "0,1,2,extra|0,1,2,extra|0,1,2,extra|3"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             let values = Object.values(indexedList).join(',');\
+             [values, indexedGetterCalls].join('|')"
+        ),
+        "10,11,12,7|6"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             let indexedJson = JSON.stringify(indexedList);\
+             [indexedJson, indexedGetterCalls].join('|')"
+        ),
+        "{\"0\":10,\"1\":11,\"2\":12,\"extra\":7}|6"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             let indexedSpread = {...indexedList};\
+             [Object.keys(indexedSpread).join(','), Object.values(indexedSpread).join(','),\
+              indexedGetterCalls].join('|')"
+        ),
+        "0,1,2,extra|10,11,12,7|6"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             let indexedAssigned = Object.assign({}, indexedList);\
+             [Object.keys(indexedAssigned).join(','), Object.values(indexedAssigned).join(','),\
+              indexedGetterCalls].join('|')"
+        ),
+        "0,1,2,extra|10,11,12,7|6"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             indexedList[0] = 99; let value = indexedList[0];\
+             let setSupported = Reflect.set(indexedList, '1', 99);\
+             let setUnsupported = Reflect.set(indexedList, '9', 99);\
+             let defineSupported = Reflect.defineProperty(indexedList, '2', {value: 99});\
+             let defineUnsupported = Reflect.defineProperty(indexedList, '8', {value: 99});\
+             let deleteSupported = Reflect.deleteProperty(indexedList, '2');\
+             let deleteUnsupported = Reflect.deleteProperty(indexedList, '8');\
+             [value, setSupported, setUnsupported, defineSupported, defineUnsupported,\
+              deleteSupported, deleteUnsupported, Reflect.preventExtensions(indexedList),\
+              Object.isExtensible(indexedList), indexedGetterCalls].join('|')"
+        ),
+        "10|false|false|false|false|false|true|false|true|3"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             let supported, unsupported, prevented;\
+             try { (function(){ 'use strict'; indexedList[0] = 1; })(); }\
+             catch (error) { supported = error.name; }\
+             try { (function(){ 'use strict'; indexedList[9] = 1; })(); }\
+             catch (error) { unsupported = error.name; }\
+             try { Object.preventExtensions(indexedList); }\
+             catch (error) { prevented = error.name; }\
+             [supported, unsupported, prevented, indexedGetterCalls].join('|')"
+        ),
+        "TypeError|TypeError|TypeError|1"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "indexedGetterCalls = 0;\
+             let proxy = new Proxy(indexedList, {});\
+             let proxyValue = proxy[1];\
+             let proxyKeys = Object.keys(proxy).join(',');\
+             let proxyDescriptor = Reflect.getOwnPropertyDescriptor(proxy, '2');\
+             [proxyValue, proxyKeys, proxyDescriptor.value, indexedGetterCalls].join('|')"
+        ),
+        "11|0,1,2,extra|12|5"
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_indexed_property_side_table_does_not_pin_dead_objects() {
+    let mut engine = Engine::new();
+    let getter = engine
+        .eval_value("index => index")
+        .expect("getter parses")
+        .unwrap_or_else(|_| panic!("getter evaluates"));
+    let target = Value::Obj(engine.ctx().new_object());
+    let pointer = target
+        .as_obj()
+        .map(|object| std::rc::Rc::as_ptr(object) as usize)
+        .expect("target is an object");
+    engine
+        .ctx()
+        .install_readonly_indexed_properties(&target, 2, getter)
+        .unwrap_or_else(|_| panic!("indexed properties install"));
+    let global = engine.ctx().global_this();
+    engine
+        .ctx()
+        .member_set(&global, "temporaryIndexedObject", target.clone())
+        .unwrap_or_else(|_| panic!("temporary object is published"));
+    assert!(engine.ctx().host_indexed.contains_key(&pointer));
+
+    engine
+        .ctx()
+        .member_set(&global, "temporaryIndexedObject", Value::Undefined)
+        .unwrap_or_else(|_| panic!("temporary object is released"));
+    drop(target);
+    engine.ctx().collect_garbage_for_host();
+
+    assert!(!engine.ctx().host_indexed.contains_key(&pointer));
+    assert!(!engine.ctx().gc_pins.contains_key(&pointer));
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_indexed_enumeration_snapshots_keys_before_running_getters() {
+    let mut engine = Engine::new();
+    let getter = engine
+        .eval_value(
+            "(function(index) { delete this.extra; this.addedByGetter = 1; return index + 20; })",
+        )
+        .expect("getter parses")
+        .unwrap_or_else(|_| panic!("getter evaluates"));
+    let target = Value::Obj(engine.ctx().new_object());
+    engine
+        .ctx()
+        .member_set(&target, "extra", Value::Num(7.0))
+        .unwrap_or_else(|_| panic!("named expando installs"));
+    engine
+        .ctx()
+        .install_readonly_indexed_properties(&target, 1, getter)
+        .unwrap_or_else(|_| panic!("indexed properties install"));
+    let global = engine.ctx().global_this();
+    engine
+        .ctx()
+        .member_set(&global, "mutatingIndexedList", target)
+        .unwrap_or_else(|_| panic!("mutating object is published"));
+
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "[Object.keys(mutatingIndexedList).join(','),\
+              Object.hasOwn(mutatingIndexedList, 'addedByGetter')].join('|')"
+        ),
+        "0|true"
+    );
+}
+
 #[test]
 fn control_flow() {
     assert_eq!(

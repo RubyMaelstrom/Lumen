@@ -406,7 +406,27 @@ fn json_str(
                             _ => None,
                         })
                         .collect(),
-                    None => ordered_enum_keys(o).iter().map(|k| k.to_string()).collect(),
+                    None => {
+                        let mut keys = Vec::new();
+                        let own_keys = ordinary_own_keys_ordered(i, o);
+                        for key in own_keys
+                            .into_iter()
+                            .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
+                        {
+                            let enumerable = if ab(i.host_indexed_own_value(o, &key))?.is_some() {
+                                true
+                            } else {
+                                o.borrow()
+                                    .props
+                                    .get(&key)
+                                    .is_some_and(|property| property.enumerable())
+                            };
+                            if enumerable {
+                                keys.push(key);
+                            }
+                        }
+                        keys
+                    }
                 };
                 let mut parts = Vec::new();
                 for k in &keys {
