@@ -1651,8 +1651,7 @@ impl Drop for Interp {
         }
         // Do not let a driver thread retain this Agent's weak object/scope registries after its
         // interpreter dies. Objects already carry their own owner through the ensuing field drops.
-        crate::value::deactivate_gc_heap_if(&self.gc_heap);
-        crate::value::deactivate_symbol_agent_if(&self.symbol_agent);
+        crate::value::deactivate_agent_if(&self.gc_heap, &self.symbol_agent);
     }
 }
 
@@ -1734,16 +1733,29 @@ const EXECUTION_STACK_RED_ZONE: usize = 1024 * 1024;
 const EXECUTION_STACK_SEGMENT: usize = 8 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 // A bytecode execution context can carry substantially more native machinery than a small
-// arithmetic recursion frame (accessors and host-native calls are common examples). Start the
-// cheap headroom checks before eight such contexts can consume the red zone; once this threshold
-// is crossed every call checks and `stacker` switches segments only when actually necessary.
-const FIRST_DEEP_STACK_CHECK: u32 = 8;
+// arithmetic recursion frame (accessors and host-native calls are common examples). Checking at
+// entry and then every eight contexts leaves the 1 MiB red zone enough room for the measured
+// 96 KiB large-frame stress case while removing a platform/TLS stack query from ordinary calls.
+// `stacker` still switches segments whenever a checkpoint finds insufficient headroom.
+const EXECUTION_STACK_CHECK_MASK: u32 = 7;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static EXECUTION_STACK_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn execution_stack_checks() -> u64 {
+    EXECUTION_STACK_CHECKS.with(std::cell::Cell::get)
+}
 
 #[inline]
 pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if depth == 1 || depth >= FIRST_DEEP_STACK_CHECK {
+        if depth == 1 || depth & EXECUTION_STACK_CHECK_MASK == 0 {
+            #[cfg(test)]
+            EXECUTION_STACK_CHECKS.with(|checks| checks.set(checks.get().wrapping_add(1)));
             return stacker::maybe_grow(EXECUTION_STACK_RED_ZONE, EXECUTION_STACK_SEGMENT, f);
         }
     }
@@ -2187,8 +2199,7 @@ impl Interp {
     /// Symbols to retain Agent-wide identity.
     pub(crate) fn new_with_symbol_agent(symbol_agent: crate::value::SymbolAgent) -> Interp {
         let gc_heap = crate::value::new_gc_heap();
-        crate::value::activate_gc_heap(&gc_heap);
-        crate::value::activate_symbol_agent(&symbol_agent);
+        crate::value::activate_agent(&gc_heap, &symbol_agent);
         let object_proto = Object::new(None);
         let function_proto = Object::new(Some(object_proto.clone()));
         let array_proto = Object::new(Some(object_proto.clone()));
@@ -2370,8 +2381,14 @@ impl Interp {
     /// worker, while embedders may alternate independent engines on one driver thread.
     #[inline]
     pub(crate) fn activate_gc_heap(&self) {
-        crate::value::activate_gc_heap(&self.gc_heap);
-        crate::value::activate_symbol_agent(&self.symbol_agent);
+        crate::value::activate_agent(&self.gc_heap, &self.symbol_agent);
+    }
+
+    /// Temporarily make this interpreter's heap and Symbol state current, restoring the
+    /// surrounding Agent when the returned guard leaves scope.
+    #[inline]
+    pub(crate) fn enter_agent(&self) -> crate::value::AgentActivationGuard {
+        crate::value::enter_agent(&self.gc_heap, &self.symbol_agent)
     }
 
     // ----- error helpers ----------------------------------------------------------------------
@@ -6352,7 +6369,6 @@ impl Interp {
     // ----- calling ----------------------------------------------------------------------------
 
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
-        self.activate_gc_heap();
         self.depth += 1;
         #[cfg(target_arch = "wasm32")]
         if self.depth > WASM_EXECUTION_DEPTH_GUARD {
@@ -6607,28 +6623,37 @@ impl Interp {
                 // while any of its sub-realm's objects — including this wrapper — exist, and it
                 // is suspended (not mutably borrowed) whenever sub-realm code runs.
                 let host: &mut Interp = unsafe { &mut *(parent as *mut Interp) };
-                let mut out_args = Vec::with_capacity(args.len());
                 for a in args {
-                    if a.is_callable() {
-                        match host.make_wrapped_shadow(realm, a.clone()) {
-                            Ok(w) => out_args.push(w),
-                            Err(_) => {
-                                return Err(self.throw(
-                                    "TypeError",
-                                    "cannot wrap the callable argument for the host realm",
-                                ))
-                            }
-                        }
-                    } else if matches!(a, Value::Obj(_)) {
+                    if matches!(a, Value::Obj(_)) && !a.is_callable() {
                         return Err(self.throw(
                             "TypeError",
                             "wrapped function arguments must be primitives or callables",
                         ));
-                    } else {
-                        out_args.push(a.clone());
                     }
                 }
-                match host.call(*target, Value::Undefined, &out_args) {
+                let host_result = (|| -> Result<Result<Value, Abrupt>, ()> {
+                    let _agent = host.enter_agent();
+                    let mut out_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        if a.is_callable() {
+                            out_args
+                                .push(host.make_wrapped_shadow(realm, a.clone()).map_err(|_| ())?);
+                        } else {
+                            out_args.push(a.clone());
+                        }
+                    }
+                    Ok(host.call(*target, Value::Undefined, &out_args))
+                })();
+                let host_result = match host_result {
+                    Ok(result) => result,
+                    Err(()) => {
+                        return Err(self.throw(
+                            "TypeError",
+                            "cannot wrap the callable argument for the host realm",
+                        ))
+                    }
+                };
+                match host_result {
                     Ok(v) if !matches!(v, Value::Obj(_)) => Ok(v),
                     Ok(v) if v.is_callable() => Ok(self.make_wrapped_cross(realm, parent, v)),
                     Ok(_) => {
@@ -6757,14 +6782,20 @@ impl Interp {
         };
         let (length_r, name_r) = match self.shadow_realms.remove(&realm) {
             Some(mut sub) => {
-                // HasOwnProperty first (its [[GetOwnProperty]] trap is observable and may throw).
-                let l = match crate::builtins::has_own_property_trapped(&mut sub, &target, "length")
-                {
-                    Ok(true) => sub.get_member(&target, "length"),
-                    Ok(false) => Ok(Value::Num(0.0)),
-                    Err(e) => Err(Abrupt::Throw(e)),
+                let (l, n) = {
+                    let _agent = sub.enter_agent();
+                    // HasOwnProperty first (its [[GetOwnProperty]] trap is observable and may
+                    // throw), and both Gets allocate in the target realm when user code runs.
+                    let l = match crate::builtins::has_own_property_trapped(
+                        &mut sub, &target, "length",
+                    ) {
+                        Ok(true) => sub.get_member(&target, "length"),
+                        Ok(false) => Ok(Value::Num(0.0)),
+                        Err(e) => Err(Abrupt::Throw(e)),
+                    };
+                    let n = sub.get_member(&target, "name");
+                    (l, n)
                 };
-                let n = sub.get_member(&target, "name");
                 self.shadow_realms.insert(realm, sub);
                 (l, n)
             }
@@ -6815,22 +6846,26 @@ impl Interp {
         // SAFETY: pinned Box target; any aliasing re-entry is sequenced by the JS call stack.
         let sub: &mut Interp = unsafe { &mut *subptr };
         let parent_ptr = self as *mut Interp as usize;
-        // Primitive arguments cross directly; callables wrap as sub-realm functions that
-        // re-enter this realm; other objects throw.
-        let mut inner_args = Vec::with_capacity(args.len());
         for a in args {
-            if a.is_callable() {
-                inner_args.push(sub.make_wrapped_cross(realm, parent_ptr, a.clone()));
-            } else if matches!(a, Value::Obj(_)) {
+            if matches!(a, Value::Obj(_)) && !a.is_callable() {
                 return Err(self.throw(
                     "TypeError",
                     "ShadowRealm wrapped function: arguments must be primitives or callables",
                 ));
-            } else {
-                inner_args.push(a.clone());
             }
         }
+        // Primitive arguments cross directly; callables wrap as sub-realm functions that
+        // re-enter this realm; other objects throw.
         let result = {
+            let _agent = sub.enter_agent();
+            let mut inner_args = Vec::with_capacity(args.len());
+            for a in args {
+                if a.is_callable() {
+                    inner_args.push(sub.make_wrapped_cross(realm, parent_ptr, a.clone()));
+                } else {
+                    inner_args.push(a.clone());
+                }
+            }
             let r = sub.call(target, Value::Undefined, &inner_args);
             sub.drain_microtasks();
             r

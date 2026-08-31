@@ -1089,10 +1089,8 @@ pub(super) fn re_sym_split_discard_fast(
     let text = i.re_text(search_re.unicode, input);
     let size = text.unit_index(text.len());
     if size == 0 {
-        let found = match regexp_match_result(
-            i,
-            search_re.find_text_shared(&text, 0, &i.runtime_interrupt),
-        ) {
+        let matched = regexp_find_text_shared(i, &search_re, &text, 0);
+        let found = match regexp_match_result(i, matched) {
             Ok(found) => found,
             Err(error) => return Some(Err(error)),
         };
@@ -1106,11 +1104,12 @@ pub(super) fn re_sym_split_discard_fast(
     let mut p = 0usize;
     let mut q = 0usize;
     while q < size {
+        if let Err(error) = regexp_interrupt_tick(i) {
+            return Some(Err(regexp_match_error_value(i, error)));
+        }
         let search_start = text.elem_at_unit(q);
-        let found = match regexp_match_result(
-            i,
-            search_re.find_text_shared(&text, search_start, &i.runtime_interrupt),
-        ) {
+        let matched = regexp_find_text_shared(i, &search_re, &text, search_start);
+        let found = match regexp_match_result(i, matched) {
             Ok(found) => found,
             Err(error) => return Some(Err(error)),
         };

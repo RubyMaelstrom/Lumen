@@ -1025,7 +1025,21 @@ impl Regex {
     }
 
     /// Match a prepared subject and return shared capture spans.
+    #[cfg(test)]
     pub fn exec_text_shared(
+        &self,
+        text: &ReText,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<Captures> {
+        poll_interrupt(control)?;
+        self.exec_text_shared_entry_polled(text, start, control)
+    }
+
+    /// Match after the surrounding execution entry has already force-polled host interruption.
+    /// Long scans and backtracking still poll internally; browser/native call sites use this to
+    /// avoid a duplicate atomic read for every tiny match.
+    pub(crate) fn exec_text_shared_entry_polled(
         &self,
         text: &ReText,
         start: usize,
@@ -1046,26 +1060,25 @@ impl Regex {
         }
     }
 
-    /// Match for a caller that only observes matcher side effects.
-    pub fn exec_text_discard_shared(
+    pub(crate) fn exec_text_discard_shared_entry_polled(
         &self,
         text: &ReText,
         start: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<Captures> {
-        self.exec_text_shared(text, start, control)
+        self.exec_text_shared_entry_polled(text, start, control)
     }
 
     /// Whole-match-only search for operations whose JavaScript result is dead. Capture groups
     /// can be recovered lazily if a legacy RegExp static is subsequently observed.
-    pub(crate) fn find_text_shared(
+    pub(crate) fn find_text_shared_entry_polled(
         &self,
         text: &ReText,
         start: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<(usize, usize)> {
         Ok(self
-            .exec_text_shared(text, start, control)?
+            .exec_text_shared_entry_polled(text, start, control)?
             .and_then(|captures| captures[0]))
     }
 
@@ -1078,7 +1091,6 @@ impl Regex {
         if start > input.len() {
             return Ok(None);
         }
-        poll_interrupt(control)?;
         // One matcher for the whole scan, its working buffers recycled across `exec` calls via a
         // thread-local (the engine is single-threaded per Interp).
         let mut scratch = MATCH_SCRATCH
@@ -2697,7 +2709,6 @@ fn find_ascii_literal(
     if start > subject.len() || literal.len() > subject.len().saturating_sub(start) {
         return Ok(None);
     }
-    poll_interrupt(control)?;
     if sticky {
         return Ok(subject[start..]
             .starts_with(literal)

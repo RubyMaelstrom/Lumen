@@ -178,6 +178,38 @@ fn regexp_resource_exhaustion_throws_instead_of_becoming_no_match() {
 }
 
 #[test]
+fn repeated_short_regexp_matches_amortize_but_do_not_starve_host_interruption() {
+    // A native RegExp operation is force-polled by dispatch before it starts. Model cancellation
+    // arriving immediately afterwards: a Rust loop of individually tiny successful matches must
+    // observe it through the shared execution cadence instead of doing an atomic read per match
+    // or postponing cancellation until the whole native operation returns.
+    let control = std::sync::Arc::new(crate::RuntimeInterrupt::default());
+    let mut engine = Engine::new();
+    engine.set_interrupt_handle(control.clone());
+    assert!(
+        engine.interp.interrupt_poll_force().is_ok(),
+        "native entry starts uninterrupted"
+    );
+    control.cancel();
+
+    let mut observed_at = None;
+    for invocation in 1..=0x4000 {
+        match crate::builtins::regexp_interrupt_tick(&mut engine.interp) {
+            Err(crate::regex::MatchError::Interrupted(crate::InterruptReason::Cancelled)) => {
+                observed_at = Some(invocation);
+                break;
+            }
+            Ok(()) => {}
+            other => panic!("unexpected polling result before cancellation: {other:?}"),
+        }
+    }
+    assert!(
+        observed_at.is_some(),
+        "amortized short matches must reach an interruption checkpoint"
+    );
+}
+
+#[test]
 fn syntax_error_is_parse_phase() {
     assert!(Engine::new().eval("function (", false).is_err());
     assert!(Engine::new().eval("1 +", false).is_err());
@@ -724,6 +756,176 @@ fn symbol_registry_is_agent_owned_and_shared_by_realms() {
             .expect("ShadowRealm symbol checks parse"),
         Completion::Value(ref value) if value == "true,true"
     ));
+}
+
+#[test]
+fn nested_calls_keep_the_surrounding_agent_activation_on_the_fast_path() {
+    // ECMA-262 §9.6: while one Agent's executing thread is performing algorithmic steps, that
+    // Agent remains the surrounding Agent. Nested execution contexts therefore must not reinstall
+    // the same heap and Symbol Agent on every ordinary call.
+    let mut first = Engine::new();
+    let mut second = Engine::new();
+    let before = crate::value::active_agent_slow_switches();
+    assert!(matches!(
+        first
+            .eval(
+                "function nested(n){ return n ? nested(n-1) + 1 : 0 } nested(256)",
+                false,
+            )
+            .expect("first Agent recursion parses"),
+        Completion::Value(ref value) if value == "256"
+    ));
+    let after_first = crate::value::active_agent_slow_switches();
+    assert_eq!(
+        after_first - before,
+        1,
+        "one real switch into the first Agent"
+    );
+
+    assert!(matches!(
+        second
+            .eval(
+                "function nested(n){ return n ? nested(n-1) + 1 : 0 } nested(256)",
+                false,
+            )
+            .expect("second Agent recursion parses"),
+        Completion::Value(ref value) if value == "256"
+    ));
+    assert_eq!(
+        crate::value::active_agent_slow_switches() - after_first,
+        1,
+        "one real switch into the second Agent"
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn host_call_entry_activates_the_receiving_engine_agent() {
+    use std::rc::Rc;
+
+    fn make_object(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
+        Ok(Value::Obj(ctx.new_object()))
+    }
+
+    // A driver may alternate independent Engines on one native thread. ECMA-262 §9.6 makes the
+    // receiving Engine's Agent surrounding before its host task calls into ECMAScript; ordinary
+    // nested calls then remain on that Agent without repeating the transition.
+    let mut first = Engine::new();
+    first.define_global("makeAgentObject", 0, make_object);
+    let first_fn = first
+        .eval_value("makeAgentObject")
+        .expect("first function parses")
+        .unwrap_or_else(|_| panic!("first function evaluates"));
+
+    let mut second = Engine::new();
+    second.define_global("makeAgentObject", 0, make_object);
+    let second_fn = second
+        .eval_value("makeAgentObject")
+        .expect("second function parses")
+        .unwrap_or_else(|_| panic!("second function evaluates"));
+
+    let first_object = match first
+        .call_function(&first_fn, Value::Undefined, &[])
+        .unwrap_or_else(|_| panic!("first host call succeeds"))
+    {
+        Value::Obj(object) => object,
+        _ => panic!("first host call returned an object"),
+    };
+    let second_object = match second
+        .call_function(&second_fn, Value::Undefined, &[])
+        .unwrap_or_else(|_| panic!("second host call succeeds"))
+    {
+        Value::Obj(object) => object,
+        _ => panic!("second host call returned an object"),
+    };
+
+    let first_snapshot = crate::value::heap_gc_snapshot(&first.interp.gc_heap);
+    let second_snapshot = crate::value::heap_gc_snapshot(&second.interp.gc_heap);
+    assert!(first_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &first_object)));
+    assert!(!second_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &first_object)));
+    assert!(second_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &second_object)));
+    assert!(!first_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &second_object)));
+}
+
+#[test]
+fn shadow_realm_heap_transitions_restore_the_caller_heap() {
+    use std::rc::Rc;
+
+    let mut engine = Engine::new();
+    let _ = engine
+        .eval(
+            "globalThis.savedShadow = new ShadowRealm();
+             savedShadow.evaluate('globalThis.childMarker = {}; 0');
+             globalThis.parentMarker = {};",
+            false,
+        )
+        .expect("ShadowRealm ownership probe parses");
+
+    let shadow = match engine
+        .interp
+        .global
+        .borrow()
+        .props
+        .get("savedShadow")
+        .map(|property| property.value())
+    {
+        Some(crate::value::Value::Obj(object)) => object,
+        _ => panic!("ShadowRealm object was retained"),
+    };
+    let parent_object = match engine
+        .interp
+        .global
+        .borrow()
+        .props
+        .get("parentMarker")
+        .map(|property| property.value())
+    {
+        Some(crate::value::Value::Obj(object)) => object,
+        _ => panic!("parent marker was retained"),
+    };
+    let shadow_key = Rc::as_ptr(&shadow) as usize;
+    let child = engine
+        .interp
+        .shadow_realms
+        .get(&shadow_key)
+        .unwrap_or_else(|| panic!("ShadowRealm implementation remains available"));
+    let child_object = match child
+        .global
+        .borrow()
+        .props
+        .get("childMarker")
+        .map(|property| property.value())
+    {
+        Some(crate::value::Value::Obj(object)) => object,
+        _ => panic!("child marker was retained"),
+    };
+
+    let parent_snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+    let child_snapshot = crate::value::heap_gc_snapshot(&child.gc_heap);
+    assert!(parent_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &parent_object)));
+    assert!(!child_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &parent_object)));
+    assert!(child_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &child_object)));
+    assert!(!parent_snapshot
+        .iter()
+        .any(|object| Rc::ptr_eq(object, &child_object)));
 }
 
 #[test]
@@ -2390,6 +2592,17 @@ fn execution_stack_growth_checks_before_large_native_frames_exhaust_small_host_s
         .join()
         .expect("early stack-growth test completes");
     assert_eq!(depth, 24);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn execution_stack_headroom_queries_are_amortized() {
+    let before = crate::interpreter::execution_stack_checks();
+    for depth in 1..=1_024 {
+        crate::interpreter::with_execution_stack(depth, || ());
+    }
+    let checks = crate::interpreter::execution_stack_checks() - before;
+    assert_eq!(checks, 129, "entry plus one check per eight contexts");
 }
 
 fn assert_deep_execution_contexts(tier: crate::bytecode::Tier) {

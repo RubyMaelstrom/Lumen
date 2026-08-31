@@ -1005,6 +1005,14 @@ thread_local! {
     /// because Lumen currently isolates a ShadowRealm's object heap while the specification still
     /// requires the ShadowRealm to share its Agent's Symbols.
     static ACTIVE_SYMBOL_AGENT: RefCell<Option<SymbolAgent>> = const { RefCell::new(None) };
+    /// Fast identity of the surrounding Agent implementation currently installed in the two
+    /// owning slots above. Ordinary calls stay within one Agent (ECMA-262 §9.6), so their entry
+    /// check must not repeatedly borrow two TLS RefCells and compare/clone two `Rc`s. A different
+    /// Realm implementation can share Symbols while owning a distinct heap, hence both pointers
+    /// participate in the tag.
+    static ACTIVE_AGENT_TAG: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    #[cfg(test)]
+    static ACTIVE_AGENT_SLOW_SWITCHES: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn new_gc_heap() -> GcHeap {
@@ -1021,28 +1029,62 @@ pub(crate) fn new_gc_heap() -> GcHeap {
     })
 }
 
-pub(crate) fn activate_gc_heap(heap: &GcHeap) {
-    ACTIVE_GC_HEAP.with(|active| {
-        let mut active = active.borrow_mut();
-        if active
-            .as_ref()
-            .is_none_or(|current| !Rc::ptr_eq(current, heap))
-        {
-            *active = Some(heap.clone());
+#[inline]
+pub(crate) fn activate_agent(heap: &GcHeap, symbols: &SymbolAgent) {
+    let next = (Rc::as_ptr(heap) as usize, Rc::as_ptr(symbols) as usize);
+    ACTIVE_AGENT_TAG.with(|tag| {
+        if tag.get() == next {
+            return;
         }
+        ACTIVE_GC_HEAP.with(|active| *active.borrow_mut() = Some(heap.clone()));
+        ACTIVE_SYMBOL_AGENT.with(|active| *active.borrow_mut() = Some(symbols.clone()));
+        tag.set(next);
+        #[cfg(test)]
+        ACTIVE_AGENT_SLOW_SWITCHES.with(|switches| {
+            switches.set(switches.get().wrapping_add(1));
+        });
     });
 }
 
-pub(crate) fn activate_symbol_agent(agent: &SymbolAgent) {
-    ACTIVE_SYMBOL_AGENT.with(|active| {
-        let mut active = active.borrow_mut();
-        if active
-            .as_ref()
-            .is_none_or(|current| !Rc::ptr_eq(current, agent))
-        {
-            *active = Some(agent.clone());
-        }
-    });
+/// Restores the surrounding Agent after a synchronous cross-Agent/heap transition.
+///
+/// Ordinary ECMAScript calls do not need this: they push an execution context on the current
+/// Agent's stack. ShadowRealm's separately allocated interpreter heap is the exceptional nested
+/// transition in Lumen, and restoring it by scope keeps early returns and throws correct.
+#[must_use]
+pub(crate) struct AgentActivationGuard {
+    previous: Option<(Option<GcHeap>, Option<SymbolAgent>, (usize, usize))>,
+}
+
+impl Drop for AgentActivationGuard {
+    fn drop(&mut self) {
+        let Some((heap, symbols, tag)) = self.previous.take() else {
+            return;
+        };
+        ACTIVE_GC_HEAP.with(|active| *active.borrow_mut() = heap);
+        ACTIVE_SYMBOL_AGENT.with(|active| *active.borrow_mut() = symbols);
+        ACTIVE_AGENT_TAG.with(|active| active.set(tag));
+        #[cfg(test)]
+        ACTIVE_AGENT_SLOW_SWITCHES.with(|switches| {
+            switches.set(switches.get().wrapping_add(1));
+        });
+    }
+}
+
+#[inline]
+pub(crate) fn enter_agent(heap: &GcHeap, symbols: &SymbolAgent) -> AgentActivationGuard {
+    let next = (Rc::as_ptr(heap) as usize, Rc::as_ptr(symbols) as usize);
+    if ACTIVE_AGENT_TAG.with(Cell::get) == next {
+        return AgentActivationGuard { previous: None };
+    }
+
+    let previous_heap = ACTIVE_GC_HEAP.with(|active| active.borrow().clone());
+    let previous_symbols = ACTIVE_SYMBOL_AGENT.with(|active| active.borrow().clone());
+    let previous_tag = ACTIVE_AGENT_TAG.with(Cell::get);
+    activate_agent(heap, symbols);
+    AgentActivationGuard {
+        previous: Some((previous_heap, previous_symbols, previous_tag)),
+    }
 }
 
 fn active_symbol(id: u64) -> Option<Rc<SymbolData>> {
@@ -1057,28 +1099,24 @@ fn active_symbol(id: u64) -> Option<Rc<SymbolData>> {
     })
 }
 
-pub(crate) fn deactivate_gc_heap_if(heap: &GcHeap) {
-    ACTIVE_GC_HEAP.with(|active| {
-        let mut active = active.borrow_mut();
-        if active
-            .as_ref()
-            .is_some_and(|current| Rc::ptr_eq(current, heap))
-        {
-            active.take();
+pub(crate) fn deactivate_agent_if(heap: &GcHeap, symbols: &SymbolAgent) {
+    let current = (Rc::as_ptr(heap) as usize, Rc::as_ptr(symbols) as usize);
+    ACTIVE_AGENT_TAG.with(|tag| {
+        if tag.get() == current {
+            ACTIVE_GC_HEAP.with(|active| {
+                active.borrow_mut().take();
+            });
+            ACTIVE_SYMBOL_AGENT.with(|active| {
+                active.borrow_mut().take();
+            });
+            tag.set((0, 0));
         }
     });
 }
 
-pub(crate) fn deactivate_symbol_agent_if(agent: &SymbolAgent) {
-    ACTIVE_SYMBOL_AGENT.with(|active| {
-        let mut active = active.borrow_mut();
-        if active
-            .as_ref()
-            .is_some_and(|current| Rc::ptr_eq(current, agent))
-        {
-            active.take();
-        }
-    });
+#[cfg(test)]
+pub(crate) fn active_agent_slow_switches() -> u64 {
+    ACTIVE_AGENT_SLOW_SWITCHES.with(Cell::get)
 }
 
 fn active_gc_heap() -> GcHeap {

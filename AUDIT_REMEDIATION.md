@@ -180,6 +180,80 @@ take precedence over every historical checkmark in this document.
       retained search and 954 useful nodes, and completed the 420-second gate
       with zero errors and no choice-saving failure.
 
+### Post-checkpoint performance recovery
+
+The 2026-08-31 release checkpoint is functionally accepted by the existing
+conformance gates but is not approved for installation. Direct execution of
+Crystal's unchanged v7/v8 fixture through the installed and checkpoint browser
+binaries found general hot-path and memory regressions that must be recovered
+without undoing the standards fixes above. Five interleaved terminal samples
+measured a 2,195 -> 1,618 aggregate score, 36.318 -> 38.904 seconds of page
+time, and 396.9 -> 456.2 MiB peak RSS. Richards accounts for most of the
+aggregate score loss; excluding it, the paired component geometric mean is
+2.4% lower. RegExp remains 19.7% lower, and a bytecode-only control is 15.0%
+lower across the seven non-Richards components. A focused browser page also
+measured Map/Set 55% faster but repeated innerHTML replacement plus scoped
+selector queries 9.0% slower. User-visible DOM churn is an optimization target,
+not an acceptable cost of conformance.
+
+- [x] Remove redundant per-call Agent activation while preserving the ECMA-262
+  surrounding-Agent, Realm, job, coroutine-resume, and independent-engine
+  boundaries. Prove cross-Agent allocation/symbol ownership with focused tests.
+  Ordinary calls now pay no Agent-selection cost; host entries activate once and
+  nested ShadowRealm heap transitions restore by RAII. All 696 embed-enabled
+  Lumen tests pass. Three optimized browser-harness samples improved median
+  benchmark time from 41.39s with the per-call fast check to 37.47s, and a
+  120-second YouTube gate completed with 1,306 nodes, 19 updates, and zero
+  script errors.
+- [x] Amortize native segmented-stack headroom checks without introducing any
+  ECMAScript recursion limit. Retain the 2 MiB host-stack/accessor stress and
+  deep interpreter/bytecode/JIT/constructor/coroutine coverage. Native calls
+  now query stack headroom at entry and every eight execution contexts; the
+  existing 1 MiB red zone and segmented growth remain. The large-frame test,
+  4,096-context tests on all three tiers, recursive construction, mixed JIT
+  boundaries, and generator continuation test pass. A 5.12-million-call
+  bytecode A/B improved 2,641ms -> 2,579ms, broad browser-harness wall time
+  improved 39.10-39.74s -> 38.32s, and a populated 90-second YouTube gate
+  completed with 1,306 nodes, 20 updates, and zero errors.
+- [x] Amortize RegExp host-interruption polling while keeping ECMA-262 matcher
+  failure distinct from interruption and resource exhaustion. Run the official
+  RegExp Test262 slice plus adversarial interruption tests. Direct engine calls
+  retain an immediate poll, long scans/backtracking retain internal checkpoints,
+  and native multi-match loops share the execution cadence instead of issuing
+  an atomic host-state read per tiny match. A 2-million-match A/B improved
+  3,961ms -> 3,921ms; all 1,879 official `built-ins/RegExp` Test262 files pass,
+  as do cancellation/resource-exhaustion tests. A 90-second Twitch gate retained
+  1,862 nodes, processed 18 updates, and reported zero script errors.
+- [ ] Profile and accelerate HTML innerHTML fragment replacement and DOM scoped
+  selector matching. Preserve ordered removal/insertion side effects, one
+  replace-all mutation record, detached wrapper identity/listeners/shadow trees,
+  iframe teardown, static querySelectorAll results, scoping, and syntax errors.
+  - [x] Batch standards-ordered fragment replacement and keep the html5ever
+    parser's private arena surgery free of live-page invalidation work. Focused
+    replace-all, foster-parenting, and adoption-agency tests pass; 1,000 isolated
+    fragment replacements improved 288.98 -> 260.69 ms (9.79%).
+  - [x] Return a new static, indexed, non-constructible `NodeList` from
+    `querySelectorAll`, defer wrapper creation until consumption, preserve
+    delayed connectedness/identity, and implement the Web IDL indexed-property
+    define/delete/extensibility rules. Invalid selector strings now throw a
+    `SyntaxError` DOMException from query and match APIs. The replacement plus
+    length-only selector microbenchmark improved 392.32 -> 108.99 ms (72.2%),
+    total workload wall time improved 2.685 -> 2.406 seconds, and peak RSS fell
+    168.5 -> 156.5 MiB.
+  - [ ] Replace the JavaScript Proxy-backed indexed collection with a native
+    Lumen/Web IDL exotic object fast path. Fully consuming every node remains
+    about 7% slower than the former nonstandard eager Array; native indexed
+    access should remove that residual cost without undoing lazy length queries.
+  - [x] Repeat the optimized semantic gates after both DOM passes. YouTube's
+    real consent Reject action closes the dialog and retains search (954 nodes,
+    24 updates), Twitch retains search/carousel/channel cards (1,924 nodes), and
+    Steam retains search/featured/offers/catalog (2,376 nodes); all three actors
+    remain responsive and report zero script errors.
+- [ ] After every accepted optimization, re-run its focused conformance tests,
+  the comparative browser-binary microbenchmark, and at least one actual-site
+  semantic gate. Repeat the full site matrix and a Speedometer slice before a
+  new release checkpoint.
+
 ### Real-site capability expansion
 
 - [x] Implement the Service Workers §5 `CacheStorage`/`Cache` Window surface

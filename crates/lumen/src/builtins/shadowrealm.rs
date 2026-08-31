@@ -22,6 +22,9 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
         i.gc_pin(&obj);
         let realm = Interp::new_with_symbol_agent(i.symbol_agent.clone());
         i.shadow_realms.insert(p, Box::new(realm));
+        // Constructing the isolated implementation heap activates it while its intrinsics are
+        // allocated. The constructor itself continues in the caller's surrounding Agent.
+        i.activate_gc_heap();
         Ok(Value::Obj(obj))
     });
     ctor.borrow_mut().props.insert(
@@ -65,6 +68,7 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     // SAFETY: pinned Box target; re-entrant evaluation is sequenced by the JS call stack.
     let sub: &mut Interp = unsafe { &mut *subptr };
     let result = {
+        let _agent = sub.enter_agent();
         // PerformShadowRealmEval: like eval code — `var`s instantiate in the realm's global,
         // lexicals live in a fresh declarative environment per evaluation.
         sub.strict = matches!(
@@ -124,14 +128,19 @@ fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value
         let sub: &mut Interp = unsafe { &mut *subptr };
         sub.module_loader = Some(loader);
         sub.import_base = base;
-        let loaded = {
+        let (loaded, ns, value) = {
+            let _agent = sub.enter_agent();
             let r = sub.load_module(&key, &src);
             sub.drain_microtasks();
-            r
+            let ns = sub.module_namespace(&key);
+            let value = match (&r, &ns) {
+                (Ok(_), Some(ns)) => Some(sub.get_member(ns, &name)),
+                _ => None,
+            };
+            (r, ns, value)
         };
-        let ns = sub.module_namespace(&key);
-        let value = match (&loaded, ns) {
-            (Ok(_), Some(ns)) => sub.get_member(&ns, &name),
+        let value = match (&loaded, ns, value) {
+            (Ok(_), Some(_), Some(value)) => value,
             _ => {
                 return Err(i.make_error("TypeError", "importValue: module evaluation failed"));
             }

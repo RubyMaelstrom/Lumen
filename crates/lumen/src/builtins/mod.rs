@@ -1961,16 +1961,58 @@ fn regexp_match_abrupt<T>(
     })
 }
 
+#[inline]
+pub(crate) fn regexp_interrupt_tick(i: &mut Interp) -> Result<(), crate::regex::MatchError> {
+    match i.interrupt_poll() {
+        Ok(()) => Ok(()),
+        Err(Abrupt::Interrupt(reason)) => Err(crate::regex::MatchError::Interrupted(reason)),
+        Err(_) => unreachable!("interrupt polling only produces an Interrupt completion"),
+    }
+}
+
+#[inline]
+fn regexp_exec_text_shared(
+    i: &mut Interp,
+    re: &crate::regex::Regex,
+    text: &crate::regex::ReText,
+    start: usize,
+) -> crate::regex::MatchResult<crate::regex::Captures> {
+    re.exec_text_shared_entry_polled(text, start, &i.runtime_interrupt)
+}
+
+#[inline]
+fn regexp_exec_text_discard_shared(
+    i: &mut Interp,
+    re: &crate::regex::Regex,
+    text: &crate::regex::ReText,
+    start: usize,
+) -> crate::regex::MatchResult<crate::regex::Captures> {
+    re.exec_text_discard_shared_entry_polled(text, start, &i.runtime_interrupt)
+}
+
+#[inline]
+pub(crate) fn regexp_find_text_shared(
+    i: &mut Interp,
+    re: &crate::regex::Regex,
+    text: &crate::regex::ReText,
+    start: usize,
+) -> crate::regex::MatchResult<(usize, usize)> {
+    re.find_text_shared_entry_polled(text, start, &i.runtime_interrupt)
+}
+
 /// All non-overlapping matches of `re` in `text`, each as capture spans (element indices).
 fn regex_find_all(
-    i: &Interp,
+    i: &mut Interp,
     re: &crate::regex::Regex,
     text: &crate::regex::ReText,
 ) -> Result<Vec<Vec<Option<(usize, usize)>>>, Value> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos <= text.len() {
-        match regexp_match_result(i, re.exec_text_shared(text, pos, &i.runtime_interrupt))? {
+        let interrupt = regexp_interrupt_tick(i).map(|()| Some(()));
+        regexp_match_result(i, interrupt)?;
+        let matched = regexp_exec_text_shared(i, re, text, pos);
+        match regexp_match_result(i, matched)? {
             None => break,
             Some(caps) => {
                 let (a, b) = caps[0].unwrap();
@@ -2040,10 +2082,8 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
         return Ok(Value::Null);
     }
     let last = text.elem_at_unit(last_units);
-    match regexp_match_result(
-        i,
-        re.exec_text_discard_shared(&text, last, &i.runtime_interrupt),
-    )? {
+    let matched = regexp_exec_text_discard_shared(i, &re, &text, last);
+    match regexp_match_result(i, matched)? {
         None => {
             if use_last {
                 set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
@@ -2220,7 +2260,8 @@ pub(crate) fn regexp_exec_discard_direct(
         return Ok(false);
     }
     let last = text.elem_at_unit(last_units);
-    match regexp_match_result(i, re.find_text_shared(&text, last, &i.runtime_interrupt))? {
+    let matched = regexp_find_text_shared(i, re, &text, last);
+    match regexp_match_result(i, matched)? {
         None => {
             if use_last {
                 set_last(0);
@@ -2272,9 +2313,8 @@ pub(crate) fn regexp_literal_exec_discard(
     input: &crate::lstr::LStr,
 ) -> Result<(), Abrupt> {
     let text = i.re_text(re.unicode, input);
-    if let Some(whole) =
-        regexp_match_abrupt(i, re.find_text_shared(&text, 0, &i.runtime_interrupt))?
-    {
+    let matched = regexp_find_text_shared(i, re, &text, 0);
+    if let Some(whole) = regexp_match_abrupt(i, matched)? {
         update_regexp_legacy_statics_lazy(i, re, whole, 0, &text, input);
     }
     Ok(())
@@ -2343,12 +2383,10 @@ pub(crate) fn regexp_literal_replace_discard(
     let text = i.re_text(re.unicode, input);
     let mut position = 0usize;
     loop {
+        i.interrupt_poll()?;
         let search_start = position;
-        let Some((start, end)) = regexp_match_abrupt(
-            i,
-            re.find_text_shared(&text, position, &i.runtime_interrupt),
-        )?
-        else {
+        let matched = regexp_find_text_shared(i, re, &text, position);
+        let Some((start, end)) = regexp_match_abrupt(i, matched)? else {
             break;
         };
         update_regexp_legacy_statics_lazy(i, re, (start, end), search_start, &text, input);
@@ -2427,12 +2465,10 @@ pub(crate) fn regexp_literal_match_discard(
     let text = i.re_text(re.unicode, input);
     let mut position = 0usize;
     loop {
+        i.interrupt_poll()?;
         let search_start = position;
-        let Some((start, end)) = regexp_match_abrupt(
-            i,
-            re.find_text_shared(&text, position, &i.runtime_interrupt),
-        )?
-        else {
+        let matched = regexp_find_text_shared(i, re, &text, position);
+        let Some((start, end)) = regexp_match_abrupt(i, matched)? else {
             break;
         };
         update_regexp_legacy_statics_lazy(i, re, (start, end), search_start, &text, input);
@@ -2625,7 +2661,8 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
         return;
     };
     if let Some((re, start)) = m.lazy_captures.take() {
-        if let Ok(Some(captures)) = re.exec_text_shared(&m.text, start, &i.runtime_interrupt) {
+        let matched = regexp_exec_text_shared(i, &re, &m.text, start);
+        if let Ok(Some(captures)) = matched {
             m.caps.clear();
             m.caps.extend_from_slice(&captures);
         }

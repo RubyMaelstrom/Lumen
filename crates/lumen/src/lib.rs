@@ -398,6 +398,7 @@ impl Engine {
         request_id: u64,
         result: Option<(String, String)>,
     ) -> bool {
+        self.interp.activate_gc_heap();
         self.interp.finish_dynamic_module_load(request_id, result)
     }
 
@@ -437,6 +438,7 @@ impl Engine {
         key: &str,
         loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
     ) -> Result<ExecutionOutcome, ParseError> {
+        self.interp.activate_gc_heap();
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
         let result = self.interp.load_module(key, src);
         Ok(match result {
@@ -758,6 +760,7 @@ impl Engine {
 
     /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
     pub fn define_global(&mut self, name: &str, len: usize, f: embed::NativeFn) {
+        self.interp.activate_gc_heap();
         let global = self.interp.global.clone();
         self.interp.def_method(&global, name, len, f);
     }
@@ -765,6 +768,7 @@ impl Engine {
     /// Define `globalThis.<name>` as a namespace object (like `Math`) with the given
     /// `(name, arity, fn)` native methods.
     pub fn define_namespace(&mut self, name: &str, ops: &[(&str, usize, embed::NativeFn)]) {
+        self.interp.activate_gc_heap();
         let ns = self.interp.new_object();
         for (op, len, f) in ops {
             self.interp.def_method(&ns, op, *len, *f);
@@ -801,6 +805,7 @@ impl Engine {
         this: embed::Value,
         args: &[embed::Value],
     ) -> Result<embed::Value, embed::EvalError> {
+        self.interp.activate_gc_heap();
         if let Err(abrupt) = self.interp.interrupt_poll_force() {
             let error = match abrupt {
                 interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
@@ -827,6 +832,7 @@ impl Engine {
 
     /// Drain the microtask (promise-reaction) queue to quiescence.
     pub fn run_microtasks(&mut self) {
+        self.interp.activate_gc_heap();
         self.interp.drain_microtasks();
         self.interp.gc_task_boundary();
     }
@@ -834,6 +840,7 @@ impl Engine {
     /// Run a microtask checkpoint while preserving host interruption as control flow. Pending jobs
     /// are discarded when a running job is killed; they must not be resumed as a later task.
     pub fn run_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
+        self.interp.activate_gc_heap();
         if let Err(reason) = self.interp.drain_microtasks_interruptible() {
             self.interp.gc_task_boundary();
             return Err(reason);
@@ -884,6 +891,7 @@ impl Engine {
 
     /// Run one queued job, preserving a host interruption from the job's JavaScript callback.
     pub fn run_one_job_interruptible(&mut self) -> Result<bool, crate::InterruptReason> {
+        self.interp.activate_gc_heap();
         match self.interp.microtasks.pop_front() {
             Some(job) => {
                 self.interp.run_job_interruptible(job)?;
