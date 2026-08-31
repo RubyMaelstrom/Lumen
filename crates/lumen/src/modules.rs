@@ -19,6 +19,39 @@ use crate::value::{Object, Property, Value};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+// One Engine can host more than one HTML environment settings object. The
+// embedder's opaque host-job context is therefore part of the module-map key,
+// while the canonical URL remains the only value exposed to loaders and
+// `import.meta.url`. Context zero keeps the historical spelling so standalone
+// and command-line embedders pay no allocation or compatibility cost.
+const MODULE_CONTEXT_SEPARATOR: char = '\0';
+
+pub(crate) fn module_map_key(context: u64, url: &str) -> String {
+    if context == 0 || url.starts_with(MODULE_CONTEXT_SEPARATOR) {
+        return url.to_string();
+    }
+    format!("{MODULE_CONTEXT_SEPARATOR}{context}{MODULE_CONTEXT_SEPARATOR}{url}")
+}
+
+pub(crate) fn module_map_context(key: &str) -> u64 {
+    let Some(encoded) = key.strip_prefix(MODULE_CONTEXT_SEPARATOR) else {
+        return 0;
+    };
+    encoded
+        .split_once(MODULE_CONTEXT_SEPARATOR)
+        .and_then(|(context, _)| context.parse().ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn module_map_url(key: &str) -> &str {
+    let Some(encoded) = key.strip_prefix(MODULE_CONTEXT_SEPARATOR) else {
+        return key;
+    };
+    encoded
+        .split_once(MODULE_CONTEXT_SEPARATOR)
+        .map_or(key, |(_, url)| url)
+}
+
 /// How a module-namespace property reads its current value.
 #[derive(Clone)]
 pub enum NsBinding {
@@ -136,6 +169,7 @@ pub(crate) struct PendingDynamicImport {
     specifier: String,
     attr_type: Option<String>,
     defer: bool,
+    pub(crate) host_context: u64,
 }
 
 /// The result of resolving an export name (spec ResolveExport).
@@ -158,13 +192,14 @@ impl Interp {
     /// await instead of treating the initial suspension as successful evaluation.
     #[cfg(feature = "embed")]
     pub(crate) fn module_evaluation_promise(&self, key: &str) -> Option<Value> {
-        let record = self.module_recs.get(key)?;
+        let key = module_map_key(self.host_job_context, key);
+        let record = self.module_recs.get(&key)?;
         let evaluation_key = if (record.started || record.evaluated || record.evaluating)
             && record.cycle_root.is_some()
         {
-            record.cycle_root.as_deref().unwrap_or(key)
+            record.cycle_root.as_deref().unwrap_or(&key)
         } else {
-            key
+            &key
         };
         self.module_recs.get(evaluation_key)?.top_promise.clone()
     }
@@ -172,10 +207,11 @@ impl Interp {
     /// Load, link, and evaluate the module identified by canonical `key` (with initial `src`),
     /// returning its namespace object.
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
+        let key = module_map_key(self.host_job_context, key);
         // Phase 1: parse the whole graph (so every module's export tables exist before any linking).
-        self.load_requested_modules(key, Some(src.to_string()))?;
+        self.load_requested_modules(&key, Some(src.to_string()))?;
         // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first.
-        self.link_module(key)?;
+        self.link_module(&key)?;
         // Phase 3: evaluate module bodies depth-first. A graph containing top-level await
         // evaluates through the async machinery (awaits interleave with the job queue, an async
         // module doesn't block siblings, ancestors run in [[AsyncEvaluationOrder]]); a fully
@@ -183,16 +219,16 @@ impl Interp {
         // Pre-create every graph member's evaluation promise, so a dynamic import of a
         // not-yet-executed batch member waits for the batch instead of executing it early.
         let mut graph = Vec::new();
-        self.collect_eager_graph(key, &mut graph);
+        self.collect_eager_graph(&key, &mut graph);
         for m in &graph {
             if !self.module_recs[m].evaluated && self.module_recs[m].top_promise.is_none() {
                 let p = self.new_promise();
                 self.module_recs.get_mut(m).unwrap().top_promise = Some(p);
             }
         }
-        let top = self.module_recs[key].top_promise.clone().unwrap();
+        let top = self.module_recs[&key].top_promise.clone().unwrap();
         let mut stack = Vec::new();
-        self.inner_module_evaluation_async(key, &mut stack, &mut 0);
+        self.inner_module_evaluation_async(&key, &mut stack, &mut 0);
         self.run_agent_event_loop().map_err(Abrupt::Interrupt)?;
         if let Value::Obj(o) = &top {
             if let Some(ps) = self.promises.get(&(Rc::as_ptr(o) as usize)) {
@@ -202,7 +238,7 @@ impl Interp {
                 }
             }
         }
-        Ok(self.module_recs[key].ns.clone())
+        Ok(self.module_recs[&key].ns.clone())
     }
 
     /// Every module in `key`'s dependency graph (including itself), depth-first.
@@ -518,11 +554,13 @@ impl Interp {
             Some(l) => l.clone(),
             None => return Err(self.throw("TypeError", "no module loader configured")),
         };
-        match loader(specifier, referrer, attr_type) {
-            Some(pair) => Ok(pair),
+        let context = module_map_context(referrer);
+        let public_referrer = module_map_url(referrer);
+        match loader(specifier, public_referrer, attr_type) {
+            Some((canonical, source)) => Ok((module_map_key(context, &canonical), source)),
             None => Err(self.throw(
                 "TypeError",
-                format!("module not found: {specifier} (imported from {referrer})"),
+                format!("module not found: {specifier} (imported from {public_referrer})"),
             )),
         }
     }
@@ -533,6 +571,7 @@ impl Interp {
     /// plain paths.
     fn build_import_meta(&mut self, key: &str) -> Value {
         let meta = Object::new(None);
+        let key = module_map_url(key);
         let is_path = key.starts_with('/');
         let url = if is_path {
             format!("file://{key}")
@@ -863,6 +902,11 @@ impl Interp {
         }
         ns.borrow_mut().extensible = false;
         ns.borrow().ic_plain.set(false);
+        // `module_ns` is keyed only by object address. Pin the namespace until
+        // the cycle collector can evict the side-table entry atomically; a
+        // released per-Document module map may otherwise drop the last strong
+        // namespace handle and let an unrelated allocation reuse its address.
+        self.gc_pin(ns);
         self.module_ns.insert(Rc::as_ptr(ns) as usize, live);
         Ok(())
     }
@@ -899,6 +943,7 @@ impl Interp {
         }
         if let Some(live) = self.module_ns.get(&(Rc::as_ptr(base_o) as usize)).cloned() {
             dns.borrow().ic_plain.set(false);
+            self.gc_pin(&dns);
             self.module_ns.insert(Rc::as_ptr(&dns) as usize, live);
         }
         dns.borrow().ic_plain.set(false);
@@ -955,6 +1000,7 @@ impl Interp {
                             self.module_ns.get(&(Rc::as_ptr(base_o) as usize)).cloned()
                         {
                             stub.borrow().ic_plain.set(false);
+                            self.gc_pin(&stub);
                             self.module_ns.insert(Rc::as_ptr(&stub) as usize, live);
                         }
                     }
@@ -1552,6 +1598,7 @@ impl Interp {
             },
             None => self.import_base.clone(),
         };
+        let host_context = self.host_job_context;
         if let Some(loader) = self.dynamic_module_loader.clone() {
             let request_id = self.next_dynamic_import_id;
             self.next_dynamic_import_id = self.next_dynamic_import_id.wrapping_add(1).max(1);
@@ -1563,13 +1610,15 @@ impl Interp {
                         specifier: specifier.to_string(),
                         attr_type: attr_type.map(str::to_string),
                         defer,
+                        host_context,
                     },
                 );
                 return promise;
             }
         }
         let result = (|| {
-            let (canon, src) = self.fetch_module(specifier, &referrer, attr_type)?;
+            let scoped_referrer = module_map_key(host_context, &referrer);
+            let (canon, src) = self.fetch_module(specifier, &scoped_referrer, attr_type)?;
             let canon = match attr_type {
                 Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
                 _ => canon,
@@ -1596,6 +1645,7 @@ impl Interp {
         };
         let result = match result {
             Some((canon, source)) => {
+                let canon = module_map_key(pending.host_context, &canon);
                 let canon = match pending.attr_type.as_deref() {
                     Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
                     _ => canon,

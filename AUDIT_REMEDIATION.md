@@ -13,6 +13,234 @@ take precedence over every historical checkmark in this document.
 
 ## Post-audit regression remediation
 
+### Incremental browser-conformance acceptance
+
+- [x] Reproduce and correct the YouTube consent rejection regression through
+  general Window/Document lifecycle behavior. A fresh optimized gate now
+  activates the real accessible "Reject" control, observes it disappear, and
+  completes with zero script errors; no site-specific selector or workaround
+  is involved.
+- [x] Give each nested Window settings context independent author global
+  properties, writable platform descriptors, global lexical declarations,
+  module maps, event handlers/listeners, timers, animation frames, observers,
+  and queued tasks. Add focused navigation and cross-Window isolation tests.
+- [x] Retire a destroyed nested Document's engine jobs, module records,
+  namespace roots, and embedder settings state, while keeping the top-level
+  settings context alive for the page realm. Move detached-node listeners to a
+  weak registry without changing observable listener identity when retained
+  author nodes are reinserted.
+- [x] Exercise Speedometer 3.1 through its actual accessible Start control and
+  require the official summary with no script errors. All default suites pass
+  one iteration (58/58, valid summary, score 0.1687), every suite has passed
+  individually, the Web Components pair passes two iterations, and the first
+  six default suites pass two iterations after the lifecycle corrections.
+- [x] Preserve Fetch's initiating global as the networking task destination and
+  construct response/body objects in that Window Realm. A focused child-Window
+  test now consumes exact text and ArrayBuffer bytes; Perf-Dashboard completes
+  all three tests instead of parsing an empty manifest body and failing its
+  router initialization.
+- [x] Remove the non-standard cumulative 256-request failure cliff from author
+  Fetch/XHR and required HTML/module/SVG resource loads. Keep the threshold only
+  as an optional module-prefetch cutoff: a focused test prepares 320 valid
+  requests, and an optimized resident-page probe completes 320 sequential Fetch
+  calls with zero errors. This restores the Fetch Standard §5.6 rule that every
+  valid call invokes Fetch and fails only for a specified request/network reason.
+- [x] Make the ECMA-262 GetTemplateObject cache Realm-owned for GC purposes.
+  Key entries by the active Realm and template site, count the cache as an
+  internal edge, activate cached arrays only with their live Realm, and evict
+  entries when that Realm is collected. The side-table regression test now
+  creates a tagged template in a temporary `$262.createRealm()` and verifies
+  that its Realm and template cache are reclaimed.
+- [x] Preserve tagged-template Parse Node identity across AST lifetime and
+  bytecode compilation. Process-unique site IDs replace allocator-address
+  keys, are carried through compiled chunks and snapshots, and a regression
+  test verifies that separately parsed identical source gets a distinct frozen
+  template object (ECMA-262 GetTemplateObject/[[TemplateMap]]).
+- [x] Re-run real-site semantic gates after the lifecycle pass. YouTube consent
+  rejection, Twitch search/carousel/channel cards, and Steam search/featured/
+  offers/catalog all pass after both Fetch corrections with responsive resident
+  actors and zero script errors.
+- [x] Repeat the YouTube/Twitch/Steam semantic matrix after document-scoped
+  geometry caching and real-Realm task normalization. YouTube consent rejection
+  and search (954 nodes), Twitch search/carousel/channel cards (1,888 nodes),
+  and Steam search/featured/offers/catalog (2,462 nodes) all retain responsive
+  actors and report zero script errors.
+- [x] Cancel queued iframe attribute-processing work when its container is
+  removed. The DOM removal steps now destroy the child navigable, and a stale
+  task cannot resurrect a detached Window Realm or run its srcdoc script;
+  focused HTTP regression coverage exercises the detached-navigation case.
+- [ ] Complete the remaining Speedometer 3.1 expansion without batching
+  unrelated implementation changes.
+  - [x] Re-run all default suites for one iteration on the lifecycle-cleanup
+    tree: actual Start activation, valid official summary, score 0.1687, 121
+    live updates, and zero script errors in 461.162 seconds. After the nested
+    frame lifecycle/viewport fixes, the same gate again reached the summary
+    with 122 live updates, zero errors, and 503.382 seconds elapsed.
+  - [x] Run all default suites for two iterations to expose repeat-navigation
+    and accumulated-state defects. The first run exposed the cumulative request
+    cliff at 112/116. After its general removal, the optimized gate completed
+    116/116, reached a valid official summary (score 0.152 ± 0.32), produced
+    240 live updates, and reported zero script errors in 938.058 seconds.
+  - [x] Run the official default ten-iteration benchmark to its summary with
+    zero script errors, then repeat the real-site regression matrix.
+    - [x] Diagnose the 2026-08-31 apparent ten-iteration stall. It made real
+      progress through 151/580 subtests with no exception; a three-iteration
+      TodoMVC reproduction completed and showed flat per-iteration callback
+      cost rather than a lost continuation or accumulating lifecycle state.
+      The two-hour gate expired because synchronous geometry was too slow.
+    - [x] Profile the real accessible-control workload rather than a synthetic
+      engine loop. A function/self-time profile and `TRUST_DIAG_FRAME` localized
+      47.3 of 59 seconds to 214 arena-wide CSSOM View measure passes triggered
+      while an iframe benchmark mutated its distinct child Document.
+    - [x] Give CSSOM View geometry invalidation document scope. Cached top-level
+      iframe boxes are reused only when every intervening mutation is confined
+      to a child Document, iframe child content, or a still-disconnected tree;
+      iframe attributes, connected container mutations, viewport/image changes,
+      and hit-test activation retain the full measure fallback. The focused Lit
+      run fell from 214 to 7 measure passes, 58.6 to 12.6 seconds, and score
+      0.01799 to 0.1023 with a valid summary and zero errors.
+    - [x] Establish an independent LibreWolf/WebDriver-BiDi reference using the
+      actual Start button. The same isolated suite completed with a valid score
+      of 12.00 in 1.242 seconds and no console errors; this remains a performance
+      reference, while the official specifications remain the behavior authority.
+    - [x] Stop treating a real child Realm's null internal task marker and its
+      root iframe marker as different Window globals. HTML creates one Window/
+      GlobalEnvironment for that Realm; normalizing the markers before legacy
+      scoped-Window dispatch removed the former 810/800 author-global descriptor
+      scan batches and exposed a remaining 212-scan Promise-job batch. The
+      focused Lit run remained valid and error-free and fell from 12.596 to
+      6.166 seconds; all 34 iframe-focused TRust tests passed.
+    - [x] Create the iframe child navigable's populated initial `about:blank`
+      Document and real Lumen Realm during post-connection processing. Detached
+      containers expose null content accessors; connected blank frames have
+      independent intrinsics and fire their initial load event; the first
+      same-origin navigation reuses that Window while replacing its Document.
+      Focused conformance coverage and all 35 iframe tests pass, and the Lit
+      workload remains valid and error-free at 6.107 seconds. A post-change
+      matrix also passes YouTube consent/search (954 nodes), Twitch search/
+      carousel/channel cards (1,858 nodes), and Steam search/featured/offers/
+      catalog (2,458 nodes), with responsive actors and zero script errors.
+    - [x] Carry the ECMA-262 §9.5 Promise-job Realm explicitly and select it
+      before HTML §8.1.6.6.4 prepares that Realm's environment settings. A
+      focused cross-Realm test proves the host preparation callback never runs
+      against the caller global, while the legacy same-Realm settings-token
+      test remains green; the Test262 `built-ins/Promise` slice passes 731/731
+      (one upstream skip). This removed the last 212 top-Realm descriptor scans;
+      the isolated Lit workload reports a valid 0.4132 score with zero errors in
+      5.072 seconds. Lumen passes 691 tests, optimized TRust passes 1,004 tests
+      (17 ignored), and all 35 iframe tests pass. Post-change Twitch (1,867
+      nodes) and Steam (2,470 nodes) retain every semantic milestone with zero
+      errors; YouTube reached its search input with zero errors in a session
+      where the consent dialog was not presented, so dismissal was not exercised
+      by this pass.
+    - [x] Batch the DOM Standard `replace all` wrapper-retention transition for
+      `innerHTML` and perform one descendant-frame teardown query per replacement
+      target. Focused tests preserve detached wrapper identity, listeners, shadow
+      descendants, reinsertion, and weak collection; the isolated TodoMVC-jQuery
+      run fell from 106.323 to 82.860 seconds before engine collection work.
+    - [x] Give ordinary Map and Set a collision-safe SameValueZero hash index while
+      retaining the ordered tombstone list required by live iterators. ECMA-262
+      §§24.1/24.2 explicitly require average sublinear access. All 587 Map/Set
+      Test262 cases pass, including clear/delete/reinsert iterator behavior, and a
+      20,000-key stress case passes. The final optimized TodoMVC-jQuery gate is
+      valid and error-free at 8.992 seconds (score 0.1162), about 11.8 times faster
+      than the pre-batching baseline.
+    - [x] Move segmented-stack headroom checks ahead of large accessor/host-native
+      execution frames. ECMA-262 §9.4 execution contexts remain language-visible
+      only through their specified state; the native representation must not abort
+      before Lumen's heap-backed stack can engage. A focused 2 MiB host-stack test,
+      the repeated bytecode iframe-navigation stress case, all 36 iframe tests,
+      and all 693 Lumen tests pass without adding a recursion limit.
+    - [x] Repeat the current optimized real-site matrix after the DOM/collection/
+      stack work. YouTube search (430 nodes), Ars Technica's populated article grid
+      (2,911), Instagram login/cookie UI (809), Twitch search/carousel/channel cards
+      (1,901), and Steam search/featured/offers/catalog (2,457) all pass with
+      responsive actors and zero script errors. YouTube did not serve a consent
+      dialog in this pass, so its reject action could not be re-exercised.
+    - [x] Re-establish a current-tree full Speedometer 3.1 one-iteration summary
+      after the collection and stack changes. All 58 workloads complete through
+      the real Start control in 127.416 seconds with 120 live updates, a valid
+      0.3385 score, and zero script errors—about 3.6–4 times faster than the
+      earlier 461–503-second full runs.
+    - [x] Re-run two iterations on the current tree to check repeat navigation
+      and accumulated state. All 116 workload executions complete in 282.190
+      seconds with 239 live updates, a valid 0.296 ± 0.53 score, and zero script
+      errors.
+    - [x] Complete the current-tree official ten-iteration gate. All 580 workload
+      executions reach a valid summary in 3,388.022 seconds with 1,188 live
+      updates, a 0.147 ± 0.066 score, and zero script errors. Resident memory
+      reached roughly 6.7 GiB and throughput declined relative to the one- and
+      two-iteration gates, so accumulated-state/lifetime cost remains a measured
+      optimization target rather than a conformance blocker.
+    - [x] Repeat the real-site matrix after the ten-iteration pass. YouTube
+      (1,306 nodes), Twitch (1,869), Steam (2,468), Ars Technica (3,122), and
+      Instagram (809) retain their semantic milestones with responsive actors
+      and zero errors. A second YouTube run presented the real consent dialog;
+      canonical activation of its accessible Reject control removed the dialog,
+      retained search and 954 useful nodes, and completed the 420-second gate
+      with zero errors and no choice-saving failure.
+
+### Real-site capability expansion
+
+- [x] Implement the Service Workers §5 `CacheStorage`/`Cache` Window surface
+  with origin-scoped named caches, request/Vary matching, body cloning, batch
+  replacement, quotas, and deleted-name/cache-object lifetime. Focused tests
+  cover the normative matching and lifetime algorithms; Discord no longer
+  aborts in its Wasm cache bridge.
+- [ ] Finish Cache API worker exposure and cross-agent serialization/ordering;
+  the current first slice is exposed in the resident Window realm.
+- [ ] Implement Indexed Database 3 incrementally rather than accepting a
+  feature-detection stub.
+  - [x] Implement the first functional Window slice: queued open/upgrade and
+    request events, ordered transaction requests, private read/write snapshots
+    with atomic publication, structured-cloned values, object-store CRUD,
+    key comparison/ranges, and reusable cursor continuation requests.
+  - [x] Run Telegram's actual downloaded `encryptedStorageLayer` module graph
+    against the implementation. Its production wrapper creates/upgrades the
+    database, stores and retrieves a nested value plus `Uint8Array`, and walks
+    the store cursor to completion with no errors.
+  - [x] Complete index retrieval/cursors and unique/multiEntry enforcement,
+    including secondary-key ordering, unique cursor directions, and per-request
+    rollback when a unique write fails.
+  - [x] Implement the Indexed Database 3/WHATWG DOM request event path
+    (`request -> transaction -> connection`), trusted capture/target/bubble
+    dispatch, transaction reactivation, cancelable error recovery, and the
+    listener-exception `AbortError` branch. Focused tests exercise every event
+    phase, non-bubbling success capture, continued requests after cancellation,
+    and abort propagation to the database.
+  - [x] Implement the per-name connection queue and event-driven upgrade/delete
+    blocking algorithms. A close-pending connection now continues to block while
+    its live transaction drains, actual closure wakes the waiter without polling,
+    and queued delete observes the upgraded version in specification order.
+  - [ ] Complete remaining abort and upgrade rollback edge cases, key
+    generators/key-path edge cases, and Worker exposure with focused WPT-style
+    coverage.
+- [x] Implement WHATWG HTML §3.2.6.6 `DOMStringMap` supported named properties:
+  dynamic attribute-order enumeration, own property descriptors, prototype
+  fallback, named set/delete conversion, and exceptions. This fixes GitLab's
+  enumerated `dataset` boot-data path; its JSON exception is gone.
+- [x] Expand the public-site matrix with Spotify and CodePen. Their optimized
+  live actors reached 1,121/786 nodes respectively, fetched 105/60 resources,
+  remained responsive, and reported zero script errors.
+- [x] Recheck the previously failing Ars Technica and Instagram front pages
+  after the Realm/lifecycle work. Ars Technica reaches its search control and
+  populated article feed (3,122 nodes, 120 resources); Instagram reaches its
+  interactive username/password login surface and cookie controls (810 nodes,
+  12 resources). Both resident actors remain responsive for two minutes with
+  zero script errors and neither snapshot is an error/unsupported-browser page.
+- [ ] Teach the browser-workload diagnostic to follow actor `Navigate`,
+  `Replace`, and `SubmitForm` events across documents. Reddit currently serves
+  a standards-based async `requestSubmit()` JavaScript challenge; the main
+  browser consumes its serialized hidden-control submission, but the single-
+  document gate discards that navigation event and therefore records only the
+  challenge splash. Keep the exact challenge flow covered by a Lumen actor
+  regression test while this diagnostic limitation remains.
+- [ ] Review TRust's HTTP and Navigator `User-Agent` policy against RFC 9110 and
+  WHATWG HTML. Telegram and WhatsApp currently return explicit unsupported-
+  browser documents to the valid but brand-specific `TRust/0.1` token before
+  their application code runs; do not disguise this as a JavaScript failure or
+  add a site-specific exception.
+
 - [ ] Replace arbitrary execution-depth rejection with an implementation that
   supports ECMAScript execution contexts up to actual resource exhaustion.
   - [x] Remove TRust's embedder-selected depth budget and Lumen's native
@@ -61,12 +289,41 @@ take precedence over every historical checkmark in this document.
   resumption, and fixed-position descendants with focused frontend tests.
 - [ ] Audit every audit-introduced numeric cap, fallback, unsupported branch,
   and watchdog against its governing standard and real-browser workloads.
+  - [x] Make iframe navigation handle local `data:` and `blob:` HTML
+    resources through their scheme fetch algorithms, including a focused
+    regression test. Unsupported document types still complete navigation and
+    fire the element `load` event.
+  - [x] Remove the no-JS frame depth/load ceilings. The breadth-first
+    prefetch/install queues now follow every finite document tree, retain the
+    HTML circular-navigation guard, and decode local `data:` HTML without
+    treating an implementation count as a navigation failure.
+  - [x] Stop truncating applicable external stylesheets and SVG external-use
+    resources at a declaration-count cap. Fetch concurrency and per-response
+    storage limits remain resource safeguards; CSS source-order participation
+    is no longer silently dropped.
+  - [x] Remove the stylesheet `@import` nesting and web-font declaration
+    count cutoffs. Imports are cycle-checked in source order and every
+    applicable `@font-face` is offered to the font loader; failed fetch or
+    decode remains the per-resource fallback.
+  - [x] Remove the non-standard 16 MiB ceilings from CompressionStream input/
+    output and Fetch ReadableStream body consumption. Stream and typed-array
+    allocation now proceed until ordinary host allocation/resource failure;
+    the standard's BufferSource/type checks remain intact.
+  - [ ] Wire TRust's page prelude to Lumen's incremental compression contexts
+    and expose the current Compression Standard format set (including Brotli
+    and DecompressionStream); the present terminal adapter still has a
+    one-shot DEFLATE-family encoder only.
+  - [ ] Replace the script-platform fallback for unsupported frame schemes
+    with standards-preserving resource/accounting behavior rather than
+    silently dropping a child document.
 - [x] Run the full Lumen and TRust suites, optimized release builds, browser
   acceptance matrix, and system `js-engine-benchmark` before promotion. The
-  Lumen workspace is green; TRust passes 949 active library tests; release
-  `trust` and `trust-desktop` build; all three browser gates and terminal runs
-  pass; three official benchmark samples score 1812, 1811, and 1810 (34.659--
-  34.701 s). The built artifacts remain uninstalled pending explicit approval.
+  Lumen workspace is green; the current Lumen-enabled TRust suite passes 987
+  active library tests plus all 28 desktop tests; release `trust` and
+  `trust-desktop` build; the YouTube and Speedometer gates pass after the
+  lifecycle fixes; prior Twitch/Steam matrix and system benchmark baselines
+  remain recorded above. The built artifacts remain uninstalled pending
+  explicit approval.
 
 ## Correctness and containment
 
@@ -146,6 +403,22 @@ take precedence over every historical checkmark in this document.
       - [x] Implement Unicode Collation Algorithm weights plus CLDR locale tailorings.
 
 ## Efficiency and lifecycle
+
+- [x] Expand compiled-tier coverage for standards-sensitive control flow and
+  constructors before optimizing around benchmark behavior.
+  - [x] Compile base class constructors after their normative pre-body instance
+    initialization and derived constructors through a real uninitialized-`this`
+    Function Environment Record. Focused bytecode/JIT tests cover `super()`,
+    `new.target`, field ordering, return validation, arrow capture, and double
+    `super()`; the forced-JIT Test262 class directory passes 4,367/4,367.
+  - [x] Compile ordinary synchronous `try`/`finally` through the existing
+    completion-aware VM handler while retaining native-JIT fallback. Focused
+    tests cover normal/throw/expression-return/bare-return/break/continue,
+    nesting, catch environment restoration, and abrupt finalizer replacement;
+    forced-tier Test262 `language/statements/try` passes 201/201.
+  - [x] Preserve optional-chain short circuiting across private field/method
+    tails and retain the receiver for a live private method Reference. The exact
+    previously failing Test262 case and the full forced-JIT class directory pass.
 
 - [x] Replace one-native-thread-per-live-coroutine with explicit VM
   continuations.

@@ -23,7 +23,7 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Snapshots are an optimization for trusted build-time glue, but the public embedding API can be
 /// handed arbitrary bytes. Keep corrupt data from turning its length fields into unbounded work.
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -811,7 +811,12 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             w.u8(28);
             enc_exprs(w, exprs);
         }
-        Expr::TaggedTemplate { tag, quasis, subs } => {
+        Expr::TaggedTemplate {
+            tag,
+            site: _,
+            quasis,
+            subs,
+        } => {
             w.u8(29);
             enc_expr(w, tag);
             w.uv(quasis.len() as u64);
@@ -954,12 +959,16 @@ fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
         28 => Expr::Seq(dec_exprs(r)?),
         29 => {
             let tag = dec_boxed_expr(r)?;
+            // Decoding constructs a fresh Parse Node, so it receives a fresh identity just as a
+            // normal parse would. The site identity is intentionally not serialized.
+            let site = crate::parser::next_template_site_id();
             let (n, mut quasis) = r.collection()?;
             for _ in 0..n {
                 quasis.push((dec_opt_str(r)?, r.str()?));
             }
             Expr::TaggedTemplate {
                 tag,
+                site,
                 quasis,
                 subs: dec_exprs(r)?,
             }

@@ -2683,9 +2683,12 @@ impl Interp {
                 args,
                 optional,
             } => self.eval_call(callee, args, *optional, env),
-            Expr::TaggedTemplate { tag, quasis, subs } => {
-                self.eval_tagged_template(tag, quasis, subs, env)
-            }
+            Expr::TaggedTemplate {
+                tag,
+                site,
+                quasis,
+                subs,
+            } => self.eval_tagged_template(tag, *site, quasis, subs, env),
             Expr::New { callee, args } => {
                 let c = self.eval(callee, env)?;
                 let argv = self.eval_args(args, env)?;
@@ -3048,11 +3051,11 @@ impl Interp {
     fn eval_tagged_template(
         &mut self,
         tag: &Expr,
+        site_id: u64,
         quasis: &[(Option<String>, String)],
         subs: &[Expr],
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        let strings = self.template_object(quasis)?;
         // Evaluate the tag callee, capturing `this` for method tags (`obj.tag\`...\``).
         let (func, this) = match tag {
             Expr::Member { obj, prop, .. } => {
@@ -3072,6 +3075,9 @@ impl Interp {
         if !func.is_callable() {
             return Err(self.throw("TypeError", "tag is not a function"));
         }
+        // Tagged-template evaluation obtains the per-Realm TemplateMap entry only after the tag
+        // reference is evaluated and validated (ECMA-262 Tagged Templates evaluation order).
+        let strings = self.template_object(site_id, quasis)?;
         let mut argv = vec![strings];
         for s in subs {
             argv.push(self.eval(s, env)?);
@@ -3083,9 +3089,10 @@ impl Interp {
     /// re-evaluating the same site passes the identical object.
     pub(crate) fn template_object(
         &mut self,
+        site_id: u64,
         quasis: &[(Option<String>, String)],
     ) -> Result<Value, Abrupt> {
-        let site = quasis.as_ptr() as usize;
+        let site = (Rc::as_ptr(&self.global) as usize, site_id);
         let strings = match self.template_cache.get(&site) {
             Some(v) => v.clone(),
             None => {
@@ -3236,7 +3243,13 @@ impl Interp {
         e: &Expr,
         env: &Env,
     ) -> Result<Option<(Value, Value, Vec<Value>)>, Abrupt> {
-        let Expr::TaggedTemplate { tag, quasis, subs } = e else {
+        let Expr::TaggedTemplate {
+            tag,
+            site,
+            quasis,
+            subs,
+        } = e
+        else {
             return Ok(None);
         };
         let (func, this) = match &**tag {
@@ -3254,7 +3267,7 @@ impl Interp {
         if !func.is_callable() {
             return Ok(None);
         }
-        let strings = self.template_object(quasis)?;
+        let strings = self.template_object(*site, quasis)?;
         let mut argv = vec![strings];
         for s in subs {
             argv.push(self.eval(s, env)?);
@@ -3598,6 +3611,8 @@ impl Interp {
         if matches!(value, Value::Obj(_)) {
             match self.get_member(&value, "then") {
                 Ok(then) if then.is_callable() => {
+                    let (realm, host_context) =
+                        self.promise_job_target(&then, self.host_job_context);
                     let (res, rej) = self.make_resolver_pair(promise);
                     let runner =
                         crate::builtins::make_thenable_job(self, then, value.clone(), res, rej);
@@ -3606,6 +3621,8 @@ impl Interp {
                         result: Value::Undefined,
                         value: Value::Undefined,
                         fulfilled: true,
+                        realm,
+                        host_context,
                     });
                     return;
                 }
@@ -3649,13 +3666,16 @@ impl Interp {
             self.unhandled_rejections
                 .insert(ptr, (promise.clone(), value.clone()));
         }
-        for (on_f, on_r, result) in reactions {
+        for (on_f, on_r, result, host_context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
+            let (realm, host_context) = self.promise_job_target(&handler, host_context);
             self.microtasks.push_back(Job {
                 handler,
                 result,
                 value: value.clone(),
                 fulfilled,
+                realm,
+                host_context,
             });
         }
     }
@@ -3681,33 +3701,74 @@ impl Interp {
             _ => return,
         };
         let status = self.promises.get(&ptr).map(|s| s.status).unwrap_or(0);
+        let host_context = self.host_job_context;
         // Attaching a handler marks the rejection handled (HostPromiseRejectionTracker "handle").
         self.unhandled_rejections.remove(&ptr);
         match status {
             0 => {
                 if let Some(s) = self.promises.get_mut(&ptr) {
-                    s.reactions.push((on_f, on_r, result.clone()));
+                    s.reactions.push((on_f, on_r, result.clone(), host_context));
                 }
             }
             1 => {
                 let v = self.promises[&ptr].value.clone();
+                let (realm, host_context) = self.promise_job_target(&on_f, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_f,
                     result: result.clone(),
                     value: v,
                     fulfilled: true,
+                    realm,
+                    host_context,
                 });
             }
             _ => {
                 let v = self.promises[&ptr].value.clone();
+                let (realm, host_context) = self.promise_job_target(&on_r, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_r,
                     result: result.clone(),
                     value: v,
                     fulfilled: false,
+                    realm,
+                    host_context,
                 });
             }
         }
+    }
+
+    /// Return the Realm/settings pair passed conceptually to HostEnqueuePromiseJob.
+    ///
+    /// ECMA-262 NewPromiseReactionJob and NewPromiseResolveThenableJob derive the Realm from the
+    /// callable that will run. HTML then obtains the job settings from that Realm. A real
+    /// cross-Realm callable therefore uses the target Realm's settings; the captured context is
+    /// retained only when an embedder multiplexes multiple settings objects through one Realm.
+    fn promise_job_target(
+        &mut self,
+        handler: &Value,
+        same_realm_context: u64,
+    ) -> (Option<usize>, u64) {
+        if !handler.is_callable() {
+            return (None, same_realm_context);
+        }
+        let current_realm = Rc::as_ptr(&self.global) as usize;
+        let realm = match handler {
+            Value::Obj(handler) => match self.get_function_realm_global(handler) {
+                Ok(Some(realm)) => realm,
+                // NewPromiseReactionJob uses the current Realm when GetFunctionRealm completes
+                // abruptly (for example, a revoked callable Proxy).
+                Ok(None) | Err(_) => current_realm,
+            },
+            _ => current_realm,
+        };
+        let host_context = if realm == current_realm {
+            same_realm_context
+        } else {
+            self.realms
+                .get(&realm)
+                .map_or(same_realm_context, |state| state.host_job_context)
+        };
+        (Some(realm), host_context)
     }
 
     /// Drain the microtask queue (called after the main script). Bounded to avoid an unbounded loop.
@@ -3855,6 +3916,41 @@ impl Interp {
         &mut self,
         job: crate::interpreter::Job,
     ) -> Result<(), crate::InterruptReason> {
+        // ECMA-262 §9.5 schedules a Promise job in the Realm supplied by
+        // HostEnqueuePromiseJob. HTML §8.1.6.6.4 prepares that Realm's settings before invoking
+        // the job. Enter the Realm around the complete abstract closure, rather than waiting for
+        // `Call(handler)` to switch after the host preparation callback has already run.
+        let current_realm = Rc::as_ptr(&self.global) as usize;
+        if let Some(target_realm) = job.realm.filter(|realm| *realm != current_realm) {
+            if let Some(target) = self
+                .realms
+                .get(&target_realm)
+                .map(crate::interpreter::RealmState::snapshot_clone)
+            {
+                let saved = self.snapshot_realm();
+                self.restore_realm(&target);
+                let result = self.run_job_in_active_realm(job);
+                let updated = self.snapshot_realm();
+                self.realms.insert(target_realm, updated);
+                self.restore_realm(&saved);
+                return result;
+            }
+        }
+        self.run_job_in_active_realm(job)
+    }
+
+    fn run_job_in_active_realm(
+        &mut self,
+        job: crate::interpreter::Job,
+    ) -> Result<(), crate::InterruptReason> {
+        let previous_host_context = self.host_job_context;
+        let switch_host_context = job.realm.is_some() && job.host_context != previous_host_context;
+        if switch_host_context {
+            if let Some(enter) = self.host_job_context_enter {
+                enter(self, job.host_context);
+            }
+            self.switch_host_job_context(job.host_context);
+        }
         if job.handler.is_callable() {
             match self.call(
                 job.handler.clone(),
@@ -3863,13 +3959,27 @@ impl Interp {
             ) {
                 Ok(r) => self.resolve_promise(&job.result, r),
                 Err(Abrupt::Throw(e)) => self.reject_promise(&job.result, e),
-                Err(Abrupt::Interrupt(reason)) => return Err(reason),
+                Err(Abrupt::Interrupt(reason)) => {
+                    if switch_host_context {
+                        if let Some(leave) = self.host_job_context_leave {
+                            leave(self);
+                        }
+                        self.switch_host_job_context(previous_host_context);
+                    }
+                    return Err(reason);
+                }
                 Err(_) => {}
             }
         } else if job.fulfilled {
             self.resolve_promise(&job.result, job.value);
         } else {
             self.reject_promise(&job.result, job.value);
+        }
+        if switch_host_context {
+            if let Some(leave) = self.host_job_context_leave {
+                leave(self);
+            }
+            self.switch_host_job_context(previous_host_context);
         }
         Ok(())
     }
@@ -5392,6 +5502,9 @@ impl Interp {
                         if let Some(v) = self.map_data.remove(&sp) {
                             self.map_data.insert(dp, v);
                             moved_collection = true;
+                        }
+                        if let Some(v) = self.collection_index.remove(&sp) {
+                            self.collection_index.insert(dp, v);
                         }
                         // WeakMap/WeakSet's [[WeakMapData]]/[[WeakSetData]] and its acceleration
                         // index are one internal slot implementation and must move together to the

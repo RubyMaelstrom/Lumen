@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use std::hash::{Hash, Hasher};
 
 pub(super) fn install_collections(it: &mut Interp) {
     // A unique private object used as the deleted-entry tombstone key (see map_tombstone).
@@ -29,18 +30,12 @@ pub(super) fn install_map_methods(it: &mut Interp) {
     // getOrInsert(key, value): return the existing value, or insert and return `value`.
     it.def_method(&mp, "getOrInsert", 2, |i, this, a| {
         let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-        let key = arg(a, 0);
-        if let Some((_, v)) = i.map_data[&ptr]
-            .iter()
-            .find(|(k, _)| same_value_zero(k, &key))
-        {
-            return Ok(v.clone());
+        let key = canonicalize_map_key(arg(a, 0));
+        if let Some(value) = collection_get(i, ptr, &key) {
+            return Ok(value);
         }
         let value = arg(a, 1);
-        i.map_data
-            .entry(ptr)
-            .or_default()
-            .push((key, value.clone()));
+        collection_set(i, ptr, key, value.clone());
         Ok(value)
     });
     it.def_method(&mp, "getOrInsertComputed", 2, |i, this, a| {
@@ -51,26 +46,12 @@ pub(super) fn install_map_methods(it: &mut Interp) {
         if !cb.is_callable() {
             return Err(i.make_error("TypeError", "callback is not callable"));
         }
-        if let Some((_, v)) = i.map_data[&ptr]
-            .iter()
-            .find(|(k, _)| same_value_zero(k, &key))
-        {
-            return Ok(v.clone());
+        if let Some(value) = collection_get(i, ptr, &key) {
+            return Ok(value);
         }
         let value = ab(i.call(cb, Value::Undefined, std::slice::from_ref(&key)))?;
         // The callback may have inserted the key; the computed value overwrites that mutation.
-        if let Some(entry) = i
-            .map_data
-            .get_mut(&ptr)
-            .and_then(|d| d.iter_mut().find(|(k, _)| same_value_zero(k, &key)))
-        {
-            entry.1 = value.clone();
-        } else {
-            i.map_data
-                .entry(ptr)
-                .or_default()
-                .push((key, value.clone()));
-        }
+        collection_set(i, ptr, key, value.clone());
         Ok(value)
     });
 }
@@ -79,23 +60,24 @@ pub(super) fn install_map_methods(it: &mut Interp) {
 fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
     // Requires a real Set [[SetData]] slot — a Map (which shares the map_data table) is rejected.
     let p = coll_ptr_kind(i, this, Some("Set"))?;
-    Ok(i.map_data[&p].iter().map(|(k, _)| k.clone()).collect())
+    Ok(i.map_data[&p]
+        .iter()
+        .filter(|(key, _)| !is_tombstone(i, key))
+        .map(|(key, _)| key.clone())
+        .collect())
 }
 /// Build a fresh Set from `values` (deduped via SameValueZero).
 fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
     let obj =
         new_from_ctor(i, "Set").unwrap_or_else(|_| Object::new(i.extra_protos.get("Set").cloned()));
     let ptr = Rc::as_ptr(&obj) as usize;
-    let mut entries: Vec<(Value, Value)> = Vec::new();
-    for v in values {
-        // Set records canonicalize -0 to +0.
-        let v = canonicalize_map_key(v);
-        if !entries.iter().any(|(k, _)| same_value_zero(k, &v)) {
-            entries.push((v.clone(), v));
-        }
-    }
     i.gc_pin(&obj);
-    i.map_data.insert(ptr, entries);
+    i.map_data.insert(ptr, Vec::new());
+    i.collection_index.insert(ptr, Default::default());
+    for value in values {
+        let value = canonicalize_map_key(value);
+        collection_set(i, ptr, value.clone(), value);
+    }
     set_internal(&obj, "__ck", Value::str("Set"));
     Value::Obj(obj)
 }
@@ -192,12 +174,7 @@ fn set_like_keys(i: &mut Interp, keys: &Value, other: &Value) -> Result<Vec<Valu
 /// SetDataHas against the LIVE backing data (skipping tombstones) — set-like callbacks may have
 /// mutated the receiver since any snapshot was taken.
 fn set_data_has(i: &Interp, ptr: usize, v: &Value) -> bool {
-    match i.map_data.get(&ptr) {
-        Some(entries) => entries
-            .iter()
-            .any(|(k, _)| !is_tombstone(i, k) && same_value_zero(k, v)),
-        None => false,
-    }
+    collection_has(i, ptr, v)
 }
 
 pub(super) fn install_set_methods(it: &mut Interp) {
@@ -409,6 +386,7 @@ fn collection_ctor(
         i.weak_collection_index.insert(ptr, Default::default());
     } else {
         i.map_data.insert(ptr, Vec::new());
+        i.collection_index.insert(ptr, Default::default());
     }
     // Brand the instance so prototype methods can reject cross-collection receivers.
     set_internal(&obj, "__ck", Value::str(name));
@@ -459,10 +437,166 @@ fn map_tombstone(i: &Interp) -> Value {
 
 /// Count the live (non-tombstone) entries of a collection.
 fn coll_live_len(i: &Interp, ptr: usize) -> usize {
-    i.map_data
+    i.collection_index
         .get(&ptr)
-        .map(|e| e.iter().filter(|(k, _)| !is_tombstone(i, k)).count())
-        .unwrap_or(0)
+        .map_or(0, crate::fasthash::FastMap::len)
+}
+
+/// Locate a live ordered entry through the SameValueZero hash index.
+fn collection_entry_index(i: &Interp, ptr: usize, key: &Value) -> Option<usize> {
+    let hash = collection_key_hash(key);
+    let bucket = i.collection_index.get(&ptr)?.get(&hash)?;
+    let entries = i.map_data.get(&ptr)?;
+    let matches = |offset: usize| {
+        entries
+            .get(offset)
+            .is_some_and(|(candidate, _)| same_value_zero(candidate, key))
+    };
+    match bucket {
+        crate::interpreter::CollectionBucket::One(offset) => matches(*offset).then_some(*offset),
+        crate::interpreter::CollectionBucket::Many(offsets) => {
+            offsets.iter().copied().find(|offset| matches(*offset))
+        }
+    }
+}
+
+fn collection_get(i: &Interp, ptr: usize, key: &Value) -> Option<Value> {
+    let index = collection_entry_index(i, ptr, key)?;
+    i.map_data
+        .get(&ptr)?
+        .get(index)
+        .map(|(_, value)| value.clone())
+}
+
+fn collection_has(i: &Interp, ptr: usize, key: &Value) -> bool {
+    collection_entry_index(i, ptr, key).is_some()
+}
+
+/// Set an existing ordered entry or append a new one. Deleted slots are never reused: delete then
+/// reinsert must move the key to the end, and live iterators must observe that append.
+fn collection_set(i: &mut Interp, ptr: usize, key: Value, value: Value) {
+    let key = canonicalize_map_key(key);
+    if let Some(index) = collection_entry_index(i, ptr, &key) {
+        if let Some(entry) = i
+            .map_data
+            .get_mut(&ptr)
+            .and_then(|entries| entries.get_mut(index))
+        {
+            entry.1 = value;
+        }
+        return;
+    }
+    let entries = i.map_data.entry(ptr).or_default();
+    let index = entries.len();
+    entries.push((key, value));
+    let hash = collection_key_hash(&entries[index].0);
+    use crate::interpreter::CollectionBucket;
+    match i.collection_index.entry(ptr).or_default().entry(hash) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(CollectionBucket::One(index));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+            CollectionBucket::One(previous) => {
+                *entry.get_mut() = CollectionBucket::Many(vec![*previous, index]);
+            }
+            CollectionBucket::Many(offsets) => offsets.push(index),
+        },
+    }
+}
+
+fn collection_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
+    let Some(index) = collection_entry_index(i, ptr, key) else {
+        return false;
+    };
+    let hash = collection_key_hash(key);
+    let mut remove_bucket = false;
+    if let Some(bucket) = i
+        .collection_index
+        .get_mut(&ptr)
+        .and_then(|collection| collection.get_mut(&hash))
+    {
+        match bucket {
+            crate::interpreter::CollectionBucket::One(_) => remove_bucket = true,
+            crate::interpreter::CollectionBucket::Many(offsets) => {
+                offsets.retain(|offset| *offset != index);
+                if offsets.len() == 1 {
+                    *bucket = crate::interpreter::CollectionBucket::One(offsets[0]);
+                }
+            }
+        }
+    }
+    if remove_bucket {
+        if let Some(collection) = i.collection_index.get_mut(&ptr) {
+            collection.remove(&hash);
+        }
+    }
+    let tombstone = map_tombstone(i);
+    if let Some(entry) = i
+        .map_data
+        .get_mut(&ptr)
+        .and_then(|entries| entries.get_mut(index))
+    {
+        entry.0 = tombstone;
+        entry.1 = Value::Undefined;
+    }
+    true
+}
+
+/// Hash a Map/Set key according to SameValueZero. A bucket hit is always checked with the full
+/// equality relation, so ordinary hash collisions cannot alias distinct JavaScript keys. Keeping
+/// only the hash in the parallel index also avoids retaining a second String/BigInt owner.
+fn collection_key_hash(value: &Value) -> u64 {
+    let mut state = crate::fasthash::FxHasher::default();
+    match value {
+        Value::Undefined => state.write_u8(0),
+        Value::Empty => state.write_u8(1),
+        Value::Null => state.write_u8(2),
+        Value::Bool(value) => {
+            state.write_u8(3);
+            value.hash(&mut state);
+        }
+        Value::Num(value) => {
+            state.write_u8(4);
+            let bits = if *value == 0.0 {
+                0.0f64.to_bits()
+            } else if value.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                value.to_bits()
+            };
+            state.write_u64(bits);
+        }
+        Value::BigInt(value) => {
+            state.write_u8(5);
+            value.hash(&mut state);
+        }
+        Value::Str(value) => {
+            state.write_u8(6);
+            value.hash(&mut state);
+        }
+        Value::Sym(value) => {
+            state.write_u8(7);
+            state.write_u64(value.id);
+        }
+        Value::Obj(value) => {
+            state.write_u8(8);
+            state.write_usize(Rc::as_ptr(value) as usize);
+        }
+    }
+    state.finish()
+}
+
+fn collection_clear(i: &mut Interp, ptr: usize) {
+    let tombstone = map_tombstone(i);
+    if let Some(entries) = i.map_data.get_mut(&ptr) {
+        for entry in entries {
+            entry.0 = tombstone.clone();
+            entry.1 = Value::Undefined;
+        }
+    }
+    if let Some(index) = i.collection_index.get_mut(&ptr) {
+        index.clear();
+    }
 }
 
 fn map_size(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
@@ -498,22 +632,14 @@ pub(super) fn install_map_like(
         |i, this, a| {
             let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
             let key = canonicalize_map_key(arg(a, 0));
-            let e = i.map_data.entry(ptr).or_default();
-            if !e.iter().any(|(k, _)| same_value_zero(k, &key)) {
-                e.push((key.clone(), key));
-            }
+            collection_set(i, ptr, key.clone(), key);
             Ok(this)
         }
     } else {
         |i, this, a| {
             let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
             let (key, val) = (canonicalize_map_key(arg(a, 0)), arg(a, 1));
-            let e = i.map_data.entry(ptr).or_default();
-            if let Some(slot) = e.iter_mut().find(|(k, _)| same_value_zero(k, &key)) {
-                slot.1 = val;
-            } else {
-                e.push((key, val));
-            }
+            collection_set(i, ptr, key, val);
             Ok(this)
         }
     };
@@ -526,39 +652,22 @@ pub(super) fn install_map_like(
     if !is_set {
         it.def_method(&proto, "get", 1, |i, this, a| {
             let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            let key = arg(a, 0);
-            Ok(i.map_data
-                .get(&ptr)
-                .and_then(|e| {
-                    e.iter()
-                        .find(|(k, _)| same_value_zero(k, &key))
-                        .map(|(_, v)| v.clone())
-                })
-                .unwrap_or(Value::Undefined))
+            let key = canonicalize_map_key(arg(a, 0));
+            Ok(collection_get(i, ptr, &key).unwrap_or(Value::Undefined))
         });
     }
     // has/delete are shared but brand-check the exact kind via kind-specific fn pointers.
     let has_fn: NativeFn = if is_set {
         |i, this, a| {
             let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
-            let key = arg(a, 0);
-            Ok(Value::Bool(
-                i.map_data
-                    .get(&ptr)
-                    .map(|e| e.iter().any(|(k, _)| same_value_zero(k, &key)))
-                    .unwrap_or(false),
-            ))
+            let key = canonicalize_map_key(arg(a, 0));
+            Ok(Value::Bool(collection_has(i, ptr, &key)))
         }
     } else {
         |i, this, a| {
             let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            let key = arg(a, 0);
-            Ok(Value::Bool(
-                i.map_data
-                    .get(&ptr)
-                    .map(|e| e.iter().any(|(k, _)| same_value_zero(k, &key)))
-                    .unwrap_or(false),
-            ))
+            let key = canonicalize_map_key(arg(a, 0));
+            Ok(Value::Bool(collection_has(i, ptr, &key)))
         }
     };
     it.def_method(&proto, "has", 1, has_fn);
@@ -568,37 +677,13 @@ pub(super) fn install_map_like(
         |i, this, a| {
             let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
             let key = canonicalize_map_key(arg(a, 0));
-            let tomb = map_tombstone(i);
-            let mut removed = false;
-            if let Some(e) = i.map_data.get_mut(&ptr) {
-                for slot in e.iter_mut() {
-                    if same_value_zero(&slot.0, &key) {
-                        slot.0 = tomb.clone();
-                        slot.1 = Value::Undefined;
-                        removed = true;
-                        break;
-                    }
-                }
-            }
-            Ok(Value::Bool(removed))
+            Ok(Value::Bool(collection_delete(i, ptr, &key)))
         }
     } else {
         |i, this, a| {
             let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
             let key = canonicalize_map_key(arg(a, 0));
-            let tomb = map_tombstone(i);
-            let mut removed = false;
-            if let Some(e) = i.map_data.get_mut(&ptr) {
-                for slot in e.iter_mut() {
-                    if same_value_zero(&slot.0, &key) {
-                        slot.0 = tomb.clone();
-                        slot.1 = Value::Undefined;
-                        removed = true;
-                        break;
-                    }
-                }
-            }
-            Ok(Value::Bool(removed))
+            Ok(Value::Bool(collection_delete(i, ptr, &key)))
         }
     };
     it.def_method(&proto, "delete", 1, delete_fn);
@@ -607,17 +692,13 @@ pub(super) fn install_map_like(
     let clear_fn: NativeFn = if is_set {
         |i, this, _| {
             let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
-            if let Some(e) = i.map_data.get_mut(&ptr) {
-                e.clear();
-            }
+            collection_clear(i, ptr);
             Ok(Value::Undefined)
         }
     } else {
         |i, this, _| {
             let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            if let Some(e) = i.map_data.get_mut(&ptr) {
-                e.clear();
-            }
+            collection_clear(i, ptr);
             Ok(Value::Undefined)
         }
     };
@@ -708,12 +789,13 @@ pub(super) fn install_map_like(
             }
             let m = Object::new(i.extra_protos.get("Map").cloned());
             let ptr = Rc::as_ptr(&m) as usize;
-            let entries: Vec<(Value, Value)> = groups
-                .into_iter()
-                .map(|(k, v)| (k, i.make_array(v)))
-                .collect();
             i.gc_pin(&m);
-            i.map_data.insert(ptr, entries);
+            i.map_data.insert(ptr, Vec::new());
+            i.collection_index.insert(ptr, Default::default());
+            for (key, values) in groups {
+                let values = i.make_array(values);
+                collection_set(i, ptr, key, values);
+            }
             set_internal(&m, "__ck", Value::str("Map"));
             Ok(Value::Obj(m))
         });

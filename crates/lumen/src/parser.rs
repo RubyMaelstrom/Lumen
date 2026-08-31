@@ -5,6 +5,17 @@ use crate::ast::*;
 use crate::lexer::tokenize_with_source;
 use crate::token::{Tok, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Pointer addresses can be reused after a short-lived eval AST is dropped.  A process-unique
+// Parse Node identity preserves the ECMA-262 template site distinction across such evaluations.
+static NEXT_TEMPLATE_SITE: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a fresh Parse Node identity for tagged templates. Snapshot decoding uses the same
+/// allocator because every decode creates a new AST (and therefore new template sites).
+pub(crate) fn next_template_site_id() -> u64 {
+    NEXT_TEMPLATE_SITE.fetch_add(1, Ordering::Relaxed)
+}
 
 pub struct ParseError {
     pub message: String,
@@ -2952,6 +2963,7 @@ impl Parser {
         }
         Ok(Expr::TaggedTemplate {
             tag: Box::new(tag),
+            site: next_template_site_id(),
             quasis,
             subs,
         })

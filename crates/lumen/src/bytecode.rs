@@ -901,9 +901,9 @@ pub struct Chunk {
     forwarded_capacity_hint: std::cell::Cell<u8>,
     /// Inner function templates for `MakeClosure`.
     funcs: Vec<Rc<Function>>,
-    /// Tagged-template sites retained by the chunk. Their stable backing address is the
-    /// GetTemplateObject site identity used by the realm cache.
-    templates: Vec<Vec<(Option<String>, String)>>,
+    /// Tagged-template sites retained by the chunk. Each entry carries the Parse Node identity
+    /// used by the Realm's GetTemplateObject cache.
+    templates: Vec<(u64, Vec<(Option<String>, String)>)>,
     eval_exprs: Vec<EvalExprPlan>,
     class_plans: Vec<ClassPlan>,
     /// AssignmentPattern expression trees retained only for generic [`Op::AssignTarget`] sites.
@@ -2356,7 +2356,16 @@ impl CaptureScan {
 
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
-    compile_inner(func, &Default::default(), None, None)
+    compile_inner(func, &Default::default(), None, None, false)
+}
+
+/// Compile a derived class constructor against a retained Function Environment Record.
+///
+/// Unlike an ordinary lean frame, that environment starts with an uninitialized `this` binding
+/// and carries the active constructor and `new.target`; `super()` binds `this` and initializes the
+/// derived class's instance elements through the shared ECMA-262 algorithm.
+pub(crate) fn compile_derived_constructor(func: &Function) -> Option<Rc<Chunk>> {
+    compile_inner(func, &Default::default(), None, None, true)
 }
 
 /// Compile a Source Text Module's already-instantiated body as a strict heap continuation.
@@ -2383,7 +2392,7 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         code2: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
     };
-    compile_inner(&function, &Default::default(), None, Some(bindings))
+    compile_inner(&function, &Default::default(), None, Some(bindings), false)
 }
 
 /// Second-stage compile: same as [`compile`], with hot monomorphic callees from `plan` spliced
@@ -2396,7 +2405,7 @@ pub(crate) fn compile_with_inlines(
     let seed = std::env::var_os("LUMEN_JIT_NO_CACHE_SEED")
         .is_none()
         .then_some(hot);
-    compile_inner(func, plan, seed, None)
+    compile_inner(func, plan, seed, None, false)
 }
 
 fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])> {
@@ -2501,6 +2510,7 @@ fn compile_inner(
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
     hot: Option<&Chunk>,
     module_bindings: Option<&[(String, bool)]>,
+    derived_constructor: bool,
 ) -> Option<Rc<Chunk>> {
     // Body facts the scanner already knows: `new.target` is an observation channel into the
     // activation that slots do not provide; `this` / `arguments` in an ordinary arrow are free
@@ -2510,9 +2520,10 @@ fn compile_inner(
     let is_coroutine = func.is_generator || func.is_async;
     // ECMA-262 §9.4.5 GetNewTarget reads the nearest this-binding Function Environment Record.
     // Coroutine calls have already materialized that activation before this chunk is created and
-    // retain it for every resumption, including as the lexical parent of async arrows. Lean
-    // ordinary frames still omit the activation, so keep their conservative exclusion.
-    if scan & SCAN_NEW_TARGET != 0 && !is_coroutine {
+    // retain it for every resumption, including as the lexical parent of async arrows. A compiled
+    // derived constructor likewise runs under its required Function Environment Record. Other
+    // lean ordinary frames still omit the activation, so keep their conservative exclusion.
+    if scan & SCAN_NEW_TARGET != 0 && !is_coroutine && !derived_constructor {
         log_bail("fn", "new.target");
         return None;
     }
@@ -2579,8 +2590,12 @@ fn compile_inner(
     let mut c = Compiler {
         // A module already has its own `this` binding, initialized to undefined. Reuse that
         // environment for nested arrows instead of synthesizing a function activation.
-        env_this: env_this && module_bindings.is_none(),
+        // A derived constructor already runs under its mandatory Function Environment Record;
+        // arrows must close over that live, initially-uninitialized `this` binding instead of a
+        // child activation seeded with the entry-time placeholder.
+        env_this: env_this && module_bindings.is_none() && !derived_constructor,
         lexical_this: func.is_arrow,
+        derived_constructor,
         strict: func.is_strict,
         is_coroutine,
         module_body: module_bindings.is_some(),
@@ -3223,7 +3238,7 @@ struct Compiler {
     /// The current lexical home has the same spelling when the declaration statement executes.
     annexb_targets: crate::fasthash::FastMap<usize, Home>,
     funcs: Vec<Rc<Function>>,
-    templates: Vec<Vec<(Option<String>, String)>>,
+    templates: Vec<(u64, Vec<(Option<String>, String)>)>,
     eval_exprs: Vec<EvalExprPlan>,
     class_plans: Vec<ClassPlan>,
     assignment_targets: Vec<AssignmentTargetPlan>,
@@ -3233,6 +3248,9 @@ struct Compiler {
     env_this: bool,
     env_arguments: bool,
     lexical_this: bool,
+    /// A derived constructor reads the live Function Environment Record: its `this` binding is
+    /// uninitialized until `super()` and its `new.target` belongs to that same record.
+    derived_constructor: bool,
     /// Speculative-inline plan stack (second-stage only): one frame per active splice, each
     /// mapping that frame's call-site ordinal (== the function's first-compile `CallIc` index —
     /// same AST, same emission order) to the callees to splice. See [`plan_inlines`].
@@ -4318,8 +4336,8 @@ impl Compiler {
     /// nullish pops what the link would have consumed and jumps to a shared pad that pushes the
     /// chain's `undefined` result (skipping every later link, key expression, and argument, per
     /// spec). Non-optional links compile as usual. Public Member/Index method calls and plain
-    /// optional callees preserve their distinct receiver rules; optional `delete`, private names,
-    /// and `super` retain the compatibility path.
+    /// optional callees preserve their distinct receiver rules, including private method
+    /// receivers. Optional `delete` and `super` retain their separate paths.
     fn opt_chain(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
         match e {
             Expr::Member {
@@ -4334,6 +4352,19 @@ impl Compiler {
                 let i = self.name_idx(prop);
                 let c = self.new_cache(i);
                 self.emit(Op::GetProp(i, c));
+                Ok(())
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional,
+            } if !matches!(**obj, Expr::Super) && prop.starts_with('#') => {
+                self.opt_chain(obj, shorts)?;
+                if *optional {
+                    self.opt_link(1, shorts);
+                }
+                let name = self.name_idx(prop);
+                self.emit(Op::GetPrivate(name));
                 Ok(())
             }
             Expr::Index {
@@ -4369,6 +4400,22 @@ impl Compiler {
                     if *call_opt {
                         // `a.b?.(args)`: the method value is peeked; nullish drops
                         // [receiver, method].
+                        self.opt_link(2, shorts);
+                    }
+                    self.finish_call(args, true, true)
+                }
+                Expr::Member {
+                    obj,
+                    prop,
+                    optional,
+                } if !matches!(**obj, Expr::Super) && prop.starts_with('#') => {
+                    self.opt_chain(obj, shorts)?;
+                    if *optional {
+                        self.opt_link(1, shorts);
+                    }
+                    let name = self.name_idx(prop);
+                    self.emit(Op::GetPrivateMethod(name));
+                    if *call_opt {
                         self.opt_link(2, shorts);
                     }
                     self.finish_call(args, true, true)
@@ -5076,20 +5123,16 @@ impl Compiler {
                 result
             }
             // `try` completion handling follows ECMA-262 §14.15.3. Catch consumes only a throw.
-            // A coroutine finally handler intercepts throw/return, records that completion in
-            // hidden slots, runs the finalizer once (which may suspend), then re-issues the saved
-            // completion unless the finalizer itself completed abruptly.
+            // A finally handler intercepts throw/return/break/continue, records that Completion
+            // in hidden slots, runs the finalizer once, then re-issues the saved Completion unless
+            // the finalizer itself completed abruptly. The same representation also survives a
+            // coroutine finalizer's suspension.
             Stmt::Try {
                 block,
                 handler,
                 finalizer,
             } => {
                 if let Some(finalizer) = finalizer {
-                    if !self.is_coroutine {
-                        log_bail("stmt", "try/finally outside supported coroutine subset");
-                        return Err(Bail);
-                    }
-
                     let completion_slot = self.fresh_slot("%finally-value%");
                     let completion_kind = self.fresh_slot("%finally-kind%");
                     let completion_target_depth = self.fresh_slot("%finally-target-depth%");
@@ -6894,7 +6937,7 @@ impl Compiler {
             } if op == "="
                 && !prop.starts_with('#')
                 && match &**mobj {
-                    Expr::This => !self.lexical_this,
+                    Expr::This => !self.lexical_this && !self.derived_constructor,
                     Expr::Ident(name) => {
                         matches!(self.home(name), Some(Home::Slot(..))) && no_assign_to(value, name)
                     }
@@ -7213,7 +7256,7 @@ impl Compiler {
     /// OrdinaryCallBindThis and `SuperThis` could resolve an enclosing/global `this` instead.
     fn emit_super_this(&mut self) {
         self.uses_this = true;
-        self.emit(if self.lexical_this {
+        self.emit(if self.lexical_this || self.derived_constructor {
             Op::LoadLexicalThis
         } else {
             Op::SuperThis
@@ -7288,7 +7331,7 @@ impl Compiler {
                     }
                 }
                 self.uses_this = true;
-                self.emit(if self.lexical_this {
+                self.emit(if self.lexical_this || self.derived_constructor {
                     Op::LoadLexicalThis
                 } else {
                     Op::LoadThis
@@ -7322,7 +7365,7 @@ impl Compiler {
                             return Ok(());
                         }
                     }
-                    Expr::This if !self.lexical_this => {
+                    Expr::This if !self.lexical_this && !self.derived_constructor => {
                         self.uses_this = true;
                         let i = self.name_idx(prop);
                         let c = self.new_cache(i);
@@ -7546,7 +7589,12 @@ impl Compiler {
                 self.emit(Op::PrivateIn(name));
                 Ok(())
             }
-            Expr::TaggedTemplate { tag, quasis, subs } => {
+            Expr::TaggedTemplate {
+                tag,
+                site: site_id,
+                quasis,
+                subs,
+            } => {
                 // Evaluation produces a Reference first, so method/with receivers are retained;
                 // IsCallable is checked before GetTemplateObject and every substitution.
                 match &**tag {
@@ -7606,7 +7654,7 @@ impl Compiler {
                 }
                 self.emit(Op::RequireCallable);
                 let site = self.templates.len() as u32;
-                self.templates.push(quasis.clone());
+                self.templates.push((*site_id, quasis.clone()));
                 self.emit(Op::TemplateObject(site));
                 for substitution in subs {
                     self.expr(substitution)?;
@@ -10239,7 +10287,8 @@ fn run_vm(
                 }
             }
             Op::TemplateObject(site) => {
-                stack.push(i.template_object(&chunk.templates[site as usize])?);
+                let (site_id, quasis) = &chunk.templates[site as usize];
+                stack.push(i.template_object(*site_id, quasis)?);
             }
             Op::RequireCallable => {
                 if !stack

@@ -51,6 +51,68 @@ fn closures() {
 }
 
 #[test]
+fn separate_scripts_share_the_realm_global_lexical_environment() {
+    // ECMA-262 ScriptEvaluation uses the Realm's [[GlobalEnv]] as both the
+    // VariableEnvironment and LexicalEnvironment for every Script Record.
+    // A closure created by one classic script must therefore resolve a
+    // top-level lexical binding introduced by a later classic script.
+    let mut engine = Engine::new();
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "function readLaterGlobalLexical() { return LaterGlobalLexical.value; }"
+        ),
+        "undefined"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "const LaterGlobalLexical = { value: 37 }; readLaterGlobalLexical()"
+        ),
+        "37"
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn host_reentrant_classic_scripts_use_script_evaluation_not_eval() {
+    fn run_classic(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        args: &[Value],
+    ) -> Result<Value, Value> {
+        let source = ctx
+            .coerce_string(args.first().unwrap_or(&Value::Undefined))
+            .unwrap_or_else(|_| panic!("classic-script source is coercible"))
+            .to_string();
+        match ctx.eval_classic_script_interruptible(&source) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(crate::embed::EvalError::Throw(value))) => Err(value),
+            Ok(Err(crate::embed::EvalError::Interrupted(reason))) => {
+                panic!("nested classic script interrupted: {}", reason.message())
+            }
+            Err(error) => panic!("nested classic script did not parse: {}", error.message),
+        }
+    }
+
+    // A browser host can be entered from an executing platform callback. The
+    // nested source is nevertheless a new Script Record, not eval code, and
+    // therefore installs its lexical declaration in the Realm [[GlobalEnv]].
+    let mut engine = Engine::new();
+    engine.define_global("hostRunClassic", 1, run_classic);
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "function readHostClassicLexical() { return HostClassicLexical.value; }\
+             function parserCallback(source) { return hostRunClassic(source); }\
+             parserCallback('const HostClassicLexical = { value: 41 }; readHostClassicLexical()')"
+        ),
+        "41"
+    );
+    assert_eq!(run_in(&mut engine, "readHostClassicLexical()"), "41");
+}
+
+#[test]
 fn control_flow() {
     assert_eq!(
         run("let s = 0; for (let i = 0; i < 5; i++) s += i; s"),
@@ -862,6 +924,17 @@ fn map_and_set() {
         run("var m = new Map([['a',1]]); m.delete('a'); m.size"),
         "0"
     );
+    // ECMA-262 §24.1.3.1 preserves [[MapData]]'s positions when clear() runs:
+    // an iterator suspended in the old list skips the emptied entries and can
+    // still observe entries appended afterwards.
+    assert_eq!(
+        run("var m=new Map([['a',1],['b',2]]), it=m.keys(); it.next(); m.clear(); m.set('c',3); var n=it.next(); n.value+':'+n.done"),
+        "c:false"
+    );
+    assert_eq!(
+        run("var s=new Set(['a','b']), it=s.values(); it.next(); s.clear(); s.add('c'); var n=it.next(); n.value+':'+n.done"),
+        "c:false"
+    );
     assert_eq!(
         run("var m = new Map([['a',1],['b',2]]); [...m.keys()].join(',')"),
         "a,b"
@@ -884,6 +957,32 @@ fn map_and_set() {
     assert_eq!(
         run("NaN === NaN ? 'x' : (new Set([NaN]).has(NaN) ? 'svz' : 'no')"),
         "svz"
+    );
+    assert_eq!(
+        run(
+            "var object={}, symbol=Symbol('key'), text=['same'].join('');
+             var m=new Map([[undefined,1],[null,2],[true,3],[NaN,4],[-0,5],
+                            [123456789012345678901234567890n,6],[text,7],[symbol,8],[object,9]]);
+             [m.size,m.get(Number('nope')),m.get(+0),m.get('same'),m.get(symbol),m.get(object)].join(',')"
+        ),
+        "9,4,5,7,8,9"
+    );
+}
+
+#[test]
+fn map_hash_index_tracks_large_delete_and_reinsert_workloads() {
+    // ECMA-262 §24.1 requires average-sublinear Map access. Exercise enough
+    // entries to catch an accidental return to linear scans while also
+    // verifying that delete leaves a tombstone and reinsertion appends a new
+    // ordered entry with the updated value.
+    assert_eq!(
+        run("var m = new Map();
+             for (var i = 0; i < 20000; i++) m.set(i, i);
+             for (var i = 0; i < 20000; i += 2) m.delete(i);
+             for (var i = 0; i < 20000; i += 2) m.set(i, -i);
+             [m.size, m.get(19998), m.get(19999),
+              Array.from(m.keys()).slice(-3).join(',')].join(':')"),
+        "20000:-19998:19999:19994,19996,19998"
     );
 }
 
@@ -948,6 +1047,190 @@ fn wall_clocks_are_mutable_and_realm_local() {
     second.set_wall_clock(|| 42.0);
     assert_eq!(read_times(&mut second), "42|42|42");
     assert_eq!(read_times(&mut first), "5678|5678|5678");
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_realms_isolate_intrinsics_and_native_globals() {
+    use crate::embed::{Ctx, Value};
+
+    fn realm_marker(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Str("child".into()))
+    }
+
+    let mut engine = Engine::new();
+    let main = engine.global_this();
+    let child = engine.ctx().create_embed_realm();
+    let installed = engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            ctx.define_embed_global("realmMarker", 0, realm_marker);
+            matches!(
+                ctx.eval_classic_script_interruptible(
+                    "Array.prototype.realmOnly = 1; globalThis.authorOnly = 2;",
+                ),
+                Ok(Ok(_))
+            )
+        })
+        .unwrap_or_else(|_| panic!("enter child realm"));
+    assert!(installed, "child setup completes");
+
+    assert!(
+        matches!(
+            engine.ctx().get_member(&main, "realmMarker"),
+            Ok(Value::Undefined)
+        ),
+        "native global stays out of the main realm"
+    );
+    let child_result = engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            match ctx.eval_classic_script_interruptible(
+                "[realmMarker(), authorOnly, Array.prototype.realmOnly].join('|')",
+            ) {
+                Ok(Ok(value)) => Some(value),
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|_| panic!("re-enter child realm"))
+        .unwrap_or_else(|| panic!("child script completes"));
+    let rendered = engine
+        .ctx()
+        .coerce_string(&child_result)
+        .unwrap_or_else(|_| panic!("string"))
+        .to_string();
+    assert_eq!(rendered, "child|2|1");
+    match engine
+        .eval(
+            "String(typeof realmMarker) + '|' + String(typeof authorOnly) + '|' + String(Array.prototype.realmOnly)",
+            false,
+        )
+        .expect("main parse")
+    {
+        Completion::Value(value) => assert_eq!(value, "undefined|undefined|undefined"),
+        Completion::Throw { name, message } => panic!("main threw {name}: {message}"),
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedder_realm_snapshot_and_host_context_restore_are_isolated() {
+    use crate::embed::{Ctx, Value};
+
+    fn current_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(ctx.host_job_context() as f64))
+    }
+
+    let mut engine = Engine::new();
+    let child = engine.ctx().create_embed_realm();
+    let snapshot = crate::compile_snapshot(
+        "globalThis.snapshotRealmValue = Array.prototype.snapshotRealmOnly = 7;",
+    )
+    .unwrap_or_else(|error| panic!("compile snapshot: {error}"));
+
+    engine.ctx().set_host_job_context(41);
+    let completed = engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            ctx.set_host_job_context(42);
+            ctx.define_embed_global("currentHostContext", 0, current_context);
+            matches!(
+                ctx.eval_classic_snapshot_interruptible(&snapshot),
+                Ok(Ok(_))
+            )
+        })
+        .unwrap_or_else(|_| panic!("enter child realm"));
+    assert!(completed);
+    assert_eq!(engine.ctx().host_job_context(), 41);
+
+    let engine_level = engine
+        .with_embed_realm(&child, |engine| {
+            engine.eval("currentHostContext() + '|' + snapshotRealmValue", false)
+        })
+        .unwrap_or_else(|_| panic!("enter child Realm through Engine"))
+        .unwrap_or_else(|error| panic!("engine-level child parse: {error:?}"));
+    assert!(matches!(
+        engine_level,
+        Completion::Value(value) if value == "42|7"
+    ));
+    assert_eq!(engine.ctx().host_job_context(), 41);
+
+    engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            ctx.eval_classic_script_interruptible(
+                "globalThis.readChildRealm = function () { return currentHostContext() + '|' + snapshotRealmValue; }; class ChildEventTarget {} globalThis.ChildEventTarget = ChildEventTarget; ChildEventTarget.prototype.realmProbe = function () { return currentHostContext() + '|' + snapshotRealmValue; };",
+            )
+        })
+        .unwrap_or_else(|_| panic!("install child reader"))
+        .unwrap_or_else(|error| panic!("parse child reader: {error:?}"))
+        .unwrap_or_else(|_| panic!("child reader setup threw"));
+    let reader = engine
+        .ctx()
+        .member_get(&child, "readChildRealm")
+        .unwrap_or_else(|_| panic!("read child function"));
+    let cross_realm_result = engine
+        .call_function(&reader, child.clone(), &[])
+        .unwrap_or_else(|_| panic!("call child function from main Realm"));
+    assert_eq!(
+        engine
+            .ctx()
+            .coerce_string(&cross_realm_result)
+            .unwrap_or_else(|_| panic!("string cross-Realm result"))
+            .to_string(),
+        "42|7"
+    );
+    assert_eq!(engine.ctx().host_job_context(), 41);
+    let main = engine.global_this();
+    engine
+        .ctx()
+        .member_set(&main, "childRealm", child.clone())
+        .unwrap_or_else(|_| panic!("expose child global to main Realm"));
+    assert!(matches!(
+        engine
+            .eval("childRealm.readChildRealm()", false)
+            .unwrap_or_else(|error| panic!("main cross-Realm expression: {error:?}")),
+        Completion::Value(value) if value == "42|7"
+    ));
+    assert_eq!(engine.ctx().host_job_context(), 41);
+    assert!(matches!(
+        engine
+            .eval("new childRealm.ChildEventTarget().realmProbe()", false)
+            .unwrap_or_else(|error| panic!("main cross-Realm construct expression: {error:?}")),
+        Completion::Value(value) if value == "42|7"
+    ));
+    assert_eq!(engine.ctx().host_job_context(), 41);
+
+    assert!(matches!(
+        engine
+            .eval(
+                "String(typeof snapshotRealmValue) + '|' + String(Array.prototype.snapshotRealmOnly)",
+                false,
+            )
+            .unwrap_or_else(|error| panic!("main eval: {error:?}")),
+        Completion::Value(value) if value == "undefined|undefined"
+    ));
+
+    let child_result = engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            ctx.set_host_job_context(42);
+            ctx.eval_classic_script_interruptible(
+                "String(snapshotRealmValue) + '|' + String(Array.prototype.snapshotRealmOnly)",
+            )
+        })
+        .unwrap_or_else(|_| panic!("re-enter child realm"))
+        .unwrap_or_else(|error| panic!("parse child script: {error:?}"))
+        .unwrap_or_else(|_| panic!("child script threw"));
+    assert_eq!(
+        engine
+            .ctx()
+            .coerce_string(&child_result)
+            .unwrap_or_else(|_| panic!("string child result"))
+            .to_string(),
+        "7|7"
+    );
+    assert_eq!(engine.ctx().host_job_context(), 41);
 }
 
 #[cfg(feature = "embed")]
@@ -1606,6 +1889,195 @@ fn embedder_can_settle_a_host_promise_after_an_external_task() {
     }
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn promise_jobs_restore_their_embedder_settings_context() {
+    #[derive(Default)]
+    struct ContextTrace {
+        current: u64,
+        entered: Vec<u64>,
+        leaves: usize,
+    }
+
+    fn set_context(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        args: &[Value],
+    ) -> Result<Value, Value> {
+        let context = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
+        ctx.set_host_job_context(context);
+        Ok(Value::Undefined)
+    }
+
+    fn current_context(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
+        Ok(Value::Num(
+            ctx.host_mut::<ContextTrace>()
+                .map_or(0, |trace| trace.current) as f64,
+        ))
+    }
+
+    fn enter_context(ctx: &mut crate::embed::Ctx, context: u64) {
+        if let Some(trace) = ctx.host_mut::<ContextTrace>() {
+            trace.current = context;
+            trace.entered.push(context);
+        }
+    }
+
+    fn leave_context(ctx: &mut crate::embed::Ctx) {
+        if let Some(trace) = ctx.host_mut::<ContextTrace>() {
+            trace.current = 0;
+            trace.leaves += 1;
+        }
+    }
+
+    // NewPromiseReactionJob chooses the handler Realm when it creates the job. An HTML embedder
+    // can associate the equivalent environment-settings token at reaction registration time,
+    // then restore it even if an external task settles the promise from the default context.
+    let mut engine = Engine::new();
+    engine.ctx().op_state().put(ContextTrace::default());
+    engine.define_global("setHostContext", 1, set_context);
+    engine.define_global("currentHostContext", 0, current_context);
+    engine.set_host_job_context_hooks(enter_context, leave_context);
+    engine
+        .eval_value_interruptible(
+            "let release; const pending = new Promise(resolve => release = resolve);\
+             setHostContext(41);\
+             pending.then(() => globalThis.observedHostContext = currentHostContext());\
+             setHostContext(0); release();",
+        )
+        .expect("setup parses")
+        .unwrap_or_else(|_| panic!("setup evaluates"));
+
+    engine.run_microtasks();
+    assert_eq!(run_in(&mut engine, "observedHostContext"), "41");
+    let trace = engine
+        .ctx()
+        .host_mut::<ContextTrace>()
+        .expect("context trace remains installed");
+    assert_eq!(trace.current, 0);
+    assert_eq!(trace.entered, vec![41]);
+    assert_eq!(trace.leaves, 1);
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
+    #[derive(Default)]
+    struct ContextTrace {
+        entered: Vec<(u64, String)>,
+        leaves: usize,
+    }
+
+    fn set_context(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        args: &[Value],
+    ) -> Result<Value, Value> {
+        let context = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
+        ctx.set_host_job_context(context);
+        Ok(Value::Undefined)
+    }
+
+    fn current_context(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
+        Ok(Value::Num(ctx.host_job_context() as f64))
+    }
+
+    fn enter_context(ctx: &mut crate::embed::Ctx, context: u64) {
+        let global = ctx.global_this();
+        let realm = ctx
+            .member_get(&global, "realmLabel")
+            .ok()
+            .and_then(|value| ctx.coerce_string(&value).ok())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("unknown"));
+        if let Some(trace) = ctx.host_mut::<ContextTrace>() {
+            trace.entered.push((context, realm));
+        }
+    }
+
+    fn leave_context(ctx: &mut crate::embed::Ctx) {
+        if let Some(trace) = ctx.host_mut::<ContextTrace>() {
+            trace.leaves += 1;
+        }
+    }
+
+    // ECMA-262 §9.5 requires a queued job with a non-null Realm to run in that Realm. HTML
+    // §8.1.6.6.4 derives the job settings from that Realm and prepares them before invoking the
+    // Promise job. Even when a host also multiplexes settings tokens inside the child Realm, its
+    // preparation callback must never run against the caller's global object.
+    let mut engine = Engine::new();
+    engine.ctx().op_state().put(ContextTrace::default());
+    engine.define_global("setHostContext", 1, set_context);
+    engine.define_global("currentHostContext", 0, current_context);
+    engine.set_host_job_context_hooks(enter_context, leave_context);
+    engine.ctx().set_host_job_context(41);
+    engine
+        .eval_value_interruptible(
+            "globalThis.realmLabel = 'main'; let release; globalThis.pending = new Promise(resolve => release = resolve); globalThis.release = release;",
+        )
+        .expect("main setup parses")
+        .unwrap_or_else(|_| panic!("main setup evaluates"));
+
+    let main = engine.global_this();
+    let pending = engine
+        .ctx()
+        .member_get(&main, "pending")
+        .unwrap_or_else(|_| panic!("read pending promise"));
+    let child = engine.ctx().create_embed_realm();
+    engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            ctx.define_embed_global("setHostContext", 1, set_context);
+            ctx.define_embed_global("currentHostContext", 0, current_context);
+            ctx.member_set(&ctx.global_this(), "mainPending", pending)
+                .unwrap_or_else(|_| panic!("publish main promise to child"));
+            ctx.set_host_job_context(42);
+            ctx.eval_classic_script_interruptible(
+                "globalThis.realmLabel = 'child'; globalThis.observed = ''; mainPending.then(() => observed = currentHostContext() + '|' + realmLabel);",
+            )
+        })
+        .unwrap_or_else(|_| panic!("enter child Realm"))
+        .unwrap_or_else(|error| panic!("child setup parses: {error:?}"))
+        .unwrap_or_else(|_| panic!("child setup evaluates"));
+
+    engine
+        .eval_value_interruptible("release('ready')")
+        .expect("settlement parses")
+        .unwrap_or_else(|_| panic!("settlement evaluates"));
+    engine.run_microtasks();
+
+    let observed = engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            let global = ctx.global_this();
+            ctx.member_get(&global, "observed")
+                .ok()
+                .and_then(|value| ctx.coerce_string(&value).ok())
+                .map(|value| value.to_string())
+        })
+        .unwrap_or_else(|_| panic!("re-enter child Realm"))
+        .unwrap_or_else(|| panic!("read child observation"));
+    assert_eq!(observed, "42|child");
+    assert_eq!(engine.ctx().host_job_context(), 41);
+    let trace = engine
+        .ctx()
+        .host_mut::<ContextTrace>()
+        .expect("context trace remains installed");
+    assert!(
+        trace.entered.is_empty(),
+        "entering the child Realm already installs its settings; a legacy switch must not run"
+    );
+    assert_eq!(trace.leaves, 0);
+}
+
 #[test]
 fn gc_keeps_reachable_cycles() {
     // A cycle still reachable from a live binding must survive collection unscathed.
@@ -1886,6 +2358,38 @@ fn recursive_calls_cross_generator_continuations_without_an_artificial_budget() 
         ),
         "512"
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn execution_stack_growth_checks_before_large_native_frames_exhaust_small_host_stack() {
+    // ECMA-262 §9.4 makes execution contexts a specification mechanism rather than native Rust
+    // stack frames. Model the relatively large native frames that accessors/host calls can place
+    // between a small number of JS contexts: the growth checkpoint must engage before a normal
+    // 2 MiB worker/test stack reaches its guard page.
+    fn descend(depth: u32) -> u32 {
+        let mut native_frame = [0u8; 96 * 1024];
+        native_frame[0] = depth as u8;
+        native_frame[native_frame.len() - 1] = depth as u8;
+        let result = crate::interpreter::with_execution_stack(depth, || {
+            if depth == 24 {
+                depth
+            } else {
+                descend(depth + 1)
+            }
+        });
+        std::hint::black_box(&native_frame);
+        result
+    }
+
+    let depth = std::thread::Builder::new()
+        .name(String::from("lumen-early-stack-growth-check"))
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| descend(1))
+        .expect("spawn early stack-growth test")
+        .join()
+        .expect("early stack-growth test completes");
+    assert_eq!(depth, 24);
 }
 
 fn assert_deep_execution_contexts(tier: crate::bytecode::Tier) {
@@ -7514,6 +8018,27 @@ fn tagged_templates() {
     assert_eq!(run("String.raw`a\\nb`"), "a\\nb");
     assert_eq!(run("String.raw`${1}+${2}`"), "1+2");
 }
+
+#[test]
+fn tagged_template_sites_do_not_alias_after_eval_ast_drop() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.firstTemplate = (tag => tag)`same-source`;",
+            false,
+        )
+        .expect("first eval parses");
+    assert!(matches!(
+        engine
+            .eval(
+                "Object.is(firstTemplate, (tag => tag)`same-source`)",
+                false,
+            )
+            .expect("second eval parses"),
+        Completion::Value(value) if value == "false"
+    ));
+}
+
 #[test]
 fn bigint_prop_names() {
     assert_eq!(run("({1n:5})[1]"), "5");
@@ -10925,9 +11450,10 @@ fn weakmap_uses_ephemeron_liveness() {
 #[test]
 fn pointer_keyed_side_tables_release_dead_owners() {
     let mut engine = Engine::new();
-    let before = (
+    let before = [
         engine.interp.gc_pins.len(),
         engine.interp.map_data.len(),
+        engine.interp.collection_index.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),
@@ -10938,7 +11464,7 @@ fn pointer_keyed_side_tables_release_dead_owners() {
         engine.interp.realms.len(),
         engine.interp.weak_refs.len(),
         engine.interp.finalization_registries.len(),
-    );
+    ];
     engine
         .eval(
             "(() => {
@@ -10946,7 +11472,10 @@ fn pointer_keyed_side_tables_release_dead_owners() {
                new Uint8Array(buffer); new DataView(buffer);
                new Map([[{}, {}]]); /side-table/;
                new Proxy({}, {}); new Promise(() => {});
-               new ShadowRealm(); $262.createRealm(); new WeakRef({});
+               new ShadowRealm();
+               const child = $262.createRealm().global;
+               child.eval('(tag => tag)`retired-realm-template`');
+               new WeakRef({});
                const registry = new FinalizationRegistry(() => {});
                registry.register({}, {});
              })();",
@@ -10954,9 +11483,10 @@ fn pointer_keyed_side_tables_release_dead_owners() {
         )
         .expect("side-table setup parses");
     engine.interp.gc_collect();
-    let after = (
+    let after = [
         engine.interp.gc_pins.len(),
         engine.interp.map_data.len(),
+        engine.interp.collection_index.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),
@@ -10967,10 +11497,15 @@ fn pointer_keyed_side_tables_release_dead_owners() {
         engine.interp.realms.len(),
         engine.interp.weak_refs.len(),
         engine.interp.finalization_registries.len(),
-    );
+    ];
     assert_eq!(
         after, before,
         "dead internal-slot owners retained side tables"
+    );
+    assert_eq!(
+        engine.interp.template_cache.len(),
+        0,
+        "template objects from a retired Realm remained cached"
     );
 }
 
@@ -11749,6 +12284,211 @@ fn module_named_and_default_exports() {
         ),
         "D:1:2"
     );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn module_maps_are_partitioned_by_embedder_settings_context() {
+    // HTML gives every environment settings object its own module map. An
+    // embedder may represent several such settings objects in one Engine; its
+    // opaque host-job context is the distinction Lumen must preserve without
+    // changing the module's observable URL.
+    let mut engine = Engine::new();
+    engine
+        .eval("globalThis.moduleRuns = [];", false)
+        .expect("setup parses");
+
+    engine.ctx().set_host_job_context(41);
+    engine
+        .eval_module(
+            "moduleRuns.push('a:' + import.meta.url);",
+            "https://example.test/application.js",
+            |_, _| None,
+        )
+        .expect("first settings module parses");
+    engine
+        .eval_module(
+            "moduleRuns.push('duplicate');",
+            "https://example.test/application.js",
+            |_, _| None,
+        )
+        .expect("same settings module stays cached");
+
+    engine.ctx().set_host_job_context(42);
+    engine
+        .eval_module(
+            "moduleRuns.push('b:' + import.meta.url);",
+            "https://example.test/application.js",
+            |_, _| None,
+        )
+        .expect("second settings module parses");
+
+    match engine
+        .eval("moduleRuns.join('|')", false)
+        .expect("result parses")
+    {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "a:https://example.test/application.js|b:https://example.test/application.js"
+        ),
+        Completion::Throw { name, message } => {
+            panic!("reading module-map result threw {name}: {message}")
+        }
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn classic_script_global_lexicals_are_partitioned_by_embedder_settings_context() {
+    // HTML creates a distinct Realm/GlobalEnv for each Window. A browser host
+    // multiplexing those Windows through one Engine must be able to evaluate
+    // the same classic script in each without cross-Window lexical conflicts.
+    let mut engine = Engine::new();
+    engine.ctx().set_host_job_context(51);
+    assert!(engine
+        .ctx()
+        .eval_classic_script_interruptible("const applicationStyle = 'first';")
+        .expect("first classic script parses")
+        .is_ok());
+
+    engine.ctx().set_host_job_context(52);
+    assert!(engine
+        .ctx()
+        .eval_classic_script_interruptible("const applicationStyle = 'second';")
+        .expect("second classic script parses")
+        .is_ok());
+
+    engine.ctx().set_host_job_context(51);
+    let duplicate = engine
+        .ctx()
+        .eval_classic_script_interruptible("const applicationStyle = 'duplicate';")
+        .expect("duplicate classic script parses");
+    assert!(matches!(duplicate, Err(crate::embed::EvalError::Throw(_))));
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() {
+    // HTML "destroy a Document" removes tasks belonging to that Document.
+    // Once the embedder destroys the corresponding settings object, Lumen
+    // must not keep its GlobalEnv, module map, or queued promise reactions as
+    // permanent roots, nor recreate the retired context for a late completion.
+    let mut engine = Engine::new();
+    engine
+        .eval("globalThis.retiredJobRan = false;", false)
+        .expect("setup parses");
+    engine.ctx().set_host_job_context(61);
+    engine
+        .ctx()
+        .eval_classic_script_interruptible("const retiredLexical = { retained: true };")
+        .expect("retired classic script parses")
+        .unwrap_or_else(|_| panic!("retired classic script evaluates"));
+    engine
+        .eval_module(
+            "export const retainedModuleValue = { retained: true };",
+            "https://example.test/retired.js",
+            |_, _| None,
+        )
+        .expect("retired module parses");
+    engine
+        .ctx()
+        .eval_classic_script_interruptible("Promise.resolve().then(() => retiredJobRan = true);")
+        .expect("retired promise script parses")
+        .unwrap_or_else(|_| panic!("retired promise script evaluates"));
+    engine.ctx().set_host_job_context(0);
+
+    assert!(engine
+        .ctx()
+        .host_settings_states
+        .keys()
+        .any(|(_, context)| *context == 61));
+    assert!(engine
+        .ctx()
+        .modules
+        .keys()
+        .any(|key| crate::modules::module_map_context(key) == 61));
+    let retired_namespace = {
+        let ctx = engine.ctx();
+        let namespace = ctx
+            .modules
+            .iter()
+            .find(|(key, _)| crate::modules::module_map_context(key) == 61)
+            .map(|(_, value)| value)
+            .expect("retired settings module has a namespace");
+        ctx.object_addr(namespace)
+            .expect("module namespace is an object")
+    };
+    assert!(engine.ctx().gc_pins.contains_key(&retired_namespace));
+    assert!(engine
+        .ctx()
+        .microtasks
+        .iter()
+        .any(|job| job.host_context == 61));
+
+    assert!(engine.ctx().release_host_job_context(61));
+    assert!(!engine.ctx().release_host_job_context(61));
+    assert!(!engine
+        .ctx()
+        .host_settings_states
+        .keys()
+        .any(|(_, context)| *context == 61));
+    assert!(!engine
+        .ctx()
+        .modules
+        .keys()
+        .any(|key| crate::modules::module_map_context(key) == 61));
+    assert!(!engine
+        .ctx()
+        .module_recs
+        .keys()
+        .any(|key| crate::modules::module_map_context(key) == 61));
+    assert!(!engine
+        .ctx()
+        .microtasks
+        .iter()
+        .any(|job| job.host_context == 61));
+
+    engine.run_microtasks();
+    assert_eq!(run_in(&mut engine, "retiredJobRan"), "false");
+    engine.collect_garbage_at_idle();
+    assert!(!engine.ctx().module_ns.contains_key(&retired_namespace));
+    assert!(!engine.ctx().gc_pins.contains_key(&retired_namespace));
+    engine.ctx().set_host_job_context(61);
+    assert_eq!(engine.ctx().host_job_context, 0);
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn first_window_context_does_not_retain_realm_bootstrap_state() {
+    // A newly-created Window Realm starts with the creator's active settings
+    // token only long enough to install its own Window settings.  That first
+    // switch must replace the bootstrap GlobalEnv rather than leave an
+    // unreachable `(realm, 0)` HostSettingsState as a Rust GC root.
+    let mut engine = Engine::new();
+    let child = engine.ctx().create_embed_realm();
+    let child_ptr = engine
+        .ctx()
+        .object_addr(&child)
+        .expect("embed Realm global is an object");
+    assert!(engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| ctx.set_host_job_context(71))
+        .is_ok());
+    assert!(!engine
+        .ctx()
+        .host_settings_states
+        .keys()
+        .any(|(realm, context)| *realm == child_ptr && *context == 0));
+    assert!(engine
+        .ctx()
+        .host_settings_states
+        .keys()
+        .any(|(realm, context)| *realm == child_ptr && *context == 71));
+
+    engine.ctx().release_host_job_context(71);
+    drop(child);
+    engine.ctx().collect_garbage_for_host();
+    assert!(!engine.ctx().realms.contains_key(&child_ptr));
 }
 
 #[test]
@@ -17026,6 +17766,264 @@ fn class_constructor_call_and_return_semantics() {
 }
 
 #[test]
+fn compiled_base_class_constructors_preserve_instance_initialization_order() {
+    // ECMA-262 §10.2.2 [[Construct]] initializes a base class's instance elements before
+    // OrdinaryCallEvaluateBody. Once that ordering has been performed by the constructor path,
+    // an otherwise lowerable body may use the compiled tiers just like an ordinary constructor.
+    let source = r#"
+        let order = [];
+        class Base {
+            field = (order.push("field"), 7);
+            constructor(value) {
+                order.push("body");
+                this.value = value;
+                if (value === 2) return { override: 9 };
+            }
+        }
+        const one = new Base(1);
+        const two = new Base(2);
+        order.join(",") + "|" + one.field + ":" + one.value + ":" +
+            ("override" in two) + ":" + two.override;
+    "#;
+
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "field,body,field,body|7:1:true:9"
+        );
+
+        let global = engine.interp.global_env.clone();
+        let ctor = engine
+            .interp
+            .get_var("Base", &global)
+            .unwrap_or_else(|_| panic!("base class binding remains available on {tier:?}"));
+        let crate::value::Value::Obj(ctor) = ctor else {
+            panic!("Base is not an object on {tier:?}");
+        };
+        let constructor_compiled = match &ctor.borrow().call {
+            crate::value::Callable::User(user) => user.func.code.get().is_some_and(Option::is_some),
+            _ => false,
+        };
+        assert!(
+            constructor_compiled,
+            "base class constructor stayed on the tree-walker on {tier:?}"
+        );
+    }
+}
+
+#[test]
+fn compiled_derived_class_constructors_preserve_super_and_this_binding_semantics() {
+    // ECMA-262 §13.3.7.1 binds the object returned by Construct(superCtor, …) into the
+    // derived constructor's previously-uninitialized `this`, then initializes the derived
+    // class's instance elements before evaluation continues after super().
+    let source = r#"
+        let order = [];
+        class Parent {
+            constructor(value) {
+                order.push("parent");
+                this.parent = value;
+            }
+        }
+        class Derived extends Parent {
+            field = (order.push("field"), 7);
+            constructor(value) {
+                order.push("before");
+                super(value);
+                order.push("after");
+                this.newTarget = new.target === Derived;
+            }
+        }
+        const instance = new Derived(3);
+        order.join(",") + "|" + instance.parent + ":" + instance.field + ":" +
+            instance.newTarget;
+    "#;
+
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "before,parent,field,after|3:7:true"
+        );
+
+        let global = engine.interp.global_env.clone();
+        let ctor = engine
+            .interp
+            .get_var("Derived", &global)
+            .unwrap_or_else(|_| panic!("derived class binding remains available on {tier:?}"));
+        let crate::value::Value::Obj(ctor) = ctor else {
+            panic!("Derived is not an object on {tier:?}");
+        };
+        let constructor_compiled = match &ctor.borrow().call {
+            crate::value::Callable::User(user) => user.func.code.get().is_some_and(Option::is_some),
+            _ => false,
+        };
+        assert!(
+            constructor_compiled,
+            "derived class constructor stayed on the tree-walker on {tier:?}"
+        );
+
+        assert_eq!(
+            run_in(
+                &mut engine,
+                r#"
+                    class ObjectOnly extends Parent { constructor() { return { ok: 1 }; } }
+                    class NoSuper extends Parent { constructor() {} }
+                    class Primitive extends Parent { constructor() { return 1; } }
+                    class ThisBeforeSuper extends Parent {
+                        constructor() { this.value = 1; super(); }
+                    }
+                    class ArrowBeforeSuper extends Parent {
+                        constructor() { (() => this)(); super(); }
+                    }
+                    class Twice extends Parent { constructor() { super(); super(); } }
+                    [
+                        new ObjectOnly().ok,
+                        (() => { try { new NoSuper(); } catch (error) { return error.name; } })(),
+                        (() => { try { new Primitive(); } catch (error) { return error.name; } })(),
+                        (() => { try { new ThisBeforeSuper(); } catch (error) { return error.name; } })(),
+                        (() => { try { new ArrowBeforeSuper(); } catch (error) { return error.name; } })(),
+                        (() => { try { new Twice(); } catch (error) { return error.name; } })()
+                    ].join(":");
+                "#,
+            ),
+            "1:ReferenceError:TypeError:ReferenceError:ReferenceError:ReferenceError"
+        );
+    }
+}
+
+#[test]
+fn compiled_optional_chain_skips_private_tail_and_preserves_method_receiver() {
+    // ECMA-262 §13.3.9 evaluates no later OptionalChain production after a nullish base. A
+    // private field/method tail therefore cannot perform its brand check on the synthetic
+    // `undefined` result, and a live private method Reference retains its base as `this`.
+    let source = r#"
+        class C {
+            #field = "ok";
+            #method() { return this.#field; }
+            field(holder) { return holder?.value.#field; }
+            method(holder) { return holder?.value.#method(); }
+        }
+        const value = new C();
+        const c = new C();
+        [
+            c.field({ value }), c.field(null), c.field(undefined),
+            c.method({ value }), c.method(null), c.method(undefined)
+        ].map(String).join(":");
+    "#;
+
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "ok:undefined:undefined:ok:undefined:undefined"
+        );
+    }
+}
+
+#[test]
+fn compiled_try_finally_preserves_every_completion_kind() {
+    // ECMA-262 §14.15.3 evaluates the finalizer after the protected Completion. A normally
+    // completed finalizer resumes that saved normal/return/throw/break/continue Completion;
+    // an abrupt finalizer replaces it. CatchClauseEvaluation must also restore its lexical
+    // environment however control leaves the catch Block.
+    let source = r#"
+        let log = [];
+        function normal() {
+            try { log.push("normal-try"); }
+            finally { log.push("normal-finally"); }
+            return 6;
+        }
+        function returning() {
+            try { log.push("return-try"); return 1; }
+            finally { log.push("return-finally"); }
+        }
+        function bareReturning() {
+            try { return; }
+            finally { log.push("bare-finally"); }
+        }
+        function throwing() {
+            try {
+                try { log.push("throw-try"); throw 2; }
+                finally { log.push("throw-finally"); }
+            } catch (error) { return error; }
+        }
+        function jumping() {
+            outer: for (let i = 0; i < 3; i++) {
+                try {
+                    if (i === 0) continue;
+                    if (i === 1) break outer;
+                } finally { log.push("jump" + i); }
+            }
+            return "done";
+        }
+        function caught() {
+            let x = "outer";
+            try { throw { x: 5 }; }
+            catch ({ x }) { log.push("catch" + x); return x; }
+            finally { log.push("catch-finally"); }
+        }
+        function overrideReturn() { try { return 3; } finally { return 4; } }
+        function overrideThrow() {
+            try { return 7; }
+            finally { throw new RangeError("override"); }
+        }
+        [
+            normal(), returning(), String(bareReturning()), throwing(), jumping(), caught(),
+            overrideReturn(),
+            (() => { try { overrideThrow(); } catch (error) { return error.name + ":" + error.message; } })(),
+            log.join(",")
+        ].join("|");
+    "#;
+    let expected = "6|1|undefined|2|done|5|4|RangeError:override|\
+        normal-try,normal-finally,return-try,return-finally,bare-finally,\
+        throw-try,throw-finally,jump0,jump1,catch5,catch-finally";
+
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            expected.replace("        ", "")
+        );
+
+        let global = engine.interp.global_env.clone();
+        for name in [
+            "normal",
+            "returning",
+            "bareReturning",
+            "throwing",
+            "jumping",
+            "caught",
+            "overrideReturn",
+            "overrideThrow",
+        ] {
+            let function = engine
+                .interp
+                .get_var(name, &global)
+                .unwrap_or_else(|_| panic!("{name} remains available on {tier:?}"));
+            let crate::value::Value::Obj(function) = function else {
+                panic!("{name} is not an object on {tier:?}");
+            };
+            let compiled = match &function.borrow().call {
+                crate::value::Callable::User(user) => {
+                    user.func.code.get().is_some_and(Option::is_some)
+                }
+                _ => false,
+            };
+            assert!(compiled, "{name} stayed on the tree-walker on {tier:?}");
+        }
+    }
+}
+
+#[test]
 fn date_called_as_function_returns_string() {
     assert_eq!(run("typeof Date()"), "string");
     // Date() ignores its arguments — even through a bound wrapper.
@@ -18072,6 +19070,34 @@ fn run_jit(src: &str) -> String {
         Completion::Value(v) => v,
         Completion::Throw { name, message } => panic!("threw {name}: {message}"),
     }
+}
+
+#[test]
+fn jit_falls_back_for_completion_aware_loop_exits() {
+    // ECMA-262 §14.7.5.7 closes abandoned for-of iterators from the inside
+    // out, and §14.9.2 represents the labelled break as an abrupt completion.
+    // This bytecode uses AbruptJump to preserve that handler state. Until the
+    // native tier models completion-aware unwinding, it must leave this chunk
+    // on the VM instead of reaching an unsupported JIT emitter case.
+    assert_eq!(
+        run_jit(
+            "var log = [];
+             function iterable(name) {
+                 return { [Symbol.iterator]() { return {
+                     next() { return { value: 1, done: false }; },
+                     return() { log.push(name); return {}; }
+                 }; } };
+             }
+             function leaveNestedLoops() {
+                 outer: for (var outerValue of iterable('outer')) {
+                     for (var innerValue of iterable('inner')) break outer;
+                 }
+                 return log.join(',');
+             }
+             leaveNestedLoops()"
+        ),
+        "inner,outer"
+    );
 }
 
 #[test]

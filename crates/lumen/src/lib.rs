@@ -560,6 +560,88 @@ pub mod embed {
     }
 }
 
+#[cfg(feature = "embed")]
+impl interpreter::Interp {
+    /// Set the opaque host settings token captured by subsequently-created promise reactions.
+    ///
+    /// ECMA-262 associates a PromiseReactionJob with its handler Realm, while HTML uses that
+    /// Realm to restore the corresponding environment settings object. Embedders that represent
+    /// more than one host settings object inside a single engine Realm can use this token to
+    /// preserve that additional distinction without changing ECMAScript-visible values.
+    pub fn set_host_job_context(&mut self, context: u64) {
+        self.switch_host_job_context(context);
+    }
+
+    /// Parse and evaluate one ECMAScript Script Record in this realm while a host operation is
+    /// already running.
+    ///
+    /// HTML's "run a classic script" algorithm can synchronously enter a new ScriptEvaluation
+    /// from parser or DOM insertion work. This is deliberately not `eval`: ScriptEvaluation uses
+    /// the Realm's persistent `[[GlobalEnv]]` as both its lexical and variable environment, while
+    /// indirect eval gives lexical declarations a fresh eval-only environment. As with
+    /// [`Engine::eval_value_interruptible`], the embedder owns the following microtask checkpoint.
+    pub fn eval_classic_script_interruptible(
+        &mut self,
+        src: &str,
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        let body = parser::parse_script(src, false).map_err(|error| ParseError {
+            message: error.message,
+            line: error.line,
+            at_eof: error.at_eof,
+        })?;
+        let directive_strict = matches!(
+            body.first(),
+            Some(ast::Stmt::Expr(ast::Expr::Str(value))) if &**value == "use strict"
+        );
+        let previous_strict = self.strict;
+        self.strict = directive_strict;
+        let result = self.run_program(&body);
+        self.strict = previous_strict;
+        Ok(match result {
+            Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
+            Ok(value) => Ok(value),
+            Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
+            Err(interpreter::Abrupt::Interrupt(reason)) => {
+                Err(embed::EvalError::Interrupted(reason))
+            }
+            Err(_) => Ok(embed::Value::Undefined),
+        })
+    }
+
+    /// Decode and evaluate a precompiled ECMAScript Script Record in the
+    /// active Realm. This is the snapshot counterpart of
+    /// [`Self::eval_classic_script_interruptible`]: browser embedders can
+    /// install the same static platform bootstrap in many Window Realms
+    /// without reparsing it for every nested Document.
+    pub fn eval_classic_snapshot_interruptible(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        let body = snapshot::decode(bytes).map_err(|message| ParseError {
+            message,
+            line: 0,
+            at_eof: false,
+        })?;
+        let directive_strict = matches!(
+            body.first(),
+            Some(ast::Stmt::Expr(ast::Expr::Str(value))) if &**value == "use strict"
+        );
+        let previous_strict = self.strict;
+        self.strict = directive_strict;
+        let result = self.run_program(&body);
+        self.strict = previous_strict;
+        Ok(match result {
+            Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
+            Ok(value) => Ok(value),
+            Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
+            Err(interpreter::Abrupt::Interrupt(reason)) => {
+                Err(embed::EvalError::Interrupted(reason))
+            }
+            Err(_) => Ok(embed::Value::Undefined),
+        })
+    }
+}
+
 /// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`
 /// pointers (they cannot capture); Rust state lives in [`embed::OpState`], reached through the
 /// `&mut Ctx` argument.
@@ -572,6 +654,23 @@ impl Engine {
         &mut self.interp
     }
 
+    /// Run an engine-level host operation in `realm_global`'s Realm, then
+    /// restore the caller's Realm. This is the task counterpart of
+    /// [`embed::Ctx::with_embed_realm`]: embedders use it when an asynchronous
+    /// completion needs entry points that live on [`Engine`] itself, such as
+    /// classic/module evaluation or an explicit microtask checkpoint.
+    pub fn with_embed_realm<R>(
+        &mut self,
+        realm_global: &embed::Value,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, embed::Value> {
+        self.interp.activate_gc_heap();
+        let (key, saved) = self.interp.enter_embed_realm(realm_global)?;
+        let result = operation(self);
+        self.interp.leave_embed_realm(key, saved);
+        Ok(result)
+    }
+
     /// Install this realm's wall-clock source, in milliseconds since the Unix epoch.
     ///
     /// The callback is realm-local and may capture mutable embedder state. `Date`, `Date.now`,
@@ -580,6 +679,18 @@ impl Engine {
     /// process-wide [`set_host_clock`] fallback.
     pub fn set_wall_clock(&mut self, clock: impl Fn() -> f64 + 'static) {
         self.interp.wall_clock = Some(std::rc::Rc::new(clock));
+    }
+
+    /// Install callbacks that enter and leave an embedder's opaque settings context around a
+    /// promise job. The callbacks are omitted for ordinary single-settings embedders and add no
+    /// work to their job path.
+    pub fn set_host_job_context_hooks(
+        &mut self,
+        enter: fn(&mut embed::Ctx, u64),
+        leave: fn(&mut embed::Ctx),
+    ) {
+        self.interp.host_job_context_enter = Some(enter);
+        self.interp.host_job_context_leave = Some(leave);
     }
 
     /// The realm's global object — the root from which an embedder reaches user-defined JS

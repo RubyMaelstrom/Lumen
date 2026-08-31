@@ -1388,10 +1388,23 @@ pub fn compile(
         return None; // op index must fit one movz
     }
     // Await and generator yield points must retain their heap-owned VM continuation.
-    if ops
-        .iter()
-        .any(|o| matches!(o, Op::Await | Op::Yield | Op::YieldStar))
-    {
+    // Completion-aware loop exits must also stay in the VM: ECMA-262 break/continue
+    // completions can cross finally regions and can run one or more IteratorClose
+    // operations before reaching the target. The native tier does not yet model that
+    // handler-unwind state, so compiling AbruptJump would lose the completion (and the
+    // emitter quite correctly has no machine-code case for it).
+    if ops.iter().any(|o| {
+        matches!(
+            o,
+            Op::Await
+                | Op::Yield
+                | Op::YieldStar
+                | Op::AbruptJump(..)
+                | Op::PushFinally(..)
+                | Op::ResumeReturn
+                | Op::ResumeJump
+        )
+    }) {
         return None;
     }
     let cfg = crate::jit_ir::Cfg::build(chunk).ok()?;

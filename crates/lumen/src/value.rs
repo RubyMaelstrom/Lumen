@@ -801,6 +801,10 @@ pub struct NativeCallable {
 pub struct UserCallable {
     pub(crate) func: Rc<Function>,
     pub(crate) env: Env,
+    /// Heap identity of the Realm whose global environment created this
+    /// function. Cross-Realm calls must temporarily activate that Realm so
+    /// intrinsics and host settings follow the function's [[Realm]].
+    pub(crate) realm: usize,
 }
 
 #[derive(Clone)]
@@ -817,8 +821,8 @@ pub struct WrappedCrossCallable {
 }
 
 impl Callable {
-    pub(crate) fn user(func: Rc<Function>, env: Env) -> Callable {
-        Callable::User(Rc::new(UserCallable { func, env }))
+    pub(crate) fn user(func: Rc<Function>, env: Env, realm: usize) -> Callable {
+        Callable::User(Rc::new(UserCallable { func, env, realm }))
     }
 
     pub(crate) fn wrapped_shadow(realm: usize, target: Value) -> Callable {

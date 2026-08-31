@@ -300,6 +300,8 @@ pub enum Expr {
     /// `tag\`a${x}b\`` — `quasis` are (cooked, raw) chunks (one more than `subs`).
     TaggedTemplate {
         tag: P<Expr>,
+        /// Stable Parse Node identity for ECMA-262's per-Realm [[TemplateMap]].
+        site: u64,
         quasis: Vec<(Option<String>, String)>,
         subs: Vec<Expr>,
     },
@@ -735,6 +737,7 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
             tag,
             quasis: _,
             subs,
+            ..
         } => {
             scan_expr(tag, flags);
             for e in subs {
