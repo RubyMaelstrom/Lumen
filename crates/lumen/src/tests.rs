@@ -5450,6 +5450,12 @@ fn compiled_regexp_literal_is_fresh() {
 #[test]
 fn reconstructible_string_and_regexp_caches_account_retained_bytes() {
     let mut engine = Engine::new();
+    let ascii = crate::lstr::LStr::from("repeated ascii subject");
+    let first_ascii = engine.interp.re_text(false, &ascii);
+    let second_ascii = engine.interp.re_text(false, &ascii);
+    assert!(std::rc::Rc::ptr_eq(&first_ascii, &second_ascii));
+    assert_eq!(engine.interp.re_texts.stats(), (0, 0));
+
     let source = "é".repeat(128);
     let source = crate::lstr::LStr::from(source.as_str());
     let units = engine.interp.units_full(&source);

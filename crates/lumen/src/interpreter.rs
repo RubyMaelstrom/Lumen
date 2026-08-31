@@ -1334,6 +1334,10 @@ pub struct Interp {
     /// strings once and run several regexp passes over the same working set.
     pub(crate) re_texts:
         crate::cache::ByteLru<(usize, bool), (crate::lstr::LStr, Rc<crate::regex::ReText>)>,
+    /// Most recently prepared ASCII RegExp subject. ASCII matching reads the immutable string's
+    /// bytes directly, so retaining thousands of these trivial views in the general LRU costs
+    /// more than rebuilding them. One hot entry preserves the common consecutive reuse case.
+    pub(crate) re_text_ascii_hot: Option<(crate::lstr::LStr, bool, Rc<crate::regex::ReText>)>,
     /// Shape-validated entry slots for the ten RegExp prototype dependencies checked by
     /// dead-result specializations. Values/accessors remain live-checked on every operation.
     pub(crate) regexp_dependency_cache: std::cell::Cell<RegexpDependencyCache>,
@@ -2289,6 +2293,7 @@ impl Interp {
             inline_ic_safe: std::cell::Cell::new(true),
             str_units: crate::cache::ByteLru::new(16 << 20, 64),
             re_texts: crate::cache::ByteLru::new(32 << 20, 8_192),
+            re_text_ascii_hot: None,
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
             map_data: Default::default(),
@@ -5793,6 +5798,16 @@ impl Interp {
         unicode: bool,
         s: &crate::lstr::LStr,
     ) -> Rc<crate::regex::ReText> {
+        if s.ascii_hint() {
+            if let Some((cached, cached_unicode, text)) = &self.re_text_ascii_hot {
+                if *cached_unicode == unicode && crate::lstr::LStr::ptr_eq(cached, s) {
+                    return text.clone();
+                }
+            }
+            let text = Rc::new(crate::regex::ReText::new_rc(unicode, s));
+            self.re_text_ascii_hot = Some((s.clone(), unicode, text.clone()));
+            return text;
+        }
         let key = (s.as_ptr() as usize, unicode);
         if let Some((cached, text)) = self.re_texts.get_cloned(&key) {
             debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));

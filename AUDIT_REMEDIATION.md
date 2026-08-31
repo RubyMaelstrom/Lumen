@@ -224,6 +224,15 @@ not an acceptable cost of conformance.
   3,961ms -> 3,921ms; all 1,879 official `built-ins/RegExp` Test262 files pass,
   as do cancellation/resource-exhaustion tests. A 90-second Twitch gate retained
   1,862 nodes, processed 18 updates, and reported zero script errors.
+- [x] Keep trivial ASCII RegExp subject views out of the byte-accounted prepared-
+  text LRU while retaining one hot entry for consecutive reuse and preserving
+  the LRU for non-ASCII code-unit/code-point materialization. This is internal
+  caching beneath ECMA-262 §§22.2.6.2 and 22.2.7.2; `lastIndex`, captures,
+  matcher ordering, and abrupt completions are unchanged. Five interleaved
+  browser samples improved the unchanged RegExp score 361 -> 437 (21.1%), and a
+  complete fixture pass improved 1,737 -> 1,786 while peak RSS fell 463.2 ->
+  453.1 MiB. All 1,879 official `built-ins/RegExp` Test262 files pass; rebuilt
+  YouTube consent/search and Twitch semantic gates complete with zero errors.
 - [ ] Profile and accelerate HTML innerHTML fragment replacement and DOM scoped
   selector matching. Preserve ordered removal/insertion side effects, one
   replace-all mutation record, detached wrapper identity/listeners/shadow trees,
