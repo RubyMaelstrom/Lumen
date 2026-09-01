@@ -1796,8 +1796,8 @@ interp_memory_inventory! {
     new_target => "measured",
     pending_new_target => "measured",
     htmldda => "measured",
-    ctor_caller_realm => "unaccounted",
-    realms => "unaccounted",
+    ctor_caller_realm => "measured",
+    realms => "measured",
     promises => "measured",
     unhandled_rejections => "measured",
     temporal => "unaccounted",
@@ -2100,6 +2100,33 @@ pub struct RealmState {
     pub error_protos: crate::fasthash::FastMap<&'static str, Gc>,
     pub eval_fn: Option<Gc>,
     pub extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
+}
+
+impl RealmState {
+    pub(crate) fn scan_retained_memory(
+        &self,
+        visitor: &mut crate::memory::Visitor,
+    ) -> (usize, bool) {
+        let (global_names, global_names_exact) = visitor.global_var_names(&self.global_var_names);
+        let bytes = global_names
+            .saturating_add(
+                self.error_protos
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(&'static str, Gc)>()),
+            )
+            .saturating_add(
+                self.extra_protos
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(&'static str, Gc)>()),
+            );
+        // Global/intrinsic objects are canonical to the object snapshot, and `global_env` is
+        // canonical to the scope snapshot. Only the two map allocations and global-name set are
+        // owned below this record.
+        (
+            bytes,
+            global_names_exact && self.error_protos.is_empty() && self.extra_protos.is_empty(),
+        )
+    }
 }
 
 impl Interp {

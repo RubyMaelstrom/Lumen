@@ -417,7 +417,7 @@ impl Visitor {
         }
     }
 
-    fn global_var_names(
+    pub(crate) fn global_var_names(
         &mut self,
         names: &Rc<RefCell<std::collections::HashSet<String>>>,
     ) -> (usize, bool) {
@@ -1182,6 +1182,36 @@ fn scan_realm(
     let (construct_ic_bytes, construct_ics_exact) = interp.construct_ic_retained_memory();
     totals.interpreter_side_tables.add(construct_ic_bytes);
     if !interp.class_info.is_empty() || !construct_ics_exact {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
+            .realms
+            .len()
+            .saturating_mul(size_of::<(usize, crate::interpreter::RealmState)>()),
+    );
+    for realm in interp.realms.values() {
+        let (bytes, exact) = realm.scan_retained_memory(visitor);
+        totals.interpreter_side_tables.add(bytes);
+        if !exact {
+            totals
+                .interpreter_side_tables
+                .make_lower_bound("opaque standard-library HashMap bucket storage");
+        }
+    }
+    if let Some(realm) = &interp.ctor_caller_realm {
+        let (bytes, exact) = realm.scan_retained_memory(visitor);
+        totals.interpreter_side_tables.add(bytes);
+        if !exact {
+            totals
+                .interpreter_side_tables
+                .make_lower_bound("opaque standard-library HashMap bucket storage");
+        }
+    }
+    if !interp.realms.is_empty() {
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
@@ -2089,6 +2119,26 @@ mod tests {
 
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
         assert!(after.function_bytecode_metadata.bytes > before.function_bytecode_metadata.bytes);
+    }
+
+    #[test]
+    fn additional_realms_account_only_their_direct_metadata() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        engine
+            .eval("globalThis.memoryRealm = $262.createRealm().global;", false)
+            .expect("realm setup parses");
+        assert_eq!(engine.interp.realms.len(), 2);
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
+
+        assert!(after.object_bodies.bytes > before.object_bodies.bytes);
+        assert!(after.scope_bodies.bytes > before.scope_bodies.bytes);
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
     }
 
     #[test]

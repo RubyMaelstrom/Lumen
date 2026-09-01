@@ -227,6 +227,11 @@ buffers, property keys and accessor boxes, and fixed construct-IC entries. Initi
 trees are credited to the canonical AST/function-bytecode family; field environments remain in
 the scope snapshot, and construct-cache weak pins are never upgraded by diagnostics.
 
+Realm ownership includes the additional-realm table, each realm's error/extra-prototype maps, and
+identity-deduplicated global-name sets, including a transient constructor-caller realm snapshot.
+Globals and intrinsic objects remain canonical to the object snapshot; global environments remain
+canonical to the scope snapshot even when several realm/settings records share them.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

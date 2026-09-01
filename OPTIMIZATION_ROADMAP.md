@@ -424,6 +424,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     mapped-arguments/module-source tables without re-crediting objects or scopes.
   - [x] Account class-construction metadata and construct ICs while routing initializer AST and
     callable/property payloads to their canonical allocation families.
+  - [x] Account additional and constructor-caller RealmState metadata with shared global-name-set
+    deduplication and object/scope snapshot canonicality.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.
