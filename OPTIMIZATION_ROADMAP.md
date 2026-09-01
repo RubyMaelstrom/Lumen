@@ -408,6 +408,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     shared/Wasm backing for the cross-Agent external-allocation slice.
   - [x] Account reusable bytecode/JIT execution pools, megamorphic stub-cache storage and names,
     raw frame buffers, and weak cache-pin containers.
+  - [x] Account realm prototype/eval/import/console/constructor-hint metadata and weak HTMLDDA
+    branding without re-crediting collector-owned objects.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

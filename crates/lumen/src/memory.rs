@@ -661,6 +661,59 @@ fn scan_realm(
         visitor.value(symbol);
         visitor.rc_str(key);
     }
+    totals.interpreter_side_tables.add(
+        interp
+            .error_protos
+            .len()
+            .saturating_mul(size_of::<(&'static str, Gc)>())
+            .saturating_add(
+                interp
+                    .extra_protos
+                    .len()
+                    .saturating_mul(size_of::<(&'static str, Gc)>()),
+            )
+            .saturating_add(
+                interp
+                    .console
+                    .capacity()
+                    .saturating_mul(size_of::<String>()),
+            )
+            .saturating_add(
+                interp
+                    .eval_realm_fns
+                    .len()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(interp.import_base.capacity())
+            .saturating_add(
+                interp
+                    .construct_capacity_hints
+                    .len()
+                    .saturating_mul(size_of::<(usize, (std::rc::Weak<RefCell<Object>>, u8))>()),
+            )
+            .saturating_add(
+                interp
+                    .htmldda
+                    .len()
+                    .saturating_mul(size_of::<(usize, std::rc::Weak<RefCell<Object>>)>()),
+            ),
+    );
+    for line in &interp.console {
+        totals.interpreter_side_tables.add(line.capacity());
+    }
+    if let Some(meta) = &interp.import_meta {
+        visitor.value(meta);
+    }
+    if !interp.error_protos.is_empty()
+        || !interp.extra_protos.is_empty()
+        || !interp.eval_realm_fns.is_empty()
+        || !interp.construct_capacity_hints.is_empty()
+        || !interp.htmldda.is_empty()
+    {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
+    }
 
     totals.interpreter_side_tables.add(
         interp
@@ -1196,6 +1249,29 @@ mod tests {
 
         assert!(!engine.interp.vm_pool.is_empty());
         assert!(snapshot.engine_caches.bytes >= stub_bytes);
+    }
+
+    #[test]
+    fn realm_metadata_accounts_console_and_import_string_capacity() {
+        let mut interp = Interp::new();
+        let objects = crate::value::heap_gc_snapshot(&interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&interp.gc_heap);
+        let before = measure(&interp, &objects, &scopes);
+        let mut line = String::with_capacity(257);
+        line.push_str("diagnostic console line");
+        interp.console.push(line);
+        interp.import_base = String::with_capacity(193);
+        interp.import_base.push_str("file:///realm/");
+        let after = measure(&interp, &objects, &scopes);
+
+        assert!(
+            after.interpreter_side_tables.bytes
+                >= before
+                    .interpreter_side_tables
+                    .bytes
+                    .saturating_add(257)
+                    .saturating_add(193)
+        );
     }
 
     #[test]

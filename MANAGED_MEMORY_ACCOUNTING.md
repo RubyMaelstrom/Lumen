@@ -183,6 +183,11 @@ the megamorphic stub table and retained names, raw fixed-size JIT frame buffers,
 creation/global-environment pin containers. Pooled VM vectors and raw frame buffers are required
 to contain no live Values; a diagnostic assertion protects that ownership invariant.
 
+Realm metadata now covers error/extra-prototype registries, captured console String capacity,
+eval-realm identities, import base/meta state, constructor capacity hints, and weak HTMLDDA brand
+entries. GC object payload remains canonical to the collector snapshot; these tables credit only
+their own entry/string storage.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
