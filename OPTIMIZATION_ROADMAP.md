@@ -427,6 +427,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Account additional and constructor-caller RealmState metadata with shared global-name-set
     deduplication and object/scope snapshot canonicality.
   - [x] Account Temporal internal-slot records and identity-deduplicated time-zone/calendar strings.
+  - [x] Account pending async waits, timers, and visible Agent channel handles; explicitly retain
+    lower-bound quality for opaque standard-library queue backing/messages.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

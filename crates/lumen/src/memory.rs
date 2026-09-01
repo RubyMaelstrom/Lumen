@@ -1243,6 +1243,40 @@ fn scan_realm(
 
     totals.interpreter_side_tables.add(
         interp
+            .pending_async_waits
+            .capacity()
+            .saturating_mul(size_of::<(Value, std::sync::mpsc::Receiver<&'static str>)>())
+            .saturating_add(
+                interp
+                    .pending_timers
+                    .capacity()
+                    .saturating_mul(size_of::<(Value, std::time::Instant)>()),
+            ),
+    );
+    for (promise, _) in &interp.pending_async_waits {
+        visitor.value(promise);
+    }
+    for (callback, _) in &interp.pending_timers {
+        visitor.value(callback);
+    }
+    if let Some(agent) = &interp.agent {
+        totals.interpreter_side_tables.add(
+            size_of::<crate::interpreter::AgentChannels>().saturating_add(
+                agent
+                    .agent_broadcast_txs
+                    .capacity()
+                    .saturating_mul(size_of::<std::sync::mpsc::Sender<(u64, usize)>>()),
+            ),
+        );
+    }
+    if !interp.pending_async_waits.is_empty() || interp.agent.is_some() {
+        totals.interpreter_side_tables.make_lower_bound(
+            "standard-library channel backing and queued message storage are opaque",
+        );
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
             .map_data
             .len()
             .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
@@ -2189,6 +2223,48 @@ mod tests {
 
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
         assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
+    }
+
+    #[test]
+    fn async_wait_timer_and_agent_handles_report_visible_storage() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        let (_wait_tx, wait_rx) = std::sync::mpsc::channel();
+        engine.interp.pending_async_waits.reserve(3);
+        engine
+            .interp
+            .pending_async_waits
+            .push((Value::str("wait promise payload"), wait_rx));
+        engine.interp.pending_timers.reserve(4);
+        engine.interp.pending_timers.push((
+            Value::str("timer callback payload"),
+            std::time::Instant::now(),
+        ));
+
+        let (broadcast_tx, broadcast_rx) = std::sync::mpsc::channel();
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
+        report_tx
+            .send("opaque queued report".to_string())
+            .expect("test receiver remains connected");
+        engine.interp.agent = Some(Box::new(crate::interpreter::AgentChannels {
+            agent_broadcast_txs: vec![broadcast_tx],
+            report_rx: Some(report_rx),
+            report_tx,
+            broadcast_rx: Some(broadcast_rx),
+        }));
+
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
+        assert!(matches!(
+            after.interpreter_side_tables.quality,
+            Quality::LowerBound
+        ));
     }
 
     #[test]

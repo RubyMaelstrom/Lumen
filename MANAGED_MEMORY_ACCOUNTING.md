@@ -236,6 +236,12 @@ Temporal ownership includes the internal-slot table, calendar-id table, ZonedDat
 identifiers, and calendar identifiers. Shared `Rc<str>` payloads use the visitor's global string
 identity set, so repeated canonical zone/calendar names are credited once across all records.
 
+Agent-event ownership includes pending `Atomics.waitAsync` and timer vector capacity, retained
+promise/callback Values, the boxed Agent channel bundle, and its broadcast-sender vector. Rust's
+standard-library channel backing and queued messages expose no retained-size API, so any live
+receiver/sender keeps the category explicitly lower-bound with that reason rather than reporting
+the visible handles as an exact total.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
