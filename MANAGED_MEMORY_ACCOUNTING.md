@@ -166,6 +166,12 @@ summed; shared strings, symbols, Functions, RegExp programs, and ArrayBuffer bac
 deduplicated. The diagnostic snapshot map itself is excluded because it is measurement output,
 not workload-retained engine state.
 
+Map/Set and WeakMap/WeakSet side tables now include ordered-entry vector capacities, collision
+vectors, and both levels of their hash indexes. Strong collection keys/values and live ephemeron
+values pass through the canonical Value visitor; weak keys remain weak during diagnostics. Hash
+table bucket capacity remains a documented lower bound because `FastMap` is a standard-library
+HashMap alias rather than an allocator-introspectable container.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

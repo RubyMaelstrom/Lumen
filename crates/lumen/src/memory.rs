@@ -604,6 +604,89 @@ fn scan_realm(
         visitor.value(symbol);
         visitor.rc_str(key);
     }
+
+    totals.interpreter_side_tables.add(
+        interp
+            .map_data
+            .len()
+            .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
+    );
+    for entries in interp.map_data.values() {
+        totals.interpreter_side_tables.add(
+            entries
+                .capacity()
+                .saturating_mul(size_of::<(Value, Value)>()),
+        );
+        for (key, value) in entries {
+            visitor.value(key);
+            visitor.value(value);
+        }
+    }
+    totals
+        .interpreter_side_tables
+        .add(interp.collection_index.len().saturating_mul(size_of::<(
+            usize,
+            crate::fasthash::FastMap<u64, crate::interpreter::CollectionBucket>,
+        )>()));
+    for index in interp.collection_index.values() {
+        totals.interpreter_side_tables.add(
+            index
+                .len()
+                .saturating_mul(size_of::<(u64, crate::interpreter::CollectionBucket)>()),
+        );
+        for bucket in index.values() {
+            if let crate::interpreter::CollectionBucket::Many(offsets) = bucket {
+                totals
+                    .interpreter_side_tables
+                    .add(offsets.capacity().saturating_mul(size_of::<usize>()));
+            }
+        }
+    }
+    totals
+        .interpreter_side_tables
+        .add(interp.weak_collection_data.len().saturating_mul(size_of::<(
+            usize,
+            Vec<(crate::interpreter::WeakTarget, Value)>,
+        )>()));
+    for entries in interp.weak_collection_data.values() {
+        totals.interpreter_side_tables.add(
+            entries
+                .capacity()
+                .saturating_mul(size_of::<(crate::interpreter::WeakTarget, Value)>()),
+        );
+        // Weak keys must not become strong merely because diagnostics are enabled. WeakMap values
+        // are visited because the collector has already resolved ephemeron liveness.
+        for (_, value) in entries {
+            visitor.value(value);
+        }
+    }
+    totals
+        .interpreter_side_tables
+        .add(
+            interp
+                .weak_collection_index
+                .len()
+                .saturating_mul(size_of::<(
+                    usize,
+                    crate::fasthash::FastMap<crate::interpreter::WeakKey, usize>,
+                )>()),
+        );
+    for index in interp.weak_collection_index.values() {
+        totals.interpreter_side_tables.add(
+            index
+                .len()
+                .saturating_mul(size_of::<(crate::interpreter::WeakKey, usize)>()),
+        );
+    }
+    if !interp.map_data.is_empty()
+        || !interp.collection_index.is_empty()
+        || !interp.weak_collection_data.is_empty()
+        || !interp.weak_collection_index.is_empty()
+    {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
     for buffer in interp.array_buffers.values() {
         visitor.array_buffer(buffer);
     }
@@ -900,6 +983,33 @@ mod tests {
             "Agent-shared symbol/string payload must be credited once"
         );
         assert!(aggregate.interpreter_side_tables.bytes >= 2 * size_of::<Interp>());
+    }
+
+    #[test]
+    fn collection_side_tables_account_vectors_indexes_and_values() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+        engine
+            .eval(
+                r#"
+                    globalThis.strong = new Map([["a", 1], ["b", 2], ["c", 3]]);
+                    globalThis.weakKey = {};
+                    globalThis.weak = new WeakMap([[weakKey, { held: "value" }]]);
+                "#,
+                false,
+            )
+            .expect("collections evaluate");
+        let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &objects, &scopes);
+
+        assert!(!engine.interp.map_data.is_empty());
+        assert!(!engine.interp.collection_index.is_empty());
+        assert!(!engine.interp.weak_collection_data.is_empty());
+        assert!(!engine.interp.weak_collection_index.is_empty());
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
     }
 
     #[test]
