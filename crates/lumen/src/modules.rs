@@ -172,6 +172,100 @@ pub(crate) struct PendingDynamicImport {
     pub(crate) host_context: u64,
 }
 
+impl ModuleRec {
+    /// Scan allocations owned below one module-record table entry. The surrounding HashMap entry
+    /// is accounted by Interp; shared AST, Values, and scope nodes retain canonical attribution.
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        fn strings(values: &Vec<String>) -> usize {
+            values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>())
+                .saturating_add(
+                    values
+                        .iter()
+                        .map(String::capacity)
+                        .fold(0usize, usize::saturating_add),
+                )
+        }
+        fn string_map<V>(values: &HashMap<String, V>) -> usize {
+            values
+                .len()
+                .saturating_mul(std::mem::size_of::<(String, V)>())
+                .saturating_add(
+                    values
+                        .keys()
+                        .map(String::capacity)
+                        .fold(0usize, usize::saturating_add),
+                )
+        }
+
+        visitor.stmt_body(&self.body);
+        visitor.value(&self.ns);
+        visitor.value(&self.meta);
+        if let Some(error) = &self.eval_error {
+            visitor.value(error);
+        }
+        if let Some(promise) = &self.top_promise {
+            visitor.value(promise);
+        }
+        let mut bytes = strings(&self.dep_keys)
+            .saturating_add(strings(&self.stars))
+            .saturating_add(strings(&self.deferred_deps))
+            .saturating_add(strings(&self.async_parents))
+            .saturating_add(string_map(&self.resolved))
+            .saturating_add(string_map(&self.local_exports))
+            .saturating_add(string_map(&self.imports))
+            .saturating_add(string_map(&self.indirect))
+            .saturating_add(string_map(&self.star_as));
+        for value in self.resolved.values().chain(self.local_exports.values()) {
+            bytes = bytes.saturating_add(value.capacity());
+        }
+        for origin in self.imports.values() {
+            bytes = bytes.saturating_add(match origin {
+                ImportOrigin::Namespace(module) | ImportOrigin::DeferNamespace(module) => {
+                    module.capacity()
+                }
+                ImportOrigin::Named(module, name) => {
+                    module.capacity().saturating_add(name.capacity())
+                }
+            });
+        }
+        for (module, name) in self.indirect.values() {
+            bytes = bytes
+                .saturating_add(module.capacity())
+                .saturating_add(name.capacity());
+        }
+        for module in self.star_as.values() {
+            bytes = bytes.saturating_add(module.capacity());
+        }
+        if let Some(root) = &self.cycle_root {
+            bytes = bytes.saturating_add(root.capacity());
+        }
+        bytes
+    }
+}
+
+impl NsBinding {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        match self {
+            NsBinding::Live(_, local) => local.capacity(),
+            NsBinding::Static(value) => {
+                visitor.value(value);
+                0
+            }
+        }
+    }
+}
+
+impl PendingDynamicImport {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        visitor.value(&self.promise);
+        self.specifier
+            .capacity()
+            .saturating_add(self.attr_type.as_ref().map_or(0, String::capacity))
+    }
+}
+
 /// The result of resolving an export name (spec ResolveExport).
 enum Resolution {
     /// A concrete binding: `local` in the given module scope.

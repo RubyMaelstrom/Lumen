@@ -188,6 +188,12 @@ eval-realm identities, import base/meta state, constructor capacity hints, and w
 entries. GC object payload remains canonical to the collector snapshot; these tables credit only
 their own entry/string storage.
 
+Module ownership now includes module/namespace tables, Rc-owned parsed statement bodies, resolved
+dependency/export/import maps, async-evaluation bookkeeping, pending dynamic-import request
+strings and promise Values, and namespace binding names. Module environments remain canonical to
+the scope snapshot. Host loader closures are classified external because an opaque embedder
+closure cannot safely report zero retained bytes.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

@@ -162,6 +162,7 @@ pub(crate) struct Visitor {
     chunks: HashSet<usize>,
     jit_codes: HashSet<usize>,
     hoist_plans: HashSet<usize>,
+    stmt_bodies: HashSet<usize>,
     re_texts: HashSet<usize>,
     regexes: HashSet<usize>,
     rc_u16_slices: HashSet<usize>,
@@ -391,6 +392,14 @@ impl Visitor {
         let identity = Rc::as_ptr(class) as usize;
         if self.classes.insert(identity) {
             let bytes = crate::ast::scan_class_retained_memory(class, self);
+            self.add_function_bytecode_bytes(bytes);
+        }
+    }
+
+    pub(crate) fn stmt_body(&mut self, body: &Rc<Vec<crate::ast::Stmt>>) {
+        let identity = Rc::as_ptr(body) as usize;
+        if self.stmt_bodies.insert(identity) {
+            let bytes = crate::ast::scan_stmt_body_retained_memory(body, self);
             self.add_function_bytecode_bytes(bytes);
         }
     }
@@ -713,6 +722,66 @@ fn scan_realm(
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
+            .modules
+            .len()
+            .saturating_mul(size_of::<(String, Value)>())
+            .saturating_add(
+                interp
+                    .module_recs
+                    .len()
+                    .saturating_mul(size_of::<(String, crate::modules::ModuleRec)>()),
+            )
+            .saturating_add(
+                interp
+                    .pending_dynamic_imports
+                    .len()
+                    .saturating_mul(size_of::<(u64, crate::modules::PendingDynamicImport)>()),
+            )
+            .saturating_add(interp.module_ns.len().saturating_mul(size_of::<(
+                usize,
+                crate::fasthash::FastMap<String, crate::modules::NsBinding>,
+            )>())),
+    );
+    for (key, value) in &interp.modules {
+        totals.interpreter_side_tables.add(key.capacity());
+        visitor.value(value);
+    }
+    for (key, record) in &interp.module_recs {
+        totals.interpreter_side_tables.add(
+            key.capacity()
+                .saturating_add(record.scan_retained_memory(visitor)),
+        );
+    }
+    for pending in interp.pending_dynamic_imports.values() {
+        totals
+            .interpreter_side_tables
+            .add(pending.scan_retained_memory(visitor));
+    }
+    for bindings in interp.module_ns.values() {
+        totals.interpreter_side_tables.add(
+            bindings
+                .len()
+                .saturating_mul(size_of::<(String, crate::modules::NsBinding)>()),
+        );
+        for (name, binding) in bindings {
+            totals.interpreter_side_tables.add(
+                name.capacity()
+                    .saturating_add(binding.scan_retained_memory(visitor)),
+            );
+        }
+    }
+    if !interp.modules.is_empty()
+        || !interp.module_recs.is_empty()
+        || !interp.pending_dynamic_imports.is_empty()
+        || !interp.module_ns.is_empty()
+    {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
     totals.interpreter_side_tables.add(
@@ -1272,6 +1341,39 @@ mod tests {
                     .saturating_add(257)
                     .saturating_add(193)
         );
+    }
+
+    #[test]
+    fn module_records_account_ast_exports_and_namespace_indexes() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+        engine
+            .eval_module(
+                r#"
+                    import { value as dependency } from "./dependency.js";
+                    export const answer = dependency + 1;
+                "#,
+                "file:///main.js",
+                |specifier, _| {
+                    (specifier == "./dependency.js").then(|| {
+                        (
+                            "file:///dependency.js".to_string(),
+                            "export const value = 41;".to_string(),
+                        )
+                    })
+                },
+            )
+            .expect("module graph evaluates");
+        let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &objects, &scopes);
+
+        assert_eq!(engine.interp.module_recs.len(), 2);
+        assert!(!engine.interp.module_ns.is_empty());
+        assert!(after.function_bytecode_metadata.bytes > before.function_bytecode_metadata.bytes);
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
     }
 
     #[test]

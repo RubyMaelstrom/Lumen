@@ -921,6 +921,20 @@ pub(crate) fn scan_expr_retained_memory(
     scan.bytes
 }
 
+/// Scan an Rc-owned statement-list allocation whose Vec header and element buffer are not part of
+/// a Function body allocation.
+pub(crate) fn scan_stmt_body_retained_memory(
+    body: &Vec<Stmt>,
+    visitor: &mut crate::memory::Visitor,
+) -> usize {
+    let mut scan = RetainedAst {
+        visitor,
+        bytes: std::mem::size_of::<Vec<Stmt>>(),
+    };
+    scan.stmt_vec(body);
+    scan.bytes
+}
+
 pub const SCAN_DONE: u8 = 1;
 pub const SCAN_ARGUMENTS: u8 = 2;
 pub const SCAN_NEW_TARGET: u8 = 4;
