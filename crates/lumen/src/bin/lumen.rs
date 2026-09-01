@@ -93,6 +93,7 @@ fn main() {
         } else {
             eval_stdin(&mut engine);
         }
+        finalize_performance_metrics(&mut engine);
         return;
     }
     for path in &args {
@@ -125,6 +126,16 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+    finalize_performance_metrics(&mut engine);
+}
+
+/// The managed-memory contract is explicitly post-collection. Keep this diagnostic collection in
+/// the shell (and behind the existing opt-in switch) so library embedders retain control of their
+/// own idle/collection boundaries and normal CLI runs do no extra work.
+fn finalize_performance_metrics(engine: &mut Engine) {
+    if std::env::var_os("LUMEN_PERF_METRICS").is_some() {
+        engine.unstable_collect_for_performance_metrics();
     }
 }
 

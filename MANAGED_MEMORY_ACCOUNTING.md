@@ -1,6 +1,11 @@
 # Managed-memory accounting design
 
-Status: design question for Phase 0; no byte total is reported yet.
+Status: implementation in vertical slices. The first post-collection visitor reports collector
+object/scope payloads, property/binding capacity, reachable shared string/Symbol/BigInt and
+callable lower bounds, and deduplicated ordinary `ArrayBuffer` capacity. Its versioned record
+marks the remaining side-table, cache, AST/bytecode, shared/Wasm, and host-resource owners as
+unavailable; the Phase 0 total is therefore explicitly a lower bound and the roadmap item remains
+open.
 
 ## Why object count is not a byte count
 
@@ -96,6 +101,18 @@ cover every `Interp` owner and refuse to call the total complete until an invent
 for all owning fields. Tests should construct shared strings/buffers, verify identity
 deduplication, distinguish `Vec::capacity` from `len`, force a collection, and show that releasing
 the final owner lowers the corresponding category exactly.
+
+Current implementation notes:
+
+- `LUMEN_PERF_METRICS=1` makes the standalone shell force one final collection and records the
+  visitor after the collector pause timer stops, so the diagnostic walk does not inflate the
+  reported pause.
+- Exact categories mean exact requested payload/capacity according to public Rust container
+  information. They exclude allocator rounding and Rust's private `RcBox` header.
+- A standard-library `HashMap` makes its containing storage category a lower bound: its entry
+  payload can be described, but its private bucket/control allocation cannot be measured exactly.
+- Adding the remaining owners and a compile-time-maintained ownership inventory is still required
+  before `complete` can become true.
 
 ## Questions worth outside review
 

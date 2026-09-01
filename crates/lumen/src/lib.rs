@@ -45,6 +45,7 @@ mod jit_ir;
 mod jstr;
 mod lexer;
 mod lstr;
+mod memory;
 mod modules;
 #[cfg(feature = "intl")]
 mod numbering;
@@ -222,6 +223,15 @@ impl Engine {
     /// thread (notably a dedicated worker).
     pub fn interrupt_handle(&self) -> std::sync::Arc<RuntimeInterrupt> {
         self.interp.runtime_interrupt.clone()
+    }
+
+    /// Force the post-collection safepoint required by the unstable performance record.
+    ///
+    /// The CLI calls this only when `LUMEN_PERF_METRICS` is enabled. It is hidden rather than part
+    /// of the supported embedder API; browser hosts use their normal idle collection entry point.
+    #[doc(hidden)]
+    pub fn unstable_collect_for_performance_metrics(&mut self) {
+        self.interp.collect_garbage_for_host();
     }
 
     /// Replace the realm's control handle before evaluating author code.

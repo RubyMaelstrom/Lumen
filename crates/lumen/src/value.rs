@@ -1092,7 +1092,7 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
     let pause_nanos = GC_PAUSE_NANOS.load(Relaxed);
     let max_pause_nanos = GC_MAX_PAUSE_NANOS.load(Relaxed);
     format!(
-        "\"gc_collections\":{},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{}",
+        "\"gc_collections\":{},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{},\"managed_memory\":{}",
         GC_COLLECTIONS.load(Relaxed),
         pause_nanos as f64 / 1_000_000_000.0,
         max_pause_nanos as f64 / 1_000_000_000.0,
@@ -1104,6 +1104,7 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
         GC_SCOPES_RECLAIMED.load(Relaxed),
         GC_PEAK_SCOPES_BEFORE.load(Relaxed),
         GC_LAST_SCOPES_AFTER.load(Relaxed),
+        crate::memory::json(),
     )
 }
 
@@ -1532,6 +1533,11 @@ impl Drop for Property {
 }
 
 impl Property {
+    fn retained_requested_storage_bytes(&self) -> usize {
+        self.accessors()
+            .map_or(0, |_| std::mem::size_of::<Accessors>())
+    }
+
     pub(crate) fn data(
         value: Value,
         writable: bool,
@@ -2191,6 +2197,64 @@ impl Props {
 
     pub(crate) fn with_capacity(capacity: usize) -> Props {
         Self::with_entries(Vec::with_capacity(capacity))
+    }
+
+    /// Requested bytes in allocations owned directly by this property map. The `Props` body is
+    /// already part of its containing `Object`; this counts only backing allocations and boxed
+    /// cold storage. `exact` is false when a standard-library hash table owns opaque bucket
+    /// storage whose requested allocation size Rust does not expose.
+    pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
+        let mut bytes = self
+            .entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Rc<str>, Property)>());
+        let mut exact = true;
+        for (_, property) in &self.entries {
+            bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
+        }
+        if let Some(dense) = self.elems.0.as_deref() {
+            bytes = bytes.saturating_add(std::mem::size_of::<DenseBuffers>());
+            bytes = bytes.saturating_add(
+                dense
+                    .elems
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
+            bytes = bytes.saturating_add(
+                dense
+                    .mirror
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<f64>()),
+            );
+            if let Some(packed) = dense.packed.as_deref() {
+                bytes = bytes.saturating_add(std::mem::size_of::<Vec<Property>>());
+                bytes = bytes.saturating_add(
+                    packed
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Property>()),
+                );
+                for property in packed {
+                    bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
+                }
+            } else {
+                for property in dense.inline_packed.as_slice() {
+                    bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
+                }
+            }
+            if dense.index.is_some() {
+                bytes = bytes.saturating_add(std::mem::size_of::<
+                    crate::fasthash::FastMap<Rc<str>, usize>,
+                >());
+                exact = false;
+            }
+            if dense.symbols.is_some() {
+                bytes = bytes.saturating_add(std::mem::size_of::<
+                    crate::fasthash::FastMap<u64, Rc<SymbolData>>,
+                >());
+                exact = false;
+            }
+        }
+        (bytes, exact)
     }
 
     fn with_entries(entries: Vec<(Rc<str>, Property)>) -> Props {

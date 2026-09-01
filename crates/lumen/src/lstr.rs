@@ -138,6 +138,15 @@ impl LStr {
         self.hdr().strong.get()
     }
 
+    /// Requested bytes retained by this allocation, excluding allocator rounding.
+    ///
+    /// This includes Lumen's stable string header because [`LStr`] allocates that header and its
+    /// byte capacity as one explicit allocation. It intentionally does not include allocator
+    /// metadata outside that request.
+    pub(crate) fn retained_requested_bytes(&self) -> usize {
+        HDR.saturating_add((self.hdr().cap.get() & !ASCII_HINT) as usize)
+    }
+
     /// Append in place when this is the ONLY reference and capacity suffices. Returns false
     /// (without modifying anything) otherwise — the caller copies. The unique-owner requirement
     /// is what makes the mutation invisible: no other handle can observe the content, and the

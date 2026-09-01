@@ -130,6 +130,20 @@ fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
 }
 
 impl JsBigInt {
+    pub(crate) fn allocation_identity(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
+    /// Requested payload/capacity bytes, excluding the implementation-private `RcBox` header.
+    pub(crate) fn retained_requested_bytes(&self) -> usize {
+        std::mem::size_of::<BigIntData>().saturating_add(
+            self.0
+                .mag
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>()),
+        )
+    }
+
     pub fn zero() -> Self {
         JsBigInt(Rc::new(BigIntData {
             neg: false,

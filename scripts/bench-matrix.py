@@ -545,6 +545,37 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
             or sum(counts) != metrics.get("gc_collections")
         ):
             raise BenchmarkError("invalid GC pause histogram in engine metrics")
+    managed = metrics.get("managed_memory")
+    if managed is not None:
+        if (
+            managed.get("schema_version") != 1
+            or managed.get("safepoint") != "post_gc"
+            or not isinstance(managed.get("complete"), bool)
+            or not isinstance(managed.get("categories"), dict)
+        ):
+            raise BenchmarkError("invalid managed-memory record in engine metrics")
+        for name in ("managed_requested_bytes", "managed_external_bytes"):
+            measurement = managed.get(name)
+            if (
+                not isinstance(measurement, dict)
+                or not isinstance(measurement.get("bytes"), int)
+                or measurement["bytes"] < 0
+                or measurement.get("quality") not in ("exact", "lower_bound")
+            ):
+                raise BenchmarkError(f"invalid {name} in managed-memory record")
+        for name, category in managed["categories"].items():
+            if not isinstance(name, str) or not isinstance(category, dict):
+                raise BenchmarkError("invalid managed-memory category")
+            quality = category.get("quality")
+            byte_count = category.get("bytes")
+            if quality == "unavailable":
+                if byte_count is not None:
+                    raise BenchmarkError("unavailable managed-memory category has a byte count")
+            elif quality in ("exact", "lower_bound"):
+                if not isinstance(byte_count, int) or byte_count < 0:
+                    raise BenchmarkError("invalid managed-memory category byte count")
+            else:
+                raise BenchmarkError("invalid managed-memory category quality")
     return metrics
 
 
@@ -689,6 +720,61 @@ def summarize(
                     ],
                     "sample_processes": len(histograms),
                 }
+                managed_records = [
+                    entry["managed_memory"]
+                    for entry in engine_metric_entries
+                    if entry.get("managed_memory") is not None
+                ]
+                if managed_records:
+                    if len(managed_records) != len(engine_metric_entries):
+                        raise BenchmarkError("managed-memory records missing from some samples")
+                    category_names = set(managed_records[0]["categories"])
+                    if any(
+                        set(record["categories"]) != category_names for record in managed_records
+                    ):
+                        raise BenchmarkError("incompatible managed-memory categories")
+                    managed_summary: dict[str, Any] = {
+                        "schema_version": managed_records[0]["schema_version"],
+                        "complete": all(record["complete"] for record in managed_records),
+                    }
+                    for name in ("managed_requested_bytes", "managed_external_bytes"):
+                        qualities = sorted({record[name]["quality"] for record in managed_records})
+                        managed_summary[name] = {
+                            "quality": qualities[0] if len(qualities) == 1 else qualities,
+                            "bytes": summary_stats(
+                                (record[name]["bytes"] for record in managed_records),
+                                confidence,
+                                resamples,
+                                stable_seed(seed, f"{engine}:{workload}:engine-metrics:{name}"),
+                            ),
+                        }
+                    category_summary = {}
+                    for name in sorted(category_names):
+                        categories = [record["categories"][name] for record in managed_records]
+                        qualities = sorted({category["quality"] for category in categories})
+                        available = [
+                            category["bytes"]
+                            for category in categories
+                            if category["bytes"] is not None
+                        ]
+                        category_summary[name] = {
+                            "quality": qualities[0] if len(qualities) == 1 else qualities,
+                            "bytes": (
+                                summary_stats(
+                                    available,
+                                    confidence,
+                                    resamples,
+                                    stable_seed(
+                                        seed,
+                                        f"{engine}:{workload}:engine-metrics:managed:{name}",
+                                    ),
+                                )
+                                if available
+                                else None
+                            ),
+                        }
+                    managed_summary["categories"] = category_summary
+                    summarized_engine_metrics["managed_memory"] = managed_summary
                 result["engine_metrics"] = summarized_engine_metrics
             workload_results[workload] = result
         rounds = sorted(round_index for (candidate, round_index) in by_round if candidate == engine)

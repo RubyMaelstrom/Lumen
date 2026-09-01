@@ -630,6 +630,26 @@ impl<'a> Iterator for VarValues<'a> {
 }
 
 impl VarMap {
+    /// Requested bytes owned directly by this binding map, plus whether the result is exact.
+    /// `HashMap` bucket allocation sizes are intentionally reported as an incomplete lower bound
+    /// because the standard library does not expose their requested layout.
+    pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
+        match &self.map {
+            VarStorage::Small(entries) => (
+                entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>()),
+                true,
+            ),
+            VarStorage::Large(entries) => (
+                entries
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>()),
+                false,
+            ),
+        }
+    }
+
     pub(crate) fn with_capacity(capacity: usize) -> VarMap {
         VarMap {
             map: if capacity <= SMALL_VAR_MAP_CAPACITY {
@@ -782,6 +802,24 @@ impl ScopeNames {
 
     pub fn iter(&self) -> std::slice::Iter<'_, String> {
         self.0.as_deref().map_or(&[][..], Vec::as_slice).iter()
+    }
+
+    pub(crate) fn retained_requested_storage_bytes(&self) -> usize {
+        let Some(names) = self.0.as_deref() else {
+            return 0;
+        };
+        std::mem::size_of::<Vec<String>>()
+            .saturating_add(
+                names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                names
+                    .iter()
+                    .map(|name| name.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 }
 
@@ -6544,6 +6582,12 @@ impl Interp {
                 performance_scopes_before,
                 scopes_after,
             );
+            // Keep diagnostic traversal outside the collector pause measurement. It runs only
+            // under LUMEN_PERF_METRICS and records a post-sweep Agent safepoint, so ordinary
+            // execution and reported GC pause time do not absorb visitor overhead.
+            let objects = crate::value::heap_gc_snapshot(&self.gc_heap);
+            let scopes = crate::value::gc_scope_snapshot(&self.gc_heap);
+            crate::memory::record_post_gc(self, &objects, &scopes);
         }
     }
 

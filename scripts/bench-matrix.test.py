@@ -45,20 +45,95 @@ class UnitTests(unittest.TestCase):
         with self.assertRaises(bench_matrix.BenchmarkError):
             bench_matrix.parse_score(output, "Other")
 
+    def test_summary_retains_managed_memory_distributions_and_quality(self) -> None:
+        metric_names = (
+            "jit_compile_attempts",
+            "jit_compile_successes",
+            "jit_compile_failures",
+            "jit_compile_seconds",
+            "jit_generated_code_bytes",
+            "jit_largest_code_bytes",
+            "gc_collections",
+            "gc_pause_seconds",
+            "gc_max_pause_seconds",
+            "gc_objects_seen",
+            "gc_objects_reclaimed",
+            "gc_peak_objects_before",
+            "gc_last_objects_after",
+            "gc_scopes_seen",
+            "gc_scopes_reclaimed",
+            "gc_peak_scopes_before",
+            "gc_last_scopes_after",
+        )
+        samples = []
+        for round_index, retained in enumerate((10, 20)):
+            metrics = {name: 0 for name in metric_names}
+            metrics["gc_pause_histogram"] = {
+                "unit": "nanoseconds",
+                "upper_bounds": [None],
+                "counts": [0],
+            }
+            metrics["managed_memory"] = {
+                "schema_version": 1,
+                "complete": False,
+                "managed_requested_bytes": {"bytes": retained, "quality": "lower_bound"},
+                "managed_external_bytes": {"bytes": 4, "quality": "lower_bound"},
+                "categories": {
+                    "objects": {"bytes": retained, "quality": "exact"},
+                    "side_tables": {"bytes": None, "quality": "unavailable"},
+                },
+            }
+            samples.append(
+                {
+                    "phase": "measure",
+                    "engine": "lumen",
+                    "workload": "demo",
+                    "round": round_index,
+                    "score": 1,
+                    "wall_seconds": 1,
+                    "cpu_seconds": 1,
+                    "peak_rss_bytes": 1,
+                    "engine_metrics": metrics,
+                }
+            )
+        summary = bench_matrix.summarize(
+            samples, ["lumen"], ["demo"], "lumen", 0.95, 0, 1
+        )
+        managed = summary["engines"]["lumen"]["workloads"]["demo"]["engine_metrics"][
+            "managed_memory"
+        ]
+        self.assertEqual(managed["managed_requested_bytes"]["bytes"]["median"], 15)
+        self.assertEqual(managed["categories"]["objects"]["quality"], "exact")
+        self.assertIsNone(managed["categories"]["side_tables"]["bytes"])
+
     def test_engine_metrics_parser_requires_one_versioned_json_line(self) -> None:
         stderr = (
             'noise\n[lumen-perf] {"schema_version":1,"jit_compile_seconds":0.25,'
             '"gc_collections":2,"gc_pause_histogram":{"unit":"nanoseconds",'
-            '"upper_bounds":[50000,null],"counts":[1,1]}}\n'
+            '"upper_bounds":[50000,null],"counts":[1,1]},'
+            '"managed_memory":{"schema_version":1,"safepoint":"post_gc",'
+            '"complete":false,"managed_requested_bytes":{"bytes":12,"quality":"lower_bound"},'
+            '"managed_external_bytes":{"bytes":4,"quality":"lower_bound"},'
+            '"categories":{"objects":{"bytes":8,"quality":"exact"},'
+            '"side_tables":{"bytes":null,"quality":"unavailable"}}}}\n'
         )
         metrics = bench_matrix.parse_engine_metrics(stderr, "[lumen-perf] ")
         self.assertEqual(metrics["jit_compile_seconds"], 0.25)
         self.assertEqual(sum(metrics["gc_pause_histogram"]["counts"]), 2)
+        self.assertEqual(metrics["managed_memory"]["managed_requested_bytes"]["bytes"], 12)
         with self.assertRaises(bench_matrix.BenchmarkError):
             bench_matrix.parse_engine_metrics("", "[lumen-perf] ")
         with self.assertRaises(bench_matrix.BenchmarkError):
             bench_matrix.parse_engine_metrics(
                 stderr.replace('"counts":[1,1]', '"counts":[1,0]'), "[lumen-perf] "
+            )
+        with self.assertRaises(bench_matrix.BenchmarkError):
+            bench_matrix.parse_engine_metrics(
+                stderr.replace(
+                    '"side_tables":{"bytes":null,"quality":"unavailable"}',
+                    '"side_tables":{"bytes":0,"quality":"unavailable"}',
+                ),
+                "[lumen-perf] ",
             )
 
 
