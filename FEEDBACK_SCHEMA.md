@@ -92,7 +92,17 @@ instruction format into the profile:
   u32 payload. A nonzero count is `Monomorphic`, and a conditional site with both directions seen
   is `Polymorphic`; counters never wrap. The payload is diagnostic data, not a language-visible
   execution limit.
-- `Allocation`: bounded allocation summaries reserved for a later Phase 1 slice.
+- `Allocation`: explicit allocation-site summaries. Version 1 stores independent bounded one-hot
+  groups for the ECMAScript result family (`Function`, `RegExp`, `Array`, or ordinary `Object`)
+  and the requested-capacity class (`zero`, `small` ≤4 units, `medium` ≤32, or `large`). Units
+  are operation-specific preallocation hints: array elements, object properties, or RegExp source
+  plus flag bytes. They are not allocator-header bytes and do not encode a Rust layout. A site
+  widens to `Generic` after four alternatives in either group. Survival age, promotion, retained
+  bytes, and exact allocator requests are heap-layer telemetry and remain unreported here until
+  the central heap can associate those facts with a stable allocation identity. The site mapping
+  follows ECMA-262 §13.2.4 (Array Initializer) and §13.2.5 (Object Initializer): observation is
+  published only after the initializer's normal completion, so it cannot alter evaluation order
+  or turn an abrupt completion into a successful allocation sample.
 
 The schema uses fixed numeric encodings and compact descriptors. Observation payload words are
 allocated lazily, so merely compiling a function does not allocate a detailed runtime profile.

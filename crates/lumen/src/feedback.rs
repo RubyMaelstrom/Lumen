@@ -163,6 +163,58 @@ const CALL_TARGET_SHIFT: u32 = 0;
 const CALL_ARITY_SHIFT: u32 = 8;
 const CALL_ENVIRONMENT_SHIFT: u32 = 16;
 
+/// Abstract allocation families for explicit allocation bytecodes. These names describe the
+/// ECMAScript result family, not the current Rust object representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum AllocationObjectKind {
+    Function = 1,
+    RegExp = 2,
+    Array = 3,
+    Object = 4,
+}
+
+/// Bounded requested-capacity class for an allocation site. The unit is operation-specific
+/// (array elements, object properties, or source bytes for a RegExp), never allocator metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum AllocationSizeKind {
+    Zero = 1,
+    Small = 2,
+    Medium = 3,
+    Large = 4,
+}
+
+const ALLOCATION_OBJECT_SHIFT: u32 = 0;
+const ALLOCATION_SIZE_SHIFT: u32 = 8;
+
+pub(crate) const fn allocation_observation_payload(
+    object: AllocationObjectKind,
+    size: AllocationSizeKind,
+) -> u32 {
+    (1_u32 << (ALLOCATION_OBJECT_SHIFT + object as u32 - 1))
+        | (1_u32 << (ALLOCATION_SIZE_SHIFT + size as u32 - 1))
+}
+
+fn allocation_group_counts(payload: u32) -> (u32, u32) {
+    (
+        ((payload >> ALLOCATION_OBJECT_SHIFT) & 0x0f).count_ones(),
+        ((payload >> ALLOCATION_SIZE_SHIFT) & 0x0f).count_ones(),
+    )
+}
+
+pub(crate) const fn allocation_size_kind(requested_units: usize) -> AllocationSizeKind {
+    if requested_units == 0 {
+        AllocationSizeKind::Zero
+    } else if requested_units <= 4 {
+        AllocationSizeKind::Small
+    } else if requested_units <= 32 {
+        AllocationSizeKind::Medium
+    } else {
+        AllocationSizeKind::Large
+    }
+}
+
 // Branch counters are deliberately saturating. Conditional sites store taken/fallthrough
 // counts as two u16 lanes; loop sites use the full u32 payload for back-edge transfers.
 const BRANCH_TAKEN_SHIFT: u32 = 0;
@@ -427,6 +479,21 @@ impl ObservationWord {
                         && (payload >> BRANCH_FALLTHROUGH_SHIFT) & BRANCH_COUNTER_MASK != 0
                 }
                 ObservationState::Generic => payload == 0,
+                ObservationState::Absent => false,
+            };
+        }
+        if kind == ObservationKind::Allocation {
+            if ((self.0 >> 8) as u8) != 0 {
+                return false;
+            }
+            let payload = self.payload_bits();
+            let (objects, sizes) = allocation_group_counts(payload);
+            return match self.decoded_state().unwrap() {
+                ObservationState::Uninitialized | ObservationState::Generic => payload == 0,
+                ObservationState::Monomorphic => (objects, sizes) == (1, 1),
+                ObservationState::Polymorphic => {
+                    payload != 0 && (1..=4).contains(&objects) && (1..=4).contains(&sizes)
+                }
                 ObservationState::Absent => false,
             };
         }
@@ -740,6 +807,8 @@ impl FeedbackVector {
         let current = ObservationWord(cell.get());
         let merged = if kind == ObservationKind::PropertyAccess {
             merge_property_access_words(current, incoming)
+        } else if kind == ObservationKind::Allocation {
+            merge_allocation_words(current, incoming)
         } else {
             merge_observation_words(current, incoming)
         };
@@ -1117,6 +1186,55 @@ impl FeedbackVector {
         cell.set(ObservationWord::new(ObservationState::Monomorphic, next, 0).0);
     }
 
+    /// Record an explicit allocation site's result family and requested capacity class. Lifetime
+    /// and promotion are deliberately collected by the heap layer later; this site-local word
+    /// never guesses a survival result at allocation time.
+    pub(crate) fn observe_allocation(
+        &self,
+        bytecode_pc: usize,
+        object: AllocationObjectKind,
+        requested_units: usize,
+    ) {
+        if !self.detailed_enabled {
+            return;
+        }
+        let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
+            return;
+        };
+        let Ok(index) = self
+            .layout
+            .sites
+            .binary_search_by_key(&bytecode_pc, |site| site.bytecode_pc)
+        else {
+            return;
+        };
+        let site = SiteId(index as u32);
+        if self
+            .layout
+            .site(site)
+            .is_none_or(|site| site.operation != OperationKind::Allocation)
+        {
+            return;
+        }
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors.iter().position(|slot| {
+            slot.kind == ObservationKind::Allocation && slot.role == ObservationRole::Outcome
+        }) else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        let cell = &self.words()[first + offset];
+        let current = ObservationWord(cell.get());
+        let incoming = ObservationWord::new(
+            ObservationState::Monomorphic,
+            allocation_observation_payload(object, allocation_size_kind(requested_units)),
+            0,
+        );
+        cell.set(merge_allocation_words(current, incoming).0);
+    }
+
     /// Merge one stable semantic value class into the matching site's bitset.
     pub(crate) fn observe_value_class(
         &self,
@@ -1314,6 +1432,7 @@ impl FeedbackVector {
                     ObservationKind::BranchCount => {
                         merge_branch_count_words(current, incoming[slot], site.operation)
                     }
+                    ObservationKind::Allocation => merge_allocation_words(current, incoming[slot]),
                     _ => merge_observation_words(current, incoming[slot]),
                 };
                 self.words()[slot].set(merged.0);
@@ -1345,6 +1464,38 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+/// Merge the two independent allocation dimensions without preserving a false correlation
+/// between object family and requested-capacity class. A site widens after four alternatives in
+/// either dimension, matching the other bounded feedback families.
+fn merge_allocation_words(current: ObservationWord, incoming: ObservationWord) -> ObservationWord {
+    debug_assert!(current.is_valid_for(ObservationKind::Allocation));
+    debug_assert!(incoming.is_valid_for(ObservationKind::Allocation));
+    if current == incoming || incoming == ObservationWord::UNINITIALIZED {
+        return current;
+    }
+    if current == ObservationWord::UNINITIALIZED {
+        return incoming;
+    }
+    let current_state = current.decoded_state().unwrap();
+    let incoming_state = incoming.decoded_state().unwrap();
+    if current_state == ObservationState::Generic || incoming_state == ObservationState::Generic {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    if current_state == ObservationState::Absent || incoming_state == ObservationState::Absent {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    let payload = current.payload_bits() | incoming.payload_bits();
+    let (objects, sizes) = allocation_group_counts(payload);
+    let state = if objects == 1 && sizes == 1 {
+        ObservationState::Monomorphic
+    } else if (1..=4).contains(&objects) && (1..=4).contains(&sizes) {
+        ObservationState::Polymorphic
+    } else {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    };
+    ObservationWord::new(state, payload, 0)
 }
 
 /// Merge bounded one-hot payloads from two diagnostic snapshots without inventing a correlation
@@ -1671,6 +1822,10 @@ mod tests {
         assert_eq!(CallArityKind::Many as u8, 4);
         assert_eq!(CallEnvironmentKind::None as u8, 1);
         assert_eq!(CallEnvironmentKind::Unknown as u8, 4);
+        assert_eq!(AllocationObjectKind::Function as u8, 1);
+        assert_eq!(AllocationObjectKind::Object as u8, 4);
+        assert_eq!(AllocationSizeKind::Zero as u8, 1);
+        assert_eq!(AllocationSizeKind::Large as u8, 4);
         assert_eq!(property_access_flags(PropertyOutcome::Data, 3, true), 0x1b);
         assert_eq!(ValueClass::Undefined as u8, 1);
         assert_eq!(ValueClass::Object as u8, 9);
@@ -1874,6 +2029,52 @@ mod tests {
         assert_eq!(loop_count.payload(), 2);
         assert_eq!(loop_count.state(), ObservationState::Monomorphic);
         assert!(loop_count.is_valid_for(ObservationKind::BranchCount));
+    }
+
+    #[test]
+    fn allocation_feedback_keeps_kind_and_requested_size_bounded() {
+        let mut builder = LayoutBuilder::default();
+        builder.add_site(
+            4,
+            OperationKind::Allocation,
+            &[SlotDescriptor {
+                kind: ObservationKind::Allocation,
+                role: ObservationRole::Outcome,
+            }],
+        );
+        let vector = FeedbackVector::new_with_enabled(
+            builder.finish(),
+            vec![RuntimeBinding::Unbound].into_boxed_slice(),
+            true,
+        );
+
+        vector.observe_allocation(4, AllocationObjectKind::Array, 2);
+        let word = vector.read(
+            SiteId(0),
+            ObservationKind::Allocation,
+            ObservationRole::Outcome,
+        );
+        assert_eq!(word.state(), ObservationState::Monomorphic);
+        assert_eq!(allocation_group_counts(word.payload()), (1, 1));
+        assert!(word.is_valid_for(ObservationKind::Allocation));
+
+        vector.observe_allocation(4, AllocationObjectKind::Array, 64);
+        let word = vector.read(
+            SiteId(0),
+            ObservationKind::Allocation,
+            ObservationRole::Outcome,
+        );
+        assert_eq!(word.state(), ObservationState::Polymorphic);
+        assert_eq!(allocation_group_counts(word.payload()), (1, 2));
+
+        vector.observe_allocation(4, AllocationObjectKind::Object, 0);
+        let word = vector.read(
+            SiteId(0),
+            ObservationKind::Allocation,
+            ObservationRole::Outcome,
+        );
+        assert_eq!(word.state(), ObservationState::Polymorphic);
+        assert_eq!(allocation_group_counts(word.payload()), (2, 3));
     }
 
     #[test]

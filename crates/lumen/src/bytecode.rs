@@ -3028,6 +3028,18 @@ fn observe_arithmetic_result(
     }
 }
 
+#[inline(always)]
+fn observe_allocation(
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
+    object: crate::feedback::AllocationObjectKind,
+    requested_units: usize,
+) {
+    if feedback.detailed_enabled() {
+        feedback.observe_allocation(pc, object, requested_units);
+    }
+}
+
 #[cfg(test)]
 mod feedback_layout_tests {
     use super::*;
@@ -3090,6 +3102,29 @@ mod feedback_layout_tests {
             layout.site(sites[1]).unwrap().operation,
             OperationKind::Loop
         );
+    }
+
+    #[test]
+    fn layout_records_explicit_allocation_sites() {
+        let ops = [
+            Op::MakeClosure(0, u32::MAX),
+            Op::MakeRegExp(0, 1),
+            Op::MakeArray(2),
+            Op::NewArray,
+            Op::MakeObject(0, 1, u32::MAX),
+            Op::NewObject,
+        ];
+        let names = [Rc::from("pattern"), Rc::from("g")];
+        let (layout, _) = feedback_layout_for_ops(&ops, &names);
+        assert_eq!(layout.len(), ops.len());
+        assert!(layout.site_ids().all(|site| {
+            layout.site(site).unwrap().operation == OperationKind::Allocation
+                && layout.slots(site).unwrap()
+                    == [crate::feedback::SlotDescriptor {
+                        kind: ObservationKind::Allocation,
+                        role: ObservationRole::Outcome,
+                    }]
+        }));
     }
 
     #[test]
@@ -10489,6 +10524,12 @@ fn run_vm(
                 if name_n != u32::MAX {
                     i.set_fn_name(&v, &chunk.names[name_n as usize]);
                 }
+                observe_allocation(
+                    &chunk.feedback,
+                    op_pc,
+                    crate::feedback::AllocationObjectKind::Function,
+                    0,
+                );
                 stack.push(v);
             }
             Op::LoadName(n, c) => {
@@ -11631,16 +11672,39 @@ fn run_vm(
                 stack.push(value);
             }
             Op::MakeRegExp(body, flags) => {
-                stack.push(
-                    i.make_regexp(&chunk.names[body as usize], &chunk.names[flags as usize])?,
+                let body = &chunk.names[body as usize];
+                let flags = &chunk.names[flags as usize];
+                let value = i.make_regexp(body, flags)?;
+                observe_allocation(
+                    &chunk.feedback,
+                    op_pc,
+                    crate::feedback::AllocationObjectKind::RegExp,
+                    body.len().saturating_add(flags.len()),
                 );
+                stack.push(value);
             }
             Op::MakeArray(n) => {
                 let at = stack.len() - n as usize;
                 let items: Vec<Value> = stack.split_off(at);
-                stack.push(i.make_array(items));
+                let value = i.make_array(items);
+                observe_allocation(
+                    &chunk.feedback,
+                    op_pc,
+                    crate::feedback::AllocationObjectKind::Array,
+                    n as usize,
+                );
+                stack.push(value);
             }
-            Op::NewArray => stack.push(i.make_array(Vec::new())),
+            Op::NewArray => {
+                let value = i.make_array(Vec::new());
+                observe_allocation(
+                    &chunk.feedback,
+                    op_pc,
+                    crate::feedback::AllocationObjectKind::Array,
+                    0,
+                );
+                stack.push(value);
+            }
             Op::ArrayPush => {
                 let value = pop!();
                 let array = stack.last().expect("array builder missing").clone();
@@ -11667,9 +11731,24 @@ fn run_vm(
                 } else {
                     i.make_plain_object_vm(keys, values)
                 };
+                observe_allocation(
+                    &chunk.feedback,
+                    op_pc,
+                    crate::feedback::AllocationObjectKind::Object,
+                    count as usize,
+                );
                 stack.push(v);
             }
-            Op::NewObject => stack.push(Value::Obj(i.new_object())),
+            Op::NewObject => {
+                let value = Value::Obj(i.new_object());
+                observe_allocation(
+                    &chunk.feedback,
+                    op_pc,
+                    crate::feedback::AllocationObjectKind::Object,
+                    0,
+                );
+                stack.push(value);
+            }
             Op::ObjectData(name_anonymous) => {
                 let value = pop!();
                 let key = pop!();
@@ -14744,6 +14823,14 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
     };
     match chunk.make_regexp_literal(unsafe { &mut *ctx.interp }, pc as usize, body, flags) {
         Ok(value) => {
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::RegExp,
+                chunk.names[body as usize]
+                    .len()
+                    .saturating_add(chunk.names[flags as usize].len()),
+            );
             unsafe { sp.write(value) };
             crate::jit::SpFlag {
                 sp: unsafe { sp.add(1) },
@@ -15786,6 +15873,12 @@ pub(crate) unsafe extern "C" fn jit_make_object(
         }
         i.make_plain_object_vm(keys, values)
     };
+    observe_allocation(
+        &chunk.feedback,
+        pc as usize,
+        crate::feedback::AllocationObjectKind::Object,
+        count,
+    );
     sp = base;
     sp.write(v);
     crate::jit::SpFlag {
@@ -15809,6 +15902,12 @@ pub(crate) unsafe extern "C" fn jit_make_array(
     };
     let base = unsafe { sp.sub(count as usize) };
     let value = unsafe { (&*ctx.interp).make_array_from_raw(base, count as usize) };
+    observe_allocation(
+        &chunk.feedback,
+        pc as usize,
+        crate::feedback::AllocationObjectKind::Array,
+        count as usize,
+    );
     sp = base;
     unsafe { sp.write(value) };
     crate::jit::SpFlag {
@@ -16817,6 +16916,12 @@ unsafe fn jit_exec_inner(
             if name_n != u32::MAX {
                 i.set_fn_name(&v, &chunk.names[name_n as usize]);
             }
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::Function,
+                0,
+            );
             push!(v);
         }
         Op::LoadName(n, c) => {
@@ -17540,7 +17645,16 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::MakeRegExp(body, flags) => {
-            push!(chunk.make_regexp_literal(i, pc as usize, body, flags)?);
+            let value = chunk.make_regexp_literal(i, pc as usize, body, flags)?;
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::RegExp,
+                chunk.names[body as usize]
+                    .len()
+                    .saturating_add(chunk.names[flags as usize].len()),
+            );
+            push!(value);
         }
         Op::MakeArray(n) => {
             let n = n as usize;
@@ -17550,7 +17664,14 @@ unsafe fn jit_exec_inner(
                 items.push(base.add(k).read());
             }
             *sp = base;
-            push!(i.make_array(items));
+            let value = i.make_array(items);
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::Array,
+                n,
+            );
+            push!(value);
         }
         Op::MakeObject(start, count, tidx) => {
             let count = count as usize;
@@ -17566,6 +17687,12 @@ unsafe fn jit_exec_inner(
             } else {
                 i.make_plain_object_vm(keys, values)
             };
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::Object,
+                count,
+            );
             push!(v);
         }
         Op::ToStr => {

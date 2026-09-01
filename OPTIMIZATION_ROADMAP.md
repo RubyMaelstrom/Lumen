@@ -521,6 +521,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   counters monotonically with saturation rather than treating them as a boolean shape signal.
 - [ ] Record allocation site, object kind, requested size, survival age, promotion, and retained
   bytes.
+  - [x] Record explicit allocation-bytecode sites with bounded ECMAScript result-family and
+    requested-capacity observations in baseline and detailed JIT execution. The adapter follows
+    ECMA-262 §13.2.4/§13.2.5 completion ordering and is disabled without detailed profiling.
+  - [ ] Associate allocation identities with survival age, promotion, exact requested bytes, and
+    retained size once the central heap/root API exists; do not infer lifetime from site samples.
 - [ ] Record GC cause, generation, pause time, concurrent work, bytes scanned/copied/freed, and
   live-set size.
 - [ ] Record baseline/optimizing compile time, generated code size, inlining decisions, guard
