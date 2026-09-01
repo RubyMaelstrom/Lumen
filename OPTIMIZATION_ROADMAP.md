@@ -397,6 +397,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     to separate identity-deduplicated families.
   - [x] Account live RegExp program pins and deferred legacy-match state through the same payload
     registries, establishing the partial `interpreter_side_tables` category.
+  - [x] Account realm-local well-known-symbol/key caches; defer the shared Agent symbol registry
+    until root-plus-ShadowRealm traversal can deduplicate it once per Agent.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

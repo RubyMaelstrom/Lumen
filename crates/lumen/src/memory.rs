@@ -200,7 +200,7 @@ impl Visitor {
         }
     }
 
-    fn symbol(&mut self, value: &Rc<SymbolData>) {
+    pub(crate) fn symbol(&mut self, value: &Rc<SymbolData>) {
         let identity = Rc::as_ptr(value) as usize;
         if self.symbols.insert(identity) {
             self.strings_symbols_bigints = self
@@ -553,6 +553,18 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
             visitor.regex(regex);
         }
     }
+    if let Some(symbol) = &interp.iterator_sym {
+        visitor.symbol(symbol);
+    }
+    interpreter_side_tables.add(interp.wk_syms.capacity().saturating_mul(size_of::<(
+        &'static str,
+        Value,
+        Rc<str>,
+    )>()));
+    for (_, symbol, key) in &interp.wk_syms {
+        visitor.value(symbol);
+        visitor.rc_str(key);
+    }
 
     // Function-owned maps can be reached while scanning either objects or scopes. Merge their
     // storage only after both root families have completed so traversal order cannot omit it.
@@ -596,7 +608,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         ),
         interpreter_side_tables: Category::lower_bound(
             interpreter_side_tables.bytes,
-            "RegExp owners are covered; remaining Interp side tables are not",
+            "RegExp and realm-local symbol owners are covered; remaining Interp side tables are not",
         ),
         // The ordinary stores reached through this table are exact, but the category remains a
         // lower bound until shared/Wasm and host-created backing stores join the same layer.
@@ -715,6 +727,23 @@ mod tests {
 
         assert!(snapshot.interpreter_side_tables.bytes > 0);
         assert!(snapshot.regexp_metadata.bytes > 0);
+    }
+
+    #[test]
+    fn realm_symbol_caches_credit_storage_and_shared_payload_once() {
+        let interp = Interp::new();
+        let objects = crate::value::heap_gc_snapshot(&interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&interp.gc_heap);
+        let snapshot = measure(&interp, &objects, &scopes);
+        let wk_storage =
+            interp
+                .wk_syms
+                .capacity()
+                .saturating_mul(size_of::<(&'static str, Value, Rc<str>)>());
+
+        assert!(!interp.wk_syms.is_empty());
+        assert!(snapshot.interpreter_side_tables.bytes >= wk_storage);
+        assert!(snapshot.strings_symbols_bigints.bytes > 0);
     }
 
     #[test]

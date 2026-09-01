@@ -158,6 +158,11 @@ program, prepared subject, and input string remain credited to their canonical p
 That side-table category stays a documented lower bound until the rest of the exhaustive `Interp`
 inventory is covered.
 
+Realm-local well-known-symbol/key caches now contribute their vector storage and route Symbol and
+`Rc<str>` payloads through the shared identity sets. The Agent-wide symbol registry intentionally
+waits for root-plus-ShadowRealm aggregation: it is one shared owner, and charging it independently
+to every collector heap would inflate the eventual Agent total.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
