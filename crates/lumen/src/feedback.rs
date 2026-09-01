@@ -19,9 +19,14 @@ const PROFILE_HEADER_LEN: usize = 48;
 
 static PROCESS_PROFILE_SESSION: OnceLock<u64> = OnceLock::new();
 static NEXT_PROFILE_VECTOR_ID: AtomicU64 = AtomicU64::new(1);
+static DETAILED_FEEDBACK_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn process_profile_session() -> u64 {
     *PROCESS_PROFILE_SESSION.get_or_init(|| RandomState::new().build_hasher().finish().max(1))
+}
+
+fn detailed_feedback_enabled() -> bool {
+    *DETAILED_FEEDBACK_ENABLED.get_or_init(|| std::env::var_os("LUMEN_FEEDBACK_PROFILE").is_some())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +66,33 @@ pub(crate) enum ObservationKind {
     CallTarget = 5,
     BranchCount = 6,
     Allocation = 7,
+}
+
+/// Stable semantic classes for `ValueClass` observations.
+///
+/// ECMAScript has one binary64 Number type. `NumberInt32` is an optimizer refinement for values
+/// that can use int32 arithmetic without losing -0 or overflowing; it is not a language type and
+/// never changes the operation's specified Number semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ValueClass {
+    Undefined = 1,
+    Null = 2,
+    Boolean = 3,
+    NumberInt32 = 4,
+    NumberDouble = 5,
+    String = 6,
+    BigInt = 7,
+    Symbol = 8,
+    Object = 9,
+}
+
+impl ValueClass {
+    const ALL_BITS: u32 = (1 << 9) - 1;
+
+    pub(crate) const fn bit(self) -> u32 {
+        1 << (self as u8 - 1)
+    }
 }
 
 /// Semantic position of an observation within its site.
@@ -119,6 +151,29 @@ impl ObservationWord {
 
     fn is_valid(self) -> bool {
         self.0 >> 48 == 0 && self.decoded_state().is_some()
+    }
+
+    fn is_valid_for(self, kind: ObservationKind) -> bool {
+        if !self.is_valid() || kind != ObservationKind::ValueClass {
+            return self.is_valid();
+        }
+        if ((self.0 >> 8) as u8) != 0 {
+            return false;
+        }
+        let bits = self.payload_bits();
+        if bits & !ValueClass::ALL_BITS != 0 {
+            return false;
+        }
+        match self.decoded_state().unwrap() {
+            ObservationState::Uninitialized | ObservationState::Generic => bits == 0,
+            ObservationState::Monomorphic => bits.count_ones() == 1,
+            ObservationState::Polymorphic => (2..=4).contains(&bits.count_ones()),
+            ObservationState::Absent => false,
+        }
+    }
+
+    fn payload_bits(self) -> u32 {
+        (self.0 >> 16) as u32
     }
 
     #[cfg(test)]
@@ -305,26 +360,44 @@ pub(crate) struct FeedbackVector {
     words: OnceCell<Box<[Cell<u64>]>>,
     /// Assigned only when this vector participates in profile serialization or ingestion.
     profile_vector_id: Cell<u64>,
+    detailed_enabled: bool,
 }
 
 impl FeedbackVector {
     pub(crate) fn new(layout: FeedbackLayout, bindings: Box<[RuntimeBinding]>) -> Self {
+        Self::new_with_enabled(layout, bindings, detailed_feedback_enabled())
+    }
+
+    pub(crate) fn new_with_enabled(
+        layout: FeedbackLayout,
+        bindings: Box<[RuntimeBinding]>,
+        detailed_enabled: bool,
+    ) -> Self {
         assert_eq!(layout.len(), bindings.len());
         Self {
             layout,
             bindings,
             words: OnceCell::new(),
             profile_vector_id: Cell::new(0),
+            detailed_enabled,
         }
     }
 
     pub(crate) fn unbound(layout: FeedbackLayout) -> Self {
         let bindings = vec![RuntimeBinding::Unbound; layout.len()].into_boxed_slice();
-        Self::new(layout, bindings)
+        // Transformed/inlined chunks retain canonical schema identity but do not yet carry an
+        // exact transformed-PC → baseline-site map. Disable detailed writes rather than letting
+        // a coincidentally equal PC corrupt the baseline meaning.
+        Self::new_with_enabled(layout, bindings, false)
     }
 
     pub(crate) fn layout(&self) -> &FeedbackLayout {
         &self.layout
+    }
+
+    #[inline(always)]
+    pub(crate) fn detailed_enabled(&self) -> bool {
+        self.detailed_enabled
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -362,6 +435,40 @@ impl FeedbackVector {
         };
         let first = self.layout.site(site).unwrap().first_slot as usize;
         self.words()[first + offset].set(value.0);
+    }
+
+    /// Merge one stable semantic value class into the matching site's bitset.
+    pub(crate) fn observe_value_class(
+        &self,
+        bytecode_pc: usize,
+        role: ObservationRole,
+        class: ValueClass,
+    ) {
+        let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
+            return;
+        };
+        let Ok(index) = self
+            .layout
+            .sites
+            .binary_search_by_key(&bytecode_pc, |site| site.bytecode_pc)
+        else {
+            return;
+        };
+        let site = SiteId(index as u32);
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors
+            .iter()
+            .position(|slot| slot.kind == ObservationKind::ValueClass && slot.role == role)
+        else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        let cell = &self.words()[first + offset];
+        let current = ObservationWord(cell.get());
+        let incoming = ObservationWord::new(ObservationState::Monomorphic, class.bit(), 0);
+        cell.set(merge_value_class_words(current, incoming).0);
     }
 
     fn words(&self) -> &[Cell<u64>] {
@@ -501,7 +608,7 @@ impl FeedbackVector {
             .enumerate()
             .map(|(slot, bytes)| {
                 let word = ObservationWord(u64::from_le_bytes(*bytes));
-                if word.is_valid() {
+                if word.is_valid_for(self.layout.slots[slot].kind) {
                     Ok(word)
                 } else {
                     Err(ProfileDropReason::InvalidObservationWord { slot: slot as u32 })
@@ -509,9 +616,19 @@ impl FeedbackVector {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (cell, incoming) in self.words().iter().zip(incoming) {
+        for ((cell, incoming), descriptor) in self
+            .words()
+            .iter()
+            .zip(incoming)
+            .zip(self.layout.slots.iter())
+        {
             let current = ObservationWord(cell.get());
-            cell.set(merge_observation_words(current, incoming).0);
+            let merged = if descriptor.kind == ObservationKind::ValueClass {
+                merge_value_class_words(current, incoming)
+            } else {
+                merge_observation_words(current, incoming)
+            };
+            cell.set(merged.0);
         }
         Ok(())
     }
@@ -559,6 +676,32 @@ fn merge_observation_words(current: ObservationWord, incoming: ObservationWord) 
     }
 }
 
+fn merge_value_class_words(current: ObservationWord, incoming: ObservationWord) -> ObservationWord {
+    debug_assert!(current.is_valid());
+    debug_assert!(incoming.is_valid());
+    let current_state = current.decoded_state().unwrap();
+    let incoming_state = incoming.decoded_state().unwrap();
+    if current_state == ObservationState::Generic || incoming_state == ObservationState::Generic {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    if incoming_state == ObservationState::Uninitialized {
+        return current;
+    }
+    if current_state == ObservationState::Uninitialized {
+        return incoming;
+    }
+    if current_state == ObservationState::Absent || incoming_state == ObservationState::Absent {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    let bits = (current.payload_bits() | incoming.payload_bits()) & ValueClass::ALL_BITS;
+    match bits.count_ones() {
+        0 => ObservationWord::new(ObservationState::Generic, 0, 0),
+        1 => ObservationWord::new(ObservationState::Monomorphic, bits, 0),
+        2..=4 => ObservationWord::new(ObservationState::Polymorphic, bits, 0),
+        _ => ObservationWord::new(ObservationState::Generic, 0, 0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +721,29 @@ mod tests {
         FeedbackVector::new(
             builder.finish(),
             vec![RuntimeBinding::Unbound].into_boxed_slice(),
+        )
+    }
+
+    fn arithmetic_vector() -> FeedbackVector {
+        let mut builder = LayoutBuilder::default();
+        builder.add_site(
+            4,
+            OperationKind::Arithmetic,
+            &[
+                SlotDescriptor {
+                    kind: ObservationKind::ValueClass,
+                    role: ObservationRole::Operand0,
+                },
+                SlotDescriptor {
+                    kind: ObservationKind::ValueClass,
+                    role: ObservationRole::Result,
+                },
+            ],
+        );
+        FeedbackVector::new_with_enabled(
+            builder.finish(),
+            vec![RuntimeBinding::Unbound].into_boxed_slice(),
+            true,
         )
     }
 
@@ -637,12 +803,55 @@ mod tests {
         assert_eq!(OperationKind::Allocation as u8, 10);
         assert_eq!(ObservationKind::ValueClass as u8, 1);
         assert_eq!(ObservationKind::Allocation as u8, 7);
+        assert_eq!(ValueClass::Undefined as u8, 1);
+        assert_eq!(ValueClass::Object as u8, 9);
         assert_eq!(ObservationRole::Operand0 as u8, 1);
         assert_eq!(ObservationRole::Outcome as u8, 8);
         assert_eq!(ObservationState::Uninitialized as u8, 0);
         assert_eq!(ObservationState::Generic as u8, 4);
         assert_eq!(std::mem::size_of::<SlotDescriptor>(), 2);
         assert_eq!(std::mem::size_of::<SiteDescriptor>(), 12);
+    }
+
+    #[test]
+    fn value_class_feedback_widens_without_losing_seen_categories() {
+        let vector = arithmetic_vector();
+        vector.observe_value_class(4, ObservationRole::Operand0, ValueClass::NumberInt32);
+        vector.observe_value_class(4, ObservationRole::Operand0, ValueClass::NumberInt32);
+        let word = vector.read(
+            SiteId(0),
+            ObservationKind::ValueClass,
+            ObservationRole::Operand0,
+        );
+        assert_eq!(word.state(), ObservationState::Monomorphic);
+        assert_eq!(word.payload(), ValueClass::NumberInt32.bit());
+
+        for class in [
+            ValueClass::NumberDouble,
+            ValueClass::String,
+            ValueClass::BigInt,
+        ] {
+            vector.observe_value_class(4, ObservationRole::Operand0, class);
+        }
+        let word = vector.read(
+            SiteId(0),
+            ObservationKind::ValueClass,
+            ObservationRole::Operand0,
+        );
+        assert_eq!(word.state(), ObservationState::Polymorphic);
+        assert_eq!(word.payload().count_ones(), 4);
+
+        vector.observe_value_class(4, ObservationRole::Operand0, ValueClass::Object);
+        assert_eq!(
+            vector
+                .read(
+                    SiteId(0),
+                    ObservationKind::ValueClass,
+                    ObservationRole::Operand0,
+                )
+                .state(),
+            ObservationState::Generic
+        );
     }
 
     #[test]

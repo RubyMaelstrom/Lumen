@@ -22,6 +22,9 @@ by the layout of Lumen's Rust enums:
 - ECMA-262 §13.3.6.2, EvaluateCall, derives `this`, evaluates arguments, checks Object/callability,
   performs the tail-call preparation when required, and then calls the target. Feedback may
   describe the completed path but must never reorder or replace those semantics.
+- ECMA-262 §7.1.3, ToNumeric, preserves BigInt and otherwise performs ToNumber after ToPrimitive.
+- ECMA-262 §13.15.3, ApplyStringOrNumericBinaryOperator, gives `+` its string-concatenation path,
+  applies ToNumeric left-to-right for numeric operations, and rejects mixed Number/BigInt inputs.
 
 Authoritative specification: <https://tc39.es/ecma262/>.
 
@@ -46,8 +49,10 @@ A site has a semantic operation plus one or more `(ObservationKind, ObservationR
 Kinds describe what was learned; roles distinguish operands/results without baking a particular
 instruction format into the profile:
 
-- `ValueClass`: an abstract ECMAScript value class. Numeric refinements such as integer versus
-  double are observations, not Rust `Value` discriminants.
+- `ValueClass`: an abstract ECMAScript value class. Version 1 assigns stable bits to Undefined,
+  Null, Boolean, int32-safe Number, other binary64 Number, String, BigInt, Symbol, and Object.
+  The int32 split excludes `-0`, non-finite values, fractions, and out-of-range integers; it is an
+  optimizer refinement rather than a second ECMAScript numeric type or a Rust `Value` tag.
 - `ReceiverLayout` and `HolderLayout`: abstract layout identities for the receiver and the object
   that supplied the property. The active adapter may currently resolve them through shapes and
   prototype guards; future adapters resolve them through Maps and validity dependencies.
@@ -74,6 +79,24 @@ Adapter bindings (cache family/index, current shape tokens, raw pins) are runtim
 never be serialized as observations. A future Map adapter replaces only the token interner and
 adds validity dependencies; `SiteId`, slot kind/role, observation states, and diagnostic schema do
 not change. Element and call adapters are intentionally separate following slices.
+
+The first arithmetic adapter covers the canonical bytecodes for binary `+`, `-`, `*`, `/`, `%`,
+bitwise operations, shifts, and `**`, plus unary `+`, `-`, and `~`. It records original operand
+classes before any observable coercion and records a result class only after successful completion.
+Thus an Object-to-String `+` path describes Object/String inputs and a String result, while a
+Number/BigInt TypeError still describes both inputs and leaves the result uninitialized. Category
+bits widen from monomorphic through a four-class polymorphic set to generic; old samples never
+overwrite or narrow newer evidence.
+
+Detailed arithmetic collection is opt-in through `LUMEN_FEEDBACK_PROFILE`. Disabled chunks retain
+one predictable boolean check at each arithmetic helper and never allocate observation words.
+Profile-enabled AArch64 chunks route numeric inline templates and register chains through the
+exact-PC helper so optimized executions are not omitted; the normal configuration keeps those
+fast paths unchanged. A second-stage transformed/inlined chunk has no exact transformed-PC to
+canonical-site map yet, so it is explicitly unbound and cannot write coincidentally matching PCs;
+its retained baseline chunk remains the feedback authority. Update-expression bytecodes
+(`++`/`--`) are a separate follow-up because their local, environment, property, and element forms
+combine arithmetic with a write.
 
 Every optimizing consumer must treat missing, unknown, mixed, or invalidated feedback as a reason
 to use a guard plus exact semantic fallback. A guard failure resumes at the exact semantic point;

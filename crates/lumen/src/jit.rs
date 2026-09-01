@@ -1472,10 +1472,16 @@ pub fn compile(
             }
         }
     }
-    let fast: u32 = std::env::var("LUMEN_JIT_FAST")
+    let mut fast: u32 = std::env::var("LUMEN_JIT_FAST")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(u32::MAX);
+    if chunk.jit_detailed_feedback_enabled() {
+        // Detailed arithmetic observation runs in the exact-PC helper. Keep ordinary builds on
+        // their inline and register-region paths; profile-enabled chunks route only numeric
+        // templates/chains through the helper so successful JIT operations cannot disappear.
+        fast &= !(1 | 16384 | 32768);
+    }
     let array_intrinsics_on = std::env::var_os("LUMEN_JIT_NO_ARRAY_INTRINSICS").is_none();
     let function_call_intrinsic_on =
         std::env::var_os("LUMEN_JIT_NO_FUNCTION_CALL_INTRINSIC").is_none();
