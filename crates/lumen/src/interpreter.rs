@@ -3275,7 +3275,7 @@ impl Interp {
     pub fn collect_garbage_for_host(&mut self) -> i64 {
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_collect();
+        self.gc_collect_with_cause(crate::value::GcCause::Explicit);
         let live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
         self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
@@ -6639,7 +6639,7 @@ impl Interp {
         if crate::value::heap_live_objects(&self.gc_heap) <= self.gc_next {
             return Ok(());
         }
-        self.gc_collect();
+        self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!(
@@ -6675,7 +6675,7 @@ impl Interp {
             return 0;
         }
         let before = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_collect();
+        self.gc_collect_with_cause(crate::value::GcCause::TaskBoundary);
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!(
@@ -6905,6 +6905,10 @@ impl Interp {
     }
 
     pub(crate) fn gc_collect(&mut self) {
+        self.gc_collect_with_cause(crate::value::GcCause::Explicit);
+    }
+
+    fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
         let performance_started = crate::value::gc_performance_metrics_start();
         let live = crate::value::heap_gc_snapshot(&self.gc_heap);
         // Scopes are graph nodes too: a closure's captured environment references objects (its
@@ -7458,12 +7462,13 @@ impl Interp {
                 objects_after,
                 performance_scopes_before,
                 scopes_after,
+                cause,
             );
             // One Agent snapshot must observe every ShadowRealm after collection, not a freshly
             // swept root mixed with stale sub-heaps. Ownership is a tree, so children recursively
             // collect their descendants before the root uses one shared identity registry.
             for sub in self.shadow_realms.values_mut() {
-                sub.gc_collect();
+                sub.gc_collect_with_cause(cause);
             }
             // Keep diagnostic traversal outside the collector pause measurement. It runs only
             // under LUMEN_PERF_METRICS and records a post-sweep Agent safepoint, so ordinary

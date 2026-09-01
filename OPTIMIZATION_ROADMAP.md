@@ -528,6 +528,11 @@ finish the baseline, but no later phase may claim a performance win against the 
     retained size once the central heap/root API exists; do not infer lifetime from site samples.
 - [ ] Record GC cause, generation, pause time, concurrent work, bytes scanned/copied/freed, and
   live-set size.
+  - [x] Classify existing stop-the-world collections by allocation-threshold, host task-boundary,
+    and explicit causes in the opt-in performance JSON, while retaining pause histograms and exact
+    object/scope live-set counters.
+  - [ ] Add generation, concurrent-work, and byte-level scan/copy/free accounting with the central
+    heap; the current cycle collector has no generational or moving phase to report honestly.
 - [ ] Record baseline/optimizing compile time, generated code size, inlining decisions, guard
   failures, side exits, deoptimizations, and reoptimization suppression.
 - [ ] Record parser, preparser, bytecode, snapshot/cache-hit, and cache-deserialization time.

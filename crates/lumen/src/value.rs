@@ -1124,6 +1124,8 @@ static GC_PAUSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static GC_MAX_PAUSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_PAUSE_BUCKET_COUNTS: [std::sync::atomic::AtomicU64; 16] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static GC_CAUSE_COUNTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static GC_OBJECTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_OBJECTS_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_PEAK_OBJECTS_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1132,6 +1134,16 @@ static GC_SCOPES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static GC_SCOPES_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_PEAK_SCOPES_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_LAST_SCOPES_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Internal collection trigger for diagnostics. Collection scheduling is not observable
+/// ECMAScript behavior; retaining the reason lets tuning distinguish allocation pressure from a
+/// host task boundary or an explicit embedder request without changing that scheduling contract.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GcCause {
+    AllocationThreshold = 0,
+    TaskBoundary = 1,
+    Explicit = 2,
+}
 
 #[inline]
 pub(crate) fn gc_performance_metrics_start() -> Option<std::time::Instant> {
@@ -1151,6 +1163,7 @@ pub(crate) fn gc_performance_metrics_finish(
     objects_after: i64,
     scopes_before: usize,
     scopes_after: usize,
+    cause: GcCause,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -1162,6 +1175,7 @@ pub(crate) fn gc_performance_metrics_finish(
     let bucket = GC_PAUSE_BUCKET_UPPER_NANOS.partition_point(|upper| elapsed > *upper);
 
     GC_COLLECTIONS.fetch_add(1, Relaxed);
+    GC_CAUSE_COUNTS[cause as usize].fetch_add(1, Relaxed);
     GC_PAUSE_NANOS.fetch_add(elapsed, Relaxed);
     GC_MAX_PAUSE_NANOS.fetch_max(elapsed, Relaxed);
     GC_PAUSE_BUCKET_COUNTS[bucket].fetch_add(1, Relaxed);
@@ -1195,8 +1209,11 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
     let pause_nanos = GC_PAUSE_NANOS.load(Relaxed);
     let max_pause_nanos = GC_MAX_PAUSE_NANOS.load(Relaxed);
     format!(
-        "\"gc_collections\":{},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{}",
+        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{}",
         GC_COLLECTIONS.load(Relaxed),
+        GC_CAUSE_COUNTS[GcCause::AllocationThreshold as usize].load(Relaxed),
+        GC_CAUSE_COUNTS[GcCause::TaskBoundary as usize].load(Relaxed),
+        GC_CAUSE_COUNTS[GcCause::Explicit as usize].load(Relaxed),
         pause_nanos as f64 / 1_000_000_000.0,
         max_pause_nanos as f64 / 1_000_000_000.0,
         GC_OBJECTS_SEEN.load(Relaxed),
