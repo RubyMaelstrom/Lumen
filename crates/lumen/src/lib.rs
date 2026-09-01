@@ -108,10 +108,10 @@ use value::Value;
 
 pub use interrupt::{InterruptReason, RuntimeInterrupt};
 
-/// Unstable, opt-in process diagnostics for Lumen's own benchmark tooling.
+/// Unstable, opt-in process JIT and collector diagnostics for Lumen's own benchmark tooling.
 ///
-/// Returns `None` unless `LUMEN_PERF_METRICS` was present when the JIT first checked its diagnostic
-/// state. This is intentionally not a stable embedder API.
+/// Returns `None` unless `LUMEN_PERF_METRICS` was present when the process first checked its
+/// diagnostic state. This is intentionally not a stable embedder API.
 #[doc(hidden)]
 pub fn unstable_performance_metrics_json() -> Option<String> {
     jit::performance_metrics_json()

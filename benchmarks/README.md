@@ -21,7 +21,15 @@ The default run builds Lumen with Cargo's offline mode, verifies every fixture b
 workload/engine pair in a balanced interleaved order. It writes a checkpointed JSON report under
 `benchmark-results/` containing raw warmup and measured samples, wall/CPU/peak-RSS measurements,
 scores, confidence intervals, exact commands and environment policy, executable hashes/sizes,
-host information, Git revisions/dirty state, and the accepted production TRust checkpoint.
+host information, Git revisions/dirty state, and the accepted production TRust checkpoint. Lumen's
+opt-in record additionally reports JIT compilation/code size and exact collector-boundary
+object/scope populations, reclaimed nodes, total/max pause, and a bounded pause histogram.
+
+Object and scope populations are graph-node counts, not managed-byte estimates. Current objects
+retain separately allocated property/element storage, shared strings, scopes, interpreter side
+tables, caches, and external `ArrayBuffer` storage. Phase 0 will not multiply node counts by a
+struct size and call the result a heap measurement; byte accounting must cover those ownership
+classes explicitly.
 
 Useful focused invocations are:
 

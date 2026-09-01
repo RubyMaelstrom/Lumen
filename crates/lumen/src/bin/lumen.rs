@@ -164,7 +164,7 @@ Diagnostics (env, unstable):
   LUMEN_JIT_OPSTAT=1      Tally ops that reach the JIT slow path (top at exit; =2 pinpoints sites)
   LUMEN_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
   LUMEN_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
-  LUMEN_PERF_METRICS=1    Print one JSON JIT compile/code-size summary at normal exit
+  LUMEN_PERF_METRICS=1    Print one JSON JIT/collector performance summary at normal exit
 "
     );
 }

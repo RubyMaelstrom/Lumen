@@ -46,11 +46,20 @@ class UnitTests(unittest.TestCase):
             bench_matrix.parse_score(output, "Other")
 
     def test_engine_metrics_parser_requires_one_versioned_json_line(self) -> None:
-        stderr = 'noise\n[lumen-perf] {"schema_version":1,"jit_compile_seconds":0.25}\n'
+        stderr = (
+            'noise\n[lumen-perf] {"schema_version":1,"jit_compile_seconds":0.25,'
+            '"gc_collections":2,"gc_pause_histogram":{"unit":"nanoseconds",'
+            '"upper_bounds":[50000,null],"counts":[1,1]}}\n'
+        )
         metrics = bench_matrix.parse_engine_metrics(stderr, "[lumen-perf] ")
         self.assertEqual(metrics["jit_compile_seconds"], 0.25)
+        self.assertEqual(sum(metrics["gc_pause_histogram"]["counts"]), 2)
         with self.assertRaises(bench_matrix.BenchmarkError):
             bench_matrix.parse_engine_metrics("", "[lumen-perf] ")
+        with self.assertRaises(bench_matrix.BenchmarkError):
+            bench_matrix.parse_engine_metrics(
+                stderr.replace('"counts":[1,1]', '"counts":[1,0]'), "[lumen-perf] "
+            )
 
 
 class IntegrationTest(unittest.TestCase):

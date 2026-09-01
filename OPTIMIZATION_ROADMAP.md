@@ -374,8 +374,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   result.
 - [x] Add executable/generated-code size and JIT-compilation-time reporting alongside execution
   scores.
-- [ ] Add managed-heap live/post-collection bytes and GC pause-distribution reporting so the
-  locked baseline satisfies the full quantitative-exit table rather than relying on peak RSS.
+- [x] Add exact collector-boundary object/scope populations, reclaimed-node counts, and bounded
+  GC pause-distribution reporting to the locked engine runner.
+- [ ] Add live/post-collection managed-byte accounting across object/property/element storage,
+  shared strings, scopes, side tables/caches, and external buffers. Do not substitute
+  `object_count * size_of::<Object>()` or peak RSS for this ownership-aware measurement.
 - [ ] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites.
 - [x] Record the accepted production TRust/Lumen hashes in every release-performance report.
@@ -844,8 +847,9 @@ before changing broad execution behavior:
 
 - [x] Finish the Phase 0 pinned manifest, offline interleaved engine runner, machine-readable
   report, executable/JIT code metrics, accepted-production provenance, and regression policy.
-- [ ] Add managed-heap/GC-pause telemetry and deterministic local browser replays; run the clean
-  full matrix and lock baseline distributions and phase targets.
+- [ ] Finish managed-byte telemetry and deterministic local browser replays; run the clean full
+  matrix and lock baseline distributions and phase targets. Exact collector populations and GC
+  pause histograms are already recorded.
 - [ ] Land the versioned abstract feedback-vector plus allocation/GC/JIT/error/conversion/iterator
   timing structures with disabled-cost tests.
 - [ ] Add bounded machine-readable diagnostic dumps for long-lived browser Agents.

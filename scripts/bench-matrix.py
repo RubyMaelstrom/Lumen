@@ -530,6 +530,21 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
         raise BenchmarkError(f"invalid engine metrics JSON: {error}") from error
     if metrics.get("schema_version") != 1:
         raise BenchmarkError("unsupported engine metrics schema_version")
+    histogram = metrics.get("gc_pause_histogram")
+    if histogram is not None:
+        bounds = histogram.get("upper_bounds")
+        counts = histogram.get("counts")
+        if (
+            histogram.get("unit") != "nanoseconds"
+            or not isinstance(bounds, list)
+            or not isinstance(counts, list)
+            or len(bounds) != len(counts)
+            or not bounds
+            or bounds[-1] is not None
+            or any(not isinstance(count, int) or count < 0 for count in counts)
+            or sum(counts) != metrics.get("gc_collections")
+        ):
+            raise BenchmarkError("invalid GC pause histogram in engine metrics")
     return metrics
 
 
@@ -628,7 +643,7 @@ def summarize(
                 entry["engine_metrics"] for entry in entries if entry.get("engine_metrics")
             ]
             if engine_metric_entries:
-                result["engine_metrics"] = {
+                summarized_engine_metrics = {
                     metric: summary_stats(
                         (entry[metric] for entry in engine_metric_entries),
                         confidence,
@@ -642,8 +657,39 @@ def summarize(
                         "jit_compile_seconds",
                         "jit_generated_code_bytes",
                         "jit_largest_code_bytes",
+                        "gc_collections",
+                        "gc_pause_seconds",
+                        "gc_max_pause_seconds",
+                        "gc_objects_seen",
+                        "gc_objects_reclaimed",
+                        "gc_peak_objects_before",
+                        "gc_last_objects_after",
+                        "gc_scopes_seen",
+                        "gc_scopes_reclaimed",
+                        "gc_peak_scopes_before",
+                        "gc_last_scopes_after",
                     )
                 }
+                histograms = [entry["gc_pause_histogram"] for entry in engine_metric_entries]
+                histogram_unit = histograms[0]["unit"]
+                histogram_bounds = histograms[0]["upper_bounds"]
+                if any(
+                    histogram["unit"] != histogram_unit
+                    or histogram["upper_bounds"] != histogram_bounds
+                    or len(histogram["counts"]) != len(histogram_bounds)
+                    for histogram in histograms
+                ):
+                    raise BenchmarkError("incompatible GC pause histograms in engine metrics")
+                summarized_engine_metrics["gc_pause_histogram_aggregate"] = {
+                    "unit": histogram_unit,
+                    "upper_bounds": histogram_bounds,
+                    "counts": [
+                        sum(histogram["counts"][index] for histogram in histograms)
+                        for index in range(len(histogram_bounds))
+                    ],
+                    "sample_processes": len(histograms),
+                }
+                result["engine_metrics"] = summarized_engine_metrics
             workload_results[workload] = result
         rounds = sorted(round_index for (candidate, round_index) in by_round if candidate == engine)
         for round_index in rounds:

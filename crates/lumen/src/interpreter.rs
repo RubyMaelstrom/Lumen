@@ -5990,10 +5990,13 @@ impl Interp {
     }
 
     pub(crate) fn gc_collect(&mut self) {
+        let performance_started = crate::value::gc_performance_metrics_start();
         let live = crate::value::heap_gc_snapshot(&self.gc_heap);
         // Scopes are graph nodes too: a closure's captured environment references objects (its
         // bindings) and vice versa (`Callable::User`), so cycles routinely pass through them.
         let scopes = crate::value::gc_scope_snapshot(&self.gc_heap);
+        let performance_objects_before = live.len();
+        let performance_scopes_before = scopes.len();
         let sidx: crate::fasthash::FastMap<usize, usize> = scopes
             .iter()
             .enumerate()
@@ -6530,6 +6533,17 @@ impl Interp {
         #[cfg(not(target_arch = "wasm32"))]
         if garbage >= 50_000 {
             crate::fastalloc::trim();
+        }
+        if let Some(started) = performance_started {
+            let objects_after = crate::value::heap_live_objects(&self.gc_heap);
+            let scopes_after = crate::value::gc_scope_registry_prune(&self.gc_heap);
+            crate::value::gc_performance_metrics_finish(
+                started,
+                performance_objects_before,
+                objects_after,
+                performance_scopes_before,
+                scopes_after,
+            );
         }
     }
 

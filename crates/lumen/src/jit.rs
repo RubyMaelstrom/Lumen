@@ -63,8 +63,9 @@ pub(crate) fn performance_metrics_json() -> Option<String> {
     let nanos = PERF_COMPILE_NANOS.load(Relaxed);
     let generated = PERF_GENERATED_CODE_BYTES.load(Relaxed);
     let largest = PERF_LARGEST_CODE_BYTES.load(Relaxed);
+    let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},{gc}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
     ))

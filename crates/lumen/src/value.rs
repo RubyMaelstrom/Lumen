@@ -995,6 +995,118 @@ pub(crate) struct GcState {
 
 pub(crate) type GcHeap = Rc<GcState>;
 
+// Process-wide collector diagnostics for the benchmark shell. Collection is already a global
+// safepoint for an Agent, so relaxed aggregate counters are sufficient. The environment check and
+// clock read occur only at a collection entry, never on the allocation or property-access paths.
+const GC_PAUSE_BUCKET_UPPER_NANOS: [u64; 15] = [
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_500_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_500_000_000,
+];
+static GC_PERF_METRICS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static GC_COLLECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_PAUSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_MAX_PAUSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_PAUSE_BUCKET_COUNTS: [std::sync::atomic::AtomicU64; 16] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static GC_OBJECTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_OBJECTS_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_PEAK_OBJECTS_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_LAST_OBJECTS_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_SCOPES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_SCOPES_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_PEAK_SCOPES_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_LAST_SCOPES_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn gc_performance_metrics_start() -> Option<std::time::Instant> {
+    let enabled =
+        *GC_PERF_METRICS_ENABLED.get_or_init(|| std::env::var_os("LUMEN_PERF_METRICS").is_some());
+    enabled.then(std::time::Instant::now)
+}
+
+#[inline]
+fn saturating_u64(value: usize) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+pub(crate) fn gc_performance_metrics_finish(
+    started: std::time::Instant,
+    objects_before: usize,
+    objects_after: i64,
+    scopes_before: usize,
+    scopes_after: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let objects_before = saturating_u64(objects_before);
+    let objects_after = u64::try_from(objects_after).unwrap_or(0);
+    let scopes_before = saturating_u64(scopes_before);
+    let scopes_after = saturating_u64(scopes_after);
+    let bucket = GC_PAUSE_BUCKET_UPPER_NANOS.partition_point(|upper| elapsed > *upper);
+
+    GC_COLLECTIONS.fetch_add(1, Relaxed);
+    GC_PAUSE_NANOS.fetch_add(elapsed, Relaxed);
+    GC_MAX_PAUSE_NANOS.fetch_max(elapsed, Relaxed);
+    GC_PAUSE_BUCKET_COUNTS[bucket].fetch_add(1, Relaxed);
+    GC_OBJECTS_SEEN.fetch_add(objects_before, Relaxed);
+    GC_OBJECTS_RECLAIMED.fetch_add(objects_before.saturating_sub(objects_after), Relaxed);
+    GC_PEAK_OBJECTS_BEFORE.fetch_max(objects_before, Relaxed);
+    GC_LAST_OBJECTS_AFTER.store(objects_after, Relaxed);
+    GC_SCOPES_SEEN.fetch_add(scopes_before, Relaxed);
+    GC_SCOPES_RECLAIMED.fetch_add(scopes_before.saturating_sub(scopes_after), Relaxed);
+    GC_PEAK_SCOPES_BEFORE.fetch_max(scopes_before, Relaxed);
+    GC_LAST_SCOPES_AFTER.store(scopes_after, Relaxed);
+}
+
+/// JSON fields appended to the unstable process-level performance record. Object and scope counts
+/// are exact graph-node populations at collector boundaries; they intentionally are not described
+/// as bytes because strings, buffers, side tables, and shared allocations need separate accounting.
+pub(crate) fn gc_performance_metrics_json_fields() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let counts = GC_PAUSE_BUCKET_COUNTS
+        .iter()
+        .map(|count| count.load(Relaxed).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let upper_bounds = GC_PAUSE_BUCKET_UPPER_NANOS
+        .iter()
+        .map(u64::to_string)
+        .chain(std::iter::once("null".to_owned()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let pause_nanos = GC_PAUSE_NANOS.load(Relaxed);
+    let max_pause_nanos = GC_MAX_PAUSE_NANOS.load(Relaxed);
+    format!(
+        "\"gc_collections\":{},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{}",
+        GC_COLLECTIONS.load(Relaxed),
+        pause_nanos as f64 / 1_000_000_000.0,
+        max_pause_nanos as f64 / 1_000_000_000.0,
+        GC_OBJECTS_SEEN.load(Relaxed),
+        GC_OBJECTS_RECLAIMED.load(Relaxed),
+        GC_PEAK_OBJECTS_BEFORE.load(Relaxed),
+        GC_LAST_OBJECTS_AFTER.load(Relaxed),
+        GC_SCOPES_SEEN.load(Relaxed),
+        GC_SCOPES_RECLAIMED.load(Relaxed),
+        GC_PEAK_SCOPES_BEFORE.load(Relaxed),
+        GC_LAST_SCOPES_AFTER.load(Relaxed),
+    )
+}
+
 thread_local! {
     /// The ECMAScript Agent surrounding the code currently running on this native thread. This is
     /// an activation pointer, not collector ownership: each object carries its Agent's heap, and
