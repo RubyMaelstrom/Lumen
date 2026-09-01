@@ -55,6 +55,7 @@ mod regex;
 mod regex_emoji;
 mod regex_fold;
 mod snapshot;
+mod tagged;
 mod temporal;
 mod token;
 mod tz;
