@@ -7,6 +7,9 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
 const TAG_MASK: u64 = !PAYLOAD_MASK;
 const TAG_CANON_NAN: u64 = 0x7ff8_0000_0000_0000;
@@ -359,6 +362,105 @@ impl DeoptRecord {
     }
 }
 
+#[derive(Default)]
+struct RootState {
+    slots: Vec<Option<TaggedValue>>,
+    free: Vec<usize>,
+}
+
+/// Agent-local strong roots for tagged migration tests. The registry is intentionally independent
+/// of the current `Interp`: until the central heap exists, a root can validate a word but cannot
+/// resolve or relocate its heap reference.
+#[derive(Clone, Default)]
+pub(crate) struct RootSet {
+    state: Rc<RefCell<RootState>>,
+}
+
+/// Lexical strong handle. Dropping it releases its slot and makes that slot available for reuse;
+/// no raw pointer or untyped frame address crosses the guard boundary.
+pub(crate) struct RootedTagged {
+    state: Rc<RefCell<RootState>>,
+    index: usize,
+}
+
+impl RootSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Rc::new(RefCell::new(RootState {
+                slots: Vec::new(),
+                free: Vec::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn root(&self, value: TaggedValue) -> Result<RootedTagged, InvalidTaggedValue> {
+        value.validate()?;
+        let mut state = self.state.borrow_mut();
+        let index = state.free.pop().unwrap_or_else(|| {
+            state.slots.push(None);
+            state.slots.len() - 1
+        });
+        state.slots[index] = Some(value);
+        Ok(RootedTagged {
+            state: Rc::clone(&self.state),
+            index,
+        })
+    }
+
+    pub(crate) fn active_len(&self) -> usize {
+        self.state
+            .borrow()
+            .slots
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
+    }
+
+    /// Snapshot roots in stable slot order for a collector or verifier. Every slot is revalidated
+    /// so corruption in a future bridge fails at the root boundary rather than becoming a hidden
+    /// liveness error.
+    pub(crate) fn snapshot(&self) -> Result<Vec<TaggedValue>, InvalidTaggedValue> {
+        self.state
+            .borrow()
+            .slots
+            .iter()
+            .flatten()
+            .copied()
+            .map(|value| value.validate().map(|()| value))
+            .collect()
+    }
+}
+
+impl RootedTagged {
+    pub(crate) fn value(&self) -> Option<TaggedValue> {
+        self.state.borrow().slots.get(self.index).copied().flatten()
+    }
+
+    pub(crate) fn replace(&mut self, value: TaggedValue) -> Result<(), InvalidTaggedValue> {
+        value.validate()?;
+        let mut state = self.state.borrow_mut();
+        let Some(slot) = state.slots.get_mut(self.index) else {
+            return Err(InvalidTaggedValue::ReservedTag);
+        };
+        if slot.is_none() {
+            return Err(InvalidTaggedValue::ReservedTag);
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+}
+
+impl Drop for RootedTagged {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        if let Some(slot) = state.slots.get_mut(self.index) {
+            if slot.take().is_some() {
+                state.free.push(self.index);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +603,46 @@ mod tests {
             bad_constant.validate(),
             Err(DeoptRecordError::InvalidConstant)
         );
+    }
+
+    #[test]
+    fn rooted_tagged_handles_are_lexical_and_reuse_released_slots() {
+        let roots = RootSet::new();
+        let mut first = roots
+            .root(TaggedValue::heap(HeapRef::new(9).unwrap()))
+            .unwrap();
+        let second = roots.root(TaggedValue::number(3.0)).unwrap();
+        assert_eq!(roots.active_len(), 2);
+        assert_eq!(
+            first.value(),
+            Some(TaggedValue::heap(HeapRef::new(9).unwrap()))
+        );
+        assert_eq!(roots.snapshot().unwrap().len(), 2);
+
+        first.replace(TaggedValue::null()).unwrap();
+        assert_eq!(first.value(), Some(TaggedValue::null()));
+        assert_eq!(
+            first.replace(TaggedValue(TAG_BOOLEAN | 2)),
+            Err(InvalidTaggedValue::InvalidBooleanPayload)
+        );
+        assert_eq!(first.value(), Some(TaggedValue::null()));
+
+        drop(first);
+        assert_eq!(roots.active_len(), 1);
+        let third = roots.root(TaggedValue::undefined()).unwrap();
+        assert_eq!(roots.active_len(), 2);
+        assert_eq!(second.value(), Some(TaggedValue::number(3.0)));
+        assert_eq!(third.value(), Some(TaggedValue::undefined()));
+    }
+
+    #[test]
+    fn rooted_handles_reject_invalid_words_before_publishing_them() {
+        let roots = RootSet::new();
+        assert!(matches!(
+            roots.root(TaggedValue(TAG_HEAP_REF)),
+            Err(InvalidTaggedValue::NullHeapReference)
+        ));
+        assert_eq!(roots.active_len(), 0);
+        assert!(roots.snapshot().unwrap().is_empty());
     }
 }

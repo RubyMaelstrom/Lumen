@@ -619,6 +619,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   scaffolding with invalid-map and forward-recipe tests. This verifies metadata without connecting
   it to live `Value` frames; relocation and execution migration remain gated.
 - [ ] Add scoped rooted handles for Rust builtins and embedders.
+  - [x] Add the isolated `RootSet`/RAII tagged-handle scaffold and validation tests; Agent/heap
+    integration remains pending until relocation exists.
 - [ ] Add a `NoGc`/no-safepoint discipline for short raw-pointer regions and make violations
   auditable.
 - [ ] Migrate bytecode operands and local frames to the canonical tagged representation.
