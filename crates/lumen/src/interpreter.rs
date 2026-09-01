@@ -3140,6 +3140,63 @@ impl Interp {
             crate::feedback::ElementKeyKind::String
         }
     }
+
+    /// Classify a call target by its observable [[Call]] family. This intentionally records no
+    /// pointer or function address; identity-sensitive caches remain private execution machinery.
+    pub(crate) fn call_target_kind(&self, callee: &Value) -> crate::feedback::CallTargetKind {
+        use crate::feedback::CallTargetKind;
+        let Value::Obj(object) = callee else {
+            return CallTargetKind::NonCallable;
+        };
+        let ptr = Rc::as_ptr(object) as usize;
+        if self.proxies.contains_key(&ptr) {
+            return CallTargetKind::Proxy;
+        }
+        match &object.borrow().call {
+            Callable::User(_) => CallTargetKind::UserFunction,
+            Callable::Native(_) | Callable::NativeData(_) => CallTargetKind::NativeFunction,
+            Callable::Bound(_) => CallTargetKind::BoundFunction,
+            Callable::WrappedShadow(_) | Callable::WrappedCross(_) => {
+                CallTargetKind::WrappedFunction
+            }
+            Callable::None => CallTargetKind::NonCallable,
+            _ => CallTargetKind::CallableObject,
+        }
+    }
+
+    /// Classify the activation requirement of a call target. User functions use the compiled
+    /// chunk's exact activation predicate when available; an uncompiled function remains
+    /// `Unknown` rather than being mistaken for a no-environment fast path.
+    pub(crate) fn call_environment_kind(
+        &self,
+        callee: &Value,
+    ) -> crate::feedback::CallEnvironmentKind {
+        use crate::feedback::{CallEnvironmentKind, CallTargetKind};
+        match self.call_target_kind(callee) {
+            CallTargetKind::NativeFunction | CallTargetKind::CallableObject => {
+                CallEnvironmentKind::None
+            }
+            CallTargetKind::BoundFunction
+            | CallTargetKind::Proxy
+            | CallTargetKind::WrappedFunction => CallEnvironmentKind::Dynamic,
+            CallTargetKind::UserFunction => {
+                let Value::Obj(object) = callee else {
+                    return CallEnvironmentKind::Unknown;
+                };
+                let Callable::User(user) = &object.borrow().call else {
+                    return CallEnvironmentKind::Unknown;
+                };
+                match user.func.code.get() {
+                    Some(Some(chunk)) if chunk.requires_activation_environment() => {
+                        CallEnvironmentKind::Captured
+                    }
+                    Some(Some(_)) => CallEnvironmentKind::None,
+                    _ => CallEnvironmentKind::Unknown,
+                }
+            }
+            CallTargetKind::NonCallable => CallEnvironmentKind::Unknown,
+        }
+    }
     /// Whether `key` is an internal private-element key. Every runtime private name carries a
     /// `\u{1}<serial>` suffix (auto-accessor backings a `\u{0}` marker), so a user property whose
     /// *string* name merely starts with `#` (a computed key) is not mistaken for one.

@@ -24,8 +24,10 @@ by the layout of Lumen's Rust enums:
 - ECMA-262 §10.5.8-9 give Proxy `[[Get]]`/`[[Set]]` their trap forwarding and invariant checks;
   those operations remain exotic even when an absent trap forwards to an ordinary target.
 - ECMA-262 §13.3.6.2, EvaluateCall, derives `this`, evaluates arguments, checks Object/callability,
-  performs the tail-call preparation when required, and then calls the target. Feedback may
-  describe the completed path but must never reorder or replace those semantics.
+  performs the tail-call preparation when required, and then calls the target. ECMA-262 §13.3.5.1.1,
+  EvaluateNew, performs the analogous constructor checks and `[[Construct]]` dispatch; §7.3.13-14
+  define the `Call` and `Construct` abstract operations. Feedback may describe the completed path
+  but must never reorder or replace those semantics.
 - ECMA-262 §7.1.3, ToNumeric, preserves BigInt and otherwise performs ToNumber after ToPrimitive.
 - ECMA-262 §13.15.3, ApplyStringOrNumericBinaryOperator, gives `+` its string-concatenation path,
   applies ToNumeric left-to-right for numeric operations, and rejects mixed Number/BigInt inputs.
@@ -74,7 +76,14 @@ instruction format into the profile:
   preserving a misleading cross-product. Exact indices, strings, object identities, and current
   Rust enum tags are never recorded. The classification follows ECMA-262 §7.1.19 (ToPropertyKey),
   §10.4.2 (Array exotic objects), and §10.4.5.8-10 (Integer-Indexed exotic objects).
-- `CallTarget`: abstract call/construct target identity and callable category, never a raw address.
+- `CallTarget`: abstract call/construct target family, argument-count bucket, and activation
+  environment requirement. Version 1 stores three independent bounded one-hot groups: target
+  family (`user`, `native`, `bound`, `proxy`, wrapped, callable object, or non-callable), arity
+  (`zero`, `one`, `few`, or `many`), and environment (`none`, captured, dynamic, or unknown).
+  Each group keeps at most four alternatives; overflow widens to `Generic`. The target's raw
+  address, object identity, and Rust callable representation are never profile data. A successful
+  call or construct also records its `ValueClass` result in the normal result slot; abrupt calls
+  retain target metadata but leave that result slot uninitialized.
 - `BranchCount` and `Allocation`: bounded counter/allocation summaries reserved for later Phase 1
   slices.
 
@@ -113,7 +122,10 @@ exotic rather than being mistaken for ordinary dense storage.
 Adapter bindings (cache family/index, current shape tokens, raw pins) are runtime-only and must
 never be serialized as observations. A future Map adapter replaces only the token interner and
 adds validity dependencies; `SiteId`, slot kind/role, observation states, and diagnostic schema do
-not change. Element and call adapters are intentionally separate following slices.
+not change. Element and call adapters are intentionally separate following slices. The call
+adapter records target metadata before `Call`/`Construct` dispatch and publishes a result class
+only after successful completion, including direct eval and `super` call paths; it never retries
+or repeats user code, argument coercion, proxy traps, or constructor setup.
 
 The first arithmetic adapter covers the canonical bytecodes for binary `+`, `-`, `*`, `/`, `%`,
 bitwise operations, shifts, and `**`, plus unary `+`, `-`, and `~`. It records original operand

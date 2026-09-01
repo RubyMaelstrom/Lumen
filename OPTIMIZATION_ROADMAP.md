@@ -506,7 +506,14 @@ finish the baseline, but no later phase may claim a performance win against the 
     through the canonical `[[Get]]`/`[[Set]]` helpers without replaying getters, traps, or
     coercions. Dense element and computed-string IC fast paths remain unchanged when profiling is
     disabled.
-- [ ] Record call and construct targets, arity, closure environment requirements, and return type.
+- [x] Record bounded call and construct target metadata and successful return classes. Version 1
+  records independent target-family, argument-count, and activation-environment groups in the
+  `CallTarget` slot, before dispatch; successful `Call`/`Construct` results reuse the `ValueClass`
+  result slot. Raw callable identities are intentionally excluded from the portable schema; exact
+  Map/closure identities remain a later optimizer concern. The adapter covers ordinary, spread,
+  array, direct-eval, `super`, baseline VM, and detailed JIT call/construct paths while preserving
+  ECMA-262 §13.3.6.2 `EvaluateCall`, §13.3.5.1.1 `EvaluateNew`, and §7.3.13-14 `Call`/`Construct`
+  ordering and abrupt-completion behavior.
 - [ ] Record branch direction counts and loop back-edge counts for optimization/OSR thresholds.
 - [ ] Record allocation site, object kind, requested size, survival age, promotion, and retained
   bytes.

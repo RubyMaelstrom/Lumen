@@ -120,9 +120,48 @@ pub(crate) enum ElementOutcome {
     Rejected = 8,
 }
 
+/// Abstract callable target family. The target's current address or object identity is never
+/// serialized; these families are stable enough for deciding which call path needs a guard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum CallTargetKind {
+    UserFunction = 1,
+    NativeFunction = 2,
+    BoundFunction = 3,
+    Proxy = 4,
+    WrappedFunction = 5,
+    CallableObject = 6,
+    NonCallable = 7,
+}
+
+/// Bounded argument-count class for a completed call site. Spread/array calls use the actual
+/// expanded list length, but retain only this portable bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum CallArityKind {
+    Zero = 1,
+    One = 2,
+    Few = 3,
+    Many = 4,
+}
+
+/// Whether a callable needs a retained activation environment or a dynamic forwarding path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum CallEnvironmentKind {
+    None = 1,
+    Captured = 2,
+    Dynamic = 3,
+    Unknown = 4,
+}
+
 const ELEMENT_RECEIVER_SHIFT: u32 = 0;
 const ELEMENT_KEY_SHIFT: u32 = 8;
 const ELEMENT_OUTCOME_SHIFT: u32 = 16;
+
+const CALL_TARGET_SHIFT: u32 = 0;
+const CALL_ARITY_SHIFT: u32 = 8;
+const CALL_ENVIRONMENT_SHIFT: u32 = 16;
 
 pub(crate) const fn element_observation_payload(
     receiver: ElementReceiverKind,
@@ -139,6 +178,24 @@ fn element_group_counts(payload: u32) -> (u32, u32, u32) {
         ((payload >> ELEMENT_RECEIVER_SHIFT) & 0x3f).count_ones(),
         ((payload >> ELEMENT_KEY_SHIFT) & 0x0f).count_ones(),
         ((payload >> ELEMENT_OUTCOME_SHIFT) & 0xff).count_ones(),
+    )
+}
+
+pub(crate) const fn call_observation_payload(
+    target: CallTargetKind,
+    arity: CallArityKind,
+    environment: CallEnvironmentKind,
+) -> u32 {
+    (1_u32 << (CALL_TARGET_SHIFT + target as u32 - 1))
+        | (1_u32 << (CALL_ARITY_SHIFT + arity as u32 - 1))
+        | (1_u32 << (CALL_ENVIRONMENT_SHIFT + environment as u32 - 1))
+}
+
+fn call_group_counts(payload: u32) -> (u32, u32, u32) {
+    (
+        ((payload >> CALL_TARGET_SHIFT) & 0x7f).count_ones(),
+        ((payload >> CALL_ARITY_SHIFT) & 0x0f).count_ones(),
+        ((payload >> CALL_ENVIRONMENT_SHIFT) & 0x0f).count_ones(),
     )
 }
 
@@ -329,6 +386,24 @@ impl ObservationWord {
                         && (1..=4).contains(&receivers)
                         && (1..=4).contains(&keys)
                         && (1..=4).contains(&outcomes)
+                }
+                ObservationState::Absent => false,
+            };
+        }
+        if kind == ObservationKind::CallTarget {
+            if ((self.0 >> 8) as u8) != 0 {
+                return false;
+            }
+            let payload = self.payload_bits();
+            let (targets, arities, environments) = call_group_counts(payload);
+            return match self.decoded_state().unwrap() {
+                ObservationState::Uninitialized | ObservationState::Generic => payload == 0,
+                ObservationState::Monomorphic => (targets, arities, environments) == (1, 1, 1),
+                ObservationState::Polymorphic => {
+                    payload != 0
+                        && (1..=4).contains(&targets)
+                        && (1..=4).contains(&arities)
+                        && (1..=4).contains(&environments)
                 }
                 ObservationState::Absent => false,
             };
@@ -836,6 +911,75 @@ impl FeedbackVector {
         );
     }
 
+    /// Merge one call/construct target observation. Target family, argument-count bucket, and
+    /// activation-environment requirement are intentionally independent bounded dimensions; this
+    /// avoids claiming a cross-product correlation that a future optimizer cannot guard cheaply.
+    pub(crate) fn observe_call(
+        &self,
+        bytecode_pc: usize,
+        target: CallTargetKind,
+        arity: CallArityKind,
+        environment: CallEnvironmentKind,
+    ) {
+        if !self.detailed_enabled {
+            return;
+        }
+        let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
+            return;
+        };
+        let Ok(index) = self
+            .layout
+            .sites
+            .binary_search_by_key(&bytecode_pc, |site| site.bytecode_pc)
+        else {
+            return;
+        };
+        let site = SiteId(index as u32);
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors.iter().position(|slot| {
+            slot.kind == ObservationKind::CallTarget && slot.role == ObservationRole::Target
+        }) else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        let cell = &self.words()[first + offset];
+        let current = ObservationWord(cell.get());
+        if current.decoded_state() == Some(ObservationState::Generic) {
+            return;
+        }
+        let incoming_payload = call_observation_payload(target, arity, environment);
+        let merged_payload = if current.decoded_state() == Some(ObservationState::Uninitialized) {
+            incoming_payload
+        } else {
+            current.payload_bits() | incoming_payload
+        };
+        let (targets, arities, environments) = call_group_counts(merged_payload);
+        let state = if targets <= 1 && arities <= 1 && environments <= 1 {
+            ObservationState::Monomorphic
+        } else if (1..=4).contains(&targets)
+            && (1..=4).contains(&arities)
+            && (1..=4).contains(&environments)
+        {
+            ObservationState::Polymorphic
+        } else {
+            ObservationState::Generic
+        };
+        cell.set(
+            ObservationWord::new(
+                state,
+                if state == ObservationState::Generic {
+                    0
+                } else {
+                    merged_payload
+                },
+                0,
+            )
+            .0,
+        );
+    }
+
     /// Merge one stable semantic value class into the matching site's bitset.
     pub(crate) fn observe_value_class(
         &self,
@@ -1281,6 +1425,12 @@ mod tests {
         assert_eq!(ElementKeyKind::Symbol as u8, 4);
         assert_eq!(ElementOutcome::OwnData as u8, 1);
         assert_eq!(ElementOutcome::Rejected as u8, 8);
+        assert_eq!(CallTargetKind::UserFunction as u8, 1);
+        assert_eq!(CallTargetKind::NonCallable as u8, 7);
+        assert_eq!(CallArityKind::Zero as u8, 1);
+        assert_eq!(CallArityKind::Many as u8, 4);
+        assert_eq!(CallEnvironmentKind::None as u8, 1);
+        assert_eq!(CallEnvironmentKind::Unknown as u8, 4);
         assert_eq!(property_access_flags(PropertyOutcome::Data, 3, true), 0x1b);
         assert_eq!(ValueClass::Undefined as u8, 1);
         assert_eq!(ValueClass::Object as u8, 9);
@@ -1344,6 +1494,83 @@ mod tests {
                     SiteId(0),
                     ObservationKind::ElementAccess,
                     ObservationRole::Access,
+                )
+                .state(),
+            ObservationState::Generic
+        );
+    }
+
+    #[test]
+    fn call_feedback_keeps_target_arity_and_environment_bounded() {
+        let mut builder = LayoutBuilder::default();
+        builder.add_site(
+            4,
+            OperationKind::Call,
+            &[SlotDescriptor {
+                kind: ObservationKind::CallTarget,
+                role: ObservationRole::Target,
+            }],
+        );
+        let vector = FeedbackVector::new_with_enabled(
+            builder.finish(),
+            vec![RuntimeBinding::Unbound].into_boxed_slice(),
+            true,
+        );
+        let payload = call_observation_payload(
+            CallTargetKind::UserFunction,
+            CallArityKind::Few,
+            CallEnvironmentKind::Captured,
+        );
+        assert_eq!(call_group_counts(payload), (1, 1, 1));
+        assert!(
+            ObservationWord::new(ObservationState::Monomorphic, payload, 0)
+                .is_valid_for(ObservationKind::CallTarget)
+        );
+
+        vector.observe_call(
+            4,
+            CallTargetKind::UserFunction,
+            CallArityKind::Few,
+            CallEnvironmentKind::Captured,
+        );
+        vector.observe_call(
+            4,
+            CallTargetKind::NativeFunction,
+            CallArityKind::Many,
+            CallEnvironmentKind::None,
+        );
+        let word = vector.read(
+            SiteId(0),
+            ObservationKind::CallTarget,
+            ObservationRole::Target,
+        );
+        assert_eq!(word.state(), ObservationState::Polymorphic);
+        assert_eq!(call_group_counts(word.payload()), (2, 2, 2));
+
+        vector.observe_call(
+            4,
+            CallTargetKind::BoundFunction,
+            CallArityKind::Zero,
+            CallEnvironmentKind::Dynamic,
+        );
+        vector.observe_call(
+            4,
+            CallTargetKind::Proxy,
+            CallArityKind::One,
+            CallEnvironmentKind::Unknown,
+        );
+        vector.observe_call(
+            4,
+            CallTargetKind::WrappedFunction,
+            CallArityKind::Few,
+            CallEnvironmentKind::None,
+        );
+        assert_eq!(
+            vector
+                .read(
+                    SiteId(0),
+                    ObservationKind::CallTarget,
+                    ObservationRole::Target,
                 )
                 .state(),
             ObservationState::Generic

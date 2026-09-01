@@ -1485,7 +1485,7 @@ pub fn compile(
         // Route all element templates through the exact-PC helper as well: GetElem (1024),
         // SetElemDrop (2048), and SetElem (4096) otherwise perform the operation without a
         // semantic trace. Register/region/property fusions are disabled for the same reason.
-        fast &= !(1 | 32 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536);
+        fast &= !(1 | 32 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 524288 | (1 << 20));
     }
     let array_intrinsics_on = std::env::var_os("LUMEN_JIT_NO_ARRAY_INTRINSICS").is_none();
     let function_call_intrinsic_on =

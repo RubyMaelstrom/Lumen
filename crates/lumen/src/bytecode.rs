@@ -1391,6 +1391,13 @@ impl Chunk {
         self.makes_env() || self.arguments_slot.is_some()
     }
 
+    /// Stable adapter query for call feedback. The optimizing tier must not infer this from the
+    /// presence of a Rust `Env`; the bytecode's activation predicate includes arguments objects
+    /// and lexical-`this` requirements that are observable at the language level.
+    pub(crate) fn requires_activation_environment(&self) -> bool {
+        self.needs_env()
+    }
+
     /// Build the activation environment for one call: normally a fresh scope under `env` holding
     /// exactly the captured bindings (and `this` when an inner arrow chain reads it). A coroutine
     /// with mapped arguments instead reuses the FunctionDeclarationInstantiation environment so
@@ -3025,9 +3032,9 @@ fn observe_arithmetic_result(
 mod feedback_layout_tests {
     use super::*;
     use crate::feedback::{
-        property_access_flags, ElementKeyKind, ElementOutcome, ElementReceiverKind, FeedbackVector,
-        ObservationKind, ObservationRole, ObservationState, OperationKind, PropertyOutcome,
-        ValueClass,
+        property_access_flags, CallEnvironmentKind, CallTargetKind, ElementKeyKind, ElementOutcome,
+        ElementReceiverKind, FeedbackVector, ObservationKind, ObservationRole, ObservationState,
+        OperationKind, PropertyOutcome, ValueClass,
     };
 
     #[test]
@@ -3640,6 +3647,54 @@ mod feedback_layout_tests {
             .unwrap_or_else(|_| panic!("canonical numeric typed-array read must complete"));
         assert!(matches!(value, Value::Undefined));
         assert_eq!(typed_trace.outcome, Some(PropertyOutcome::Exotic));
+    }
+
+    #[test]
+    fn call_adapter_classifies_callable_families_without_object_identity() {
+        let mut interp = Interp::new();
+        let global = interp.global_this();
+        let user = interp
+            .eval_in_realm(&global, "(function user() {})")
+            .unwrap_or_else(|_| panic!("user function construction must complete"));
+        let bound = interp
+            .eval_in_realm(&global, "(function target() {}).bind(null)")
+            .unwrap_or_else(|_| panic!("bound function construction must complete"));
+        let proxy = interp
+            .eval_in_realm(&global, "new Proxy(function target() {}, {})")
+            .unwrap_or_else(|_| panic!("proxy function construction must complete"));
+        let native = interp.new_native_fn("native", 0, Rc::new(|_, _, _| Ok(Value::Undefined)));
+        let ordinary = Value::Obj(interp.new_object());
+
+        assert_eq!(interp.call_target_kind(&user), CallTargetKind::UserFunction);
+        assert_eq!(
+            interp.call_target_kind(&native),
+            CallTargetKind::NativeFunction
+        );
+        assert_eq!(
+            interp.call_target_kind(&bound),
+            CallTargetKind::BoundFunction
+        );
+        assert_eq!(interp.call_target_kind(&proxy), CallTargetKind::Proxy);
+        assert_eq!(
+            interp.call_target_kind(&ordinary),
+            CallTargetKind::NonCallable
+        );
+        assert_eq!(
+            interp.call_target_kind(&Value::Num(1.0)),
+            CallTargetKind::NonCallable
+        );
+        assert!(matches!(
+            interp.call_environment_kind(&user),
+            CallEnvironmentKind::None | CallEnvironmentKind::Unknown
+        ));
+        assert_eq!(
+            interp.call_environment_kind(&bound),
+            CallEnvironmentKind::Dynamic
+        );
+        assert_eq!(
+            interp.call_environment_kind(&proxy),
+            CallEnvironmentKind::Dynamic
+        );
     }
 
     #[test]
@@ -11006,7 +11061,11 @@ fn run_vm(
                 } else {
                     Value::Undefined
                 };
-                let v = i.call(callee, this, &args)?;
+                let v = if chunk.feedback.detailed_enabled() {
+                    call_profiled(i, chunk, op_pc, callee, this, &args)?
+                } else {
+                    i.call(callee, this, &args)?
+                };
                 stack.push(v);
             }
             Op::CallArgsArray | Op::CallArgsArrayThis => {
@@ -11017,7 +11076,11 @@ fn run_vm(
                 } else {
                     Value::Undefined
                 };
-                let value = i.call(callee, this, &args)?;
+                let value = if chunk.feedback.detailed_enabled() {
+                    call_profiled(i, chunk, op_pc, callee, this, &args)?
+                } else {
+                    i.call(callee, this, &args)?
+                };
                 stack.push(value);
             }
             Op::EvalCallArgsArray => {
@@ -11031,7 +11094,29 @@ fn run_vm(
                             if Rc::ptr_eq(function, intrinsic)
                     );
                 let value = if direct {
-                    i.direct_eval(args.first(), env)?
+                    if chunk.feedback.detailed_enabled() {
+                        let target = i.call_target_kind(&callee);
+                        let environment = i.call_environment_kind(&callee);
+                        chunk.feedback.observe_call(
+                            op_pc,
+                            target,
+                            call_arity_kind(args.len()),
+                            environment,
+                        );
+                    }
+                    let value = i.direct_eval(args.first(), env)?;
+                    if chunk.feedback.detailed_enabled() {
+                        if let Some(class) = arithmetic_value_class(&value) {
+                            chunk.feedback.observe_value_class(
+                                op_pc,
+                                crate::feedback::ObservationRole::Result,
+                                class,
+                            );
+                        }
+                    }
+                    value
+                } else if chunk.feedback.detailed_enabled() {
+                    call_profiled(i, chunk, op_pc, callee, receiver, &args)?
                 } else {
                     i.call(callee, receiver, &args)?
                 };
@@ -11470,7 +11555,11 @@ fn run_vm(
             Op::Call(argc, _) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack[at - 1].clone();
-                let v = i.call(callee, Value::Undefined, &stack[at..])?;
+                let v = if chunk.feedback.detailed_enabled() {
+                    call_profiled(i, chunk, op_pc, callee, Value::Undefined, &stack[at..])?
+                } else {
+                    i.call(callee, Value::Undefined, &stack[at..])?
+                };
                 stack.truncate(at - 1);
                 stack.push(v);
             }
@@ -11493,21 +11582,34 @@ fn run_vm(
                 let at = stack.len() - argc as usize;
                 let m = stack[at - 1].clone();
                 let this = stack[at - 2].clone();
-                let v = i.call(m, this, &stack[at..])?;
+                let v = if chunk.feedback.detailed_enabled() {
+                    call_profiled(i, chunk, op_pc, m, this, &stack[at..])?
+                } else {
+                    i.call(m, this, &stack[at..])?
+                };
                 stack.truncate(at - 2);
                 stack.push(v);
             }
             Op::New(argc, _) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack[at - 1].clone();
-                let v = i.construct(callee, &stack[at..])?;
+                let v = if chunk.feedback.detailed_enabled() {
+                    construct_profiled(i, chunk, op_pc, callee, &stack[at..])?
+                } else {
+                    i.construct(callee, &stack[at..])?
+                };
                 stack.truncate(at - 1);
                 stack.push(v);
             }
             Op::NewArgsArray => {
                 let args = argument_array_values(i, pop!());
                 let callee = pop!();
-                stack.push(i.construct(callee, &args)?);
+                let value = if chunk.feedback.detailed_enabled() {
+                    construct_profiled(i, chunk, op_pc, callee, &args)?
+                } else {
+                    i.construct(callee, &args)?
+                };
+                stack.push(value);
             }
             Op::MakeRegExp(body, flags) => {
                 stack.push(
@@ -11665,7 +11767,28 @@ fn run_vm(
                 let args = argument_array_values(i, pop!());
                 let super_constructor = pop!();
                 let new_target = pop!();
-                stack.push(i.finish_super_call(new_target, super_constructor, &args, env)?);
+                let value = if chunk.feedback.detailed_enabled() {
+                    let target = i.call_target_kind(&super_constructor);
+                    let environment = i.call_environment_kind(&super_constructor);
+                    chunk.feedback.observe_call(
+                        op_pc,
+                        target,
+                        call_arity_kind(args.len()),
+                        environment,
+                    );
+                    let value = i.finish_super_call(new_target, super_constructor, &args, env)?;
+                    if let Some(class) = arithmetic_value_class(&value) {
+                        chunk.feedback.observe_value_class(
+                            op_pc,
+                            crate::feedback::ObservationRole::Result,
+                            class,
+                        );
+                    }
+                    value
+                } else {
+                    i.finish_super_call(new_target, super_constructor, &args, env)?
+                };
+                stack.push(value);
             }
             // ECMA-262 §13.3.7.1 creates a Super Reference with the current function's actual
             // this binding as [[ThisValue]]. Compiled calls keep that binding in the VM frame
@@ -13341,6 +13464,69 @@ fn set_element_profiled(
     let mut trace = crate::feedback::CurrentPropertyTrace::default();
     let result = i.set_member_profiled(base, key.as_str(), value, &mut trace);
     observe_element_trace(i, chunk, pc, base, key.as_str(), trace);
+    result
+}
+
+#[inline]
+fn call_arity_kind(len: usize) -> crate::feedback::CallArityKind {
+    match len {
+        0 => crate::feedback::CallArityKind::Zero,
+        1 => crate::feedback::CallArityKind::One,
+        2..=4 => crate::feedback::CallArityKind::Few,
+        _ => crate::feedback::CallArityKind::Many,
+    }
+}
+
+/// Profile one completed `Call` operation. Target metadata is captured before dispatch, and the
+/// return value class is published only after [[Call]] succeeds, matching EvaluateCall's ordering.
+#[inline]
+fn call_profiled(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    callee: Value,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Abrupt> {
+    let target = i.call_target_kind(&callee);
+    let environment = i.call_environment_kind(&callee);
+    chunk
+        .feedback
+        .observe_call(pc, target, call_arity_kind(args.len()), environment);
+    let result = i.call(callee, this, args);
+    if let Ok(value) = &result {
+        if let Some(class) = arithmetic_value_class(value) {
+            chunk
+                .feedback
+                .observe_value_class(pc, crate::feedback::ObservationRole::Result, class);
+        }
+    }
+    result
+}
+
+/// Profile one completed `Construct` operation. The construct result is necessarily an object on
+/// success, but it still flows through the normal ValueClass result slot for a uniform call ABI.
+#[inline]
+fn construct_profiled(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    callee: Value,
+    args: &[Value],
+) -> Result<Value, Abrupt> {
+    let target = i.call_target_kind(&callee);
+    let environment = i.call_environment_kind(&callee);
+    chunk
+        .feedback
+        .observe_call(pc, target, call_arity_kind(args.len()), environment);
+    let result = i.construct(callee, args);
+    if let Ok(value) = &result {
+        if let Some(class) = arithmetic_value_class(value) {
+            chunk
+                .feedback
+                .observe_value_class(pc, crate::feedback::ObservationRole::Result, class);
+        }
+    }
     result
 }
 
@@ -15483,6 +15669,18 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
+    // Detailed profiling disables the inline probe at compile time, but keep this helper
+    // semantically complete if a previously emitted chunk reaches it after instrumentation is
+    // enabled. The profiled path must observe before dispatch and must not consume moved slots.
+    if chunk.feedback.detailed_enabled() {
+        return match jit_call_inner(ctx, pc, &mut sp) {
+            Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+            Err(ab) => {
+                ctx.error = Some(ab);
+                crate::jit::SpFlag { sp, flag: 1 }
+            }
+        };
+    }
     let (argc, c, with_this) = match chunk.ops[pc as usize] {
         Op::CallWithThis(argc, c) => (argc as usize, c, true),
         Op::Call(argc, c) => (argc as usize, c, false),
@@ -15701,6 +15899,26 @@ pub(crate) unsafe extern "C" fn jit_new(
         Op::New(n, _) if n as u32 == argc
     ));
     let i = unsafe { &mut *ctx.interp };
+    let chunk = unsafe { &*ctx.chunk };
+    if chunk.feedback.detailed_enabled() {
+        let argc = argc as usize;
+        let args_ptr = unsafe { sp.sub(argc) };
+        let callee = unsafe { (*sp.sub(argc + 1)).clone() };
+        let args = unsafe { std::slice::from_raw_parts(args_ptr, argc) };
+        let value = match construct_profiled(i, chunk, pc as usize, callee, args) {
+            Ok(value) => value,
+            Err(abrupt) => {
+                ctx.error = Some(abrupt);
+                return crate::jit::SpFlag { sp, flag: 1 };
+            }
+        };
+        sp = unsafe { jit_consume(sp, argc + 1) };
+        unsafe { sp.write(value) };
+        return crate::jit::SpFlag {
+            sp: unsafe { sp.add(1) },
+            flag: 0,
+        };
+    }
     let cache = match (&*ctx.chunk).ops[pc as usize] {
         Op::New(_, cache) => cache,
         _ => unreachable!(),
@@ -16056,6 +16274,19 @@ unsafe fn jit_call_inner(
         _ => unreachable!("jit_call emitted only for call ops"),
     };
     let args_ptr = sp.sub(argc);
+    if chunk.feedback.detailed_enabled() {
+        let args = std::slice::from_raw_parts(args_ptr, argc);
+        let callee = (*sp.sub(argc + 1)).clone();
+        let this = if with_this {
+            (*sp.sub(argc + 2)).clone()
+        } else {
+            Value::Undefined
+        };
+        let value = call_profiled(i, chunk, pc as usize, callee, this, args)?;
+        *sp = jit_consume(*sp, argc + usize::from(with_this) + 1);
+        push!(value);
+        return Ok(());
+    }
     // See the Op::Call arm of `jit_exec_inner` for the ownership story: on Some the arguments
     // and the `this` slot were MOVED into the callee.
     let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);
@@ -16770,7 +17001,11 @@ unsafe fn jit_exec_inner(
             while let Some(x) = i.iterator_step(&it, &nx)? {
                 args.push(x);
             }
-            let v = i.call(callee, this, &args)?;
+            let v = if chunk.feedback.detailed_enabled() {
+                call_profiled(i, chunk, pc as usize, callee, this, &args)?
+            } else {
+                i.call(callee, this, &args)?
+            };
             push!(v);
         }
         Op::CallArgsArray | Op::CallArgsArrayThis => {
@@ -16781,7 +17016,11 @@ unsafe fn jit_exec_inner(
             } else {
                 Value::Undefined
             };
-            push!(i.call(callee, this, &args)?);
+            if chunk.feedback.detailed_enabled() {
+                push!(call_profiled(i, chunk, pc as usize, callee, this, &args)?);
+            } else {
+                push!(i.call(callee, this, &args)?);
+            }
         }
         Op::AppendProp(n, c) => {
             let v = pop!();
@@ -17158,6 +17397,14 @@ unsafe fn jit_exec_inner(
         Op::Call(argc, c) => {
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
+            if chunk.feedback.detailed_enabled() {
+                let args = std::slice::from_raw_parts(args_ptr, argc);
+                let callee = (*sp.sub(argc + 1)).clone();
+                let value = call_profiled(i, chunk, pc as usize, callee, Value::Undefined, args)?;
+                *sp = jit_consume(*sp, argc + 1);
+                push!(value);
+                return Ok(());
+            }
             // JIT→JIT fast call: on Some the arguments and the `this` slot were MOVED into the
             // callee — rewind the stack past them without dropping, then drop only the callee
             // slot. The `this` here is a local Undefined in a ManuallyDrop: the callee owns it on
@@ -17211,6 +17458,15 @@ unsafe fn jit_exec_inner(
         Op::CallWithThis(argc, c) => {
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
+            if chunk.feedback.detailed_enabled() {
+                let args = std::slice::from_raw_parts(args_ptr, argc);
+                let method = (*sp.sub(argc + 1)).clone();
+                let this = (*sp.sub(argc + 2)).clone();
+                let value = call_profiled(i, chunk, pc as usize, method, this, args)?;
+                *sp = jit_consume(*sp, argc + 2);
+                push!(value);
+                return Ok(());
+            }
             let mut r = i.call_jit_cached(
                 &chunk.call_caches[c as usize],
                 &*sp.sub(argc + 1),
@@ -17243,12 +17499,26 @@ unsafe fn jit_exec_inner(
             push!(v);
         }
         Op::New(argc, cache) => {
-            unsafe { jit_new_inner(i, None, Some((chunk, cache)), argc as usize, sp) }?;
+            let argc = argc as usize;
+            if chunk.feedback.detailed_enabled() {
+                let args_ptr = sp.sub(argc);
+                let callee = (*sp.sub(argc + 1)).clone();
+                let args = std::slice::from_raw_parts(args_ptr, argc);
+                let value = construct_profiled(i, chunk, pc as usize, callee, args)?;
+                *sp = jit_consume(*sp, argc + 1);
+                push!(value);
+            } else {
+                unsafe { jit_new_inner(i, None, Some((chunk, cache)), argc, sp) }?;
+            }
         }
         Op::NewArgsArray => {
             let args = argument_array_values(i, pop!());
             let callee = pop!();
-            push!(i.construct(callee, &args)?);
+            if chunk.feedback.detailed_enabled() {
+                push!(construct_profiled(i, chunk, pc as usize, callee, &args)?);
+            } else {
+                push!(i.construct(callee, &args)?);
+            }
         }
         Op::MakeRegExp(body, flags) => {
             push!(chunk.make_regexp_literal(i, pc as usize, body, flags)?);
