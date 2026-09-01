@@ -138,6 +138,20 @@ not comparable because instrumentation is expensive; execution counts are the us
   changing content make them unsuitable as the only regression oracle, so repeatable local replay
   workloads are also required.
 
+### Current Phase 0 evidence
+
+The current-tree release binary at `6ead595fa325533ea2a46b735a050b183c6b91c6` completed the
+required seven-sample, affinity-controlled Node/V8-versus-Lumen matrix on 2026-09-01. The
+machine-readable report is
+`benchmark-results/engine-matrix-20260901T195955106211Z.json` (SHA-256
+`4e0799eef5f7840d2415940673a6c4a91ee651f571fa228283371ef8f794ecd1`). Lumen's composite median
+was 1,904.46 (95% bootstrap interval 1,902.49–1,905.99); component medians were Crypto 7,293,
+DeltaBlue 840, EarleyBoyer 874, NavierStokes 12,601, RayTrace 1,876, RegExp 436, Richards
+1,051, and Splay 2,968. Managed requested-byte snapshots were complete for every Lumen sample.
+The optional Bun leg is currently retained separately because Bun 1.4 rejects the upstream
+fixture's legacy undeclared `setupEngine` assignment before the Crypto workload begins; no Bun
+numbers are mixed into this required baseline.
+
 ## Quantitative decision and exit policy
 
 Correctness gates are absolute: no score, memory reduction, or phase target permits a standards or
@@ -571,8 +585,10 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [ ] Add stable helper identities and cover remaining spread/ordinary-versus-symbol iteration
     distinctions without adding a disabled-path timestamp to primitive fast cases.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
-- [ ] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
-  recover diagnostics.
+- [x] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
+  recover diagnostics. `PerformanceMetricsSampler` emits an immediate and then interval-spaced
+  JSON envelope, coalesces missed intervals, triggers the existing post-GC snapshot only when due,
+  and remains inert unless `LUMEN_PERF_METRICS` is enabled.
 - [ ] Add a stable machine-readable profile format and a human summary tool.
 
 ### Phase 2: canonical tagged value and execution ABI
@@ -1005,7 +1021,7 @@ before changing broad execution behavior:
   DOM/event-loop/Speedometer-Vue browser replays are already recorded.
 - [ ] Land the versioned abstract feedback-vector plus allocation/GC/JIT/error/conversion/iterator
   timing structures with disabled-cost tests.
-- [ ] Add bounded machine-readable diagnostic dumps for long-lived browser Agents.
+- [x] Add bounded machine-readable diagnostic dumps for long-lived browser Agents.
 - [ ] Write and review the tagged-value/frame/root/deoptimization ABI design record.
 - [ ] Migrate one bounded bytecode/frame/helper slice to the canonical tagged ABI and prove forced
   safepoint, relocation, frame walking, and differential behavior before widening the migration.

@@ -107,6 +107,7 @@ mod cldr_numbers;
 mod value;
 
 use interpreter::Interp;
+use std::time::{Duration, Instant};
 use value::Value;
 
 pub use interrupt::{InterruptReason, RuntimeInterrupt};
@@ -121,6 +122,139 @@ pub use interrupt::{InterruptReason, RuntimeInterrupt};
 pub fn unstable_performance_metrics_json(engine: &Engine) -> Option<String> {
     let managed_memory = memory::json(&engine.interp);
     jit::performance_metrics_json(&managed_memory)
+}
+
+/// An opt-in, bounded sampler for diagnostics from a long-lived Agent.
+///
+/// Performance counters are intentionally cumulative, while the managed-memory record is a
+/// post-collection snapshot. `maybe_dump` advances the existing diagnostic collection boundary
+/// only when the interval expires and returns one bounded JSON envelope. Hosts can call it from
+/// their normal task/idle loop; normal execution never creates a sampler or pays for its clock.
+/// The JIT/GC counters inside the envelope remain process aggregates; the managed-memory record
+/// carries the sampled Agent/heap identity. The envelope is deliberately unstable tooling output,
+/// not an ECMAScript-visible operation.
+#[doc(hidden)]
+pub struct PerformanceMetricsSampler {
+    interval: Duration,
+    started: Instant,
+    next_dump: Instant,
+    sequence: u64,
+    enabled: bool,
+}
+
+impl PerformanceMetricsSampler {
+    const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Construct a sampler when the host has already opted into `LUMEN_PERF_METRICS`.
+    ///
+    /// A zero interval is normalized to one second so a configuration mistake cannot turn a
+    /// long-lived browser loop into an unbounded stream of collections and JSON allocations.
+    #[must_use]
+    pub fn new(interval: Duration) -> Self {
+        let interval = if interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            interval
+        };
+        let now = Instant::now();
+        let enabled = std::env::var_os("LUMEN_PERF_METRICS").is_some();
+        Self {
+            interval,
+            started: now,
+            next_dump: now,
+            sequence: 0,
+            enabled,
+        }
+    }
+
+    /// Construct a sampler from the diagnostic environment, or return `None` when diagnostics are
+    /// disabled. `LUMEN_PERF_METRICS_INTERVAL_SECONDS` accepts a finite positive floating-point
+    /// duration and defaults to ten seconds. Invalid values are ignored rather than changing host
+    /// behavior or disabling the normal metrics switch.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        std::env::var_os("LUMEN_PERF_METRICS")?;
+        let interval = std::env::var("LUMEN_PERF_METRICS_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .unwrap_or(Self::DEFAULT_INTERVAL);
+        Some(Self::new(interval))
+    }
+
+    /// Return a machine-readable diagnostic envelope once the configured interval has elapsed.
+    /// The first call emits an immediate snapshot. The caller owns the output destination; no
+    /// process-global stream or background thread is created.
+    pub fn maybe_dump(&mut self, engine: &mut Engine) -> Option<String> {
+        let now = Instant::now();
+        let (sequence, elapsed_seconds) = self.claim(now)?;
+        engine.unstable_collect_for_performance_metrics();
+        let metrics = unstable_performance_metrics_json(engine)?;
+        Some(format!(
+            "{{\"schema_version\":1,\"dump_sequence\":{sequence},\"elapsed_seconds\":{elapsed_seconds:.6},\"interval_seconds\":{:.6},\"metrics\":{metrics}}}",
+            self.interval.as_secs_f64()
+        ))
+    }
+
+    fn claim(&mut self, now: Instant) -> Option<(u64, f64)> {
+        if !self.enabled || now < self.next_dump {
+            return None;
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        // Schedule from the completed sample, not from the old deadline. If a host is paused for
+        // minutes, the next poll emits one record instead of replaying every missed interval.
+        self.next_dump = now.checked_add(self.interval).unwrap_or(now);
+        Some((
+            self.sequence,
+            now.duration_since(self.started).as_secs_f64(),
+        ))
+    }
+
+    #[cfg(test)]
+    fn new_for_test(interval: Duration, enabled: bool, now: Instant) -> Self {
+        let mut sampler = Self::new(interval);
+        sampler.started = now;
+        sampler.next_dump = now;
+        sampler.enabled = enabled;
+        sampler
+    }
+}
+
+#[cfg(test)]
+mod performance_sampler_tests {
+    use super::PerformanceMetricsSampler;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn sampler_emits_immediately_then_respects_interval() {
+        let start = Instant::now();
+        let mut sampler =
+            PerformanceMetricsSampler::new_for_test(Duration::from_secs(5), true, start);
+        assert_eq!(sampler.claim(start), Some((1, 0.0)));
+        assert_eq!(sampler.claim(start + Duration::from_secs(4)), None);
+        let (sequence, elapsed) = sampler
+            .claim(start + Duration::from_secs(5))
+            .expect("second interval");
+        assert_eq!(sequence, 2);
+        assert_eq!(elapsed, 5.0);
+        assert_eq!(sampler.claim(start + Duration::from_secs(6)), None);
+    }
+
+    #[test]
+    fn disabled_sampler_never_claims_or_allocates_a_sample() {
+        let start = Instant::now();
+        let mut sampler =
+            PerformanceMetricsSampler::new_for_test(Duration::from_secs(1), false, start);
+        assert_eq!(sampler.claim(start), None);
+        assert_eq!(sampler.claim(start + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn zero_interval_is_bounded() {
+        let sampler = PerformanceMetricsSampler::new(Duration::ZERO);
+        assert_eq!(sampler.interval, Duration::from_secs(1));
+    }
 }
 
 /// Internal-stage entry points, exposed only for benchmarking (`bench` feature). These reach past
