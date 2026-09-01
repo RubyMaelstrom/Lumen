@@ -933,6 +933,9 @@ pub struct Chunk {
     /// Representation-independent semantic site layout. The detailed payload is lazy and does
     /// not mirror raw IC words; a second-stage compile reuses the canonical baseline layout.
     feedback: crate::feedback::FeedbackVector,
+    /// Runtime-only current-shape adapter table. Index+1 is the abstract layout token stored in
+    /// feedback words; raw Agent-local shape numbers never cross the profile boundary.
+    feedback_shapes: std::cell::RefCell<Vec<u32>>,
     /// One pre-shaped `Props` template per plain object-literal site (`Op::MakeObject`'s third
     /// operand indexes this; `u32::MAX` = duplicate keys, take the insert path). Built on first
     /// execution, cloned per instance — key hashing and shape transitions paid once per SITE.
@@ -999,6 +1002,7 @@ impl Chunk {
     /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
     /// allocation-family visitor for identity deduplication.
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
+        refresh_current_layout_feedback(&self.feedback, &self.feedback_shapes, &self.caches);
         macro_rules! vec_bytes {
             ($field:ident, $ty:ty) => {
                 self.$field
@@ -1035,6 +1039,12 @@ impl Chunk {
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
+        bytes = bytes.saturating_add(
+            self.feedback_shapes
+                .borrow()
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u32>()),
+        );
 
         for value in &self.consts {
             visitor.value(value);
@@ -2564,11 +2574,36 @@ const ALLOCATION_OUTCOME: crate::feedback::SlotDescriptor = crate::feedback::Slo
 /// raw shape/callee state are intentionally ignored: a future adapter may read them, but they are
 /// not part of the profile schema. ECMA-262 §6.1, §10.1.8.1, and §13.3.6.2 define the semantic
 /// distinctions represented by these slots.
-fn feedback_layout_for_ops(ops: &[Op]) -> crate::feedback::FeedbackLayout {
-    use crate::feedback::{LayoutBuilder, OperationKind};
+fn feedback_layout_for_ops(
+    ops: &[Op],
+) -> (
+    crate::feedback::FeedbackLayout,
+    Box<[crate::feedback::RuntimeBinding]>,
+) {
+    use crate::feedback::{LayoutBuilder, OperationKind, RuntimeBinding};
 
     let mut builder = LayoutBuilder::default();
+    let mut bindings = Vec::new();
     for (pc, op) in ops.iter().enumerate() {
+        let binding = match op {
+            Op::GetProp(_, cache)
+            | Op::GetPropThis(_, cache)
+            | Op::SetProp(_, cache)
+            | Op::SetPropDrop(_, cache)
+            | Op::SetPropThisDrop(_, cache)
+            | Op::AppendProp(_, cache)
+            | Op::GetMethod(_, cache) => RuntimeBinding::PropertyIc {
+                first_way: *cache,
+                way_count: PROP_IC_WAYS as u8,
+            },
+            Op::GetPropLocal(_, _, cache)
+            | Op::SetPropLocalDrop(_, _, cache)
+            | Op::UpdateProp(_, cache, _) => RuntimeBinding::PropertyIc {
+                first_way: *cache,
+                way_count: PROP_IC_WAYS as u8,
+            },
+            _ => RuntimeBinding::Unbound,
+        };
         let (operation, slots): (OperationKind, &[crate::feedback::SlotDescriptor]) = match op {
             Op::GetProp(..) | Op::GetPropThis(..) | Op::GetPropLocal(..) | Op::GetMethod(..) => (
                 OperationKind::NamedLoad,
@@ -2638,22 +2673,161 @@ fn feedback_layout_for_ops(ops: &[Op]) -> crate::feedback::FeedbackLayout {
             _ => continue,
         };
         builder.add_site(pc, operation, slots);
+        bindings.push(binding);
     }
-    builder.finish()
+    (builder.finish(), bindings.into_boxed_slice())
+}
+
+const OBS_FLAG_ARRAY_KEY_CHECK: u8 = 0x80;
+const OBS_FLAG_CREATION: u8 = 0x40;
+
+fn intern_current_shape(shapes: &std::cell::RefCell<Vec<u32>>, shape: u32) -> u32 {
+    let mut shapes = shapes.borrow_mut();
+    if let Some(index) = shapes.iter().position(|candidate| *candidate == shape) {
+        return index as u32 + 1;
+    }
+    let token = u32::try_from(shapes.len())
+        .expect("feedback layout identity space exhausted")
+        .checked_add(1)
+        .expect("feedback layout identity space exhausted");
+    shapes.push(shape);
+    token
+}
+
+/// Current-shape adapter for diagnostic snapshots. It reads warmed property ICs only when the
+/// opt-in retained-memory/profile walk runs, interns Agent-local shapes into dense abstract
+/// tokens, and writes no raw shape or pointer into the versioned vector.
+fn refresh_current_layout_feedback(
+    feedback: &crate::feedback::FeedbackVector,
+    shapes: &std::cell::RefCell<Vec<u32>>,
+    caches: &[std::cell::Cell<IcState>],
+) {
+    use crate::feedback::{
+        ObservationKind, ObservationRole, ObservationState, ObservationWord, RuntimeBinding,
+    };
+
+    for (site, binding) in feedback.sites() {
+        let RuntimeBinding::PropertyIc {
+            first_way,
+            way_count,
+        } = binding
+        else {
+            continue;
+        };
+        let start = first_way as usize;
+        let mut ways = Vec::with_capacity(way_count as usize);
+        let mut generic = false;
+        for state in caches.iter().skip(start).take(way_count as usize) {
+            let state = state.get();
+            let observation = match state.depth {
+                IC_EMPTY => continue,
+                IC_ABSENT => (state.recv_shape, None, 0),
+                IC_CREATE => (state.recv_shape, None, OBS_FLAG_CREATION),
+                encoded_depth => {
+                    let key_check = encoded_depth & IC_ARR_KEYCHK != 0;
+                    let depth = encoded_depth & !IC_ARR_KEYCHK;
+                    if depth > IC_MAX_DEPTH {
+                        generic = true;
+                        break;
+                    }
+                    (
+                        state.recv_shape,
+                        Some(state.holder_shape),
+                        depth
+                            | if key_check {
+                                OBS_FLAG_ARRAY_KEY_CHECK
+                            } else {
+                                0
+                            },
+                    )
+                }
+            };
+            if !ways.contains(&observation) {
+                ways.push(observation);
+            }
+        }
+        if generic {
+            let word = ObservationWord::new(ObservationState::Generic, 0, 0);
+            feedback.write(
+                site,
+                ObservationKind::ReceiverLayout,
+                ObservationRole::Receiver,
+                word,
+            );
+            feedback.write(
+                site,
+                ObservationKind::HolderLayout,
+                ObservationRole::Holder,
+                word,
+            );
+            continue;
+        }
+        match ways.as_slice() {
+            [] => {}
+            [(receiver, holder, flags)] => {
+                let receiver = intern_current_shape(shapes, *receiver);
+                feedback.write(
+                    site,
+                    ObservationKind::ReceiverLayout,
+                    ObservationRole::Receiver,
+                    ObservationWord::new(ObservationState::Monomorphic, receiver, *flags),
+                );
+                let holder_word = holder.map_or_else(
+                    || ObservationWord::new(ObservationState::Absent, 0, *flags),
+                    |holder| {
+                        ObservationWord::new(
+                            ObservationState::Monomorphic,
+                            intern_current_shape(shapes, holder),
+                            *flags,
+                        )
+                    },
+                );
+                feedback.write(
+                    site,
+                    ObservationKind::HolderLayout,
+                    ObservationRole::Holder,
+                    holder_word,
+                );
+            }
+            polymorphic => {
+                let word = ObservationWord::new(
+                    ObservationState::Polymorphic,
+                    polymorphic.len() as u32,
+                    0,
+                );
+                feedback.write(
+                    site,
+                    ObservationKind::ReceiverLayout,
+                    ObservationRole::Receiver,
+                    word,
+                );
+                feedback.write(
+                    site,
+                    ObservationKind::HolderLayout,
+                    ObservationRole::Holder,
+                    word,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod feedback_layout_tests {
     use super::*;
-    use crate::feedback::{ObservationKind, ObservationRole, OperationKind};
+    use crate::feedback::{
+        FeedbackVector, ObservationKind, ObservationRole, ObservationState, OperationKind,
+    };
 
     #[test]
     fn canonical_layout_ignores_raw_cache_and_name_indexes() {
-        let first = feedback_layout_for_ops(&[Op::GetProp(1, 4), Op::Add, Op::CallWithThis(2, 7)]);
-        let second =
+        let (first, first_bindings) =
+            feedback_layout_for_ops(&[Op::GetProp(1, 4), Op::Add, Op::CallWithThis(2, 7)]);
+        let (second, second_bindings) =
             feedback_layout_for_ops(&[Op::GetProp(99, 400), Op::Add, Op::CallWithThis(2, 700)]);
 
         assert_eq!(first, second);
+        assert_ne!(first_bindings, second_bindings);
         assert_eq!(first.version(), crate::feedback::SCHEMA_VERSION);
         assert_eq!(first.len(), 3);
         assert_eq!(first.slot_len(), 8);
@@ -2681,7 +2855,7 @@ mod feedback_layout_tests {
 
     #[test]
     fn layout_records_back_edges_separately_from_conditional_branches() {
-        let layout =
+        let (layout, _) =
             feedback_layout_for_ops(&[Op::JumpIfFalse(3), Op::Undef, Op::Jump(0), Op::ReturnUndef]);
         let sites = layout.site_ids().collect::<Vec<_>>();
 
@@ -2698,9 +2872,89 @@ mod feedback_layout_tests {
 
     #[test]
     fn layout_stays_empty_for_bytecode_without_feedback_sites() {
-        let layout = feedback_layout_for_ops(&[Op::Undef, Op::Return]);
+        let (layout, bindings) = feedback_layout_for_ops(&[Op::Undef, Op::Return]);
         assert!(layout.is_empty());
         assert_eq!(layout.slot_len(), 0);
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn current_shape_adapter_uses_dense_tokens_and_widens_polymorphism() {
+        let (layout, bindings) = feedback_layout_for_ops(&[Op::GetProp(0, 0)]);
+        let feedback = FeedbackVector::new(layout, bindings);
+        let shapes = std::cell::RefCell::new(Vec::new());
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        caches[0].set(IcState {
+            recv_shape: 41,
+            holder_shape: 73,
+            slot: 2,
+            depth: 1,
+            mid_ok: 0,
+            mid_shape: 0,
+            mid2_shape: 0,
+        });
+
+        refresh_current_layout_feedback(&feedback, &shapes, &caches);
+        let site = feedback.sites().next().unwrap().0;
+        let receiver = feedback.read(
+            site,
+            ObservationKind::ReceiverLayout,
+            ObservationRole::Receiver,
+        );
+        let holder = feedback.read(site, ObservationKind::HolderLayout, ObservationRole::Holder);
+        assert_eq!(receiver.state(), ObservationState::Monomorphic);
+        assert_eq!(holder.state(), ObservationState::Monomorphic);
+        assert_eq!((receiver.payload(), holder.payload()), (1, 2));
+        assert_eq!(&*shapes.borrow(), &[41, 73]);
+
+        caches[1].set(IcState {
+            recv_shape: 99,
+            holder_shape: 73,
+            slot: 2,
+            depth: 1,
+            mid_ok: 0,
+            mid_shape: 0,
+            mid2_shape: 0,
+        });
+        refresh_current_layout_feedback(&feedback, &shapes, &caches);
+        let receiver = feedback.read(
+            site,
+            ObservationKind::ReceiverLayout,
+            ObservationRole::Receiver,
+        );
+        assert_eq!(receiver.state(), ObservationState::Polymorphic);
+        assert_eq!(receiver.payload(), 2);
+    }
+
+    #[test]
+    fn current_shape_adapter_records_absence_without_a_fake_holder() {
+        let (layout, bindings) = feedback_layout_for_ops(&[Op::GetProp(0, 0)]);
+        let feedback = FeedbackVector::new(layout, bindings);
+        let shapes = std::cell::RefCell::new(Vec::new());
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        caches[0].set(IcState {
+            recv_shape: 12,
+            holder_shape: 0,
+            slot: 1,
+            depth: IC_ABSENT,
+            mid_ok: 0,
+            mid_shape: 0,
+            mid2_shape: 0,
+        });
+
+        refresh_current_layout_feedback(&feedback, &shapes, &caches);
+        let site = feedback.sites().next().unwrap().0;
+        assert_eq!(
+            feedback
+                .read(site, ObservationKind::HolderLayout, ObservationRole::Holder,)
+                .state(),
+            ObservationState::Absent
+        );
+        assert_eq!(&*shapes.borrow(), &[12]);
     }
 }
 
@@ -3246,9 +3500,14 @@ fn compile_inner(
     });
     let cap_cache_len = c.names.len();
     let op_count = c.ops.len();
-    let feedback_layout = hot
-        .map(|chunk| chunk.feedback.layout().clone())
-        .unwrap_or_else(|| feedback_layout_for_ops(&c.ops));
+    let feedback = if let Some(chunk) = hot {
+        // The transformed/inlined bytecode has different PCs. Retain the baseline schema without
+        // guessing new runtime bindings; the original chunk remains the current-shape adapter.
+        crate::feedback::FeedbackVector::unbound(chunk.feedback.layout().clone())
+    } else {
+        let (layout, bindings) = feedback_layout_for_ops(&c.ops);
+        crate::feedback::FeedbackVector::new(layout, bindings)
+    };
     Some(Rc::new(Chunk {
         ops: c.ops,
         consts: c.consts,
@@ -3273,7 +3532,8 @@ fn compile_inner(
         reuse_activation: c.reuse_activation,
         env_this: c.env_this,
         env_arguments: c.env_arguments,
-        feedback: crate::feedback::FeedbackVector::new(feedback_layout),
+        feedback,
+        feedback_shapes: std::cell::RefCell::new(Vec::new()),
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),

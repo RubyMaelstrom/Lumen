@@ -472,9 +472,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   discriminants, raw pointers, or today's shape-number encoding as the profile contract. Schema
   version 1, its canonical baseline-bytecode numbering, lazy payload boundary, and adapter rules
   are recorded in `FEEDBACK_SCHEMA.md` and compile into every eligible baseline chunk.
-- [ ] Define adapters that initially populate layout observations from current shape/prototype
+- [x] Define adapters that initially populate layout observations from current shape/prototype
   data, then migrate the same slots to heap Map handles and validity dependencies without changing
-  bytecode site identity or the diagnostic file schema.
+  bytecode site identity or the diagnostic file schema. The first runtime-only adapter binds
+  baseline named-property sites to their existing polymorphic ICs, interns current shapes as
+  profile-local abstract tokens, and reserves the same slots for future Map identities.
 - [ ] Version serialized profiles and define explicit upgrade/drop behavior so an incompatible
   engine build never interprets old observation bits as a new representation.
 - [ ] Record arithmetic operand/result categories, including integer, double, string, BigInt,

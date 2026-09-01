@@ -13,7 +13,6 @@ pub(crate) const SCHEMA_VERSION: u16 = 1;
 pub(crate) struct SiteId(u32);
 
 impl SiteId {
-    #[cfg(test)]
     pub(crate) fn index(self) -> usize {
         self.0 as usize
     }
@@ -62,6 +61,53 @@ pub(crate) enum ObservationRole {
     Outcome = 8,
 }
 
+/// Runtime-only bridge to the current baseline machinery. These indexes are never serialized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeBinding {
+    Unbound,
+    PropertyIc { first_way: u32, way_count: u8 },
+}
+
+/// Stable abstract state stored in an observation word. Numeric encodings are schema data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ObservationState {
+    Uninitialized = 0,
+    Monomorphic = 1,
+    Polymorphic = 2,
+    Absent = 3,
+    Generic = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct ObservationWord(u64);
+
+impl ObservationWord {
+    pub(crate) const UNINITIALIZED: Self = Self::new(ObservationState::Uninitialized, 0, 0);
+
+    pub(crate) const fn new(state: ObservationState, payload: u32, flags: u8) -> Self {
+        Self((state as u64) | ((flags as u64) << 8) | ((payload as u64) << 16))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state(self) -> ObservationState {
+        match self.0 as u8 {
+            0 => ObservationState::Uninitialized,
+            1 => ObservationState::Monomorphic,
+            2 => ObservationState::Polymorphic,
+            3 => ObservationState::Absent,
+            4 => ObservationState::Generic,
+            _ => unreachable!("invalid in-process observation state"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload(self) -> u32 {
+        (self.0 >> 16) as u32
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub(crate) struct SlotDescriptor {
@@ -93,7 +139,6 @@ impl FeedbackLayout {
         self.version
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.sites.len()
     }
@@ -103,17 +148,14 @@ impl FeedbackLayout {
         self.sites.is_empty()
     }
 
-    #[cfg(test)]
     pub(crate) fn slot_len(&self) -> usize {
         self.slots.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn site(&self, id: SiteId) -> Option<&SiteDescriptor> {
         self.sites.get(id.index())
     }
 
-    #[cfg(test)]
     pub(crate) fn slots(&self, id: SiteId) -> Option<&[SlotDescriptor]> {
         let site = self.site(id)?;
         let start = site.first_slot as usize;
@@ -121,7 +163,6 @@ impl FeedbackLayout {
         self.slots.get(start..end)
     }
 
-    #[cfg(test)]
     pub(crate) fn site_ids(&self) -> impl ExactSizeIterator<Item = SiteId> + '_ {
         (0..self.sites.len()).map(|index| SiteId(index as u32))
     }
@@ -186,15 +227,23 @@ impl LayoutBuilder {
 /// opt-in and does not allocate a word array until an adapter requests it.
 pub(crate) struct FeedbackVector {
     layout: FeedbackLayout,
+    bindings: Box<[RuntimeBinding]>,
     words: OnceCell<Box<[Cell<u64>]>>,
 }
 
 impl FeedbackVector {
-    pub(crate) fn new(layout: FeedbackLayout) -> Self {
+    pub(crate) fn new(layout: FeedbackLayout, bindings: Box<[RuntimeBinding]>) -> Self {
+        assert_eq!(layout.len(), bindings.len());
         Self {
             layout,
+            bindings,
             words: OnceCell::new(),
         }
+    }
+
+    pub(crate) fn unbound(layout: FeedbackLayout) -> Self {
+        let bindings = vec![RuntimeBinding::Unbound; layout.len()].into_boxed_slice();
+        Self::new(layout, bindings)
     }
 
     pub(crate) fn layout(&self) -> &FeedbackLayout {
@@ -204,19 +253,63 @@ impl FeedbackVector {
     pub(crate) fn retained_bytes(&self) -> usize {
         self.layout
             .retained_bytes()
+            .saturating_add(
+                self.bindings
+                    .len()
+                    .saturating_mul(std::mem::size_of::<RuntimeBinding>()),
+            )
             .saturating_add(self.words.get().map_or(0, |words| {
                 words.len().saturating_mul(std::mem::size_of::<Cell<u64>>())
             }))
     }
 
-    #[cfg(test)]
-    pub(crate) fn words(&self) -> &[Cell<u64>] {
+    pub(crate) fn sites(&self) -> impl ExactSizeIterator<Item = (SiteId, RuntimeBinding)> + '_ {
+        self.layout.site_ids().zip(self.bindings.iter().copied())
+    }
+
+    pub(crate) fn write(
+        &self,
+        site: SiteId,
+        kind: ObservationKind,
+        role: ObservationRole,
+        value: ObservationWord,
+    ) {
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors
+            .iter()
+            .position(|slot| slot.kind == kind && slot.role == role)
+        else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        self.words()[first + offset].set(value.0);
+    }
+
+    fn words(&self) -> &[Cell<u64>] {
         self.words.get_or_init(|| {
             (0..self.layout.slot_len())
-                .map(|_| Cell::new(0))
+                .map(|_| Cell::new(ObservationWord::UNINITIALIZED.0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read(
+        &self,
+        site: SiteId,
+        kind: ObservationKind,
+        role: ObservationRole,
+    ) -> ObservationWord {
+        let descriptors = self.layout.slots(site).unwrap();
+        let offset = descriptors
+            .iter()
+            .position(|slot| slot.kind == kind && slot.role == role)
+            .unwrap();
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        ObservationWord(self.words()[first + offset].get())
     }
 }
 
@@ -259,10 +352,29 @@ mod tests {
     fn observation_words_are_lazy_and_layout_sized() {
         let mut builder = LayoutBuilder::default();
         builder.add_site(0, OperationKind::NamedLoad, &[RECEIVER, HOLDER]);
-        let vector = FeedbackVector::new(builder.finish());
+        let vector = FeedbackVector::new(
+            builder.finish(),
+            vec![RuntimeBinding::Unbound].into_boxed_slice(),
+        );
         let layout_bytes = vector.retained_bytes();
 
+        vector.write(
+            SiteId(0),
+            ObservationKind::ReceiverLayout,
+            ObservationRole::Receiver,
+            ObservationWord::new(ObservationState::Monomorphic, 7, 0),
+        );
         assert_eq!(vector.words().len(), 2);
+        assert_eq!(
+            vector
+                .read(
+                    SiteId(0),
+                    ObservationKind::ReceiverLayout,
+                    ObservationRole::Receiver,
+                )
+                .payload(),
+            7
+        );
         assert_eq!(
             vector.retained_bytes(),
             layout_bytes + 2 * std::mem::size_of::<Cell<u64>>()
@@ -277,6 +389,8 @@ mod tests {
         assert_eq!(ObservationKind::Allocation as u8, 7);
         assert_eq!(ObservationRole::Operand0 as u8, 1);
         assert_eq!(ObservationRole::Outcome as u8, 8);
+        assert_eq!(ObservationState::Uninitialized as u8, 0);
+        assert_eq!(ObservationState::Generic as u8, 4);
         assert_eq!(std::mem::size_of::<SlotDescriptor>(), 2);
         assert_eq!(std::mem::size_of::<SiteDescriptor>(), 12);
     }

@@ -64,11 +64,18 @@ specialized state.
 
 ## Adapter boundary
 
-Version 1 first constructs layouts only. The next slice adds an adapter that translates existing
-property/call cache state into the abstract slots. Adapter bindings (cache family/index, current
-shape tokens, raw pins) are runtime-only and must never be serialized as observations.
+Version 1 binds canonical named-property sites to their existing four-way ICs at runtime. During
+an opt-in diagnostic traversal, the current-shape adapter translates monomorphic receiver/holder
+shapes into profile-local dense layout tokens, preserves absent-holder and creation outcomes, and
+widens distinct ways to an explicit polymorphic state. Raw shape numbers remain in an internal
+adapter table and are never written to observation words. Transformed/inlined chunks reuse the
+baseline schema without guessing new bindings; the retained baseline chunk remains authoritative.
+
+Adapter bindings (cache family/index, current shape tokens, raw pins) are runtime-only and must
+never be serialized as observations. A future Map adapter replaces only the token interner and
+adds validity dependencies; `SiteId`, slot kind/role, observation states, and diagnostic schema do
+not change. Element and call adapters are intentionally separate following slices.
 
 Every optimizing consumer must treat missing, unknown, mixed, or invalidated feedback as a reason
 to use a guard plus exact semantic fallback. A guard failure resumes at the exact semantic point;
 the tree-walker remains the differential oracle.
-
