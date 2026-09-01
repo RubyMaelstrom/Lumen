@@ -1574,31 +1574,36 @@ impl Interp {
 
     /// GetIterator: returns (iterator, next-method).
     pub(crate) fn get_iterator(&mut self, v: &Value) -> Result<(Value, Value), Abrupt> {
-        // A primitive string iterates by code point (it has no own @@iterator method here).
-        if let Value::Str(s) = v {
-            let chars: Vec<Value> = crate::jstr::CodePointIter::new(s)
-                .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
-                .collect();
-            let arr = self.make_array(chars);
-            return self.get_iterator(&arr);
-        }
-        let key = match &self.iterator_sym {
-            Some(s) => Interp::sym_key(s),
-            None => return Err(self.throw("TypeError", "no iterator symbol")),
-        };
-        let itfn = self.get_member(v, &key)?;
-        if !itfn.is_callable() {
-            return Err(self.throw("TypeError", "value is not iterable"));
-        }
-        let iter = self.call(itfn, v.clone(), &[])?;
-        // GetIteratorFromMethod: the iterator must be an object.
-        if !matches!(iter, Value::Obj(_)) {
-            return Err(self.throw("TypeError", "@@iterator returned a non-object"));
-        }
-        // GetIterator only *reads* `next`; it is validated as callable when actually called
-        // (IteratorNext), so a missing/non-callable `next` doesn't fail at open time.
-        let next = self.get_member(&iter, "next")?;
-        Ok((iter, next))
+        let perf_started = crate::jit::perf_stage_start();
+        let result: Result<(Value, Value), Abrupt> = (|| {
+            // A primitive string iterates by code point (it has no own @@iterator method here).
+            if let Value::Str(s) = v {
+                let chars: Vec<Value> = crate::jstr::CodePointIter::new(s)
+                    .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
+                    .collect();
+                let arr = self.make_array(chars);
+                return self.get_iterator(&arr);
+            }
+            let key = match &self.iterator_sym {
+                Some(s) => Interp::sym_key(s),
+                None => return Err(self.throw("TypeError", "no iterator symbol")),
+            };
+            let itfn = self.get_member(v, &key)?;
+            if !itfn.is_callable() {
+                return Err(self.throw("TypeError", "value is not iterable"));
+            }
+            let iter = self.call(itfn, v.clone(), &[])?;
+            // GetIteratorFromMethod: the iterator must be an object.
+            if !matches!(iter, Value::Obj(_)) {
+                return Err(self.throw("TypeError", "@@iterator returned a non-object"));
+            }
+            // GetIterator only *reads* `next`; it is validated as callable when actually called
+            // (IteratorNext), so a missing/non-callable `next` doesn't fail at open time.
+            let next = self.get_member(&iter, "next")?;
+            Ok((iter, next))
+        })();
+        crate::jit::perf_iterator_get_end(perf_started, result.is_ok());
+        result
     }
     /// IteratorStep: `Some(value)` or `None` when done.
     pub(crate) fn iterator_step(
@@ -1606,40 +1611,52 @@ impl Interp {
         iter: &Value,
         next: &Value,
     ) -> Result<Option<Value>, Abrupt> {
-        let res = self.call(next.clone(), iter.clone(), &[])?;
-        if !matches!(res, Value::Obj(_)) {
-            return Err(self.throw("TypeError", "iterator result is not an object"));
-        }
-        let done = self.get_member(&res, "done")?;
-        if self.to_boolean(&done) {
-            Ok(None)
-        } else {
-            Ok(Some(self.get_member(&res, "value")?))
-        }
+        let perf_started = crate::jit::perf_stage_start();
+        let result: Result<Option<Value>, Abrupt> = (|| {
+            let res = self.call(next.clone(), iter.clone(), &[])?;
+            if !matches!(res, Value::Obj(_)) {
+                return Err(self.throw("TypeError", "iterator result is not an object"));
+            }
+            let done = self.get_member(&res, "done")?;
+            if self.to_boolean(&done) {
+                Ok(None)
+            } else {
+                Ok(Some(self.get_member(&res, "value")?))
+            }
+        })();
+        crate::jit::perf_iterator_step_end(perf_started, result.is_ok());
+        result
     }
     /// IteratorClose: call `return()` if present (swallowing its result/most errors).
     pub(crate) fn iterator_close(&mut self, iter: &Value) {
+        let perf_started = crate::jit::perf_stage_start();
         if let Ok(ret) = self.get_member(iter, "return") {
             if ret.is_callable() {
                 let _ = self.call(ret, iter.clone(), &[]);
             }
         }
+        crate::jit::perf_iterator_close_end(perf_started);
     }
 
     /// IteratorClose for a *normal* completion: errors from reading or calling `return` propagate
     /// (unlike the throw-completion `iterator_close`, which swallows them).
     pub(crate) fn iterator_close_normal(&mut self, iter: &Value) -> Result<(), Abrupt> {
-        let ret = self.get_member(iter, "return")?;
-        if !matches!(ret, Value::Undefined | Value::Null) {
-            if !ret.is_callable() {
-                return Err(self.throw("TypeError", "iterator 'return' is not callable"));
+        let perf_started = crate::jit::perf_stage_start();
+        let result: Result<(), Abrupt> = (|| {
+            let ret = self.get_member(iter, "return")?;
+            if !matches!(ret, Value::Undefined | Value::Null) {
+                if !ret.is_callable() {
+                    return Err(self.throw("TypeError", "iterator 'return' is not callable"));
+                }
+                let r = self.call(ret, iter.clone(), &[])?;
+                if !matches!(r, Value::Obj(_)) {
+                    return Err(self.throw("TypeError", "iterator 'return' must return an object"));
+                }
             }
-            let r = self.call(ret, iter.clone(), &[])?;
-            if !matches!(r, Value::Obj(_)) {
-                return Err(self.throw("TypeError", "iterator 'return' must return an object"));
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        crate::jit::perf_iterator_close_end(perf_started);
+        result
     }
 
     /// Collect every value an iterable yields. Strings and plain arrays use a fast path; everything

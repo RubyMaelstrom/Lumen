@@ -560,6 +560,11 @@ finish the baseline, but no later phase may claim a performance win against the 
     escaping) without conflating a thrown completion with an allocation site.
 - [ ] Measure conversion and protocol helpers separately, including `ToPrimitive`, `toString`,
   `valueOf`, `GetIterator`, iterator stepping/closing, spread, and ordinary/symbol iteration.
+  - [x] Expose opt-in GetIterator, IteratorStep, and both IteratorClose path timings/failure
+    counts; the wrappers preserve the existing ECMA-262 protocol ordering.
+  - [ ] Measure ToPrimitive/string conversion and spread/ordinary-versus-symbol iteration paths
+    with stable helper identities and without adding a disabled-path timestamp to primitive fast
+    cases.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
 - [ ] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
   recover diagnostics.
