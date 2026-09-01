@@ -154,6 +154,211 @@ impl TaggedValue {
     }
 }
 
+/// Canonical bytecode identity used by feedback, safepoints, and deoptimization records. Native
+/// instruction addresses are deliberately not part of this identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct BytecodePc(u32);
+
+impl BytecodePc {
+    pub(crate) const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Stable index of one published safepoint or deoptimization record.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SafepointId(u32);
+
+impl SafepointId {
+    pub(crate) const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct DeoptId(u32);
+
+impl DeoptId {
+    pub(crate) const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameMapError {
+    SlotBitmapTooLong,
+    OverlappingRootClasses,
+    SlotOutOfRange,
+    OperandDepthOutOfRange,
+    InvalidTaggedWord,
+    FrameLengthMismatch,
+}
+
+/// Immutable root metadata for one exact execution point. Bitmaps address logical frame slots;
+/// the generated tier may keep those slots in registers or spills as long as it publishes this
+/// same logical map before a safepoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootMap {
+    pub(crate) safepoint: SafepointId,
+    pub(crate) bytecode_pc: BytecodePc,
+    pub(crate) slot_count: u16,
+    pub(crate) operand_depth: u16,
+    pub(crate) tagged_registers: u64,
+    pub(crate) tagged_slots: Vec<u64>,
+    pub(crate) handle_slots: Vec<u64>,
+    pub(crate) environment_slots: Vec<u64>,
+}
+
+impl RootMap {
+    fn bitmap_words(slot_count: u16) -> usize {
+        usize::from(slot_count).div_ceil(64)
+    }
+
+    fn check_bitmap(bits: &[u64], slot_count: u16) -> Result<(), FrameMapError> {
+        let expected = Self::bitmap_words(slot_count);
+        if bits.len() != expected {
+            return Err(FrameMapError::SlotBitmapTooLong);
+        }
+        let excess = expected
+            .checked_mul(64)
+            .and_then(|count| count.checked_sub(usize::from(slot_count)))
+            .unwrap_or(0);
+        if excess != 0 && bits.last().is_some_and(|word| word >> (64 - excess) != 0) {
+            return Err(FrameMapError::SlotOutOfRange);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), FrameMapError> {
+        if self.operand_depth > self.slot_count {
+            return Err(FrameMapError::OperandDepthOutOfRange);
+        }
+        Self::check_bitmap(&self.tagged_slots, self.slot_count)?;
+        Self::check_bitmap(&self.handle_slots, self.slot_count)?;
+        Self::check_bitmap(&self.environment_slots, self.slot_count)?;
+        for ((tagged, handles), environments) in self
+            .tagged_slots
+            .iter()
+            .zip(&self.handle_slots)
+            .zip(&self.environment_slots)
+        {
+            if tagged & handles != 0 || tagged & environments != 0 || handles & environments != 0 {
+                return Err(FrameMapError::OverlappingRootClasses);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_root_slot(&self, slot: usize) -> bool {
+        let word = slot / 64;
+        let bit = 1u64 << (slot % 64);
+        self.tagged_slots[word] & bit != 0
+            || self.handle_slots[word] & bit != 0
+            || self.environment_slots[word] & bit != 0
+    }
+}
+
+/// A temporary tagged shadow frame used by the ABI verifier and migration tests. It has no
+/// connection to the live `Value` frames until a complete relocation implementation exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaggedFrame {
+    slots: Vec<TaggedValue>,
+}
+
+impl TaggedFrame {
+    pub(crate) fn new(slots: Vec<TaggedValue>) -> Self {
+        Self { slots }
+    }
+
+    pub(crate) fn roots(&self, map: &RootMap) -> Result<Vec<TaggedValue>, FrameMapError> {
+        map.validate()?;
+        if self.slots.len() != usize::from(map.slot_count) {
+            return Err(FrameMapError::FrameLengthMismatch);
+        }
+        let mut roots = Vec::new();
+        for (slot, value) in self.slots.iter().enumerate() {
+            if !map.is_root_slot(slot) {
+                continue;
+            }
+            value
+                .validate()
+                .map_err(|_| FrameMapError::InvalidTaggedWord)?;
+            roots.push(*value);
+        }
+        Ok(roots)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MaterializationRecipe {
+    CopySlot(u16),
+    Constant(TaggedValue),
+    BoxNumber(u16),
+    Handle(u16),
+    Duplicate(usize),
+    VirtualObject { layout: u32, fields: Vec<usize> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeoptRecordError {
+    InvalidRootMap(FrameMapError),
+    ValueCountOverflow,
+    RecipeDependencyOutOfOrder,
+    RecipeSlotOutOfRange,
+    InvalidConstant,
+}
+
+/// Deoptimization metadata is validated before publication. Recipes refer only to prior recipes
+/// or logical frame slots, which makes reconstruction deterministic and prevents hidden native
+/// pointers from entering a resumed frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeoptRecord {
+    pub(crate) id: DeoptId,
+    pub(crate) bytecode_pc: BytecodePc,
+    pub(crate) root_map: RootMap,
+    pub(crate) recipes: Vec<MaterializationRecipe>,
+}
+
+impl DeoptRecord {
+    pub(crate) fn validate(&self) -> Result<(), DeoptRecordError> {
+        self.root_map
+            .validate()
+            .map_err(DeoptRecordError::InvalidRootMap)?;
+        if self.recipes.len() > usize::from(u16::MAX) {
+            return Err(DeoptRecordError::ValueCountOverflow);
+        }
+        let slots = self.root_map.slot_count;
+        for (index, recipe) in self.recipes.iter().enumerate() {
+            match recipe {
+                MaterializationRecipe::CopySlot(slot)
+                | MaterializationRecipe::BoxNumber(slot)
+                | MaterializationRecipe::Handle(slot)
+                    if *slot >= slots =>
+                {
+                    return Err(DeoptRecordError::RecipeSlotOutOfRange);
+                }
+                MaterializationRecipe::Constant(value) => value
+                    .validate()
+                    .map_err(|_| DeoptRecordError::InvalidConstant)?,
+                MaterializationRecipe::Duplicate(source) if *source >= index => {
+                    return Err(DeoptRecordError::RecipeDependencyOutOfOrder);
+                }
+                MaterializationRecipe::VirtualObject { fields, .. }
+                    if fields.iter().any(|source| *source >= index) =>
+                {
+                    return Err(DeoptRecordError::RecipeDependencyOutOfOrder);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +412,94 @@ mod tests {
         assert_eq!(
             TaggedValue(TAG_CANON_NAN | 1).validate(),
             Err(InvalidTaggedValue::NonCanonicalNan)
+        );
+    }
+
+    #[test]
+    fn root_map_extracts_only_declared_and_validated_slots() {
+        let map = RootMap {
+            safepoint: SafepointId::new(3),
+            bytecode_pc: BytecodePc::new(17),
+            slot_count: 4,
+            operand_depth: 2,
+            tagged_registers: 0b101,
+            tagged_slots: vec![0b0001],
+            handle_slots: vec![0b0010],
+            environment_slots: vec![0b1000],
+        };
+        let frame = TaggedFrame::new(vec![
+            TaggedValue::heap(HeapRef::new(1).unwrap()),
+            TaggedValue::number(42.0),
+            TaggedValue::boolean(true),
+            TaggedValue::null(),
+        ]);
+        assert_eq!(
+            frame.roots(&map).unwrap(),
+            vec![
+                TaggedValue::heap(HeapRef::new(1).unwrap()),
+                TaggedValue::number(42.0),
+                TaggedValue::null(),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_map_rejects_bad_bitmap_and_overlapping_classes() {
+        let mut map = RootMap {
+            safepoint: SafepointId::new(0),
+            bytecode_pc: BytecodePc::new(0),
+            slot_count: 1,
+            operand_depth: 0,
+            tagged_registers: 0,
+            tagged_slots: vec![0b11],
+            handle_slots: vec![0],
+            environment_slots: vec![0],
+        };
+        assert_eq!(map.validate(), Err(FrameMapError::SlotOutOfRange));
+        map.tagged_slots[0] = 1;
+        map.handle_slots[0] = 1;
+        assert_eq!(map.validate(), Err(FrameMapError::OverlappingRootClasses));
+    }
+
+    #[test]
+    fn deopt_recipes_are_forward_only_and_validate_constants() {
+        let root_map = RootMap {
+            safepoint: SafepointId::new(1),
+            bytecode_pc: BytecodePc::new(8),
+            slot_count: 2,
+            operand_depth: 1,
+            tagged_registers: 0,
+            tagged_slots: vec![0b01],
+            handle_slots: vec![0b10],
+            environment_slots: vec![0],
+        };
+        let valid = DeoptRecord {
+            id: DeoptId::new(4),
+            bytecode_pc: BytecodePc::new(8),
+            root_map: root_map.clone(),
+            recipes: vec![
+                MaterializationRecipe::Constant(TaggedValue::number(-0.0)),
+                MaterializationRecipe::Duplicate(0),
+                MaterializationRecipe::VirtualObject {
+                    layout: 7,
+                    fields: vec![0, 1],
+                },
+            ],
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        let mut bad = valid.clone();
+        bad.recipes[1] = MaterializationRecipe::Duplicate(2);
+        assert_eq!(
+            bad.validate(),
+            Err(DeoptRecordError::RecipeDependencyOutOfOrder)
+        );
+
+        let mut bad_constant = valid;
+        bad_constant.recipes[0] = MaterializationRecipe::Constant(TaggedValue(TAG_BOOLEAN | 2));
+        assert_eq!(
+            bad_constant.validate(),
+            Err(DeoptRecordError::InvalidConstant)
         );
     }
 }

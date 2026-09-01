@@ -615,6 +615,9 @@ finish the baseline, but no later phase may claim a performance win against the 
   (`TAGGED_VALUE_DESIGN.md`; implementation remains gated).
 - [x] Define materialization recipes for constants, boxed numbers, virtual objects, and duplicated
   logical values (`TAGGED_VALUE_DESIGN.md`; implementation remains gated).
+- [x] Add isolated `RootMap`, tagged shadow-frame, and deoptimization-record validation
+  scaffolding with invalid-map and forward-recipe tests. This verifies metadata without connecting
+  it to live `Value` frames; relocation and execution migration remain gated.
 - [ ] Add scoped rooted handles for Rust builtins and embedders.
 - [ ] Add a `NoGc`/no-safepoint discipline for short raw-pointer regions and make violations
   auditable.
