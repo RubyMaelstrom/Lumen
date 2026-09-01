@@ -140,7 +140,7 @@ impl HostCategory {
             return format!(
                 concat!(
                     "{{\"bytes\":null,\"quality\":\"unavailable\",",
-                    "\"reason\":\"{} live host entries do not implement RetainedBytes\"}}"
+                    "\"reason\":\"{} reachable host owners lack complete retained-memory traversal\"}}"
                 ),
                 self.unavailable_entries
             );
@@ -2195,7 +2195,7 @@ mod tests {
         assert!(!unavailable_snapshot.complete());
         let json = unavailable_snapshot.json(1, 1);
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
-        assert!(json.contains("live host entries do not implement RetainedBytes"));
+        assert!(json.contains("reachable host owners lack complete retained-memory traversal"));
     }
 
     #[test]
