@@ -163,6 +163,12 @@ const CALL_TARGET_SHIFT: u32 = 0;
 const CALL_ARITY_SHIFT: u32 = 8;
 const CALL_ENVIRONMENT_SHIFT: u32 = 16;
 
+// Branch counters are deliberately saturating. Conditional sites store taken/fallthrough
+// counts as two u16 lanes; loop sites use the full u32 payload for back-edge transfers.
+const BRANCH_TAKEN_SHIFT: u32 = 0;
+const BRANCH_FALLTHROUGH_SHIFT: u32 = 16;
+const BRANCH_COUNTER_MASK: u32 = 0xffff;
+
 pub(crate) const fn element_observation_payload(
     receiver: ElementReceiverKind,
     key: ElementKeyKind,
@@ -405,6 +411,22 @@ impl ObservationWord {
                         && (1..=4).contains(&arities)
                         && (1..=4).contains(&environments)
                 }
+                ObservationState::Absent => false,
+            };
+        }
+        if kind == ObservationKind::BranchCount {
+            if ((self.0 >> 8) as u8) != 0 {
+                return false;
+            }
+            let payload = self.payload_bits();
+            return match self.decoded_state().unwrap() {
+                ObservationState::Uninitialized => payload == 0,
+                ObservationState::Monomorphic => payload != 0,
+                ObservationState::Polymorphic => {
+                    payload & BRANCH_COUNTER_MASK != 0
+                        && (payload >> BRANCH_FALLTHROUGH_SHIFT) & BRANCH_COUNTER_MASK != 0
+                }
+                ObservationState::Generic => payload == 0,
                 ObservationState::Absent => false,
             };
         }
@@ -866,6 +888,14 @@ impl FeedbackVector {
             return;
         };
         let site = SiteId(index as u32);
+        if self.layout.site(site).is_none_or(|site| {
+            !matches!(
+                site.operation,
+                OperationKind::ElementLoad | OperationKind::ElementStore
+            )
+        }) {
+            return;
+        }
         let Some(descriptors) = self.layout.slots(site) else {
             return;
         };
@@ -935,6 +965,14 @@ impl FeedbackVector {
             return;
         };
         let site = SiteId(index as u32);
+        if self.layout.site(site).is_none_or(|site| {
+            !matches!(
+                site.operation,
+                OperationKind::Call | OperationKind::Construct
+            )
+        }) {
+            return;
+        }
         let Some(descriptors) = self.layout.slots(site) else {
             return;
         };
@@ -978,6 +1016,105 @@ impl FeedbackVector {
             )
             .0,
         );
+    }
+
+    /// Record one completed conditional branch direction. The counters saturate instead of
+    /// wrapping, so a hot loop can never appear cold (or more specialized) after overflow.
+    pub(crate) fn observe_branch(&self, bytecode_pc: usize, taken: bool) {
+        if !self.detailed_enabled {
+            return;
+        }
+        let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
+            return;
+        };
+        let Ok(index) = self
+            .layout
+            .sites
+            .binary_search_by_key(&bytecode_pc, |site| site.bytecode_pc)
+        else {
+            return;
+        };
+        let site = SiteId(index as u32);
+        if self
+            .layout
+            .site(site)
+            .is_none_or(|site| site.operation != OperationKind::Branch)
+        {
+            return;
+        }
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors.iter().position(|slot| {
+            slot.kind == ObservationKind::BranchCount && slot.role == ObservationRole::Outcome
+        }) else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        let cell = &self.words()[first + offset];
+        let current = ObservationWord(cell.get());
+        if current.decoded_state() == Some(ObservationState::Generic) {
+            return;
+        }
+        let payload = current.payload_bits();
+        let shift = if taken {
+            BRANCH_TAKEN_SHIFT
+        } else {
+            BRANCH_FALLTHROUGH_SHIFT
+        };
+        let count = (payload >> shift) & BRANCH_COUNTER_MASK;
+        let next = count.saturating_add(1).min(BRANCH_COUNTER_MASK);
+        let updated = (payload & !(BRANCH_COUNTER_MASK << shift)) | (next << shift);
+        let taken_count = (updated >> BRANCH_TAKEN_SHIFT) & BRANCH_COUNTER_MASK;
+        let fallthrough_count = (updated >> BRANCH_FALLTHROUGH_SHIFT) & BRANCH_COUNTER_MASK;
+        let state = if taken_count != 0 && fallthrough_count != 0 {
+            ObservationState::Polymorphic
+        } else {
+            ObservationState::Monomorphic
+        };
+        cell.set(ObservationWord::new(state, updated, 0).0);
+    }
+
+    /// Record one completed unconditional loop back-edge transfer. The caller invokes this only
+    /// after any host interruption poll succeeds, so the count describes actual control flow.
+    pub(crate) fn observe_loop_backedge(&self, bytecode_pc: usize) {
+        if !self.detailed_enabled {
+            return;
+        }
+        let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
+            return;
+        };
+        let Ok(index) = self
+            .layout
+            .sites
+            .binary_search_by_key(&bytecode_pc, |site| site.bytecode_pc)
+        else {
+            return;
+        };
+        let site = SiteId(index as u32);
+        if self
+            .layout
+            .site(site)
+            .is_none_or(|site| site.operation != OperationKind::Loop)
+        {
+            return;
+        }
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors.iter().position(|slot| {
+            slot.kind == ObservationKind::BranchCount && slot.role == ObservationRole::Outcome
+        }) else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        let cell = &self.words()[first + offset];
+        let current = ObservationWord(cell.get());
+        if current.decoded_state() == Some(ObservationState::Generic) {
+            return;
+        }
+        let next = current.payload_bits().saturating_add(1);
+        cell.set(ObservationWord::new(ObservationState::Monomorphic, next, 0).0);
     }
 
     /// Merge one stable semantic value class into the matching site's bitset.
@@ -1159,19 +1296,28 @@ impl FeedbackVector {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        for ((cell, incoming), descriptor) in self
-            .words()
-            .iter()
-            .zip(incoming)
-            .zip(self.layout.slots.iter())
-        {
-            let current = ObservationWord(cell.get());
-            let merged = if descriptor.kind == ObservationKind::ValueClass {
-                merge_value_class_words(current, incoming)
-            } else {
-                merge_observation_words(current, incoming)
-            };
-            cell.set(merged.0);
+        for site_id in self.layout.site_ids() {
+            let site = self.layout.site(site_id).unwrap();
+            let first = site.first_slot as usize;
+            let slots = self.layout.slots(site_id).unwrap();
+            for (offset, descriptor) in slots.iter().enumerate() {
+                let slot = first + offset;
+                let current = ObservationWord(self.words()[slot].get());
+                let merged = match descriptor.kind {
+                    ObservationKind::ValueClass => merge_value_class_words(current, incoming[slot]),
+                    ObservationKind::ElementAccess => {
+                        merge_bounded_words(current, incoming[slot], element_group_counts)
+                    }
+                    ObservationKind::CallTarget => {
+                        merge_bounded_words(current, incoming[slot], call_group_counts)
+                    }
+                    ObservationKind::BranchCount => {
+                        merge_branch_count_words(current, incoming[slot], site.operation)
+                    }
+                    _ => merge_observation_words(current, incoming[slot]),
+                };
+                self.words()[slot].set(merged.0);
+            }
         }
         Ok(())
     }
@@ -1199,6 +1345,100 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+/// Merge bounded one-hot payloads from two diagnostic snapshots without inventing a correlation
+/// between independent dimensions. This is the same monotone widening rule used by live
+/// observation, applied to already-polymorphic incoming words as well.
+fn merge_bounded_words(
+    current: ObservationWord,
+    incoming: ObservationWord,
+    group_counts: fn(u32) -> (u32, u32, u32),
+) -> ObservationWord {
+    debug_assert!(current.is_valid());
+    debug_assert!(incoming.is_valid());
+    if current == incoming || incoming == ObservationWord::UNINITIALIZED {
+        return current;
+    }
+    if current == ObservationWord::UNINITIALIZED {
+        return incoming;
+    }
+    let current_state = current.decoded_state().unwrap();
+    let incoming_state = incoming.decoded_state().unwrap();
+    if current_state == ObservationState::Generic || incoming_state == ObservationState::Generic {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    if current_state == ObservationState::Absent || incoming_state == ObservationState::Absent {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    let payload = current.payload_bits() | incoming.payload_bits();
+    let (first, second, third) = group_counts(payload);
+    let state = if first == 1 && second == 1 && third == 1 {
+        ObservationState::Monomorphic
+    } else if (1..=4).contains(&first) && (1..=4).contains(&second) && (1..=4).contains(&third) {
+        ObservationState::Polymorphic
+    } else {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    };
+    ObservationWord::new(state, payload, 0)
+}
+
+/// Merge saturating branch counters from separate profile snapshots. Loop sites use one full
+/// payload lane; conditional sites use the two u16 direction lanes.
+fn merge_branch_count_words(
+    current: ObservationWord,
+    incoming: ObservationWord,
+    operation: OperationKind,
+) -> ObservationWord {
+    debug_assert!(current.is_valid());
+    debug_assert!(incoming.is_valid());
+    if current == incoming || incoming == ObservationWord::UNINITIALIZED {
+        return current;
+    }
+    if current == ObservationWord::UNINITIALIZED {
+        return incoming;
+    }
+    let current_state = current.decoded_state().unwrap();
+    let incoming_state = incoming.decoded_state().unwrap();
+    if current_state == ObservationState::Generic || incoming_state == ObservationState::Generic {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    if current_state == ObservationState::Absent || incoming_state == ObservationState::Absent {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    let payload = match operation {
+        OperationKind::Loop => current
+            .payload_bits()
+            .saturating_add(incoming.payload_bits()),
+        OperationKind::Branch => {
+            let current_taken = current.payload_bits() & BRANCH_COUNTER_MASK;
+            let incoming_taken = incoming.payload_bits() & BRANCH_COUNTER_MASK;
+            let current_fallthrough =
+                (current.payload_bits() >> BRANCH_FALLTHROUGH_SHIFT) & BRANCH_COUNTER_MASK;
+            let incoming_fallthrough =
+                (incoming.payload_bits() >> BRANCH_FALLTHROUGH_SHIFT) & BRANCH_COUNTER_MASK;
+            current_taken
+                .saturating_add(incoming_taken)
+                .min(BRANCH_COUNTER_MASK)
+                | (current_fallthrough
+                    .saturating_add(incoming_fallthrough)
+                    .min(BRANCH_COUNTER_MASK)
+                    << BRANCH_FALLTHROUGH_SHIFT)
+        }
+        _ => return ObservationWord::new(ObservationState::Generic, 0, 0),
+    };
+    if payload == 0 {
+        return ObservationWord::UNINITIALIZED;
+    }
+    let state = if operation == OperationKind::Branch
+        && (payload & BRANCH_COUNTER_MASK) != 0
+        && ((payload >> BRANCH_FALLTHROUGH_SHIFT) & BRANCH_COUNTER_MASK) != 0
+    {
+        ObservationState::Polymorphic
+    } else {
+        ObservationState::Monomorphic
+    };
+    ObservationWord::new(state, payload, 0)
 }
 
 fn merge_observation_words(current: ObservationWord, incoming: ObservationWord) -> ObservationWord {
@@ -1575,6 +1815,131 @@ mod tests {
                 .state(),
             ObservationState::Generic
         );
+    }
+
+    #[test]
+    fn branch_feedback_counts_directions_and_saturates() {
+        let mut builder = LayoutBuilder::default();
+        builder.add_site(
+            4,
+            OperationKind::Branch,
+            &[SlotDescriptor {
+                kind: ObservationKind::BranchCount,
+                role: ObservationRole::Outcome,
+            }],
+        );
+        builder.add_site(
+            8,
+            OperationKind::Loop,
+            &[SlotDescriptor {
+                kind: ObservationKind::BranchCount,
+                role: ObservationRole::Outcome,
+            }],
+        );
+        let vector = FeedbackVector::new_with_enabled(
+            builder.finish(),
+            vec![RuntimeBinding::Unbound, RuntimeBinding::Unbound].into_boxed_slice(),
+            true,
+        );
+        vector.observe_branch(4, true);
+        vector.observe_branch(4, true);
+        vector.observe_branch(4, false);
+        let branch = vector.read(
+            SiteId(0),
+            ObservationKind::BranchCount,
+            ObservationRole::Outcome,
+        );
+        assert_eq!(branch.payload() & BRANCH_COUNTER_MASK, 2);
+        assert_eq!(branch.payload() >> BRANCH_FALLTHROUGH_SHIFT, 1);
+        assert_eq!(branch.state(), ObservationState::Polymorphic);
+        assert!(branch.is_valid_for(ObservationKind::BranchCount));
+
+        for _ in 0..=u16::MAX {
+            vector.observe_branch(4, true);
+        }
+        let branch = vector.read(
+            SiteId(0),
+            ObservationKind::BranchCount,
+            ObservationRole::Outcome,
+        );
+        assert_eq!(branch.payload() & BRANCH_COUNTER_MASK, u32::from(u16::MAX));
+
+        vector.observe_loop_backedge(8);
+        vector.observe_loop_backedge(8);
+        let loop_count = vector.read(
+            SiteId(1),
+            ObservationKind::BranchCount,
+            ObservationRole::Outcome,
+        );
+        assert_eq!(loop_count.payload(), 2);
+        assert_eq!(loop_count.state(), ObservationState::Monomorphic);
+        assert!(loop_count.is_valid_for(ObservationKind::BranchCount));
+    }
+
+    #[test]
+    fn profile_merges_preserve_bounded_payloads_and_counts() {
+        let element_a = ObservationWord::new(
+            ObservationState::Monomorphic,
+            element_observation_payload(
+                ElementReceiverKind::Array,
+                ElementKeyKind::Index,
+                ElementOutcome::OwnData,
+            ),
+            0,
+        );
+        let element_b = ObservationWord::new(
+            ObservationState::Monomorphic,
+            element_observation_payload(
+                ElementReceiverKind::TypedArray,
+                ElementKeyKind::String,
+                ElementOutcome::Hole,
+            ),
+            0,
+        );
+        let element = merge_bounded_words(element_a, element_b, element_group_counts);
+        assert_eq!(element.state(), ObservationState::Polymorphic);
+        assert_eq!(element_group_counts(element.payload()), (2, 2, 2));
+        assert!(element.is_valid_for(ObservationKind::ElementAccess));
+
+        let call_a = ObservationWord::new(
+            ObservationState::Monomorphic,
+            call_observation_payload(
+                CallTargetKind::UserFunction,
+                CallArityKind::One,
+                CallEnvironmentKind::None,
+            ),
+            0,
+        );
+        let call_b = ObservationWord::new(
+            ObservationState::Monomorphic,
+            call_observation_payload(
+                CallTargetKind::NativeFunction,
+                CallArityKind::Many,
+                CallEnvironmentKind::Captured,
+            ),
+            0,
+        );
+        let call = merge_bounded_words(call_a, call_b, call_group_counts);
+        assert_eq!(call.state(), ObservationState::Polymorphic);
+        assert_eq!(call_group_counts(call.payload()), (2, 2, 2));
+        assert!(call.is_valid_for(ObservationKind::CallTarget));
+
+        let branch_a = ObservationWord::new(ObservationState::Monomorphic, 3 | (2 << 16), 0);
+        let branch_b = ObservationWord::new(ObservationState::Monomorphic, 4 | (5 << 16), 0);
+        let branch = merge_branch_count_words(branch_a, branch_b, OperationKind::Branch);
+        assert_eq!(branch.state(), ObservationState::Polymorphic);
+        assert_eq!(branch.payload() & BRANCH_COUNTER_MASK, 7);
+        assert_eq!(branch.payload() >> BRANCH_FALLTHROUGH_SHIFT, 7);
+        assert!(branch.is_valid_for(ObservationKind::BranchCount));
+
+        let loop_count = merge_branch_count_words(
+            ObservationWord::new(ObservationState::Monomorphic, 10, 0),
+            ObservationWord::new(ObservationState::Monomorphic, 20, 0),
+            OperationKind::Loop,
+        );
+        assert_eq!(loop_count.state(), ObservationState::Monomorphic);
+        assert_eq!(loop_count.payload(), 30);
+        assert!(loop_count.is_valid_for(ObservationKind::BranchCount));
     }
 
     #[test]

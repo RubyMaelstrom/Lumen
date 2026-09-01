@@ -466,6 +466,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_strict_eq as *const () as usize,
         crate::bytecode::jit_make_regexp as *const () as usize,
         crate::bytecode::jit_interrupt as *const () as usize,
+        crate::bytecode::jit_loop_backedge as *const () as usize,
     ]
 }
 
@@ -514,6 +515,8 @@ pub const H_STRICT_EQ: usize = 24;
 pub const H_MAKE_REGEXP: usize = 25;
 /// Amortized host cancellation/deadline poll at generated loop backedges.
 pub const H_INTERRUPT: usize = 26;
+/// Exact-PC loop back-edge feedback in diagnostic mode.
+pub const H_LOOP_BACKEDGE: usize = 27;
 
 /// One-time semantic guard for the numeric packed-array region. A keyless Empty slot is still a
 /// missing property, so filling it may be intercepted by an indexed setter on Array.prototype.
@@ -553,7 +556,7 @@ unsafe extern "C" fn jit_prepare_numeric_packed_array(
     slots
 }
 
-pub const N_HELPERS: usize = 27;
+pub const N_HELPERS: usize = 28;
 
 /// ARM64 condition codes used by the inline templates.
 #[cfg(all(
@@ -1485,7 +1488,22 @@ pub fn compile(
         // Route all element templates through the exact-PC helper as well: GetElem (1024),
         // SetElemDrop (2048), and SetElem (4096) otherwise perform the operation without a
         // semantic trace. Register/region/property fusions are disabled for the same reason.
-        fast &= !(1 | 32 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 524288 | (1 << 20));
+        // Branch templates and compare/loop fusions are routed through exact-PC observation
+        // helpers below so optimized execution cannot disappear from branch/back-edge counts.
+        fast &= !(1
+            | 2
+            | 4
+            | 32
+            | 1024
+            | 2048
+            | 4096
+            | 8192
+            | 16384
+            | 32768
+            | 65536
+            | 524288
+            | (1 << 20)
+            | (1 << 21));
     }
     let array_intrinsics_on = std::env::var_os("LUMEN_JIT_NO_ARRAY_INTRINSICS").is_none();
     let function_call_intrinsic_on =
@@ -1904,10 +1922,17 @@ pub fn compile(
         }
         match op {
             Op::Jump(t) => {
+                if chunk.jit_detailed_feedback_enabled() && (*t as usize) <= pc {
+                    emit_loop_backedge(&mut a, pc as u32);
+                }
                 a.b(pc_labels[*t as usize]);
             }
             Op::AbruptJump(..) => {
                 unreachable!("abrupt loop jumps are emitted only for suspending chunks")
+            }
+            Op::JumpIfFalse(t) if chunk.jit_detailed_feedback_enabled() => {
+                emit_cond_profiled(&mut a, COND_POP_TRUTHY, pc as u32, false, l_unwind);
+                a.cbz(1, false, pc_labels[*t as usize]);
             }
             Op::JumpIfFalse(t) if fast & 4 != 0 => {
                 // Bool on top (the compare fast paths produce one): branch on its payload byte.
@@ -1929,12 +1954,24 @@ pub fn compile(
                 emit_cond(&mut a, COND_POP_TRUTHY, l_unwind);
                 a.cbz(1, false, pc_labels[*t as usize]);
             }
+            Op::JumpIfFalsePeek(t) if chunk.jit_detailed_feedback_enabled() => {
+                emit_cond_profiled(&mut a, COND_PEEK_TRUTHY, pc as u32, false, l_unwind);
+                a.cbz(1, false, pc_labels[*t as usize]);
+            }
             Op::JumpIfFalsePeek(t) => {
                 emit_peek_cond_inline(&mut a, layout, false, l_unwind);
                 a.cbz(1, false, pc_labels[*t as usize]);
             }
+            Op::JumpIfTruePeek(t) if chunk.jit_detailed_feedback_enabled() => {
+                emit_cond_profiled(&mut a, COND_PEEK_TRUTHY, pc as u32, true, l_unwind);
+                a.cbnz(1, false, pc_labels[*t as usize]);
+            }
             Op::JumpIfTruePeek(t) => {
                 emit_peek_cond_inline(&mut a, layout, false, l_unwind);
+                a.cbnz(1, false, pc_labels[*t as usize]);
+            }
+            Op::JumpIfNotNullishPeek(t) if chunk.jit_detailed_feedback_enabled() => {
+                emit_cond_profiled(&mut a, 2, pc as u32, true, l_unwind);
                 a.cbnz(1, false, pc_labels[*t as usize]);
             }
             Op::JumpIfNotNullishPeek(t) => {
@@ -12085,14 +12122,44 @@ fn emit_helper(a: &mut asm::Asm, idx: usize, imm: u32) {
     a.mov(20, 0);
 }
 
+/// Record one unconditional loop back-edge without changing the operand-stack pointer. This is
+/// emitted only for detailed chunks; normal JIT loops retain their direct branch instruction.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_loop_backedge(a: &mut asm::Asm, pc: u32) {
+    emit_helper(a, H_LOOP_BACKEDGE, pc);
+}
+
 /// Condition helper: leaves the flag in w1, new sp in x0 (null = threw during ToBoolean).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_cond(a: &mut asm::Asm, mode: u32, l_unwind: usize) {
+    emit_cond_imm(a, mode, l_unwind);
+}
+
+/// Condition helper variant carrying an exact baseline PC and branch polarity for detailed
+/// branch feedback. The low bits retain the ordinary condition mode; higher bits are diagnostic
+/// metadata decoded by `jit_cond` and do not affect the predicate or stack behavior.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_cond_profiled(a: &mut asm::Asm, mode: u32, pc: u32, take_when_true: bool, l_unwind: usize) {
+    let packed = mode | 1 << 2 | u32::from(take_when_true) << 3 | (pc << 4);
+    emit_cond_imm(a, packed, l_unwind);
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_cond_imm(a: &mut asm::Asm, mode: u32, l_unwind: usize) {
     a.mov(0, 19);
-    a.movz(1, mode, 0);
+    a.mov_imm64(1, mode as u64);
     a.mov(2, 20);
     a.ldr_imm(16, 21, (H_COND * 8) as u32);
     a.blr(16);

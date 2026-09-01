@@ -31,6 +31,9 @@ by the layout of Lumen's Rust enums:
 - ECMA-262 §7.1.3, ToNumeric, preserves BigInt and otherwise performs ToNumber after ToPrimitive.
 - ECMA-262 §13.15.3, ApplyStringOrNumericBinaryOperator, gives `+` its string-concatenation path,
   applies ToNumeric left-to-right for numeric operations, and rejects mixed Number/BigInt inputs.
+- ECMA-262 §14.6.2 (`if`) and §14.7.2-4 (iteration statements) evaluate predicates and loop
+  bodies in source order; diagnostic counters are published only after the predicate succeeds and
+  after a back-edge's host interruption check.
 
 Authoritative specification: <https://tc39.es/ecma262/>.
 
@@ -84,8 +87,12 @@ instruction format into the profile:
   address, object identity, and Rust callable representation are never profile data. A successful
   call or construct also records its `ValueClass` result in the normal result slot; abrupt calls
   retain target metadata but leave that result slot uninitialized.
-- `BranchCount` and `Allocation`: bounded counter/allocation summaries reserved for later Phase 1
-  slices.
+- `BranchCount`: saturating control-flow counters. Conditional sites keep taken and fallthrough
+  counts in independent u16 lanes; loop sites keep the unconditional back-edge count in the full
+  u32 payload. A nonzero count is `Monomorphic`, and a conditional site with both directions seen
+  is `Polymorphic`; counters never wrap. The payload is diagnostic data, not a language-visible
+  execution limit.
+- `Allocation`: bounded allocation summaries reserved for a later Phase 1 slice.
 
 The schema uses fixed numeric encodings and compact descriptors. Observation payload words are
 allocated lazily, so merely compiling a function does not allocate a detailed runtime profile.
@@ -126,6 +133,12 @@ not change. Element and call adapters are intentionally separate following slice
 adapter records target metadata before `Call`/`Construct` dispatch and publishes a result class
 only after successful completion, including direct eval and `super` call paths; it never retries
 or repeats user code, argument coercion, proxy traps, or constructor setup.
+
+Branch and loop adapters publish only after the canonical VM predicate has completed. Detailed JIT
+chunks route conditional predicates through the same condition helper with the baseline PC and
+branch polarity packed into diagnostic-only bits, and route unconditional back-edges through a
+no-op stack-preserving helper. Normal JIT chunks keep their direct branch instructions and incur
+no profiling calls.
 
 The first arithmetic adapter covers the canonical bytecodes for binary `+`, `-`, `*`, `/`, `%`,
 bitwise operations, shifts, and `**`, plus unary `+`, `-`, and `~`. It records original operand

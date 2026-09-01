@@ -11490,6 +11490,9 @@ fn run_vm(
             Op::Jump(t) => {
                 if t as usize <= *pc {
                     i.interrupt_poll()?;
+                    if chunk.feedback.detailed_enabled() {
+                        chunk.feedback.observe_loop_backedge(op_pc);
+                    }
                 }
                 *pc = t as usize;
             }
@@ -11514,37 +11517,53 @@ fn run_vm(
             }
             Op::JumpIfFalse(t) => {
                 let a = pop!();
-                if !i.to_boolean(&a) {
-                    if t as usize <= *pc {
-                        i.interrupt_poll()?;
-                    }
+                let taken = !i.to_boolean(&a);
+                if taken && t as usize <= *pc {
+                    i.interrupt_poll()?;
+                }
+                if chunk.feedback.detailed_enabled() {
+                    chunk.feedback.observe_branch(op_pc, taken);
+                }
+                if taken {
                     *pc = t as usize;
                 }
             }
             Op::JumpIfFalsePeek(t) => {
-                if !i.to_boolean(stack.last().expect("vm stack underflow")) {
-                    if t as usize <= *pc {
-                        i.interrupt_poll()?;
-                    }
+                let taken = !i.to_boolean(stack.last().expect("vm stack underflow"));
+                if taken && t as usize <= *pc {
+                    i.interrupt_poll()?;
+                }
+                if chunk.feedback.detailed_enabled() {
+                    chunk.feedback.observe_branch(op_pc, taken);
+                }
+                if taken {
                     *pc = t as usize;
                 }
             }
             Op::JumpIfTruePeek(t) => {
-                if i.to_boolean(stack.last().expect("vm stack underflow")) {
-                    if t as usize <= *pc {
-                        i.interrupt_poll()?;
-                    }
+                let taken = i.to_boolean(stack.last().expect("vm stack underflow"));
+                if taken && t as usize <= *pc {
+                    i.interrupt_poll()?;
+                }
+                if chunk.feedback.detailed_enabled() {
+                    chunk.feedback.observe_branch(op_pc, taken);
+                }
+                if taken {
                     *pc = t as usize;
                 }
             }
             Op::JumpIfNotNullishPeek(t) => {
-                if !matches!(
+                let taken = !matches!(
                     stack.last().expect("vm stack underflow"),
                     Value::Undefined | Value::Null
-                ) {
-                    if t as usize <= *pc {
-                        i.interrupt_poll()?;
-                    }
+                );
+                if taken && t as usize <= *pc {
+                    i.interrupt_poll()?;
+                }
+                if chunk.feedback.detailed_enabled() {
+                    chunk.feedback.observe_branch(op_pc, taken);
+                }
+                if taken {
                     *pc = t as usize;
                 }
             }
@@ -17794,11 +17813,14 @@ unsafe fn jit_bin_cmp(
 /// returning the new sp and the flag. `to_boolean` cannot throw, so sp is never null here.
 pub(crate) unsafe extern "C" fn jit_cond(
     ctx: *mut crate::jit::JitCtx,
-    mode: u32,
+    packed_mode: u32,
     mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let i = &mut *ctx.interp;
+    let profiled = packed_mode & (1 << 2) != 0;
+    let take_when_true = packed_mode & (1 << 3) != 0;
+    let mode = packed_mode & 0x3;
     let flag = match mode {
         crate::jit::COND_POP_TRUTHY => {
             sp = sp.sub(1);
@@ -17808,6 +17830,12 @@ pub(crate) unsafe extern "C" fn jit_cond(
         crate::jit::COND_PEEK_TRUTHY => i.to_boolean(&*sp.sub(1)) as u64,
         _ => !matches!(&*sp.sub(1), Value::Undefined | Value::Null) as u64,
     };
+    if profiled {
+        let taken = (flag != 0) == take_when_true;
+        (&*ctx.chunk)
+            .feedback
+            .observe_branch((packed_mode >> 4) as usize, taken);
+    }
     crate::jit::SpFlag { sp, flag }
 }
 
@@ -17917,4 +17945,16 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
+}
+
+/// Record one completed unconditional loop back-edge from a detailed JIT chunk. The generated
+/// caller has already performed the branch's normal stack/interrupt bookkeeping.
+pub(crate) unsafe extern "C" fn jit_loop_backedge(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+) -> *mut Value {
+    let ctx = unsafe { &*ctx };
+    unsafe { (&*ctx.chunk).feedback.observe_loop_backedge(pc as usize) };
+    sp
 }

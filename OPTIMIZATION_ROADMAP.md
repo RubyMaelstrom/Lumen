@@ -514,7 +514,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   array, direct-eval, `super`, baseline VM, and detailed JIT call/construct paths while preserving
   ECMA-262 §13.3.6.2 `EvaluateCall`, §13.3.5.1.1 `EvaluateNew`, and §7.3.13-14 `Call`/`Construct`
   ordering and abrupt-completion behavior.
-- [ ] Record branch direction counts and loop back-edge counts for optimization/OSR thresholds.
+- [x] Record saturating branch-direction and loop back-edge counts for optimization/OSR thresholds.
+  Conditional sites retain taken/fallthrough u16 lanes; loop sites retain a u32 back-edge count.
+  Baseline VM and detailed JIT execution publish only after the predicate and host interruption
+  ordering succeeds, while normal JIT code remains direct-branch fast. Profile ingestion adds
+  counters monotonically with saturation rather than treating them as a boolean shape signal.
 - [ ] Record allocation site, object kind, requested size, survival age, promotion, and retained
   bytes.
 - [ ] Record GC cause, generation, pause time, concurrent work, bytes scanned/copied/freed, and
