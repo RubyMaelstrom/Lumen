@@ -584,6 +584,9 @@ finish the baseline, but no later phase may claim a performance win against the 
   in generated code (`HEAP_POINTER_MODEL.md`: desktop cage offsets with a checked handle fallback).
 - [ ] Make heap pointers and immediate tags engine-owned rather than dependent on Rust enum or
   standard-library layouts.
+  - [x] Add and test an isolated engine-owned `TaggedValue`/`HeapRef` word nucleus with canonical
+    NaN, signed-zero, invalid-tag, and nonzero-reference validation; execution migration waits for
+    the central heap.
 - [ ] Define one interpreter/bytecode/baseline/optimizing calling convention and frame layout.
 - [ ] Define exact safepoints: allocation, runtime/host calls, back-edge polls, interrupts, and
   explicit collection points.
