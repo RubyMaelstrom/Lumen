@@ -211,6 +211,12 @@ callbacks and held values, and the queued cleanup-job vector. Weak targets and u
 are never upgraded or visited by diagnostics; their inline `Weak` handles are included in table or
 cell payload, while private `Rc` allocation headers remain outside requested-byte accounting.
 
+Active execution ownership includes legacy reflection-frame capacity and rare boxed frame state,
+proper-tail-call argument buffers, inferred function-name storage, `using` disposal frames,
+decorator initializer scratch, and active/pending `new.target` Values. Lazy argument slices are
+identity-deduplicated; their function and Value payloads route to canonical families, and their
+captured environments remain canonical to the scope snapshot.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

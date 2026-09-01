@@ -167,6 +167,7 @@ pub(crate) struct Visitor {
     re_texts: HashSet<usize>,
     regexes: HashSet<usize>,
     rc_u16_slices: HashSet<usize>,
+    rc_value_slices: HashSet<usize>,
     array_buffers: HashSet<usize>,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
@@ -315,6 +316,17 @@ impl Visitor {
                     .saturating_add(units.len().saturating_mul(std::mem::size_of::<u16>()));
             }
         }
+    }
+
+    fn value_slice(&mut self, values: &Rc<[Value]>) -> usize {
+        let identity = Rc::as_ptr(values) as *const () as usize;
+        if !self.rc_value_slices.insert(identity) {
+            return 0;
+        }
+        for value in values.iter() {
+            self.value(value);
+        }
+        values.len().saturating_mul(size_of::<Value>())
     }
 
     pub(crate) fn re_text(&mut self, text: &Rc<crate::regex::ReText>) {
@@ -988,6 +1000,69 @@ fn scan_realm(
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
+            .fn_frames
+            .capacity()
+            .saturating_mul(size_of::<crate::interpreter::FnFrame>())
+            .saturating_add(interp.pending_fn_name.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                interp
+                    .using_stack
+                    .capacity()
+                    .saturating_mul(size_of::<Vec<crate::interpreter::Disposable>>()),
+            )
+            .saturating_add(
+                interp
+                    .decorator_initializers
+                    .capacity()
+                    .saturating_mul(size_of::<Value>()),
+            ),
+    );
+    visitor.value(&interp.new_target);
+    visitor.value(&interp.pending_new_target);
+    for frame in &interp.fn_frames {
+        if let Some(extra) = &frame.extra {
+            totals
+                .interpreter_side_tables
+                .add(size_of::<crate::interpreter::FrameExtra>());
+            visitor.value(&extra.args_obj);
+            if let Some((function, arguments, _environment)) = &extra.lazy {
+                visitor.function(function);
+                totals
+                    .interpreter_side_tables
+                    .add(visitor.value_slice(arguments));
+            }
+        }
+    }
+    if let Some(pending) = &interp.pending_tail {
+        totals
+            .interpreter_side_tables
+            .add(size_of::<(Value, Value, Vec<Value>)>());
+        visitor.value(&pending.0);
+        visitor.value(&pending.1);
+        totals
+            .interpreter_side_tables
+            .add(pending.2.capacity().saturating_mul(size_of::<Value>()));
+        for argument in &pending.2 {
+            visitor.value(argument);
+        }
+    }
+    for frame in &interp.using_stack {
+        totals.interpreter_side_tables.add(
+            frame
+                .capacity()
+                .saturating_mul(size_of::<crate::interpreter::Disposable>()),
+        );
+        for resource in frame {
+            visitor.value(&resource.value);
+            visitor.value(&resource.method);
+        }
+    }
+    for initializer in &interp.decorator_initializers {
+        visitor.value(initializer);
     }
 
     totals.interpreter_side_tables.add(
@@ -1756,6 +1831,58 @@ mod tests {
             .interp
             .pending_finalization_cleanup
             .push_back(registry);
+
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
+    }
+
+    #[test]
+    fn active_execution_scratch_accounts_nested_buffers_and_values() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        engine.interp.fn_frames.reserve(3);
+        engine.interp.fn_frames.push(crate::interpreter::FnFrame {
+            fn_ptr: 0,
+            coro: 0,
+            strict: false,
+            extra: Some(Box::new(crate::interpreter::FrameExtra {
+                args_obj: Value::str("materialized frame arguments"),
+                lazy: None,
+            })),
+        });
+        engine.interp.pending_fn_name = Some("pending inferred function name".to_string());
+        engine.interp.pending_tail = Some(Box::new((
+            Value::str("tail callee"),
+            Value::str("tail receiver"),
+            vec![Value::str("tail argument")],
+        )));
+        let mut resources = Vec::with_capacity(4);
+        resources.push(crate::interpreter::Disposable {
+            value: Value::str("disposable value"),
+            method: Value::str("dispose method"),
+            kind_is_async: false,
+            method_is_async: false,
+        });
+        engine.interp.using_stack = Vec::with_capacity(3);
+        engine.interp.using_stack.push(resources);
+        engine.interp.decorator_initializers.reserve(5);
+        engine
+            .interp
+            .decorator_initializers
+            .push(Value::str("decorator initializer"));
+        engine.interp.new_target = Value::str("active new target");
+        engine.interp.pending_new_target = Value::str("pending new target");
+
+        let shared_values: Rc<[Value]> = vec![Value::str("lazy frame argument")].into();
+        let mut visitor = Visitor::default();
+        assert!(visitor.value_slice(&shared_values) > 0);
+        assert_eq!(visitor.value_slice(&shared_values), 0);
 
         let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);

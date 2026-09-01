@@ -418,6 +418,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     async-generator requests without re-crediting chunks, scopes, or JavaScript payloads.
   - [x] Account WeakRef and FinalizationRegistry storage, strongly retained held values/callbacks,
     and cleanup jobs without upgrading weak targets or unregister tokens.
+  - [x] Account active reflection frames, tail-call/disposal/decorator scratch, inferred names,
+    and active constructor Values, including identity-deduplicated lazy argument slices.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.
