@@ -448,11 +448,11 @@ finish the baseline, but no later phase may claim a performance win against the 
     built-in N-API callback/class/Promise wrappers.
   - [x] Add the corresponding identity-aware host/resource reporting surface so shared embedder
     allocations and host-retained JavaScript Values can use the Agent-wide canonical visitor.
-  - [ ] Eliminate remaining unavailable browser host-resource entries before treating browser
-    Agent records as complete. TRust now has exhaustive HostState and DOM ownership tripwires plus
-    identity-aware storage/cache/value traversal; parsed StyleIndex, populated PagePaint, and
-    active wasmi internals remain explicit unavailable subgraphs. Shared Tendril backing is a
-    documented lower bound because its crate exposes sharedness but not allocation identity.
+  - [x] Eliminate unavailable browser host-resource entries at a healthy post-GC safepoint. TRust
+    has exhaustive HostState, DOM, StyleIndex, and PagePaint ownership tripwires plus identity-aware
+    storage/cache/value traversal. Shared Tendril and active wasmi private backing are documented
+    lower bounds: their crates expose the owners and visible payloads but not complete allocation
+    identities; a poisoned/actively-borrowed owner still correctly degrades to unavailable.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page
