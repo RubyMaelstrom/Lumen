@@ -547,6 +547,10 @@ finish the baseline, but no later phase may claim a performance win against the 
     reported for one.
 - [ ] Record host/native call counts and time by stable operation identity without requiring
   source-name guesses.
+  - [x] Expose opt-in aggregate native invocation counts, failures, and elapsed time at both the
+    ordinary dispatch and native-entry IC funnels; diagnostics do not alter dispatch policy.
+  - [ ] Attach stable operation identities (including embedder-provided names) without relying on
+    raw function-pointer addresses.
 - [ ] Measure error construction as separate message conversion, object allocation, stack capture,
   and stack formatting costs; distinguish constructed, thrown/caught, and escaping errors before
   considering lazy stack materialization for Lumen's non-standard `stack` extension.

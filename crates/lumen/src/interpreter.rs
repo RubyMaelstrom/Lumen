@@ -3577,6 +3577,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         self.interrupt_poll_force()?;
+        let perf_started = crate::jit::perf_stage_start();
         let result = match call {
             Callable::Native(f) => f(self, this, args),
             Callable::NativeData(data) => {
@@ -3585,6 +3586,7 @@ impl Interp {
             }
             _ => unreachable!("dispatch_native on a non-native callable"),
         };
+        crate::jit::perf_native_end(perf_started, result.is_ok());
         // A native may run nested JavaScript (for example `$262.evalScript`). Host interruption
         // from that execution must override its Value-shaped native error before author `catch`.
         self.interrupt_poll_force()?;
@@ -8607,7 +8609,10 @@ impl Interp {
         let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
         let native_result = match self.interrupt_poll_force() {
             Ok(()) => with_execution_stack(self.depth, || {
-                nf(self, unsafe { &*this_slot }.clone(), args_ref)
+                let perf_started = crate::jit::perf_stage_start();
+                let result = nf(self, unsafe { &*this_slot }.clone(), args_ref);
+                crate::jit::perf_native_end(perf_started, result.is_ok());
+                result
             }),
             Err(interrupt) => {
                 self.constructing = saved_ctor;

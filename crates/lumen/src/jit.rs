@@ -73,6 +73,9 @@ static PERF_SNAPSHOT_DECODE_SUCCESSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static PERF_SNAPSHOT_DECODE_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static PERF_NATIVE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_NATIVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_NATIVE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn perf_metrics_enabled() -> bool {
@@ -148,6 +151,20 @@ pub(crate) fn perf_snapshot_decode_end(started: Option<std::time::Instant>, succ
     );
     if success {
         PERF_SNAPSHOT_DECODE_SUCCESSES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_native_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_NATIVE_CALLS.fetch_add(1, Relaxed);
+    PERF_NATIVE_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if !success {
+        PERF_NATIVE_FAILURES.fetch_add(1, Relaxed);
     }
 }
 
@@ -231,9 +248,12 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let snapshot_decode_attempts = PERF_SNAPSHOT_DECODE_ATTEMPTS.load(Relaxed);
     let snapshot_decode_successes = PERF_SNAPSHOT_DECODE_SUCCESSES.load(Relaxed);
     let snapshot_decode_nanos = PERF_SNAPSHOT_DECODE_NANOS.load(Relaxed);
+    let native_calls = PERF_NATIVE_CALLS.load(Relaxed);
+    let native_nanos = PERF_NATIVE_NANOS.load(Relaxed);
+    let native_failures = PERF_NATIVE_FAILURES.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
         lex_nanos as f64 / 1_000_000_000.0,
@@ -243,6 +263,7 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
         snapshot_encode_nanos as f64 / 1_000_000_000.0,
         snapshot_decode_attempts.saturating_sub(snapshot_decode_successes),
         snapshot_decode_nanos as f64 / 1_000_000_000.0,
+        native_nanos as f64 / 1_000_000_000.0,
     ))
 }
 
