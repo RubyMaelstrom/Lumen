@@ -1219,6 +1219,30 @@ fn scan_realm(
 
     totals.interpreter_side_tables.add(
         interp
+            .temporal
+            .len()
+            .saturating_mul(size_of::<(usize, crate::temporal::Temporal)>())
+            .saturating_add(
+                interp
+                    .temporal_cal
+                    .len()
+                    .saturating_mul(size_of::<(usize, Rc<str>)>()),
+            ),
+    );
+    for temporal in interp.temporal.values() {
+        temporal.scan_retained_memory(visitor);
+    }
+    for calendar in interp.temporal_cal.values() {
+        visitor.rc_str(calendar);
+    }
+    if !interp.temporal.is_empty() || !interp.temporal_cal.is_empty() {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
             .map_data
             .len()
             .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
@@ -2139,6 +2163,32 @@ mod tests {
         assert!(after.object_bodies.bytes > before.object_bodies.bytes);
         assert!(after.scope_bodies.bytes > before.scope_bodies.bytes);
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+    }
+
+    #[test]
+    fn temporal_records_account_zone_and_calendar_strings_once() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        engine
+            .eval(
+                r#"
+                    globalThis.memoryDate = new Temporal.PlainDate(2024, 1, 2, "gregory");
+                    globalThis.memoryZoned = new Temporal.ZonedDateTime(0n, "UTC", "iso8601");
+                "#,
+                false,
+            )
+            .expect("Temporal setup parses");
+        assert_eq!(engine.interp.temporal.len(), 2);
+        assert_eq!(engine.interp.temporal_cal.len(), 2);
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
+
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
     }
 
     #[test]

@@ -57,6 +57,14 @@ pub enum Temporal {
     },
 }
 
+impl Temporal {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
+        if let Temporal::Zoned { tz, .. } = self {
+            visitor.rc_str(tz);
+        }
+    }
+}
+
 // ----- ISO calendar math ----------------------------------------------------------------------
 
 pub fn is_leap(y: i64) -> bool {

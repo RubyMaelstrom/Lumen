@@ -232,6 +232,10 @@ identity-deduplicated global-name sets, including a transient constructor-caller
 Globals and intrinsic objects remain canonical to the object snapshot; global environments remain
 canonical to the scope snapshot even when several realm/settings records share them.
 
+Temporal ownership includes the internal-slot table, calendar-id table, ZonedDateTime time-zone
+identifiers, and calendar identifiers. Shared `Rc<str>` payloads use the visitor's global string
+identity set, so repeated canonical zone/calendar names are credited once across all records.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

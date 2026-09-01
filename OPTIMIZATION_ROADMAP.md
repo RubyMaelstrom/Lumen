@@ -426,6 +426,7 @@ finish the baseline, but no later phase may claim a performance win against the 
     callable/property payloads to their canonical allocation families.
   - [x] Account additional and constructor-caller RealmState metadata with shared global-name-set
     deduplication and object/scope snapshot canonicality.
+  - [x] Account Temporal internal-slot records and identity-deduplicated time-zone/calendar strings.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.
