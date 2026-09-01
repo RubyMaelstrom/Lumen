@@ -1711,7 +1711,7 @@ macro_rules! interp_memory_inventory {
 
 #[cfg(test)]
 interp_memory_inventory! {
-    gc_heap => "unaccounted",
+    gc_heap => "measured",
     symbol_agent => "measured",
     global => "measured",
     global_env => "measured",
@@ -1725,8 +1725,8 @@ interp_memory_inventory! {
     symbol_proto => "measured",
     error_protos => "measured",
     console => "measured",
-    wall_clock => "unaccounted",
-    runtime_interrupt => "unaccounted",
+    wall_clock => "external",
+    runtime_interrupt => "external",
     interrupt_poll_tick => "non_owning",
     strict => "non_owning",
     tier => "non_owning",

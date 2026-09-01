@@ -429,6 +429,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Account Temporal internal-slot records and identity-deduplicated time-zone/calendar strings.
   - [x] Account pending async waits, timers, and visible Agent channel handles; explicitly retain
     lower-bound quality for opaque standard-library queue backing/messages.
+  - [x] Account identity-deduplicated collector registry/shape infrastructure; classify the opaque
+    embedder wall clock and shared runtime-interrupt control handle as external ownership.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

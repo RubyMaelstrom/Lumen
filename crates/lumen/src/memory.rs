@@ -152,6 +152,7 @@ impl Snapshot {
 
 #[derive(Default)]
 pub(crate) struct Visitor {
+    gc_heaps: HashSet<usize>,
     lstrs: HashSet<usize>,
     rc_strs: HashSet<usize>,
     symbols: HashSet<usize>,
@@ -180,6 +181,14 @@ pub(crate) struct Visitor {
 }
 
 impl Visitor {
+    fn gc_heap(&mut self, heap: &crate::value::GcHeap) -> (usize, bool) {
+        let identity = Rc::as_ptr(heap) as usize;
+        if !self.gc_heaps.insert(identity) {
+            return (0, true);
+        }
+        crate::value::scan_gc_heap_retained_memory(heap, self)
+    }
+
     pub(crate) fn lstr(&mut self, value: &crate::lstr::LStr) {
         let identity = value.as_ptr() as usize;
         if self.lstrs.insert(identity) {
@@ -554,6 +563,13 @@ fn scan_realm(
     totals.object_count = totals.object_count.saturating_add(objects.len());
     totals.scope_count = totals.scope_count.saturating_add(scopes.len());
     totals.interpreter_side_tables.add(size_of::<Interp>());
+    let (gc_heap_bytes, gc_heap_exact) = visitor.gc_heap(&interp.gc_heap);
+    totals.interpreter_side_tables.add(gc_heap_bytes);
+    if !gc_heap_exact {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque object-shape HashMap bucket storage");
+    }
     for object in objects {
         let (bytes, exact) = visitor.object(&object.borrow());
         totals.property_storage.add(bytes);
@@ -2265,6 +2281,18 @@ mod tests {
             after.interpreter_side_tables.quality,
             Quality::LowerBound
         ));
+    }
+
+    #[test]
+    fn gc_heap_registries_are_identity_deduplicated() {
+        let engine = crate::Engine::new();
+        let mut visitor = Visitor::default();
+        let (first, _) = visitor.gc_heap(&engine.interp.gc_heap);
+        let (duplicate, duplicate_exact) = visitor.gc_heap(&engine.interp.gc_heap);
+
+        assert!(first > size_of::<crate::value::GcHeap>());
+        assert_eq!(duplicate, 0);
+        assert!(duplicate_exact);
     }
 
     #[test]

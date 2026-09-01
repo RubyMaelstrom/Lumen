@@ -242,6 +242,12 @@ standard-library channel backing and queued messages expose no retained-size API
 receiver/sender keeps the category explicitly lower-bound with that reason rather than reporting
 the visible handles as an exact total.
 
+Collector infrastructure includes each identity-deduplicated `GcState` payload, object-registry
+and free-list capacity, weak scope-registry capacity, and shape-transition entry/key storage.
+Object/scope bodies remain in their existing canonical categories. The embedder wall-clock closure
+and shared runtime-interrupt handle are classified external: captured closure state and cross-engine
+Arc ownership cannot be assigned honestly to one Agent's managed total.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

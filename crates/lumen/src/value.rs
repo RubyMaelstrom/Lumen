@@ -1011,6 +1011,44 @@ pub(crate) struct GcState {
 
 pub(crate) type GcHeap = Rc<GcState>;
 
+pub(crate) fn scan_gc_heap_retained_memory(
+    heap: &GcHeap,
+    visitor: &mut crate::memory::Visitor,
+) -> (usize, bool) {
+    let registry = heap.registry.borrow();
+    let mut bytes = std::mem::size_of::<GcState>()
+        .saturating_add(
+            registry
+                .entries
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Option<Weak<RefCell<Object>>>>()),
+        )
+        .saturating_add(
+            registry
+                .free
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        );
+    drop(registry);
+    bytes = bytes.saturating_add(
+        heap.scope_registry
+            .borrow()
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Weak<RefCell<crate::interpreter::Scope>>>()),
+    );
+    let shapes = heap.shapes.borrow();
+    bytes = bytes.saturating_add(
+        shapes
+            .transitions
+            .len()
+            .saturating_mul(std::mem::size_of::<((u32, Rc<str>), u32)>()),
+    );
+    for (_, key) in shapes.transitions.keys() {
+        visitor.rc_str(key);
+    }
+    (bytes, shapes.transitions.is_empty())
+}
+
 // Process-wide collector diagnostics for the benchmark shell. Collection is already a global
 // safepoint for an Agent, so relaxed aggregate counters are sufficient. The environment check and
 // clock read occur only at a collection entry, never on the allocation or property-access paths.
