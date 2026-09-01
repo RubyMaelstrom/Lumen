@@ -562,6 +562,63 @@ fn scan_realm(
             .engine_caches
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
+    totals.engine_caches.add(
+        interp
+            .vm_pool
+            .capacity()
+            .saturating_mul(size_of::<(Vec<Value>, Vec<Value>)>())
+            .saturating_add(
+                interp
+                    .stub_cache
+                    .capacity()
+                    .saturating_mul(size_of::<std::cell::Cell<crate::interpreter::StubEntry>>()),
+            )
+            .saturating_add(
+                interp
+                    .stub_cache_names
+                    .borrow()
+                    .capacity()
+                    .saturating_mul(size_of::<Option<Rc<str>>>()),
+            )
+            .saturating_add(
+                interp
+                    .frame_pool
+                    .capacity()
+                    .saturating_mul(size_of::<std::ptr::NonNull<Value>>()),
+            )
+            .saturating_add(interp.frame_pool.len().saturating_mul(
+                crate::jit::FRAME_BUF.saturating_mul(size_of::<std::mem::MaybeUninit<Value>>()),
+            ))
+            .saturating_add(
+                interp
+                    .creation_pins
+                    .len()
+                    .saturating_mul(size_of::<(usize, std::rc::Weak<RefCell<Object>>)>()),
+            )
+            .saturating_add(
+                interp
+                    .global_env_pins
+                    .capacity()
+                    .saturating_mul(size_of::<std::rc::Weak<RefCell<Scope>>>()),
+            ),
+    );
+    for (slots, stack) in &interp.vm_pool {
+        totals.engine_caches.add(
+            slots
+                .capacity()
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(stack.capacity().saturating_mul(size_of::<Value>())),
+        );
+        debug_assert!(slots.is_empty() && stack.is_empty());
+    }
+    for name in interp.stub_cache_names.borrow().iter().flatten() {
+        visitor.rc_str(name);
+    }
+    if !interp.creation_pins.is_empty() {
+        totals
+            .engine_caches
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
 
     totals.interpreter_side_tables.add(
         interp
@@ -1115,6 +1172,30 @@ mod tests {
         assert!(!engine.interp.data_views.is_empty());
         assert!(snapshot.interpreter_side_tables.bytes > size_of::<Interp>());
         assert!(snapshot.array_buffer_backing.bytes >= 64);
+    }
+
+    #[test]
+    fn reusable_execution_pools_report_retained_capacity() {
+        let mut engine = crate::Engine::new();
+        engine.set_tier(crate::bytecode::Tier::Bytecode);
+        engine.set_tier_threshold(0);
+        engine
+            .eval(
+                "function pooled(a, b) { return a + b; } pooled(20, 22);",
+                false,
+            )
+            .expect("bytecode function evaluates");
+        let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let snapshot = measure(&engine.interp, &objects, &scopes);
+        let stub_bytes = engine
+            .interp
+            .stub_cache
+            .capacity()
+            .saturating_mul(size_of::<std::cell::Cell<crate::interpreter::StubEntry>>());
+
+        assert!(!engine.interp.vm_pool.is_empty());
+        assert!(snapshot.engine_caches.bytes >= stub_bytes);
     }
 
     #[test]

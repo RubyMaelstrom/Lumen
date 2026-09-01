@@ -406,6 +406,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Separate ArrayBuffer/view metadata from identity-deduplicated byte backing, covering
     version/dirty tracking, TypedArray/DataView records, and detach-policy sets while reserving
     shared/Wasm backing for the cross-Agent external-allocation slice.
+  - [x] Account reusable bytecode/JIT execution pools, megamorphic stub-cache storage and names,
+    raw frame buffers, and weak cache-pin containers.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

@@ -178,6 +178,11 @@ credit `interpreter_side_tables`, while the identity-deduplicated byte capacity 
 `array_buffer_backing`. Shared/Wasm backing is still intentionally unavailable pending the
 cross-Agent allocation-identity policy; only its per-realm id map is included in this slice.
 
+Reusable execution storage now contributes to `engine_caches`: bytecode slot/operand Vec pools,
+the megamorphic stub table and retained names, raw fixed-size JIT frame buffers, and weak
+creation/global-environment pin containers. Pooled VM vectors and raw frame buffers are required
+to contain no live Values; a diagnostic assertion protects that ownership invariant.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
