@@ -390,14 +390,16 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Exhaustively traverse recursive statement/expression/pattern/class AST allocations,
     including Box targets and vector capacities, with shared Function/Class/string/BigInt
     identity deduplication.
+  - [x] Cover uncommon Chunk-owned eval/assignment/class/constructor/RegExp/forwarder plans and
+    call-pin entry payloads; retain a lower-bound label for opaque HashMap bucket capacity.
   - [x] Scan the bounded UTF-16/prepared-subject/compiled-RegExp caches, including payloads pinned
     only by stale recency entries, while attributing cache storage, strings, and matcher payloads
     to separate identity-deduplicated families.
   - [x] Account live RegExp program pins and deferred legacy-match state through the same payload
     registries, establishing the partial `interpreter_side_tables` category.
-  - [ ] Cover uncommon bytecode allocations, every remaining interpreter side table and bounded
-    cache, shared/Wasm backing stores, and host resources; reduce the inventory's `unaccounted`
-    class to zero before changing the report to complete.
+  - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
+    stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
+    the report to complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page

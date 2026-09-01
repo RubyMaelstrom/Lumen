@@ -992,9 +992,9 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    /// Scan the directly-owned bytecode/feedback payload. Recursive AST plans remain explicitly a
-    /// lower bound in the report; shared Functions, strings, properties, chunks, and JIT sidecars
-    /// route back through the one allocation-family visitor for identity deduplication.
+    /// Scan the directly-owned bytecode/feedback payload. Shared AST nodes, Functions, strings,
+    /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
+    /// allocation-family visitor for identity deduplication.
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
         macro_rules! vec_bytes {
             ($field:ident, $ty:ty) => {
@@ -1055,6 +1055,8 @@ impl Chunk {
             }
         }
         for plan in &self.eval_exprs {
+            bytes =
+                bytes.saturating_add(crate::ast::scan_expr_retained_memory(&plan.expr, visitor));
             bytes = bytes.saturating_add(
                 plan.locals
                     .capacity()
@@ -1066,6 +1068,8 @@ impl Chunk {
             }
         }
         for plan in &self.assignment_targets {
+            bytes =
+                bytes.saturating_add(crate::ast::scan_expr_retained_memory(&plan.target, visitor));
             bytes = bytes.saturating_add(
                 plan.locals
                     .capacity()
@@ -1076,6 +1080,7 @@ impl Chunk {
             }
         }
         for plan in &self.class_plans {
+            visitor.class(&plan.class);
             bytes = bytes.saturating_add(plan.inferred_name.as_ref().map_or(0, String::capacity));
         }
         for scope in &self.lexical_scopes {
@@ -1131,6 +1136,16 @@ impl Chunk {
         if let Some(runtime) = self.arguments_forwarder_runtime.borrow().as_ref() {
             visitor.chunk(&runtime.chunk);
         }
+        for regex in &self.regexp_literals {
+            if let Some(regex) = regex.get() {
+                visitor.regex(regex);
+            }
+        }
+        let call_pins = self.call_pins.borrow();
+        bytes = bytes.saturating_add(call_pins.len().saturating_mul(std::mem::size_of::<(
+            usize,
+            std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+        )>()));
         if let Some(code) = self.jit.get().and_then(Option::as_ref) {
             visitor.jit_code(code);
         }

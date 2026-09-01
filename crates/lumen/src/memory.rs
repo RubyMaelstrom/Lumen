@@ -580,7 +580,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         ),
         function_bytecode_metadata: Category::lower_bound(
             visitor.function_bytecode_metadata,
-            "uncommon Chunk plans are not yet fully traversed",
+            "Chunk call-pin HashMap bucket capacity is opaque",
         ),
         jit_heap_metadata: Category::lower_bound(
             visitor.jit_heap_metadata,

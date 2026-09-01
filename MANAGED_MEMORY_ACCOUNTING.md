@@ -138,8 +138,11 @@ bytecode, constant, name, feedback/IC, captured-binding, template, and plan-vect
 The recursive AST visitor exhaustively matches every `Stmt`, `Expr`, `Pattern`, class, import, and
 property variant; vector capacities and `Box` targets are local storage, while shared Functions,
 Classes, strings, and BigInts use allocation-family identity sets. Several uncommon Chunk plans
-remain a documented lower bound. JIT `pc_offsets` and its Rust payload are reported as heap
-metadata; executable mappings remain exclusively in generated-code metrics.
+are also traversed, including generic eval/assignment expressions, class plans, initialized
+RegExp literals, constructor-plan vectors, forwarding chunks, and call-pin entry payloads. The
+Chunk category remains a lower bound because Rust's HashMap bucket capacity is opaque. JIT
+`pc_offsets` and its Rust payload are reported as heap metadata; executable mappings remain
+exclusively in generated-code metrics.
 
 The bounded string/RegExp cache slice scans UTF-16 views, prepared subjects, the ASCII hot entry,
 and compiled-program cache entries plus stale recency keys. Cache tables and recency queues credit

@@ -911,6 +911,16 @@ pub(crate) fn scan_class_retained_memory(
     scan.bytes
 }
 
+/// Scan allocations recursively owned by an Expr whose enum body is stored inline by its caller.
+pub(crate) fn scan_expr_retained_memory(
+    expr: &Expr,
+    visitor: &mut crate::memory::Visitor,
+) -> usize {
+    let mut scan = RetainedAst { visitor, bytes: 0 };
+    scan.expr(expr);
+    scan.bytes
+}
+
 pub const SCAN_DONE: u8 = 1;
 pub const SCAN_ARGUMENTS: u8 = 2;
 pub const SCAN_NEW_TARGET: u8 = 4;
