@@ -679,6 +679,14 @@ impl ReText {
             }))
     }
 
+    /// Attribute the prepared view and its pinned source through the managed-memory visitor.
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        if let Some(source) = &self.ascii_src {
+            visitor.lstr(source);
+        }
+        self.heap_bytes()
+    }
+
     /// Prepare `s` for matching, keeping the caller's `Rc` for zero-copy ASCII slicing.
     pub fn new_rc(unicode: bool, s: &crate::lstr::LStr) -> ReText {
         // Engine strings maintain an exact one-way ASCII hint in their allocation header.
@@ -836,6 +844,41 @@ fn has_named_group(pattern: &str) -> bool {
 }
 
 impl Regex {
+    /// Requested bytes that are directly owned by this compiled matcher. Rc-backed character
+    /// classes and nested lookaround programs are intentionally omitted until their allocation
+    /// families have identity-aware traversal; unlike `heap_bytes`, this diagnostic must never
+    /// double-count a shared allocation merely because the cache eviction estimate is allowed to.
+    pub(crate) fn retained_requested_lower_bound_bytes(&self) -> usize {
+        let first = match &self.first {
+            FirstFilter::Atoms(atoms) => {
+                atoms.capacity().saturating_mul(std::mem::size_of::<Rep>())
+            }
+            _ => 0,
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.prog
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Inst>()),
+            )
+            .saturating_add(first)
+            .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
+            .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.flags.capacity())
+            .saturating_add(
+                self.names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, usize)>()),
+            )
+            .saturating_add(
+                self.names
+                    .iter()
+                    .map(|(name, _)| name.capacity())
+                    .sum::<usize>(),
+            )
+    }
+
     /// Conservative retained heap size of this immutable compiled matcher. Shared character
     /// classes/lookaround programs may be counted more than once; over-accounting only evicts a
     /// reconstructible cache entry sooner and avoids an expensive graph-dedup pass on insertion.

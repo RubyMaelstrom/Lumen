@@ -87,6 +87,8 @@ pub(crate) struct Snapshot {
     callable_metadata: Category,
     function_bytecode_metadata: Category,
     jit_heap_metadata: Category,
+    regexp_metadata: Category,
+    engine_caches: Category,
     array_buffer_backing: Category,
 }
 
@@ -100,6 +102,8 @@ impl Snapshot {
             self.strings_symbols_bigints,
             self.callable_metadata,
             self.function_bytecode_metadata,
+            self.regexp_metadata,
+            self.engine_caches,
         ]
         .into_iter()
         .map(|category| category.bytes)
@@ -118,9 +122,9 @@ impl Snapshot {
                 "\"scope_bodies\":{},\"scope_storage\":{},",
                 "\"strings_symbols_bigints\":{},\"callable_metadata\":{},",
                 "\"function_bytecode_metadata\":{},\"jit_heap_metadata\":{},",
+                "\"regexp_metadata\":{},\"engine_caches\":{},",
                 "\"array_buffer_backing\":{},",
                 "\"interpreter_side_tables\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"Interp ownership inventory still contains unaccounted fields\"}},",
-                "\"engine_caches\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cache overhead and pinned payload traversal has not landed\"}},",
                 "\"shared_wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cross-Agent backing-store identity policy has not landed\"}},",
                 "\"host_resources\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"host retained-size hook has not landed\"}}",
                 "}}}}"
@@ -137,6 +141,8 @@ impl Snapshot {
             self.callable_metadata.json(),
             self.function_bytecode_metadata.json(),
             self.jit_heap_metadata.json(),
+            self.regexp_metadata.json(),
+            self.engine_caches.json(),
             self.array_buffer_backing.json(),
         )
     }
@@ -153,15 +159,28 @@ pub(crate) struct Visitor {
     chunks: HashSet<usize>,
     jit_codes: HashSet<usize>,
     hoist_plans: HashSet<usize>,
+    re_texts: HashSet<usize>,
+    regexes: HashSet<usize>,
+    rc_u16_slices: HashSet<usize>,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
     function_bytecode_metadata: usize,
     jit_heap_metadata: usize,
+    regexp_metadata: usize,
     detached_property_storage: usize,
     detached_property_storage_opaque: bool,
 }
 
 impl Visitor {
+    pub(crate) fn lstr(&mut self, value: &crate::lstr::LStr) {
+        let identity = value.as_ptr() as usize;
+        if self.lstrs.insert(identity) {
+            self.strings_symbols_bigints = self
+                .strings_symbols_bigints
+                .saturating_add(value.retained_requested_bytes());
+        }
+    }
+
     pub(crate) fn rc_str(&mut self, value: &Rc<str>) {
         let identity = Rc::as_ptr(value) as *const () as usize;
         if self.rc_strs.insert(identity) {
@@ -192,12 +211,7 @@ impl Visitor {
                 }
             }
             Value::Str(value) => {
-                let identity = value.as_ptr() as usize;
-                if self.lstrs.insert(identity) {
-                    self.strings_symbols_bigints = self
-                        .strings_symbols_bigints
-                        .saturating_add(value.retained_requested_bytes());
-                }
+                self.lstr(value);
             }
             Value::Sym(value) => self.symbol(value),
             Value::Undefined
@@ -279,6 +293,35 @@ impl Visitor {
 
     pub(crate) fn add_jit_heap_metadata_bytes(&mut self, bytes: usize) {
         self.jit_heap_metadata = self.jit_heap_metadata.saturating_add(bytes);
+    }
+
+    pub(crate) fn str_units(&mut self, units: &crate::interpreter::StrUnits) {
+        if let crate::interpreter::StrUnits::Units(units) = units {
+            let identity = Rc::as_ptr(units) as *const () as usize;
+            if self.rc_u16_slices.insert(identity) {
+                self.strings_symbols_bigints = self
+                    .strings_symbols_bigints
+                    .saturating_add(units.len().saturating_mul(std::mem::size_of::<u16>()));
+            }
+        }
+    }
+
+    pub(crate) fn re_text(&mut self, text: &Rc<crate::regex::ReText>) {
+        let identity = Rc::as_ptr(text) as usize;
+        if self.re_texts.insert(identity) {
+            self.regexp_metadata = self
+                .regexp_metadata
+                .saturating_add(text.scan_retained_memory(self));
+        }
+    }
+
+    pub(crate) fn regex(&mut self, regex: &Rc<crate::regex::Regex>) {
+        let identity = Rc::as_ptr(regex) as usize;
+        if self.regexes.insert(identity) {
+            self.regexp_metadata = self
+                .regexp_metadata
+                .saturating_add(regex.retained_requested_lower_bound_bytes());
+        }
     }
 
     pub(crate) fn function(&mut self, function: &Rc<crate::ast::Function>) {
@@ -462,6 +505,33 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         }
     }
 
+    let mut engine_caches = Category::exact(0);
+    let (bytes, exact) = interp.str_units.scan_retained_memory(|(string, units)| {
+        visitor.lstr(string);
+        visitor.str_units(units);
+    });
+    engine_caches.add(bytes);
+    if !exact {
+        engine_caches.make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+    let (bytes, exact) = interp.re_texts.scan_retained_memory(|(string, text)| {
+        visitor.lstr(string);
+        visitor.re_text(text);
+    });
+    engine_caches.add(bytes);
+    if !exact {
+        engine_caches.make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+    if let Some((string, _, text)) = &interp.re_text_ascii_hot {
+        visitor.lstr(string);
+        visitor.re_text(text);
+    }
+    let (bytes, exact) = interp.regexp_programs.scan_retained_memory(&mut visitor);
+    engine_caches.add(bytes);
+    if !exact {
+        engine_caches.make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
     // Function-owned maps can be reached while scanning either objects or scopes. Merge their
     // storage only after both root families have completed so traversal order cannot omit it.
     property_storage.add(visitor.detached_property_storage);
@@ -480,7 +550,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         // deliberately deferred to later vertical slices.
         strings_symbols_bigints: Category::lower_bound(
             visitor.strings_symbols_bigints,
-            "AST, cache, and side-table owners are not yet traversed",
+            "AST and remaining side-table owners are not yet traversed",
         ),
         callable_metadata: Category::lower_bound(
             visitor.callable_metadata,
@@ -493,6 +563,14 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         jit_heap_metadata: Category::lower_bound(
             visitor.jit_heap_metadata,
             "heap sidecars are covered; executable mappings are reported separately",
+        ),
+        regexp_metadata: Category::lower_bound(
+            visitor.regexp_metadata,
+            "shared character classes and nested lookaround programs are not yet traversed",
+        ),
+        engine_caches: Category::lower_bound(
+            engine_caches.bytes,
+            "string and RegExp caches are covered; remaining interpreter caches are not",
         ),
         // The ordinary stores reached through this table are exact, but the category remains a
         // lower bound until shared/Wasm and host-created backing stores join the same layer.
@@ -555,11 +633,13 @@ mod tests {
             callable_metadata: Category::lower_bound(6, "test lower bound"),
             function_bytecode_metadata: Category::lower_bound(8, "test lower bound"),
             jit_heap_metadata: Category::lower_bound(9, "test lower bound"),
+            regexp_metadata: Category::lower_bound(10, "test lower bound"),
+            engine_caches: Category::lower_bound(11, "test lower bound"),
             array_buffer_backing: Category::lower_bound(7, "test lower bound"),
         }
         .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":null"));
-        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":29"));
+        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":50"));
     }
 
     #[test]
@@ -570,6 +650,29 @@ mod tests {
         visitor.value(&Value::Str(string.clone()));
         visitor.value(&Value::Str(string));
         assert_eq!(visitor.strings_symbols_bigints, expected);
+    }
+
+    #[test]
+    fn cache_pins_are_scanned_into_canonical_allocation_families() {
+        let mut interp = Interp::new();
+        let non_ascii = LStr::from("éééé");
+        interp.units_full(&non_ascii);
+        interp.re_text(true, &non_ascii);
+        let ascii = LStr::from("cache-hot-ascii");
+        interp.re_text(false, &ascii);
+        interp
+            .compiled_regexp("(?:cache)+", "gi")
+            .unwrap_or_else(|_| panic!("regexp compiles"));
+
+        let objects = crate::value::heap_gc_snapshot(&interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&interp.gc_heap);
+        let first = measure(&interp, &objects, &scopes);
+        let second = measure(&interp, &objects, &scopes);
+
+        assert!(first.engine_caches.bytes > 0);
+        assert!(first.regexp_metadata.bytes > 0);
+        assert!(first.strings_symbols_bigints.bytes >= non_ascii.len() + ascii.len());
+        assert_eq!(first.json(9, 12), second.json(9, 12));
     }
 
     #[test]

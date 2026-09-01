@@ -387,9 +387,12 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Add allocation-family-deduplicated Function/Chunk traversal for primary bytecode,
     constant/name, feedback/IC, hoist, template, and JIT heap-sidecar storage while keeping
     executable mappings separate.
+  - [x] Scan the bounded UTF-16/prepared-subject/compiled-RegExp caches, including payloads pinned
+    only by stale recency entries, while attributing cache storage, strings, and matcher payloads
+    to separate identity-deduplicated families.
   - [ ] Cover remaining recursive AST/uncommon bytecode allocations, every interpreter side table
-    and bounded cache, shared/Wasm backing stores, and host resources; reduce the inventory's
-    `unaccounted` class to zero before changing the report to complete.
+    and remaining bounded cache, shared/Wasm backing stores, and host resources; reduce the
+    inventory's `unaccounted` class to zero before changing the report to complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page

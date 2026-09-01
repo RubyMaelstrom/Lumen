@@ -198,6 +198,46 @@ impl RegexpProgramCache {
     pub(crate) fn stats(&self) -> (usize, usize) {
         (self.entries, self.bytes)
     }
+
+    /// Visit every allocation retained by the cache while returning the directly-owned table and
+    /// recency-queue storage. Standard-library HashMap bucket capacity is opaque, so the table
+    /// contribution is deliberately a lower bound; payloads are attributed by their canonical
+    /// allocation family through `Visitor` rather than to the cache that discovered them.
+    pub(crate) fn scan_retained_memory(
+        &self,
+        visitor: &mut crate::memory::Visitor,
+    ) -> (usize, bool) {
+        let mut storage = self
+            .programs
+            .len()
+            .saturating_mul(std::mem::size_of::<(Rc<str>, FastMap<Rc<str>, RegexpEntry>)>())
+            .saturating_add(self.order.capacity().saturating_mul(std::mem::size_of::<(
+                Rc<str>,
+                Rc<str>,
+                u64,
+            )>()));
+        for (source, by_flags) in &self.programs {
+            visitor.rc_str(source);
+            storage = storage.saturating_add(
+                by_flags
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(Rc<str>, RegexpEntry)>()),
+            );
+            for (flags, entry) in by_flags {
+                visitor.rc_str(flags);
+                visitor.rc_str(&entry.source);
+                visitor.rc_str(&entry.flags);
+                visitor.regex(&entry.value);
+            }
+        }
+        // Stale recency records can outlive their table entry and therefore be the sole owner of
+        // their string payload. The global Rc<str> identity set prevents duplicate attribution.
+        for (source, flags, _) in &self.order {
+            visitor.rc_str(source);
+            visitor.rc_str(flags);
+        }
+        (storage, false)
+    }
 }
 
 impl<K, V> ByteLru<K, V>
@@ -322,6 +362,24 @@ where
     #[cfg(test)]
     pub(crate) fn stats(&self) -> (usize, usize) {
         (self.entries.len(), self.bytes)
+    }
+
+    /// Visit live values and report storage owned by the table and recency queue. HashMap bucket
+    /// capacity is not exposed by std, so the entry portion is a review-visible lower bound.
+    pub(crate) fn scan_retained_memory(&self, mut visit: impl FnMut(&V)) -> (usize, bool) {
+        for entry in self.entries.values() {
+            visit(&entry.value);
+        }
+        let bytes = self
+            .entries
+            .len()
+            .saturating_mul(std::mem::size_of::<(K, Entry<V>)>())
+            .saturating_add(
+                self.order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(K, u64)>()),
+            );
+        (bytes, false)
     }
 }
 

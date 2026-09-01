@@ -139,6 +139,14 @@ Recursive allocations inside retained AST `Stmt`/`Expr`/`Pattern`/`Class` trees 
 uncommon Chunk plans remain a documented lower bound. JIT `pc_offsets` and its Rust payload are
 reported as heap metadata; executable mappings remain exclusively in generated-code metrics.
 
+The bounded string/RegExp cache slice scans UTF-16 views, prepared subjects, the ASCII hot entry,
+and compiled-program cache entries plus stale recency keys. Cache tables and recency queues credit
+only their own storage to `engine_caches`; pinned strings and matcher payloads pass through the
+global string/RegExp identity registries. The diagnostic does not reuse the cache eviction byte
+estimate as an exact total: that estimate may conservatively double-count shared matcher graphs,
+whereas retained-memory reporting now uses a direct-allocation lower bound until shared character
+classes and nested lookaround programs gain identity-aware traversal.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
