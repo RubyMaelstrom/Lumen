@@ -628,8 +628,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 
 #### Phase 3A: central heap, simple old generation, and copying nursery
 
-- [ ] Write the heap safety model before implementation: allocation, rooting, relocation,
-  mutation, barriers, weak references, finalization, and host handles.
+- [x] Write the heap safety model before implementation: allocation, rooting, relocation,
+  mutation, barriers, weak references, finalization, and host handles (`HEAP_SAFETY_MODEL.md`).
+  The contract is a non-executable gate; relocation and nursery work remain blocked until their
+  stress and differential tests exist.
 - [ ] Replace per-object `Rc<RefCell<_>>` ownership incrementally with Agent-owned heap objects and
   explicit tracing, using typed handles that cannot silently create untraced hybrid edges.
 - [ ] Define a compact engine-owned object header carrying layout/type, size, generation/mark
@@ -1025,8 +1027,10 @@ before changing broad execution behavior:
 - [ ] Write and review the tagged-value/frame/root/deoptimization ABI design record.
 - [ ] Migrate one bounded bytecode/frame/helper slice to the canonical tagged ABI and prove forced
   safepoint, relocation, frame walking, and differential behavior before widening the migration.
-- [ ] Write and review the Phase 3A heap safety/migration design, including every root family,
-  object tracer, hybrid-edge rule, promotion destination, and old-to-young barrier.
+- [x] Write and review the Phase 3A heap safety/migration design, including every root family,
+  object tracer, hybrid-edge rule, promotion destination, and old-to-young barrier
+  (`HEAP_SAFETY_MODEL.md`). The document is a non-executable safety gate; object-family migration
+  remains blocked until its relocation and differential tests exist.
 - [ ] Implement and verify deoptimization metadata for a non-speculative toy/general SSA region as
   compiler scaffolding only; defer Map/property specialization until Phase 4 provides stable
   identities.
