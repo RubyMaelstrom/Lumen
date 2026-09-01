@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "suite": {
+    "name": "Speedometer 3.1 TodoMVC-Vue",
+    "fixture_root": "browser-replay-fixtures/speedometer-3.1",
+    "source": {
+      "repository": "https://github.com/WebKit/Speedometer.git",
+      "revision": "1386415be8fef2f6b6bbdbe1828872471c5d802a",
+      "revision_date": "2025-03-11",
+      "raw_base": "https://raw.githubusercontent.com/WebKit/Speedometer/1386415be8fef2f6b6bbdbe1828872471c5d802a"
+    },
+    "files": [
+      {
+        "path": "LICENSE",
+        "sha256": "1f9ee170a26f339b7fbc2e4a638f1d22defacad5b8846dc4a3862e7799a51588"
+      },
+      {
+        "path": "resources/todomvc/architecture-examples/vue/dist/js/chunk-vendors.b4ac9361.js",
+        "sha256": "5a6341a5c1eef0dc8a8bcdd7e706d0892e16a67293cc201daa933452a98451e0"
+      },
+      {
+        "path": "resources/todomvc/architecture-examples/vue/dist/js/app.ad36df07.js",
+        "sha256": "452be7f1e0368a850befdade9dfda12e73cdd9933ea45e9bcc9c325c19f93ced"
+      },
+      {
+        "path": "resources/todomvc/architecture-examples/vue/dist/css/app.319576e1.css",
+        "sha256": "044cf0127f5e8df29b8a4751e4d15289a1af153cd3b8649f53a4e9e19d94a320"
+      }
+    ]
+  }
+}

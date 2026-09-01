@@ -208,6 +208,9 @@ cargo run --release -p lumen-difftest -- --count 2000
 ```sh
 scripts/fetch-v8-v7.py      # one-time provisioning of the revision-pinned classic V8 fixtures
 scripts/bench-matrix.py     # accepted offline/interleaved Node + Bun + Lumen JSON measurement
+scripts/fetch-browser-replay-assets.py  # one-time pinned Speedometer/Vue asset provisioning
+scripts/run-browser-replays.sh quick    # fast production-page-pipeline correctness gate
+scripts/run-browser-replays.sh check    # all offline DOM/event-loop/framework replay gates
 scripts/run-v8bench.sh      # quick directional classic V8 suite run on lumen
 scripts/bench-compare.sh    # quick one-sample markdown table; not an accepted performance result
 

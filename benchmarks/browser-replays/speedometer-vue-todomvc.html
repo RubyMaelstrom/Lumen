@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en" data-framework="vue" data-version="3.2.47" data-features="webpack">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Speedometer 3.1 TodoMVC-Vue replay</title>
+  <script defer src="js/chunk-vendors.b4ac9361.js"></script>
+  <script defer src="js/app.ad36df07.js"></script>
+  <link href="css/app.319576e1.css" rel="stylesheet">
+</head>
+<body>
+  <section class="todoapp"></section>
+  <output id="replay-result" data-replay-state="pending" data-replay-checksum="pending" data-replay-expected="100:100:100"></output>
+  <script>
+  (() => {
+    "use strict";
+    const result = document.getElementById("replay-result");
+    const count = selector => document.querySelectorAll(selector).length;
+    const fail = message => {
+      result.dataset.replayState = "failed";
+      result.dataset.replayChecksum = message;
+      throw new Error(message);
+    };
+    const enter = target => target.dispatchEvent(new KeyboardEvent("keyup", {
+      bubbles: true,
+      cancelable: true,
+      key: "Enter",
+      code: "Enter",
+      keyCode: 13,
+      which: 13,
+    }));
+
+    const newTodo = document.querySelector(".new-todo");
+    if (!newTodo) fail("Vue did not mount TodoMVC");
+    newTodo.focus();
+    for (let index = 0; index < 100; index++) {
+      newTodo.value = `TRust Speedometer item ${index}`;
+      newTodo.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+      enter(newTodo);
+    }
+
+    setTimeout(() => {
+      const added = count(".todo-list li");
+      if (added !== 100) fail(`expected 100 added todos, got ${added}`);
+      const checkboxes = document.querySelectorAll(".toggle");
+      for (let index = 0; index < checkboxes.length; index++) checkboxes[index].click();
+
+      setTimeout(() => {
+        const completed = count(".todo-list li.completed");
+        if (completed !== 100) fail(`expected 100 completed todos, got ${completed}`);
+        const deleteButtons = document.querySelectorAll(".destroy");
+        for (let index = deleteButtons.length - 1; index >= 0; index--) deleteButtons[index].click();
+
+        setTimeout(() => {
+          const removed = 100 - count(".todo-list li");
+          const checksum = `${added}:${completed}:${removed}`;
+          result.dataset.replayChecksum = checksum;
+          result.dataset.replayState = "complete";
+          result.textContent = "complete";
+        }, 0);
+      }, 0);
+    }, 0);
+  })();
+  </script>
+</body>
+</html>
