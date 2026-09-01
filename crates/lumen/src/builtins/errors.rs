@@ -58,6 +58,7 @@ pub(super) fn install_errors(it: &mut Interp) {
                 ))
             }
         };
+        let perf_started = crate::jit::perf_stage_start();
         let name = match ab(i.get_member(&this, "name"))? {
             Value::Undefined => "Error".to_string(),
             v => ab(i.to_string(&v))?.to_string(),
@@ -73,6 +74,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         } else {
             format!("{name}: {msg}")
         };
+        crate::jit::perf_error_stack_format_end(perf_started);
         Ok(Value::from_string(format!("{head}{frames}")))
     });
     // set stack: SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v).
@@ -322,7 +324,9 @@ fn make_err(i: &mut Interp, kind: &str, args: &[Value]) -> Result<Value, Value> 
     if let Some(msg) = args.first() {
         if !matches!(msg, Value::Undefined) {
             // ToString(message) may throw (e.g. a Symbol, or a throwing toString) — propagate it.
+            let perf_started = crate::jit::perf_stage_start();
             let s = ab(i.to_string(msg))?;
+            crate::jit::perf_error_message_end(perf_started);
             // The own `message` is { writable:true, enumerable:false, configurable:true }.
             if let Some(e) = err.as_obj() {
                 e.borrow_mut()

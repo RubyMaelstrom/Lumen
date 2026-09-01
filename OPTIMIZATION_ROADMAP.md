@@ -554,6 +554,10 @@ finish the baseline, but no later phase may claim a performance win against the 
 - [ ] Measure error construction as separate message conversion, object allocation, stack capture,
   and stack formatting costs; distinguish constructed, thrown/caught, and escaping errors before
   considering lazy stack materialization for Lumen's non-standard `stack` extension.
+  - [x] Expose opt-in construction counts plus message-conversion, stack-capture, and stack-format
+    timings at the existing error helpers; no error behavior or stack contents change.
+  - [ ] Add object-allocation timing and lifecycle classification (constructed versus caught or
+    escaping) without conflating a thrown completion with an allocation site.
 - [ ] Measure conversion and protocol helpers separately, including `ToPrimitive`, `toString`,
   `valueOf`, `GetIterator`, iterator stepping/closing, spread, and ordinary/symbol iteration.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.

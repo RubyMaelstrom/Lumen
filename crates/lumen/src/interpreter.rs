@@ -2714,14 +2714,22 @@ impl Interp {
     // ----- error helpers ----------------------------------------------------------------------
 
     pub fn make_error(&self, kind: &str, message: impl Into<String>) -> Value {
+        crate::jit::perf_error_construction();
         let proto = self
             .error_protos
             .get(kind)
             .cloned()
             .unwrap_or_else(|| self.error_protos["Error"].clone());
+        let object_started = crate::jit::perf_stage_start();
         let obj = Object::new(Some(proto));
-        obj.borrow_mut().exotic = Exotic::error(self.capture_stack());
+        crate::jit::perf_error_object_end(object_started);
+        let stack_started = crate::jit::perf_stage_start();
+        let stack = self.capture_stack();
+        crate::jit::perf_error_stack_capture_end(stack_started);
+        obj.borrow_mut().exotic = Exotic::error(stack);
+        let message_started = crate::jit::perf_stage_start();
         let msg = message.into();
+        crate::jit::perf_error_message_end(message_started);
         if !msg.is_empty() {
             obj.borrow_mut()
                 .props
