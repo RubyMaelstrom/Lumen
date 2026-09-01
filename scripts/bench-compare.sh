@@ -8,14 +8,13 @@
 #   scripts/bench-compare.sh --tiers         # also include lumen bytecode + interp tiers
 #
 # Requires: node and bun on PATH (either is skipped with a warning if missing).
-# Downloads the benchmark JS into ./v8-v7 (gitignored) on first run and builds
-# the `lumen` CLI in release mode.
+# Verifies the benchmark JS against benchmarks/engine-matrix.json (fetching the pinned revision on
+# first use) and builds the `lumen` CLI in release mode. Use bench-matrix.py for accepted results;
+# this script remains a quick directional table.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$ROOT/v8-v7"
-RAW="https://raw.githubusercontent.com/mozilla/arewefastyet/master/benchmarks/v8-v7"
-FILES=(base.js richards.js deltablue.js crypto.js raytrace.js earley-boyer.js regexp.js splay.js navier-stokes.js run.js)
 SUITES=(richards deltablue crypto raytrace earley-boyer regexp splay navier-stokes)
 BENCH_NAMES=(Richards DeltaBlue Crypto RayTrace EarleyBoyer RegExp Splay NavierStokes Score)
 
@@ -24,13 +23,7 @@ if [ "${1:-}" = "--tiers" ]; then
   ALL_TIERS=1
 fi
 
-if [ ! -f "$DEST/base.js" ]; then
-  echo "Downloading v8-v7 benchmark into $DEST ..." >&2
-  mkdir -p "$DEST"
-  for f in "${FILES[@]}"; do
-    curl -fsSL "$RAW/$f" -o "$DEST/$f"
-  done
-fi
+"$ROOT/scripts/fetch-v8-v7.py" >&2
 
 # The upstream driver uses the shell `load()`; the lumen CLI takes files in sequence instead.
 sed '/^load(/d' "$DEST/run.js" > "$DEST/driver.js"

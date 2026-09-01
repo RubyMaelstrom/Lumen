@@ -35,6 +35,41 @@ use crate::bytecode::UpdKind;
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
 
+/// Opt-in process counters used by the reproducible benchmark runner. The enabled check occurs
+/// only when a chunk first attempts native compilation, never in generated code or ordinary JIT
+/// execution. Relaxed atomics are sufficient: these are aggregate diagnostics, not engine state.
+static PERF_METRICS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static PERF_COMPILE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_COMPILE_SUCCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_COMPILE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_GENERATED_CODE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_LARGEST_CODE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn perf_metrics_enabled() -> bool {
+    *PERF_METRICS_ENABLED.get_or_init(|| std::env::var_os("LUMEN_PERF_METRICS").is_some())
+}
+
+/// Machine-readable process summary printed by the CLI at normal exit. Kept as a single JSON line
+/// so an external runner can separate it from other diagnostics without a serializer dependency.
+pub(crate) fn performance_metrics_json() -> Option<String> {
+    if !perf_metrics_enabled() {
+        return None;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let attempts = PERF_COMPILE_ATTEMPTS.load(Relaxed);
+    let successes = PERF_COMPILE_SUCCESSES.load(Relaxed);
+    let nanos = PERF_COMPILE_NANOS.load(Relaxed);
+    let generated = PERF_GENERATED_CODE_BYTES.load(Relaxed);
+    let largest = PERF_LARGEST_CODE_BYTES.load(Relaxed);
+    Some(format!(
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest}}}",
+        attempts.saturating_sub(successes),
+        nanos as f64 / 1_000_000_000.0,
+    ))
+}
+
 /// ARM64's generated templates use owned 8-byte NaN-boxed local slots. The x64 backend keeps
 /// the established wide `Value` ABI until its load/store templates are migrated as a unit.
 const PACKED_LOCAL_SLOTS: bool = false;
@@ -3403,6 +3438,32 @@ pub fn compile(
     _ilayout: &crate::interpreter::InterpLayout,
 ) -> Option<JitCode> {
     None
+}
+
+/// Compile one chunk and, when explicitly requested, account for compilation latency and emitted
+/// instruction bytes. Keeping this wrapper outside the target-specific emitters ensures AArch64,
+/// x86-64, successful compilations, and defensive fallbacks use one measurement definition.
+pub(crate) fn compile_profiled(
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+) -> Option<JitCode> {
+    if !perf_metrics_enabled() {
+        return compile(chunk, layout, ilayout);
+    }
+    let started = std::time::Instant::now();
+    let result = compile(chunk, layout, ilayout);
+    let elapsed = started.elapsed();
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_COMPILE_ATTEMPTS.fetch_add(1, Relaxed);
+    PERF_COMPILE_NANOS.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
+    if let Some(code) = &result {
+        let bytes = code.len as u64;
+        PERF_COMPILE_SUCCESSES.fetch_add(1, Relaxed);
+        PERF_GENERATED_CODE_BYTES.fetch_add(bytes, Relaxed);
+        PERF_LARGEST_CODE_BYTES.fetch_max(bytes, Relaxed);
+    }
+    result
 }
 
 /// Whether `layout` is usable for the inline GetProp template: valid (probed std layouts hold)

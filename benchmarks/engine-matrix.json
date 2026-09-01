@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "suite": {
+    "id": "classic-v8-v7",
+    "title": "Classic V8 benchmark suite, version 7",
+    "direction": "higher",
+    "fixture_root": "v8-v7",
+    "source": {
+      "repository": "https://github.com/mozilla/arewefastyet.git",
+      "revision": "0e2160885d0ca693577d54f1bbbe572f052282c6",
+      "path": "benchmarks/v8-v7",
+      "raw_base": "https://raw.githubusercontent.com/mozilla/arewefastyet/0e2160885d0ca693577d54f1bbbe572f052282c6/benchmarks/v8-v7"
+    },
+    "files": [
+      {
+        "path": "base.js",
+        "sha256": "ac383759c3cbf5f3a499ade526a4e296f7925733d8c3889b6d5840ce6867ff51",
+        "role": "base"
+      },
+      {
+        "path": "richards.js",
+        "sha256": "d86eac4108343a54ba6e10621a77b46f82f554c3b0a46e8fb4032d5cf65a2a11",
+        "role": "workload"
+      },
+      {
+        "path": "deltablue.js",
+        "sha256": "74b5a95f4877701073c6efef08e4ae306562747067e292925b69cbd629a511b9",
+        "role": "workload"
+      },
+      {
+        "path": "crypto.js",
+        "sha256": "d8b885eadc8be11c28f79543876beaa85bd70c71cfd5265c020005f43b59f48a",
+        "role": "workload"
+      },
+      {
+        "path": "raytrace.js",
+        "sha256": "d52183ca324cdb88d9ee3e78326433fe2ca28d6436f0a6c3ec013ab67cb798eb",
+        "role": "workload"
+      },
+      {
+        "path": "earley-boyer.js",
+        "sha256": "7bfa888839dee0939798d0f5da251f0ecb30fc5ea2ee52747b4adc5b0386e6ad",
+        "role": "workload"
+      },
+      {
+        "path": "regexp.js",
+        "sha256": "f04a1b4817e5d687363e99d941cc78de9b29b722b46cc034d877f59a269bdfdf",
+        "role": "workload"
+      },
+      {
+        "path": "splay.js",
+        "sha256": "1f875cec579d03af40d256ceaeb6823f3ef16c883652650ca51d183472a8185d",
+        "role": "workload"
+      },
+      {
+        "path": "navier-stokes.js",
+        "sha256": "ce241465ffeee77b5c4f7119f522aa971fe1fe92c3aed76f7514ea43e07fec84",
+        "role": "workload"
+      },
+      {
+        "path": "run.js",
+        "sha256": "11ef403ccc064bccf8230542510fdf2fce0bf09379e05badf5e01663b3d2a576",
+        "role": "driver"
+      }
+    ],
+    "base": "base.js",
+    "driver": "run.js",
+    "workloads": [
+      {
+        "id": "richards",
+        "label": "Richards",
+        "file": "richards.js"
+      },
+      {
+        "id": "deltablue",
+        "label": "DeltaBlue",
+        "file": "deltablue.js"
+      },
+      {
+        "id": "crypto",
+        "label": "Crypto",
+        "file": "crypto.js"
+      },
+      {
+        "id": "raytrace",
+        "label": "RayTrace",
+        "file": "raytrace.js"
+      },
+      {
+        "id": "earley-boyer",
+        "label": "EarleyBoyer",
+        "file": "earley-boyer.js"
+      },
+      {
+        "id": "regexp",
+        "label": "RegExp",
+        "file": "regexp.js"
+      },
+      {
+        "id": "splay",
+        "label": "Splay",
+        "file": "splay.js"
+      },
+      {
+        "id": "navier-stokes",
+        "label": "NavierStokes",
+        "file": "navier-stokes.js"
+      }
+    ]
+  },
+  "run": {
+    "warmup_rounds": 1,
+    "sample_rounds": 7,
+    "timeout_seconds": 1800,
+    "cpu_affinity": [
+      5
+    ],
+    "schedule_seed": 1592639215,
+    "confidence_level": 0.95,
+    "bootstrap_resamples": 10000,
+    "environment": {
+      "LANG": "C",
+      "LC_ALL": "C",
+      "TZ": "UTC"
+    },
+    "clear_environment_prefixes": [
+      "LUMEN_",
+      "TRUST_"
+    ]
+  },
+  "reference_engine": "node",
+  "engines": [
+    {
+      "id": "node",
+      "label": "Node/V8",
+      "program": "node",
+      "version_args": [
+        "--version"
+      ],
+      "expected_version": "v24.19.0",
+      "input_mode": "combined",
+      "args": [],
+      "allocator": "engine default",
+      "required": false
+    },
+    {
+      "id": "bun",
+      "label": "Bun",
+      "program": "bun",
+      "version_args": [
+        "--version"
+      ],
+      "expected_version": "1.4.0",
+      "input_mode": "combined",
+      "args": [],
+      "allocator": "engine default",
+      "required": false
+    },
+    {
+      "id": "lumen-jit",
+      "label": "Lumen JIT",
+      "program": "target/release/lumen",
+      "version_args": [
+        "--version"
+      ],
+      "expected_version": "lumen 0.1.3",
+      "input_mode": "separate",
+      "args": [
+        "--tier=jit"
+      ],
+      "environment": {
+        "LUMEN_PERF_METRICS": "1"
+      },
+      "metrics_stderr_prefix": "[lumen-perf] ",
+      "allocator": "Rust system allocator",
+      "required": true,
+      "artifact": "target/release/lumen",
+      "build": [
+        "cargo",
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "-q",
+        "-p",
+        "lumen",
+        "--bin",
+        "lumen"
+      ]
+    }
+  ],
+  "provenance": {
+    "repositories": [
+      {
+        "id": "lumen",
+        "path": "."
+      },
+      {
+        "id": "trust",
+        "path": "../TRust"
+      }
+    ],
+    "accepted_production": "benchmarks/accepted-production.json"
+  }
+}

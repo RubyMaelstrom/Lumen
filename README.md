@@ -206,8 +206,10 @@ cargo run --release -p lumen-difftest -- --count 2000
 ## Benchmarks
 
 ```sh
-scripts/run-v8bench.sh      # classic V8 suite (v8-v7) on lumen; downloads on first run
-scripts/bench-compare.sh    # same suite on node + bun + lumen, as a markdown table
+scripts/fetch-v8-v7.py      # one-time provisioning of the revision-pinned classic V8 fixtures
+scripts/bench-matrix.py     # accepted offline/interleaved Node + Bun + Lumen JSON measurement
+scripts/run-v8bench.sh      # quick directional classic V8 suite run on lumen
+scripts/bench-compare.sh    # quick one-sample markdown table; not an accepted performance result
 
 git clone https://github.com/chromium/octane.git ../octane   # one-time: Octane checkout
 scripts/run-octane.sh                    # full Octane suite

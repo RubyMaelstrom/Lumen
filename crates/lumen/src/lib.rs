@@ -108,6 +108,15 @@ use value::Value;
 
 pub use interrupt::{InterruptReason, RuntimeInterrupt};
 
+/// Unstable, opt-in process diagnostics for Lumen's own benchmark tooling.
+///
+/// Returns `None` unless `LUMEN_PERF_METRICS` was present when the JIT first checked its diagnostic
+/// state. This is intentionally not a stable embedder API.
+#[doc(hidden)]
+pub fn unstable_performance_metrics_json() -> Option<String> {
+    jit::performance_metrics_json()
+}
+
 /// Internal-stage entry points, exposed only for benchmarking (`bench` feature). These reach past
 /// the stable public API to time individual compilation stages (lex → parse → snapshot encode →
 /// decode) — the breakdown behind cold-boot cost. Not a stability commitment; do not depend on it.

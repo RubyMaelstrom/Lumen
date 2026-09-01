@@ -7263,7 +7263,7 @@ impl Interp {
                     self.interp_layout.set(l);
                 }
                 let _ = chunk.jit.set(
-                    crate::jit::compile(chunk, &layout, &self.interp_layout.get())
+                    crate::jit::compile_profiled(chunk, &layout, &self.interp_layout.get())
                         .map(std::rc::Rc::new),
                 );
             }

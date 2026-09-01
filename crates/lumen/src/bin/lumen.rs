@@ -19,7 +19,18 @@ use lumen::{Completion, Engine};
 #[global_allocator]
 static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;
 
+struct PerformanceMetricsGuard;
+
+impl Drop for PerformanceMetricsGuard {
+    fn drop(&mut self) {
+        if let Some(metrics) = lumen::unstable_performance_metrics_json() {
+            eprintln!("[lumen-perf] {metrics}");
+        }
+    }
+}
+
 fn main() {
+    let _performance_metrics = PerformanceMetricsGuard;
     let mut module = false;
     let mut interactive = false;
     let mut tier = None;
@@ -153,6 +164,7 @@ Diagnostics (env, unstable):
   LUMEN_JIT_OPSTAT=1      Tally ops that reach the JIT slow path (top at exit; =2 pinpoints sites)
   LUMEN_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
   LUMEN_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
+  LUMEN_PERF_METRICS=1    Print one JSON JIT compile/code-size summary at normal exit
 "
     );
 }

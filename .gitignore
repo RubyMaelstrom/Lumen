@@ -1,4 +1,5 @@
 /target/
+__pycache__/
 # tc39/test262 conformance suite (cloned on demand by scripts/test262-clone.sh) + its score report.
 /test262/
 /test262-report/
@@ -12,6 +13,8 @@
 /autobahn-reports/
 # Classic V8 benchmark suite (downloaded on demand by scripts/run-v8bench.sh).
 /v8-v7/
+# Machine-readable local performance reports from scripts/bench-matrix.py.
+/benchmark-results/
 # Playground wasm bundle + build stamp (built by wasm-pack in .github/workflows/pages.yml).
 /site/pkg/
 /site/version.json
