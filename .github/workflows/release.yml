@@ -1,15 +1,10 @@
 name: Release
 
-# Pushing a version tag (e.g. v0.1.0 — release-plz creates these when the release PR merges) builds
-# lumen in release mode for each supported platform and publishes a GitHub release with the binaries
-# attached, named by target triple: lumen-<target-triple> (the bare engine shell) and
-# lumen-cli-<target-triple> (the Node/Deno-style runtime users run programs with).
-#
-# Also dispatchable at a tag ref: tags created with the default GITHUB_TOKEN (release-plz's) do not
-# fire `push` events, so release-plz.yml dispatches this workflow explicitly after tagging.
+# Manually dispatching this workflow at a version tag (e.g. v0.1.0) builds lumen in release mode for
+# each supported platform and publishes a GitHub release with the binaries attached, named by target
+# triple: lumen-<target-triple> (the bare engine shell) and lumen-cli-<target-triple> (the Node/Deno-
+# style runtime users run programs with).
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:

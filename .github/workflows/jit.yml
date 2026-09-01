@@ -1,11 +1,6 @@
 name: JIT targets
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/lumen/**'
-      - '.github/workflows/jit.yml'
   pull_request:
     paths:
       - 'crates/lumen/**'

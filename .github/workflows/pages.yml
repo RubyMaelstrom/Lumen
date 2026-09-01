@@ -1,10 +1,8 @@
 name: Pages
 
 # Builds the playground (the lumen engine compiled to WebAssembly + the static page in site/) and
-# deploys it to GitHub Pages on every push to main: https://lucid-softworks.github.io/lumen/
+# deploys it to GitHub Pages when manually dispatched: https://lucid-softworks.github.io/lumen/
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
