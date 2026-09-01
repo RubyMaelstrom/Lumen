@@ -103,6 +103,16 @@ static PERF_ITERATOR_CLOSE_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static PERF_ITERATOR_CLOSE_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static PERF_TO_PRIMITIVE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_TO_PRIMITIVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_TO_PRIMITIVE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_TO_STRING_OBJECT_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_TO_STRING_OBJECT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_TO_STRING_OBJECT_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn perf_metrics_enabled() -> bool {
@@ -285,6 +295,34 @@ pub(crate) fn perf_iterator_close_end(started: Option<std::time::Instant>) {
 }
 
 #[inline]
+pub(crate) fn perf_to_primitive_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_TO_PRIMITIVE_CALLS.fetch_add(1, Relaxed);
+    PERF_TO_PRIMITIVE_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if !success {
+        PERF_TO_PRIMITIVE_FAILURES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_to_string_object_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_TO_STRING_OBJECT_CALLS.fetch_add(1, Relaxed);
+    PERF_TO_STRING_OBJECT_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if !success {
+        PERF_TO_STRING_OBJECT_FAILURES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
 pub(crate) fn perf_inline_attempt() {
     if perf_metrics_enabled() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -382,9 +420,15 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let iterator_step_failures = PERF_ITERATOR_STEP_FAILURES.load(Relaxed);
     let iterator_close_calls = PERF_ITERATOR_CLOSE_CALLS.load(Relaxed);
     let iterator_close_nanos = PERF_ITERATOR_CLOSE_NANOS.load(Relaxed);
+    let to_primitive_calls = PERF_TO_PRIMITIVE_CALLS.load(Relaxed);
+    let to_primitive_nanos = PERF_TO_PRIMITIVE_NANOS.load(Relaxed);
+    let to_primitive_failures = PERF_TO_PRIMITIVE_FAILURES.load(Relaxed);
+    let to_string_object_calls = PERF_TO_STRING_OBJECT_CALLS.load(Relaxed);
+    let to_string_object_nanos = PERF_TO_STRING_OBJECT_NANOS.load(Relaxed);
+    let to_string_object_failures = PERF_TO_STRING_OBJECT_FAILURES.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
         lex_nanos as f64 / 1_000_000_000.0,
@@ -402,6 +446,8 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
         iterator_get_nanos as f64 / 1_000_000_000.0,
         iterator_step_nanos as f64 / 1_000_000_000.0,
         iterator_close_nanos as f64 / 1_000_000_000.0,
+        to_primitive_nanos as f64 / 1_000_000_000.0,
+        to_string_object_nanos as f64 / 1_000_000_000.0,
     ))
 }
 

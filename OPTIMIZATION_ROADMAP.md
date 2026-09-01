@@ -556,15 +556,18 @@ finish the baseline, but no later phase may claim a performance win against the 
   considering lazy stack materialization for Lumen's non-standard `stack` extension.
   - [x] Expose opt-in construction counts plus message-conversion, stack-capture, and stack-format
     timings at the existing error helpers; no error behavior or stack contents change.
-  - [ ] Add object-allocation timing and lifecycle classification (constructed versus caught or
-    escaping) without conflating a thrown completion with an allocation site.
+  - [x] Add object-allocation timing; lifecycle classification (constructed versus caught or
+    escaping) remains separate so a thrown completion is not conflated with an allocation site.
+  - [ ] Add lifecycle classification (constructed versus caught or escaping) without conflating a
+    thrown completion with an allocation site.
 - [ ] Measure conversion and protocol helpers separately, including `ToPrimitive`, `toString`,
   `valueOf`, `GetIterator`, iterator stepping/closing, spread, and ordinary/symbol iteration.
   - [x] Expose opt-in GetIterator, IteratorStep, and both IteratorClose path timings/failure
     counts; the wrappers preserve the existing ECMA-262 protocol ordering.
-  - [ ] Measure ToPrimitive/string conversion and spread/ordinary-versus-symbol iteration paths
-    with stable helper identities and without adding a disabled-path timestamp to primitive fast
-    cases.
+  - [x] Expose opt-in object-path `ToPrimitive`/`toString` timings and failures; primitive fast
+    paths do not take a timestamp when diagnostics are disabled.
+  - [ ] Measure spread/ordinary-versus-symbol iteration paths with stable helper identities and
+    without adding a disabled-path timestamp to primitive fast cases.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
 - [ ] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
   recover diagnostics.

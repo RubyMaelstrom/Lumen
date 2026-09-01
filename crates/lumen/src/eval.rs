@@ -7403,26 +7403,31 @@ impl Interp {
     }
 
     pub fn to_string(&mut self, v: &Value) -> Result<crate::lstr::LStr, Abrupt> {
-        Ok(match v {
-            Value::Undefined | Value::Empty => crate::lstr::LStr::from("undefined"),
-            Value::Null => crate::lstr::LStr::from("null"),
-            Value::Bool(b) => crate::lstr::LStr::from(if *b { "true" } else { "false" }),
-            Value::Num(n) => crate::lstr::LStr::from(self.num_to_str(*n).as_str()),
-            Value::BigInt(n) => crate::lstr::LStr::from(n.to_string().as_str()),
-            Value::Str(s) => s.clone(),
+        match v {
+            Value::Undefined | Value::Empty => Ok(crate::lstr::LStr::from("undefined")),
+            Value::Null => Ok(crate::lstr::LStr::from("null")),
+            Value::Bool(b) => Ok(crate::lstr::LStr::from(if *b { "true" } else { "false" })),
+            Value::Num(n) => Ok(crate::lstr::LStr::from(self.num_to_str(*n).as_str())),
+            Value::BigInt(n) => Ok(crate::lstr::LStr::from(n.to_string().as_str())),
+            Value::Str(s) => Ok(s.clone()),
             Value::Sym(_) => {
-                return Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"));
+                Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"))
             }
             Value::Obj(_) => {
-                let p = self.to_primitive(v, Hint::String)?;
-                match p {
-                    Value::Obj(_) => {
-                        return Err(self.throw("TypeError", "cannot convert object to string"));
+                let perf_started = crate::jit::perf_stage_start();
+                let result = (|| {
+                    let p = self.to_primitive(v, Hint::String)?;
+                    match p {
+                        Value::Obj(_) => {
+                            Err(self.throw("TypeError", "cannot convert object to string"))
+                        }
+                        other => self.to_string(&other),
                     }
-                    other => self.to_string(&other)?,
-                }
+                })();
+                crate::jit::perf_to_string_object_end(perf_started, result.is_ok());
+                result
             }
-        })
+        }
     }
 
     pub(crate) fn to_property_key(
@@ -7468,42 +7473,47 @@ impl Interp {
             Value::Obj(o) => o.clone(),
             _ => return Ok(v.clone()),
         };
-        // A `@@toPrimitive` method takes precedence over valueOf/toString.
-        if let Some(key) = self.well_known_sym_key("toPrimitive") {
-            let f = self.get_member(&Value::Obj(obj.clone()), &key)?;
-            // GetMethod: a present-but-non-callable @@toPrimitive (not undefined/null) is a TypeError.
-            if !matches!(f, Value::Undefined | Value::Null) && !f.is_callable() {
-                return Err(self.throw("TypeError", "@@toPrimitive is not callable"));
-            }
-            if f.is_callable() {
-                let hint_str = match hint {
-                    Hint::String => "string",
-                    Hint::Number => "number",
-                    Hint::Default => "default",
-                };
-                let r = self.call(f, v.clone(), &[Value::str(hint_str)])?;
-                if matches!(r, Value::Obj(_)) {
-                    return Err(
-                        self.throw("TypeError", "Cannot convert object to a primitive value")
-                    );
+        let perf_started = crate::jit::perf_stage_start();
+        let result: Result<Value, Abrupt> = (|| {
+            // A `@@toPrimitive` method takes precedence over valueOf/toString.
+            if let Some(key) = self.well_known_sym_key("toPrimitive") {
+                let f = self.get_member(&Value::Obj(obj.clone()), &key)?;
+                // GetMethod: a present-but-non-callable @@toPrimitive (not undefined/null) is a TypeError.
+                if !matches!(f, Value::Undefined | Value::Null) && !f.is_callable() {
+                    return Err(self.throw("TypeError", "@@toPrimitive is not callable"));
                 }
-                return Ok(r);
-            }
-        }
-        let order: [&str; 2] = match hint {
-            Hint::String => ["toString", "valueOf"],
-            _ => ["valueOf", "toString"],
-        };
-        for method in order {
-            let f = self.get_member(&Value::Obj(obj.clone()), method)?;
-            if f.is_callable() {
-                let r = self.call(f, v.clone(), &[])?;
-                if !matches!(r, Value::Obj(_)) {
+                if f.is_callable() {
+                    let hint_str = match hint {
+                        Hint::String => "string",
+                        Hint::Number => "number",
+                        Hint::Default => "default",
+                    };
+                    let r = self.call(f, v.clone(), &[Value::str(hint_str)])?;
+                    if matches!(r, Value::Obj(_)) {
+                        return Err(
+                            self.throw("TypeError", "Cannot convert object to a primitive value")
+                        );
+                    }
                     return Ok(r);
                 }
             }
-        }
-        Err(self.throw("TypeError", "cannot convert object to primitive value"))
+            let order: [&str; 2] = match hint {
+                Hint::String => ["toString", "valueOf"],
+                _ => ["valueOf", "toString"],
+            };
+            for method in order {
+                let f = self.get_member(&Value::Obj(obj.clone()), method)?;
+                if f.is_callable() {
+                    let r = self.call(f, v.clone(), &[])?;
+                    if !matches!(r, Value::Obj(_)) {
+                        return Ok(r);
+                    }
+                }
+            }
+            Err(self.throw("TypeError", "cannot convert object to primitive value"))
+        })();
+        crate::jit::perf_to_primitive_end(perf_started, result.is_ok());
+        result
     }
 
     /// ECMAScript `Number::toString` (base 10): the shortest round-tripping digit string, formatted
