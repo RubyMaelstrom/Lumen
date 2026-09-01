@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use lumen_host::{ArrayBufferBytes, Ctx, Value, WeakValue};
+use lumen_host::{
+    ArrayBufferBytes, Ctx, RetainedExternalAllocation, RetainedExternalMemory, Value, WeakValue,
+};
 
 use crate::wasm;
 use crate::wasm::exec::{Host, Imports, Store, StoreRoot, Val};
@@ -36,6 +38,14 @@ enum WasmRoot {
 struct MemoryBuffer {
     storage: ArrayBufferBytes,
     buffer: Value,
+}
+
+impl RetainedExternalMemory for WasmStore {
+    fn retained_external_memory(&self, visit: &mut dyn FnMut(RetainedExternalAllocation)) {
+        for memory in self.store.memories.iter().flatten() {
+            visit(RetainedExternalAllocation::wasm_array_buffer(&memory.bytes));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -815,4 +825,24 @@ pub(crate) fn op_global_set(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
         g.val = val;
     }
     Ok(Value::Undefined)
+}
+
+#[cfg(test)]
+mod retained_memory_tests {
+    use super::*;
+
+    #[test]
+    fn wasm_store_reports_each_live_memory_backing_once() {
+        let mut wasm = WasmStore::default();
+        wasm.store
+            .alloc_memory(1, Some(2))
+            .expect("first memory allocation");
+        wasm.store
+            .alloc_memory(2, Some(3))
+            .expect("second memory allocation");
+
+        let mut allocations = Vec::new();
+        wasm.retained_external_memory(&mut |allocation| allocations.push(allocation));
+        assert_eq!(allocations.len(), 2);
+    }
 }

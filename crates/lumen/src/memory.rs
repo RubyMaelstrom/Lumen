@@ -5,7 +5,7 @@
 //! emitted record; unavailable owners are never represented by a misleading zero.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::rc::Rc;
 
@@ -93,6 +93,26 @@ impl SharedBackingCategory {
             ),
             self.bytes(),
             allocations
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WasmBackingCategory {
+    bytes: usize,
+    identity_conflict: bool,
+}
+
+impl WasmBackingCategory {
+    fn json(self) -> String {
+        let reason = if self.identity_conflict {
+            "conflicting byte counts were reported for one Wasm allocation identity; unreported embedder stores are also excluded"
+        } else {
+            "embedder stores without RetainedExternalMemory reporters are excluded"
+        };
+        format!(
+            "{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"{}\"}}",
+            self.bytes, reason
         )
     }
 }
@@ -192,6 +212,7 @@ pub(crate) struct Snapshot {
     interpreter_side_tables: Category,
     array_buffer_backing: Category,
     shared_array_buffer_backing: SharedBackingCategory,
+    wasm_backing: WasmBackingCategory,
     host_resources: HostCategory,
 }
 
@@ -218,7 +239,8 @@ impl Snapshot {
         let managed_external_bytes = self
             .array_buffer_backing
             .bytes
-            .saturating_add(self.shared_array_buffer_backing.bytes());
+            .saturating_add(self.shared_array_buffer_backing.bytes())
+            .saturating_add(self.wasm_backing.bytes);
         format!(
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
@@ -233,7 +255,7 @@ impl Snapshot {
                 "\"regexp_metadata\":{},\"engine_caches\":{},",
                 "\"interpreter_side_tables\":{},\"array_buffer_backing\":{},",
                 "\"shared_array_buffer_backing\":{},",
-                "\"wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"embedder Wasm store accounting has not landed\"}},",
+                "\"wasm_backing\":{},",
                 "\"host_resources\":{}",
                 "}}}}"
             ),
@@ -254,6 +276,7 @@ impl Snapshot {
             self.interpreter_side_tables.json(),
             self.array_buffer_backing.json(),
             self.shared_array_buffer_backing.json(),
+            self.wasm_backing.json(),
             self.host_resources.json(),
         )
     }
@@ -278,16 +301,18 @@ pub(crate) struct Visitor {
     regexes: HashSet<usize>,
     rc_u16_slices: HashSet<usize>,
     rc_value_slices: HashSet<usize>,
-    array_buffers: HashSet<usize>,
+    array_buffers: HashMap<usize, usize>,
     shared_array_buffers: HashSet<u64>,
     shared_array_buffer_allocations: Vec<SharedBackingAllocation>,
     unavailable_shared_array_buffers: usize,
+    external_allocations:
+        HashMap<crate::host::RetainedExternalIdentity, crate::host::RetainedExternalAllocation>,
+    external_identity_conflict: bool,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
     function_bytecode_metadata: usize,
     jit_heap_metadata: usize,
     regexp_metadata: usize,
-    array_buffer_bytes: usize,
     detached_property_storage: usize,
     detached_property_storage_opaque: bool,
 }
@@ -470,10 +495,36 @@ impl Visitor {
 
     fn array_buffer(&mut self, buffer: &crate::interpreter::ArrayBufferBytes) {
         let identity = Rc::as_ptr(buffer) as usize;
-        if self.array_buffers.insert(identity) {
-            self.array_buffer_bytes = self
-                .array_buffer_bytes
-                .saturating_add(buffer.borrow().capacity());
+        self.array_buffers
+            .entry(identity)
+            .or_insert_with(|| buffer.borrow().capacity());
+    }
+
+    fn array_buffer_bytes(&self) -> usize {
+        self.array_buffers
+            .iter()
+            .filter(|(identity, _)| {
+                !self.external_allocations.contains_key(
+                    &crate::host::RetainedExternalIdentity::ArrayBufferBytes(**identity),
+                )
+            })
+            .map(|(_, bytes)| *bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn external_allocation(&mut self, allocation: crate::host::RetainedExternalAllocation) {
+        match self.external_allocations.entry(allocation.identity) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(allocation);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().bytes != allocation.bytes || entry.get().kind != allocation.kind {
+                    self.external_identity_conflict = true;
+                    if allocation.bytes > entry.get().bytes {
+                        entry.insert(allocation);
+                    }
+                }
+            }
         }
     }
 
@@ -691,9 +742,11 @@ fn scan_realm(
     totals.object_count = totals.object_count.saturating_add(objects.len());
     totals.scope_count = totals.scope_count.saturating_add(scopes.len());
     totals.interpreter_side_tables.add(size_of::<Interp>());
-    totals
-        .host_resources
-        .add(interp.host_state.retained_memory());
+    let host_memory = interp.host_state.retained_memory();
+    for allocation in &host_memory.external_allocations {
+        visitor.external_allocation(*allocation);
+    }
+    totals.host_resources.add(host_memory);
     let (gc_heap_bytes, gc_heap_exact) = visitor.gc_heap(&interp.gc_heap);
     totals.interpreter_side_tables.add(gc_heap_bytes);
     if !gc_heap_exact {
@@ -1662,6 +1715,12 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     visitor
         .shared_array_buffer_allocations
         .sort_unstable_by_key(|allocation| allocation.id);
+    let wasm_backing_bytes = visitor
+        .external_allocations
+        .values()
+        .filter(|allocation| allocation.kind == crate::host::RetainedExternalKind::WasmMemory)
+        .map(|allocation| allocation.bytes)
+        .fold(0usize, usize::saturating_add);
 
     totals
         .property_storage
@@ -1714,12 +1773,16 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
             "Agent/ShadowRealm, RegExp, and symbol owners are covered; remaining Interp side tables are not",
         ),
         array_buffer_backing: Category::lower_bound(
-            visitor.array_buffer_bytes,
+            visitor.array_buffer_bytes(),
             "private Rc allocation metadata is excluded",
         ),
         shared_array_buffer_backing: SharedBackingCategory {
             allocations: visitor.shared_array_buffer_allocations,
             unavailable_ids: visitor.unavailable_shared_array_buffers,
+        },
+        wasm_backing: WasmBackingCategory {
+            bytes: wasm_backing_bytes,
+            identity_conflict: visitor.external_identity_conflict,
         },
         host_resources: totals.host_resources.into(),
     }
@@ -1755,15 +1818,23 @@ pub(crate) fn json(interp: &Interp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::RetainedBytes;
+    use crate::host::{RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory};
     use crate::lstr::LStr;
     use crate::value::Props;
 
     struct ReportedHostState(Vec<u8>);
 
+    struct ExternalWasmState(crate::interpreter::ArrayBufferBytes);
+
     impl RetainedBytes for ReportedHostState {
         fn retained_bytes(&self) -> usize {
             self.0.capacity()
+        }
+    }
+
+    impl RetainedExternalMemory for ExternalWasmState {
+        fn retained_external_memory(&self, visit: &mut dyn FnMut(RetainedExternalAllocation)) {
+            visit(RetainedExternalAllocation::wasm_array_buffer(&self.0));
         }
     }
 
@@ -1791,6 +1862,10 @@ mod tests {
             interpreter_side_tables: Category::lower_bound(12, "test lower bound"),
             array_buffer_backing: Category::lower_bound(7, "test lower bound"),
             shared_array_buffer_backing: SharedBackingCategory::default(),
+            wasm_backing: WasmBackingCategory {
+                bytes: 0,
+                identity_conflict: false,
+            },
             host_resources: HostCategory {
                 reported_bytes: 0,
                 unavailable_entries: 1,
@@ -1829,6 +1904,29 @@ mod tests {
         let json = unavailable_snapshot.json(1, 1);
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
         assert!(json.contains("live host entries do not implement RetainedBytes"));
+    }
+
+    #[test]
+    fn wasm_backing_alias_is_not_credited_again_as_an_array_buffer() {
+        let mut interp = Interp::new();
+        let storage = Rc::new(RefCell::new(Vec::with_capacity(79)));
+        interp.array_buffers.insert(1, storage.clone());
+        interp
+            .host_state
+            .put_external_memory(ExternalWasmState(storage.clone()));
+        interp
+            .host_state
+            .resources
+            .add_external_memory(ExternalWasmState(storage));
+
+        let snapshot = measure(&interp, &[], &[]);
+        assert_eq!(snapshot.array_buffer_backing.bytes, 0);
+        assert_eq!(snapshot.wasm_backing.bytes, 79);
+        assert!(!snapshot.wasm_backing.identity_conflict);
+        assert_eq!(snapshot.host_resources.unavailable_entries, 2);
+        let json = snapshot.json(1, 1);
+        assert!(json.contains("\"wasm_backing\":{\"bytes\":79"));
+        assert!(json.contains("\"managed_external_bytes\":{\"bytes\":79"));
     }
 
     #[test]
@@ -2518,7 +2616,7 @@ mod tests {
         for buffer in &aliases {
             visitor.array_buffer(buffer);
         }
-        assert_eq!(visitor.array_buffer_bytes, aliases[0].borrow().capacity());
+        assert_eq!(visitor.array_buffer_bytes(), aliases[0].borrow().capacity());
     }
 
     #[test]

@@ -3,10 +3,11 @@
 Status: implementation in vertical slices. The post-collection visitor now classifies every
 `Interp` field, traverses the engine-owned side tables/caches described below, reports ordinary
 `ArrayBuffer` backing by identity, and exposes an opt-in retained-size contract for host state.
-SharedArrayBuffer backing is now reported by address-independent Shared Data Block identity. Wasm
-embedder backing remains unavailable, and any host entry that does not implement the contract
-makes the host category unavailable rather than silently contributing zero. The Phase 0 total is
-therefore explicitly incomplete and the roadmap item remains open.
+SharedArrayBuffer backing is reported by address-independent Shared Data Block identity. Typed
+external-allocation observations now cover the built-in Lumen-web Wasm store and TRust's wasmi
+store without double-counting aliased `Memory.buffer` Data Blocks. Any host entry that does not
+implement the retained-metadata contract still makes the host category unavailable rather than
+silently contributing zero. The Phase 0 total therefore remains explicitly incomplete.
 
 ## Why object count is not a byte count
 
@@ -117,7 +118,8 @@ Current implementation notes:
 - The test-only inventory macro expands one checked-in classification list into an exhaustive
   `Interp` struct pattern with no `..`, so a newly added field fails test compilation until
   classified. The inventory now rejects every `unaccounted` entry. `complete` remains false until
-  the separately tracked embedder Wasm backing category participates in the host contract.
+  live host entries have retained-metadata reporters and every remaining lower-bound reason has
+  been audited.
 
 Allocation attribution rules for the remaining slices:
 
@@ -134,8 +136,10 @@ Allocation attribution rules for the remaining slices:
 - Per-Agent records carry both Agent and collector-heap identity. SharedArrayBuffer records use the
   engine's address-independent Shared Data Block id and an `externally_shared` marker so a process
   aggregator can dedupe them across Agents without changing the useful per-Agent retained view.
-  Agent-local Wasm backing still needs an embedder allocation identity so an exposed
-  `Memory.buffer` Data Block is not credited twice.
+  Agent-local Wasm backing uses typed embedder allocation identities. A backing identified with
+  Lumen's `ArrayBufferBytes` is attributed canonically to Wasm and suppressed from the ordinary
+  ArrayBuffer total; separately allocated mirrors retain distinct identities and both allocations
+  remain visible.
 
 The Function/Chunk vertical slice now follows user callables through both compiled generations,
 deduplicates shared Functions, Chunks, hoist plans, and JIT sidecars, and accounts the principal
@@ -183,7 +187,7 @@ credit `interpreter_side_tables`, while the identity-deduplicated byte capacity 
 `array_buffer_backing`. SharedArrayBuffer backing is credited once per address-independent Shared
 Data Block id across the root realm and ShadowRealms; each allocation record is marked externally
 shared so a process-level consumer can deduplicate the same block across Agents. Missing registry
-identities make the category unavailable. Embedder Wasm backing remains a separate pending slice.
+identities make the category unavailable.
 
 Reusable execution storage now contributes to `engine_caches`: bytecode slot/operand Vec pools,
 the megamorphic stub table and retained names, raw fixed-size JIT frame buffers, and weak
@@ -262,6 +266,14 @@ capacity use `put_retained` or `add_retained`; Lumen adds the inline value size 
 reported payload across the root realm and every ShadowRealm. HashMap bucket storage and private
 `Rc` allocation metadata remain a documented lower bound. Host bytes stay a sibling category and
 are not added to either engine-managed composite.
+
+External host backing uses the independent `RetainedExternalMemory` contract, so an embedder may
+report Wasm linear memory even while its other opaque host metadata remains unavailable. Each
+allocation carries a typed identity. The built-in Lumen-web store reports the same
+`ArrayBufferBytes` identity used by `Memory.buffer`, causing one canonical Wasm credit. TRust's
+wasmi store reports store-plus-slot identities; its keyed ArrayBuffer synchronization mirror is a
+second real allocation and therefore remains in `array_buffer_backing`. Duplicate external
+identities are credited once, while conflicting sizes keep the category explicitly lower-bound.
 
 ## Questions worth outside review
 

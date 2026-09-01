@@ -157,7 +157,7 @@ pub fn extension() -> Extension {
             state.put(server::ServerRegistry::default());
             state.put(websocket::WsRegistry::default());
             state.put(sse::SseRegistry::default());
-            state.put(wasm_ops::WasmStore::default());
+            state.put_external_memory(wasm_ops::WasmStore::default());
             state.put(CodecRegistry::default());
             state.put(TextDecoderRegistry::default());
         }),

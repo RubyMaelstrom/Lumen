@@ -437,8 +437,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Report SharedArrayBuffer backing with address-independent Shared Data Block identities,
     deduplicate aliases across the Agent's realms, mark records externally shared for process
     aggregation, and validate that allocation identities and category totals agree.
-  - [ ] Cover embedder WebAssembly backing stores without double-counting Data Blocks identified
-    with exposed `Memory.buffer` objects before changing the report to complete.
+  - [x] Add typed embedder external-allocation observations; cover the built-in Lumen-web store and
+    TRust's wasmi store, canonically attribute aliased Lumen `Memory.buffer` Data Blocks to Wasm,
+    and retain TRust's separately allocated safety mirror as real ArrayBuffer backing.
+  - [ ] Eliminate remaining unavailable host-resource entries and audit every documented
+    lower-bound reason before changing the report to complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page

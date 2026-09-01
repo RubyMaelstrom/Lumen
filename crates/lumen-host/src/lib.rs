@@ -57,7 +57,7 @@ fn install_task_panic_hook() {
 pub use lumen::bytecode::Tier;
 pub use lumen::embed::{
     ArrayBufferBytes, Ctx, EvalError, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable,
-    RetainedBytes, Value, WeakValue,
+    RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory, Value, WeakValue,
 };
 pub use lumen::{
     Completion, Engine, ExecutionOutcome, InterruptReason, ParseError, RuntimeInterrupt,
