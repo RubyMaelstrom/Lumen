@@ -648,6 +648,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [x] Add a checked Agent-local handle-table heap nucleus with explicit payload accounting,
   relocation forwarding, and fail-closed stale-reference tests. Slot reuse and generation cookies
   remain deferred until the production relocation verifier exists.
+- [x] Add one traceable tagged-field leaf family to that nucleus and prove root/field rewriting of
+  self-references before source reclamation. It remains a migration fixture, not a live object
+  representation.
 - [ ] Add page/arena allocation and bump-pointer allocation for common small objects.
 - [ ] Start with a correct stop-the-world old-generation mark/sweep tracer and bounded free lists
   behind the new root API. A nursery needs a collectible promotion destination; old-generation

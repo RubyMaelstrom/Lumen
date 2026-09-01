@@ -89,6 +89,12 @@ impl TaggedValue {
         self.0
     }
 
+    /// Construct an unchecked word for verifier and corruption tests. Production constructors
+    /// remain typed; callers must invoke `validate` before treating this as a value.
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub(crate) fn validate(self) -> Result<(), InvalidTaggedValue> {
         let tag = self.0 & TAG_MASK;
         match tag {
@@ -428,6 +434,21 @@ impl RootSet {
             .copied()
             .map(|value| value.validate().map(|()| value))
             .collect()
+    }
+
+    /// Rewrite a relocated handle in every live root. The central heap performs the analogous
+    /// walk over tagged object fields before its forwarding source is reclaimed.
+    pub(crate) fn rewrite_heap_reference(&self, from: HeapRef, to: HeapRef) -> usize {
+        let replacement = TaggedValue::heap(to);
+        let mut state = self.state.borrow_mut();
+        let mut rewritten = 0;
+        for slot in state.slots.iter_mut().flatten() {
+            if slot.as_heap() == Some(from) {
+                *slot = replacement;
+                rewritten += 1;
+            }
+        }
+        rewritten
     }
 }
 

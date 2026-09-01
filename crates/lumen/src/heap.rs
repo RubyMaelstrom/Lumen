@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use crate::tagged::HeapRef;
+use crate::tagged::{HeapRef, TaggedValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapGeneration {
@@ -37,7 +37,24 @@ pub(crate) struct ObjectHeader {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HeapObject {
     header: ObjectHeader,
-    payload: Box<[u8]>,
+    storage: HeapStorage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HeapStorage {
+    Bytes(Box<[u8]>),
+    Tagged(Box<[TaggedValue]>),
+}
+
+impl HeapStorage {
+    fn requested_bytes(&self) -> usize {
+        match self {
+            Self::Bytes(payload) => payload.len(),
+            Self::Tagged(fields) => fields
+                .len()
+                .saturating_mul(std::mem::size_of::<TaggedValue>()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +63,8 @@ pub(crate) enum HeapError {
     ForwardedReference,
     AlreadyForwarded,
     NotForwarded,
+    PayloadKindMismatch,
+    InvalidTaggedField,
     RequestTooLarge,
     ReferenceSpaceExhausted,
 }
@@ -91,9 +110,38 @@ impl CentralHeap {
                 marked: false,
                 forwarding: None,
             },
-            payload,
+            storage: HeapStorage::Bytes(payload),
         }));
         // `index` is at least one because slot zero is reserved by `new`.
+        Ok(HeapRef::new(index).expect("central heap never publishes a zero handle"))
+    }
+
+    pub(crate) fn allocate_tagged_fields(
+        &mut self,
+        layout: LayoutId,
+        fields: Vec<TaggedValue>,
+        generation: HeapGeneration,
+    ) -> Result<HeapRef, HeapError> {
+        let size_units = u32::try_from(fields.len()).map_err(|_| HeapError::RequestTooLarge)?;
+        if fields.iter().any(|value| value.validate().is_err()) {
+            return Err(HeapError::InvalidTaggedField);
+        }
+        let storage = HeapStorage::Tagged(fields.into_boxed_slice());
+        self.requested_bytes = self
+            .requested_bytes
+            .saturating_add(storage.requested_bytes());
+        let index =
+            u32::try_from(self.objects.len()).map_err(|_| HeapError::ReferenceSpaceExhausted)?;
+        self.objects.push(Some(HeapObject {
+            header: ObjectHeader {
+                size_units,
+                layout,
+                generation,
+                marked: false,
+                forwarding: None,
+            },
+            storage,
+        }));
         Ok(HeapRef::new(index).expect("central heap never publishes a zero handle"))
     }
 
@@ -126,11 +174,53 @@ impl CentralHeap {
     }
 
     pub(crate) fn payload(&self, reference: HeapRef) -> Result<&[u8], HeapError> {
-        Ok(&self.object(reference)?.payload)
+        match &self.object(reference)?.storage {
+            HeapStorage::Bytes(payload) => Ok(payload),
+            HeapStorage::Tagged(_) => Err(HeapError::PayloadKindMismatch),
+        }
     }
 
     pub(crate) fn payload_mut(&mut self, reference: HeapRef) -> Result<&mut [u8], HeapError> {
-        Ok(&mut self.object_mut(reference)?.payload)
+        match &mut self.object_mut(reference)?.storage {
+            HeapStorage::Bytes(payload) => Ok(payload),
+            HeapStorage::Tagged(_) => Err(HeapError::PayloadKindMismatch),
+        }
+    }
+
+    pub(crate) fn tagged_fields(&self, reference: HeapRef) -> Result<&[TaggedValue], HeapError> {
+        match &self.object(reference)?.storage {
+            HeapStorage::Tagged(fields) => Ok(fields),
+            HeapStorage::Bytes(_) => Err(HeapError::PayloadKindMismatch),
+        }
+    }
+
+    pub(crate) fn tagged_fields_mut(
+        &mut self,
+        reference: HeapRef,
+    ) -> Result<&mut [TaggedValue], HeapError> {
+        match &mut self.object_mut(reference)?.storage {
+            HeapStorage::Tagged(fields) => Ok(fields),
+            HeapStorage::Bytes(_) => Err(HeapError::PayloadKindMismatch),
+        }
+    }
+
+    /// Rewrite every tagged field in the table after a relocation. The caller must rewrite its
+    /// external roots through the corresponding `RootSet` operation before reclaiming from-space.
+    pub(crate) fn rewrite_tagged_references(&mut self, from: HeapRef, to: HeapRef) -> usize {
+        let replacement = TaggedValue::heap(to);
+        let mut rewritten = 0;
+        for object in self.objects.iter_mut().flatten() {
+            let HeapStorage::Tagged(fields) = &mut object.storage else {
+                continue;
+            };
+            for field in fields.iter_mut() {
+                if field.as_heap() == Some(from) {
+                    *field = replacement;
+                    rewritten += 1;
+                }
+            }
+        }
+        rewritten
     }
 
     pub(crate) fn mark(&mut self, reference: HeapRef) -> Result<(), HeapError> {
@@ -158,7 +248,9 @@ impl CentralHeap {
         moved.header.forwarding = None;
         let target_index =
             u32::try_from(self.objects.len()).map_err(|_| HeapError::ReferenceSpaceExhausted)?;
-        self.requested_bytes = self.requested_bytes.saturating_add(moved.payload.len());
+        self.requested_bytes = self
+            .requested_bytes
+            .saturating_add(moved.storage.requested_bytes());
         self.objects.push(Some(moved));
         let target = HeapRef::new(target_index).expect("central heap never publishes zero handle");
         let source_object = self
@@ -184,7 +276,9 @@ impl CentralHeap {
             .get_mut(source.get() as usize)
             .and_then(Option::take)
             .ok_or(HeapError::InvalidReference)?;
-        self.requested_bytes = self.requested_bytes.saturating_sub(released.payload.len());
+        self.requested_bytes = self
+            .requested_bytes
+            .saturating_sub(released.storage.requested_bytes());
         Ok(target)
     }
 
@@ -204,7 +298,9 @@ impl CentralHeap {
             .get_mut(reference.get() as usize)
             .and_then(Option::take)
             .ok_or(HeapError::InvalidReference)?;
-        self.requested_bytes = self.requested_bytes.saturating_sub(released.payload.len());
+        self.requested_bytes = self
+            .requested_bytes
+            .saturating_sub(released.storage.requested_bytes());
         Ok(())
     }
 }
@@ -212,6 +308,7 @@ impl CentralHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tagged::RootSet;
 
     #[test]
     fn allocation_uses_checked_handles_and_separate_payload_accounting() {
@@ -271,5 +368,54 @@ mod tests {
             .unwrap();
         let _target = heap.relocate(source).unwrap();
         assert_eq!(heap.free(source), Err(HeapError::ForwardedReference));
+    }
+
+    #[test]
+    fn tagged_leaf_rewrites_roots_and_self_references_before_reclaim() {
+        let mut heap = CentralHeap::new();
+        let source = heap
+            .allocate_tagged_fields(
+                LayoutId::new(11),
+                vec![TaggedValue::undefined(), TaggedValue::null()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        heap.tagged_fields_mut(source).unwrap()[0] = TaggedValue::heap(source);
+        let roots = RootSet::new();
+        let root = roots.root(TaggedValue::heap(source)).unwrap();
+
+        let target = heap.relocate(source).unwrap();
+        assert_eq!(
+            heap.rewrite_tagged_references(source, target),
+            2,
+            "one self-edge in from-space and one copied self-edge must be rewritten"
+        );
+        assert_eq!(roots.rewrite_heap_reference(source, target), 1);
+        assert_eq!(heap.reclaim_forwarded(source), Ok(target));
+        assert_eq!(
+            heap.tagged_fields(target).unwrap()[0].as_heap(),
+            Some(target)
+        );
+        assert_eq!(root.value().and_then(TaggedValue::as_heap), Some(target));
+    }
+
+    #[test]
+    fn tagged_leaf_rejects_invalid_fields_and_keeps_byte_payloads_distinct() {
+        let mut heap = CentralHeap::new();
+        assert_eq!(
+            heap.allocate_tagged_fields(
+                LayoutId::new(1),
+                vec![TaggedValue::from_raw(0x7ffc_0000_0000_0002)],
+                HeapGeneration::Young,
+            ),
+            Err(HeapError::InvalidTaggedField)
+        );
+        let bytes = heap
+            .allocate(LayoutId::new(2), 1, HeapGeneration::Old)
+            .unwrap();
+        assert_eq!(
+            heap.tagged_fields(bytes),
+            Err(HeapError::PayloadKindMismatch)
+        );
     }
 }
