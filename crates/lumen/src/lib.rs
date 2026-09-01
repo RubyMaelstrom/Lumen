@@ -577,8 +577,13 @@ pub mod embed {
     /// JS values. Matching/constructing the primitive variants is supported API; object
     /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
-    /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
-    pub use crate::value::{NativeClosure, NativeFn, Value};
+    /// [`Ctx::new_native_fn`] when the host function must capture state, or with
+    /// [`Ctx::new_native_fn_with_retained_memory`] when that state must participate in managed
+    /// memory diagnostics.
+    pub use crate::value::{
+        NativeCallableRetained, NativeClosure, NativeFn, NativeRetainedMemoryVisitor,
+        RetainedManagedAllocation, Value,
+    };
 
     /// Non-parse failure from an interrupt-aware embedding entry point.
     pub enum EvalError {

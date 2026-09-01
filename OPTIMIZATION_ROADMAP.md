@@ -443,8 +443,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Audit every requested/external category, replace stale lower-bound labels with exact
     requested-payload classifications, add identity-aware traversal for the full immutable RegExp
     graph, and derive `complete` from machine-enforced coverage and documented-reason predicates.
-  - [ ] Eliminate remaining unavailable browser host-resource entries and add retained-payload
-    reporting for data-carrying native closures before treating browser Agent records as complete.
+  - [x] Add identity-aware retained-payload/value reporting for data-carrying native callables,
+    preserve legacy closure source compatibility as explicitly incomplete, and migrate the
+    built-in N-API callback/class/Promise wrappers.
+  - [ ] Eliminate remaining unavailable browser host-resource entries before treating browser
+    Agent records as complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page

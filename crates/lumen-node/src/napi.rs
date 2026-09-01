@@ -35,7 +35,10 @@
 use std::os::raw::{c_char, c_int, c_void};
 use std::rc::Rc;
 
-use lumen_host::{Ctx, NativeClosure, Value};
+use lumen_host::{
+    Ctx, NativeCallableRetained, NativeClosure, NativeRetainedMemoryVisitor,
+    RetainedManagedAllocation, Value,
+};
 
 use crate::dylib::DynLib;
 
@@ -156,12 +159,86 @@ fn to_int32(n: f64) -> i32 {
 /// Wrap an addon C callback (`cb` + its `data`) as a lumen function value. When JS calls it, a
 /// fresh [`Env`] and [`CbInfo`] are built and the C callback is invoked.
 fn make_callback_fn(interp: &mut Ctx, name: &str, cb: napi_callback, data: *mut c_void) -> Value {
-    // The raw C pointers are Copy and move into a 'static closure. They are not `Send`, but a
-    // NativeClosure runs only on the engine's own `!Send` loop thread, so that is fine.
-    let closure = move |ip: &mut Ctx, this: Value, args: &[Value]| -> Result<Value, Value> {
-        invoke_napi_callback(ip, cb, data, this, args)
-    };
-    interp.new_native_fn(name, 0, Rc::new(closure) as Rc<NativeClosure>)
+    let state = Rc::new(NapiCallbackClosure { callback: cb, data });
+    let callable_state = state.clone();
+    interp.new_native_fn_with_retained_memory(
+        name,
+        0,
+        Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
+            callable_state.call(interp, this, args)
+        }) as Rc<NativeClosure>,
+        state,
+    )
+}
+
+struct NapiCallbackClosure {
+    callback: napi_callback,
+    data: *mut c_void,
+}
+
+impl NapiCallbackClosure {
+    fn call(&self, interp: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+        invoke_napi_callback(interp, self.callback, self.data, this, args)
+    }
+}
+
+impl NativeCallableRetained for NapiCallbackClosure {
+    fn scan_retained_memory(&self, _visitor: &mut dyn NativeRetainedMemoryVisitor) {
+        // Both captures are non-owning C pointers stored in this callable's inline payload.
+    }
+}
+
+// Node-API “Working with JavaScript functions” and `napi_define_class` require the callback's
+// opaque `data` pointer and the already-created instance/prototype relationship to survive until
+// invocation. Reporter structs preserve those callback semantics while exposing only actual
+// managed owners to Lumen's diagnostic visitor.
+struct NapiConstructorClosure {
+    prototype: Value,
+    callback: napi_callback,
+    data: *mut c_void,
+}
+
+impl NapiConstructorClosure {
+    fn call(&self, interp: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+        let instance = match this {
+            Value::Undefined => interp.new_object_with_proto(&self.prototype),
+            other => other,
+        };
+        invoke_napi_callback(interp, self.callback, self.data, instance.clone(), args)?;
+        Ok(instance)
+    }
+}
+
+impl NativeCallableRetained for NapiConstructorClosure {
+    fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor) {
+        visitor.value(&self.prototype);
+    }
+}
+
+struct NapiPromiseExecutor {
+    slot: Rc<std::cell::RefCell<(Value, Value)>>,
+}
+
+impl NapiPromiseExecutor {
+    fn call(&self, _interp: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let resolve = args.first().cloned().unwrap_or(Value::Undefined);
+        let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
+        *self.slot.borrow_mut() = (resolve, reject);
+        Ok(Value::Undefined)
+    }
+}
+
+impl NativeCallableRetained for NapiPromiseExecutor {
+    fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor) {
+        visitor.allocation(RetainedManagedAllocation::rc(
+            "lumen-node.napi-promise-executor-slot",
+            &self.slot,
+            std::mem::size_of::<std::cell::RefCell<(Value, Value)>>(),
+        ));
+        let slot = self.slot.borrow();
+        visitor.value(&slot.0);
+        visitor.value(&slot.1);
+    }
 }
 
 /// Drive one call into an addon C callback, translating its return / thrown exception back into
@@ -1195,18 +1272,20 @@ pub unsafe extern "C" fn napi_define_class(
     // The prototype instances inherit from, captured by the constructor trampoline so `new`
     // produces an object with the right shape before the C constructor wraps native state onto it.
     let proto = Value::Obj(interp.new_object());
-    let proto_for_ctor = proto.clone();
-    let closure = move |ip: &mut Ctx, this: Value, args: &[Value]| -> Result<Value, Value> {
-        // Under `new`, the construct path passes `this = undefined`; build the instance. A
-        // `super()` call passes an existing `this` to graft onto.
-        let instance = match this {
-            Value::Undefined => ip.new_object_with_proto(&proto_for_ctor),
-            other => other,
-        };
-        invoke_napi_callback(ip, constructor, data, instance.clone(), args)?;
-        Ok(instance)
-    };
-    let ctor = interp.new_native_fn(&name, 0, Rc::new(closure) as Rc<NativeClosure>);
+    let state = Rc::new(NapiConstructorClosure {
+        prototype: proto.clone(),
+        callback: constructor,
+        data,
+    });
+    let callable_state = state.clone();
+    let ctor = interp.new_native_fn_with_retained_memory(
+        &name,
+        0,
+        Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
+            callable_state.call(interp, this, args)
+        }) as Rc<NativeClosure>,
+        state,
+    );
     interp.set_constructor_prototype(&ctor, &proto);
 
     // Attach each declared method / accessor / value to the prototype (or the constructor, for
@@ -1300,16 +1379,15 @@ pub unsafe extern "C" fn napi_create_promise(
         Value::Undefined,
         Value::Undefined,
     )));
-    let slot2 = slot.clone();
-    let executor = interp.new_native_fn(
+    let state = Rc::new(NapiPromiseExecutor { slot: slot.clone() });
+    let callable_state = state.clone();
+    let executor = interp.new_native_fn_with_retained_memory(
         "",
         2,
-        Rc::new(move |_ip: &mut Ctx, _this: Value, args: &[Value]| {
-            let res = args.first().cloned().unwrap_or(Value::Undefined);
-            let rej = args.get(1).cloned().unwrap_or(Value::Undefined);
-            *slot2.borrow_mut() = (res, rej);
-            Ok(Value::Undefined)
+        Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
+            callable_state.call(interp, this, args)
         }) as Rc<NativeClosure>,
+        state,
     );
 
     let p = match interp.construct_value(promise_ctor, &[executor]) {
@@ -1663,6 +1741,22 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
+    #[derive(Default)]
+    struct RetainedVisit {
+        allocations: Vec<RetainedManagedAllocation>,
+        values: Vec<Value>,
+    }
+
+    impl NativeRetainedMemoryVisitor for RetainedVisit {
+        fn allocation(&mut self, allocation: RetainedManagedAllocation) {
+            self.allocations.push(allocation);
+        }
+
+        fn value(&mut self, value: &Value) {
+            self.values.push(value.clone());
+        }
+    }
+
     #[test]
     fn to_int32_matches_ecmascript() {
         assert_eq!(to_int32(0.0), 0);
@@ -1684,5 +1778,53 @@ mod tests {
         assert_eq!(unsafe { read_utf8(s.as_ptr(), 3) }, "hel");
         // A null pointer reads as empty.
         assert_eq!(unsafe { read_utf8(std::ptr::null(), NAPI_AUTO_LENGTH) }, "");
+    }
+
+    #[test]
+    fn retained_callback_wrappers_preserve_callback_and_capture_semantics() {
+        let mut engine = lumen_host::Engine::new();
+        let interp = engine.ctx();
+        let callback = NapiCallbackClosure {
+            callback: None,
+            data: std::ptr::null_mut(),
+        };
+        let Ok(callback_result) = callback.call(interp, Value::Undefined, &[]) else {
+            panic!("empty N-API callback should not throw")
+        };
+        assert!(matches!(callback_result, Value::Undefined));
+        let mut visit = RetainedVisit::default();
+        callback.scan_retained_memory(&mut visit);
+        assert!(visit.allocations.is_empty());
+
+        let prototype = Value::Obj(interp.new_object());
+        let constructor = NapiConstructorClosure {
+            prototype: prototype.clone(),
+            callback: None,
+            data: std::ptr::null_mut(),
+        };
+        let Ok(constructor_result) = constructor.call(interp, Value::Undefined, &[]) else {
+            panic!("empty N-API constructor should not throw")
+        };
+        assert!(matches!(constructor_result, Value::Obj(_)));
+        constructor.scan_retained_memory(&mut visit);
+        assert!(matches!(visit.values.last(), Some(Value::Obj(_))));
+
+        let slot = Rc::new(std::cell::RefCell::new((
+            Value::Undefined,
+            Value::Undefined,
+        )));
+        let executor = NapiPromiseExecutor { slot: slot.clone() };
+        assert!(executor
+            .call(
+                interp,
+                Value::Undefined,
+                &[Value::Num(3.0), Value::Num(4.0)],
+            )
+            .is_ok());
+        assert_eq!(slot.borrow().0.as_num_opt(), Some(3.0));
+        assert_eq!(slot.borrow().1.as_num_opt(), Some(4.0));
+        executor.scan_retained_memory(&mut visit);
+        assert_eq!(visit.allocations.len(), 1);
+        assert_eq!(visit.values.len(), 3);
     }
 }

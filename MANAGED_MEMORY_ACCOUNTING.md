@@ -299,6 +299,15 @@ even if the visitor has not observed a Wasm allocation through another entry.
 - Host-resource bytes and generated executable code remain sibling totals; neither is silently
   folded into the managed requested/external composites.
 
+Data-carrying native callables have a separate `NativeCallableRetained` companion surface. A
+reporter enumerates identity-bearing managed allocations and captured JavaScript Values; both are
+routed through the Agent-wide visitor, so two callbacks sharing one allocation or string receive
+one canonical credit. Ordinary Rust closures retain the original `Rc<NativeClosure>` API and are
+deliberately classified as incomplete unless their registration supplies a companion reporter.
+Lumen-node's N-API function, class-constructor, and Promise-executor wrappers use explicit reporter
+structs; their C callback/data pointers are non-owning, constructor prototypes are visited as
+Values, and the Promise executor's shared result slot is identity-deduplicated.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

@@ -398,6 +398,11 @@ pub(crate) struct Visitor {
     bigints: HashSet<usize>,
     callable_allocations: HashSet<usize>,
     native_closure_allocations: HashSet<usize>,
+    native_closure_reporters: HashSet<usize>,
+    reported_native_closures: HashSet<usize>,
+    unreported_native_closures: HashSet<usize>,
+    native_managed_allocations: HashMap<(&'static str, usize), usize>,
+    native_managed_identity_conflict: bool,
     functions: HashSet<usize>,
     classes: HashSet<usize>,
     chunks: HashSet<usize>,
@@ -422,7 +427,6 @@ pub(crate) struct Visitor {
     external_identity_conflict: bool,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
-    unavailable_native_closure_payloads: usize,
     function_bytecode_metadata: usize,
     function_bytecode_opaque_storage: bool,
     jit_heap_metadata: usize,
@@ -510,8 +514,18 @@ impl Visitor {
                     self.callable_metadata = self
                         .callable_metadata
                         .saturating_add(size_of_val(value.func.as_ref()));
-                    self.unavailable_native_closure_payloads =
-                        self.unavailable_native_closure_payloads.saturating_add(1);
+                }
+                if let Some(reporter) = &value.retained {
+                    self.reported_native_closures.insert(closure_identity);
+                    let reporter_identity = Rc::as_ptr(reporter) as *const () as usize;
+                    if self.native_closure_reporters.insert(reporter_identity) {
+                        self.callable_metadata = self
+                            .callable_metadata
+                            .saturating_add(size_of_val(reporter.as_ref()));
+                        reporter.scan_retained_memory(self);
+                    }
+                } else {
+                    self.unreported_native_closures.insert(closure_identity);
                 }
             }
             Callable::User(value) => {
@@ -847,6 +861,29 @@ impl Visitor {
             }
         }
         (bytes, exact)
+    }
+}
+
+impl crate::value::NativeRetainedMemoryVisitor for Visitor {
+    fn allocation(&mut self, allocation: crate::value::RetainedManagedAllocation) {
+        let identity = (allocation.identity_domain, allocation.identity);
+        match self.native_managed_allocations.entry(identity) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(allocation.requested_bytes);
+                self.callable_metadata = self
+                    .callable_metadata
+                    .saturating_add(allocation.requested_bytes);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if *entry.get() != allocation.requested_bytes {
+                    self.native_managed_identity_conflict = true;
+                }
+            }
+        }
+    }
+
+    fn value(&mut self, value: &Value) {
+        Visitor::value(self, value);
     }
 }
 
@@ -1887,12 +1924,16 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         ),
         scope_storage: totals.scope_storage,
         strings_symbols_bigints: Category::exact(visitor.strings_symbols_bigints),
-        callable_metadata: if visitor.unavailable_native_closure_payloads == 0 {
+        callable_metadata: if visitor
+            .unreported_native_closures
+            .is_subset(&visitor.reported_native_closures)
+            && !visitor.native_managed_identity_conflict
+        {
             Category::exact(visitor.callable_metadata)
         } else {
             Category::incomplete_lower_bound(
                 visitor.callable_metadata,
-                "native closure captured allocations have no retained-memory reporter",
+                "native closure captured allocations are unreported or have conflicting identities",
             )
         },
         function_bytecode_metadata: if visitor.function_bytecode_opaque_storage {
@@ -1959,6 +2000,11 @@ mod tests {
 
     struct ExternalWasmState(crate::interpreter::ArrayBufferBytes);
 
+    struct ReportedNativeClosure {
+        allocation: Rc<RefCell<Vec<u8>>>,
+        value: Value,
+    }
+
     impl RetainedBytes for ReportedHostState {
         fn retained_bytes(&self) -> usize {
             self.0.capacity()
@@ -1968,6 +2014,22 @@ mod tests {
     impl RetainedExternalMemory for ExternalWasmState {
         fn retained_external_memory(&self, visit: &mut dyn FnMut(RetainedExternalAllocation)) {
             visit(RetainedExternalAllocation::wasm_array_buffer(&self.0));
+        }
+    }
+
+    impl crate::value::NativeCallableRetained for ReportedNativeClosure {
+        fn scan_retained_memory(
+            &self,
+            visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor,
+        ) {
+            let requested_bytes =
+                size_of::<RefCell<Vec<u8>>>().saturating_add(self.allocation.borrow().capacity());
+            visitor.allocation(crate::value::RetainedManagedAllocation::rc(
+                "lumen-test.native-shared-buffer",
+                &self.allocation,
+                requested_bytes,
+            ));
+            visitor.value(&self.value);
         }
     }
 
@@ -2164,10 +2226,12 @@ mod tests {
     fn native_closure_captures_keep_the_snapshot_incomplete() {
         let interp = Interp::new();
         let retained = Vec::<u8>::with_capacity(101);
-        let closure: Rc<crate::value::NativeClosure> = Rc::new(move |_, _, _| {
-            std::hint::black_box(retained.len());
-            Ok(Value::Undefined)
-        });
+        let closure: Rc<crate::value::NativeClosure> = Rc::new(
+            move |_: &mut Interp, _: Value, _: &[Value]| -> Result<Value, Value> {
+                std::hint::black_box(retained.len());
+                Ok(Value::Undefined)
+            },
+        );
         let object = interp.make_native_closure("capturing", 0, closure);
         let snapshot = measure(&interp, &[object], &[]);
 
@@ -2177,9 +2241,74 @@ mod tests {
             Quality::LowerBound
         ));
         assert!(!snapshot.complete());
-        assert!(snapshot
-            .json(1, 1)
-            .contains("native closure captured allocations have no retained-memory reporter"));
+        assert!(snapshot.json(1, 1).contains(
+            "native closure captured allocations are unreported or have conflicting identities"
+        ));
+    }
+
+    #[test]
+    fn reported_native_closure_allocations_and_values_are_deduplicated() {
+        let interp = Interp::new();
+        let allocation = Rc::new(RefCell::new(Vec::<u8>::with_capacity(137)));
+        let string = LStr::from("shared native capture");
+        let make_closure = || {
+            let state = Rc::new(ReportedNativeClosure {
+                allocation: allocation.clone(),
+                value: Value::Str(string.clone()),
+            });
+            let callable_state = state.clone();
+            let callable: Rc<crate::value::NativeClosure> = Rc::new(
+                move |_: &mut Interp, _: Value, _: &[Value]| -> Result<Value, Value> {
+                    std::hint::black_box(&callable_state);
+                    Ok(Value::Undefined)
+                },
+            );
+            (
+                callable,
+                state as Rc<dyn crate::value::NativeCallableRetained>,
+            )
+        };
+        let (first_callable, first_reporter) = make_closure();
+        let first = interp.make_native_closure_with_retained_memory(
+            "first",
+            0,
+            first_callable,
+            first_reporter,
+        );
+        let (second_callable, second_reporter) = make_closure();
+        let second = interp.make_native_closure_with_retained_memory(
+            "second",
+            0,
+            second_callable,
+            second_reporter,
+        );
+        let snapshot = measure(&interp, &[first, second], &[]);
+
+        assert!(matches!(snapshot.callable_metadata.quality, Quality::Exact));
+        assert!(snapshot.callable_metadata.coverage_complete);
+        assert!(snapshot.complete());
+
+        let mut visitor = Visitor::default();
+        let (first_func, first_retained) = make_closure();
+        let first_callable =
+            crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
+                func: first_func,
+                retained: Some(first_retained),
+            }));
+        let (second_func, second_retained) = make_closure();
+        let second_callable =
+            crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
+                func: second_func,
+                retained: Some(second_retained),
+            }));
+        visitor.callable(&first_callable);
+        visitor.callable(&second_callable);
+        assert_eq!(visitor.native_managed_allocations.len(), 1);
+        assert_eq!(
+            visitor.strings_symbols_bigints,
+            string.retained_requested_bytes()
+        );
+        assert!(visitor.unreported_native_closures.is_empty());
     }
 
     #[test]

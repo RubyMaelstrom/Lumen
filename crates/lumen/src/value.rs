@@ -13,10 +13,58 @@ pub type Gc = Rc<RefCell<Object>>;
 /// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract.
 pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
+/// One identity-bearing allocation retained below a data-carrying native callable.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RetainedManagedAllocation {
+    pub(crate) identity_domain: &'static str,
+    pub(crate) identity: usize,
+    pub(crate) requested_bytes: usize,
+}
+
+impl RetainedManagedAllocation {
+    /// Describe one live allocation. The `(identity_domain, identity)` pair must be unique among
+    /// simultaneously live allocations and stable for the duration of a diagnostic visit.
+    pub fn new(identity_domain: &'static str, identity: usize, requested_bytes: usize) -> Self {
+        Self {
+            identity_domain,
+            identity,
+            requested_bytes,
+        }
+    }
+
+    /// Describe the requested payload of an `Rc` allocation without relying on Rust's private
+    /// refcount-header layout.
+    pub fn rc<T: ?Sized>(
+        identity_domain: &'static str,
+        value: &Rc<T>,
+        requested_bytes: usize,
+    ) -> Self {
+        Self::new(
+            identity_domain,
+            Rc::as_ptr(value) as *const () as usize,
+            requested_bytes,
+        )
+    }
+}
+
+/// Canonical sinks available to a native callable's retained-memory reporter.
+pub trait NativeRetainedMemoryVisitor {
+    fn allocation(&mut self, allocation: RetainedManagedAllocation);
+    fn value(&mut self, value: &Value);
+}
+
 /// A native function that carries captured state, unlike the bare-`fn` [`NativeFn`]. The embedder
-/// uses this to wrap host callbacks that need associated data a function pointer can't hold — e.g.
-/// an N-API C callback together with its `void*` and module handle.
+/// uses this to wrap host callbacks that need associated data a function pointer cannot hold.
 pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
+
+/// Optional retained-memory companion for a [`NativeClosure`].
+///
+/// The reporter is stored separately so the established `Rc<NativeClosure>` call surface remains
+/// source-compatible. It must enumerate every allocation below its own inline payload and every
+/// captured JavaScript value.
+pub trait NativeCallableRetained {
+    fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor);
+}
 
 /// The engine value. `repr(u8)` with fixed discriminants gives it a *defined* layout — tag byte
 /// at offset 0, payload at offset 8 — which the JIT's inline fast paths read directly (see
@@ -810,6 +858,7 @@ pub struct BoundCallable {
 
 pub struct NativeCallable {
     pub(crate) func: Rc<NativeClosure>,
+    pub(crate) retained: Option<Rc<dyn NativeCallableRetained>>,
 }
 
 #[derive(Clone)]
