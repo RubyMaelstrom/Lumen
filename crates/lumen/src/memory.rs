@@ -165,11 +165,13 @@ pub(crate) struct Visitor {
     re_texts: HashSet<usize>,
     regexes: HashSet<usize>,
     rc_u16_slices: HashSet<usize>,
+    array_buffers: HashSet<usize>,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
     function_bytecode_metadata: usize,
     jit_heap_metadata: usize,
     regexp_metadata: usize,
+    array_buffer_bytes: usize,
     detached_property_storage: usize,
     detached_property_storage_opaque: bool,
 }
@@ -331,6 +333,15 @@ impl Visitor {
         }
     }
 
+    fn array_buffer(&mut self, buffer: &crate::interpreter::ArrayBufferBytes) {
+        let identity = Rc::as_ptr(buffer) as usize;
+        if self.array_buffers.insert(identity) {
+            self.array_buffer_bytes = self
+                .array_buffer_bytes
+                .saturating_add(buffer.borrow().capacity());
+        }
+    }
+
     pub(crate) fn function(&mut self, function: &Rc<crate::ast::Function>) {
         let identity = Rc::as_ptr(function) as usize;
         if !self.functions.insert(identity) {
@@ -469,80 +480,105 @@ impl Visitor {
     }
 }
 
-fn unique_array_buffer_capacity<'a>(
-    buffers: impl Iterator<Item = &'a crate::interpreter::ArrayBufferBytes>,
-) -> usize {
-    let mut seen = HashSet::new();
-    buffers.fold(0usize, |bytes, buffer| {
-        let identity = Rc::as_ptr(buffer) as usize;
-        if seen.insert(identity) {
-            bytes.saturating_add(buffer.borrow().capacity())
-        } else {
-            bytes
-        }
-    })
+struct DirectTotals {
+    object_count: usize,
+    scope_count: usize,
+    property_storage: Category,
+    scope_storage: Category,
+    engine_caches: Category,
+    interpreter_side_tables: Category,
 }
 
-fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
-    let mut visitor = Visitor::default();
-    let mut property_storage = Category::exact(0);
-    for object in objects {
-        let (bytes, exact) = visitor.object(&object.borrow());
-        property_storage.add(bytes);
-        if !exact {
-            property_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
+impl Default for DirectTotals {
+    fn default() -> Self {
+        Self {
+            object_count: 0,
+            scope_count: 0,
+            property_storage: Category::exact(0),
+            scope_storage: Category::exact(0),
+            engine_caches: Category::exact(0),
+            interpreter_side_tables: Category::exact(0),
         }
     }
-    let mut scope_storage = Category::exact(0);
+}
+
+fn scan_realm(
+    interp: &Interp,
+    objects: &[Gc],
+    scopes: &[Env],
+    visitor: &mut Visitor,
+    totals: &mut DirectTotals,
+) {
+    totals.object_count = totals.object_count.saturating_add(objects.len());
+    totals.scope_count = totals.scope_count.saturating_add(scopes.len());
+    totals.interpreter_side_tables.add(size_of::<Interp>());
+    for object in objects {
+        let (bytes, exact) = visitor.object(&object.borrow());
+        totals.property_storage.add(bytes);
+        if !exact {
+            totals
+                .property_storage
+                .make_lower_bound("opaque standard-library HashMap bucket storage");
+        }
+    }
     for scope in scopes {
         let (bytes, exact) = visitor.scope(&scope.borrow());
-        scope_storage.add(bytes);
+        totals.scope_storage.add(bytes);
         if !exact {
-            scope_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
+            totals
+                .scope_storage
+                .make_lower_bound("opaque standard-library HashMap bucket storage");
         }
     }
 
-    let mut engine_caches = Category::exact(0);
     let (bytes, exact) = interp.str_units.scan_retained_memory(|(string, units)| {
         visitor.lstr(string);
         visitor.str_units(units);
     });
-    engine_caches.add(bytes);
+    totals.engine_caches.add(bytes);
     if !exact {
-        engine_caches.make_lower_bound("opaque standard-library HashMap bucket storage");
+        totals
+            .engine_caches
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
     let (bytes, exact) = interp.re_texts.scan_retained_memory(|(string, text)| {
         visitor.lstr(string);
         visitor.re_text(text);
     });
-    engine_caches.add(bytes);
+    totals.engine_caches.add(bytes);
     if !exact {
-        engine_caches.make_lower_bound("opaque standard-library HashMap bucket storage");
+        totals
+            .engine_caches
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
     if let Some((string, _, text)) = &interp.re_text_ascii_hot {
         visitor.lstr(string);
         visitor.re_text(text);
     }
-    let (bytes, exact) = interp.regexp_programs.scan_retained_memory(&mut visitor);
-    engine_caches.add(bytes);
+    let (bytes, exact) = interp.regexp_programs.scan_retained_memory(visitor);
+    totals.engine_caches.add(bytes);
     if !exact {
-        engine_caches.make_lower_bound("opaque standard-library HashMap bucket storage");
+        totals
+            .engine_caches
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
-    let mut interpreter_side_tables = Category::exact(
+    totals.interpreter_side_tables.add(
         interp
             .regexps
             .len()
             .saturating_mul(size_of::<(usize, Rc<crate::regex::Regex>)>()),
     );
     if !interp.regexps.is_empty() {
-        interpreter_side_tables.make_lower_bound("opaque standard-library HashMap bucket storage");
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
     for regex in interp.regexps.values() {
         visitor.regex(regex);
     }
     if let Some(last) = &interp.regexp_last {
-        interpreter_side_tables.add(
+        totals.interpreter_side_tables.add(
             last.caps
                 .capacity()
                 .saturating_mul(size_of::<Option<(usize, usize)>>()),
@@ -556,32 +592,114 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     if let Some(symbol) = &interp.iterator_sym {
         visitor.symbol(symbol);
     }
-    interpreter_side_tables.add(interp.wk_syms.capacity().saturating_mul(size_of::<(
-        &'static str,
-        Value,
-        Rc<str>,
-    )>()));
+    totals
+        .interpreter_side_tables
+        .add(
+            interp
+                .wk_syms
+                .capacity()
+                .saturating_mul(size_of::<(&'static str, Value, Rc<str>)>()),
+        );
     for (_, symbol, key) in &interp.wk_syms {
         visitor.value(symbol);
         visitor.rc_str(key);
     }
-
-    // Function-owned maps can be reached while scanning either objects or scopes. Merge their
-    // storage only after both root families have completed so traversal order cannot omit it.
-    property_storage.add(visitor.detached_property_storage);
-    if visitor.detached_property_storage_opaque {
-        property_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
+    for buffer in interp.array_buffers.values() {
+        visitor.array_buffer(buffer);
     }
 
-    let array_buffer_bytes = unique_array_buffer_capacity(interp.array_buffers.values());
+    totals.interpreter_side_tables.add(
+        interp
+            .shadow_realms
+            .len()
+            .saturating_mul(size_of::<(usize, Box<Interp>)>()),
+    );
+    if !interp.shadow_realms.is_empty() {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+    for sub in interp.shadow_realms.values() {
+        let objects = crate::value::heap_gc_snapshot(&sub.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&sub.gc_heap);
+        scan_realm(sub, &objects, &scopes, visitor, totals);
+    }
+}
+
+fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut DirectTotals) {
+    let agent = interp.symbol_agent.borrow();
+    totals
+        .interpreter_side_tables
+        .add(size_of::<crate::value::SymbolAgentState>());
+    totals.interpreter_side_tables.add(
+        agent
+            .symbols
+            .len()
+            .saturating_mul(size_of::<(u64, std::rc::Weak<SymbolData>)>())
+            .saturating_add(
+                agent
+                    .global_by_key
+                    .len()
+                    .saturating_mul(size_of::<(Rc<str>, Rc<SymbolData>)>()),
+            )
+            .saturating_add(
+                agent
+                    .global_key_by_id
+                    .len()
+                    .saturating_mul(size_of::<(u64, Rc<str>)>()),
+            )
+            .saturating_add(
+                agent
+                    .well_known
+                    .len()
+                    .saturating_mul(size_of::<(&'static str, Rc<SymbolData>)>()),
+            ),
+    );
+    totals
+        .interpreter_side_tables
+        .make_lower_bound("opaque standard-library HashMap bucket storage");
+    for (key, symbol) in &agent.global_by_key {
+        visitor.rc_str(key);
+        visitor.symbol(symbol);
+    }
+    for key in agent.global_key_by_id.values() {
+        visitor.rc_str(key);
+    }
+    for symbol in agent.well_known.values() {
+        visitor.symbol(symbol);
+    }
+    // The weak identity table owns no Symbol payload. `memory_snapshots` is diagnostic output
+    // produced by this visitor and is excluded so measurement cannot inflate the workload.
+}
+
+fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
+    let mut visitor = Visitor::default();
+    let mut totals = DirectTotals::default();
+    scan_realm(interp, objects, scopes, &mut visitor, &mut totals);
+    scan_symbol_agent(interp, &mut visitor, &mut totals);
+
+    totals
+        .property_storage
+        .add(visitor.detached_property_storage);
+    if visitor.detached_property_storage_opaque {
+        totals
+            .property_storage
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
 
     Snapshot {
-        object_bodies: Category::exact(objects.len().saturating_mul(size_of::<RefCell<Object>>())),
-        property_storage,
-        scope_bodies: Category::exact(scopes.len().saturating_mul(size_of::<RefCell<Scope>>())),
-        scope_storage,
-        // The visitor deduplicates everything it sees; remaining side-table owners are added in
-        // later vertical slices.
+        object_bodies: Category::exact(
+            totals
+                .object_count
+                .saturating_mul(size_of::<RefCell<Object>>()),
+        ),
+        property_storage: totals.property_storage,
+        scope_bodies: Category::exact(
+            totals
+                .scope_count
+                .saturating_mul(size_of::<RefCell<Scope>>()),
+        ),
+        scope_storage: totals.scope_storage,
         strings_symbols_bigints: Category::lower_bound(
             visitor.strings_symbols_bigints,
             "remaining side-table owners are not yet traversed",
@@ -603,17 +721,15 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
             "shared character classes and nested lookaround programs are not yet traversed",
         ),
         engine_caches: Category::lower_bound(
-            engine_caches.bytes,
+            totals.engine_caches.bytes,
             "string and RegExp caches are covered; remaining interpreter caches are not",
         ),
         interpreter_side_tables: Category::lower_bound(
-            interpreter_side_tables.bytes,
-            "RegExp and realm-local symbol owners are covered; remaining Interp side tables are not",
+            totals.interpreter_side_tables.bytes,
+            "Agent/ShadowRealm, RegExp, and symbol owners are covered; remaining Interp side tables are not",
         ),
-        // The ordinary stores reached through this table are exact, but the category remains a
-        // lower bound until shared/Wasm and host-created backing stores join the same layer.
         array_buffer_backing: Category::lower_bound(
-            array_buffer_bytes,
+            visitor.array_buffer_bytes,
             "shared, Wasm, and host-created backing stores are not yet traversed",
         ),
     }
@@ -747,13 +863,54 @@ mod tests {
     }
 
     #[test]
+    fn agent_snapshot_aggregates_shadow_heaps_with_global_deduplication() {
+        let mut root = Interp::new();
+        let mut shadow = Interp::new_with_symbol_agent(root.symbol_agent.clone());
+        let shared_buffer = Rc::new(RefCell::new(Vec::with_capacity(333)));
+        root.array_buffers.insert(1, shared_buffer.clone());
+        shadow.array_buffers.insert(2, shared_buffer);
+
+        let root_objects = crate::value::heap_gc_snapshot(&root.gc_heap);
+        let root_scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
+        let shadow_objects = crate::value::heap_gc_snapshot(&shadow.gc_heap);
+        let shadow_scopes = crate::value::gc_scope_snapshot(&shadow.gc_heap);
+        let root_only = measure(&root, &root_objects, &root_scopes);
+        let shadow_only = measure(&shadow, &shadow_objects, &shadow_scopes);
+        let expected_objects = root_objects.len().saturating_add(shadow_objects.len());
+        let expected_scopes = root_scopes.len().saturating_add(shadow_scopes.len());
+
+        root.shadow_realms.insert(7, Box::new(shadow));
+        let aggregate = measure(&root, &root_objects, &root_scopes);
+
+        assert_eq!(
+            aggregate.object_bodies.bytes,
+            expected_objects.saturating_mul(size_of::<RefCell<Object>>())
+        );
+        assert_eq!(
+            aggregate.scope_bodies.bytes,
+            expected_scopes.saturating_mul(size_of::<RefCell<Scope>>())
+        );
+        assert_eq!(aggregate.array_buffer_backing.bytes, 333);
+        assert!(
+            aggregate.strings_symbols_bigints.bytes
+                < root_only
+                    .strings_symbols_bigints
+                    .bytes
+                    .saturating_add(shadow_only.strings_symbols_bigints.bytes),
+            "Agent-shared symbol/string payload must be credited once"
+        );
+        assert!(aggregate.interpreter_side_tables.bytes >= 2 * size_of::<Interp>());
+    }
+
+    #[test]
     fn aliased_array_buffer_backing_is_counted_once() {
         let buffer = Rc::new(RefCell::new(Vec::with_capacity(257)));
         let aliases = [buffer.clone(), buffer];
-        assert_eq!(
-            unique_array_buffer_capacity(aliases.iter()),
-            aliases[0].borrow().capacity()
-        );
+        let mut visitor = Visitor::default();
+        for buffer in &aliases {
+            visitor.array_buffer(buffer);
+        }
+        assert_eq!(visitor.array_buffer_bytes, aliases[0].borrow().capacity());
     }
 
     #[test]

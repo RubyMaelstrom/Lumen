@@ -159,9 +159,12 @@ That side-table category stays a documented lower bound until the rest of the ex
 inventory is covered.
 
 Realm-local well-known-symbol/key caches now contribute their vector storage and route Symbol and
-`Rc<str>` payloads through the shared identity sets. The Agent-wide symbol registry intentionally
-waits for root-plus-ShadowRealm aggregation: it is one shared owner, and charging it independently
-to every collector heap would inflate the eventual Agent total.
+`Rc<str>` payloads through the shared identity sets. Root-plus-ShadowRealm measurement now walks
+every collector heap with one visitor, collects each sub-heap before a diagnostic safepoint, and
+credits the Agent-wide symbol registry exactly once. Per-realm object/scope/container storage is
+summed; shared strings, symbols, Functions, RegExp programs, and ArrayBuffer backing are globally
+deduplicated. The diagnostic snapshot map itself is excluded because it is measurement output,
+not workload-retained engine state.
 
 ## Questions worth outside review
 

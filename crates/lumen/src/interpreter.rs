@@ -1712,7 +1712,7 @@ macro_rules! interp_memory_inventory {
 #[cfg(test)]
 interp_memory_inventory! {
     gc_heap => "unaccounted",
-    symbol_agent => "unaccounted",
+    symbol_agent => "measured",
     global => "measured",
     global_env => "measured",
     object_proto => "measured",
@@ -1787,7 +1787,7 @@ interp_memory_inventory! {
     global_var_names => "unaccounted",
     gc_pins => "unaccounted",
     ta_buffer => "unaccounted",
-    shadow_realms => "unaccounted",
+    shadow_realms => "measured",
     data_views => "unaccounted",
     regexps => "measured",
     regexp_programs => "measured",
@@ -6757,6 +6757,12 @@ impl Interp {
                 performance_scopes_before,
                 scopes_after,
             );
+            // One Agent snapshot must observe every ShadowRealm after collection, not a freshly
+            // swept root mixed with stale sub-heaps. Ownership is a tree, so children recursively
+            // collect their descendants before the root uses one shared identity registry.
+            for sub in self.shadow_realms.values_mut() {
+                sub.gc_collect();
+            }
             // Keep diagnostic traversal outside the collector pause measurement. It runs only
             // under LUMEN_PERF_METRICS and records a post-sweep Agent safepoint, so ordinary
             // execution and reported GC pause time do not absorb visitor overhead.
