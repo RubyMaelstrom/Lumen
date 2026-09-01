@@ -163,6 +163,7 @@ pub(crate) struct Visitor {
     jit_codes: HashSet<usize>,
     hoist_plans: HashSet<usize>,
     stmt_bodies: HashSet<usize>,
+    global_var_name_sets: HashSet<usize>,
     re_texts: HashSet<usize>,
     regexes: HashSet<usize>,
     rc_u16_slices: HashSet<usize>,
@@ -402,6 +403,26 @@ impl Visitor {
             let bytes = crate::ast::scan_stmt_body_retained_memory(body, self);
             self.add_function_bytecode_bytes(bytes);
         }
+    }
+
+    fn global_var_names(
+        &mut self,
+        names: &Rc<RefCell<std::collections::HashSet<String>>>,
+    ) -> (usize, bool) {
+        let identity = Rc::as_ptr(names) as usize;
+        if !self.global_var_name_sets.insert(identity) {
+            return (0, true);
+        }
+        let names = names.borrow();
+        let bytes = size_of::<RefCell<std::collections::HashSet<String>>>()
+            .saturating_add(names.len().saturating_mul(size_of::<String>()))
+            .saturating_add(
+                names
+                    .iter()
+                    .map(String::capacity)
+                    .fold(0usize, usize::saturating_add),
+            );
+        (bytes, names.is_empty())
     }
 
     pub(crate) fn chunk(&mut self, chunk: &Rc<crate::bytecode::Chunk>) {
@@ -782,6 +803,106 @@ fn scan_realm(
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
+            .promises
+            .len()
+            .saturating_mul(size_of::<(usize, crate::interpreter::PromiseState)>())
+            .saturating_add(
+                interp
+                    .unhandled_rejections
+                    .len()
+                    .saturating_mul(size_of::<(usize, (Value, Value))>()),
+            )
+            .saturating_add(
+                interp
+                    .microtasks
+                    .capacity()
+                    .saturating_mul(size_of::<crate::interpreter::Job>()),
+            )
+            .saturating_add(interp.host_settings_states.len().saturating_mul(size_of::<(
+                (usize, u64),
+                crate::interpreter::HostSettingsState,
+            )>()))
+            .saturating_add(
+                interp
+                    .retired_host_job_contexts
+                    .len()
+                    .saturating_mul(size_of::<u64>()),
+            )
+            .saturating_add(
+                interp
+                    .kept_alive
+                    .capacity()
+                    .saturating_mul(size_of::<Value>()),
+            )
+            .saturating_add(
+                interp
+                    .promise_forward
+                    .len()
+                    .saturating_mul(size_of::<(usize, Value)>()),
+            ),
+    );
+    for state in interp.promises.values() {
+        visitor.value(&state.value);
+        totals
+            .interpreter_side_tables
+            .add(
+                state
+                    .reactions
+                    .capacity()
+                    .saturating_mul(size_of::<(Value, Value, Value, u64)>()),
+            );
+        for (on_fulfilled, on_rejected, result, _) in &state.reactions {
+            visitor.value(on_fulfilled);
+            visitor.value(on_rejected);
+            visitor.value(result);
+        }
+    }
+    for (promise, reason) in interp.unhandled_rejections.values() {
+        visitor.value(promise);
+        visitor.value(reason);
+    }
+    for job in &interp.microtasks {
+        visitor.value(&job.handler);
+        visitor.value(&job.result);
+        visitor.value(&job.value);
+    }
+    for state in interp.host_settings_states.values() {
+        // Environments are already canonical to the collector's scope snapshot. The parallel
+        // global-name set is not part of an Env and therefore needs its own identity registry.
+        let (bytes, exact) = visitor.global_var_names(&state.global_var_names);
+        totals.interpreter_side_tables.add(bytes);
+        if !exact {
+            totals
+                .interpreter_side_tables
+                .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
+        }
+    }
+    let (bytes, exact) = visitor.global_var_names(&interp.global_var_names);
+    totals.interpreter_side_tables.add(bytes);
+    if !exact {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
+    }
+    for value in &interp.kept_alive {
+        visitor.value(value);
+    }
+    for value in interp.promise_forward.values() {
+        visitor.value(value);
+    }
+    if !interp.promises.is_empty()
+        || !interp.unhandled_rejections.is_empty()
+        || !interp.host_settings_states.is_empty()
+        || !interp.retired_host_job_contexts.is_empty()
+        || !interp.promise_forward.is_empty()
+    {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
     }
 
     totals.interpreter_side_tables.add(
@@ -1374,6 +1495,84 @@ mod tests {
         assert!(!engine.interp.module_ns.is_empty());
         assert!(after.function_bytecode_metadata.bytes > before.function_bytecode_metadata.bytes);
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+    }
+
+    #[test]
+    fn promise_reactions_and_queued_jobs_retain_their_storage() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        let source = engine.interp.new_promise();
+        let result = engine.interp.new_promise();
+        engine
+            .interp
+            .promise_then_into(&source, Value::Undefined, Value::Undefined, result);
+        let pending_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let pending_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let pending = measure(&engine.interp, &pending_objects, &pending_scopes);
+        assert_eq!(engine.interp.promises.len(), 2);
+        assert_eq!(engine.interp.microtasks.len(), 0);
+        assert!(engine
+            .interp
+            .promises
+            .values()
+            .any(|state| state.reactions.capacity() > 0));
+        assert!(pending.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+
+        engine
+            .interp
+            .resolve_promise(&source, Value::str("settled payload"));
+        let queued_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let queued_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let queued = measure(&engine.interp, &queued_objects, &queued_scopes);
+        assert_eq!(engine.interp.microtasks.len(), 1);
+        assert!(queued.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(queued.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
+    }
+
+    #[test]
+    fn host_settings_global_names_are_identity_deduplicated() {
+        let mut engine = crate::Engine::new();
+        engine
+            .interp
+            .global_var_names
+            .borrow_mut()
+            .insert("rootGlobalWithRetainedCapacity".to_string());
+        engine.interp.switch_host_job_context(41);
+        engine
+            .interp
+            .global_var_names
+            .borrow_mut()
+            .insert("contextGlobalWithRetainedCapacity".to_string());
+        let shared_names = engine.interp.global_var_names.clone();
+        let saved_names = &engine
+            .interp
+            .host_settings_states
+            .values()
+            .next()
+            .expect("switched host context is saved")
+            .global_var_names;
+        assert!(Rc::ptr_eq(&shared_names, saved_names));
+        let mut visitor = Visitor::default();
+        let (first_names, _) = visitor.global_var_names(&shared_names);
+        let (duplicate_names, duplicate_exact) = visitor.global_var_names(saved_names);
+        assert!(first_names > 0);
+        assert_eq!(duplicate_names, 0);
+        assert!(duplicate_exact);
+        let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+
+        let first = measure(&engine.interp, &objects, &scopes);
+        let second = measure(&engine.interp, &objects, &scopes);
+
+        assert_eq!(engine.interp.host_settings_states.len(), 1);
+        assert_eq!(
+            first.interpreter_side_tables.bytes,
+            second.interpreter_side_tables.bytes
+        );
+        assert!(first.interpreter_side_tables.bytes >= size_of::<Interp>());
     }
 
     #[test]

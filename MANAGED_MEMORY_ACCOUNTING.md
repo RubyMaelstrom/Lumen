@@ -194,6 +194,12 @@ strings and promise Values, and namespace binding names. Module environments rem
 the scope snapshot. Host loader closures are classified external because an opaque embedder
 closure cannot safely report zero retained bytes.
 
+Promise ownership includes pending reaction vectors, rejection tracking, queued Promise jobs,
+forwarding entries, the Agent `[[KeptAlive]]` vector, and host-settings bookkeeping. JavaScript
+Values retain their canonical allocation-family attribution, while saved environments remain in
+the scope snapshot. Per-settings global-name sets are identity-deduplicated across their shared
+`Rc` owners; opaque map/set bucket storage keeps the category explicitly lower-bound.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
