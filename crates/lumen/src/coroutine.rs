@@ -50,6 +50,21 @@ pub enum Coroutine {
 }
 
 impl Coroutine {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        match self {
+            Coroutine::Vm(coroutine) => std::mem::size_of::<crate::bytecode::VmCoro>()
+                .saturating_add(coroutine.scan_retained_memory(visitor)),
+            Coroutine::Module(coroutine) => coroutine.scan_retained_memory(visitor),
+            Coroutine::FromAsync(coroutine) => coroutine.scan_retained_memory(visitor),
+            Coroutine::Unavailable(coroutine) => {
+                if let Some(reason) = &coroutine.reason {
+                    visitor.value(reason);
+                }
+                0
+            }
+        }
+    }
+
     #[inline]
     pub(crate) fn resume(&mut self, i: &mut Interp, signal: Resume) -> Suspend {
         match self {
@@ -91,6 +106,17 @@ impl Coroutine {
                 c.reason.take();
                 c.done = true;
             }
+        }
+    }
+}
+
+impl Resume {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
+        match self {
+            Resume::Next(value) | Resume::Return(value) | Resume::Throw(value) => {
+                visitor.value(value)
+            }
+            Resume::Terminate => {}
         }
     }
 }

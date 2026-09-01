@@ -362,6 +362,13 @@ impl PropertyKey {
         &self.text
     }
 
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        if let Some(symbol) = &self.symbol {
+            visitor.symbol(symbol);
+        }
+        self.text.capacity()
+    }
+
     pub(crate) fn into_value(self) -> Value {
         match self.symbol {
             Some(symbol) => Value::Sym(symbol),

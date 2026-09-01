@@ -11394,6 +11394,106 @@ pub struct VmCoro {
 }
 
 impl VmCoro {
+    /// Scan allocations owned below this continuation. The caller credits the fixed `VmCoro`
+    /// payload because it may be boxed directly or embedded in a module-coroutine box.
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        fn disposable(
+            resource: &crate::interpreter::Disposable,
+            visitor: &mut crate::memory::Visitor,
+        ) {
+            visitor.value(&resource.value);
+            visitor.value(&resource.method);
+        }
+        fn completion(completion: &DisposeCompletion, visitor: &mut crate::memory::Visitor) {
+            match completion {
+                DisposeCompletion::Throw(value)
+                | DisposeCompletion::SourceReturn(value)
+                | DisposeCompletion::ResumeReturn(value) => visitor.value(value),
+                DisposeCompletion::Normal
+                | DisposeCompletion::BareReturn
+                | DisposeCompletion::Jump { .. } => {}
+            }
+        }
+
+        visitor.chunk(&self.chunk);
+        visitor.value(&self.this_val);
+        let mut bytes = self
+            .references
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<crate::eval::PreparedReference>>())
+            .saturating_add(
+                self.slots
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.stack
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.handlers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Handler>()),
+            )
+            .saturating_add(
+                self.disposal_frames
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<crate::interpreter::Disposable>>()),
+            )
+            .saturating_add(
+                self.class_states
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<
+                        Option<crate::eval::PreparedClassEvaluation>,
+                    >()),
+            );
+        for reference in self.references.iter().flatten() {
+            bytes = bytes.saturating_add(reference.scan_retained_memory(visitor));
+        }
+        for value in self.slots.iter().chain(&self.stack) {
+            visitor.value(value);
+        }
+        for frame in &self.disposal_frames {
+            bytes = bytes.saturating_add(
+                frame
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<crate::interpreter::Disposable>()),
+            );
+            for resource in frame {
+                disposable(resource, visitor);
+            }
+        }
+        for state in self.class_states.iter().flatten() {
+            bytes = bytes.saturating_add(state.scan_retained_memory(visitor));
+        }
+        if let Some(delegation) = &self.delegation {
+            visitor.value(&delegation.iterator);
+            visitor.value(&delegation.next);
+        }
+        if let Some(close) = &self.async_close {
+            visitor.value(&close._iterator);
+        }
+        if let Some(disposal) = &self.disposal {
+            bytes = bytes.saturating_add(
+                disposal
+                    .resources
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<crate::interpreter::Disposable>()),
+            );
+            for resource in &disposal.resources {
+                disposable(resource, visitor);
+            }
+            if let Some(resource) = &disposal.pending_resource {
+                disposable(resource, visitor);
+            }
+            completion(&disposal.output, visitor);
+        }
+        // `cap_env` and `env` are registered scope allocations and remain canonical to the
+        // collector snapshot even when a suspended continuation is their discoverer.
+        bytes
+    }
+
     /// Build an async coroutine for `chunk` with its already-instantiated parameter values, parked
     /// before its first step (run on the first `resume`). `arguments` remains the original call
     /// list, as required for the function's arguments object.

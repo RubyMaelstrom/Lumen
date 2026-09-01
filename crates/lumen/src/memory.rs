@@ -907,6 +907,49 @@ fn scan_realm(
 
     totals.interpreter_side_tables.add(
         interp
+            .generators
+            .len()
+            .saturating_mul(size_of::<(usize, crate::coroutine::Coroutine)>())
+            .saturating_add(interp.async_gens.len().saturating_mul(size_of::<usize>()))
+            .saturating_add(
+                interp
+                    .async_gen_busy
+                    .len()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(interp.async_gen_queue.len().saturating_mul(size_of::<(
+                usize,
+                std::collections::VecDeque<(Value, crate::coroutine::Resume)>,
+            )>())),
+    );
+    for coroutine in interp.generators.values() {
+        totals
+            .interpreter_side_tables
+            .add(coroutine.scan_retained_memory(visitor));
+    }
+    for queue in interp.async_gen_queue.values() {
+        totals.interpreter_side_tables.add(
+            queue
+                .capacity()
+                .saturating_mul(size_of::<(Value, crate::coroutine::Resume)>()),
+        );
+        for (promise, signal) in queue {
+            visitor.value(promise);
+            signal.scan_retained_memory(visitor);
+        }
+    }
+    if !interp.generators.is_empty()
+        || !interp.async_gens.is_empty()
+        || !interp.async_gen_busy.is_empty()
+        || !interp.async_gen_queue.is_empty()
+    {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
             .map_data
             .len()
             .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
@@ -1573,6 +1616,55 @@ mod tests {
             second.interpreter_side_tables.bytes
         );
         assert!(first.interpreter_side_tables.bytes >= size_of::<Interp>());
+    }
+
+    #[test]
+    fn suspended_coroutines_and_async_requests_retain_their_storage() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        engine
+            .eval(
+                r#"
+                    globalThis.memoryGenerator = (function* (value) {
+                        yield value;
+                    })("retained generator payload");
+                "#,
+                false,
+            )
+            .expect("generator setup parses");
+        assert_eq!(engine.interp.generators.len(), 1);
+        assert!(engine
+            .interp
+            .generators
+            .values()
+            .all(|coroutine| matches!(coroutine, crate::coroutine::Coroutine::Vm(_))));
+
+        let request_key = *engine
+            .interp
+            .generators
+            .keys()
+            .next()
+            .expect("generator has an identity");
+        engine.interp.async_gen_busy.insert(request_key);
+        engine
+            .interp
+            .async_gen_queue
+            .entry(request_key)
+            .or_default()
+            .push_back((
+                Value::str("queued request promise"),
+                crate::coroutine::Resume::Throw(Value::str("queued request signal")),
+            ));
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
+
+        assert!(after.function_bytecode_metadata.bytes > before.function_bytecode_metadata.bytes);
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
     }
 
     #[test]

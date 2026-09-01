@@ -1596,8 +1596,8 @@ pub struct Interp {
     /// Embedder host state (typed slots + resource table); see [`crate::host`]. Reached from
     /// native fns via [`Interp::op_state`] — the only way, since `NativeFn` cannot capture.
     pub(crate) host_state: crate::host::OpState,
-    /// Live generator coroutines, keyed by the generator object's pointer. Each owns an OS thread
-    /// that runs the body and parks at every `yield` (see [`crate::coroutine`]).
+    /// Live generator coroutines, keyed by the generator object's pointer. Each owns an explicit
+    /// heap VM continuation that parks at `yield`/`await` without reserving an OS thread stack.
     pub(crate) generators: crate::fasthash::FastMap<usize, crate::coroutine::Coroutine>,
     /// Live-object count above which the next allocation safe point runs the cycle collector.
     pub(crate) gc_next: i64,
@@ -1783,7 +1783,7 @@ interp_memory_inventory! {
     pending_timers => "unaccounted",
     agent => "unaccounted",
     typed_arrays => "measured",
-    async_gens => "unaccounted",
+    async_gens => "measured",
     global_var_names => "measured",
     gc_pins => "unaccounted",
     ta_buffer => "measured",
@@ -1810,7 +1810,7 @@ interp_memory_inventory! {
     host_job_context_leave => "non_owning",
     kept_alive => "measured",
     host_state => "unaccounted",
-    generators => "unaccounted",
+    generators => "measured",
     gc_next => "non_owning",
     gc_suppressed => "non_owning",
     gc_tick => "non_owning",
@@ -1839,8 +1839,8 @@ interp_memory_inventory! {
     weak_refs => "unaccounted",
     finalization_registries => "unaccounted",
     pending_finalization_cleanup => "unaccounted",
-    async_gen_busy => "unaccounted",
-    async_gen_queue => "unaccounted",
+    async_gen_busy => "measured",
+    async_gen_queue => "measured",
 }
 
 #[cfg(test)]

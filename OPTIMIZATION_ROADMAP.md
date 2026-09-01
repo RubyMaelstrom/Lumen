@@ -414,6 +414,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     pending dynamic-import state; classify opaque host loader closures as external.
   - [x] Account Promise reactions, rejection and forwarding tables, queued jobs, Agent
     `[[KeptAlive]]`, and host-settings/global-name ownership with shared-`Rc` deduplication.
+  - [x] Account boxed heap VM/module/builtin coroutines, suspended execution buffers, and queued
+    async-generator requests without re-crediting chunks, scopes, or JavaScript payloads.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

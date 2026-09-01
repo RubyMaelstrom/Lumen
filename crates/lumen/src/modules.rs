@@ -149,6 +149,12 @@ impl ModuleCoro {
     pub(crate) fn terminate(&mut self, i: &mut Interp) {
         let _ = self.body.resume(i, crate::coroutine::Resume::Terminate);
     }
+
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        std::mem::size_of::<ModuleCoro>()
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.body.scan_retained_memory(visitor))
+    }
 }
 
 /// The origin of a local name that is an import binding (so re-exports resolve to the source).

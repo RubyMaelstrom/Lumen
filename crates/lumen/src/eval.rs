@@ -31,6 +31,54 @@ struct PreparedDecoratorValue {
     this_value: Value,
 }
 
+impl PreparedClassEvaluation {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        let mut bytes = self
+            .keys
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<crate::value::PropertyKey>>());
+        for key in self.keys.iter().flatten() {
+            bytes = bytes.saturating_add(key.scan_retained_memory(visitor));
+        }
+        if let Some(parent) = &self.ctor_parent {
+            visitor.value(parent);
+        }
+        if let Some(decorators) = &self.decorator_values {
+            bytes = bytes
+                .saturating_add(
+                    decorators
+                        .class
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<PreparedDecoratorValue>()),
+                )
+                .saturating_add(
+                    decorators
+                        .members
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Vec<PreparedDecoratorValue>>()),
+                );
+            for decorator in &decorators.class {
+                visitor.value(&decorator.callback);
+                visitor.value(&decorator.this_value);
+            }
+            for member in &decorators.members {
+                bytes = bytes.saturating_add(
+                    member
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<PreparedDecoratorValue>()),
+                );
+                for decorator in member {
+                    visitor.value(&decorator.callback);
+                    visitor.value(&decorator.this_value);
+                }
+            }
+        }
+        // Class environments and the optional prototype object are canonical to the collector
+        // snapshots; this method only credits the continuation-owned buffers and Value payloads.
+        bytes
+    }
+}
+
 impl Interp {
     // ----- statements -------------------------------------------------------------------------
 
@@ -8199,6 +8247,46 @@ enum Reference {
 /// intervening `yield`/`await`. Keeping this wrapper private-fielded prevents bytecode from
 /// reimplementing GetValue/PutValue details while still preserving the spec's resolve-once rule.
 pub(crate) struct PreparedReference(Reference);
+
+impl PreparedReference {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        fn base(base: &RefBase, visitor: &mut crate::memory::Visitor) {
+            if let RefBase::With(value) = base {
+                visitor.value(value);
+            }
+        }
+        fn key(key: &RefKey, visitor: &mut crate::memory::Visitor) -> usize {
+            match key {
+                RefKey::Static(value) => value.capacity(),
+                RefKey::Coerced(value) => value.scan_retained_memory(visitor),
+                RefKey::Raw(value) => {
+                    visitor.value(value);
+                    0
+                }
+            }
+        }
+
+        match &self.0 {
+            Reference::Var(reference_base, name) => {
+                base(reference_base, visitor);
+                name.capacity()
+            }
+            Reference::Prop(object, property) => {
+                visitor.value(object);
+                key(property, visitor)
+            }
+            Reference::Super {
+                proto,
+                receiver,
+                key: property,
+            } => {
+                visitor.value(proto);
+                visitor.value(receiver);
+                key(property, visitor)
+            }
+        }
+    }
+}
 
 impl Interp {
     pub(crate) fn prepare_name_reference(

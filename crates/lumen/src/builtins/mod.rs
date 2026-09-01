@@ -7168,6 +7168,37 @@ enum FromAsyncStage {
 }
 
 impl FromAsyncCoro {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        let values: &[&Value] = match &self.stage {
+            FromAsyncStage::Start {
+                ctor,
+                source,
+                mapper,
+                this_arg,
+            } => &[ctor, source, mapper, this_arg],
+            FromAsyncStage::IteratorNext(state)
+            | FromAsyncStage::IteratorResult(state)
+            | FromAsyncStage::IteratorMapped(state) => &[
+                &state.array,
+                &state.iterator,
+                &state.next,
+                &state.mapper,
+                &state.this_arg,
+            ],
+            FromAsyncStage::ArrayLikeNext(state)
+            | FromAsyncStage::ArrayLikeValue(state)
+            | FromAsyncStage::ArrayLikeMapped(state) => {
+                &[&state.array, &state.source, &state.mapper, &state.this_arg]
+            }
+            FromAsyncStage::Closing { error, iterator } => &[error, iterator],
+            FromAsyncStage::Done => &[],
+        };
+        for value in values {
+            visitor.value(value);
+        }
+        std::mem::size_of::<FromAsyncCoro>()
+    }
+
     fn new(ctor: Value, source: Value, mapper: Value, this_arg: Value) -> Self {
         Self {
             stage: FromAsyncStage::Start {

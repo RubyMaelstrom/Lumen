@@ -200,6 +200,12 @@ Values retain their canonical allocation-family attribution, while saved environ
 the scope snapshot. Per-settings global-name sets are identity-deduplicated across their shared
 `Rc` owners; opaque map/set bucket storage keeps the category explicitly lower-bound.
 
+Generator ownership includes each boxed heap VM continuation, its slots/operand stack, prepared
+references and class state, handler/disposal frames, delegation/async-close state, and queued
+async-generator requests. Chunks and JavaScript payloads retain canonical family attribution;
+suspended environments remain canonical to the scope snapshot. Lumen's current continuations own
+no OS thread or native stack, correcting an obsolete interpreter comment from the former design.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
