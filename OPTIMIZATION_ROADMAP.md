@@ -603,15 +603,18 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Add and test an isolated engine-owned `TaggedValue`/`HeapRef` word nucleus with canonical
     NaN, signed-zero, invalid-tag, and nonzero-reference validation; execution migration waits for
     the central heap.
-- [ ] Define one interpreter/bytecode/baseline/optimizing calling convention and frame layout.
-- [ ] Define exact safepoints: allocation, runtime/host calls, back-edge polls, interrupts, and
-  explicit collection points.
-- [ ] Define precise root maps for tagged registers, tagged stack slots, interpreter fields,
-  handles, suspended jobs, and coroutine continuations.
-- [ ] Define deoptimization metadata mapping optimized values to bytecode parameters, locals,
-  operand stack, environment state, handlers, completion state, and the exact resume PC.
-- [ ] Define materialization recipes for constants, boxed numbers, virtual objects, and duplicated
-  logical values.
+- [x] Define one interpreter/bytecode/baseline/optimizing calling convention and frame layout
+  (`TAGGED_VALUE_DESIGN.md`; implementation remains gated).
+- [x] Define exact safepoints: allocation, runtime/host calls, back-edge polls, interrupts, and
+  explicit collection points (`TAGGED_VALUE_DESIGN.md`; implementation remains gated).
+- [x] Define precise root maps for tagged registers, tagged stack slots, interpreter fields,
+  handles, suspended jobs, and coroutine continuations (`TAGGED_VALUE_DESIGN.md`; implementation
+  remains gated).
+- [x] Define deoptimization metadata mapping optimized values to bytecode parameters, locals,
+  operand stack, environment state, handlers, completion state, and the exact resume PC
+  (`TAGGED_VALUE_DESIGN.md`; implementation remains gated).
+- [x] Define materialization recipes for constants, boxed numbers, virtual objects, and duplicated
+  logical values (`TAGGED_VALUE_DESIGN.md`; implementation remains gated).
 - [ ] Add scoped rooted handles for Rust builtins and embedders.
 - [ ] Add a `NoGc`/no-safepoint discipline for short raw-pointer regions and make violations
   auditable.
@@ -1024,7 +1027,10 @@ before changing broad execution behavior:
 - [ ] Land the versioned abstract feedback-vector plus allocation/GC/JIT/error/conversion/iterator
   timing structures with disabled-cost tests.
 - [x] Add bounded machine-readable diagnostic dumps for long-lived browser Agents.
-- [ ] Write and review the tagged-value/frame/root/deoptimization ABI design record.
+- [x] Write and review the tagged-value/frame/root/deoptimization ABI design record
+  (`TAGGED_VALUE_DESIGN.md`). It fixes the logical frame, safepoint/root-map, deoptimization, and
+  materialization contracts; execution migration still requires the executable gates in the
+  record and `HEAP_SAFETY_MODEL.md`.
 - [ ] Migrate one bounded bytecode/frame/helper slice to the canonical tagged ABI and prove forced
   safepoint, relocation, frame walking, and differential behavior before widening the migration.
 - [x] Write and review the Phase 3A heap safety/migration design, including every root family,
