@@ -148,6 +148,11 @@ class UnitTests(unittest.TestCase):
             )
         with self.assertRaises(bench_matrix.BenchmarkError):
             bench_matrix.parse_engine_metrics(
+                stderr.replace('"complete":false', '"complete":true'),
+                "[lumen-perf] ",
+            )
+        with self.assertRaises(bench_matrix.BenchmarkError):
+            bench_matrix.parse_engine_metrics(
                 stderr.replace('"allocation_id":"shared-data-block:7"', '"allocation_id":""'),
                 "[lumen-perf] ",
             )

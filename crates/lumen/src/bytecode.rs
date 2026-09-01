@@ -1146,6 +1146,9 @@ impl Chunk {
             usize,
             std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
         )>()));
+        if call_pins.capacity() != 0 {
+            visitor.mark_function_bytecode_opaque_storage();
+        }
         if let Some(code) = self.jit.get().and_then(Option::as_ref) {
             visitor.jit_code(code);
         }

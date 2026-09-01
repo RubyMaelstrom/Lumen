@@ -844,15 +844,20 @@ fn has_named_group(pattern: &str) -> bool {
 }
 
 impl Regex {
-    /// Requested bytes that are directly owned by this compiled matcher. Rc-backed character
-    /// classes and nested lookaround programs are intentionally omitted until their allocation
-    /// families have identity-aware traversal; unlike `heap_bytes`, this diagnostic must never
-    /// double-count a shared allocation merely because the cache eviction estimate is allowed to.
-    pub(crate) fn retained_requested_lower_bound_bytes(&self) -> usize {
+    /// Requested payload/capacity retained by this compiled matcher. The visitor owns one
+    /// identity registry per shared allocation family, so first-set aliases and nested program
+    /// references are credited exactly once across every cache and Realm in the Agent.
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         let first = match &self.first {
-            FirstFilter::Atoms(atoms) => {
-                atoms.capacity().saturating_mul(std::mem::size_of::<Rep>())
-            }
+            FirstFilter::Atoms(atoms) => atoms
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Rep>())
+                .saturating_add(
+                    atoms
+                        .iter()
+                        .map(|rep| scan_rep_retained_memory(rep, visitor))
+                        .fold(0usize, usize::saturating_add),
+                ),
             _ => 0,
         };
         std::mem::size_of::<Self>()
@@ -861,6 +866,7 @@ impl Regex {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Inst>()),
             )
+            .saturating_add(scan_program_references(&self.prog, visitor))
             .saturating_add(first)
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
@@ -1240,6 +1246,115 @@ impl Regex {
         });
         result
     }
+}
+
+fn scan_program_references(program: &[Inst], visitor: &mut crate::memory::Visitor) -> usize {
+    program
+        .iter()
+        .map(|instruction| scan_inst_retained_memory(instruction, visitor))
+        .fold(0usize, usize::saturating_add)
+}
+
+fn scan_inst_retained_memory(instruction: &Inst, visitor: &mut crate::memory::Visitor) -> usize {
+    match instruction {
+        Inst::Class(class) => scan_char_class_retained_memory(class, visitor),
+        Inst::StringSet(set) | Inst::StringSetRepeat { set, .. } => {
+            scan_string_set_retained_memory(set, visitor)
+        }
+        Inst::BackrefAlt(groups) => {
+            let identity = Rc::as_ptr(groups) as usize;
+            if visitor.regexp_backref_groups_allocation(identity) {
+                std::mem::size_of::<Vec<usize>>().saturating_add(
+                    groups
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                )
+            } else {
+                0
+            }
+        }
+        Inst::Look { prog, .. } | Inst::LookBehind { prog, .. } => {
+            let identity = Rc::as_ptr(prog) as usize;
+            if visitor.regexp_program_allocation(identity) {
+                std::mem::size_of::<Vec<Inst>>()
+                    .saturating_add(prog.capacity().saturating_mul(std::mem::size_of::<Inst>()))
+                    .saturating_add(scan_program_references(prog, visitor))
+            } else {
+                0
+            }
+        }
+        Inst::Many { rep, .. } => scan_rep_retained_memory(rep, visitor),
+        _ => 0,
+    }
+}
+
+fn scan_rep_retained_memory(rep: &Rep, visitor: &mut crate::memory::Visitor) -> usize {
+    match rep {
+        Rep::Class(class) => scan_char_class_retained_memory(class, visitor),
+        Rep::Char(_) | Rep::Any => 0,
+    }
+}
+
+fn scan_char_class_retained_memory(
+    class: &Rc<CharClass>,
+    visitor: &mut crate::memory::Visitor,
+) -> usize {
+    let identity = Rc::as_ptr(class) as usize;
+    if visitor.regexp_char_class_allocation(identity) {
+        char_class_requested_bytes(class)
+    } else {
+        0
+    }
+}
+
+fn scan_string_set_retained_memory(
+    set: &Rc<StringSet>,
+    visitor: &mut crate::memory::Visitor,
+) -> usize {
+    let identity = Rc::as_ptr(set) as usize;
+    if !visitor.regexp_string_set_allocation(identity) {
+        return 0;
+    }
+    let trie_requested_bytes = |trie: &StringTrie| {
+        trie.nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<StringTrieNode>())
+            .saturating_add(trie.nodes.iter().fold(0usize, |bytes, node| {
+                bytes.saturating_add(
+                    node.edges
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(u32, usize)>()),
+                )
+            }))
+    };
+    std::mem::size_of::<StringSet>()
+        .saturating_add(trie_requested_bytes(&set.forward))
+        .saturating_add(trie_requested_bytes(&set.backward))
+        .saturating_add(char_class_requested_capacity(&set.singles))
+        .saturating_add(char_class_requested_capacity(&set.first))
+}
+
+fn char_class_requested_bytes(class: &CharClass) -> usize {
+    std::mem::size_of::<CharClass>().saturating_add(char_class_requested_capacity(class))
+}
+
+fn char_class_requested_capacity(class: &CharClass) -> usize {
+    class
+        .ranges
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(u32, u32)>())
+        .saturating_add(
+            class
+                .builtins
+                .capacity()
+                .saturating_mul(std::mem::size_of::<char>()),
+        )
+        .saturating_add(
+            class
+                .props
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(bool, &'static [(u32, u32)])>()),
+        )
 }
 
 fn program_heap_bytes(program: &[Inst], capacity: usize) -> usize {

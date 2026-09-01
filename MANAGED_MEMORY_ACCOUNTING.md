@@ -7,7 +7,9 @@ SharedArrayBuffer backing is reported by address-independent Shared Data Block i
 external-allocation observations now cover the built-in Lumen-web Wasm store and TRust's wasmi
 store without double-counting aliased `Memory.buffer` Data Blocks. Any host entry that does not
 implement the retained-metadata contract still makes the host category unavailable rather than
-silently contributing zero. The Phase 0 total therefore remains explicitly incomplete.
+silently contributing zero. Snapshot completeness is now derived from those category states: a
+fully classified standalone Agent can be complete, while current browser embedders remain
+incomplete until all live host metadata implements the contract.
 
 ## Why object count is not a byte count
 
@@ -117,9 +119,12 @@ Current implementation notes:
   payload can be described, but its private bucket/control allocation cannot be measured exactly.
 - The test-only inventory macro expands one checked-in classification list into an exhaustive
   `Interp` struct pattern with no `..`, so a newly added field fails test compilation until
-  classified. The inventory now rejects every `unaccounted` entry. `complete` remains false until
-  live host entries have retained-metadata reporters and every remaining lower-bound reason has
-  been audited.
+  classified. The inventory rejects every `unaccounted` entry. The top-level `complete` value is
+  computed, not hard-coded: every category must have complete allocation-family coverage, every
+  lower bound must carry a non-empty audited reason, host entries must report retained metadata,
+  Shared Data Block identities must resolve, and embedder external backing must be classified
+  without identity conflicts. Numeric completeness is distinct from exactness: a complete record
+  may retain a documented lower bound for private `HashMap` bucket/control allocation.
 
 Allocation attribution rules for the remaining slices:
 
@@ -131,8 +136,8 @@ Allocation attribution rules for the remaining slices:
 - Do not descend from callables or chunks into registered captured environments: the collector's
   scope snapshot already accounts those graph nodes and their storage.
 - Keep executable mappings and their bounded code-memory budget separate from requested managed
-  payload. Heap-side JIT metadata is also reported separately, never silently folded into either
-  allocator residency or executable bytes.
+  payload. Heap-side JIT metadata has its own category and participates in
+  `managed_requested_bytes`; executable bytes remain exclusively in generated-code metrics.
 - Per-Agent records carry both Agent and collector-heap identity. SharedArrayBuffer records use the
   engine's address-independent Shared Data Block id and an `externally_shared` marker so a process
   aggregator can dedupe them across Agents without changing the useful per-Agent retained view.
@@ -149,7 +154,8 @@ property variant; vector capacities and `Box` targets are local storage, while s
 Classes, strings, and BigInts use allocation-family identity sets. Several uncommon Chunk plans
 are also traversed, including generic eval/assignment expressions, class plans, initialized
 RegExp literals, constructor-plan vectors, forwarding chunks, and call-pin entry payloads. The
-Chunk category remains a lower bound because Rust's HashMap bucket capacity is opaque. JIT
+Chunk category becomes a lower bound when a live call-pin HashMap has retained bucket storage,
+because Rust does not expose that allocation's requested bytes. JIT
 `pc_offsets` and its Rust payload are reported as heap metadata; executable mappings remain
 exclusively in generated-code metrics.
 
@@ -157,9 +163,9 @@ The bounded string/RegExp cache slice scans UTF-16 views, prepared subjects, the
 and compiled-program cache entries plus stale recency keys. Cache tables and recency queues credit
 only their own storage to `engine_caches`; pinned strings and matcher payloads pass through the
 global string/RegExp identity registries. The diagnostic does not reuse the cache eviction byte
-estimate as an exact total: that estimate may conservatively double-count shared matcher graphs,
-whereas retained-memory reporting now uses a direct-allocation lower bound until shared character
-classes and nested lookaround programs gain identity-aware traversal.
+estimate, which may conservatively double-count shared matcher graphs. Retained-memory traversal
+instead deduplicates nested lookaround programs, character classes, Unicode string sets, and
+alternate-backreference vectors by allocation family, making RegExp requested payload exact.
 
 Live RegExp object-to-program pins and deferred legacy-match state now use those same registries.
 Their pointer table and capture-vector storage is credited to `interpreter_side_tables`; the
@@ -274,6 +280,24 @@ allocation carries a typed identity. The built-in Lumen-web store reports the sa
 wasmi store reports store-plus-slot identities; its keyed ArrayBuffer synchronization mirror is a
 second real allocation and therefore remains in `array_buffer_backing`. Duplicate external
 identities are credited once, while conflicting sizes keep the category explicitly lower-bound.
+`put_retained`/`add_retained` explicitly classify an entry as owning no separate external backing;
+the combined registration methods classify both layers. Legacy entries registered through
+`put`/`add` leave external ownership unclassified and therefore prevent an exact Wasm category,
+even if the visitor has not observed a Wasm allocation through another entry.
+
+### Audited quality states
+
+- Exact requested-payload families: object/scope bodies, strings/Symbols/BigInts, JIT heap
+  sidecars, RegExp graphs, and ordinary ArrayBuffer backing. Allocator rounding and private
+  `RcBox` headers are excluded by definition and do not reduce quality.
+- Conditionally exact: property/scope storage, function/bytecode metadata, engine caches, and
+  interpreter side tables. They become documented lower bounds only while live standard-library
+  maps, sets, or channel storage hide requested bucket/message capacity.
+- Coverage-incomplete: native closure captures without a retained-memory reporter, legacy host
+  entries, unresolved Shared Data Block ids, unclassified embedder external ownership, and
+  conflicting Wasm allocation identities. Any one of these forces top-level `complete: false`.
+- Host-resource bytes and generated executable code remain sibling totals; neither is silently
+  folded into the managed requested/external composites.
 
 ## Questions worth outside review
 

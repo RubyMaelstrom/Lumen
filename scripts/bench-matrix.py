@@ -571,6 +571,7 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
                 managed.get("categories"), dict
             ):
                 raise BenchmarkError("invalid managed-memory safepoint record")
+            has_unavailable_category = False
             for name in ("managed_requested_bytes", "managed_external_bytes"):
                 measurement = managed.get(name)
                 if (
@@ -593,6 +594,7 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
                 quality = category.get("quality")
                 byte_count = category.get("bytes")
                 if quality == "unavailable":
+                    has_unavailable_category = True
                     if (
                         byte_count is not None
                         or not isinstance(category.get("reason"), str)
@@ -635,6 +637,10 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
                         raise BenchmarkError(
                             "externally-shared allocations do not match category bytes"
                         )
+            if managed.get("complete") and has_unavailable_category:
+                raise BenchmarkError(
+                    "complete managed-memory record contains an unavailable category"
+                )
     return metrics
 
 

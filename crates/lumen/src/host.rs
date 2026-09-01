@@ -101,6 +101,7 @@ fn report_external<T: Any + RetainedExternalMemory>(
 pub(crate) struct HostRetainedMemory {
     pub(crate) reported_bytes: usize,
     pub(crate) unavailable_entries: usize,
+    pub(crate) unclassified_external_entries: usize,
     pub(crate) opaque_storage: bool,
     pub(crate) external_allocations: Vec<RetainedExternalAllocation>,
 }
@@ -111,6 +112,9 @@ impl HostRetainedMemory {
         self.unavailable_entries = self
             .unavailable_entries
             .saturating_add(other.unavailable_entries);
+        self.unclassified_external_entries = self
+            .unclassified_external_entries
+            .saturating_add(other.unclassified_external_entries);
         self.opaque_storage |= other.opaque_storage;
         self.external_allocations.extend(other.external_allocations);
     }
@@ -134,7 +138,9 @@ impl OpState {
         self.retained_reporters.remove(&type_id);
         self.external_reporters.remove(&type_id);
     }
-    /// Install a slot whose owned heap storage participates in retained-memory diagnostics.
+    /// Install a slot whose owned heap storage participates in retained-memory diagnostics and
+    /// which retains no separately allocated external backing. Use
+    /// [`Self::put_retained_with_external_memory`] when both kinds are present.
     pub fn put_retained<T: Any + RetainedBytes>(&mut self, value: T) {
         let type_id = TypeId::of::<T>();
         self.map.insert(type_id, Box::new(value));
@@ -196,6 +202,14 @@ impl OpState {
                         .saturating_mul(std::mem::size_of::<(TypeId, ExternalReporter)>()),
                 ),
             unavailable_entries: self.map.len().saturating_sub(self.retained_reporters.len()),
+            unclassified_external_entries: self
+                .map
+                .keys()
+                .filter(|type_id| {
+                    !self.retained_reporters.contains_key(type_id)
+                        && !self.external_reporters.contains_key(type_id)
+                })
+                .count(),
             opaque_storage: !self.map.is_empty()
                 || !self.retained_reporters.is_empty()
                 || !self.external_reporters.is_empty(),
@@ -242,7 +256,9 @@ impl ResourceTable {
         self.map.insert(rid, Rc::new(resource));
         rid
     }
-    /// Add a resource whose owned heap storage participates in retained-memory diagnostics.
+    /// Add a resource whose owned heap storage participates in retained-memory diagnostics and
+    /// which retains no separately allocated external backing. Use
+    /// [`Self::add_retained_with_external_memory`] when both kinds are present.
     pub fn add_retained<T: Any + RetainedBytes>(&mut self, resource: T) -> ResourceId {
         let rid = self.add(resource);
         self.retained_reporters.insert(rid, report_retained::<T>);
@@ -305,6 +321,14 @@ impl ResourceTable {
                         .saturating_mul(std::mem::size_of::<(ResourceId, ExternalReporter)>()),
                 ),
             unavailable_entries: self.map.len().saturating_sub(self.retained_reporters.len()),
+            unclassified_external_entries: self
+                .map
+                .keys()
+                .filter(|rid| {
+                    !self.retained_reporters.contains_key(rid)
+                        && !self.external_reporters.contains_key(rid)
+                })
+                .count(),
             opaque_storage: !self.map.is_empty()
                 || !self.retained_reporters.is_empty()
                 || !self.external_reporters.is_empty(),
@@ -358,11 +382,13 @@ mod tests {
 
         let reported = state.retained_memory();
         assert_eq!(reported.unavailable_entries, 0);
+        assert_eq!(reported.unclassified_external_entries, 0);
         assert!(reported.reported_bytes >= 41 + 73 + 2 * std::mem::size_of::<Reported>());
         assert!(reported.opaque_storage);
 
         state.put(String::from("not reported"));
         assert_eq!(state.retained_memory().unavailable_entries, 1);
+        assert_eq!(state.retained_memory().unclassified_external_entries, 1);
         state.take::<String>();
         state.resources.close(rid);
         assert_eq!(state.retained_memory().unavailable_entries, 0);
@@ -387,6 +413,7 @@ mod tests {
 
         let memory = state.retained_memory();
         assert_eq!(memory.unavailable_entries, 2);
+        assert_eq!(memory.unclassified_external_entries, 0);
         assert_eq!(memory.external_allocations.len(), 2);
         assert_eq!(
             memory.external_allocations[0],

@@ -32,6 +32,7 @@ struct Category {
     bytes: usize,
     quality: Quality,
     reason: Option<&'static str>,
+    coverage_complete: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -101,19 +102,34 @@ impl SharedBackingCategory {
 struct WasmBackingCategory {
     bytes: usize,
     identity_conflict: bool,
+    unclassified_external_entries: usize,
 }
 
 impl WasmBackingCategory {
     fn json(self) -> String {
-        let reason = if self.identity_conflict {
-            "conflicting byte counts were reported for one Wasm allocation identity; unreported embedder stores are also excluded"
-        } else {
-            "embedder stores without RetainedExternalMemory reporters are excluded"
-        };
-        format!(
-            "{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"{}\"}}",
-            self.bytes, reason
-        )
+        if self.identity_conflict {
+            return format!(
+                concat!(
+                    "{{\"bytes\":{},\"quality\":\"lower_bound\",",
+                    "\"reason\":\"conflicting byte counts were reported for one Wasm allocation identity\"}}"
+                ),
+                self.bytes
+            );
+        }
+        if self.unclassified_external_entries != 0 {
+            return format!(
+                concat!(
+                    "{{\"bytes\":{},\"quality\":\"lower_bound\",",
+                    "\"reason\":\"{} live embedder entries have neither retained nor external-memory classification\"}}"
+                ),
+                self.bytes, self.unclassified_external_entries
+            );
+        }
+        format!("{{\"bytes\":{},\"quality\":\"exact\"}}", self.bytes)
+    }
+
+    fn coverage_complete(self) -> bool {
+        !self.identity_conflict && self.unclassified_external_entries == 0
     }
 }
 
@@ -160,6 +176,7 @@ impl Category {
             bytes,
             quality: Quality::Exact,
             reason: None,
+            coverage_complete: true,
         }
     }
 
@@ -168,6 +185,16 @@ impl Category {
             bytes,
             quality: Quality::LowerBound,
             reason: Some(reason),
+            coverage_complete: true,
+        }
+    }
+
+    fn incomplete_lower_bound(bytes: usize, reason: &'static str) -> Self {
+        Self {
+            bytes,
+            quality: Quality::LowerBound,
+            reason: Some(reason),
+            coverage_complete: false,
         }
     }
 
@@ -195,6 +222,10 @@ impl Category {
             ),
         }
     }
+
+    fn is_exact(self) -> bool {
+        matches!(self.quality, Quality::Exact)
+    }
 }
 
 #[derive(Clone)]
@@ -218,6 +249,13 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     fn managed_requested_bytes(&self) -> usize {
+        self.requested_categories()
+            .into_iter()
+            .map(|category| category.bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn requested_categories(&self) -> [Category; 11] {
         [
             self.object_bodies,
             self.property_storage,
@@ -226,27 +264,95 @@ impl Snapshot {
             self.strings_symbols_bigints,
             self.callable_metadata,
             self.function_bytecode_metadata,
+            self.jit_heap_metadata,
             self.regexp_metadata,
             self.engine_caches,
             self.interpreter_side_tables,
         ]
-        .into_iter()
-        .map(|category| category.bytes)
-        .fold(0usize, usize::saturating_add)
     }
 
-    fn json(&self, agent_id: u64, heap_id: u64) -> String {
-        let managed_external_bytes = self
+    fn managed_requested_category(&self) -> Category {
+        let bytes = self.managed_requested_bytes();
+        if self
+            .requested_categories()
+            .into_iter()
+            .all(Category::is_exact)
+        {
+            Category::exact(bytes)
+        } else if self
+            .requested_categories()
+            .into_iter()
+            .all(|category| category.coverage_complete)
+        {
+            Category::lower_bound(
+                bytes,
+                "one or more component categories exclude opaque storage",
+            )
+        } else {
+            Category::incomplete_lower_bound(
+                bytes,
+                "one or more requested-payload allocation families lack retained-memory traversal",
+            )
+        }
+    }
+
+    fn managed_external_category(&self) -> Category {
+        let bytes = self
             .array_buffer_backing
             .bytes
             .saturating_add(self.shared_array_buffer_backing.bytes())
             .saturating_add(self.wasm_backing.bytes);
+        if self.shared_array_buffer_backing.unavailable_ids != 0 {
+            return Category::incomplete_lower_bound(
+                bytes,
+                "referenced Shared Data Block identities unavailable from the backing registry",
+            );
+        }
+        if !self.wasm_backing.coverage_complete() {
+            return Category::incomplete_lower_bound(
+                bytes,
+                "Wasm backing identities or embedder external-memory classification are incomplete",
+            );
+        }
+        Category::exact(bytes)
+    }
+
+    fn complete(&self) -> bool {
+        [
+            self.object_bodies,
+            self.property_storage,
+            self.scope_bodies,
+            self.scope_storage,
+            self.strings_symbols_bigints,
+            self.callable_metadata,
+            self.function_bytecode_metadata,
+            self.jit_heap_metadata,
+            self.regexp_metadata,
+            self.engine_caches,
+            self.interpreter_side_tables,
+            self.array_buffer_backing,
+        ]
+        .into_iter()
+        .all(|category| {
+            category.coverage_complete
+                && match category.quality {
+                    Quality::Exact => category.reason.is_none(),
+                    Quality::LowerBound => category.reason.is_some_and(|reason| !reason.is_empty()),
+                }
+        }) && self.shared_array_buffer_backing.unavailable_ids == 0
+            && self.wasm_backing.coverage_complete()
+            && self.host_resources.unavailable_entries == 0
+    }
+
+    fn json(&self, agent_id: u64, heap_id: u64) -> String {
+        let managed_requested = self.managed_requested_category();
+        let managed_external = self.managed_external_category();
         format!(
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
-                "\"safepoint\":\"post_gc\",\"complete\":false,",
-                "\"managed_requested_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"opaque allocator and container storage is excluded\"}},",
-                "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"unavailable external categories are excluded\"}},",
+                "\"safepoint\":\"post_gc\",\"complete\":{},",
+                "\"managed_requested_bytes\":{},",
+                "\"managed_external_bytes\":{},",
                 "\"categories\":{{",
                 "\"object_bodies\":{},\"property_storage\":{},",
                 "\"scope_bodies\":{},\"scope_storage\":{},",
@@ -261,8 +367,9 @@ impl Snapshot {
             ),
             agent_id,
             heap_id,
-            self.managed_requested_bytes(),
-            managed_external_bytes,
+            self.complete(),
+            managed_requested.json(),
+            managed_external.json(),
             self.object_bodies.json(),
             self.property_storage.json(),
             self.scope_bodies.json(),
@@ -290,6 +397,7 @@ pub(crate) struct Visitor {
     symbols: HashSet<usize>,
     bigints: HashSet<usize>,
     callable_allocations: HashSet<usize>,
+    native_closure_allocations: HashSet<usize>,
     functions: HashSet<usize>,
     classes: HashSet<usize>,
     chunks: HashSet<usize>,
@@ -299,6 +407,10 @@ pub(crate) struct Visitor {
     global_var_name_sets: HashSet<usize>,
     re_texts: HashSet<usize>,
     regexes: HashSet<usize>,
+    regexp_programs: HashSet<usize>,
+    regexp_char_classes: HashSet<usize>,
+    regexp_string_sets: HashSet<usize>,
+    regexp_backref_groups: HashSet<usize>,
     rc_u16_slices: HashSet<usize>,
     rc_value_slices: HashSet<usize>,
     array_buffers: HashMap<usize, usize>,
@@ -310,7 +422,9 @@ pub(crate) struct Visitor {
     external_identity_conflict: bool,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
+    unavailable_native_closure_payloads: usize,
     function_bytecode_metadata: usize,
+    function_bytecode_opaque_storage: bool,
     jit_heap_metadata: usize,
     regexp_metadata: usize,
     detached_property_storage: usize,
@@ -391,6 +505,14 @@ impl Visitor {
                         .callable_metadata
                         .saturating_add(size_of_val(value.as_ref()));
                 }
+                let closure_identity = Rc::as_ptr(&value.func) as *const () as usize;
+                if self.native_closure_allocations.insert(closure_identity) {
+                    self.callable_metadata = self
+                        .callable_metadata
+                        .saturating_add(size_of_val(value.func.as_ref()));
+                    self.unavailable_native_closure_payloads =
+                        self.unavailable_native_closure_payloads.saturating_add(1);
+                }
             }
             Callable::User(value) => {
                 let identity = Rc::as_ptr(value) as usize;
@@ -449,6 +571,10 @@ impl Visitor {
         self.function_bytecode_metadata = self.function_bytecode_metadata.saturating_add(bytes);
     }
 
+    pub(crate) fn mark_function_bytecode_opaque_storage(&mut self) {
+        self.function_bytecode_opaque_storage = true;
+    }
+
     pub(crate) fn add_jit_heap_metadata_bytes(&mut self, bytes: usize) {
         self.jit_heap_metadata = self.jit_heap_metadata.saturating_add(bytes);
     }
@@ -489,8 +615,24 @@ impl Visitor {
         if self.regexes.insert(identity) {
             self.regexp_metadata = self
                 .regexp_metadata
-                .saturating_add(regex.retained_requested_lower_bound_bytes());
+                .saturating_add(regex.scan_retained_memory(self));
         }
+    }
+
+    pub(crate) fn regexp_program_allocation(&mut self, identity: usize) -> bool {
+        self.regexp_programs.insert(identity)
+    }
+
+    pub(crate) fn regexp_char_class_allocation(&mut self, identity: usize) -> bool {
+        self.regexp_char_classes.insert(identity)
+    }
+
+    pub(crate) fn regexp_string_set_allocation(&mut self, identity: usize) -> bool {
+        self.regexp_string_sets.insert(identity)
+    }
+
+    pub(crate) fn regexp_backref_groups_allocation(&mut self, identity: usize) -> bool {
+        self.regexp_backref_groups.insert(identity)
     }
 
     fn array_buffer(&mut self, buffer: &crate::interpreter::ArrayBufferBytes) {
@@ -1744,38 +1886,28 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
                 .saturating_mul(size_of::<RefCell<Scope>>()),
         ),
         scope_storage: totals.scope_storage,
-        strings_symbols_bigints: Category::lower_bound(
-            visitor.strings_symbols_bigints,
-            "remaining side-table owners are not yet traversed",
-        ),
-        callable_metadata: Category::lower_bound(
-            visitor.callable_metadata,
-            "native closure payloads are not yet traversed",
-        ),
-        function_bytecode_metadata: Category::lower_bound(
-            visitor.function_bytecode_metadata,
-            "Chunk call-pin HashMap bucket capacity is opaque",
-        ),
-        jit_heap_metadata: Category::lower_bound(
-            visitor.jit_heap_metadata,
-            "heap sidecars are covered; executable mappings are reported separately",
-        ),
-        regexp_metadata: Category::lower_bound(
-            visitor.regexp_metadata,
-            "shared character classes and nested lookaround programs are not yet traversed",
-        ),
-        engine_caches: Category::lower_bound(
-            totals.engine_caches.bytes,
-            "string and RegExp caches are covered; remaining interpreter caches are not",
-        ),
-        interpreter_side_tables: Category::lower_bound(
-            totals.interpreter_side_tables.bytes,
-            "Agent/ShadowRealm, RegExp, and symbol owners are covered; remaining Interp side tables are not",
-        ),
-        array_buffer_backing: Category::lower_bound(
-            visitor.array_buffer_bytes(),
-            "private Rc allocation metadata is excluded",
-        ),
+        strings_symbols_bigints: Category::exact(visitor.strings_symbols_bigints),
+        callable_metadata: if visitor.unavailable_native_closure_payloads == 0 {
+            Category::exact(visitor.callable_metadata)
+        } else {
+            Category::incomplete_lower_bound(
+                visitor.callable_metadata,
+                "native closure captured allocations have no retained-memory reporter",
+            )
+        },
+        function_bytecode_metadata: if visitor.function_bytecode_opaque_storage {
+            Category::lower_bound(
+                visitor.function_bytecode_metadata,
+                "Chunk call-pin HashMap bucket storage is opaque",
+            )
+        } else {
+            Category::exact(visitor.function_bytecode_metadata)
+        },
+        jit_heap_metadata: Category::exact(visitor.jit_heap_metadata),
+        regexp_metadata: Category::exact(visitor.regexp_metadata),
+        engine_caches: totals.engine_caches,
+        interpreter_side_tables: totals.interpreter_side_tables,
+        array_buffer_backing: Category::exact(visitor.array_buffer_bytes()),
         shared_array_buffer_backing: SharedBackingCategory {
             allocations: visitor.shared_array_buffer_allocations,
             unavailable_ids: visitor.unavailable_shared_array_buffers,
@@ -1783,6 +1915,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         wasm_backing: WasmBackingCategory {
             bytes: wasm_backing_bytes,
             identity_conflict: visitor.external_identity_conflict,
+            unclassified_external_entries: totals.host_resources.unclassified_external_entries,
         },
         host_resources: totals.host_resources.into(),
     }
@@ -1865,6 +1998,7 @@ mod tests {
             wasm_backing: WasmBackingCategory {
                 bytes: 0,
                 identity_conflict: false,
+                unclassified_external_entries: 0,
             },
             host_resources: HostCategory {
                 reported_bytes: 0,
@@ -1874,7 +2008,7 @@ mod tests {
         }
         .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":12"));
-        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":62"));
+        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":71"));
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
     }
 
@@ -1888,6 +2022,8 @@ mod tests {
         assert!(empty_snapshot
             .json(1, 1)
             .contains("\"host_resources\":{\"bytes\":0,\"quality\":\"exact\"}"));
+        assert!(empty_snapshot.complete());
+        assert!(empty_snapshot.json(1, 1).contains("\"complete\":true"));
 
         let mut reported = Interp::new();
         reported
@@ -1897,10 +2033,12 @@ mod tests {
         assert_eq!(reported_snapshot.host_resources.unavailable_entries, 0);
         assert!(reported_snapshot.host_resources.reported_bytes >= 47);
         assert!(reported_snapshot.host_resources.opaque_storage);
+        assert!(reported_snapshot.complete());
 
         reported.host_state.put(String::from("opaque host state"));
         let unavailable_snapshot = measure(&reported, &[], &[]);
         assert_eq!(unavailable_snapshot.host_resources.unavailable_entries, 1);
+        assert!(!unavailable_snapshot.complete());
         let json = unavailable_snapshot.json(1, 1);
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
         assert!(json.contains("live host entries do not implement RetainedBytes"));
@@ -1924,9 +2062,11 @@ mod tests {
         assert_eq!(snapshot.wasm_backing.bytes, 79);
         assert!(!snapshot.wasm_backing.identity_conflict);
         assert_eq!(snapshot.host_resources.unavailable_entries, 2);
+        assert_eq!(snapshot.wasm_backing.unclassified_external_entries, 0);
+        assert!(snapshot.wasm_backing.coverage_complete());
         let json = snapshot.json(1, 1);
         assert!(json.contains("\"wasm_backing\":{\"bytes\":79"));
-        assert!(json.contains("\"managed_external_bytes\":{\"bytes\":79"));
+        assert!(json.contains("\"managed_external_bytes\":{\"bytes\":79,\"quality\":\"exact\"}"));
     }
 
     #[test]
@@ -1975,6 +2115,71 @@ mod tests {
 
         assert!(snapshot.interpreter_side_tables.bytes > 0);
         assert!(snapshot.regexp_metadata.bytes > 0);
+    }
+
+    #[test]
+    fn regexp_allocations_are_exact_and_identity_deduplicated() {
+        let regexes = [
+            Rc::new(crate::regex::Regex::new("[a-z]+(?=[A-Z])", "").unwrap()),
+            Rc::new(crate::regex::Regex::new(r"\p{Basic_Emoji}", "v").unwrap()),
+            Rc::new(
+                crate::regex::Regex::new(r"(?:(?<letter>a)|(?<letter>b))\k<letter>", "u").unwrap(),
+            ),
+        ];
+        let mut visitor = Visitor::default();
+        for regex in &regexes {
+            visitor.regex(regex);
+        }
+        let first_bytes = visitor.regexp_metadata;
+        assert!(first_bytes > 0);
+        assert!(!visitor.regexp_programs.is_empty());
+        assert!(!visitor.regexp_char_classes.is_empty());
+        assert!(!visitor.regexp_string_sets.is_empty());
+        assert!(!visitor.regexp_backref_groups.is_empty());
+
+        for regex in &regexes {
+            visitor.regex(regex);
+        }
+        assert_eq!(visitor.regexp_metadata, first_bytes);
+    }
+
+    #[test]
+    fn requested_payload_categories_do_not_blame_excluded_allocator_metadata() {
+        let interp = Interp::new();
+        let snapshot = measure(&interp, &[], &[]);
+
+        assert!(matches!(
+            snapshot.strings_symbols_bigints.quality,
+            Quality::Exact
+        ));
+        assert!(matches!(snapshot.jit_heap_metadata.quality, Quality::Exact));
+        assert!(matches!(
+            snapshot.array_buffer_backing.quality,
+            Quality::Exact
+        ));
+        assert!(matches!(snapshot.regexp_metadata.quality, Quality::Exact));
+    }
+
+    #[test]
+    fn native_closure_captures_keep_the_snapshot_incomplete() {
+        let interp = Interp::new();
+        let retained = Vec::<u8>::with_capacity(101);
+        let closure: Rc<crate::value::NativeClosure> = Rc::new(move |_, _, _| {
+            std::hint::black_box(retained.len());
+            Ok(Value::Undefined)
+        });
+        let object = interp.make_native_closure("capturing", 0, closure);
+        let snapshot = measure(&interp, &[object], &[]);
+
+        assert!(!snapshot.callable_metadata.coverage_complete);
+        assert!(matches!(
+            snapshot.callable_metadata.quality,
+            Quality::LowerBound
+        ));
+        assert!(!snapshot.complete());
+        assert!(snapshot
+            .json(1, 1)
+            .contains("native closure captured allocations have no retained-memory reporter"));
     }
 
     #[test]
@@ -2056,6 +2261,7 @@ mod tests {
 
         let snapshot = measure(&interp, &[], &[]);
         assert_eq!(snapshot.shared_array_buffer_backing.unavailable_ids, 1);
+        assert!(!snapshot.complete());
         let json = snapshot.json(1, 1);
         assert!(json.contains(
             "\"shared_array_buffer_backing\":{\"bytes\":null,\"quality\":\"unavailable\""

@@ -440,8 +440,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Add typed embedder external-allocation observations; cover the built-in Lumen-web store and
     TRust's wasmi store, canonically attribute aliased Lumen `Memory.buffer` Data Blocks to Wasm,
     and retain TRust's separately allocated safety mirror as real ArrayBuffer backing.
-  - [ ] Eliminate remaining unavailable host-resource entries and audit every documented
-    lower-bound reason before changing the report to complete.
+  - [x] Audit every requested/external category, replace stale lower-bound labels with exact
+    requested-payload classifications, add identity-aware traversal for the full immutable RegExp
+    graph, and derive `complete` from machine-enforced coverage and documented-reason predicates.
+  - [ ] Eliminate remaining unavailable browser host-resource entries and add retained-payload
+    reporting for data-carrying native closures before treating browser Agent records as complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page
