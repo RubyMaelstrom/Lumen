@@ -568,8 +568,8 @@ impl Engine {
 #[cfg(feature = "embed")]
 pub mod embed {
     pub use crate::host::{
-        OpState, ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,
-        RetainedExternalMemory,
+        HostRetainedMemoryVisitor, OpState, ResourceId, ResourceTable, RetainedBytes,
+        RetainedExternalAllocation, RetainedExternalMemory, RetainedMemory,
     };
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.

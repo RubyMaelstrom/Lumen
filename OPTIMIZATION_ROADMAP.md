@@ -446,6 +446,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Add identity-aware retained-payload/value reporting for data-carrying native callables,
     preserve legacy closure source compatibility as explicitly incomplete, and migrate the
     built-in N-API callback/class/Promise wrappers.
+  - [x] Add the corresponding identity-aware host/resource reporting surface so shared embedder
+    allocations and host-retained JavaScript Values can use the Agent-wide canonical visitor.
   - [ ] Eliminate remaining unavailable browser host-resource entries before treating browser
     Agent records as complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so

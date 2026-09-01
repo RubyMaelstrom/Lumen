@@ -39,6 +39,7 @@ struct Category {
 struct HostCategory {
     reported_bytes: usize,
     unavailable_entries: usize,
+    identity_conflict: bool,
     opaque_storage: bool,
 }
 
@@ -144,11 +145,20 @@ impl HostCategory {
                 self.unavailable_entries
             );
         }
+        if self.identity_conflict {
+            return format!(
+                concat!(
+                    "{{\"bytes\":{},\"quality\":\"lower_bound\",",
+                    "\"reason\":\"conflicting byte counts were reported for one host allocation identity\"}}"
+                ),
+                self.reported_bytes
+            );
+        }
         if self.opaque_storage {
             return format!(
                 concat!(
                     "{{\"bytes\":{},\"quality\":\"lower_bound\",",
-                    "\"reason\":\"opaque HashMap bucket and Rc allocation metadata\"}}"
+                    "\"reason\":\"opaque standard-library map or channel storage\"}}"
                 ),
                 self.reported_bytes
             );
@@ -165,6 +175,7 @@ impl From<crate::host::HostRetainedMemory> for HostCategory {
         Self {
             reported_bytes: memory.reported_bytes,
             unavailable_entries: memory.unavailable_entries,
+            identity_conflict: memory.identity_conflict,
             opaque_storage: memory.opaque_storage,
         }
     }
@@ -342,6 +353,7 @@ impl Snapshot {
         }) && self.shared_array_buffer_backing.unavailable_ids == 0
             && self.wasm_backing.coverage_complete()
             && self.host_resources.unavailable_entries == 0
+            && !self.host_resources.identity_conflict
     }
 
     fn json(&self, agent_id: u64, heap_id: u64) -> String {
@@ -403,6 +415,7 @@ pub(crate) struct Visitor {
     unreported_native_closures: HashSet<usize>,
     native_managed_allocations: HashMap<(&'static str, usize), usize>,
     native_managed_identity_conflict: bool,
+    host_managed_allocations: HashMap<(&'static str, usize), usize>,
     functions: HashSet<usize>,
     classes: HashSet<usize>,
     chunks: HashSet<usize>,
@@ -875,8 +888,15 @@ impl crate::value::NativeRetainedMemoryVisitor for Visitor {
                     .saturating_add(allocation.requested_bytes);
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
-                if *entry.get() != allocation.requested_bytes {
+                let previous = *entry.get();
+                if previous != allocation.requested_bytes {
                     self.native_managed_identity_conflict = true;
+                    if allocation.requested_bytes > previous {
+                        self.callable_metadata = self
+                            .callable_metadata
+                            .saturating_add(allocation.requested_bytes - previous);
+                        *entry.into_mut() = allocation.requested_bytes;
+                    }
                 }
             }
         }
@@ -884,6 +904,51 @@ impl crate::value::NativeRetainedMemoryVisitor for Visitor {
 
     fn value(&mut self, value: &Value) {
         Visitor::value(self, value);
+    }
+}
+
+struct HostMemoryAdapter<'a> {
+    visitor: &'a mut Visitor,
+    memory: &'a mut crate::host::HostRetainedMemory,
+}
+
+impl crate::host::HostRetainedMemoryVisitor for HostMemoryAdapter<'_> {
+    fn allocation(&mut self, allocation: crate::value::RetainedManagedAllocation) {
+        let identity = (allocation.identity_domain, allocation.identity);
+        match self.visitor.host_managed_allocations.entry(identity) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(allocation.requested_bytes);
+                self.memory.reported_bytes = self
+                    .memory
+                    .reported_bytes
+                    .saturating_add(allocation.requested_bytes);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let previous = *entry.get();
+                if previous != allocation.requested_bytes {
+                    self.memory.identity_conflict = true;
+                    if allocation.requested_bytes > previous {
+                        self.memory.reported_bytes = self
+                            .memory
+                            .reported_bytes
+                            .saturating_add(allocation.requested_bytes - previous);
+                        *entry.into_mut() = allocation.requested_bytes;
+                    }
+                }
+            }
+        }
+    }
+
+    fn value(&mut self, value: &Value) {
+        self.visitor.value(value);
+    }
+
+    fn opaque_storage(&mut self) {
+        self.memory.opaque_storage = true;
+    }
+
+    fn unavailable(&mut self) {
+        self.memory.unavailable_entries = self.memory.unavailable_entries.saturating_add(1);
     }
 }
 
@@ -921,10 +986,16 @@ fn scan_realm(
     totals.object_count = totals.object_count.saturating_add(objects.len());
     totals.scope_count = totals.scope_count.saturating_add(scopes.len());
     totals.interpreter_side_tables.add(size_of::<Interp>());
-    let host_memory = interp.host_state.retained_memory();
+    let mut host_memory = interp.host_state.retained_memory();
     for allocation in &host_memory.external_allocations {
         visitor.external_allocation(*allocation);
     }
+    interp
+        .host_state
+        .scan_retained_memory(&mut HostMemoryAdapter {
+            visitor,
+            memory: &mut host_memory,
+        });
     totals.host_resources.add(host_memory);
     let (gc_heap_bytes, gc_heap_exact) = visitor.gc_heap(&interp.gc_heap);
     totals.interpreter_side_tables.add(gc_heap_bytes);
@@ -1992,7 +2063,10 @@ pub(crate) fn json(interp: &Interp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory};
+    use crate::host::{
+        HostRetainedMemoryVisitor, RetainedBytes, RetainedExternalAllocation,
+        RetainedExternalMemory, RetainedMemory,
+    };
     use crate::lstr::LStr;
     use crate::value::Props;
 
@@ -2005,6 +2079,12 @@ mod tests {
         value: Value,
     }
 
+    struct ReportedManagedHostState {
+        allocation: Rc<RefCell<Vec<u8>>>,
+        value: Value,
+        requested_bytes: usize,
+    }
+
     impl RetainedBytes for ReportedHostState {
         fn retained_bytes(&self) -> usize {
             self.0.capacity()
@@ -2014,6 +2094,17 @@ mod tests {
     impl RetainedExternalMemory for ExternalWasmState {
         fn retained_external_memory(&self, visit: &mut dyn FnMut(RetainedExternalAllocation)) {
             visit(RetainedExternalAllocation::wasm_array_buffer(&self.0));
+        }
+    }
+
+    impl RetainedMemory for ReportedManagedHostState {
+        fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
+            visitor.allocation(crate::value::RetainedManagedAllocation::rc(
+                "lumen-test.host-shared-buffer",
+                &self.allocation,
+                self.requested_bytes,
+            ));
+            visitor.value(&self.value);
         }
     }
 
@@ -2065,6 +2156,7 @@ mod tests {
             host_resources: HostCategory {
                 reported_bytes: 0,
                 unavailable_entries: 1,
+                identity_conflict: false,
                 opaque_storage: false,
             },
         }
@@ -2104,6 +2196,52 @@ mod tests {
         let json = unavailable_snapshot.json(1, 1);
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
         assert!(json.contains("live host entries do not implement RetainedBytes"));
+    }
+
+    #[test]
+    fn identity_aware_host_allocations_and_values_are_deduplicated() {
+        let mut interp = Interp::new();
+        let baseline_strings = measure(&interp, &[], &[]).strings_symbols_bigints.bytes;
+        let allocation = Rc::new(RefCell::new(Vec::<u8>::with_capacity(83)));
+        let string = LStr::from("host-retained string");
+        let requested_bytes = size_of::<RefCell<Vec<u8>>>() + allocation.borrow().capacity();
+        let make_reporter = || ReportedManagedHostState {
+            allocation: allocation.clone(),
+            value: Value::Str(string.clone()),
+            requested_bytes,
+        };
+        interp.host_state.put_retained_memory(make_reporter());
+        interp
+            .host_state
+            .resources
+            .add_retained_memory(make_reporter());
+
+        let snapshot = measure(&interp, &[], &[]);
+        assert_eq!(snapshot.host_resources.unavailable_entries, 0);
+        assert!(!snapshot.host_resources.identity_conflict);
+        assert!(snapshot.host_resources.reported_bytes >= requested_bytes);
+        assert_eq!(
+            snapshot
+                .strings_symbols_bigints
+                .bytes
+                .saturating_sub(baseline_strings),
+            string.retained_requested_bytes()
+        );
+        assert!(snapshot.complete());
+
+        interp
+            .host_state
+            .put_retained_memory(ReportedManagedHostState {
+                allocation,
+                value: Value::Undefined,
+                requested_bytes: requested_bytes + 1,
+            });
+        let conflicting = measure(&interp, &[], &[]);
+        assert!(conflicting.host_resources.identity_conflict);
+        assert!(!conflicting.complete());
+        assert!(conflicting
+            .json(1, 1)
+            .contains("conflicting byte counts were reported for one host allocation identity"));
     }
 
     #[test]

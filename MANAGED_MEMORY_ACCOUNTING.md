@@ -265,13 +265,17 @@ Object/scope bodies remain in their existing canonical categories. The embedder 
 and shared runtime-interrupt handle are classified external: captured closure state and cross-engine
 Arc ownership cannot be assigned honestly to one Agent's managed total.
 
-Host ownership uses the public `RetainedBytes` contract. Existing `OpState::put` and
-`ResourceTable::add` calls remain source-compatible but deliberately register an unreported entry;
-the `host_resources` category then emits `null`/`unavailable`. Embedders that can describe owned
-capacity use `put_retained` or `add_retained`; Lumen adds the inline value size and aggregates the
-reported payload across the root realm and every ShadowRealm. HashMap bucket storage and private
-`Rc` allocation metadata remain a documented lower bound. Host bytes stay a sibling category and
-are not added to either engine-managed composite.
+Host ownership has two public contracts. `RetainedBytes` remains the simple scalar hook for an
+unshared owner. `RetainedMemory` reports identity-bearing shared allocations and captured
+JavaScript Values through the Agent-wide visitor; aliases across host entries and ShadowRealms are
+therefore credited once, while host-retained Values re-enter the canonical engine graph traversal.
+Existing `OpState::put` and `ResourceTable::add` calls remain source-compatible but deliberately
+register an unreported entry; the `host_resources` category then emits `null`/`unavailable`.
+Embedders select the scalar or identity-aware registration method as their ownership requires.
+Lumen adds each registered value's inline size. Conflicting allocation sizes make completeness
+false and use the deterministic maximum as a lower bound. Opaque standard-library map and channel
+storage remains a documented lower bound; excluded private `Rc` headers do not reduce quality.
+Host bytes stay a sibling category and are not added to either engine-managed composite.
 
 External host backing uses the independent `RetainedExternalMemory` contract, so an embedder may
 report Wasm linear memory even while its other opaque host metadata remains unavailable. Each

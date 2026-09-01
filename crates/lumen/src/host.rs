@@ -9,6 +9,8 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::value::{RetainedManagedAllocation, Value};
+
 /// Reports heap storage retained by an embedder-owned value.
 ///
 /// The returned byte count is the requested size of allocations owned below `Self`; it excludes
@@ -20,6 +22,50 @@ pub trait RetainedBytes {
 }
 
 type RetainedReporter = fn(&dyn Any) -> usize;
+
+/// Canonical sinks available to an embedder-owned value's retained-memory reporter.
+pub trait HostRetainedMemoryVisitor {
+    /// Report one identity-bearing allocation retained below the registered host value.
+    fn allocation(&mut self, allocation: RetainedManagedAllocation);
+    /// Report a JavaScript value retained by the host so its engine-owned graph is visited once.
+    fn value(&mut self, value: &Value);
+    /// Mark requested bytes as a documented lower bound because a standard-library container or
+    /// channel does not expose its complete allocation layout.
+    fn opaque_storage(&mut self);
+    /// Mark one reachable owner as unavailable until the embedder can enumerate it. This keeps a
+    /// partially migrated reporter from making the Agent snapshot look complete.
+    fn unavailable(&mut self);
+}
+
+/// Identity-aware retained-memory reporting for embedder values that own shared allocations or
+/// JavaScript roots. The registered value's inline payload is counted by [`OpState`]; the reporter
+/// enumerates allocations and values below that payload.
+pub trait RetainedMemory {
+    fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor);
+}
+
+#[derive(Clone, Copy)]
+struct ManagedReporter {
+    scan: fn(&dyn Any, &mut dyn HostRetainedMemoryVisitor),
+    inline_bytes: usize,
+}
+
+fn report_managed<T: Any + RetainedMemory>(
+    value: &dyn Any,
+    visitor: &mut dyn HostRetainedMemoryVisitor,
+) {
+    let value = value
+        .downcast_ref::<T>()
+        .expect("managed-memory reporter must match its registered host value type");
+    value.scan_retained_memory(visitor);
+}
+
+fn managed_reporter<T: Any + RetainedMemory>() -> ManagedReporter {
+    ManagedReporter {
+        scan: report_managed::<T>,
+        inline_bytes: std::mem::size_of::<T>(),
+    }
+}
 
 /// An embedder allocation whose bytes belong in a managed external-memory category rather than
 /// the host metadata total.
@@ -102,6 +148,7 @@ pub(crate) struct HostRetainedMemory {
     pub(crate) reported_bytes: usize,
     pub(crate) unavailable_entries: usize,
     pub(crate) unclassified_external_entries: usize,
+    pub(crate) identity_conflict: bool,
     pub(crate) opaque_storage: bool,
     pub(crate) external_allocations: Vec<RetainedExternalAllocation>,
 }
@@ -115,6 +162,7 @@ impl HostRetainedMemory {
         self.unclassified_external_entries = self
             .unclassified_external_entries
             .saturating_add(other.unclassified_external_entries);
+        self.identity_conflict |= other.identity_conflict;
         self.opaque_storage |= other.opaque_storage;
         self.external_allocations.extend(other.external_allocations);
     }
@@ -126,6 +174,7 @@ impl HostRetainedMemory {
 pub struct OpState {
     map: HashMap<TypeId, Box<dyn Any>>,
     retained_reporters: HashMap<TypeId, RetainedReporter>,
+    managed_reporters: HashMap<TypeId, ManagedReporter>,
     external_reporters: HashMap<TypeId, ExternalReporter>,
     pub resources: ResourceTable,
 }
@@ -136,6 +185,7 @@ impl OpState {
         let type_id = TypeId::of::<T>();
         self.map.insert(type_id, Box::new(value));
         self.retained_reporters.remove(&type_id);
+        self.managed_reporters.remove(&type_id);
         self.external_reporters.remove(&type_id);
     }
     /// Install a slot whose owned heap storage participates in retained-memory diagnostics and
@@ -146,6 +196,17 @@ impl OpState {
         self.map.insert(type_id, Box::new(value));
         self.retained_reporters
             .insert(type_id, report_retained::<T>);
+        self.managed_reporters.remove(&type_id);
+        self.external_reporters.remove(&type_id);
+    }
+    /// Install a slot whose shared allocations and JavaScript roots participate in the
+    /// identity-aware Agent-wide retained-memory visit and which owns no external backing.
+    pub fn put_retained_memory<T: Any + RetainedMemory>(&mut self, value: T) {
+        let type_id = TypeId::of::<T>();
+        self.map.insert(type_id, Box::new(value));
+        self.retained_reporters.remove(&type_id);
+        self.managed_reporters
+            .insert(type_id, managed_reporter::<T>());
         self.external_reporters.remove(&type_id);
     }
     /// Install a slot that reports external backing while leaving its host metadata unavailable.
@@ -153,6 +214,7 @@ impl OpState {
         let type_id = TypeId::of::<T>();
         self.map.insert(type_id, Box::new(value));
         self.retained_reporters.remove(&type_id);
+        self.managed_reporters.remove(&type_id);
         self.external_reporters
             .insert(type_id, report_external::<T>);
     }
@@ -165,6 +227,22 @@ impl OpState {
         self.map.insert(type_id, Box::new(value));
         self.retained_reporters
             .insert(type_id, report_retained::<T>);
+        self.managed_reporters.remove(&type_id);
+        self.external_reporters
+            .insert(type_id, report_external::<T>);
+    }
+    /// Install a slot with identity-aware managed-memory and external-backing reporters.
+    pub fn put_retained_memory_with_external_memory<
+        T: Any + RetainedMemory + RetainedExternalMemory,
+    >(
+        &mut self,
+        value: T,
+    ) {
+        let type_id = TypeId::of::<T>();
+        self.map.insert(type_id, Box::new(value));
+        self.retained_reporters.remove(&type_id);
+        self.managed_reporters
+            .insert(type_id, managed_reporter::<T>());
         self.external_reporters
             .insert(type_id, report_external::<T>);
     }
@@ -178,6 +256,7 @@ impl OpState {
         let type_id = TypeId::of::<T>();
         let value = self.map.remove(&type_id)?;
         self.retained_reporters.remove(&type_id);
+        self.managed_reporters.remove(&type_id);
         self.external_reporters.remove(&type_id);
         Some(*value.downcast().ok()?)
     }
@@ -197,21 +276,32 @@ impl OpState {
                         .saturating_mul(std::mem::size_of::<(TypeId, RetainedReporter)>()),
                 )
                 .saturating_add(
+                    self.managed_reporters
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(TypeId, ManagedReporter)>()),
+                )
+                .saturating_add(
                     self.external_reporters
                         .len()
                         .saturating_mul(std::mem::size_of::<(TypeId, ExternalReporter)>()),
                 ),
-            unavailable_entries: self.map.len().saturating_sub(self.retained_reporters.len()),
+            unavailable_entries: self
+                .map
+                .len()
+                .saturating_sub(self.retained_reporters.len() + self.managed_reporters.len()),
             unclassified_external_entries: self
                 .map
                 .keys()
                 .filter(|type_id| {
                     !self.retained_reporters.contains_key(type_id)
+                        && !self.managed_reporters.contains_key(type_id)
                         && !self.external_reporters.contains_key(type_id)
                 })
                 .count(),
+            identity_conflict: false,
             opaque_storage: !self.map.is_empty()
                 || !self.retained_reporters.is_empty()
+                || !self.managed_reporters.is_empty()
                 || !self.external_reporters.is_empty(),
             external_allocations: Vec::new(),
         };
@@ -222,6 +312,9 @@ impl OpState {
                     .saturating_add(reporter(value.as_ref()));
             }
         }
+        for reporter in self.managed_reporters.values() {
+            memory.reported_bytes = memory.reported_bytes.saturating_add(reporter.inline_bytes);
+        }
         for (type_id, reporter) in &self.external_reporters {
             if let Some(value) = self.map.get(type_id) {
                 reporter(value.as_ref(), &mut |allocation| {
@@ -231,6 +324,15 @@ impl OpState {
         }
         memory.add(self.resources.retained_memory());
         memory
+    }
+
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
+        for (type_id, reporter) in &self.managed_reporters {
+            if let Some(value) = self.map.get(type_id) {
+                (reporter.scan)(value.as_ref(), visitor);
+            }
+        }
+        self.resources.scan_retained_memory(visitor);
     }
 }
 
@@ -246,6 +348,7 @@ pub struct ResourceTable {
     next: ResourceId,
     map: HashMap<ResourceId, Rc<dyn Any>>,
     retained_reporters: HashMap<ResourceId, RetainedReporter>,
+    managed_reporters: HashMap<ResourceId, ManagedReporter>,
     external_reporters: HashMap<ResourceId, ExternalReporter>,
 }
 
@@ -262,6 +365,13 @@ impl ResourceTable {
     pub fn add_retained<T: Any + RetainedBytes>(&mut self, resource: T) -> ResourceId {
         let rid = self.add(resource);
         self.retained_reporters.insert(rid, report_retained::<T>);
+        rid
+    }
+    /// Add a resource whose shared allocations and JavaScript roots participate in the
+    /// identity-aware Agent-wide retained-memory visit.
+    pub fn add_retained_memory<T: Any + RetainedMemory>(&mut self, resource: T) -> ResourceId {
+        let rid = self.add(resource);
+        self.managed_reporters.insert(rid, managed_reporter::<T>());
         rid
     }
     /// Add a resource that reports external backing while leaving its host metadata unavailable.
@@ -282,6 +392,17 @@ impl ResourceTable {
         self.external_reporters.insert(rid, report_external::<T>);
         rid
     }
+    /// Add a resource with identity-aware managed-memory and external-backing reporters.
+    pub fn add_retained_memory_with_external_memory<
+        T: Any + RetainedMemory + RetainedExternalMemory,
+    >(
+        &mut self,
+        resource: T,
+    ) -> ResourceId {
+        let rid = self.add_retained_memory(resource);
+        self.external_reporters.insert(rid, report_external::<T>);
+        rid
+    }
     pub fn get<T: Any>(&self, rid: ResourceId) -> Option<Rc<T>> {
         Rc::downcast(self.map.get(&rid)?.clone()).ok()
     }
@@ -293,6 +414,7 @@ impl ResourceTable {
     pub fn close(&mut self, rid: ResourceId) -> Option<Rc<dyn Any>> {
         let value = self.map.remove(&rid);
         self.retained_reporters.remove(&rid);
+        self.managed_reporters.remove(&rid);
         self.external_reporters.remove(&rid);
         value
     }
@@ -316,21 +438,32 @@ impl ResourceTable {
                         .saturating_mul(std::mem::size_of::<(ResourceId, RetainedReporter)>()),
                 )
                 .saturating_add(
+                    self.managed_reporters
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(ResourceId, ManagedReporter)>()),
+                )
+                .saturating_add(
                     self.external_reporters
                         .len()
                         .saturating_mul(std::mem::size_of::<(ResourceId, ExternalReporter)>()),
                 ),
-            unavailable_entries: self.map.len().saturating_sub(self.retained_reporters.len()),
+            unavailable_entries: self
+                .map
+                .len()
+                .saturating_sub(self.retained_reporters.len() + self.managed_reporters.len()),
             unclassified_external_entries: self
                 .map
                 .keys()
                 .filter(|rid| {
                     !self.retained_reporters.contains_key(rid)
+                        && !self.managed_reporters.contains_key(rid)
                         && !self.external_reporters.contains_key(rid)
                 })
                 .count(),
+            identity_conflict: false,
             opaque_storage: !self.map.is_empty()
                 || !self.retained_reporters.is_empty()
+                || !self.managed_reporters.is_empty()
                 || !self.external_reporters.is_empty(),
             external_allocations: Vec::new(),
         };
@@ -341,6 +474,9 @@ impl ResourceTable {
                     .saturating_add(reporter(value.as_ref()));
             }
         }
+        for reporter in self.managed_reporters.values() {
+            memory.reported_bytes = memory.reported_bytes.saturating_add(reporter.inline_bytes);
+        }
         for (rid, reporter) in &self.external_reporters {
             if let Some(value) = self.map.get(rid) {
                 reporter(value.as_ref(), &mut |allocation| {
@@ -349,6 +485,14 @@ impl ResourceTable {
             }
         }
         memory
+    }
+
+    fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
+        for (rid, reporter) in &self.managed_reporters {
+            if let Some(value) = self.map.get(rid) {
+                (reporter.scan)(value.as_ref(), visitor);
+            }
+        }
     }
 }
 
