@@ -1559,6 +1559,17 @@ impl Property {
             .map_or(0, |_| std::mem::size_of::<Accessors>())
     }
 
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        visitor.value(&self.value());
+        if let Some(getter) = self.getter() {
+            visitor.value(getter);
+        }
+        if let Some(setter) = self.setter() {
+            visitor.value(setter);
+        }
+        self.retained_requested_storage_bytes()
+    }
+
     pub(crate) fn data(
         value: Value,
         writable: bool,

@@ -1170,6 +1170,25 @@ fn scan_realm(
 
     totals.interpreter_side_tables.add(
         interp
+            .class_info
+            .len()
+            .saturating_mul(size_of::<(usize, crate::interpreter::ClassInfo)>()),
+    );
+    for class in interp.class_info.values() {
+        totals
+            .interpreter_side_tables
+            .add(class.scan_retained_memory(visitor));
+    }
+    let (construct_ic_bytes, construct_ics_exact) = interp.construct_ic_retained_memory();
+    totals.interpreter_side_tables.add(construct_ic_bytes);
+    if !interp.class_info.is_empty() || !construct_ics_exact {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
             .map_data
             .len()
             .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
@@ -2043,6 +2062,33 @@ mod tests {
         let after = measure(&engine.interp, &after_objects, &after_scopes);
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
         assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
+    }
+
+    #[test]
+    fn class_metadata_routes_initializer_ast_to_bytecode_accounting() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        engine
+            .eval(
+                r#"
+                    globalThis.MemoryAccountingClass = class {
+                        retainedField = "class initializer payload";
+                        #retainedMethod() { return this.retainedField; }
+                    };
+                "#,
+                false,
+            )
+            .expect("class metadata setup parses");
+        assert_eq!(engine.interp.class_info.len(), 1);
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
+
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(after.function_bytecode_metadata.bytes > before.function_bytecode_metadata.bytes);
     }
 
     #[test]

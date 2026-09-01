@@ -422,6 +422,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     and active constructor Values, including identity-deduplicated lazy argument slices.
   - [x] Account GC pins and object-side Proxy/host-indexed/template/Annex-B/deferred-namespace/
     mapped-arguments/module-source tables without re-crediting objects or scopes.
+  - [x] Account class-construction metadata and construct ICs while routing initializer AST and
+    callable/property payloads to their canonical allocation families.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

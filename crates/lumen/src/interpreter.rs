@@ -1749,11 +1749,11 @@ interp_memory_inventory! {
     regexp_last => "measured",
     depth => "non_owning",
     direct_call_depth => "non_owning",
-    class_info => "unaccounted",
+    class_info => "measured",
     eval_fn => "measured",
     eval_realm_fns => "measured",
     elems_protector => "non_owning",
-    construct_ics => "unaccounted",
+    construct_ics => "measured",
     construct_capacity_hints => "measured",
     iterator_sym => "measured",
     wk_syms => "measured",
@@ -1936,6 +1936,51 @@ pub struct ClassInfo {
     pub private_members: Vec<(String, crate::value::Property)>,
 }
 
+impl ClassInfo {
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        let mut bytes = self
+            .fields
+            .capacity()
+            .saturating_mul(std::mem::size_of::<FieldInit>())
+            .saturating_add(
+                self.instance_initializers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.private_members
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, crate::value::Property)>()),
+            );
+        for field in &self.fields {
+            bytes = bytes.saturating_add(field.key.scan_retained_memory(visitor));
+            if let Some(initializer) = &field.init {
+                let ast_bytes = crate::ast::scan_expr_retained_memory(initializer, visitor);
+                visitor.add_function_bytecode_bytes(ast_bytes);
+            }
+            bytes = bytes.saturating_add(
+                field
+                    .transforms
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            );
+            for transform in &field.transforms {
+                visitor.value(transform);
+            }
+        }
+        for initializer in &self.instance_initializers {
+            visitor.value(initializer);
+        }
+        for (name, property) in &self.private_members {
+            bytes = bytes
+                .saturating_add(name.capacity())
+                .saturating_add(property.scan_retained_memory(visitor));
+        }
+        // `field_env` is a registered scope and remains canonical to the collector snapshot.
+        bytes
+    }
+}
+
 /// One instance field: its key, optional initializer expression, and any decorator-supplied
 /// initializer functions (each maps the current value to a new one during construction).
 pub struct FieldInit {
@@ -2058,6 +2103,15 @@ pub struct RealmState {
 }
 
 impl Interp {
+    pub(crate) fn construct_ic_retained_memory(&self) -> (usize, bool) {
+        (
+            self.construct_ics
+                .len()
+                .saturating_mul(std::mem::size_of::<(usize, ConstructIc)>()),
+            self.construct_ics.is_empty(),
+        )
+    }
+
     /// Snapshot the current realm's intrinsics so they can be swapped out and back.
     pub(crate) fn snapshot_realm(&self) -> RealmState {
         RealmState {

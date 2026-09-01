@@ -222,6 +222,11 @@ function, deferred-namespace, mapped-arguments, and module-source tables. Table/
 storage is credited to interpreter side tables; Functions and JavaScript Values retain canonical
 family attribution, while mapped argument environments remain canonical to the scope snapshot.
 
+Class-construction ownership includes constructor metadata, field/transform/private-member
+buffers, property keys and accessor boxes, and fixed construct-IC entries. Initializer expression
+trees are credited to the canonical AST/function-bytecode family; field environments remain in
+the scope snapshot, and construct-cache weak pins are never upgraded by diagnostics.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
