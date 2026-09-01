@@ -89,6 +89,7 @@ pub(crate) struct Snapshot {
     jit_heap_metadata: Category,
     regexp_metadata: Category,
     engine_caches: Category,
+    interpreter_side_tables: Category,
     array_buffer_backing: Category,
 }
 
@@ -104,6 +105,7 @@ impl Snapshot {
             self.function_bytecode_metadata,
             self.regexp_metadata,
             self.engine_caches,
+            self.interpreter_side_tables,
         ]
         .into_iter()
         .map(|category| category.bytes)
@@ -123,8 +125,7 @@ impl Snapshot {
                 "\"strings_symbols_bigints\":{},\"callable_metadata\":{},",
                 "\"function_bytecode_metadata\":{},\"jit_heap_metadata\":{},",
                 "\"regexp_metadata\":{},\"engine_caches\":{},",
-                "\"array_buffer_backing\":{},",
-                "\"interpreter_side_tables\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"Interp ownership inventory still contains unaccounted fields\"}},",
+                "\"interpreter_side_tables\":{},\"array_buffer_backing\":{},",
                 "\"shared_wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cross-Agent backing-store identity policy has not landed\"}},",
                 "\"host_resources\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"host retained-size hook has not landed\"}}",
                 "}}}}"
@@ -143,6 +144,7 @@ impl Snapshot {
             self.jit_heap_metadata.json(),
             self.regexp_metadata.json(),
             self.engine_caches.json(),
+            self.interpreter_side_tables.json(),
             self.array_buffer_backing.json(),
         )
     }
@@ -532,6 +534,31 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         engine_caches.make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
+    let mut interpreter_side_tables = Category::exact(
+        interp
+            .regexps
+            .len()
+            .saturating_mul(size_of::<(usize, Rc<crate::regex::Regex>)>()),
+    );
+    if !interp.regexps.is_empty() {
+        interpreter_side_tables.make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+    for regex in interp.regexps.values() {
+        visitor.regex(regex);
+    }
+    if let Some(last) = &interp.regexp_last {
+        interpreter_side_tables.add(
+            last.caps
+                .capacity()
+                .saturating_mul(size_of::<Option<(usize, usize)>>()),
+        );
+        visitor.lstr(&last.input);
+        visitor.re_text(&last.text);
+        if let Some((regex, _)) = &last.lazy_captures {
+            visitor.regex(regex);
+        }
+    }
+
     // Function-owned maps can be reached while scanning either objects or scopes. Merge their
     // storage only after both root families have completed so traversal order cannot omit it.
     property_storage.add(visitor.detached_property_storage);
@@ -571,6 +598,10 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         engine_caches: Category::lower_bound(
             engine_caches.bytes,
             "string and RegExp caches are covered; remaining interpreter caches are not",
+        ),
+        interpreter_side_tables: Category::lower_bound(
+            interpreter_side_tables.bytes,
+            "RegExp owners are covered; remaining Interp side tables are not",
         ),
         // The ordinary stores reached through this table are exact, but the category remains a
         // lower bound until shared/Wasm and host-created backing stores join the same layer.
@@ -635,11 +666,12 @@ mod tests {
             jit_heap_metadata: Category::lower_bound(9, "test lower bound"),
             regexp_metadata: Category::lower_bound(10, "test lower bound"),
             engine_caches: Category::lower_bound(11, "test lower bound"),
+            interpreter_side_tables: Category::lower_bound(12, "test lower bound"),
             array_buffer_backing: Category::lower_bound(7, "test lower bound"),
         }
         .json(1, 1);
-        assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":null"));
-        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":50"));
+        assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":12"));
+        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":62"));
     }
 
     #[test]
@@ -673,6 +705,21 @@ mod tests {
         assert!(first.regexp_metadata.bytes > 0);
         assert!(first.strings_symbols_bigints.bytes >= non_ascii.len() + ascii.len());
         assert_eq!(first.json(9, 12), second.json(9, 12));
+    }
+
+    #[test]
+    fn regexp_side_tables_scan_match_state_and_program_pins() {
+        let mut engine = crate::Engine::new();
+        engine
+            .eval("/(cache)(?<tail>.*)/giu.exec('cache-state')", false)
+            .expect("evaluates");
+
+        let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let snapshot = measure(&engine.interp, &objects, &scopes);
+
+        assert!(snapshot.interpreter_side_tables.bytes > 0);
+        assert!(snapshot.regexp_metadata.bytes > 0);
     }
 
     #[test]

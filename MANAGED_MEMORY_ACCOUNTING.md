@@ -147,6 +147,12 @@ estimate as an exact total: that estimate may conservatively double-count shared
 whereas retained-memory reporting now uses a direct-allocation lower bound until shared character
 classes and nested lookaround programs gain identity-aware traversal.
 
+Live RegExp object-to-program pins and deferred legacy-match state now use those same registries.
+Their pointer table and capture-vector storage is credited to `interpreter_side_tables`; the
+program, prepared subject, and input string remain credited to their canonical payload families.
+That side-table category stays a documented lower bound until the rest of the exhaustive `Interp`
+inventory is covered.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

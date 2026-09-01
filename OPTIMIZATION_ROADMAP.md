@@ -390,6 +390,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Scan the bounded UTF-16/prepared-subject/compiled-RegExp caches, including payloads pinned
     only by stale recency entries, while attributing cache storage, strings, and matcher payloads
     to separate identity-deduplicated families.
+  - [x] Account live RegExp program pins and deferred legacy-match state through the same payload
+    registries, establishing the partial `interpreter_side_tables` category.
   - [ ] Cover remaining recursive AST/uncommon bytecode allocations, every interpreter side table
     and remaining bounded cache, shared/Wasm backing stores, and host resources; reduce the
     inventory's `unaccounted` class to zero before changing the report to complete.
