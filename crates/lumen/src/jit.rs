@@ -1482,7 +1482,10 @@ pub fn compile(
         // templates, fusions, and chains through the helper so successful JIT operations cannot
         // disappear. The broader name/property bits also cover non-update operations, but this
         // diagnostic-only mode favors complete attribution over profiling throughput.
-        fast &= !(1 | 32 | 1024 | 8192 | 16384 | 32768 | 65536);
+        // Route all element templates through the exact-PC helper as well: GetElem (1024),
+        // SetElemDrop (2048), and SetElem (4096) otherwise perform the operation without a
+        // semantic trace. Register/region/property fusions are disabled for the same reason.
+        fast &= !(1 | 32 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536);
     }
     let array_intrinsics_on = std::env::var_os("LUMEN_JIT_NO_ARRAY_INTRINSICS").is_none();
     let function_call_intrinsic_on =
@@ -1612,9 +1615,10 @@ pub fn compile(
         // allocate its observable wrapper object. The helper validates the live method and
         // side-effect-free dense subject load before performing the real match; every miss
         // falls through to the untouched literal/GetMethod/call templates.
-        if let Some(exit) = regexp_literal_exec_exit(ops, pc)
-            .filter(|exit| !targeted[pc + 1..*exit].iter().any(|target| *target))
-        {
+        if let Some(exit) = regexp_literal_exec_exit(ops, pc).filter(|exit| {
+            !chunk.jit_detailed_feedback_enabled()
+                && !targeted[pc + 1..*exit].iter().any(|target| *target)
+        }) {
             a.mov(0, 19);
             a.movz(1, pc as u32, 0);
             a.ldr_imm(16, 21, (H_REGEXP_LITERAL_EXEC_DISCARD * 8) as u32);
@@ -1624,9 +1628,10 @@ pub fn compile(
             a.cmp_imm_w(0, 2);
             a.b_cond(C_EQ, l_unwind);
         }
-        if let Some(exit) = regexp_literal_replace_exit(ops, pc)
-            .filter(|exit| !targeted[pc + 1..*exit].iter().any(|target| *target))
-        {
+        if let Some(exit) = regexp_literal_replace_exit(ops, pc).filter(|exit| {
+            !chunk.jit_detailed_feedback_enabled()
+                && !targeted[pc + 1..*exit].iter().any(|target| *target)
+        }) {
             a.mov(0, 19);
             a.movz(1, pc as u32, 0);
             a.ldr_imm(16, 21, (H_REGEXP_LITERAL_REPLACE_DISCARD * 8) as u32);
@@ -1636,9 +1641,10 @@ pub fn compile(
             a.cmp_imm_w(0, 2);
             a.b_cond(C_EQ, l_unwind);
         }
-        if let Some(exit) = regexp_literal_match_exit(ops, pc)
-            .filter(|exit| !targeted[pc + 1..*exit].iter().any(|target| *target))
-        {
+        if let Some(exit) = regexp_literal_match_exit(ops, pc).filter(|exit| {
+            !chunk.jit_detailed_feedback_enabled()
+                && !targeted[pc + 1..*exit].iter().any(|target| *target)
+        }) {
             a.mov(0, 19);
             a.movz(1, pc as u32, 0);
             a.ldr_imm(16, 21, (H_REGEXP_LITERAL_MATCH_DISCARD * 8) as u32);

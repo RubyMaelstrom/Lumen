@@ -83,6 +83,65 @@ pub(crate) enum PropertyOutcome {
     Rejected = 6,
 }
 
+/// Abstract receiver families for indexed/named element operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ElementReceiverKind {
+    Ordinary = 1,
+    Array = 2,
+    TypedArray = 3,
+    String = 4,
+    Primitive = 5,
+    Exotic = 6,
+}
+
+/// Abstract post-coercion property-key categories. Exact indices and strings are intentionally
+/// not profile data: they are workload facts, not portable optimizer identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ElementKeyKind {
+    Index = 1,
+    CanonicalNumeric = 2,
+    String = 3,
+    Symbol = 4,
+}
+
+/// Result family of an indexed operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ElementOutcome {
+    OwnData = 1,
+    Hole = 2,
+    Prototype = 3,
+    Absent = 4,
+    Accessor = 5,
+    Exotic = 6,
+    Created = 7,
+    Rejected = 8,
+}
+
+const ELEMENT_RECEIVER_SHIFT: u32 = 0;
+const ELEMENT_KEY_SHIFT: u32 = 8;
+const ELEMENT_OUTCOME_SHIFT: u32 = 16;
+
+pub(crate) const fn element_observation_payload(
+    receiver: ElementReceiverKind,
+    key: ElementKeyKind,
+    outcome: ElementOutcome,
+) -> u32 {
+    (1_u32 << (ELEMENT_RECEIVER_SHIFT + receiver as u32 - 1))
+        | (1_u32 << (ELEMENT_KEY_SHIFT + key as u32 - 1))
+        | (1_u32 << (ELEMENT_OUTCOME_SHIFT + outcome as u32 - 1))
+}
+
+fn element_group_counts(payload: u32) -> (u32, u32, u32) {
+    (
+        ((payload >> ELEMENT_RECEIVER_SHIFT) & 0x3f).count_ones(),
+        ((payload >> ELEMENT_KEY_SHIFT) & 0x0f).count_ones(),
+        ((payload >> ELEMENT_OUTCOME_SHIFT) & 0xff).count_ones(),
+    )
+}
+
 /// Runtime-only result of one named-property operation. Current `Props` shape numbers enter this
 /// adapter record but are interned to vector-local layout tokens before any observation word is
 /// written or serialized.
@@ -254,6 +313,24 @@ impl ObservationWord {
                     ) => payload == 0,
                     _ => false,
                 },
+            };
+        }
+        if kind == ObservationKind::ElementAccess {
+            if ((self.0 >> 8) as u8) != 0 {
+                return false;
+            }
+            let payload = self.payload_bits();
+            let (receivers, keys, outcomes) = element_group_counts(payload);
+            return match self.decoded_state().unwrap() {
+                ObservationState::Uninitialized | ObservationState::Generic => payload == 0,
+                ObservationState::Monomorphic => (receivers, keys, outcomes) == (1, 1, 1),
+                ObservationState::Polymorphic => {
+                    payload != 0
+                        && (1..=4).contains(&receivers)
+                        && (1..=4).contains(&keys)
+                        && (1..=4).contains(&outcomes)
+                }
+                ObservationState::Absent => false,
             };
         }
         if kind != ObservationKind::ValueClass {
@@ -690,6 +767,75 @@ impl FeedbackVector {
         );
     }
 
+    /// Merge one current-representation element observation. Each semantic dimension is kept as
+    /// a bounded one-hot set; when any dimension exceeds four alternatives the site becomes
+    /// generic. This intentionally does not claim correlations between dimensions.
+    pub(crate) fn observe_element(
+        &self,
+        bytecode_pc: usize,
+        receiver: ElementReceiverKind,
+        key: ElementKeyKind,
+        outcome: ElementOutcome,
+    ) {
+        if !self.detailed_enabled {
+            return;
+        }
+        let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
+            return;
+        };
+        let Ok(index) = self
+            .layout
+            .sites
+            .binary_search_by_key(&bytecode_pc, |site| site.bytecode_pc)
+        else {
+            return;
+        };
+        let site = SiteId(index as u32);
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors.iter().position(|slot| {
+            slot.kind == ObservationKind::ElementAccess && slot.role == ObservationRole::Access
+        }) else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        let cell = &self.words()[first + offset];
+        let current = ObservationWord(cell.get());
+        let incoming_payload = element_observation_payload(receiver, key, outcome);
+        if current.decoded_state() == Some(ObservationState::Generic) {
+            return;
+        }
+        let merged_payload = if current.decoded_state() == Some(ObservationState::Uninitialized) {
+            incoming_payload
+        } else {
+            current.payload_bits() | incoming_payload
+        };
+        let (receivers, keys, outcomes) = element_group_counts(merged_payload);
+        let state = if receivers <= 1 && keys <= 1 && outcomes <= 1 {
+            ObservationState::Monomorphic
+        } else if (1..=4).contains(&receivers)
+            && (1..=4).contains(&keys)
+            && (1..=4).contains(&outcomes)
+        {
+            ObservationState::Polymorphic
+        } else {
+            ObservationState::Generic
+        };
+        cell.set(
+            ObservationWord::new(
+                state,
+                if state == ObservationState::Generic {
+                    0
+                } else {
+                    merged_payload
+                },
+                0,
+            )
+            .0,
+        );
+    }
+
     /// Merge one stable semantic value class into the matching site's bitset.
     pub(crate) fn observe_value_class(
         &self,
@@ -1023,6 +1169,10 @@ mod tests {
         kind: ObservationKind::PropertyAccess,
         role: ObservationRole::Access,
     };
+    const ELEMENT_ACCESS: SlotDescriptor = SlotDescriptor {
+        kind: ObservationKind::ElementAccess,
+        role: ObservationRole::Access,
+    };
 
     fn property_vector() -> FeedbackVector {
         let mut builder = LayoutBuilder::default();
@@ -1049,6 +1199,16 @@ mod tests {
                 },
             ],
         );
+        FeedbackVector::new_with_enabled(
+            builder.finish(),
+            vec![RuntimeBinding::Unbound].into_boxed_slice(),
+            true,
+        )
+    }
+
+    fn element_vector() -> FeedbackVector {
+        let mut builder = LayoutBuilder::default();
+        builder.add_site(4, OperationKind::ElementLoad, &[ELEMENT_ACCESS]);
         FeedbackVector::new_with_enabled(
             builder.finish(),
             vec![RuntimeBinding::Unbound].into_boxed_slice(),
@@ -1115,6 +1275,12 @@ mod tests {
         assert_eq!(ObservationKind::PropertyAccess as u8, 8);
         assert_eq!(PropertyOutcome::Data as u8, 1);
         assert_eq!(PropertyOutcome::Rejected as u8, 6);
+        assert_eq!(ElementReceiverKind::Ordinary as u8, 1);
+        assert_eq!(ElementReceiverKind::Exotic as u8, 6);
+        assert_eq!(ElementKeyKind::Index as u8, 1);
+        assert_eq!(ElementKeyKind::Symbol as u8, 4);
+        assert_eq!(ElementOutcome::OwnData as u8, 1);
+        assert_eq!(ElementOutcome::Rejected as u8, 8);
         assert_eq!(property_access_flags(PropertyOutcome::Data, 3, true), 0x1b);
         assert_eq!(ValueClass::Undefined as u8, 1);
         assert_eq!(ValueClass::Object as u8, 9);
@@ -1124,6 +1290,64 @@ mod tests {
         assert_eq!(ObservationState::Generic as u8, 4);
         assert_eq!(std::mem::size_of::<SlotDescriptor>(), 2);
         assert_eq!(std::mem::size_of::<SiteDescriptor>(), 12);
+    }
+
+    #[test]
+    fn element_feedback_keeps_bounded_semantic_dimensions() {
+        let vector = element_vector();
+        let payload = element_observation_payload(
+            ElementReceiverKind::Array,
+            ElementKeyKind::Index,
+            ElementOutcome::OwnData,
+        );
+        assert_eq!(element_group_counts(payload), (1, 1, 1));
+        assert!(
+            ObservationWord::new(ObservationState::Monomorphic, payload, 0)
+                .is_valid_for(ObservationKind::ElementAccess)
+        );
+        assert!(
+            !ObservationWord::new(ObservationState::Monomorphic, payload, 1)
+                .is_valid_for(ObservationKind::ElementAccess)
+        );
+
+        vector.observe_element(
+            4,
+            ElementReceiverKind::Array,
+            ElementKeyKind::Index,
+            ElementOutcome::OwnData,
+        );
+        vector.observe_element(
+            4,
+            ElementReceiverKind::Array,
+            ElementKeyKind::Index,
+            ElementOutcome::Hole,
+        );
+        let word = vector.read(
+            SiteId(0),
+            ObservationKind::ElementAccess,
+            ObservationRole::Access,
+        );
+        assert_eq!(word.state(), ObservationState::Polymorphic);
+        assert_eq!(element_group_counts(word.payload()), (1, 1, 2));
+
+        for receiver in [
+            ElementReceiverKind::Ordinary,
+            ElementReceiverKind::TypedArray,
+            ElementReceiverKind::String,
+            ElementReceiverKind::Primitive,
+        ] {
+            vector.observe_element(4, receiver, ElementKeyKind::Index, ElementOutcome::OwnData);
+        }
+        assert_eq!(
+            vector
+                .read(
+                    SiteId(0),
+                    ObservationKind::ElementAccess,
+                    ObservationRole::Access,
+                )
+                .state(),
+            ObservationState::Generic
+        );
     }
 
     #[test]

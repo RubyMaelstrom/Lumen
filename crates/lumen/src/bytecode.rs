@@ -3025,8 +3025,9 @@ fn observe_arithmetic_result(
 mod feedback_layout_tests {
     use super::*;
     use crate::feedback::{
-        property_access_flags, FeedbackVector, ObservationKind, ObservationRole, ObservationState,
-        OperationKind, PropertyOutcome, ValueClass,
+        property_access_flags, ElementKeyKind, ElementOutcome, ElementReceiverKind, FeedbackVector,
+        ObservationKind, ObservationRole, ObservationState, OperationKind, PropertyOutcome,
+        ValueClass,
     };
 
     #[test]
@@ -3594,6 +3595,51 @@ mod feedback_layout_tests {
             interp.get_member(&object, "value"),
             Ok(Value::Num(1.0))
         ));
+    }
+
+    #[test]
+    fn profiled_element_helpers_preserve_array_holes_and_typedarray_exotics() {
+        let mut interp = Interp::new();
+        let global = interp.global_this();
+        let array = interp
+            .eval_in_realm(&global, "[1,,3]")
+            .unwrap_or_else(|_| panic!("array construction must complete"));
+        assert_eq!(
+            interp.element_receiver_kind(&array),
+            ElementReceiverKind::Array
+        );
+        assert_eq!(interp.element_key_kind("1"), ElementKeyKind::Index);
+        let mut trace = crate::feedback::CurrentPropertyTrace::default();
+        let value = interp
+            .get_member_profiled(&array, "1", &mut trace)
+            .unwrap_or_else(|_| panic!("array hole read must complete"));
+        assert!(matches!(value, Value::Undefined));
+        assert_eq!(trace.outcome, Some(PropertyOutcome::Absent));
+        assert_eq!(
+            match trace.outcome {
+                Some(PropertyOutcome::Absent) => ElementOutcome::Hole,
+                _ => panic!("expected an absent property trace"),
+            },
+            ElementOutcome::Hole
+        );
+
+        let typed = interp
+            .eval_in_realm(&global, "new Uint8Array(2)")
+            .unwrap_or_else(|_| panic!("typed array construction must complete"));
+        assert_eq!(
+            interp.element_receiver_kind(&typed),
+            ElementReceiverKind::TypedArray
+        );
+        assert_eq!(
+            interp.element_key_kind("-0"),
+            ElementKeyKind::CanonicalNumeric
+        );
+        let mut typed_trace = crate::feedback::CurrentPropertyTrace::default();
+        let value = interp
+            .get_member_profiled(&typed, "-0", &mut typed_trace)
+            .unwrap_or_else(|_| panic!("canonical numeric typed-array read must complete"));
+        assert!(matches!(value, Value::Undefined));
+        assert_eq!(typed_trace.outcome, Some(PropertyOutcome::Exotic));
     }
 
     #[test]
@@ -11010,6 +11056,11 @@ fn run_vm(
             Op::GetElem => {
                 let key = pop!();
                 let obj = pop!();
+                if chunk.feedback.detailed_enabled() {
+                    let v = get_element_profiled(i, chunk, op_pc, &obj, &key)?;
+                    stack.push(v);
+                    continue;
+                }
                 if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                     if let Some(v) = i.fast_get_elem(o, *n) {
                         stack.push(v);
@@ -11027,6 +11078,12 @@ fn run_vm(
                 let v = pop!();
                 let key = pop!();
                 let obj = pop!();
+                if chunk.feedback.detailed_enabled() {
+                    let ret = v.clone();
+                    set_element_profiled(i, chunk, op_pc, &obj, &key, v)?;
+                    stack.push(ret);
+                    continue;
+                }
                 if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                     let ret = v.clone();
                     match i.fast_set_elem(o, *n, v) {
@@ -11050,6 +11107,10 @@ fn run_vm(
                 let v = pop!();
                 let key = pop!();
                 let obj = pop!();
+                if chunk.feedback.detailed_enabled() {
+                    set_element_profiled(i, chunk, op_pc, &obj, &key, v)?;
+                    continue;
+                }
                 if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                     match i.fast_set_elem(o, *n, v) {
                         Ok(()) => continue,
@@ -11065,6 +11126,12 @@ fn run_vm(
             }
             Op::GetElemLocal(s) => {
                 let key = pop!();
+                if chunk.feedback.detailed_enabled() {
+                    let obj = slots[s as usize].clone();
+                    let v = get_element_profiled(i, chunk, op_pc, &obj, &key)?;
+                    stack.push(v);
+                    continue;
+                }
                 if let (Value::Obj(o), Value::Num(n)) = (&slots[s as usize], &key) {
                     if let Some(v) = i.fast_get_elem(o, *n) {
                         stack.push(v);
@@ -11083,6 +11150,14 @@ fn run_vm(
                 let keep = matches!(op, Op::SetElemLocal(_));
                 let v = pop!();
                 let key = pop!();
+                if chunk.feedback.detailed_enabled() {
+                    if keep {
+                        stack.push(v.clone());
+                    }
+                    let obj = slots[s as usize].clone();
+                    set_element_profiled(i, chunk, op_pc, &obj, &key, v)?;
+                    continue;
+                }
                 if keep {
                     stack.push(v.clone());
                 }
@@ -11141,6 +11216,15 @@ fn run_vm(
                             }
                         }
                     }
+                }
+                if chunk.feedback.detailed_enabled() {
+                    let old = get_element_profiled(i, chunk, op_pc, &obj, &key)?;
+                    if let Some(v) = step_value(i, &chunk.feedback, op_pc, kind, old, |i, v| {
+                        set_element_profiled(i, chunk, op_pc, &obj, &key, v)
+                    })? {
+                        stack.push(v);
+                    }
+                    continue;
                 }
                 // General path: nullish check, one ToPropertyKey, [[Get]], ToNumeric, [[Set]] —
                 // the oracle's Reference order exactly.
@@ -11207,6 +11291,12 @@ fn run_vm(
             Op::GetMethodElem => {
                 let key = pop!();
                 let obj = pop!();
+                if chunk.feedback.detailed_enabled() {
+                    let m = get_element_profiled(i, chunk, op_pc, &obj, &key)?;
+                    stack.push(obj);
+                    stack.push(m);
+                    continue;
+                }
                 let m = if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                     match i.fast_get_elem(o, *n) {
                         Some(v) => v,
@@ -13171,6 +13261,86 @@ fn set_named_property(
     chunk
         .feedback
         .observe_current_property(pc, &chunk.feedback_shapes, trace);
+    result
+}
+
+#[inline]
+fn observe_element_trace(
+    i: &Interp,
+    chunk: &Chunk,
+    pc: usize,
+    base: &Value,
+    key: &str,
+    trace: crate::feedback::CurrentPropertyTrace,
+) {
+    let Some(property_outcome) = trace.outcome else {
+        return;
+    };
+    let receiver = i.element_receiver_kind(base);
+    let key_kind = i.element_key_kind(key);
+    let outcome = match property_outcome {
+        crate::feedback::PropertyOutcome::Data => {
+            if trace.depth == 0 {
+                crate::feedback::ElementOutcome::OwnData
+            } else {
+                crate::feedback::ElementOutcome::Prototype
+            }
+        }
+        crate::feedback::PropertyOutcome::Absent => {
+            if receiver == crate::feedback::ElementReceiverKind::Array
+                && key_kind == crate::feedback::ElementKeyKind::Index
+            {
+                crate::feedback::ElementOutcome::Hole
+            } else {
+                crate::feedback::ElementOutcome::Absent
+            }
+        }
+        crate::feedback::PropertyOutcome::Created => crate::feedback::ElementOutcome::Created,
+        crate::feedback::PropertyOutcome::Accessor => crate::feedback::ElementOutcome::Accessor,
+        crate::feedback::PropertyOutcome::Exotic => crate::feedback::ElementOutcome::Exotic,
+        crate::feedback::PropertyOutcome::Rejected => crate::feedback::ElementOutcome::Rejected,
+    };
+    chunk
+        .feedback
+        .observe_element(pc, receiver, key_kind, outcome);
+}
+
+/// Profile a computed element read after the normal nullish check and `ToPropertyKey` conversion.
+/// Diagnostic mode deliberately bypasses dense/temporary IC shortcuts so the one canonical
+/// `[[Get]]` operation supplies the semantic outcome without replaying observable work.
+#[inline]
+fn get_element_profiled(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    base: &Value,
+    raw_key: &Value,
+) -> Result<Value, Abrupt> {
+    if matches!(base, Value::Undefined | Value::Null) {
+        return Err(i.throw("TypeError", "cannot read property of null or undefined"));
+    }
+    let key = i.to_property_key(raw_key)?;
+    let mut trace = crate::feedback::CurrentPropertyTrace::default();
+    let result = i.get_member_profiled(base, key.as_str(), &mut trace);
+    observe_element_trace(i, chunk, pc, base, key.as_str(), trace);
+    result
+}
+
+/// Profile a computed element write after `ToPropertyKey`, retaining the original value/result
+/// handling in the caller. The underlying [[Set]] operation is still executed exactly once.
+#[inline]
+fn set_element_profiled(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    base: &Value,
+    raw_key: &Value,
+    value: Value,
+) -> Result<(), Abrupt> {
+    let key = i.to_property_key(raw_key)?;
+    let mut trace = crate::feedback::CurrentPropertyTrace::default();
+    let result = i.set_member_profiled(base, key.as_str(), value, &mut trace);
+    observe_element_trace(i, chunk, pc, base, key.as_str(), trace);
     result
 }
 
@@ -15454,7 +15624,9 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
             sp = unsafe { sp.sub(1) };
             let object = unsafe { sp.read() };
             let retained = keep.then(|| value.clone());
-            if let (Value::Obj(o), Value::Num(n)) = (&object, &key) {
+            if chunk.feedback.detailed_enabled() {
+                set_element_profiled(i, chunk, pc as usize, &object, &key, value)?;
+            } else if let (Value::Obj(o), Value::Num(n)) = (&object, &key) {
                 match i.fast_set_elem(o, *n, value) {
                     Ok(()) => {}
                     Err(back) => {
@@ -15483,7 +15655,10 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
                 sp = unsafe { sp.add(1) };
             }
             let local = unsafe { &*ctx.slots.add(slot as usize) };
-            if let (Value::Obj(o), Value::Num(n)) = (local, &key) {
+            if chunk.feedback.detailed_enabled() {
+                let object = local.clone();
+                set_element_profiled(i, chunk, pc as usize, &object, &key, value)?;
+            } else if let (Value::Obj(o), Value::Num(n)) = (local, &key) {
                 match i.fast_set_elem(o, *n, value) {
                     Ok(()) => {}
                     Err(back) => {
@@ -16635,6 +16810,11 @@ unsafe fn jit_exec_inner(
         Op::GetElem => {
             let key = pop!();
             let obj = pop!();
+            if chunk.feedback.detailed_enabled() {
+                let v = get_element_profiled(i, chunk, pc as usize, &obj, &key)?;
+                push!(v);
+                return Ok(());
+            }
             if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                 if let Some(v) = i.fast_get_elem(o, *n) {
                     push!(v);
@@ -16659,6 +16839,12 @@ unsafe fn jit_exec_inner(
             let v = pop!();
             let key = pop!();
             let obj = pop!();
+            if chunk.feedback.detailed_enabled() {
+                let ret = v.clone();
+                set_element_profiled(i, chunk, pc as usize, &obj, &key, v)?;
+                push!(ret);
+                return Ok(());
+            }
             if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                 let ret = v.clone();
                 match i.fast_set_elem(o, *n, v) {
@@ -16682,6 +16868,10 @@ unsafe fn jit_exec_inner(
             let v = pop!();
             let key = pop!();
             let obj = pop!();
+            if chunk.feedback.detailed_enabled() {
+                set_element_profiled(i, chunk, pc as usize, &obj, &key, v)?;
+                return Ok(());
+            }
             if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                 match i.fast_set_elem(o, *n, v) {
                     Ok(()) => return Ok(()),
@@ -16697,6 +16887,12 @@ unsafe fn jit_exec_inner(
         }
         Op::GetElemLocal(s) => {
             let key = pop!();
+            if chunk.feedback.detailed_enabled() {
+                let obj = slots[s as usize].clone();
+                let v = get_element_profiled(i, chunk, pc as usize, &obj, &key)?;
+                push!(v);
+                return Ok(());
+            }
             if let (Value::Obj(o), Value::Num(n)) = (&slots[s as usize], &key) {
                 if let Some(v) = i.fast_get_elem(o, *n) {
                     push!(v);
@@ -16715,6 +16911,14 @@ unsafe fn jit_exec_inner(
             let keep = matches!(chunk.ops[pc as usize], Op::SetElemLocal(_));
             let v = pop!();
             let key = pop!();
+            if chunk.feedback.detailed_enabled() {
+                if keep {
+                    push!(v.clone());
+                }
+                let obj = slots[s as usize].clone();
+                set_element_profiled(i, chunk, pc as usize, &obj, &key, v)?;
+                return Ok(());
+            }
             if keep {
                 push!(v.clone());
             }
@@ -16764,6 +16968,15 @@ unsafe fn jit_exec_inner(
                         }
                     }
                 }
+            }
+            if chunk.feedback.detailed_enabled() {
+                let old = get_element_profiled(i, chunk, pc as usize, &obj, &key)?;
+                if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                    set_element_profiled(i, chunk, pc as usize, &obj, &key, v)
+                })? {
+                    push!(v);
+                }
+                return Ok(());
             }
             if matches!(obj, Value::Undefined | Value::Null) {
                 return Err(i.throw("TypeError", "cannot read property of null or undefined"));
@@ -16818,6 +17031,12 @@ unsafe fn jit_exec_inner(
         Op::GetMethodElem => {
             let key = pop!();
             let obj = pop!();
+            if chunk.feedback.detailed_enabled() {
+                let m = get_element_profiled(i, chunk, pc as usize, &obj, &key)?;
+                push!(obj);
+                push!(m);
+                return Ok(());
+            }
             let m = if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                 match i.fast_get_elem(o, *n) {
                     Some(v) => v,

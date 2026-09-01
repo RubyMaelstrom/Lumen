@@ -66,6 +66,14 @@ instruction format into the profile:
   low flag nibble stores bounded prototype depth and the current adapter's array-key guard. These
   meanings describe the completed ECMAScript operation rather than an IC implementation detail.
 - `ElementAccess`: indexed/named key class, bounds/hole result, and prototype fallback outcome.
+  Version 1 stores three independent bounded one-hot groups in the payload: receiver family
+  (`ordinary`, `Array`, `TypedArray`, `String`, primitive, or other exotic), post-`ToPropertyKey`
+  key category (array index, canonical numeric non-index, string, or Symbol), and result
+  (`own data`, array hole, prototype, absent, accessor, exotic, created, or rejected). Each group
+  keeps at most four alternatives; exceeding that bound widens the site to `Generic` rather than
+  preserving a misleading cross-product. Exact indices, strings, object identities, and current
+  Rust enum tags are never recorded. The classification follows ECMA-262 §7.1.19 (ToPropertyKey),
+  §10.4.2 (Array exotic objects), and §10.4.5.8-10 (Integer-Indexed exotic objects).
 - `CallTarget`: abstract call/construct target identity and callable category, never a raw address.
 - `BranchCount` and `Allocation`: bounded counter/allocation summaries reserved for later Phase 1
   slices.
@@ -94,6 +102,13 @@ getter, setter, coercion, or invariant check. Proxy forwarding remains `Exotic`;
 non-writable/non-extensible failure is `Rejected`. Repeated equal observations remain exact,
 ordinary IC ways retain their bounded polymorphic count, and heterogeneous runtime outcomes widen
 to `Generic` rather than inventing a partly exact payload.
+
+Computed element reads and writes use the same canonical `[[Get]]`/`[[Set]]` helpers in detailed
+mode, after the operation's `ToPropertyKey` conversion. Dense numeric paths and temporary
+computed-string ICs remain unchanged when profiling is disabled. The trace is published after a
+single operation, including abrupt completion; array holes are distinguished from true absence,
+prototype data is distinguished by lookup depth, and TypedArray/string/proxy behavior remains
+exotic rather than being mistaken for ordinary dense storage.
 
 Adapter bindings (cache family/index, current shape tokens, raw pins) are runtime-only and must
 never be serialized as observations. A future Map adapter replaces only the token interner and

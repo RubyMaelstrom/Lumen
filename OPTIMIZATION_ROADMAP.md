@@ -499,7 +499,13 @@ finish the baseline, but no later phase may claim a performance win against the 
     outcomes from the current IC adapter in stable `PropertyAccess` slots.
   - [x] Record accessor, exotic, and rejected outcomes at canonical runtime helper endpoints
     without duplicating observable property operations.
-- [ ] Record element receiver kind, index category, bounds/hole outcome, and prototype fallback.
+- [x] Record element receiver kind, index category, bounds/hole outcome, and prototype fallback.
+  - [x] Keep receiver family, post-`ToPropertyKey` key category, and semantic result as
+    independent bounded groups; widen any group beyond four alternatives to `Generic`.
+  - [x] Route detailed computed element reads/writes (including local, update, and method forms)
+    through the canonical `[[Get]]`/`[[Set]]` helpers without replaying getters, traps, or
+    coercions. Dense element and computed-string IC fast paths remain unchanged when profiling is
+    disabled.
 - [ ] Record call and construct targets, arity, closure environment requirements, and return type.
 - [ ] Record branch direction counts and loop back-edge counts for optimization/OSR thresholds.
 - [ ] Record allocation site, object kind, requested size, survival age, promotion, and retained

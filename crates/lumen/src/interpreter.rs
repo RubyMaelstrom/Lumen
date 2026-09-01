@@ -3086,6 +3086,60 @@ impl Interp {
                     .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'_' || b == b'-')
         })
     }
+
+    /// Classify an element receiver without exposing the current object/exotic representation to
+    /// feedback consumers. This is deliberately a semantic family (ordinary, Array, TypedArray,
+    /// String, primitive, or other exotic), not an engine enum or object identity.
+    pub(crate) fn element_receiver_kind(
+        &self,
+        base: &Value,
+    ) -> crate::feedback::ElementReceiverKind {
+        use crate::feedback::ElementReceiverKind;
+        match base {
+            Value::Obj(object) => {
+                let ptr = Rc::as_ptr(object) as usize;
+                if self.typed_arrays.contains_key(&ptr) {
+                    return ElementReceiverKind::TypedArray;
+                }
+                if self.proxies.contains_key(&ptr)
+                    || self.module_ns.contains_key(&ptr)
+                    || self.deferred_ns.contains_key(&ptr)
+                    || self.data_views.contains_key(&ptr)
+                    || self.array_buffers.contains_key(&ptr)
+                    || self.host_indexed.contains_key(&ptr)
+                {
+                    return ElementReceiverKind::Exotic;
+                }
+                match &object.borrow().exotic {
+                    crate::value::Exotic::Array => ElementReceiverKind::Array,
+                    crate::value::Exotic::StrWrap(_) => ElementReceiverKind::String,
+                    crate::value::Exotic::None => ElementReceiverKind::Ordinary,
+                    _ => ElementReceiverKind::Exotic,
+                }
+            }
+            Value::Str(_) => ElementReceiverKind::String,
+            Value::Num(_) | Value::Bool(_) | Value::Sym(_) | Value::BigInt(_) => {
+                ElementReceiverKind::Primitive
+            }
+            Value::Undefined | Value::Empty | Value::Null => ElementReceiverKind::Exotic,
+        }
+    }
+
+    /// Classify a post-`ToPropertyKey` string for indexed feedback. The canonical numeric
+    /// category is kept separate from array indices because Integer-Indexed exotic objects treat
+    /// canonical numeric non-indices (for example `-0` or `1.5`) as inert rather than ordinary
+    /// properties (ECMA-262 §§7.1.19, 10.4.5.8-10).
+    pub(crate) fn element_key_kind(&self, key: &str) -> crate::feedback::ElementKeyKind {
+        if Self::is_sym_key(key) {
+            crate::feedback::ElementKeyKind::Symbol
+        } else if crate::value::canonical_index(key).is_some() {
+            crate::feedback::ElementKeyKind::Index
+        } else if self.canonical_numeric_index(key).is_some() {
+            crate::feedback::ElementKeyKind::CanonicalNumeric
+        } else {
+            crate::feedback::ElementKeyKind::String
+        }
+    }
     /// Whether `key` is an internal private-element key. Every runtime private name carries a
     /// `\u{1}<serial>` suffix (auto-accessor backings a `\u{0}` marker), so a user property whose
     /// *string* name merely starts with `#` (a computed key) is not mistaken for one.
@@ -4069,6 +4123,19 @@ impl Interp {
     /// receiver defaults to `base`.
     pub fn get_member(&mut self, base: &Value, key: &str) -> Result<Value, Abrupt> {
         self.get_member_recv(base, key, base.clone())
+    }
+
+    /// Profile-enabled `[[Get]]` entry used by computed element operations. It executes the
+    /// canonical property algorithm once and records the branch that determined the result;
+    /// getters, proxy traps, and conversions are never replayed for diagnostics.
+    pub(crate) fn get_member_profiled(
+        &mut self,
+        base: &Value,
+        key: &str,
+        trace: &mut crate::feedback::CurrentPropertyTrace,
+    ) -> Result<Value, Abrupt> {
+        trace.receiver_shape = self.property_receiver_shape(base);
+        self.get_member_recv_impl(base, key, base.clone(), Some(trace))
     }
 
     /// Whether `o` may take the dense element fast paths: a plain object or array — not an
@@ -5615,6 +5682,20 @@ impl Interp {
 
     pub fn set_member(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Abrupt> {
         self.set_member_recv(base, key, value, base.clone())
+            .map(|_| ())
+    }
+
+    /// Profile-enabled `[[Set]]` entry used by computed element operations. The trace is filled at
+    /// the semantic setter/proxy/rejection branch, while the operation itself remains single-shot.
+    pub(crate) fn set_member_profiled(
+        &mut self,
+        base: &Value,
+        key: &str,
+        value: Value,
+        trace: &mut crate::feedback::CurrentPropertyTrace,
+    ) -> Result<(), Abrupt> {
+        trace.receiver_shape = self.property_receiver_shape(base);
+        self.set_member_recv_impl(base, key, value, base.clone(), Some(trace))
             .map(|_| ())
     }
 
