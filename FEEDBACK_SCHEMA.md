@@ -19,6 +19,10 @@ by the layout of Lumen's Rust enums:
   distinction between a value, a property Reference, and its `this` value.
 - ECMA-262 §10.1.8.1, OrdinaryGet, walks the prototype chain and distinguishes absent, data, and
   accessor outcomes. A receiver layout alone is therefore not a complete property observation.
+- ECMA-262 §10.1.9.1-2, OrdinarySet and OrdinarySetWithOwnDescriptor, distinguish inherited
+  descriptor search, accessor invocation/refusal, receiver update, and receiver property creation.
+- ECMA-262 §10.5.8-9 give Proxy `[[Get]]`/`[[Set]]` their trap forwarding and invariant checks;
+  those operations remain exotic even when an absent trap forwards to an ordinary target.
 - ECMA-262 §13.3.6.2, EvaluateCall, derives `this`, evaluates arguments, checks Object/callability,
   performs the tail-call preparation when required, and then calls the target. Feedback may
   describe the completed path but must never reorder or replace those semantics.
@@ -82,10 +86,14 @@ observation words. Transformed/inlined chunks reuse the baseline schema without 
 bindings; the retained baseline chunk remains authoritative.
 
 The IC adapter intentionally does not infer accessor, proxy, typed-array, namespace, or other
-exotic outcomes from an unfilled cache. Those outcomes must be recorded at the canonical runtime
-helper endpoint after the normative operation has identified them, without repeating a lookup,
-trap, getter, setter, or other observable action. Until that collector lands, their stable outcome
-codes are reserved and the property-observation milestone remains incomplete.
+exotic outcomes from an unfilled cache. In opt-in detailed mode, a stack-local trace instead flows
+through the canonical runtime helper and is filled at the branch that identifies an accessor,
+exotic operation, ordinary rejection, uncached data field, or absence. It is published after the
+operation returns (including abrupt completion), so collection never repeats a lookup, trap,
+getter, setter, coercion, or invariant check. Proxy forwarding remains `Exotic`; ordinary
+non-writable/non-extensible failure is `Rejected`. Repeated equal observations remain exact,
+ordinary IC ways retain their bounded polymorphic count, and heterogeneous runtime outcomes widen
+to `Generic` rather than inventing a partly exact payload.
 
 Adapter bindings (cache family/index, current shape tokens, raw pins) are runtime-only and must
 never be serialized as observations. A future Map adapter replaces only the token interner and
@@ -108,8 +116,9 @@ selection affects the expression value returned to bytecode but not this arithme
 An object that coerces to BigInt is therefore recorded as an Object operand with a BigInt result,
 and a throwing coercion or setter never publishes a successful result.
 
-Detailed arithmetic collection is opt-in through `LUMEN_FEEDBACK_PROFILE`. Disabled chunks retain
-one predictable boolean check at each arithmetic helper and never allocate observation words.
+Detailed arithmetic and property collection is opt-in through `LUMEN_FEEDBACK_PROFILE`. Disabled
+chunks retain one predictable boolean check at each instrumented helper and never allocate
+observation words.
 Profile-enabled AArch64 chunks route numeric inline templates, update fusions, and register chains
 through exact-PC observation paths so optimized executions are not omitted; the normal
 configuration keeps those fast paths unchanged. A second-stage transformed/inlined chunk has no

@@ -4244,7 +4244,22 @@ impl Interp {
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
-        self.get_prop_ic_impl(base, name, cache, true)
+        self.get_prop_ic_impl(base, name, cache, true, None)
+    }
+
+    /// Profile-enabled form of [`Self::get_prop_ic`]. Slow paths fill `trace` at the exact
+    /// OrdinaryGet/accessor/exotic branch that determines the result (ECMA-262 §10.1.8.1 and
+    /// §10.5.8). IC hits need no duplicate work: the chunk's existing IC adapter records them at
+    /// the diagnostic safepoint.
+    pub(crate) fn get_prop_ic_profiled(
+        &mut self,
+        base: &Value,
+        name: &str,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+        trace: &mut crate::feedback::CurrentPropertyTrace,
+    ) -> Result<Value, Abrupt> {
+        trace.receiver_shape = self.property_receiver_shape(base);
+        self.get_prop_ic_impl(base, name, cache, true, Some(trace))
     }
 
     /// [`Interp::get_prop_ic`] for a RUNTIME string key (computed reads — `o[k]`): the global
@@ -4260,7 +4275,7 @@ impl Interp {
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
-        self.get_prop_ic_impl(base, name, cache, false)
+        self.get_prop_ic_impl(base, name, cache, false, None)
     }
 
     fn get_prop_ic_impl(
@@ -4269,6 +4284,7 @@ impl Interp {
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
+        trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
     ) -> Result<Value, Abrupt> {
         match base {
             Value::Obj(o) => {
@@ -4295,7 +4311,20 @@ impl Interp {
             }
             _ => {}
         }
-        self.get_member(base, name)
+        self.get_member_recv_impl(base, name, base.clone(), trace)
+    }
+
+    fn property_receiver_shape(&self, base: &Value) -> Option<u32> {
+        let object = match base {
+            Value::Obj(object) => Some(object),
+            Value::Str(_) => Some(&self.string_proto),
+            Value::Num(_) => Some(&self.number_proto),
+            Value::Bool(_) => Some(&self.boolean_proto),
+            Value::Sym(_) => Some(&self.symbol_proto),
+            Value::BigInt(_) => self.extra_protos.get("BigInt"),
+            _ => None,
+        }?;
+        Some(object.borrow().props.shape())
     }
 
     /// Whether object pointer `ptr` (holding `b`) reads like an ordinary object for IC purposes.
@@ -4629,6 +4658,27 @@ impl Interp {
             }
         }
         self.set_member(base, name, v)
+    }
+
+    /// Profile-enabled form of [`Self::set_prop_ic`]. Ordinary IC hits are retained by the
+    /// existing adapter; slow accessor/exotic/rejection paths annotate the canonical [[Set]]
+    /// branch from ECMA-262 §10.1.9.1-2 / §10.5.9 without replaying any observable operation.
+    pub(crate) fn set_prop_ic_profiled(
+        &mut self,
+        base: &Value,
+        name: &Rc<str>,
+        v: Value,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+        trace: &mut crate::feedback::CurrentPropertyTrace,
+    ) -> Result<(), Abrupt> {
+        trace.receiver_shape = self.property_receiver_shape(base);
+        if let Value::Obj(o) = base {
+            if self.try_ic_set(o, name, &v, cache) {
+                return Ok(());
+            }
+        }
+        self.set_member_recv_impl(base, name, v, base.clone(), Some(trace))
+            .map(|_| ())
     }
 
     /// The `SetProp` inline-cache fast path; `false` means "take the slow path". Writes cache
@@ -4978,23 +5028,55 @@ impl Interp {
         key: &str,
         receiver: Value,
     ) -> Result<Value, Abrupt> {
+        self.get_member_recv_impl(base, key, receiver, None)
+    }
+
+    fn get_member_recv_impl(
+        &mut self,
+        base: &Value,
+        key: &str,
+        receiver: Value,
+        mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
+    ) -> Result<Value, Abrupt> {
         // An `import defer` namespace evaluates its module on string-keyed access.
         if let Value::Obj(o) = base {
+            if self.deferred_ns.contains_key(&(Rc::as_ptr(o) as usize)) {
+                let shape = o.borrow().props.shape();
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(shape),
+                        0,
+                        None,
+                    );
+                }
+            }
             self.defer_trigger(o, Some(key))?;
         }
         match base {
-            Value::Undefined | Value::Empty | Value::Null => Err(self.throw(
-                "TypeError",
-                format!("cannot read property '{key}' of {}", type_name(base)),
-            )),
+            Value::Undefined | Value::Empty | Value::Null => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(crate::feedback::PropertyOutcome::Rejected, None, 0, None);
+                }
+                Err(self.throw(
+                    "TypeError",
+                    format!("cannot read property '{key}' of {}", type_name(base)),
+                ))
+            }
             Value::Str(s) => {
                 // `length` and indices are in UTF-16 code units (cached — a scanner loop reads
                 // them per character of a megabytes-long source).
                 if key == "length" {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(crate::feedback::PropertyOutcome::Exotic, None, 0, None);
+                    }
                     let s = s.clone();
                     return Ok(Value::Num(self.str_len(&s) as f64));
                 }
                 if let Ok(i) = key.parse::<usize>() {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(crate::feedback::PropertyOutcome::Exotic, None, 0, None);
+                    }
                     let s = s.clone();
                     return Ok(match self.unit_at(&s, i) {
                         Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
@@ -5002,18 +5084,21 @@ impl Interp {
                     });
                 }
                 let proto = self.string_proto.clone();
-                self.get_from_chain(&proto, key, &receiver)
+                self.get_from_chain(&proto, key, &receiver, trace)
             }
             Value::Num(_) => {
                 let proto = self.number_proto.clone();
-                self.get_from_chain(&proto, key, &receiver)
+                self.get_from_chain(&proto, key, &receiver, trace)
             }
             Value::Bool(_) => {
                 let proto = self.boolean_proto.clone();
-                self.get_from_chain(&proto, key, &receiver)
+                self.get_from_chain(&proto, key, &receiver, trace)
             }
             Value::Sym(s) => {
                 if key == "description" {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(crate::feedback::PropertyOutcome::Exotic, None, 0, None);
+                    }
                     return Ok(s
                         .description
                         .clone()
@@ -5021,11 +5106,16 @@ impl Interp {
                         .unwrap_or(Value::Undefined));
                 }
                 let proto = self.symbol_proto.clone();
-                self.get_from_chain(&proto, key, &receiver)
+                self.get_from_chain(&proto, key, &receiver, trace)
             }
             Value::BigInt(_) => match self.extra_protos.get("BigInt").cloned() {
-                Some(proto) => self.get_from_chain(&proto, key, &receiver),
-                None => Ok(Value::Undefined),
+                Some(proto) => self.get_from_chain(&proto, key, &receiver, trace),
+                None => {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(crate::feedback::PropertyOutcome::Absent, None, 0, None);
+                    }
+                    Ok(Value::Undefined)
+                }
             },
             Value::Obj(o) => {
                 let o = o.clone();
@@ -5040,6 +5130,15 @@ impl Interp {
                                 .get(name.as_str())
                                 .map(|b| b.value.clone());
                             if let Some(v) = v {
+                                let shape = o.borrow().props.shape();
+                                if let Some(trace) = trace.as_deref_mut() {
+                                    trace.record(
+                                        crate::feedback::PropertyOutcome::Exotic,
+                                        Some(shape),
+                                        0,
+                                        None,
+                                    );
+                                }
                                 return Ok(v);
                             }
                         }
@@ -5048,10 +5147,26 @@ impl Interp {
                 // String wrapper (`new String(...)`/`Object("...")`): own indexed chars + `length`.
                 if let Exotic::StrWrap(s) = o.borrow().exotic.clone() {
                     if key == "length" {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(o.borrow().props.shape()),
+                                0,
+                                None,
+                            );
+                        }
                         return Ok(Value::Num(self.str_len(&s) as f64));
                     }
                     if let Ok(i) = key.parse::<usize>() {
                         if let Some(u) = self.unit_at(&s, i) {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Exotic,
+                                    Some(o.borrow().props.shape()),
+                                    0,
+                                    None,
+                                );
+                            }
                             return Ok(Value::Str(crate::jstr::unit_lstr(u)));
                         }
                     }
@@ -5061,6 +5176,14 @@ impl Interp {
                 if !self.module_ns.is_empty() {
                     if let Some(map) = self.module_ns.get(&ptr) {
                         if let Some(binding) = map.get(key) {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Exotic,
+                                    Some(o.borrow().props.shape()),
+                                    0,
+                                    None,
+                                );
+                            }
                             match binding.clone() {
                                 crate::modules::NsBinding::Live(mod_env, local) => {
                                     return self.get_var(&local, &mod_env);
@@ -5073,6 +5196,14 @@ impl Interp {
                 // Proxy: invoke the `get` trap, or forward to the target.
                 if !self.proxies.is_empty() {
                     if let Some((target, handler)) = self.proxy_at(ptr) {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(o.borrow().props.shape()),
+                                0,
+                                None,
+                            );
+                        }
                         let trap = self.get_member(&handler, "get")?;
                         if matches!(trap, Value::Undefined | Value::Null) {
                             // Forward to the target's [[Get]], preserving the original Receiver.
@@ -5098,19 +5229,54 @@ impl Interp {
                 // length/byteLength/byteOffset are computed (and 0 once the buffer is detached).
                 if let Some(info) = self.typed_arrays.get(&ptr).copied() {
                     match self.ta_index_kind(&info, key) {
-                        TaIndex::Element(idx) => return Ok(self.ta_read(&info, idx)),
+                        TaIndex::Element(idx) => {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Exotic,
+                                    Some(o.borrow().props.shape()),
+                                    0,
+                                    None,
+                                );
+                            }
+                            return Ok(self.ta_read(&info, idx));
+                        }
                         // A canonical-numeric non-index never reaches the prototype: it reads undefined.
-                        TaIndex::Exotic => return Ok(Value::Undefined),
+                        TaIndex::Exotic => {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Exotic,
+                                    Some(o.borrow().props.shape()),
+                                    0,
+                                    None,
+                                );
+                            }
+                            return Ok(Value::Undefined);
+                        }
                         TaIndex::Ordinary => {}
                     }
                     // The meta keys live on %TypedArray.prototype% as accessors; an own property
                     // (defineProperty on the instance) shadows them.
                     let cur = self.ta_len(&info);
                     if o.borrow().props.contains(key) {
-                        return self.get_from_chain(&o, key, &receiver);
+                        return self.get_from_chain(&o, key, &receiver, trace);
+                    }
+                    if matches!(
+                        key,
+                        "length" | "byteLength" | "byteOffset" | "BYTES_PER_ELEMENT" | "buffer"
+                    ) {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(o.borrow().props.shape()),
+                                0,
+                                None,
+                            );
+                        }
                     }
                     match key {
-                        "length" => return Ok(Value::Num(cur.unwrap_or(0) as f64)),
+                        "length" => {
+                            return Ok(Value::Num(cur.unwrap_or(0) as f64));
+                        }
                         "byteLength" => {
                             return Ok(Value::Num((cur.unwrap_or(0) * info.kind.elsize()) as f64))
                         }
@@ -5135,21 +5301,44 @@ impl Interp {
                 // Web IDL legacy platform object [[GetOwnProperty]]: a supported indexed
                 // property is a lazy, enumerable/configurable, read-only data property.
                 if let Some(value) = self.host_indexed_own_value(&o, key)? {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(o.borrow().props.shape()),
+                            0,
+                            None,
+                        );
+                    }
                     return Ok(value);
                 }
-                self.get_from_chain(&o, key, &receiver)
+                self.get_from_chain(&o, key, &receiver, trace)
             }
         }
     }
 
-    fn get_from_chain(&mut self, start: &Gc, key: &str, receiver: &Value) -> Result<Value, Abrupt> {
+    fn get_from_chain(
+        &mut self,
+        start: &Gc,
+        key: &str,
+        receiver: &Value,
+        mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
+    ) -> Result<Value, Abrupt> {
         let mut cur = Some(start.clone());
+        let mut depth = 0_u8;
         while let Some(obj) = cur {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&obj, Some(key))?;
             // A proxy anywhere on the chain handles the read itself (with the original receiver).
             let ptr = Rc::as_ptr(&obj) as usize;
             if let Some((target, handler)) = self.proxy_at(ptr) {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(obj.borrow().props.shape()),
+                        depth,
+                        None,
+                    );
+                }
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
                 }
@@ -5173,27 +5362,73 @@ impl Interp {
                 return Ok(res);
             }
             if let Some(value) = self.host_indexed_own_value(&obj, key)? {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(obj.borrow().props.shape()),
+                        depth,
+                        None,
+                    );
+                }
                 return Ok(value);
             }
             // Clone only the fields the branches read (value / accessor-get), not the whole
             // Property — data reads are the hot path and were paying for three Rc bumps.
             let prop = {
                 let b = obj.borrow();
-                b.props.get(key).map(|p| {
-                    if p.accessor() {
-                        (true, p.getter().cloned(), Value::Undefined)
-                    } else {
-                        (false, None, p.value())
-                    }
-                })
+                if trace.is_some() {
+                    b.props.get_with_slot(key).map(|(p, slot)| {
+                        if p.accessor() {
+                            (
+                                slot.map(|slot| slot as u32),
+                                b.props.shape(),
+                                true,
+                                p.getter().cloned(),
+                                Value::Undefined,
+                            )
+                        } else {
+                            (
+                                slot.map(|slot| slot as u32),
+                                b.props.shape(),
+                                false,
+                                None,
+                                p.value(),
+                            )
+                        }
+                    })
+                } else {
+                    // `Props::get` is the semantic lookup and also covers dense/indexed storage;
+                    // `slot_of` above is used only by the named-field profiling adapter.
+                    b.props.get(key).map(|p| {
+                        if p.accessor() {
+                            (
+                                None,
+                                b.props.shape(),
+                                true,
+                                p.getter().cloned(),
+                                Value::Undefined,
+                            )
+                        } else {
+                            (None, b.props.shape(), false, None, p.value())
+                        }
+                    })
+                }
             };
-            if let Some((accessor, getter, value)) = prop {
+            if let Some((slot, holder_shape, accessor, getter, value)) = prop {
                 let p = PropRead {
                     accessor,
                     get: getter,
                     value,
                 };
                 if p.accessor {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Accessor,
+                            Some(holder_shape),
+                            depth,
+                            None,
+                        );
+                    }
                     // Legacy `fn.caller` / `fn.arguments`: reading the poisoned
                     // %Function.prototype% accessor through an ordinary sloppy function
                     // yields undefined instead of throwing.
@@ -5263,9 +5498,21 @@ impl Interp {
                         None => Ok(Value::Undefined),
                     };
                 }
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Data,
+                        Some(holder_shape),
+                        depth,
+                        slot,
+                    );
+                }
                 return Ok(p.value);
             }
             cur = obj.borrow().proto.clone();
+            depth = depth.saturating_add(1);
+        }
+        if let Some(trace) = trace {
+            trace.record(crate::feedback::PropertyOutcome::Absent, None, depth, None);
         }
         Ok(Value::Undefined)
     }
@@ -5381,6 +5628,17 @@ impl Interp {
         value: Value,
         receiver: Value,
     ) -> Result<bool, Abrupt> {
+        self.set_member_recv_impl(base, key, value, receiver, None)
+    }
+
+    fn set_member_recv_impl(
+        &mut self,
+        base: &Value,
+        key: &str,
+        value: Value,
+        receiver: Value,
+        mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
+    ) -> Result<bool, Abrupt> {
         // A mapped `arguments` index aliases its parameter binding: writes update the parameter
         // (and the own property, so unmapped reads and enumeration stay consistent).
         if !self.mapped_arguments.is_empty() {
@@ -5401,6 +5659,14 @@ impl Interp {
                             b.props
                                 .insert(key, crate::value::Property::data(value, true, true, true));
                         }
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(b.props.shape()),
+                                0,
+                                None,
+                            );
+                        }
                         return Ok(true);
                     }
                 }
@@ -5409,10 +5675,13 @@ impl Interp {
         let obj = match base {
             Value::Obj(o) => o.clone(),
             Value::Undefined | Value::Null => {
+                if let Some(trace) = trace {
+                    trace.record(crate::feedback::PropertyOutcome::Rejected, None, 0, None);
+                }
                 return Err(self.throw(
                     "TypeError",
                     format!("cannot set property '{key}' of {}", type_name(base)),
-                ))
+                ));
             }
             // Setting a property on a primitive: an accessor (or proxy) on the wrapper
             // prototype chain still handles the write, with the primitive as receiver; otherwise
@@ -5427,14 +5696,31 @@ impl Interp {
                     _ => None,
                 };
                 let mut cur = proto;
+                let mut depth = 0_u8;
                 while let Some(o) = cur {
                     // A proxy on the chain (or any accessor) takes over with the original receiver.
                     if self.proxies.contains_key(&(Rc::as_ptr(&o) as usize)) {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(o.borrow().props.shape()),
+                                depth,
+                                None,
+                            );
+                        }
                         return self.set_member_recv(&Value::Obj(o), key, value, receiver);
                     }
                     let prop = o.borrow().props.get(key).cloned();
                     if let Some(p) = prop {
                         if p.accessor() {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Accessor,
+                                    Some(o.borrow().props.shape()),
+                                    depth,
+                                    None,
+                                );
+                            }
                             return match p.setter().cloned() {
                                 Some(setter) => {
                                     self.call(setter, receiver.clone(), &[value])?;
@@ -5456,6 +5742,15 @@ impl Interp {
                     }
                     let parent = o.borrow().proto.clone();
                     cur = parent;
+                    depth = depth.saturating_add(1);
+                }
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Rejected,
+                        None,
+                        depth,
+                        None,
+                    );
                 }
                 if self.strict {
                     return Err(self.throw(
@@ -5475,6 +5770,14 @@ impl Interp {
         // is strict) the assignment throws a TypeError; a sloppy caller sees an inert no-op. The
         // property is resolved first, so a binding still in its TDZ throws ReferenceError instead.
         if self.is_namespace(ptr) {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.record(
+                    crate::feedback::PropertyOutcome::Exotic,
+                    Some(obj.borrow().props.shape()),
+                    0,
+                    None,
+                );
+            }
             self.ns_probe_tdz(ptr, key)?;
             if self.strict {
                 return Err(self.throw(
@@ -5489,6 +5792,14 @@ impl Interp {
         // Proxy: invoke the `set` trap, or forward to the target.
         if !self.proxies.is_empty() {
             if let Some((target, handler)) = self.proxy_at(ptr) {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(obj.borrow().props.shape()),
+                        0,
+                        None,
+                    );
+                }
                 let trap = self.get_member(&handler, "set")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     // Forward to the target's [[Set]], preserving the original Receiver.
@@ -5520,6 +5831,14 @@ impl Interp {
         if let Some(info) = self.typed_arrays.get(&ptr).copied() {
             match self.ta_index_kind(&info, key) {
                 TaIndex::Element(_) | TaIndex::Exotic => {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(obj.borrow().props.shape()),
+                            0,
+                            None,
+                        );
+                    }
                     // IntegerIndexedElementSet coerces the value first — the coercion can resize
                     // the underlying buffer, changing which indices are valid — then re-checks the
                     // index and silently discards an out-of-bounds write.
@@ -5539,12 +5858,21 @@ impl Interp {
 
         // Walk the chain for an accessor or read-only data property.
         let mut cur = Some(obj.clone());
+        let mut depth = 0_u8;
         while let Some(o) = cur {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&o, Some(key))?;
             // A proxy on the chain handles the write itself (with the original receiver).
             let optr = Rc::as_ptr(&o) as usize;
             if let Some((target, handler)) = self.proxies.get(&optr).cloned() {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(o.borrow().props.shape()),
+                        depth,
+                        None,
+                    );
+                }
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'set' on a revoked proxy"));
                 }
@@ -5580,6 +5908,14 @@ impl Interp {
                     match self.ta_index_kind(&info, key) {
                         TaIndex::Element(_) | TaIndex::Exotic if matches!(&receiver, Value::Obj(r) if Rc::ptr_eq(r, &o)) =>
                         {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Exotic,
+                                    Some(o.borrow().props.shape()),
+                                    depth,
+                                    None,
+                                );
+                            }
                             // The receiver IS this TypedArray: IntegerIndexedElementSet applies
                             // (coerce, then store or silently drop an out-of-range write).
                             let num = if info.kind.is_bigint() {
@@ -5595,7 +5931,17 @@ impl Interp {
                         // Foreign receiver: a valid element behaves as a writable data property
                         // (create it on the receiver, uncoerced); a numeric non-index is inert.
                         TaIndex::Element(_) => break,
-                        TaIndex::Exotic => return Ok(true),
+                        TaIndex::Exotic => {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Exotic,
+                                    Some(o.borrow().props.shape()),
+                                    depth,
+                                    None,
+                                );
+                            }
+                            return Ok(true);
+                        }
                         TaIndex::Ordinary => {}
                     }
                 }
@@ -5605,6 +5951,14 @@ impl Interp {
             if self.host_indexed_array_key(&o, key)
                 && self.host_indexed_own_value(&o, key)?.is_some()
             {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(o.borrow().props.shape()),
+                        depth,
+                        None,
+                    );
+                }
                 if self.strict {
                     return Err(self.throw(
                         "TypeError",
@@ -5616,6 +5970,14 @@ impl Interp {
             let prop = o.borrow().props.get(key).cloned();
             if let Some(p) = prop {
                 if p.accessor() {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Accessor,
+                            Some(o.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
+                    }
                     return match p.setter().cloned() {
                         Some(setter) => {
                             self.call(setter, receiver.clone(), &[value])?;
@@ -5635,6 +5997,14 @@ impl Interp {
                 }
                 if Rc::ptr_eq(&o, &obj) {
                     if !p.writable() {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Rejected,
+                                Some(o.borrow().props.shape()),
+                                depth,
+                                None,
+                            );
+                        }
                         if self.strict {
                             return Err(self.throw(
                                 "TypeError",
@@ -5646,6 +6016,14 @@ impl Interp {
                     break; // own writable data property — update below
                 }
                 if !p.writable() {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Rejected,
+                            Some(o.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
+                    }
                     if self.strict {
                         return Err(self.throw(
                             "TypeError",
@@ -5657,6 +6035,7 @@ impl Interp {
                 break; // inherited writable data property — create own on receiver
             }
             cur = o.borrow().proto.clone();
+            depth = depth.saturating_add(1);
         }
 
         // OrdinarySet: the write lands on the *receiver* (they differ for `super.x = v` and
@@ -5668,6 +6047,14 @@ impl Interp {
                 self.defer_trigger(r, Some(key))?;
                 let rptr = Rc::as_ptr(r) as usize;
                 if self.is_namespace(rptr) {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(r.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
+                    }
                     self.ns_probe_tdz(rptr, key)?;
                     if self.strict {
                         return Err(self.throw(
@@ -5682,6 +6069,14 @@ impl Interp {
                 // A proxy receiver gets the write as CreateDataProperty through its
                 // [[DefineOwnProperty]] trap.
                 if self.proxies.contains_key(&rptr) {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(r.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
+                    }
                     return match crate::builtins::reflect_define_on_receiver(
                         self, &receiver, key, value,
                     ) {
@@ -5701,6 +6096,14 @@ impl Interp {
         // [[DefineOwnProperty]]. A read-only Web IDL collection rejects every array-index key,
         // including currently unsupported indices.
         if self.host_indexed_array_key(&obj, key) {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.record(
+                    crate::feedback::PropertyOutcome::Exotic,
+                    Some(obj.borrow().props.shape()),
+                    depth,
+                    None,
+                );
+            }
             if self.strict {
                 return Err(self.throw(
                     "TypeError",
@@ -5711,6 +6114,14 @@ impl Interp {
         }
         let is_array = matches!(obj.borrow().exotic, Exotic::Array);
         if is_array {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.record(
+                    crate::feedback::PropertyOutcome::Exotic,
+                    Some(obj.borrow().props.shape()),
+                    depth,
+                    None,
+                );
+            }
             return self.array_set(&obj, key, value);
         } else {
             let existed = obj.borrow().props.contains(key);
@@ -5724,6 +6135,14 @@ impl Interp {
                     (pr.accessor(), pr.writable())
                 };
                 if accessor || !writable {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Rejected,
+                            Some(obj.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
+                    }
                     if self.strict {
                         return Err(self.throw(
                             "TypeError",
@@ -5735,8 +6154,25 @@ impl Interp {
                 if let Some(p) = obj.borrow_mut().props.get_mut(key) {
                     p.set_value(value);
                 }
+                if let Some(trace) = trace.as_deref_mut() {
+                    let b = obj.borrow();
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Data,
+                        Some(b.props.shape()),
+                        0,
+                        b.props.slot_of(key).map(|slot| slot as u32),
+                    );
+                }
             } else {
                 if !obj.borrow().extensible {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Rejected,
+                            None,
+                            depth,
+                            None,
+                        );
+                    }
                     if self.strict {
                         return Err(self
                             .throw("TypeError", "cannot add property, object is not extensible"));
@@ -5744,6 +6180,14 @@ impl Interp {
                     return Ok(false);
                 }
                 obj.borrow_mut().props.insert(key, Property::plain(value));
+                if let Some(trace) = trace {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Created,
+                        Some(obj.borrow().props.shape()),
+                        depth,
+                        None,
+                    );
+                }
             }
         }
         Ok(true)

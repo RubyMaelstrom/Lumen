@@ -492,12 +492,12 @@ finish the baseline, but no later phase may claim a performance win against the 
     element, private-field, immutable-target, and `super` update paths without losing their
     combined ToNumeric/write ordering. The shared path also corrects object-to-BigInt ToNumeric
     updates across the tree-walker, bytecode VM, and JIT.
-- [ ] Record abstract property receiver/holder layout identities, prototype depth, field location,
+- [x] Record abstract property receiver/holder layout identities, prototype depth, field location,
   and accessor/exotic outcomes; resolve identities to current shapes or future Maps through the
   active adapter.
   - [x] Preserve ordinary data field location/prototype depth and distinct absence/creation
     outcomes from the current IC adapter in stable `PropertyAccess` slots.
-  - [ ] Record accessor, exotic, and rejected outcomes at canonical runtime helper endpoints
+  - [x] Record accessor, exotic, and rejected outcomes at canonical runtime helper endpoints
     without duplicating observable property operations.
 - [ ] Record element receiver kind, index category, bounds/hole outcome, and prototype fallback.
 - [ ] Record call and construct targets, arity, closure environment requirements, and return type.

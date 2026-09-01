@@ -2830,19 +2830,19 @@ fn refresh_current_layout_feedback(
         }
         if generic {
             let word = ObservationWord::new(ObservationState::Generic, 0, 0);
-            feedback.write(
+            feedback.merge_write(
                 site,
                 ObservationKind::ReceiverLayout,
                 ObservationRole::Receiver,
                 word,
             );
-            feedback.write(
+            feedback.merge_write(
                 site,
                 ObservationKind::HolderLayout,
                 ObservationRole::Holder,
                 word,
             );
-            feedback.write(
+            feedback.merge_write(
                 site,
                 ObservationKind::PropertyAccess,
                 ObservationRole::Access,
@@ -2854,7 +2854,7 @@ fn refresh_current_layout_feedback(
             [] => {}
             [observation] => {
                 let receiver = intern_current_shape(shapes, observation.receiver_shape);
-                feedback.write(
+                feedback.merge_write(
                     site,
                     ObservationKind::ReceiverLayout,
                     ObservationRole::Receiver,
@@ -2874,13 +2874,13 @@ fn refresh_current_layout_feedback(
                         )
                     },
                 );
-                feedback.write(
+                feedback.merge_write(
                     site,
                     ObservationKind::HolderLayout,
                     ObservationRole::Holder,
                     holder_word,
                 );
-                feedback.write(
+                feedback.merge_write(
                     site,
                     ObservationKind::PropertyAccess,
                     ObservationRole::Access,
@@ -2897,19 +2897,19 @@ fn refresh_current_layout_feedback(
                     polymorphic.len() as u32,
                     0,
                 );
-                feedback.write(
+                feedback.merge_write(
                     site,
                     ObservationKind::ReceiverLayout,
                     ObservationRole::Receiver,
                     word,
                 );
-                feedback.write(
+                feedback.merge_write(
                     site,
                     ObservationKind::HolderLayout,
                     ObservationRole::Holder,
                     word,
                 );
-                feedback.write(
+                feedback.merge_write(
                     site,
                     ObservationKind::PropertyAccess,
                     ObservationRole::Access,
@@ -3459,6 +3459,170 @@ mod feedback_layout_tests {
             ObservationState::Absent
         );
         assert_eq!(&*shapes.borrow(), &[23]);
+    }
+
+    #[test]
+    fn profiled_named_get_records_accessor_at_the_canonical_lookup() {
+        let mut interp = Interp::new();
+        let object = Value::Obj(interp.new_object());
+        let getter = interp.new_native_fn("get value", 0, Rc::new(|_, _, _| Ok(Value::Num(17.0))));
+        interp.define_accessor_value(&object, "value", Some(getter), None, true);
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        let mut trace = crate::feedback::CurrentPropertyTrace::default();
+
+        let result = match interp.get_prop_ic_profiled(&object, "value", &caches[0], &mut trace) {
+            Ok(value) => value,
+            Err(_) => panic!("getter must complete"),
+        };
+
+        assert!(matches!(result, Value::Num(17.0)));
+        assert_eq!(trace.outcome, Some(PropertyOutcome::Accessor));
+        assert_eq!(trace.depth, 0);
+        assert_eq!(trace.field_slot, None);
+        assert_eq!(
+            trace.holder_shape,
+            object.as_obj().map(|object| object.borrow().props.shape())
+        );
+        assert!(caches.iter().all(|cache| cache.get().depth == IC_EMPTY));
+    }
+
+    #[test]
+    fn profiled_named_get_classifies_primitive_virtual_properties_as_exotic() {
+        let mut interp = Interp::new();
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        let mut trace = crate::feedback::CurrentPropertyTrace::default();
+
+        let result =
+            match interp.get_prop_ic_profiled(&Value::str("abc"), "length", &caches[0], &mut trace)
+            {
+                Ok(value) => value,
+                Err(_) => panic!("string length must complete"),
+            };
+
+        assert!(matches!(result, Value::Num(3.0)));
+        assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
+        assert_eq!(trace.depth, 0);
+    }
+
+    #[test]
+    fn profiled_named_access_classifies_proxy_forwarding_as_exotic() {
+        let mut interp = Interp::new();
+        let global = interp.global_this();
+        let proxy = match interp.eval_in_realm(&global, "new Proxy({ value: 3 }, {})") {
+            Ok(value) => value,
+            Err(_) => panic!("proxy construction must complete"),
+        };
+        let name: Rc<str> = Rc::from("value");
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        let mut get_trace = crate::feedback::CurrentPropertyTrace::default();
+
+        let result = match interp.get_prop_ic_profiled(&proxy, &name, &caches[0], &mut get_trace) {
+            Ok(value) => value,
+            Err(_) => panic!("forwarded proxy get must complete"),
+        };
+        assert!(matches!(result, Value::Num(3.0)));
+        assert_eq!(get_trace.outcome, Some(PropertyOutcome::Exotic));
+
+        let mut set_trace = crate::feedback::CurrentPropertyTrace::default();
+        assert!(interp
+            .set_prop_ic_profiled(&proxy, &name, Value::Num(4.0), &caches[0], &mut set_trace,)
+            .is_ok());
+        assert_eq!(set_trace.outcome, Some(PropertyOutcome::Exotic));
+        assert!(matches!(
+            interp.get_member(&proxy, "value"),
+            Ok(Value::Num(4.0))
+        ));
+    }
+
+    #[test]
+    fn profiled_named_set_invokes_a_setter_once_and_records_accessor() {
+        let mut interp = Interp::new();
+        let object = Value::Obj(interp.new_object());
+        let calls = Rc::new(std::cell::Cell::new(0_u32));
+        let setter_calls = calls.clone();
+        let setter = interp.new_native_fn(
+            "set value",
+            1,
+            Rc::new(move |_, _, _| {
+                setter_calls.set(setter_calls.get() + 1);
+                Ok(Value::Undefined)
+            }),
+        );
+        interp.define_accessor_value(&object, "value", None, Some(setter), true);
+        let name: Rc<str> = Rc::from("value");
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        let mut trace = crate::feedback::CurrentPropertyTrace::default();
+
+        assert!(interp
+            .set_prop_ic_profiled(&object, &name, Value::Num(9.0), &caches[0], &mut trace,)
+            .is_ok());
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(trace.outcome, Some(PropertyOutcome::Accessor));
+        assert_eq!(trace.depth, 0);
+        assert!(caches.iter().all(|cache| cache.get().depth == IC_EMPTY));
+    }
+
+    #[test]
+    fn profiled_named_set_records_read_only_rejection() {
+        let mut interp = Interp::new();
+        let object = Value::Obj(interp.new_object());
+        object.as_obj().unwrap().borrow_mut().props.insert(
+            "value",
+            crate::value::Property::data(Value::Num(1.0), false, true, true),
+        );
+        let name: Rc<str> = Rc::from("value");
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        let mut trace = crate::feedback::CurrentPropertyTrace::default();
+
+        assert!(interp
+            .set_prop_ic_profiled(&object, &name, Value::Num(9.0), &caches[0], &mut trace,)
+            .is_ok());
+
+        assert_eq!(trace.outcome, Some(PropertyOutcome::Rejected));
+        assert!(matches!(
+            interp.get_member(&object, "value"),
+            Ok(Value::Num(1.0))
+        ));
+    }
+
+    #[test]
+    fn throwing_profiled_setter_is_not_replayed_by_observation() {
+        let mut interp = Interp::new();
+        let object = Value::Obj(interp.new_object());
+        let calls = Rc::new(std::cell::Cell::new(0_u32));
+        let setter_calls = calls.clone();
+        let setter = interp.new_native_fn(
+            "set value",
+            1,
+            Rc::new(move |_, _, _| {
+                setter_calls.set(setter_calls.get() + 1);
+                Err(Value::str("setter failed"))
+            }),
+        );
+        interp.define_accessor_value(&object, "value", None, Some(setter), true);
+        let name: Rc<str> = Rc::from("value");
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        let mut trace = crate::feedback::CurrentPropertyTrace::default();
+
+        assert!(interp
+            .set_prop_ic_profiled(&object, &name, Value::Num(9.0), &caches[0], &mut trace,)
+            .is_err());
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(trace.outcome, Some(PropertyOutcome::Accessor));
     }
 }
 
@@ -10302,11 +10466,21 @@ fn run_vm(
             }
             Op::GetProp(n, c) => {
                 let obj = pop!();
-                let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let v = get_named_property(
+                    i,
+                    chunk,
+                    op_pc,
+                    &obj,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
                 stack.push(v);
             }
             Op::GetPropThis(n, c) => {
-                let v = i.get_prop_ic(
+                let v = get_named_property(
+                    i,
+                    chunk,
+                    op_pc,
                     this_val,
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
@@ -10324,13 +10498,23 @@ fn run_vm(
                         ),
                     ));
                 }
-                let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let v = get_named_property(
+                    i,
+                    chunk,
+                    op_pc,
+                    &obj,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
                 stack.push(v);
             }
             Op::SetProp(n, c) => {
                 let v = pop!();
                 let obj = pop!();
-                i.set_prop_ic(
+                set_named_property(
+                    i,
+                    chunk,
+                    op_pc,
                     &obj,
                     &chunk.names[n as usize],
                     v.clone(),
@@ -10341,11 +10525,22 @@ fn run_vm(
             Op::SetPropDrop(n, c) => {
                 let v = pop!();
                 let obj = pop!();
-                i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])?;
+                set_named_property(
+                    i,
+                    chunk,
+                    op_pc,
+                    &obj,
+                    &chunk.names[n as usize],
+                    v,
+                    &chunk.caches[c as usize],
+                )?;
             }
             Op::SetPropThisDrop(n, c) => {
                 let v = pop!();
-                i.set_prop_ic(
+                set_named_property(
+                    i,
+                    chunk,
+                    op_pc,
                     this_val,
                     &chunk.names[n as usize],
                     v,
@@ -10364,7 +10559,15 @@ fn run_vm(
                         ),
                     ));
                 }
-                i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])?;
+                set_named_property(
+                    i,
+                    chunk,
+                    op_pc,
+                    &obj,
+                    &chunk.names[n as usize],
+                    v,
+                    &chunk.caches[c as usize],
+                )?;
             }
             Op::DestructureGuard => {
                 if matches!(
@@ -10802,7 +11005,7 @@ fn run_vm(
                     lval
                 };
                 let r = i.binary("+", lval, v)?;
-                i.set_prop_ic(&obj, name, r, &chunk.caches[c as usize])?;
+                set_named_property(i, chunk, op_pc, &obj, name, r, &chunk.caches[c as usize])?;
             }
             Op::GetElem => {
                 let key = pop!();
@@ -10902,9 +11105,9 @@ fn run_vm(
                 let obj = pop!();
                 let name = &chunk.names[n as usize];
                 let cache = &chunk.caches[c as usize];
-                let old = i.get_prop_ic(&obj, name, cache)?;
+                let old = get_named_property(i, chunk, op_pc, &obj, name, cache)?;
                 step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
-                    i.set_prop_ic(&obj, name, v, cache)
+                    set_named_property(i, chunk, op_pc, &obj, name, v, cache)
                 })?;
             }
             Op::UpdateElem(kind) => {
@@ -10990,7 +11193,14 @@ fn run_vm(
             }
             Op::GetMethod(n, c) => {
                 let obj = pop!();
-                let m = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let m = get_named_property(
+                    i,
+                    chunk,
+                    op_pc,
+                    &obj,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
                 stack.push(obj);
                 stack.push(m);
             }
@@ -12921,6 +13131,47 @@ fn step_and_store(
         stack.push(v);
     }
     Ok(())
+}
+
+#[inline]
+fn get_named_property(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    base: &Value,
+    name: &str,
+    cache: &std::cell::Cell<IcState>,
+) -> Result<Value, Abrupt> {
+    if !chunk.feedback.detailed_enabled() {
+        return i.get_prop_ic(base, name, cache);
+    }
+    let mut trace = crate::feedback::CurrentPropertyTrace::default();
+    let result = i.get_prop_ic_profiled(base, name, cache, &mut trace);
+    chunk
+        .feedback
+        .observe_current_property(pc, &chunk.feedback_shapes, trace);
+    result
+}
+
+#[inline]
+fn set_named_property(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    base: &Value,
+    name: &Rc<str>,
+    value: Value,
+    cache: &std::cell::Cell<IcState>,
+) -> Result<(), Abrupt> {
+    if !chunk.feedback.detailed_enabled() {
+        return i.set_prop_ic(base, name, value, cache);
+    }
+    let mut trace = crate::feedback::CurrentPropertyTrace::default();
+    let result = i.set_prop_ic_profiled(base, name, value, cache, &mut trace);
+    chunk
+        .feedback
+        .observe_current_property(pc, &chunk.feedback_shapes, trace);
+    result
 }
 
 #[inline]
@@ -15388,7 +15639,10 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
             let v = sp.read();
             sp = sp.sub(1);
             let obj = sp.read();
-            i.set_prop_ic(
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
                 &obj,
                 &chunk.names[n as usize],
                 v.clone(),
@@ -15403,13 +15657,24 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
             let v = sp.read();
             sp = sp.sub(1);
             let obj = sp.read();
-            i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                &chunk.names[n as usize],
+                v,
+                &chunk.caches[c as usize],
+            )
         }
         Op::SetPropThisDrop(n, c) => {
             sp = sp.sub(1);
             let v = sp.read();
             let this = (*ctx.this_raw).clone();
-            i.set_prop_ic(
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
                 &this,
                 &chunk.names[n as usize],
                 v,
@@ -15429,7 +15694,15 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                     ),
                 ));
             }
-            i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                &chunk.names[n as usize],
+                v,
+                &chunk.caches[c as usize],
+            )
         }
         _ => unreachable!("jit_set_prop emitted only for property stores"),
     })();
@@ -15491,14 +15764,28 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
             Op::GetProp(n, c) => {
                 sp = sp.sub(1);
                 let obj = sp.read();
-                let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let v = get_named_property(
+                    i,
+                    chunk,
+                    pc as usize,
+                    &obj,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
                 sp.write(v);
                 sp = sp.add(1);
                 Ok(())
             }
             Op::GetPropThis(n, c) => {
                 let this = &*ctx.this_raw;
-                let v = i.get_prop_ic(this, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let v = get_named_property(
+                    i,
+                    chunk,
+                    pc as usize,
+                    this,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
                 sp.write(v);
                 sp = sp.add(1);
                 Ok(())
@@ -15518,14 +15805,28 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         ),
                     ));
                 }
-                let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let v = get_named_property(
+                    i,
+                    chunk,
+                    pc as usize,
+                    &obj,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
                 sp.write(v);
                 sp = sp.add(1);
                 Ok(())
             }
             Op::GetMethod(n, c) => {
                 let obj = &*sp.sub(1); // receiver stays on the stack
-                let m = i.get_prop_ic(obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let m = get_named_property(
+                    i,
+                    chunk,
+                    pc as usize,
+                    obj,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
                 sp.write(m);
                 sp = sp.add(1);
                 Ok(())
@@ -16108,12 +16409,26 @@ unsafe fn jit_exec_inner(
         Op::LoadThis => push!(ctx.this_val.clone()),
         Op::GetProp(n, c) => {
             let obj = pop!();
-            let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+            let v = get_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+            )?;
             push!(v);
         }
         Op::GetPropThis(n, c) => {
             let this = (*ctx.this_raw).clone();
-            let v = i.get_prop_ic(&this, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+            let v = get_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &this,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+            )?;
             push!(v);
         }
         Op::GetPropLocal(s, n, c) => {
@@ -16127,13 +16442,23 @@ unsafe fn jit_exec_inner(
                     ),
                 ));
             }
-            let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+            let v = get_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+            )?;
             push!(v);
         }
         Op::SetProp(n, c) => {
             let v = pop!();
             let obj = pop!();
-            i.set_prop_ic(
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
                 &obj,
                 &chunk.names[n as usize],
                 v.clone(),
@@ -16144,12 +16469,23 @@ unsafe fn jit_exec_inner(
         Op::SetPropDrop(n, c) => {
             let v = pop!();
             let obj = pop!();
-            i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])?;
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                &chunk.names[n as usize],
+                v,
+                &chunk.caches[c as usize],
+            )?;
         }
         Op::SetPropThisDrop(n, c) => {
             let v = pop!();
             let this = (*ctx.this_raw).clone();
-            i.set_prop_ic(
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
                 &this,
                 &chunk.names[n as usize],
                 v,
@@ -16168,7 +16504,15 @@ unsafe fn jit_exec_inner(
                     ),
                 ));
             }
-            i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])?;
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                &chunk.names[n as usize],
+                v,
+                &chunk.caches[c as usize],
+            )?;
         }
         Op::DestructureGuard => {
             if matches!(&*sp.sub(1), Value::Undefined | Value::Null) {
@@ -16278,7 +16622,15 @@ unsafe fn jit_exec_inner(
                 lval
             };
             let r = i.binary("+", lval, v)?;
-            i.set_prop_ic(&obj, name, r, &chunk.caches[c as usize])?;
+            set_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                name,
+                r,
+                &chunk.caches[c as usize],
+            )?;
         }
         Op::GetElem => {
             let key = pop!();
@@ -16385,9 +16737,9 @@ unsafe fn jit_exec_inner(
             let obj = pop!();
             let name = &chunk.names[n as usize];
             let cache = &chunk.caches[c as usize];
-            let old = i.get_prop_ic(&obj, name, cache)?;
+            let old = get_named_property(i, chunk, pc as usize, &obj, name, cache)?;
             if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.set_prop_ic(&obj, name, v, cache)
+                set_named_property(i, chunk, pc as usize, &obj, name, v, cache)
             })? {
                 push!(v);
             }
@@ -16452,7 +16804,14 @@ unsafe fn jit_exec_inner(
         }
         Op::GetMethod(n, c) => {
             let obj = pop!();
-            let m = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+            let m = get_named_property(
+                i,
+                chunk,
+                pc as usize,
+                &obj,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+            )?;
             push!(obj);
             push!(m);
         }

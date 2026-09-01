@@ -2990,6 +2990,21 @@ impl Props {
         }
         self.find(key).map(|i| &self.entries[i].1)
     }
+    /// Semantic lookup plus the named-entry slot when the result lives in `entries`. Dense
+    /// indexed results have no named field slot. Used by opt-in feedback collection so it can
+    /// retain location metadata without performing a second lookup.
+    pub(crate) fn get_with_slot(&self, key: &str) -> Option<(&Property, Option<usize>)> {
+        if let Some(n) = canonical_index(key) {
+            if let Some(property) = self.get_index(n) {
+                return Some((property, None));
+            }
+            if !self.has_far.get() {
+                return None;
+            }
+        }
+        self.find(key)
+            .map(|slot| (&self.entries[slot].1, Some(slot)))
+    }
     /// The memoized own `prototype` slot, for guarded constructor fast paths.
     #[inline]
     pub(crate) fn prototype_slot(&self) -> Option<u32> {

@@ -83,6 +83,37 @@ pub(crate) enum PropertyOutcome {
     Rejected = 6,
 }
 
+/// Runtime-only result of one named-property operation. Current `Props` shape numbers enter this
+/// adapter record but are interned to vector-local layout tokens before any observation word is
+/// written or serialized.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CurrentPropertyTrace {
+    pub(crate) receiver_shape: Option<u32>,
+    pub(crate) holder_shape: Option<u32>,
+    pub(crate) depth: u8,
+    pub(crate) field_slot: Option<u32>,
+    pub(crate) outcome: Option<PropertyOutcome>,
+    pub(crate) array_key_check: bool,
+}
+
+impl CurrentPropertyTrace {
+    pub(crate) fn record(
+        &mut self,
+        outcome: PropertyOutcome,
+        holder_shape: Option<u32>,
+        depth: u8,
+        field_slot: Option<u32>,
+    ) {
+        if self.outcome.is_some() {
+            return;
+        }
+        self.outcome = Some(outcome);
+        self.holder_shape = holder_shape;
+        self.depth = depth;
+        self.field_slot = field_slot;
+    }
+}
+
 pub(crate) const PROPERTY_DEPTH_MASK: u8 = 0x07;
 pub(crate) const PROPERTY_ARRAY_KEY_CHECK: u8 = 0x08;
 const PROPERTY_OUTCOME_SHIFT: u8 = 4;
@@ -493,6 +524,7 @@ impl FeedbackVector {
         self.layout.site_ids().zip(self.bindings.iter().copied())
     }
 
+    #[cfg(test)]
     pub(crate) fn write(
         &self,
         site: SiteId,
@@ -511,6 +543,151 @@ impl FeedbackVector {
         };
         let first = self.layout.site(site).unwrap().first_slot as usize;
         self.words()[first + offset].set(value.0);
+    }
+
+    pub(crate) fn merge_write(
+        &self,
+        site: SiteId,
+        kind: ObservationKind,
+        role: ObservationRole,
+        incoming: ObservationWord,
+    ) {
+        let Some(descriptors) = self.layout.slots(site) else {
+            return;
+        };
+        let Some(offset) = descriptors
+            .iter()
+            .position(|slot| slot.kind == kind && slot.role == role)
+        else {
+            return;
+        };
+        let first = self.layout.site(site).unwrap().first_slot as usize;
+        let cell = &self.words()[first + offset];
+        let current = ObservationWord(cell.get());
+        let merged = if kind == ObservationKind::PropertyAccess {
+            merge_property_access_words(current, incoming)
+        } else {
+            merge_observation_words(current, incoming)
+        };
+        cell.set(merged.0);
+    }
+
+    /// Adapt one canonical runtime property result into the stable vector. This is used only for
+    /// paths that do not populate the ordinary property IC (accessors and exotic/rejected
+    /// operations); ordinary cached data/absence/creation paths are collected by the IC adapter.
+    pub(crate) fn observe_current_property(
+        &self,
+        bytecode_pc: usize,
+        shapes: &std::cell::RefCell<Vec<u32>>,
+        trace: CurrentPropertyTrace,
+    ) {
+        if !self.detailed_enabled {
+            return;
+        }
+        let Some(outcome) = trace.outcome else {
+            return;
+        };
+        let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
+            return;
+        };
+        let Ok(index) = self
+            .layout
+            .sites
+            .binary_search_by_key(&bytecode_pc, |site| site.bytecode_pc)
+        else {
+            return;
+        };
+        let site = SiteId(index as u32);
+        if trace.depth > PROPERTY_DEPTH_MASK {
+            let generic = ObservationWord::new(ObservationState::Generic, 0, 0);
+            self.merge_write(
+                site,
+                ObservationKind::ReceiverLayout,
+                ObservationRole::Receiver,
+                generic,
+            );
+            self.merge_write(
+                site,
+                ObservationKind::HolderLayout,
+                ObservationRole::Holder,
+                generic,
+            );
+            self.merge_write(
+                site,
+                ObservationKind::PropertyAccess,
+                ObservationRole::Access,
+                generic,
+            );
+            return;
+        }
+
+        let layout_flags = trace.depth | if trace.array_key_check { 0x80 } else { 0 };
+        if let Some(shape) = trace.receiver_shape {
+            self.merge_write(
+                site,
+                ObservationKind::ReceiverLayout,
+                ObservationRole::Receiver,
+                ObservationWord::new(
+                    ObservationState::Monomorphic,
+                    intern_current_shape(shapes, shape),
+                    layout_flags,
+                ),
+            );
+        }
+        self.merge_write(
+            site,
+            ObservationKind::HolderLayout,
+            ObservationRole::Holder,
+            trace.holder_shape.map_or_else(
+                || ObservationWord::new(ObservationState::Absent, 0, layout_flags),
+                |shape| {
+                    ObservationWord::new(
+                        ObservationState::Monomorphic,
+                        intern_current_shape(shapes, shape),
+                        layout_flags,
+                    )
+                },
+            ),
+        );
+        let payload = match (outcome, trace.field_slot) {
+            (PropertyOutcome::Data, Some(slot)) => match slot.checked_add(1) {
+                Some(payload) => payload,
+                None => {
+                    self.merge_write(
+                        site,
+                        ObservationKind::PropertyAccess,
+                        ObservationRole::Access,
+                        ObservationWord::new(ObservationState::Generic, 0, 0),
+                    );
+                    return;
+                }
+            },
+            (PropertyOutcome::Data, None) => {
+                self.merge_write(
+                    site,
+                    ObservationKind::PropertyAccess,
+                    ObservationRole::Access,
+                    ObservationWord::new(ObservationState::Generic, 0, 0),
+                );
+                return;
+            }
+            _ => 0,
+        };
+        let state = if outcome == PropertyOutcome::Absent {
+            ObservationState::Absent
+        } else {
+            ObservationState::Monomorphic
+        };
+        self.merge_write(
+            site,
+            ObservationKind::PropertyAccess,
+            ObservationRole::Access,
+            ObservationWord::new(
+                state,
+                payload,
+                property_access_flags(outcome, trace.depth, trace.array_key_check),
+            ),
+        );
     }
 
     /// Merge one stable semantic value class into the matching site's bitset.
@@ -746,9 +923,61 @@ fn merge_observation_words(current: ObservationWord, incoming: ObservationWord) 
     let current_state = current.decoded_state().unwrap();
     let incoming_state = incoming.decoded_state().unwrap();
     if current_state == ObservationState::Generic || incoming_state == ObservationState::Generic {
-        ObservationWord::new(ObservationState::Generic, 0, 0)
-    } else {
-        ObservationWord::new(ObservationState::Polymorphic, 0, 0)
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    if incoming_state == ObservationState::Polymorphic {
+        return incoming;
+    }
+    if current_state == ObservationState::Polymorphic {
+        return current;
+    }
+    if current_state == ObservationState::Absent || incoming_state == ObservationState::Absent {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    ObservationWord::new(ObservationState::Polymorphic, 2, 0)
+}
+
+fn merge_property_access_words(
+    current: ObservationWord,
+    incoming: ObservationWord,
+) -> ObservationWord {
+    debug_assert!(current.is_valid_for(ObservationKind::PropertyAccess));
+    debug_assert!(incoming.is_valid_for(ObservationKind::PropertyAccess));
+    if current == incoming || incoming == ObservationWord::UNINITIALIZED {
+        return current;
+    }
+    if current == ObservationWord::UNINITIALIZED {
+        return incoming;
+    }
+    if current.decoded_state() == Some(ObservationState::Generic)
+        || incoming.decoded_state() == Some(ObservationState::Generic)
+    {
+        return ObservationWord::new(ObservationState::Generic, 0, 0);
+    }
+    if incoming.decoded_state() == Some(ObservationState::Polymorphic)
+        && matches!(
+            property_outcome((current.0 >> 8) as u8),
+            Some(PropertyOutcome::Data | PropertyOutcome::Created)
+        )
+    {
+        // The IC adapter has just summarized multiple ordinary data/create ways. Preserve its
+        // bounded count when the earlier runtime word was itself an ordinary cacheable outcome.
+        return incoming;
+    }
+    // Unlike layout-token observations, heterogeneous property outcomes cannot retain their
+    // distinct flags/field payloads in one word. Widen conservatively instead of manufacturing a
+    // partially exact polymorphic observation.
+    ObservationWord::new(ObservationState::Generic, 0, 0)
+}
+
+fn intern_current_shape(shapes: &std::cell::RefCell<Vec<u32>>, shape: u32) -> u32 {
+    let mut shapes = shapes.borrow_mut();
+    match shapes.iter().position(|existing| *existing == shape) {
+        Some(index) => index as u32 + 1,
+        None => {
+            shapes.push(shape);
+            shapes.len() as u32
+        }
     }
 }
 
@@ -789,6 +1018,10 @@ mod tests {
     const HOLDER: SlotDescriptor = SlotDescriptor {
         kind: ObservationKind::HolderLayout,
         role: ObservationRole::Holder,
+    };
+    const ACCESS: SlotDescriptor = SlotDescriptor {
+        kind: ObservationKind::PropertyAccess,
+        role: ObservationRole::Access,
     };
 
     fn property_vector() -> FeedbackVector {
@@ -935,6 +1168,87 @@ mod tests {
             property_access_flags(PropertyOutcome::Data, 0, false),
         )
         .is_valid_for(ObservationKind::PropertyAccess));
+    }
+
+    #[test]
+    fn current_property_adapter_interns_shapes_and_widens_mixed_outcomes() {
+        let mut builder = LayoutBuilder::default();
+        builder.add_site(4, OperationKind::NamedLoad, &[RECEIVER, HOLDER, ACCESS]);
+        let vector = FeedbackVector::new_with_enabled(
+            builder.finish(),
+            vec![RuntimeBinding::Unbound].into_boxed_slice(),
+            true,
+        );
+        let shapes = std::cell::RefCell::new(Vec::new());
+        let trace = CurrentPropertyTrace {
+            receiver_shape: Some(41),
+            holder_shape: Some(73),
+            depth: 1,
+            field_slot: None,
+            outcome: Some(PropertyOutcome::Accessor),
+            array_key_check: false,
+        };
+
+        vector.observe_current_property(4, &shapes, trace);
+        let site = vector.sites().next().unwrap().0;
+        assert_eq!(
+            vector
+                .read(
+                    site,
+                    ObservationKind::ReceiverLayout,
+                    ObservationRole::Receiver
+                )
+                .payload(),
+            1
+        );
+        assert_eq!(
+            vector
+                .read(site, ObservationKind::HolderLayout, ObservationRole::Holder)
+                .payload(),
+            2
+        );
+        let access = vector.read(
+            site,
+            ObservationKind::PropertyAccess,
+            ObservationRole::Access,
+        );
+        assert_eq!(access.state(), ObservationState::Monomorphic);
+        assert_eq!(
+            property_outcome(access.flags()),
+            Some(PropertyOutcome::Accessor)
+        );
+        assert_eq!(&*shapes.borrow(), &[41, 73]);
+
+        vector.observe_current_property(4, &shapes, trace);
+        assert_eq!(
+            vector
+                .read(
+                    site,
+                    ObservationKind::PropertyAccess,
+                    ObservationRole::Access
+                )
+                .state(),
+            ObservationState::Monomorphic
+        );
+
+        vector.observe_current_property(
+            4,
+            &shapes,
+            CurrentPropertyTrace {
+                outcome: Some(PropertyOutcome::Exotic),
+                ..trace
+            },
+        );
+        assert_eq!(
+            vector
+                .read(
+                    site,
+                    ObservationKind::PropertyAccess,
+                    ObservationRole::Access
+                )
+                .state(),
+            ObservationState::Generic
+        );
     }
 
     #[test]
