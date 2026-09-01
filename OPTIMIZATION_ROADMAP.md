@@ -434,8 +434,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Add an explicit `RetainedBytes` hook for typed host state and resources, report any live
     legacy/unreported entry as unavailable rather than zero, aggregate host state across nested
     realms, and reduce the exhaustive `Interp` inventory's `unaccounted` class to zero.
-  - [ ] Cover shared/Wasm backing stores with cross-Agent identity deduplication before changing
-    the report to complete.
+  - [x] Report SharedArrayBuffer backing with address-independent Shared Data Block identities,
+    deduplicate aliases across the Agent's realms, mark records externally shared for process
+    aggregation, and validate that allocation identities and category totals agree.
+  - [ ] Cover embedder WebAssembly backing stores without double-counting Data Blocks identified
+    with exposed `Memory.buffer` objects before changing the report to complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page

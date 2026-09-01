@@ -3,7 +3,8 @@
 Status: implementation in vertical slices. The post-collection visitor now classifies every
 `Interp` field, traverses the engine-owned side tables/caches described below, reports ordinary
 `ArrayBuffer` backing by identity, and exposes an opt-in retained-size contract for host state.
-Shared/Wasm backing remains unavailable, and any host entry that does not implement the contract
+SharedArrayBuffer backing is now reported by address-independent Shared Data Block identity. Wasm
+embedder backing remains unavailable, and any host entry that does not implement the contract
 makes the host category unavailable rather than silently contributing zero. The Phase 0 total is
 therefore explicitly incomplete and the roadmap item remains open.
 
@@ -116,7 +117,7 @@ Current implementation notes:
 - The test-only inventory macro expands one checked-in classification list into an exhaustive
   `Interp` struct pattern with no `..`, so a newly added field fails test compilation until
   classified. The inventory now rejects every `unaccounted` entry. `complete` remains false until
-  the separately tracked shared/Wasm backing category has a cross-Agent identity policy.
+  the separately tracked embedder Wasm backing category participates in the host contract.
 
 Allocation attribution rules for the remaining slices:
 
@@ -130,9 +131,11 @@ Allocation attribution rules for the remaining slices:
 - Keep executable mappings and their bounded code-memory budget separate from requested managed
   payload. Heap-side JIT metadata is also reported separately, never silently folded into either
   allocator residency or executable bytes.
-- Per-Agent records carry both Agent and collector-heap identity. Shared/Wasm memory will need a
-  stable allocation identity and an externally-shared marker so a process aggregator can dedupe
-  it across Agents without changing the useful per-Agent retained view.
+- Per-Agent records carry both Agent and collector-heap identity. SharedArrayBuffer records use the
+  engine's address-independent Shared Data Block id and an `externally_shared` marker so a process
+  aggregator can dedupe them across Agents without changing the useful per-Agent retained view.
+  Agent-local Wasm backing still needs an embedder allocation identity so an exposed
+  `Memory.buffer` Data Block is not credited twice.
 
 The Function/Chunk vertical slice now follows user callables through both compiled generations,
 deduplicates shared Functions, Chunks, hoist plans, and JIT sidecars, and accounts the principal
@@ -177,8 +180,10 @@ HashMap alias rather than an allocator-introspectable container.
 ArrayBuffer ownership now separates byte backing from engine metadata: owner/version/dirty-range
 tables, TypedArray/DataView records, immutable and host-detach-key sets, and view-to-buffer Values
 credit `interpreter_side_tables`, while the identity-deduplicated byte capacity remains in
-`array_buffer_backing`. Shared/Wasm backing is still intentionally unavailable pending the
-cross-Agent allocation-identity policy; only its per-realm id map is included in this slice.
+`array_buffer_backing`. SharedArrayBuffer backing is credited once per address-independent Shared
+Data Block id across the root realm and ShadowRealms; each allocation record is marked externally
+shared so a process-level consumer can deduplicate the same block across Agents. Missing registry
+identities make the category unavailable. Embedder Wasm backing remains a separate pending slice.
 
 Reusable execution storage now contributes to `engine_caches`: bytecode slot/operand Vec pools,
 the megamorphic stub table and retained names, raw fixed-size JIT frame buffers, and weak

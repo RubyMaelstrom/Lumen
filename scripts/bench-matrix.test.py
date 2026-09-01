@@ -117,12 +117,21 @@ class UnitTests(unittest.TestCase):
             '"reason":"partial"},'
             '"managed_external_bytes":{"bytes":4,"quality":"lower_bound","reason":"partial"},'
             '"categories":{"objects":{"bytes":8,"quality":"exact"},'
+            '"shared":{"bytes":4,"quality":"exact","externally_shared":true,'
+            '"allocations":[{"allocation_id":"shared-data-block:7","bytes":4,'
+            '"externally_shared":true}]},'
             '"side_tables":{"bytes":null,"quality":"unavailable","reason":"pending"}}}}\n'
         )
         metrics = bench_matrix.parse_engine_metrics(stderr, "[lumen-perf] ")
         self.assertEqual(metrics["jit_compile_seconds"], 0.25)
         self.assertEqual(sum(metrics["gc_pause_histogram"]["counts"]), 2)
         self.assertEqual(metrics["managed_memory"]["managed_requested_bytes"]["bytes"], 12)
+        self.assertEqual(
+            metrics["managed_memory"]["categories"]["shared"]["allocations"][0][
+                "allocation_id"
+            ],
+            "shared-data-block:7",
+        )
         with self.assertRaises(bench_matrix.BenchmarkError):
             bench_matrix.parse_engine_metrics("", "[lumen-perf] ")
         with self.assertRaises(bench_matrix.BenchmarkError):
@@ -135,6 +144,16 @@ class UnitTests(unittest.TestCase):
                     '"side_tables":{"bytes":null,"quality":"unavailable","reason":"pending"}',
                     '"side_tables":{"bytes":0,"quality":"unavailable","reason":"pending"}',
                 ),
+                "[lumen-perf] ",
+            )
+        with self.assertRaises(bench_matrix.BenchmarkError):
+            bench_matrix.parse_engine_metrics(
+                stderr.replace('"allocation_id":"shared-data-block:7"', '"allocation_id":""'),
+                "[lumen-perf] ",
+            )
+        with self.assertRaises(bench_matrix.BenchmarkError):
+            bench_matrix.parse_engine_metrics(
+                stderr.replace('"bytes":4,"externally_shared":true}]', '"bytes":5,"externally_shared":true}]'),
                 "[lumen-perf] ",
             )
         unavailable = (

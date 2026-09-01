@@ -610,6 +610,31 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
                         raise BenchmarkError("lower-bound managed-memory category lacks a reason")
                 else:
                     raise BenchmarkError("invalid managed-memory category quality")
+                allocations = category.get("allocations")
+                if allocations is not None:
+                    if category.get("externally_shared") is not True or not isinstance(
+                        allocations, list
+                    ):
+                        raise BenchmarkError("invalid externally-shared allocation list")
+                    identities: set[str] = set()
+                    allocation_bytes = 0
+                    for allocation in allocations:
+                        if (
+                            not isinstance(allocation, dict)
+                            or not isinstance(allocation.get("allocation_id"), str)
+                            or not allocation["allocation_id"]
+                            or allocation["allocation_id"] in identities
+                            or not isinstance(allocation.get("bytes"), int)
+                            or allocation["bytes"] < 0
+                            or allocation.get("externally_shared") is not True
+                        ):
+                            raise BenchmarkError("invalid externally-shared allocation entry")
+                        identities.add(allocation["allocation_id"])
+                        allocation_bytes += allocation["bytes"]
+                    if quality == "unavailable" or allocation_bytes != byte_count:
+                        raise BenchmarkError(
+                            "externally-shared allocations do not match category bytes"
+                        )
     return metrics
 
 

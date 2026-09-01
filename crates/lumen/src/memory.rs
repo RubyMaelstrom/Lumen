@@ -41,6 +41,62 @@ struct HostCategory {
     opaque_storage: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SharedBackingAllocation {
+    id: u64,
+    bytes: usize,
+}
+
+#[derive(Clone, Default)]
+struct SharedBackingCategory {
+    allocations: Vec<SharedBackingAllocation>,
+    unavailable_ids: usize,
+}
+
+impl SharedBackingCategory {
+    fn bytes(&self) -> usize {
+        self.allocations
+            .iter()
+            .map(|allocation| allocation.bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn json(&self) -> String {
+        if self.unavailable_ids != 0 {
+            return format!(
+                concat!(
+                    "{{\"bytes\":null,\"quality\":\"unavailable\",",
+                    "\"externally_shared\":true,",
+                    "\"reason\":\"{} referenced Shared Data Block identities were absent from the registry\"}}"
+                ),
+                self.unavailable_ids
+            );
+        }
+        let allocations = self
+            .allocations
+            .iter()
+            .map(|allocation| {
+                format!(
+                    concat!(
+                        "{{\"allocation_id\":\"shared-data-block:{}\",",
+                        "\"bytes\":{},\"externally_shared\":true}}"
+                    ),
+                    allocation.id, allocation.bytes
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            concat!(
+                "{{\"bytes\":{},\"quality\":\"exact\",",
+                "\"externally_shared\":true,\"allocations\":[{}]}}"
+            ),
+            self.bytes(),
+            allocations
+        )
+    }
+}
+
 impl HostCategory {
     fn json(self) -> String {
         if self.unavailable_entries != 0 {
@@ -135,6 +191,7 @@ pub(crate) struct Snapshot {
     engine_caches: Category,
     interpreter_side_tables: Category,
     array_buffer_backing: Category,
+    shared_array_buffer_backing: SharedBackingCategory,
     host_resources: HostCategory,
 }
 
@@ -158,12 +215,16 @@ impl Snapshot {
     }
 
     fn json(&self, agent_id: u64, heap_id: u64) -> String {
+        let managed_external_bytes = self
+            .array_buffer_backing
+            .bytes
+            .saturating_add(self.shared_array_buffer_backing.bytes());
         format!(
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
                 "\"safepoint\":\"post_gc\",\"complete\":false,",
                 "\"managed_requested_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"opaque allocator and container storage is excluded\"}},",
-                "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"shared and Wasm backing stores are not yet included\"}},",
+                "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"unavailable external categories are excluded\"}},",
                 "\"categories\":{{",
                 "\"object_bodies\":{},\"property_storage\":{},",
                 "\"scope_bodies\":{},\"scope_storage\":{},",
@@ -171,14 +232,15 @@ impl Snapshot {
                 "\"function_bytecode_metadata\":{},\"jit_heap_metadata\":{},",
                 "\"regexp_metadata\":{},\"engine_caches\":{},",
                 "\"interpreter_side_tables\":{},\"array_buffer_backing\":{},",
-                "\"shared_wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cross-Agent backing-store identity policy has not landed\"}},",
+                "\"shared_array_buffer_backing\":{},",
+                "\"wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"embedder Wasm store accounting has not landed\"}},",
                 "\"host_resources\":{}",
                 "}}}}"
             ),
             agent_id,
             heap_id,
             self.managed_requested_bytes(),
-            self.array_buffer_backing.bytes,
+            managed_external_bytes,
             self.object_bodies.json(),
             self.property_storage.json(),
             self.scope_bodies.json(),
@@ -191,6 +253,7 @@ impl Snapshot {
             self.engine_caches.json(),
             self.interpreter_side_tables.json(),
             self.array_buffer_backing.json(),
+            self.shared_array_buffer_backing.json(),
             self.host_resources.json(),
         )
     }
@@ -216,6 +279,9 @@ pub(crate) struct Visitor {
     rc_u16_slices: HashSet<usize>,
     rc_value_slices: HashSet<usize>,
     array_buffers: HashSet<usize>,
+    shared_array_buffers: HashSet<u64>,
+    shared_array_buffer_allocations: Vec<SharedBackingAllocation>,
+    unavailable_shared_array_buffers: usize,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
     function_bytecode_metadata: usize,
@@ -409,6 +475,20 @@ impl Visitor {
                 .array_buffer_bytes
                 .saturating_add(buffer.borrow().capacity());
         }
+    }
+
+    fn shared_array_buffer(&mut self, id: u64) {
+        if !self.shared_array_buffers.insert(id) {
+            return;
+        }
+        let Some(backing) = crate::interpreter::shared_mem_get(id) else {
+            self.unavailable_shared_array_buffers =
+                self.unavailable_shared_array_buffers.saturating_add(1);
+            return;
+        };
+        let bytes = backing.lock().unwrap().capacity();
+        self.shared_array_buffer_allocations
+            .push(SharedBackingAllocation { id, bytes });
     }
 
     pub(crate) fn function(&mut self, function: &Rc<crate::ast::Function>) {
@@ -1506,6 +1586,9 @@ fn scan_realm(
     for buffer in interp.array_buffers.values() {
         visitor.array_buffer(buffer);
     }
+    for id in interp.shared_buffers.values() {
+        visitor.shared_array_buffer(*id);
+    }
 
     totals.interpreter_side_tables.add(
         interp
@@ -1576,6 +1659,9 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     let mut totals = DirectTotals::default();
     scan_realm(interp, objects, scopes, &mut visitor, &mut totals);
     scan_symbol_agent(interp, &mut visitor, &mut totals);
+    visitor
+        .shared_array_buffer_allocations
+        .sort_unstable_by_key(|allocation| allocation.id);
 
     totals
         .property_storage
@@ -1629,8 +1715,12 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         ),
         array_buffer_backing: Category::lower_bound(
             visitor.array_buffer_bytes,
-            "shared and Wasm backing stores are not yet traversed",
+            "private Rc allocation metadata is excluded",
         ),
+        shared_array_buffer_backing: SharedBackingCategory {
+            allocations: visitor.shared_array_buffer_allocations,
+            unavailable_ids: visitor.unavailable_shared_array_buffers,
+        },
         host_resources: totals.host_resources.into(),
     }
 }
@@ -1700,6 +1790,7 @@ mod tests {
             engine_caches: Category::lower_bound(11, "test lower bound"),
             interpreter_side_tables: Category::lower_bound(12, "test lower bound"),
             array_buffer_backing: Category::lower_bound(7, "test lower bound"),
+            shared_array_buffer_backing: SharedBackingCategory::default(),
             host_resources: HostCategory {
                 reported_bytes: 0,
                 unavailable_entries: 1,
@@ -1812,6 +1903,9 @@ mod tests {
         let shared_buffer = Rc::new(RefCell::new(Vec::with_capacity(333)));
         root.array_buffers.insert(1, shared_buffer.clone());
         shadow.array_buffers.insert(2, shared_buffer);
+        let shared_data_block = crate::interpreter::alloc_shared_mem(337);
+        root.shared_buffers.insert(3, shared_data_block);
+        shadow.shared_buffers.insert(4, shared_data_block);
 
         let root_objects = crate::value::heap_gc_snapshot(&root.gc_heap);
         let root_scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
@@ -1834,6 +1928,17 @@ mod tests {
             expected_scopes.saturating_mul(size_of::<RefCell<Scope>>())
         );
         assert_eq!(aggregate.array_buffer_backing.bytes, 333);
+        assert_eq!(aggregate.shared_array_buffer_backing.allocations.len(), 1);
+        assert_eq!(
+            aggregate.shared_array_buffer_backing.allocations[0].id,
+            shared_data_block
+        );
+        assert!(aggregate.shared_array_buffer_backing.bytes() >= 337);
+        let json = aggregate.json(5, 7);
+        assert!(json.contains(&format!(
+            "\"allocation_id\":\"shared-data-block:{shared_data_block}\""
+        )));
+        assert!(json.contains("\"externally_shared\":true"));
         assert!(
             aggregate.strings_symbols_bigints.bytes
                 < root_only
@@ -1843,6 +1948,21 @@ mod tests {
             "Agent-shared symbol/string payload must be credited once"
         );
         assert!(aggregate.interpreter_side_tables.bytes >= 2 * size_of::<Interp>());
+    }
+
+    #[test]
+    fn absent_shared_backing_identity_is_unavailable_not_zero() {
+        let mut interp = Interp::new();
+        let absent_id = crate::interpreter::next_shared_id();
+        interp.shared_buffers.insert(1, absent_id);
+
+        let snapshot = measure(&interp, &[], &[]);
+        assert_eq!(snapshot.shared_array_buffer_backing.unavailable_ids, 1);
+        let json = snapshot.json(1, 1);
+        assert!(json.contains(
+            "\"shared_array_buffer_backing\":{\"bytes\":null,\"quality\":\"unavailable\""
+        ));
+        assert!(json.contains("referenced Shared Data Block identities were absent"));
     }
 
     #[test]
