@@ -378,7 +378,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   GC pause-distribution reporting to the locked engine runner.
 - [ ] Add live/post-collection managed-byte accounting across object/property/element storage,
   shared strings, scopes, side tables/caches, and external buffers. Do not substitute
-  `object_count * size_of::<Object>()` or peak RSS for this ownership-aware measurement.
+  `object_count * size_of::<Object>()` or peak RSS for this ownership-aware measurement. The
+  measurement contract and review questions are recorded in `MANAGED_MEMORY_ACCOUNTING.md`.
 - [ ] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites.
 - [x] Record the accepted production TRust/Lumen hashes in every release-performance report.
