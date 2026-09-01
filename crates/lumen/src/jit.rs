@@ -45,10 +45,64 @@ static PERF_COMPILE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 static PERF_GENERATED_CODE_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static PERF_LARGEST_CODE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_INLINE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_INLINE_EMPTY_PLANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_INLINE_PLAN_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_INLINE_SUCCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_INLINE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_INLINE_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
 fn perf_metrics_enabled() -> bool {
     *PERF_METRICS_ENABLED.get_or_init(|| std::env::var_os("LUMEN_PERF_METRICS").is_some())
+}
+
+#[inline]
+pub(crate) fn perf_inline_attempt() {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_INLINE_ATTEMPTS.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_inline_empty_plan() {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_INLINE_EMPTY_PLANS.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_inline_plan_sites(sites: usize) {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_INLINE_PLAN_SITES.fetch_add(sites as u64, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_inline_success() {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_INLINE_SUCCESSES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_inline_failure() {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_INLINE_FAILURES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_inline_suppressed() {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_INLINE_SUPPRESSED.fetch_add(1, Relaxed);
+    }
 }
 
 /// Machine-readable process summary printed by the CLI at normal exit. Kept as a single JSON line
@@ -63,9 +117,15 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let nanos = PERF_COMPILE_NANOS.load(Relaxed);
     let generated = PERF_GENERATED_CODE_BYTES.load(Relaxed);
     let largest = PERF_LARGEST_CODE_BYTES.load(Relaxed);
+    let inline_attempts = PERF_INLINE_ATTEMPTS.load(Relaxed);
+    let inline_empty = PERF_INLINE_EMPTY_PLANS.load(Relaxed);
+    let inline_sites = PERF_INLINE_PLAN_SITES.load(Relaxed);
+    let inline_successes = PERF_INLINE_SUCCESSES.load(Relaxed);
+    let inline_failures = PERF_INLINE_FAILURES.load(Relaxed);
+    let inline_suppressed = PERF_INLINE_SUPPRESSED.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},{gc},\"managed_memory\":{managed_memory}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},{gc},\"managed_memory\":{managed_memory}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
     ))

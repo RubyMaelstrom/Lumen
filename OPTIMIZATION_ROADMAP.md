@@ -535,6 +535,11 @@ finish the baseline, but no later phase may claim a performance win against the 
     heap; the current cycle collector has no generational or moving phase to report honestly.
 - [ ] Record baseline/optimizing compile time, generated code size, inlining decisions, guard
   failures, side exits, deoptimizations, and reoptimization suppression.
+  - [x] Expose opt-in JIT compile attempts/successes/failures, elapsed time, generated-code size,
+    and one-shot inline-plan attempts, plan size, outcomes, and suppression in the performance
+    JSON. Disabled runs retain the existing fast path.
+  - [ ] Attribute guard failures, side exits, deoptimizations, and reoptimization suppression to
+    stable bytecode sites without turning diagnostics into execution policy.
 - [ ] Record parser, preparser, bytecode, snapshot/cache-hit, and cache-deserialization time.
 - [ ] Record host/native call counts and time by stable operation identity without requiring
   source-name guesses.

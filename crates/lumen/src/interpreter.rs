@@ -8755,18 +8755,26 @@ impl Interp {
         chunk: &crate::bytecode::Chunk,
         caller_env: *const RefCell<Scope>,
     ) {
-        if func.is_null() || chunk.inline_attempted.replace(true) {
+        if func.is_null() {
+            crate::jit::perf_inline_suppressed();
+            return;
+        }
+        if chunk.inline_attempted.replace(true) {
+            crate::jit::perf_inline_suppressed();
             return;
         }
         // Alive because the callee object that carried this IC is alive and its `call` field is
         // never reassigned (the same argument that makes the rest of the IC readable).
         let func = unsafe { &*func };
         if func.code2.get().is_some() {
+            crate::jit::perf_inline_suppressed();
             return;
         }
+        crate::jit::perf_inline_attempt();
         let global_env = self.global_env.clone();
         let plan = crate::bytecode::plan_inlines(chunk, func, &global_env, caller_env);
         if plan.is_empty() {
+            crate::jit::perf_inline_empty_plan();
             if std::env::var_os("LUMEN_TIER_LOG").is_some() {
                 let src = func.source.as_deref().unwrap_or("<no source>");
                 let head: String = src.chars().take(60).collect();
@@ -8774,7 +8782,9 @@ impl Interp {
             }
             return;
         }
+        crate::jit::perf_inline_plan_sites(plan.len());
         if let Some(chunk2) = crate::bytecode::compile_with_inlines(func, &plan, chunk) {
+            crate::jit::perf_inline_success();
             if std::env::var_os("LUMEN_TIER_LOG").is_some() {
                 let src = func.source.as_deref().unwrap_or("<no source>");
                 let head: String = src.chars().take(60).collect();
@@ -8786,6 +8796,8 @@ impl Interp {
             }
             let _ = func.code2.set(Some(chunk2));
             crate::bytecode::CALL_IC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::jit::perf_inline_failure();
         }
     }
 
