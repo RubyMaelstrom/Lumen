@@ -158,6 +158,7 @@ pub(crate) struct Visitor {
     bigints: HashSet<usize>,
     callable_allocations: HashSet<usize>,
     functions: HashSet<usize>,
+    classes: HashSet<usize>,
     chunks: HashSet<usize>,
     jit_codes: HashSet<usize>,
     hoist_plans: HashSet<usize>,
@@ -177,6 +178,14 @@ impl Visitor {
     pub(crate) fn lstr(&mut self, value: &crate::lstr::LStr) {
         let identity = value.as_ptr() as usize;
         if self.lstrs.insert(identity) {
+            self.strings_symbols_bigints = self
+                .strings_symbols_bigints
+                .saturating_add(value.retained_requested_bytes());
+        }
+    }
+
+    pub(crate) fn bigint(&mut self, value: &crate::bigint::JsBigInt) {
+        if self.bigints.insert(value.allocation_identity()) {
             self.strings_symbols_bigints = self
                 .strings_symbols_bigints
                 .saturating_add(value.retained_requested_bytes());
@@ -206,11 +215,7 @@ impl Visitor {
     pub(crate) fn value(&mut self, value: &Value) {
         match value {
             Value::BigInt(value) => {
-                if self.bigints.insert(value.allocation_identity()) {
-                    self.strings_symbols_bigints = self
-                        .strings_symbols_bigints
-                        .saturating_add(value.retained_requested_bytes());
-                }
+                self.bigint(value);
             }
             Value::Str(value) => {
                 self.lstr(value);
@@ -331,25 +336,7 @@ impl Visitor {
         if !self.functions.insert(identity) {
             return;
         }
-        let mut bytes = size_of::<crate::ast::Function>()
-            .saturating_add(
-                function
-                    .params
-                    .capacity()
-                    .saturating_mul(size_of::<crate::ast::Param>()),
-            )
-            .saturating_add(
-                function
-                    .body
-                    .capacity()
-                    .saturating_mul(size_of::<crate::ast::Stmt>()),
-            );
-        if let Some(name) = &function.name {
-            bytes = bytes.saturating_add(name.capacity());
-        }
-        if let Some(source) = &function.source {
-            self.rc_str(source);
-        }
+        let mut bytes = crate::ast::scan_function_retained_memory(function, self);
         if let Some((_, hoist)) = function.hoist.get() {
             let identity = Rc::as_ptr(hoist) as usize;
             if self.hoist_plans.insert(identity) {
@@ -387,6 +374,14 @@ impl Visitor {
             }
         }
         self.add_function_bytecode_bytes(bytes);
+    }
+
+    pub(crate) fn class(&mut self, class: &Rc<crate::ast::Class>) {
+        let identity = Rc::as_ptr(class) as usize;
+        if self.classes.insert(identity) {
+            let bytes = crate::ast::scan_class_retained_memory(class, self);
+            self.add_function_bytecode_bytes(bytes);
+        }
     }
 
     pub(crate) fn chunk(&mut self, chunk: &Rc<crate::bytecode::Chunk>) {
@@ -573,19 +568,19 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         property_storage,
         scope_bodies: Category::exact(scopes.len().saturating_mul(size_of::<RefCell<Scope>>())),
         scope_storage,
-        // The visitor deduplicates everything it sees, but AST, bytecode and side-table values are
-        // deliberately deferred to later vertical slices.
+        // The visitor deduplicates everything it sees; remaining side-table owners are added in
+        // later vertical slices.
         strings_symbols_bigints: Category::lower_bound(
             visitor.strings_symbols_bigints,
-            "AST and remaining side-table owners are not yet traversed",
+            "remaining side-table owners are not yet traversed",
         ),
         callable_metadata: Category::lower_bound(
             visitor.callable_metadata,
-            "Function AST, bytecode, and native closure payloads are not yet traversed",
+            "native closure payloads are not yet traversed",
         ),
         function_bytecode_metadata: Category::lower_bound(
             visitor.function_bytecode_metadata,
-            "nested AST allocations and uncommon Chunk plans are not yet fully traversed",
+            "uncommon Chunk plans are not yet fully traversed",
         ),
         jit_heap_metadata: Category::lower_bound(
             visitor.jit_heap_metadata,
@@ -783,5 +778,49 @@ mod tests {
         let snapshot = measure(&engine.interp, &objects, &scopes);
         assert!(snapshot.function_bytecode_metadata.bytes > 0);
         assert!(snapshot.callable_metadata.bytes > 0);
+    }
+
+    #[test]
+    fn recursive_ast_allocations_are_identity_deduplicated() {
+        let source = r#"
+            function outer({ first: [head = "default", ...tail] }, ...items) {
+                class Nested extends Base {
+                    ["method"]({ value = 123456789012345678901234567890n }) {
+                        return `${value}:${head}`;
+                    }
+                }
+                function inner(arg) { return { [arg]: /x+/gi, ...items }; }
+                try {
+                    for (let item of items) { if (item) continue; }
+                } catch ({ message }) {
+                    throw message;
+                }
+                return [Nested, inner];
+            }
+        "#;
+        let statements = crate::parser::parse_script(source, false)
+            .ok()
+            .expect("recursive AST parses");
+        let function = statements
+            .iter()
+            .find_map(|statement| match statement {
+                crate::ast::Stmt::FuncDecl(function) => Some(function.clone()),
+                _ => None,
+            })
+            .expect("outer function declaration");
+
+        let mut visitor = Visitor::default();
+        visitor.function(&function);
+        let first_ast_bytes = visitor.function_bytecode_metadata;
+        let first_string_bytes = visitor.strings_symbols_bigints;
+        visitor.function(&function);
+
+        assert!(first_ast_bytes > size_of::<crate::ast::Function>());
+        assert!(first_string_bytes > 0);
+        assert_eq!(visitor.function_bytecode_metadata, first_ast_bytes);
+        assert_eq!(visitor.strings_symbols_bigints, first_string_bytes);
+        assert!(visitor.functions.len() >= 3, "outer, method, and inner");
+        assert_eq!(visitor.classes.len(), 1);
+        assert_eq!(visitor.bigints.len(), 1);
     }
 }

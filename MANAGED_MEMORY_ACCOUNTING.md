@@ -135,9 +135,11 @@ Allocation attribution rules for the remaining slices:
 The Function/Chunk vertical slice now follows user callables through both compiled generations,
 deduplicates shared Functions, Chunks, hoist plans, and JIT sidecars, and accounts the principal
 bytecode, constant, name, feedback/IC, captured-binding, template, and plan-vector capacities.
-Recursive allocations inside retained AST `Stmt`/`Expr`/`Pattern`/`Class` trees and several
-uncommon Chunk plans remain a documented lower bound. JIT `pc_offsets` and its Rust payload are
-reported as heap metadata; executable mappings remain exclusively in generated-code metrics.
+The recursive AST visitor exhaustively matches every `Stmt`, `Expr`, `Pattern`, class, import, and
+property variant; vector capacities and `Box` targets are local storage, while shared Functions,
+Classes, strings, and BigInts use allocation-family identity sets. Several uncommon Chunk plans
+remain a documented lower bound. JIT `pc_offsets` and its Rust payload are reported as heap
+metadata; executable mappings remain exclusively in generated-code metrics.
 
 The bounded string/RegExp cache slice scans UTF-16 views, prepared subjects, the ASCII hot entry,
 and compiled-program cache entries plus stale recency keys. Cache tables and recency queues credit

@@ -447,6 +447,470 @@ pub enum HoistOp {
     AnnexB(String, Rc<Function>),
 }
 
+struct RetainedAst<'a> {
+    visitor: &'a mut crate::memory::Visitor,
+    bytes: usize,
+}
+
+impl RetainedAst<'_> {
+    fn add(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn vec<T>(&mut self, values: &Vec<T>) {
+        self.add(values.capacity().saturating_mul(std::mem::size_of::<T>()));
+    }
+
+    fn string(&mut self, value: &String) {
+        self.add(value.capacity());
+    }
+
+    fn rc_str(&mut self, value: &Rc<str>) {
+        self.visitor.rc_str(value);
+    }
+
+    fn boxed_expr(&mut self, value: &Expr) {
+        self.add(std::mem::size_of::<Expr>());
+        self.expr(value);
+    }
+
+    fn boxed_stmt(&mut self, value: &Stmt) {
+        self.add(std::mem::size_of::<Stmt>());
+        self.stmt(value);
+    }
+
+    fn stmt_vec(&mut self, values: &Vec<Stmt>) {
+        self.vec(values);
+        for value in values {
+            self.stmt(value);
+        }
+    }
+
+    fn decls(&mut self, decls: &Vec<(Pattern, Option<Expr>)>) {
+        self.vec(decls);
+        for (pattern, initializer) in decls {
+            self.pattern(pattern);
+            if let Some(initializer) = initializer {
+                self.expr(initializer);
+            }
+        }
+    }
+
+    fn stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Expr(expr) | Stmt::Throw(expr) => self.expr(expr),
+            Stmt::VarDecl { kind: _, decls } => self.decls(decls),
+            Stmt::FuncDecl(function) => self.visitor.function(function),
+            Stmt::Return(expr) => {
+                if let Some(expr) = expr {
+                    self.expr(expr);
+                }
+            }
+            Stmt::If { test, cons, alt } => {
+                self.expr(test);
+                self.boxed_stmt(cons);
+                if let Some(alt) = alt {
+                    self.boxed_stmt(alt);
+                }
+            }
+            Stmt::Block(body) => self.stmt_vec(body),
+            Stmt::While { test, body } => {
+                self.expr(test);
+                self.boxed_stmt(body);
+            }
+            Stmt::DoWhile { body, test } => {
+                self.boxed_stmt(body);
+                self.expr(test);
+            }
+            Stmt::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    self.add(std::mem::size_of::<ForInit>());
+                    self.for_init(init);
+                }
+                if let Some(test) = test {
+                    self.expr(test);
+                }
+                if let Some(update) = update {
+                    self.expr(update);
+                }
+                self.boxed_stmt(body);
+            }
+            Stmt::ForInOf {
+                decl: _,
+                left,
+                right,
+                of: _,
+                is_await: _,
+                body,
+            } => {
+                self.pattern(left);
+                self.expr(right);
+                self.boxed_stmt(body);
+            }
+            Stmt::Break(label) | Stmt::Continue(label) => {
+                if let Some(label) = label {
+                    self.string(label);
+                }
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                self.stmt_vec(block);
+                if let Some((pattern, body)) = handler {
+                    if let Some(pattern) = pattern {
+                        self.pattern(pattern);
+                    }
+                    self.stmt_vec(body);
+                }
+                if let Some(finalizer) = finalizer {
+                    self.stmt_vec(finalizer);
+                }
+            }
+            Stmt::Switch { disc, cases } => {
+                self.expr(disc);
+                self.vec(cases);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        self.expr(test);
+                    }
+                    self.stmt_vec(&case.body);
+                }
+            }
+            Stmt::Labeled { label, body } => {
+                self.string(label);
+                self.boxed_stmt(body);
+            }
+            Stmt::With { obj, body } => {
+                self.expr(obj);
+                self.boxed_stmt(body);
+            }
+            Stmt::ClassDecl(class) => self.visitor.class(class),
+            Stmt::Empty | Stmt::Debugger => {}
+            Stmt::Import(import) => self.import(import),
+            Stmt::ExportNamed { specs, source } => {
+                self.vec(specs);
+                for spec in specs {
+                    self.string(&spec.local);
+                    self.string(&spec.exported);
+                }
+                if let Some(source) = source {
+                    self.rc_str(source);
+                }
+            }
+            Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => self.boxed_stmt(inner),
+            Stmt::ExportAll { source, exported } => {
+                self.rc_str(source);
+                if let Some(exported) = exported {
+                    self.string(exported);
+                }
+            }
+        }
+    }
+
+    fn import(&mut self, import: &ImportDecl) {
+        self.rc_str(&import.source);
+        self.vec(&import.specs);
+        for spec in &import.specs {
+            match spec {
+                ImportSpec::Default(local)
+                | ImportSpec::Namespace(local)
+                | ImportSpec::DeferNamespace(local)
+                | ImportSpec::Source(local) => self.string(local),
+                ImportSpec::Named { imported, local } => {
+                    self.string(imported);
+                    self.string(local);
+                }
+            }
+        }
+        if let Some(attr_type) = &import.attr_type {
+            self.string(attr_type);
+        }
+    }
+
+    fn for_init(&mut self, init: &ForInit) {
+        match init {
+            ForInit::VarDecl { kind: _, decls } => self.decls(decls),
+            ForInit::Expr(expr) => self.expr(expr),
+        }
+    }
+
+    fn pattern(&mut self, pattern: &Pattern) {
+        match pattern {
+            Pattern::Ident(name) => self.string(name),
+            Pattern::Array(elements) => {
+                self.vec(elements);
+                for element in elements {
+                    match element {
+                        ArrayPatElem::Hole => {}
+                        ArrayPatElem::Elem { pattern, default } => {
+                            self.pattern(pattern);
+                            if let Some(default) = default {
+                                self.expr(default);
+                            }
+                        }
+                        ArrayPatElem::Rest(pattern) => self.pattern(pattern),
+                    }
+                }
+            }
+            Pattern::Object(object) => {
+                self.vec(&object.props);
+                for property in &object.props {
+                    self.prop_key(&property.key);
+                    self.pattern(&property.value);
+                    if let Some(default) = &property.default {
+                        self.expr(default);
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    self.string(rest);
+                }
+            }
+            Pattern::Member(expr) => self.boxed_expr(expr),
+        }
+    }
+
+    fn expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Paren(inner)
+            | Expr::ToStr(inner)
+            | Expr::Await(inner)
+            | Expr::OptionalChain(inner) => self.boxed_expr(inner),
+            Expr::Num(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::Undefined
+            | Expr::This
+            | Expr::Super
+            | Expr::ImportMeta
+            | Expr::NewTarget => {}
+            Expr::BigInt(value) => self.visitor.bigint(value),
+            Expr::Str(value) => self.rc_str(value),
+            Expr::Ident(name) => self.string(name),
+            Expr::Regex { body, flags } => {
+                self.rc_str(body);
+                self.rc_str(flags);
+            }
+            Expr::Array(elements) => {
+                self.vec(elements);
+                for element in elements {
+                    self.array_elem(element);
+                }
+            }
+            Expr::Object(properties) => {
+                self.vec(properties);
+                for property in properties {
+                    self.prop_def(property);
+                }
+            }
+            Expr::Func(function) => self.visitor.function(function),
+            Expr::Class(class) => self.visitor.class(class),
+            Expr::Yield { delegate: _, arg } => {
+                if let Some(arg) = arg {
+                    self.boxed_expr(arg);
+                }
+            }
+            Expr::Unary { op: _, arg }
+            | Expr::Update {
+                op: _,
+                prefix: _,
+                arg,
+            } => self.boxed_expr(arg),
+            Expr::Binary { op: _, left, right }
+            | Expr::Logical { op: _, left, right }
+            | Expr::Assign {
+                op: _,
+                target: left,
+                value: right,
+            } => {
+                self.boxed_expr(left);
+                self.boxed_expr(right);
+            }
+            Expr::Cond { test, cons, alt } => {
+                self.boxed_expr(test);
+                self.boxed_expr(cons);
+                self.boxed_expr(alt);
+            }
+            Expr::Call {
+                callee,
+                args,
+                optional: _,
+            }
+            | Expr::New { callee, args } => {
+                self.boxed_expr(callee);
+                self.vec(args);
+                for argument in args {
+                    self.array_elem(argument);
+                }
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: _,
+            } => {
+                self.boxed_expr(obj);
+                self.string(prop);
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: _,
+            } => {
+                self.boxed_expr(obj);
+                self.boxed_expr(index);
+            }
+            Expr::Seq(expressions) => {
+                self.vec(expressions);
+                for expression in expressions {
+                    self.expr(expression);
+                }
+            }
+            Expr::TaggedTemplate {
+                tag,
+                site: _,
+                quasis,
+                subs,
+            } => {
+                self.boxed_expr(tag);
+                self.vec(quasis);
+                for (cooked, raw) in quasis {
+                    if let Some(cooked) = cooked {
+                        self.string(cooked);
+                    }
+                    self.string(raw);
+                }
+                self.vec(subs);
+                for substitution in subs {
+                    self.expr(substitution);
+                }
+            }
+            Expr::PrivateIn { name, obj } => {
+                self.string(name);
+                self.boxed_expr(obj);
+            }
+            Expr::ImportCall {
+                spec,
+                phase: _,
+                options,
+            } => {
+                self.boxed_expr(spec);
+                if let Some(options) = options {
+                    self.boxed_expr(options);
+                }
+            }
+        }
+    }
+
+    fn array_elem(&mut self, element: &ArrayElem) {
+        match element {
+            ArrayElem::Item(expr) | ArrayElem::Spread(expr) => self.expr(expr),
+            ArrayElem::Hole => {}
+        }
+    }
+
+    fn prop_def(&mut self, property: &PropDef) {
+        match property {
+            PropDef::KeyValue { key, value } | PropDef::Cover { key, value } => {
+                self.prop_key(key);
+                self.expr(value);
+            }
+            PropDef::Method { key, func }
+            | PropDef::Getter { key, func }
+            | PropDef::Setter { key, func } => {
+                self.prop_key(key);
+                self.visitor.function(func);
+            }
+            PropDef::Spread(expr) | PropDef::Proto(expr) => self.expr(expr),
+        }
+    }
+
+    fn prop_key(&mut self, key: &PropKey) {
+        match key {
+            PropKey::Ident(name) => self.string(name),
+            PropKey::Str(value) => self.rc_str(value),
+            PropKey::Num(_) => {}
+            PropKey::Computed(expr) => self.expr(expr),
+        }
+    }
+
+    fn class(&mut self, class: &Class) {
+        if let Some(name) = &class.name {
+            self.string(name);
+        }
+        if let Some(superclass) = &class.superclass {
+            self.boxed_expr(superclass);
+        }
+        self.vec(&class.members);
+        for member in &class.members {
+            self.prop_key(&member.key);
+            if let Some(function) = &member.func {
+                self.visitor.function(function);
+            }
+            if let Some(value) = &member.value {
+                self.expr(value);
+            }
+            self.vec(&member.decorators);
+            for decorator in &member.decorators {
+                self.expr(decorator);
+            }
+        }
+        self.vec(&class.decorators);
+        for decorator in &class.decorators {
+            self.expr(decorator);
+        }
+        if let Some(source) = &class.source {
+            self.rc_str(source);
+        }
+    }
+}
+
+/// Scan one identity-unique Function allocation and every non-shared AST allocation it owns.
+/// Rc-backed Functions, Classes, strings, and BigInts route through the global allocation-family
+/// visitor so shared subgraphs are never attributed according to discovery order.
+pub(crate) fn scan_function_retained_memory(
+    function: &Function,
+    visitor: &mut crate::memory::Visitor,
+) -> usize {
+    let mut scan = RetainedAst {
+        visitor,
+        bytes: std::mem::size_of::<Function>(),
+    };
+    if let Some(name) = &function.name {
+        scan.string(name);
+    }
+    scan.vec(&function.params);
+    for param in &function.params {
+        scan.pattern(&param.pattern);
+        if let Some(default) = &param.default {
+            scan.expr(default);
+        }
+    }
+    scan.stmt_vec(&function.body);
+    if let Some(source) = &function.source {
+        scan.rc_str(source);
+    }
+    scan.bytes
+}
+
+/// Scan one identity-unique Class allocation and its recursively-owned AST storage.
+pub(crate) fn scan_class_retained_memory(
+    class: &Class,
+    visitor: &mut crate::memory::Visitor,
+) -> usize {
+    let mut scan = RetainedAst {
+        visitor,
+        bytes: std::mem::size_of::<Class>(),
+    };
+    scan.class(class);
+    scan.bytes
+}
+
 pub const SCAN_DONE: u8 = 1;
 pub const SCAN_ARGUMENTS: u8 = 2;
 pub const SCAN_NEW_TARGET: u8 = 4;
