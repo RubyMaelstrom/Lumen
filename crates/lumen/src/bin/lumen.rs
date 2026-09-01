@@ -19,18 +19,7 @@ use lumen::{Completion, Engine};
 #[global_allocator]
 static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;
 
-struct PerformanceMetricsGuard;
-
-impl Drop for PerformanceMetricsGuard {
-    fn drop(&mut self) {
-        if let Some(metrics) = lumen::unstable_performance_metrics_json() {
-            eprintln!("[lumen-perf] {metrics}");
-        }
-    }
-}
-
 fn main() {
-    let _performance_metrics = PerformanceMetricsGuard;
     let mut module = false;
     let mut interactive = false;
     let mut tier = None;
@@ -136,6 +125,9 @@ fn main() {
 fn finalize_performance_metrics(engine: &mut Engine) {
     if std::env::var_os("LUMEN_PERF_METRICS").is_some() {
         engine.unstable_collect_for_performance_metrics();
+        if let Some(metrics) = lumen::unstable_performance_metrics_json(engine) {
+            eprintln!("[lumen-perf] {metrics}");
+        }
     }
 }
 

@@ -401,22 +401,30 @@ impl PartialEq<&str> for PropertyKey {
 /// `symbols` is only an identity lookup for encoded property keys and therefore holds ordinary
 /// Symbols weakly; global-registry and well-known Symbols have their normative strong owners.
 pub(crate) struct SymbolAgentState {
+    /// Process-local diagnostic identity. Shared by every realm implementation in this Agent.
+    pub(crate) agent_id: u64,
     pub(crate) next_id: u64,
     pub(crate) symbols: crate::fasthash::FastMap<u64, Weak<SymbolData>>,
     pub(crate) global_by_key: crate::fasthash::FastMap<Rc<str>, Rc<SymbolData>>,
     pub(crate) global_key_by_id: crate::fasthash::FastMap<u64, Rc<str>>,
     pub(crate) well_known: crate::fasthash::FastMap<&'static str, Rc<SymbolData>>,
+    /// Post-collection diagnostics keyed by the independently collected heap implementation.
+    /// ShadowRealms share this Agent state but currently own distinct collector registries.
+    pub(crate) memory_snapshots: crate::fasthash::FastMap<u64, crate::memory::Snapshot>,
 }
 
 pub(crate) type SymbolAgent = Rc<RefCell<SymbolAgentState>>;
 
 pub(crate) fn new_symbol_agent() -> SymbolAgent {
+    static NEXT_AGENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     Rc::new(RefCell::new(SymbolAgentState {
+        agent_id: NEXT_AGENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         next_id: 0,
         symbols: Default::default(),
         global_by_key: Default::default(),
         global_key_by_id: Default::default(),
         well_known: Default::default(),
+        memory_snapshots: Default::default(),
     }))
 }
 
@@ -985,6 +993,7 @@ struct GcRegistry {
 }
 
 pub(crate) struct GcState {
+    heap_id: u64,
     registry: RefCell<GcRegistry>,
     scope_registry: RefCell<Vec<Weak<RefCell<crate::interpreter::Scope>>>>,
     shapes: RefCell<ShapeTable>,
@@ -1092,7 +1101,7 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
     let pause_nanos = GC_PAUSE_NANOS.load(Relaxed);
     let max_pause_nanos = GC_MAX_PAUSE_NANOS.load(Relaxed);
     format!(
-        "\"gc_collections\":{},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{},\"managed_memory\":{}",
+        "\"gc_collections\":{},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{}",
         GC_COLLECTIONS.load(Relaxed),
         pause_nanos as f64 / 1_000_000_000.0,
         max_pause_nanos as f64 / 1_000_000_000.0,
@@ -1104,7 +1113,6 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
         GC_SCOPES_RECLAIMED.load(Relaxed),
         GC_PEAK_SCOPES_BEFORE.load(Relaxed),
         GC_LAST_SCOPES_AFTER.load(Relaxed),
-        crate::memory::json(),
     )
 }
 
@@ -1129,7 +1137,9 @@ thread_local! {
 }
 
 pub(crate) fn new_gc_heap() -> GcHeap {
+    static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     Rc::new(GcState {
+        heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         registry: RefCell::new(GcRegistry {
             entries: Vec::new(),
             free: Vec::new(),
@@ -1140,6 +1150,10 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         live: Cell::new(0),
         allocated: Cell::new(0),
     })
+}
+
+pub(crate) fn heap_id(heap: &GcHeap) -> u64 {
+    heap.heap_id
 }
 
 #[inline]
@@ -3201,6 +3215,16 @@ impl Props {
             .flat_map(|p| p.iter())
             .filter(|p| !matches!(p.value(), Value::Empty))
             .chain(self.entries.iter().map(|(_, p)| p))
+    }
+
+    /// Keyless packed elements only. Managed-memory traversal visits named entries together with
+    /// their keys, then uses this iterator so those entries are not scanned twice.
+    pub(crate) fn packed_values(&self) -> impl Iterator<Item = &Property> {
+        self.elems
+            .packed_ref()
+            .into_iter()
+            .flat_map(|properties| properties.iter())
+            .filter(|property| !matches!(property.value(), Value::Empty))
     }
 
     pub(crate) fn highest_nonconfig_index_from(&self, from: usize) -> Option<usize> {

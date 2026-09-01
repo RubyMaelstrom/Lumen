@@ -8,7 +8,6 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
 use std::rc::Rc;
-use std::sync::Mutex;
 
 use crate::interpreter::{Env, Interp, Scope};
 use crate::value::{Callable, Exotic, Gc, Object, SymbolData, Value};
@@ -67,7 +66,7 @@ impl Category {
 }
 
 #[derive(Clone)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     object_bodies: Category,
     property_storage: Category,
     scope_bodies: Category,
@@ -92,10 +91,11 @@ impl Snapshot {
         .fold(0usize, usize::saturating_add)
     }
 
-    fn json(&self) -> String {
+    fn json(&self, agent_id: u64, heap_id: u64) -> String {
         format!(
             concat!(
-                "{{\"schema_version\":1,\"safepoint\":\"post_gc\",\"complete\":false,",
+                "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
+                "\"safepoint\":\"post_gc\",\"complete\":false,",
                 "\"managed_requested_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\"}},",
                 "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\"}},",
                 "\"categories\":{{",
@@ -110,6 +110,8 @@ impl Snapshot {
                 "\"host_resources\":{{\"bytes\":null,\"quality\":\"unavailable\"}}",
                 "}}}}"
             ),
+            agent_id,
+            heap_id,
             self.managed_requested_bytes(),
             self.array_buffer_backing.bytes,
             self.object_bodies.json(),
@@ -202,6 +204,8 @@ impl Visitor {
                 }
             }
             Callable::Bound(value) => {
+                // Box-backed variants have one allocation per containing Object, and the object
+                // snapshot is identity-unique, so they need no shared-allocation identity set.
                 self.callable_metadata = self
                     .callable_metadata
                     .saturating_add(size_of_val(value.as_ref()))
@@ -222,6 +226,7 @@ impl Visitor {
                 }
             }
             Callable::WrappedCross(value) => {
+                // See Bound above: this Box cannot be shared between object holders.
                 self.callable_metadata = self
                     .callable_metadata
                     .saturating_add(size_of_val(value.as_ref()))
@@ -255,7 +260,7 @@ impl Visitor {
             }
         }
         // Packed array elements have no key entry and must be visited separately.
-        for property in object.props.values() {
+        for property in object.props.packed_values() {
             let value = property.value();
             self.value(&value);
             if let Some(getter) = property.getter() {
@@ -294,8 +299,6 @@ impl Visitor {
     }
 }
 
-static LAST_SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
-
 fn unique_array_buffer_capacity<'a>(
     buffers: impl Iterator<Item = &'a crate::interpreter::ArrayBufferBytes>,
 ) -> usize {
@@ -310,7 +313,7 @@ fn unique_array_buffer_capacity<'a>(
     })
 }
 
-pub(crate) fn record_post_gc(interp: &Interp, objects: &[Gc], scopes: &[Env]) {
+fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     let mut visitor = Visitor::default();
     let mut property_storage = Category::exact(0);
     for object in objects {
@@ -332,7 +335,7 @@ pub(crate) fn record_post_gc(interp: &Interp, objects: &[Gc], scopes: &[Env]) {
 
     let array_buffer_bytes = unique_array_buffer_capacity(interp.array_buffers.values());
 
-    let snapshot = Snapshot {
+    Snapshot {
         object_bodies: Category::exact(objects.len().saturating_mul(size_of::<RefCell<Object>>())),
         property_storage,
         scope_bodies: Category::exact(scopes.len().saturating_mul(size_of::<RefCell<Scope>>())),
@@ -341,25 +344,36 @@ pub(crate) fn record_post_gc(interp: &Interp, objects: &[Gc], scopes: &[Env]) {
         // deliberately deferred to later vertical slices.
         strings_symbols_bigints: Category::lower_bound(visitor.strings_symbols_bigints),
         callable_metadata: Category::lower_bound(visitor.callable_metadata),
-        // Ordinary backing stores are exact; shared/Wasm/host external stores remain unavailable.
+        // The ordinary stores reached through this table are exact, but the category remains a
+        // lower bound until shared/Wasm and host-created backing stores join the same layer.
         array_buffer_backing: Category::lower_bound(array_buffer_bytes),
-    };
-    *LAST_SNAPSHOT.lock().expect("managed-memory snapshot lock") = Some(snapshot);
+    }
 }
 
-pub(crate) fn json() -> String {
-    match LAST_SNAPSHOT
-        .lock()
-        .expect("managed-memory snapshot lock")
-        .as_ref()
-    {
-        Some(snapshot) => snapshot.json(),
-        None => concat!(
-            "{\"schema_version\":1,\"safepoint\":null,\"complete\":false,",
-            "\"managed_requested_bytes\":{\"bytes\":null,\"quality\":\"unavailable\"},",
-            "\"managed_external_bytes\":{\"bytes\":null,\"quality\":\"unavailable\"}}"
-        )
-        .to_owned(),
+pub(crate) fn record_post_gc(interp: &Interp, objects: &[Gc], scopes: &[Env]) {
+    let snapshot = measure(interp, objects, scopes);
+    let heap_id = crate::value::heap_id(&interp.gc_heap);
+    interp
+        .symbol_agent
+        .borrow_mut()
+        .memory_snapshots
+        .insert(heap_id, snapshot);
+}
+
+pub(crate) fn json(interp: &Interp) -> String {
+    let heap_id = crate::value::heap_id(&interp.gc_heap);
+    let agent = interp.symbol_agent.borrow();
+    match agent.memory_snapshots.get(&heap_id) {
+        Some(snapshot) => snapshot.json(agent.agent_id, heap_id),
+        None => format!(
+            concat!(
+                "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
+                "\"safepoint\":null,\"complete\":false,",
+                "\"managed_requested_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\"}},",
+                "\"managed_external_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\"}}}}"
+            ),
+            agent.agent_id, heap_id
+        ),
     }
 }
 
@@ -388,7 +402,7 @@ mod tests {
             callable_metadata: Category::lower_bound(6),
             array_buffer_backing: Category::lower_bound(7),
         }
-        .json();
+        .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":null"));
         assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":21"));
     }
@@ -410,6 +424,41 @@ mod tests {
         assert_eq!(
             unique_array_buffer_capacity(aliases.iter()),
             aliases[0].borrow().capacity()
+        );
+    }
+
+    #[test]
+    fn repeated_scan_at_one_safepoint_is_byte_deterministic() {
+        let interp = Interp::new();
+        let objects = crate::value::heap_gc_snapshot(&interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&interp.gc_heap);
+        assert_eq!(
+            measure(&interp, &objects, &scopes).json(7, 11),
+            measure(&interp, &objects, &scopes).json(7, 11)
+        );
+    }
+
+    #[test]
+    fn independent_agents_cannot_overwrite_each_others_snapshots() {
+        let first = Interp::new();
+        let first_objects = crate::value::heap_gc_snapshot(&first.gc_heap);
+        let first_scopes = crate::value::gc_scope_snapshot(&first.gc_heap);
+        record_post_gc(&first, &first_objects, &first_scopes);
+        let first_before = json(&first);
+
+        let second = Interp::new();
+        let second_objects = crate::value::heap_gc_snapshot(&second.gc_heap);
+        let second_scopes = crate::value::gc_scope_snapshot(&second.gc_heap);
+        record_post_gc(&second, &second_objects, &second_scopes);
+
+        assert_eq!(json(&first), first_before);
+        assert_ne!(
+            first.symbol_agent.borrow().agent_id,
+            second.symbol_agent.borrow().agent_id
+        );
+        assert_ne!(
+            crate::value::heap_id(&first.gc_heap),
+            crate::value::heap_id(&second.gc_heap)
         );
     }
 }

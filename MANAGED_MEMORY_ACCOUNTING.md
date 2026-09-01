@@ -104,15 +104,31 @@ the final owner lowers the corresponding category exactly.
 
 Current implementation notes:
 
-- `LUMEN_PERF_METRICS=1` makes the standalone shell force one final collection and records the
-  visitor after the collector pause timer stops, so the diagnostic walk does not inflate the
-  reported pause.
+- `LUMEN_PERF_METRICS=1` records after every diagnostic-mode collection and makes the standalone
+  shell force one final collection. Each visitor runs after the collector pause timer stops, so
+  the diagnostic walk does not inflate the reported pause.
 - Exact categories mean exact requested payload/capacity according to public Rust container
   information. They exclude allocator rounding and Rust's private `RcBox` header.
 - A standard-library `HashMap` makes its containing storage category a lower bound: its entry
   payload can be described, but its private bucket/control allocation cannot be measured exactly.
 - Adding the remaining owners and a compile-time-maintained ownership inventory is still required
   before `complete` can become true.
+
+Allocation attribution rules for the remaining slices:
+
+- Use one visitor context and one identity set per allocation family across objects, scopes,
+  callables, functions, chunks, caches, side tables, and sub-realms.
+- Credit an allocation to its canonical family, not to the edge that discovered it. A cache owns
+  only its table/order overhead; a cached string, function, chunk, or RegExp program is credited
+  to that payload's canonical category through the shared identity set.
+- Do not descend from callables or chunks into registered captured environments: the collector's
+  scope snapshot already accounts those graph nodes and their storage.
+- Keep executable mappings and their bounded code-memory budget separate from requested managed
+  payload. Heap-side JIT metadata is also reported separately, never silently folded into either
+  allocator residency or executable bytes.
+- Per-Agent records carry both Agent and collector-heap identity. Shared/Wasm memory will need a
+  stable allocation identity and an externally-shared marker so a process aggregator can dedupe
+  it across Agents without changing the useful per-Agent retained view.
 
 ## Questions worth outside review
 

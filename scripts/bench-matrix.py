@@ -547,35 +547,47 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
             raise BenchmarkError("invalid GC pause histogram in engine metrics")
     managed = metrics.get("managed_memory")
     if managed is not None:
-        if (
-            managed.get("schema_version") != 1
-            or managed.get("safepoint") != "post_gc"
-            or not isinstance(managed.get("complete"), bool)
-            or not isinstance(managed.get("categories"), dict)
-        ):
+        if managed.get("schema_version") != 1 or not isinstance(managed.get("complete"), bool):
             raise BenchmarkError("invalid managed-memory record in engine metrics")
-        for name in ("managed_requested_bytes", "managed_external_bytes"):
-            measurement = managed.get(name)
-            if (
-                not isinstance(measurement, dict)
-                or not isinstance(measurement.get("bytes"), int)
-                or measurement["bytes"] < 0
-                or measurement.get("quality") not in ("exact", "lower_bound")
+        if not isinstance(managed.get("agent_id"), int) or not isinstance(
+            managed.get("heap_id"), int
+        ):
+            raise BenchmarkError("managed-memory record lacks Agent/heap identity")
+        if managed.get("safepoint") is None:
+            if managed.get("complete"):
+                raise BenchmarkError("managed-memory record cannot be complete before a safepoint")
+            for name in ("managed_requested_bytes", "managed_external_bytes"):
+                if managed.get(name) != {"bytes": None, "quality": "unavailable"}:
+                    raise BenchmarkError(f"invalid unavailable {name} record")
+        else:
+            if managed.get("safepoint") != "post_gc" or not isinstance(
+                managed.get("categories"), dict
             ):
-                raise BenchmarkError(f"invalid {name} in managed-memory record")
-        for name, category in managed["categories"].items():
-            if not isinstance(name, str) or not isinstance(category, dict):
-                raise BenchmarkError("invalid managed-memory category")
-            quality = category.get("quality")
-            byte_count = category.get("bytes")
-            if quality == "unavailable":
-                if byte_count is not None:
-                    raise BenchmarkError("unavailable managed-memory category has a byte count")
-            elif quality in ("exact", "lower_bound"):
-                if not isinstance(byte_count, int) or byte_count < 0:
-                    raise BenchmarkError("invalid managed-memory category byte count")
-            else:
-                raise BenchmarkError("invalid managed-memory category quality")
+                raise BenchmarkError("invalid managed-memory safepoint record")
+            for name in ("managed_requested_bytes", "managed_external_bytes"):
+                measurement = managed.get(name)
+                if (
+                    not isinstance(measurement, dict)
+                    or not isinstance(measurement.get("bytes"), int)
+                    or measurement["bytes"] < 0
+                    or measurement.get("quality") not in ("exact", "lower_bound")
+                ):
+                    raise BenchmarkError(f"invalid {name} in managed-memory record")
+            for name, category in managed["categories"].items():
+                if not isinstance(name, str) or not isinstance(category, dict):
+                    raise BenchmarkError("invalid managed-memory category")
+                quality = category.get("quality")
+                byte_count = category.get("bytes")
+                if quality == "unavailable":
+                    if byte_count is not None:
+                        raise BenchmarkError(
+                            "unavailable managed-memory category has a byte count"
+                        )
+                elif quality in ("exact", "lower_bound"):
+                    if not isinstance(byte_count, int) or byte_count < 0:
+                        raise BenchmarkError("invalid managed-memory category byte count")
+                else:
+                    raise BenchmarkError("invalid managed-memory category quality")
     return metrics
 
 

@@ -111,7 +111,8 @@ class UnitTests(unittest.TestCase):
             'noise\n[lumen-perf] {"schema_version":1,"jit_compile_seconds":0.25,'
             '"gc_collections":2,"gc_pause_histogram":{"unit":"nanoseconds",'
             '"upper_bounds":[50000,null],"counts":[1,1]},'
-            '"managed_memory":{"schema_version":1,"safepoint":"post_gc",'
+            '"managed_memory":{"schema_version":1,"agent_id":1,"heap_id":2,'
+            '"safepoint":"post_gc",'
             '"complete":false,"managed_requested_bytes":{"bytes":12,"quality":"lower_bound"},'
             '"managed_external_bytes":{"bytes":4,"quality":"lower_bound"},'
             '"categories":{"objects":{"bytes":8,"quality":"exact"},'
@@ -135,6 +136,15 @@ class UnitTests(unittest.TestCase):
                 ),
                 "[lumen-perf] ",
             )
+        unavailable = (
+            '[lumen-perf] {"schema_version":1,"gc_collections":0,'
+            '"managed_memory":{"schema_version":1,"agent_id":1,"heap_id":2,'
+            '"safepoint":null,"complete":false,'
+            '"managed_requested_bytes":{"bytes":null,"quality":"unavailable"},'
+            '"managed_external_bytes":{"bytes":null,"quality":"unavailable"}}}\n'
+        )
+        parsed = bench_matrix.parse_engine_metrics(unavailable, "[lumen-perf] ")
+        self.assertIsNone(parsed["managed_memory"]["managed_requested_bytes"]["bytes"])
 
 
 class IntegrationTest(unittest.TestCase):

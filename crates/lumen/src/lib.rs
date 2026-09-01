@@ -109,13 +109,16 @@ use value::Value;
 
 pub use interrupt::{InterruptReason, RuntimeInterrupt};
 
-/// Unstable, opt-in process JIT and collector diagnostics for Lumen's own benchmark tooling.
+/// Unstable, opt-in process JIT/collector and per-Agent managed-memory diagnostics for Lumen's
+/// own benchmark tooling.
 ///
 /// Returns `None` unless `LUMEN_PERF_METRICS` was present when the process first checked its
-/// diagnostic state. This is intentionally not a stable embedder API.
+/// diagnostic state. `engine` selects the Agent-owned memory snapshot; process JIT/GC counters
+/// remain aggregate diagnostics. This is intentionally not a stable embedder API.
 #[doc(hidden)]
-pub fn unstable_performance_metrics_json() -> Option<String> {
-    jit::performance_metrics_json()
+pub fn unstable_performance_metrics_json(engine: &Engine) -> Option<String> {
+    let managed_memory = memory::json(&engine.interp);
+    jit::performance_metrics_json(&managed_memory)
 }
 
 /// Internal-stage entry points, exposed only for benchmarking (`bench` feature). These reach past
