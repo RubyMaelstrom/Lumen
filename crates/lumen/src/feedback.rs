@@ -66,6 +66,51 @@ pub(crate) enum ObservationKind {
     CallTarget = 5,
     BranchCount = 6,
     Allocation = 7,
+    PropertyAccess = 8,
+}
+
+/// Stable outcome class for a named-property access. The low nibble of an observation's flags
+/// carries bounded prototype-depth/adapter details; the high nibble carries this encoding.
+/// Values may only be appended, never reordered within a schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum PropertyOutcome {
+    Data = 1,
+    Absent = 2,
+    Created = 3,
+    Accessor = 4,
+    Exotic = 5,
+    Rejected = 6,
+}
+
+pub(crate) const PROPERTY_DEPTH_MASK: u8 = 0x07;
+pub(crate) const PROPERTY_ARRAY_KEY_CHECK: u8 = 0x08;
+const PROPERTY_OUTCOME_SHIFT: u8 = 4;
+
+pub(crate) const fn property_access_flags(
+    outcome: PropertyOutcome,
+    depth: u8,
+    array_key_check: bool,
+) -> u8 {
+    ((outcome as u8) << PROPERTY_OUTCOME_SHIFT)
+        | (depth & PROPERTY_DEPTH_MASK)
+        | if array_key_check {
+            PROPERTY_ARRAY_KEY_CHECK
+        } else {
+            0
+        }
+}
+
+fn property_outcome(flags: u8) -> Option<PropertyOutcome> {
+    Some(match flags >> PROPERTY_OUTCOME_SHIFT {
+        1 => PropertyOutcome::Data,
+        2 => PropertyOutcome::Absent,
+        3 => PropertyOutcome::Created,
+        4 => PropertyOutcome::Accessor,
+        5 => PropertyOutcome::Exotic,
+        6 => PropertyOutcome::Rejected,
+        _ => return None,
+    })
 }
 
 /// Stable semantic classes for `ValueClass` observations.
@@ -154,8 +199,34 @@ impl ObservationWord {
     }
 
     fn is_valid_for(self, kind: ObservationKind) -> bool {
-        if !self.is_valid() || kind != ObservationKind::ValueClass {
-            return self.is_valid();
+        if !self.is_valid() {
+            return false;
+        }
+        if kind == ObservationKind::PropertyAccess {
+            let flags = (self.0 >> 8) as u8;
+            let payload = self.payload_bits();
+            return match self.decoded_state().unwrap() {
+                ObservationState::Uninitialized | ObservationState::Generic => {
+                    flags == 0 && payload == 0
+                }
+                ObservationState::Polymorphic => flags == 0 && (2..=4).contains(&payload),
+                ObservationState::Absent => {
+                    property_outcome(flags) == Some(PropertyOutcome::Absent) && payload == 0
+                }
+                ObservationState::Monomorphic => match property_outcome(flags) {
+                    Some(PropertyOutcome::Data) => payload != 0,
+                    Some(
+                        PropertyOutcome::Created
+                        | PropertyOutcome::Accessor
+                        | PropertyOutcome::Exotic
+                        | PropertyOutcome::Rejected,
+                    ) => payload == 0,
+                    _ => false,
+                },
+            };
+        }
+        if kind != ObservationKind::ValueClass {
+            return true;
         }
         if ((self.0 >> 8) as u8) != 0 {
             return false;
@@ -185,6 +256,11 @@ impl ObservationWord {
     #[cfg(test)]
     pub(crate) fn payload(self) -> u32 {
         (self.0 >> 16) as u32
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flags(self) -> u8 {
+        (self.0 >> 8) as u8
     }
 }
 
@@ -803,6 +879,10 @@ mod tests {
         assert_eq!(OperationKind::Allocation as u8, 10);
         assert_eq!(ObservationKind::ValueClass as u8, 1);
         assert_eq!(ObservationKind::Allocation as u8, 7);
+        assert_eq!(ObservationKind::PropertyAccess as u8, 8);
+        assert_eq!(PropertyOutcome::Data as u8, 1);
+        assert_eq!(PropertyOutcome::Rejected as u8, 6);
+        assert_eq!(property_access_flags(PropertyOutcome::Data, 3, true), 0x1b);
         assert_eq!(ValueClass::Undefined as u8, 1);
         assert_eq!(ValueClass::Object as u8, 9);
         assert_eq!(ObservationRole::Operand0 as u8, 1);
@@ -811,6 +891,50 @@ mod tests {
         assert_eq!(ObservationState::Generic as u8, 4);
         assert_eq!(std::mem::size_of::<SlotDescriptor>(), 2);
         assert_eq!(std::mem::size_of::<SiteDescriptor>(), 12);
+    }
+
+    #[test]
+    fn property_access_words_enforce_the_semantic_envelope() {
+        let data = ObservationWord::new(
+            ObservationState::Monomorphic,
+            3,
+            property_access_flags(PropertyOutcome::Data, 1, false),
+        );
+        assert!(data.is_valid_for(ObservationKind::PropertyAccess));
+        assert_eq!(property_outcome(data.flags()), Some(PropertyOutcome::Data));
+
+        let absent = ObservationWord::new(
+            ObservationState::Absent,
+            0,
+            property_access_flags(PropertyOutcome::Absent, 0, false),
+        );
+        assert!(absent.is_valid_for(ObservationKind::PropertyAccess));
+
+        let created = ObservationWord::new(
+            ObservationState::Monomorphic,
+            0,
+            property_access_flags(PropertyOutcome::Created, 0, false),
+        );
+        assert!(created.is_valid_for(ObservationKind::PropertyAccess));
+
+        assert!(!ObservationWord::new(
+            ObservationState::Monomorphic,
+            0,
+            property_access_flags(PropertyOutcome::Data, 0, false),
+        )
+        .is_valid_for(ObservationKind::PropertyAccess));
+        assert!(!ObservationWord::new(
+            ObservationState::Monomorphic,
+            1,
+            property_access_flags(PropertyOutcome::Absent, 0, false),
+        )
+        .is_valid_for(ObservationKind::PropertyAccess));
+        assert!(!ObservationWord::new(
+            ObservationState::Absent,
+            0,
+            property_access_flags(PropertyOutcome::Data, 0, false),
+        )
+        .is_valid_for(ObservationKind::PropertyAccess));
     }
 
     #[test]

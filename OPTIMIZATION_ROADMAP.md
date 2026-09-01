@@ -495,6 +495,10 @@ finish the baseline, but no later phase may claim a performance win against the 
 - [ ] Record abstract property receiver/holder layout identities, prototype depth, field location,
   and accessor/exotic outcomes; resolve identities to current shapes or future Maps through the
   active adapter.
+  - [x] Preserve ordinary data field location/prototype depth and distinct absence/creation
+    outcomes from the current IC adapter in stable `PropertyAccess` slots.
+  - [ ] Record accessor, exotic, and rejected outcomes at canonical runtime helper endpoints
+    without duplicating observable property operations.
 - [ ] Record element receiver kind, index category, bounds/hole outcome, and prototype fallback.
 - [ ] Record call and construct targets, arity, closure environment requirements, and return type.
 - [ ] Record branch direction counts and loop back-edge counts for optimization/OSR thresholds.

@@ -2553,6 +2553,10 @@ const HOLDER_LAYOUT: crate::feedback::SlotDescriptor = crate::feedback::SlotDesc
     kind: crate::feedback::ObservationKind::HolderLayout,
     role: crate::feedback::ObservationRole::Holder,
 };
+const PROPERTY_ACCESS: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::PropertyAccess,
+    role: crate::feedback::ObservationRole::Access,
+};
 const ELEMENT_ACCESS: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
     kind: crate::feedback::ObservationKind::ElementAccess,
     role: crate::feedback::ObservationRole::Access,
@@ -2608,7 +2612,12 @@ fn feedback_layout_for_ops(
         let (operation, slots): (OperationKind, &[crate::feedback::SlotDescriptor]) = match op {
             Op::GetProp(..) | Op::GetPropThis(..) | Op::GetPropLocal(..) | Op::GetMethod(..) => (
                 OperationKind::NamedLoad,
-                &[RECEIVER_LAYOUT, HOLDER_LAYOUT, VALUE_RESULT],
+                &[
+                    RECEIVER_LAYOUT,
+                    HOLDER_LAYOUT,
+                    PROPERTY_ACCESS,
+                    VALUE_RESULT,
+                ],
             ),
             Op::SetProp(..)
             | Op::SetPropDrop(..)
@@ -2616,13 +2625,19 @@ fn feedback_layout_for_ops(
             | Op::SetPropLocalDrop(..)
             | Op::AppendProp(..) => (
                 OperationKind::NamedStore,
-                &[RECEIVER_LAYOUT, HOLDER_LAYOUT, VALUE_OPERAND_1],
+                &[
+                    RECEIVER_LAYOUT,
+                    HOLDER_LAYOUT,
+                    PROPERTY_ACCESS,
+                    VALUE_OPERAND_1,
+                ],
             ),
             Op::UpdateProp(..) => (
                 OperationKind::NamedStore,
                 &[
                     RECEIVER_LAYOUT,
                     HOLDER_LAYOUT,
+                    PROPERTY_ACCESS,
                     VALUE_OPERAND_0,
                     VALUE_RESULT,
                 ],
@@ -2734,8 +2749,19 @@ fn refresh_current_layout_feedback(
     caches: &[std::cell::Cell<IcState>],
 ) {
     use crate::feedback::{
-        ObservationKind, ObservationRole, ObservationState, ObservationWord, RuntimeBinding,
+        property_access_flags, ObservationKind, ObservationRole, ObservationState, ObservationWord,
+        PropertyOutcome, RuntimeBinding,
     };
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct CurrentPropertyObservation {
+        receiver_shape: u32,
+        holder_shape: Option<u32>,
+        layout_flags: u8,
+        access_state: ObservationState,
+        access_payload: u32,
+        access_flags: u8,
+    }
 
     for (site, binding) in feedback.sites() {
         let RuntimeBinding::PropertyIc {
@@ -2752,25 +2778,50 @@ fn refresh_current_layout_feedback(
             let state = state.get();
             let observation = match state.depth {
                 IC_EMPTY => continue,
-                IC_ABSENT => (state.recv_shape, None, 0),
-                IC_CREATE => (state.recv_shape, None, OBS_FLAG_CREATION),
+                IC_ABSENT => CurrentPropertyObservation {
+                    receiver_shape: state.recv_shape,
+                    holder_shape: None,
+                    layout_flags: 0,
+                    access_state: ObservationState::Absent,
+                    access_payload: 0,
+                    access_flags: property_access_flags(PropertyOutcome::Absent, 0, false),
+                },
+                IC_CREATE => CurrentPropertyObservation {
+                    receiver_shape: state.recv_shape,
+                    holder_shape: None,
+                    layout_flags: OBS_FLAG_CREATION,
+                    access_state: ObservationState::Monomorphic,
+                    access_payload: 0,
+                    access_flags: property_access_flags(PropertyOutcome::Created, 0, false),
+                },
                 encoded_depth => {
                     let key_check = encoded_depth & IC_ARR_KEYCHK != 0;
                     let depth = encoded_depth & !IC_ARR_KEYCHK;
+                    let Some(slot) = state.slot.checked_add(1) else {
+                        generic = true;
+                        break;
+                    };
                     if depth > IC_MAX_DEPTH {
                         generic = true;
                         break;
                     }
-                    (
-                        state.recv_shape,
-                        Some(state.holder_shape),
-                        depth
+                    CurrentPropertyObservation {
+                        receiver_shape: state.recv_shape,
+                        holder_shape: Some(state.holder_shape),
+                        layout_flags: depth
                             | if key_check {
                                 OBS_FLAG_ARRAY_KEY_CHECK
                             } else {
                                 0
                             },
-                    )
+                        access_state: ObservationState::Monomorphic,
+                        access_payload: slot,
+                        access_flags: property_access_flags(
+                            PropertyOutcome::Data,
+                            depth,
+                            key_check,
+                        ),
+                    }
                 }
             };
             if !ways.contains(&observation) {
@@ -2791,25 +2842,35 @@ fn refresh_current_layout_feedback(
                 ObservationRole::Holder,
                 word,
             );
+            feedback.write(
+                site,
+                ObservationKind::PropertyAccess,
+                ObservationRole::Access,
+                word,
+            );
             continue;
         }
         match ways.as_slice() {
             [] => {}
-            [(receiver, holder, flags)] => {
-                let receiver = intern_current_shape(shapes, *receiver);
+            [observation] => {
+                let receiver = intern_current_shape(shapes, observation.receiver_shape);
                 feedback.write(
                     site,
                     ObservationKind::ReceiverLayout,
                     ObservationRole::Receiver,
-                    ObservationWord::new(ObservationState::Monomorphic, receiver, *flags),
+                    ObservationWord::new(
+                        ObservationState::Monomorphic,
+                        receiver,
+                        observation.layout_flags,
+                    ),
                 );
-                let holder_word = holder.map_or_else(
-                    || ObservationWord::new(ObservationState::Absent, 0, *flags),
+                let holder_word = observation.holder_shape.map_or_else(
+                    || ObservationWord::new(ObservationState::Absent, 0, observation.layout_flags),
                     |holder| {
                         ObservationWord::new(
                             ObservationState::Monomorphic,
                             intern_current_shape(shapes, holder),
-                            *flags,
+                            observation.layout_flags,
                         )
                     },
                 );
@@ -2818,6 +2879,16 @@ fn refresh_current_layout_feedback(
                     ObservationKind::HolderLayout,
                     ObservationRole::Holder,
                     holder_word,
+                );
+                feedback.write(
+                    site,
+                    ObservationKind::PropertyAccess,
+                    ObservationRole::Access,
+                    ObservationWord::new(
+                        observation.access_state,
+                        observation.access_payload,
+                        observation.access_flags,
+                    ),
                 );
             }
             polymorphic => {
@@ -2836,6 +2907,12 @@ fn refresh_current_layout_feedback(
                     site,
                     ObservationKind::HolderLayout,
                     ObservationRole::Holder,
+                    word,
+                );
+                feedback.write(
+                    site,
+                    ObservationKind::PropertyAccess,
+                    ObservationRole::Access,
                     word,
                 );
             }
@@ -2948,8 +3025,8 @@ fn observe_arithmetic_result(
 mod feedback_layout_tests {
     use super::*;
     use crate::feedback::{
-        FeedbackVector, ObservationKind, ObservationRole, ObservationState, OperationKind,
-        ValueClass,
+        property_access_flags, FeedbackVector, ObservationKind, ObservationRole, ObservationState,
+        OperationKind, PropertyOutcome, ValueClass,
     };
 
     #[test]
@@ -2965,7 +3042,7 @@ mod feedback_layout_tests {
         assert_ne!(first_bindings, second_bindings);
         assert_eq!(first.version(), crate::feedback::SCHEMA_VERSION);
         assert_eq!(first.len(), 3);
-        assert_eq!(first.slot_len(), 8);
+        assert_eq!(first.slot_len(), 9);
         let sites = first.site_ids().collect::<Vec<_>>();
         assert_eq!(
             first.site(sites[0]).unwrap().operation,
@@ -3262,9 +3339,20 @@ mod feedback_layout_tests {
             ObservationRole::Receiver,
         );
         let holder = feedback.read(site, ObservationKind::HolderLayout, ObservationRole::Holder);
+        let access = feedback.read(
+            site,
+            ObservationKind::PropertyAccess,
+            ObservationRole::Access,
+        );
         assert_eq!(receiver.state(), ObservationState::Monomorphic);
         assert_eq!(holder.state(), ObservationState::Monomorphic);
+        assert_eq!(access.state(), ObservationState::Monomorphic);
         assert_eq!((receiver.payload(), holder.payload()), (1, 2));
+        assert_eq!(access.payload(), 3);
+        assert_eq!(
+            access.flags(),
+            property_access_flags(PropertyOutcome::Data, 1, false)
+        );
         assert_eq!(&*shapes.borrow(), &[41, 73]);
 
         caches[1].set(IcState {
@@ -3282,8 +3370,15 @@ mod feedback_layout_tests {
             ObservationKind::ReceiverLayout,
             ObservationRole::Receiver,
         );
+        let access = feedback.read(
+            site,
+            ObservationKind::PropertyAccess,
+            ObservationRole::Access,
+        );
         assert_eq!(receiver.state(), ObservationState::Polymorphic);
         assert_eq!(receiver.payload(), 2);
+        assert_eq!(access.state(), ObservationState::Polymorphic);
+        assert_eq!(access.payload(), 2);
     }
 
     #[test]
@@ -3312,7 +3407,58 @@ mod feedback_layout_tests {
                 .state(),
             ObservationState::Absent
         );
+        let access = feedback.read(
+            site,
+            ObservationKind::PropertyAccess,
+            ObservationRole::Access,
+        );
+        assert_eq!(access.state(), ObservationState::Absent);
+        assert_eq!(access.payload(), 0);
+        assert_eq!(
+            access.flags(),
+            property_access_flags(PropertyOutcome::Absent, 0, false)
+        );
         assert_eq!(&*shapes.borrow(), &[12]);
+    }
+
+    #[test]
+    fn current_shape_adapter_distinguishes_property_creation() {
+        let (layout, bindings) = feedback_layout_for_ops(&[Op::SetProp(0, 0)], &[]);
+        let feedback = FeedbackVector::new(layout, bindings);
+        let shapes = std::cell::RefCell::new(Vec::new());
+        let caches = (0..PROP_IC_WAYS)
+            .map(|_| std::cell::Cell::new(IcState::EMPTY))
+            .collect::<Vec<_>>();
+        caches[0].set(IcState {
+            recv_shape: 23,
+            holder_shape: 0,
+            slot: 0,
+            depth: IC_CREATE,
+            mid_ok: 0,
+            mid_shape: 0,
+            mid2_shape: 0,
+        });
+
+        refresh_current_layout_feedback(&feedback, &shapes, &caches);
+        let site = feedback.sites().next().unwrap().0;
+        let access = feedback.read(
+            site,
+            ObservationKind::PropertyAccess,
+            ObservationRole::Access,
+        );
+        assert_eq!(access.state(), ObservationState::Monomorphic);
+        assert_eq!(access.payload(), 0);
+        assert_eq!(
+            access.flags(),
+            property_access_flags(PropertyOutcome::Created, 0, false)
+        );
+        assert_eq!(
+            feedback
+                .read(site, ObservationKind::HolderLayout, ObservationRole::Holder)
+                .state(),
+            ObservationState::Absent
+        );
+        assert_eq!(&*shapes.borrow(), &[23]);
     }
 }
 

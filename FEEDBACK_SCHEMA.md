@@ -56,6 +56,11 @@ instruction format into the profile:
 - `ReceiverLayout` and `HolderLayout`: abstract layout identities for the receiver and the object
   that supplied the property. The active adapter may currently resolve them through shapes and
   prototype guards; future adapters resolve them through Maps and validity dependencies.
+- `PropertyAccess`: the named-property outcome and its operation-specific detail. Version 1 uses
+  stable outcome classes for data, absence, creation, accessor, exotic, and rejected paths. A
+  data result stores `field slot + 1` (zero is reserved for outcomes without a field), while the
+  low flag nibble stores bounded prototype depth and the current adapter's array-key guard. These
+  meanings describe the completed ECMAScript operation rather than an IC implementation detail.
 - `ElementAccess`: indexed/named key class, bounds/hole result, and prototype fallback outcome.
 - `CallTarget`: abstract call/construct target identity and callable category, never a raw address.
 - `BranchCount` and `Allocation`: bounded counter/allocation summaries reserved for later Phase 1
@@ -70,10 +75,17 @@ specialized state.
 
 Version 1 binds canonical named-property sites to their existing four-way ICs at runtime. During
 an opt-in diagnostic traversal, the current-shape adapter translates monomorphic receiver/holder
-shapes into profile-local dense layout tokens, preserves absent-holder and creation outcomes, and
-widens distinct ways to an explicit polymorphic state. Raw shape numbers remain in an internal
-adapter table and are never written to observation words. Transformed/inlined chunks reuse the
-baseline schema without guessing new bindings; the retained baseline chunk remains authoritative.
+shapes into profile-local dense layout tokens, preserves ordinary data field location and
+prototype depth plus absence and creation outcomes, and widens distinct ways to an explicit
+polymorphic state. Raw shape numbers remain in an internal adapter table and are never written to
+observation words. Transformed/inlined chunks reuse the baseline schema without guessing new
+bindings; the retained baseline chunk remains authoritative.
+
+The IC adapter intentionally does not infer accessor, proxy, typed-array, namespace, or other
+exotic outcomes from an unfilled cache. Those outcomes must be recorded at the canonical runtime
+helper endpoint after the normative operation has identified them, without repeating a lookup,
+trap, getter, setter, or other observable action. Until that collector lands, their stable outcome
+codes are reserved and the property-observation milestone remains incomplete.
 
 Adapter bindings (cache family/index, current shape tokens, raw pins) are runtime-only and must
 never be serialized as observations. A future Map adapter replaces only the token interner and
