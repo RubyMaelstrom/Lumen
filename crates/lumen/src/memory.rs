@@ -687,6 +687,85 @@ fn scan_realm(
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
+
+    totals.interpreter_side_tables.add(
+        interp
+            .array_buffers
+            .len()
+            .saturating_mul(size_of::<(usize, crate::interpreter::ArrayBufferBytes)>())
+            .saturating_add(
+                interp
+                    .array_buffer_versions
+                    .len()
+                    .saturating_mul(size_of::<(usize, u64)>()),
+            )
+            .saturating_add(
+                interp
+                    .array_buffer_dirty_ranges
+                    .len()
+                    .saturating_mul(size_of::<(usize, Vec<std::ops::Range<usize>>)>()),
+            )
+            .saturating_add(
+                interp
+                    .shared_buffers
+                    .len()
+                    .saturating_mul(size_of::<(usize, u64)>()),
+            )
+            .saturating_add(
+                interp
+                    .immutable_buffers
+                    .len()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(
+                interp
+                    .host_keyed_buffers
+                    .len()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(
+                interp
+                    .typed_arrays
+                    .len()
+                    .saturating_mul(size_of::<(usize, crate::value::TaInfo)>()),
+            )
+            .saturating_add(
+                interp
+                    .ta_buffer
+                    .len()
+                    .saturating_mul(size_of::<(usize, Value)>()),
+            )
+            .saturating_add(
+                interp
+                    .data_views
+                    .len()
+                    .saturating_mul(size_of::<(usize, (usize, usize, usize, bool))>()),
+            ),
+    );
+    for ranges in interp.array_buffer_dirty_ranges.values() {
+        totals.interpreter_side_tables.add(
+            ranges
+                .capacity()
+                .saturating_mul(size_of::<std::ops::Range<usize>>()),
+        );
+    }
+    for buffer in interp.ta_buffer.values() {
+        visitor.value(buffer);
+    }
+    if !interp.array_buffers.is_empty()
+        || !interp.array_buffer_versions.is_empty()
+        || !interp.array_buffer_dirty_ranges.is_empty()
+        || !interp.shared_buffers.is_empty()
+        || !interp.immutable_buffers.is_empty()
+        || !interp.host_keyed_buffers.is_empty()
+        || !interp.typed_arrays.is_empty()
+        || !interp.ta_buffer.is_empty()
+        || !interp.data_views.is_empty()
+    {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
+    }
     for buffer in interp.array_buffers.values() {
         visitor.array_buffer(buffer);
     }
@@ -1010,6 +1089,32 @@ mod tests {
         assert!(!engine.interp.weak_collection_data.is_empty());
         assert!(!engine.interp.weak_collection_index.is_empty());
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+    }
+
+    #[test]
+    fn array_buffer_view_metadata_is_accounted_separately_from_backing() {
+        let mut engine = crate::Engine::new();
+        engine
+            .eval(
+                r#"
+                    globalThis.buffer = new ArrayBuffer(64, { maxByteLength: 128 });
+                    globalThis.typed = new Uint8Array(buffer);
+                    globalThis.view = new DataView(buffer, 4, 16);
+                    typed[2] = 7;
+                "#,
+                false,
+            )
+            .expect("buffer views evaluate");
+        let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let snapshot = measure(&engine.interp, &objects, &scopes);
+
+        assert!(!engine.interp.array_buffers.is_empty());
+        assert!(!engine.interp.typed_arrays.is_empty());
+        assert!(!engine.interp.ta_buffer.is_empty());
+        assert!(!engine.interp.data_views.is_empty());
+        assert!(snapshot.interpreter_side_tables.bytes > size_of::<Interp>());
+        assert!(snapshot.array_buffer_backing.bytes >= 64);
     }
 
     #[test]

@@ -403,6 +403,9 @@ finish the baseline, but no later phase may claim a performance win against the 
     payload families exactly once.
   - [x] Account Map/Set ordered storage and indexes plus WeakMap/WeakSet ephemeron storage without
     promoting weak keys to diagnostic roots.
+  - [x] Separate ArrayBuffer/view metadata from identity-deduplicated byte backing, covering
+    version/dirty tracking, TypedArray/DataView records, and detach-policy sets while reserving
+    shared/Wasm backing for the cross-Agent external-allocation slice.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.

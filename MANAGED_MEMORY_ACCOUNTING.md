@@ -172,6 +172,12 @@ values pass through the canonical Value visitor; weak keys remain weak during di
 table bucket capacity remains a documented lower bound because `FastMap` is a standard-library
 HashMap alias rather than an allocator-introspectable container.
 
+ArrayBuffer ownership now separates byte backing from engine metadata: owner/version/dirty-range
+tables, TypedArray/DataView records, immutable and host-detach-key sets, and view-to-buffer Values
+credit `interpreter_side_tables`, while the identity-deduplicated byte capacity remains in
+`array_buffer_backing`. Shared/Wasm backing is still intentionally unavailable pending the
+cross-Agent allocation-identity policy; only its per-realm id map is included in this slice.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
