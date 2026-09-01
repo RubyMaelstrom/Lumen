@@ -36,6 +36,7 @@ mod eval;
 pub mod fastalloc;
 mod fasthash;
 mod feedback;
+mod heap;
 mod host;
 mod interpreter;
 mod interrupt;
