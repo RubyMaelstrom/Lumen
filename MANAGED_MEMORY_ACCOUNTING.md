@@ -217,6 +217,11 @@ decorator initializer scratch, and active/pending `new.target` Values. Lazy argu
 identity-deduplicated; their function and Value payloads route to canonical families, and their
 captured environments remain canonical to the scope snapshot.
 
+Object-side ownership now covers GC pin, Proxy, host-indexed-property, template-object, Annex B
+function, deferred-namespace, mapped-arguments, and module-source tables. Table/string/vector
+storage is credited to interpreter side tables; Functions and JavaScript Values retain canonical
+family attribution, while mapped argument environments remain canonical to the scope snapshot.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

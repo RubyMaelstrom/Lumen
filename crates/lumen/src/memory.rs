@@ -1067,6 +1067,109 @@ fn scan_realm(
 
     totals.interpreter_side_tables.add(
         interp
+            .gc_pins
+            .len()
+            .saturating_mul(size_of::<(usize, Gc)>())
+            .saturating_add(
+                interp
+                    .proxies
+                    .len()
+                    .saturating_mul(size_of::<(usize, (Value, Value))>()),
+            )
+            .saturating_add(
+                interp
+                    .host_indexed
+                    .len()
+                    .saturating_mul(
+                        size_of::<(usize, crate::interpreter::HostIndexedProperties)>(),
+                    ),
+            )
+            .saturating_add(
+                interp
+                    .template_cache
+                    .len()
+                    .saturating_mul(size_of::<((usize, u64), Value)>()),
+            )
+            .saturating_add(
+                interp
+                    .annexb_fn_sync
+                    .len()
+                    .saturating_mul(size_of::<(usize, Rc<crate::ast::Function>)>()),
+            )
+            .saturating_add(
+                interp
+                    .deferred_ns
+                    .len()
+                    .saturating_mul(size_of::<(usize, String)>()),
+            )
+            .saturating_add(
+                interp
+                    .deferred_ns_objs
+                    .len()
+                    .saturating_mul(size_of::<(String, Value)>()),
+            )
+            .saturating_add(
+                interp
+                    .mapped_arguments
+                    .len()
+                    .saturating_mul(size_of::<(usize, (Env, Vec<Option<String>>))>()),
+            )
+            .saturating_add(
+                interp
+                    .module_source_objs
+                    .len()
+                    .saturating_mul(size_of::<(String, Value)>()),
+            ),
+    );
+    for (target, handler) in interp.proxies.values() {
+        visitor.value(target);
+        visitor.value(handler);
+    }
+    for properties in interp.host_indexed.values() {
+        visitor.value(&properties.getter);
+    }
+    for value in interp.template_cache.values() {
+        visitor.value(value);
+    }
+    for function in interp.annexb_fn_sync.values() {
+        visitor.function(function);
+    }
+    for module in interp.deferred_ns.values() {
+        totals.interpreter_side_tables.add(module.capacity());
+    }
+    for (module, namespace) in &interp.deferred_ns_objs {
+        totals.interpreter_side_tables.add(module.capacity());
+        visitor.value(namespace);
+    }
+    for (_environment, names) in interp.mapped_arguments.values() {
+        totals
+            .interpreter_side_tables
+            .add(names.capacity().saturating_mul(size_of::<Option<String>>()));
+        for name in names.iter().flatten() {
+            totals.interpreter_side_tables.add(name.capacity());
+        }
+    }
+    for (module, source) in &interp.module_source_objs {
+        totals.interpreter_side_tables.add(module.capacity());
+        visitor.value(source);
+    }
+    if !interp.gc_pins.is_empty()
+        || !interp.proxies.is_empty()
+        || !interp.host_indexed.is_empty()
+        || !interp.template_cache.is_empty()
+        || !interp.annexb_fn_sync.is_empty()
+        || !interp.deferred_ns.is_empty()
+        || !interp.deferred_ns_objs.is_empty()
+        || !interp.mapped_arguments.is_empty()
+        || !interp.module_source_objs.is_empty()
+    {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
             .map_data
             .len()
             .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
@@ -1883,6 +1986,57 @@ mod tests {
         let mut visitor = Visitor::default();
         assert!(visitor.value_slice(&shared_values) > 0);
         assert_eq!(visitor.value_slice(&shared_values), 0);
+
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
+    }
+
+    #[test]
+    fn object_side_tables_account_keys_vectors_and_payload_values() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+        let object = engine.interp.global.clone();
+        let identity = Rc::as_ptr(&object) as usize;
+
+        engine.interp.gc_pins.insert(identity, object.clone());
+        engine.interp.proxies.insert(
+            identity,
+            (Value::Obj(object.clone()), Value::Obj(object.clone())),
+        );
+        engine.interp.host_indexed.insert(
+            identity,
+            crate::interpreter::HostIndexedProperties {
+                length: 1,
+                getter: Value::str("host indexed getter payload"),
+            },
+        );
+        engine
+            .interp
+            .template_cache
+            .insert((identity, 7), Value::str("template cache payload"));
+        engine
+            .interp
+            .deferred_ns
+            .insert(identity, "deferred/module.js".to_string());
+        engine.interp.deferred_ns_objs.insert(
+            "deferred/module.js".to_string(),
+            Value::str("deferred namespace payload"),
+        );
+        let mut mapped_names = Vec::with_capacity(5);
+        mapped_names.push(Some("mappedParameterWithCapacity".to_string()));
+        engine
+            .interp
+            .mapped_arguments
+            .insert(identity, (engine.interp.global_env.clone(), mapped_names));
+        engine.interp.module_source_objs.insert(
+            "source/module.js".to_string(),
+            Value::str("module source payload"),
+        );
 
         let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
