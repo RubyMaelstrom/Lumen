@@ -1691,6 +1691,181 @@ pub struct Interp {
         HashMap<usize, std::collections::VecDeque<(Value, crate::coroutine::Resume)>>,
 }
 
+// Phase 0 managed-memory ownership inventory. This macro deliberately generates both the golden
+// classification list and an exhaustive (no `..`) struct pattern from the same field tokens. A
+// newly added `Interp` field therefore makes test builds fail until its ownership class is chosen
+// in a review-visible diff. `unaccounted` is permitted while the visitor is incomplete, but must
+// reach zero before the managed-memory record may set `complete: true`.
+#[cfg(test)]
+macro_rules! interp_memory_inventory {
+    ($($field:ident => $class:literal,)*) => {
+        const INTERP_MEMORY_INVENTORY: &[(&str, &str)] = &[
+            $((stringify!($field), $class),)*
+        ];
+
+        fn interp_memory_inventory_exhaustive_pattern(interp: &Interp) {
+            let Interp { $($field: _,)* } = interp;
+        }
+    };
+}
+
+#[cfg(test)]
+interp_memory_inventory! {
+    gc_heap => "unaccounted",
+    symbol_agent => "unaccounted",
+    global => "measured",
+    global_env => "measured",
+    object_proto => "measured",
+    function_proto => "measured",
+    array_proto => "measured",
+    array_ctor => "measured",
+    string_proto => "measured",
+    number_proto => "measured",
+    boolean_proto => "measured",
+    symbol_proto => "measured",
+    error_protos => "unaccounted",
+    console => "unaccounted",
+    wall_clock => "unaccounted",
+    runtime_interrupt => "unaccounted",
+    interrupt_poll_tick => "non_owning",
+    strict => "non_owning",
+    tier => "non_owning",
+    tier_threshold => "non_owning",
+    vm_pool => "unaccounted",
+    stub_cache => "unaccounted",
+    stub_cache_names => "unaccounted",
+    frame_pool => "unaccounted",
+    creation_pins => "unaccounted",
+    global_env_pins => "unaccounted",
+    cur_coro => "non_owning",
+    jit_helpers => "non_owning",
+    jit_layout => "non_owning",
+    interp_layout => "non_owning",
+    inline_ic_safe => "non_owning",
+    str_units => "unaccounted",
+    re_texts => "unaccounted",
+    re_text_ascii_hot => "unaccounted",
+    regexp_dependency_cache => "non_owning",
+    regexp_last => "unaccounted",
+    depth => "non_owning",
+    direct_call_depth => "non_owning",
+    class_info => "unaccounted",
+    eval_fn => "measured",
+    eval_realm_fns => "unaccounted",
+    elems_protector => "non_owning",
+    construct_ics => "unaccounted",
+    construct_capacity_hints => "unaccounted",
+    iterator_sym => "unaccounted",
+    wk_syms => "unaccounted",
+    short_circuit => "non_owning",
+    import_meta => "unaccounted",
+    import_base => "unaccounted",
+    modules => "unaccounted",
+    module_recs => "unaccounted",
+    module_loader => "unaccounted",
+    dynamic_module_loader => "unaccounted",
+    pending_dynamic_imports => "unaccounted",
+    next_dynamic_import_id => "non_owning",
+    module_ns => "unaccounted",
+    map_data => "unaccounted",
+    collection_index => "unaccounted",
+    weak_collection_data => "unaccounted",
+    weak_collection_index => "unaccounted",
+    extra_protos => "unaccounted",
+    array_buffers => "external",
+    array_buffer_versions => "unaccounted",
+    array_buffer_dirty_ranges => "unaccounted",
+    shared_buffers => "unaccounted",
+    immutable_buffers => "unaccounted",
+    host_keyed_buffers => "unaccounted",
+    can_block => "non_owning",
+    pending_async_waits => "unaccounted",
+    pending_timers => "unaccounted",
+    agent => "unaccounted",
+    typed_arrays => "unaccounted",
+    async_gens => "unaccounted",
+    global_var_names => "unaccounted",
+    gc_pins => "unaccounted",
+    ta_buffer => "unaccounted",
+    shadow_realms => "unaccounted",
+    data_views => "unaccounted",
+    regexps => "unaccounted",
+    regexp_programs => "unaccounted",
+    proxies => "unaccounted",
+    host_indexed => "unaccounted",
+    new_target => "unaccounted",
+    pending_new_target => "unaccounted",
+    htmldda => "unaccounted",
+    ctor_caller_realm => "unaccounted",
+    realms => "unaccounted",
+    promises => "unaccounted",
+    unhandled_rejections => "unaccounted",
+    temporal => "unaccounted",
+    temporal_cal => "unaccounted",
+    microtasks => "unaccounted",
+    host_job_context => "non_owning",
+    host_settings_states => "unaccounted",
+    retired_host_job_contexts => "unaccounted",
+    host_job_context_enter => "non_owning",
+    host_job_context_leave => "non_owning",
+    kept_alive => "unaccounted",
+    host_state => "unaccounted",
+    generators => "unaccounted",
+    gc_next => "non_owning",
+    gc_suppressed => "non_owning",
+    gc_tick => "non_owning",
+    gc_task_allocated => "non_owning",
+    scope_gc_next => "non_owning",
+    constructing => "non_owning",
+    super_call_ok => "non_owning",
+    fn_frames => "unaccounted",
+    module_async_seq => "non_owning",
+    yield_raw_result => "non_owning",
+    in_async_gen_body => "non_owning",
+    pending_fn_name => "unaccounted",
+    pending_tail => "unaccounted",
+    tco_ok => "non_owning",
+    template_cache => "unaccounted",
+    in_field_init_code => "non_owning",
+    using_stack => "unaccounted",
+    accessor_seq => "non_owning",
+    decorator_initializers => "unaccounted",
+    annexb_fn_sync => "unaccounted",
+    deferred_ns => "unaccounted",
+    deferred_ns_objs => "unaccounted",
+    promise_forward => "unaccounted",
+    mapped_arguments => "unaccounted",
+    module_source_objs => "unaccounted",
+    weak_refs => "unaccounted",
+    finalization_registries => "unaccounted",
+    pending_finalization_cleanup => "unaccounted",
+    async_gen_busy => "unaccounted",
+    async_gen_queue => "unaccounted",
+}
+
+#[cfg(test)]
+#[test]
+fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
+    use std::collections::HashSet;
+
+    let mut names = HashSet::new();
+    for &(name, class) in INTERP_MEMORY_INVENTORY {
+        assert!(
+            names.insert(name),
+            "duplicate Interp inventory field {name}"
+        );
+        assert!(
+            matches!(
+                class,
+                "measured" | "external" | "non_owning" | "unaccounted"
+            ),
+            "invalid Interp memory classification for {name}: {class}"
+        );
+    }
+    assert_eq!(names.len(), 130);
+    let _tripwire: fn(&Interp) = interp_memory_inventory_exhaustive_pattern;
+}
+
 impl Drop for Interp {
     fn drop(&mut self) {
         // libtest exits the process before persistent runtime-worker TLS destructors run. Flush

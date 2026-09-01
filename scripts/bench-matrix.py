@@ -557,7 +557,14 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
             if managed.get("complete"):
                 raise BenchmarkError("managed-memory record cannot be complete before a safepoint")
             for name in ("managed_requested_bytes", "managed_external_bytes"):
-                if managed.get(name) != {"bytes": None, "quality": "unavailable"}:
+                measurement = managed.get(name)
+                if (
+                    not isinstance(measurement, dict)
+                    or measurement.get("bytes") is not None
+                    or measurement.get("quality") != "unavailable"
+                    or not isinstance(measurement.get("reason"), str)
+                    or not measurement["reason"]
+                ):
                     raise BenchmarkError(f"invalid unavailable {name} record")
         else:
             if managed.get("safepoint") != "post_gc" or not isinstance(
@@ -571,6 +578,13 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
                     or not isinstance(measurement.get("bytes"), int)
                     or measurement["bytes"] < 0
                     or measurement.get("quality") not in ("exact", "lower_bound")
+                    or (
+                        measurement.get("quality") == "lower_bound"
+                        and (
+                            not isinstance(measurement.get("reason"), str)
+                            or not measurement["reason"]
+                        )
+                    )
                 ):
                     raise BenchmarkError(f"invalid {name} in managed-memory record")
             for name, category in managed["categories"].items():
@@ -579,13 +593,21 @@ def parse_engine_metrics(stderr: str, prefix: str | None) -> dict[str, Any] | No
                 quality = category.get("quality")
                 byte_count = category.get("bytes")
                 if quality == "unavailable":
-                    if byte_count is not None:
+                    if (
+                        byte_count is not None
+                        or not isinstance(category.get("reason"), str)
+                        or not category["reason"]
+                    ):
                         raise BenchmarkError(
-                            "unavailable managed-memory category has a byte count"
+                            "unavailable managed-memory category lacks a reason or has bytes"
                         )
                 elif quality in ("exact", "lower_bound"):
                     if not isinstance(byte_count, int) or byte_count < 0:
                         raise BenchmarkError("invalid managed-memory category byte count")
+                    if quality == "lower_bound" and (
+                        not isinstance(category.get("reason"), str) or not category["reason"]
+                    ):
+                        raise BenchmarkError("lower-bound managed-memory category lacks a reason")
                 else:
                     raise BenchmarkError("invalid managed-memory category quality")
     return metrics

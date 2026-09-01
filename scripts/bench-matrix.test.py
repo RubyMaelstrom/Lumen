@@ -113,10 +113,11 @@ class UnitTests(unittest.TestCase):
             '"upper_bounds":[50000,null],"counts":[1,1]},'
             '"managed_memory":{"schema_version":1,"agent_id":1,"heap_id":2,'
             '"safepoint":"post_gc",'
-            '"complete":false,"managed_requested_bytes":{"bytes":12,"quality":"lower_bound"},'
-            '"managed_external_bytes":{"bytes":4,"quality":"lower_bound"},'
+            '"complete":false,"managed_requested_bytes":{"bytes":12,"quality":"lower_bound",'
+            '"reason":"partial"},'
+            '"managed_external_bytes":{"bytes":4,"quality":"lower_bound","reason":"partial"},'
             '"categories":{"objects":{"bytes":8,"quality":"exact"},'
-            '"side_tables":{"bytes":null,"quality":"unavailable"}}}}\n'
+            '"side_tables":{"bytes":null,"quality":"unavailable","reason":"pending"}}}}\n'
         )
         metrics = bench_matrix.parse_engine_metrics(stderr, "[lumen-perf] ")
         self.assertEqual(metrics["jit_compile_seconds"], 0.25)
@@ -131,8 +132,8 @@ class UnitTests(unittest.TestCase):
         with self.assertRaises(bench_matrix.BenchmarkError):
             bench_matrix.parse_engine_metrics(
                 stderr.replace(
-                    '"side_tables":{"bytes":null,"quality":"unavailable"}',
-                    '"side_tables":{"bytes":0,"quality":"unavailable"}',
+                    '"side_tables":{"bytes":null,"quality":"unavailable","reason":"pending"}',
+                    '"side_tables":{"bytes":0,"quality":"unavailable","reason":"pending"}',
                 ),
                 "[lumen-perf] ",
             )
@@ -140,8 +141,10 @@ class UnitTests(unittest.TestCase):
             '[lumen-perf] {"schema_version":1,"gc_collections":0,'
             '"managed_memory":{"schema_version":1,"agent_id":1,"heap_id":2,'
             '"safepoint":null,"complete":false,'
-            '"managed_requested_bytes":{"bytes":null,"quality":"unavailable"},'
-            '"managed_external_bytes":{"bytes":null,"quality":"unavailable"}}}\n'
+            '"managed_requested_bytes":{"bytes":null,"quality":"unavailable",'
+            '"reason":"no safepoint"},'
+            '"managed_external_bytes":{"bytes":null,"quality":"unavailable",'
+            '"reason":"no safepoint"}}}\n'
         )
         parsed = bench_matrix.parse_engine_metrics(unavailable, "[lumen-perf] ")
         self.assertIsNone(parsed["managed_memory"]["managed_requested_bytes"]["bytes"])

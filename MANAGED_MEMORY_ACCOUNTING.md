@@ -111,8 +111,10 @@ Current implementation notes:
   information. They exclude allocator rounding and Rust's private `RcBox` header.
 - A standard-library `HashMap` makes its containing storage category a lower bound: its entry
   payload can be described, but its private bucket/control allocation cannot be measured exactly.
-- Adding the remaining owners and a compile-time-maintained ownership inventory is still required
-  before `complete` can become true.
+- Adding the remaining owners is still required before `complete` can become true. A test-only
+  inventory macro expands one checked-in classification list into an exhaustive `Interp` struct
+  pattern with no `..`, so a newly added field fails test compilation until classified. Its
+  temporary `unaccounted` class is review-visible and must reach zero before completion.
 
 Allocation attribution rules for the remaining slices:
 

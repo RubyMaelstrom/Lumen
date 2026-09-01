@@ -31,6 +31,7 @@ impl Quality {
 struct Category {
     bytes: usize,
     quality: Quality,
+    reason: Option<&'static str>,
 }
 
 impl Category {
@@ -38,13 +39,15 @@ impl Category {
         Self {
             bytes,
             quality: Quality::Exact,
+            reason: None,
         }
     }
 
-    fn lower_bound(bytes: usize) -> Self {
+    fn lower_bound(bytes: usize, reason: &'static str) -> Self {
         Self {
             bytes,
             quality: Quality::LowerBound,
+            reason: Some(reason),
         }
     }
 
@@ -52,16 +55,25 @@ impl Category {
         self.bytes = self.bytes.saturating_add(bytes);
     }
 
-    fn make_lower_bound(&mut self) {
+    fn make_lower_bound(&mut self, reason: &'static str) {
         self.quality = Quality::LowerBound;
+        self.reason = Some(reason);
     }
 
     fn json(self) -> String {
-        format!(
-            "{{\"bytes\":{},\"quality\":\"{}\"}}",
-            self.bytes,
-            self.quality.json()
-        )
+        match self.reason {
+            Some(reason) => format!(
+                "{{\"bytes\":{},\"quality\":\"{}\",\"reason\":\"{}\"}}",
+                self.bytes,
+                self.quality.json(),
+                reason
+            ),
+            None => format!(
+                "{{\"bytes\":{},\"quality\":\"{}\"}}",
+                self.bytes,
+                self.quality.json()
+            ),
+        }
     }
 }
 
@@ -96,18 +108,18 @@ impl Snapshot {
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
                 "\"safepoint\":\"post_gc\",\"complete\":false,",
-                "\"managed_requested_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\"}},",
-                "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\"}},",
+                "\"managed_requested_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"unavailable ownership categories are excluded\"}},",
+                "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"shared, Wasm, and host backing stores are not yet included\"}},",
                 "\"categories\":{{",
                 "\"object_bodies\":{},\"property_storage\":{},",
                 "\"scope_bodies\":{},\"scope_storage\":{},",
                 "\"strings_symbols_bigints\":{},\"callable_metadata\":{},",
                 "\"array_buffer_backing\":{},",
-                "\"function_ast_bytecode_feedback\":{{\"bytes\":null,\"quality\":\"unavailable\"}},",
-                "\"interpreter_side_tables\":{{\"bytes\":null,\"quality\":\"unavailable\"}},",
-                "\"engine_caches\":{{\"bytes\":null,\"quality\":\"unavailable\"}},",
-                "\"shared_wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\"}},",
-                "\"host_resources\":{{\"bytes\":null,\"quality\":\"unavailable\"}}",
+                "\"function_ast_bytecode_feedback\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"recursive Function and Chunk traversal has not landed\"}},",
+                "\"interpreter_side_tables\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"Interp ownership inventory still contains unaccounted fields\"}},",
+                "\"engine_caches\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cache overhead and pinned payload traversal has not landed\"}},",
+                "\"shared_wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cross-Agent backing-store identity policy has not landed\"}},",
+                "\"host_resources\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"host retained-size hook has not landed\"}}",
                 "}}}}"
             ),
             agent_id,
@@ -320,7 +332,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         let (bytes, exact) = visitor.object(&object.borrow());
         property_storage.add(bytes);
         if !exact {
-            property_storage.make_lower_bound();
+            property_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
         }
     }
 
@@ -329,7 +341,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         let (bytes, exact) = visitor.scope(&scope.borrow());
         scope_storage.add(bytes);
         if !exact {
-            scope_storage.make_lower_bound();
+            scope_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
         }
     }
 
@@ -342,11 +354,20 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         scope_storage,
         // The visitor deduplicates everything it sees, but AST, bytecode and side-table values are
         // deliberately deferred to later vertical slices.
-        strings_symbols_bigints: Category::lower_bound(visitor.strings_symbols_bigints),
-        callable_metadata: Category::lower_bound(visitor.callable_metadata),
+        strings_symbols_bigints: Category::lower_bound(
+            visitor.strings_symbols_bigints,
+            "AST, cache, and side-table owners are not yet traversed",
+        ),
+        callable_metadata: Category::lower_bound(
+            visitor.callable_metadata,
+            "Function AST, bytecode, and native closure payloads are not yet traversed",
+        ),
         // The ordinary stores reached through this table are exact, but the category remains a
         // lower bound until shared/Wasm and host-created backing stores join the same layer.
-        array_buffer_backing: Category::lower_bound(array_buffer_bytes),
+        array_buffer_backing: Category::lower_bound(
+            array_buffer_bytes,
+            "shared, Wasm, and host-created backing stores are not yet traversed",
+        ),
     }
 }
 
@@ -369,8 +390,8 @@ pub(crate) fn json(interp: &Interp) -> String {
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
                 "\"safepoint\":null,\"complete\":false,",
-                "\"managed_requested_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\"}},",
-                "\"managed_external_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\"}}}}"
+                "\"managed_requested_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}},",
+                "\"managed_external_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}}}}"
             ),
             agent.agent_id, heap_id
         ),
@@ -395,12 +416,12 @@ mod tests {
     fn unavailable_snapshot_is_not_reported_as_zero() {
         let json = Snapshot {
             object_bodies: Category::exact(1),
-            property_storage: Category::lower_bound(2),
+            property_storage: Category::lower_bound(2, "test lower bound"),
             scope_bodies: Category::exact(3),
             scope_storage: Category::exact(4),
-            strings_symbols_bigints: Category::lower_bound(5),
-            callable_metadata: Category::lower_bound(6),
-            array_buffer_backing: Category::lower_bound(7),
+            strings_symbols_bigints: Category::lower_bound(5, "test lower bound"),
+            callable_metadata: Category::lower_bound(6, "test lower bound"),
+            array_buffer_backing: Category::lower_bound(7, "test lower bound"),
         }
         .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":null"));
