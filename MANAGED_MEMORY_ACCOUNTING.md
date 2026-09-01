@@ -206,6 +206,11 @@ async-generator requests. Chunks and JavaScript payloads retain canonical family
 suspended environments remain canonical to the scope snapshot. Lumen's current continuations own
 no OS thread or native stack, correcting an obsolete interpreter comment from the former design.
 
+Weak-reference ownership includes WeakRef entries, FinalizationRegistry cell buffers, cleanup
+callbacks and held values, and the queued cleanup-job vector. Weak targets and unregister tokens
+are never upgraded or visited by diagnostics; their inline `Weak` handles are included in table or
+cell payload, while private `Rc` allocation headers remain outside requested-byte accounting.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly

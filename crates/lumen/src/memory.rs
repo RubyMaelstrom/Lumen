@@ -950,6 +950,48 @@ fn scan_realm(
 
     totals.interpreter_side_tables.add(
         interp
+            .weak_refs
+            .len()
+            .saturating_mul(size_of::<(usize, Option<crate::interpreter::WeakTarget>)>())
+            .saturating_add(
+                interp
+                    .finalization_registries
+                    .len()
+                    .saturating_mul(size_of::<(usize, crate::interpreter::FinalizationState)>()),
+            )
+            .saturating_add(
+                interp
+                    .pending_finalization_cleanup
+                    .capacity()
+                    .saturating_mul(size_of::<Value>()),
+            ),
+    );
+    for registry in interp.finalization_registries.values() {
+        visitor.value(&registry.cleanup_callback);
+        totals.interpreter_side_tables.add(
+            registry
+                .cells
+                .capacity()
+                .saturating_mul(size_of::<crate::interpreter::FinalizationCell>()),
+        );
+        for cell in &registry.cells {
+            // `target` and `unregister_token` are deliberately not upgraded: diagnostics must
+            // never turn an ECMA-262 weak edge into a strong root. The cell buffer already
+            // includes their inline Weak handles; only [[HeldValue]] is strongly retained.
+            visitor.value(&cell.held_value);
+        }
+    }
+    for registry in &interp.pending_finalization_cleanup {
+        visitor.value(registry);
+    }
+    if !interp.weak_refs.is_empty() || !interp.finalization_registries.is_empty() {
+        totals
+            .interpreter_side_tables
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+
+    totals.interpreter_side_tables.add(
+        interp
             .map_data
             .len()
             .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
@@ -1663,6 +1705,61 @@ mod tests {
         let after = measure(&engine.interp, &after_objects, &after_scopes);
 
         assert!(after.function_bytecode_metadata.bytes > before.function_bytecode_metadata.bytes);
+        assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
+        assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
+    }
+
+    #[test]
+    fn weak_targets_stay_weak_while_finalization_payloads_are_scanned() {
+        let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
+
+        engine
+            .eval(
+                r#"
+                    globalThis.memoryWeakTarget = {};
+                    globalThis.memoryWeakToken = {};
+                    globalThis.memoryWeakRef = new WeakRef(memoryWeakTarget);
+                    globalThis.memoryFinalizer = new FinalizationRegistry(function () {});
+                    memoryFinalizer.register(
+                        memoryWeakTarget,
+                        "held finalization payload",
+                        memoryWeakToken
+                    );
+                "#,
+                false,
+            )
+            .expect("weak-owner setup parses");
+        assert_eq!(engine.interp.weak_refs.len(), 1);
+        assert_eq!(engine.interp.finalization_registries.len(), 1);
+        assert_eq!(
+            engine
+                .interp
+                .finalization_registries
+                .values()
+                .next()
+                .expect("registry state exists")
+                .cells
+                .len(),
+            1
+        );
+        let registry = match engine
+            .interp
+            .get_member(&Value::Obj(engine.interp.global.clone()), "memoryFinalizer")
+        {
+            Ok(registry) => registry,
+            Err(_) => panic!("registry global is readable"),
+        };
+        engine
+            .interp
+            .pending_finalization_cleanup
+            .push_back(registry);
+
+        let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let after = measure(&engine.interp, &after_objects, &after_scopes);
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
         assert!(after.strings_symbols_bigints.bytes > before.strings_symbols_bigints.bytes);
     }

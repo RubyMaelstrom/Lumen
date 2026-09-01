@@ -1836,9 +1836,9 @@ interp_memory_inventory! {
     promise_forward => "measured",
     mapped_arguments => "unaccounted",
     module_source_objs => "unaccounted",
-    weak_refs => "unaccounted",
-    finalization_registries => "unaccounted",
-    pending_finalization_cleanup => "unaccounted",
+    weak_refs => "measured",
+    finalization_registries => "measured",
+    pending_finalization_cleanup => "measured",
     async_gen_busy => "measured",
     async_gen_queue => "measured",
 }

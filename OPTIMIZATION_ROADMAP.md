@@ -416,6 +416,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     `[[KeptAlive]]`, and host-settings/global-name ownership with shared-`Rc` deduplication.
   - [x] Account boxed heap VM/module/builtin coroutines, suspended execution buffers, and queued
     async-generator requests without re-crediting chunks, scopes, or JavaScript payloads.
+  - [x] Account WeakRef and FinalizationRegistry storage, strongly retained held values/callbacks,
+    and cleanup jobs without upgrading weak targets or unregister tokens.
   - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
     stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
     the report to complete.
