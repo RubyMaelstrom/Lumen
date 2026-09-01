@@ -384,9 +384,12 @@ finish the baseline, but no later phase may claim a performance win against the 
     slice, shared-allocation deduplication, and explicit exact/lower-bound/unavailable labels.
   - [x] Add an exact `Interp`-field destructuring tripwire and checked-in ownership classification;
     a newly added field now breaks test compilation until it is explicitly classified.
-  - [ ] Cover function AST/bytecode/feedback, every interpreter side table and bounded cache,
-    shared/Wasm backing stores, and host resources; reduce the inventory's `unaccounted` class to
-    zero before changing the report to complete.
+  - [x] Add allocation-family-deduplicated Function/Chunk traversal for primary bytecode,
+    constant/name, feedback/IC, hoist, template, and JIT heap-sidecar storage while keeping
+    executable mappings separate.
+  - [ ] Cover remaining recursive AST/uncommon bytecode allocations, every interpreter side table
+    and bounded cache, shared/Wasm backing stores, and host resources; reduce the inventory's
+    `unaccounted` class to zero before changing the report to complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
   DOM-reconciliation/layout and event-loop/mutation fixtures run through TRust's production page

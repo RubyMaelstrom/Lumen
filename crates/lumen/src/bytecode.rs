@@ -991,6 +991,153 @@ pub struct Chunk {
     pub(crate) jit: std::cell::OnceCell<Option<Rc<crate::jit::JitCode>>>,
 }
 
+impl Chunk {
+    /// Scan the directly-owned bytecode/feedback payload. Recursive AST plans remain explicitly a
+    /// lower bound in the report; shared Functions, strings, properties, chunks, and JIT sidecars
+    /// route back through the one allocation-family visitor for identity deduplication.
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
+        macro_rules! vec_bytes {
+            ($field:ident, $ty:ty) => {
+                self.$field
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<$ty>())
+            };
+        }
+        let mut bytes = std::mem::size_of::<Chunk>()
+            .saturating_add(vec_bytes!(ops, Op))
+            .saturating_add(vec_bytes!(consts, Value))
+            .saturating_add(vec_bytes!(names, Rc<str>))
+            .saturating_add(vec_bytes!(slot_names, Rc<str>))
+            .saturating_add(vec_bytes!(funcs, Rc<Function>))
+            .saturating_add(vec_bytes!(templates, (u64, Vec<(Option<String>, String)>)))
+            .saturating_add(vec_bytes!(eval_exprs, EvalExprPlan))
+            .saturating_add(vec_bytes!(class_plans, ClassPlan))
+            .saturating_add(vec_bytes!(assignment_targets, AssignmentTargetPlan))
+            .saturating_add(vec_bytes!(lexical_scopes, Vec<LexicalBinding>))
+            .saturating_add(vec_bytes!(cap_inits, CapInit))
+            .saturating_add(vec_bytes!(caches, std::cell::Cell<IcState>))
+            .saturating_add(vec_bytes!(
+                obj_maps,
+                std::cell::OnceCell<crate::value::Props>
+            ))
+            .saturating_add(vec_bytes!(name_caches, std::cell::Cell<NameIc>))
+            .saturating_add(vec_bytes!(name_num_bits, std::cell::Cell<u64>))
+            .saturating_add(vec_bytes!(name_num_valid, std::cell::Cell<bool>))
+            .saturating_add(vec_bytes!(cap_caches, std::cell::Cell<NameIc>))
+            .saturating_add(vec_bytes!(
+                regexp_literals,
+                std::cell::OnceCell<Rc<crate::regex::Regex>>
+            ))
+            .saturating_add(vec_bytes!(call_caches, CallSite))
+            .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
+            .saturating_add(vec_bytes!(inline_targets, InlineTarget));
+
+        for value in &self.consts {
+            visitor.value(value);
+        }
+        for name in self.names.iter().chain(&self.slot_names) {
+            visitor.rc_str(name);
+        }
+        for function in &self.funcs {
+            visitor.function(function);
+        }
+        for (_, parts) in &self.templates {
+            bytes = bytes.saturating_add(
+                parts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(Option<String>, String)>()),
+            );
+            for (cooked, raw) in parts {
+                bytes = bytes.saturating_add(raw.capacity());
+                if let Some(cooked) = cooked {
+                    bytes = bytes.saturating_add(cooked.capacity());
+                }
+            }
+        }
+        for plan in &self.eval_exprs {
+            bytes = bytes.saturating_add(
+                plan.locals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<AssignmentLocal>()),
+            );
+            bytes = bytes.saturating_add(plan.name.as_ref().map_or(0, String::capacity));
+            for local in &plan.locals {
+                visitor.rc_str(&local.name);
+            }
+        }
+        for plan in &self.assignment_targets {
+            bytes = bytes.saturating_add(
+                plan.locals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<AssignmentLocal>()),
+            );
+            for local in &plan.locals {
+                visitor.rc_str(&local.name);
+            }
+        }
+        for plan in &self.class_plans {
+            bytes = bytes.saturating_add(plan.inferred_name.as_ref().map_or(0, String::capacity));
+        }
+        for scope in &self.lexical_scopes {
+            bytes = bytes.saturating_add(
+                scope
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<LexicalBinding>()),
+            );
+            for binding in scope {
+                visitor.rc_str(&binding.name);
+            }
+        }
+        for init in &self.cap_inits {
+            let name = match init {
+                CapInit::Param(_, name)
+                | CapInit::Var(name)
+                | CapInit::Fn(_, name)
+                | CapInit::Lexical(name, _) => name,
+            };
+            visitor.rc_str(name);
+        }
+        for map in &self.obj_maps {
+            if let Some(map) = map.get() {
+                visitor.props(map);
+            }
+        }
+        bytes =
+            bytes
+                .saturating_add(self.name_pins.borrow().capacity().saturating_mul(
+                    std::mem::size_of::<
+                        Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>,
+                    >(),
+                ))
+                .saturating_add(self.cap_pins.borrow().capacity().saturating_mul(
+                    std::mem::size_of::<
+                        Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>,
+                    >(),
+                ));
+        if let Some(Some(plan)) = self.initializer_plan.get() {
+            bytes = bytes.saturating_add(
+                plan.fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<InitializerField>()),
+            );
+        }
+        if let Some(Some(fields)) = self.simple_constructor_plan.get() {
+            bytes = bytes.saturating_add(
+                fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<InitializerField>()),
+            );
+        }
+        if let Some(runtime) = self.arguments_forwarder_runtime.borrow().as_ref() {
+            visitor.chunk(&runtime.chunk);
+        }
+        if let Some(code) = self.jit.get().and_then(Option::as_ref) {
+            visitor.jit_code(code);
+        }
+        visitor.add_function_bytecode_bytes(bytes);
+    }
+}
+
 /// Borrowed description of a constructor whose complete body is a sequence of unique
 /// parameter-to-`this` stores followed by implicit return.
 pub(crate) struct SimpleConstructor<'a> {

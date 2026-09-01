@@ -281,6 +281,16 @@ pub struct JitCode {
 }
 
 impl JitCode {
+    /// Heap-requested metadata only. The executable mapping is intentionally excluded and remains
+    /// visible through the independent generated-code byte metric.
+    pub(crate) fn retained_heap_metadata_bytes(&self) -> usize {
+        std::mem::size_of::<JitCode>().saturating_add(
+            self.pc_offsets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u32>()),
+        )
+    }
+
     /// The machine-code entry address (for CallIc fills — the direct-call sequence branches
     /// to it through the swapped ctx).
     pub(crate) fn mem_ptr(&self) -> *const u8 {

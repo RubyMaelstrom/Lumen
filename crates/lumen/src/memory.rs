@@ -85,6 +85,8 @@ pub(crate) struct Snapshot {
     scope_storage: Category,
     strings_symbols_bigints: Category,
     callable_metadata: Category,
+    function_bytecode_metadata: Category,
+    jit_heap_metadata: Category,
     array_buffer_backing: Category,
 }
 
@@ -97,6 +99,7 @@ impl Snapshot {
             self.scope_storage,
             self.strings_symbols_bigints,
             self.callable_metadata,
+            self.function_bytecode_metadata,
         ]
         .into_iter()
         .map(|category| category.bytes)
@@ -114,8 +117,8 @@ impl Snapshot {
                 "\"object_bodies\":{},\"property_storage\":{},",
                 "\"scope_bodies\":{},\"scope_storage\":{},",
                 "\"strings_symbols_bigints\":{},\"callable_metadata\":{},",
+                "\"function_bytecode_metadata\":{},\"jit_heap_metadata\":{},",
                 "\"array_buffer_backing\":{},",
-                "\"function_ast_bytecode_feedback\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"recursive Function and Chunk traversal has not landed\"}},",
                 "\"interpreter_side_tables\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"Interp ownership inventory still contains unaccounted fields\"}},",
                 "\"engine_caches\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cache overhead and pinned payload traversal has not landed\"}},",
                 "\"shared_wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cross-Agent backing-store identity policy has not landed\"}},",
@@ -132,24 +135,34 @@ impl Snapshot {
             self.scope_storage.json(),
             self.strings_symbols_bigints.json(),
             self.callable_metadata.json(),
+            self.function_bytecode_metadata.json(),
+            self.jit_heap_metadata.json(),
             self.array_buffer_backing.json(),
         )
     }
 }
 
 #[derive(Default)]
-struct Visitor {
+pub(crate) struct Visitor {
     lstrs: HashSet<usize>,
     rc_strs: HashSet<usize>,
     symbols: HashSet<usize>,
     bigints: HashSet<usize>,
     callable_allocations: HashSet<usize>,
+    functions: HashSet<usize>,
+    chunks: HashSet<usize>,
+    jit_codes: HashSet<usize>,
+    hoist_plans: HashSet<usize>,
     strings_symbols_bigints: usize,
     callable_metadata: usize,
+    function_bytecode_metadata: usize,
+    jit_heap_metadata: usize,
+    detached_property_storage: usize,
+    detached_property_storage_opaque: bool,
 }
 
 impl Visitor {
-    fn rc_str(&mut self, value: &Rc<str>) {
+    pub(crate) fn rc_str(&mut self, value: &Rc<str>) {
         let identity = Rc::as_ptr(value) as *const () as usize;
         if self.rc_strs.insert(identity) {
             // `RcBox` counters are a private standard-library layout and are excluded.
@@ -169,7 +182,7 @@ impl Visitor {
         }
     }
 
-    fn value(&mut self, value: &Value) {
+    pub(crate) fn value(&mut self, value: &Value) {
         match value {
             Value::BigInt(value) => {
                 if self.bigints.insert(value.allocation_identity()) {
@@ -214,6 +227,7 @@ impl Visitor {
                         .callable_metadata
                         .saturating_add(size_of_val(value.as_ref()));
                 }
+                self.function(&value.func);
             }
             Callable::Bound(value) => {
                 // Box-backed variants have one allocation per containing Object, and the object
@@ -256,6 +270,110 @@ impl Visitor {
                 }
                 self.rc_str(name.as_ref());
             }
+        }
+    }
+
+    pub(crate) fn add_function_bytecode_bytes(&mut self, bytes: usize) {
+        self.function_bytecode_metadata = self.function_bytecode_metadata.saturating_add(bytes);
+    }
+
+    pub(crate) fn add_jit_heap_metadata_bytes(&mut self, bytes: usize) {
+        self.jit_heap_metadata = self.jit_heap_metadata.saturating_add(bytes);
+    }
+
+    pub(crate) fn function(&mut self, function: &Rc<crate::ast::Function>) {
+        let identity = Rc::as_ptr(function) as usize;
+        if !self.functions.insert(identity) {
+            return;
+        }
+        let mut bytes = size_of::<crate::ast::Function>()
+            .saturating_add(
+                function
+                    .params
+                    .capacity()
+                    .saturating_mul(size_of::<crate::ast::Param>()),
+            )
+            .saturating_add(
+                function
+                    .body
+                    .capacity()
+                    .saturating_mul(size_of::<crate::ast::Stmt>()),
+            );
+        if let Some(name) = &function.name {
+            bytes = bytes.saturating_add(name.capacity());
+        }
+        if let Some(source) = &function.source {
+            self.rc_str(source);
+        }
+        if let Some((_, hoist)) = function.hoist.get() {
+            let identity = Rc::as_ptr(hoist) as usize;
+            if self.hoist_plans.insert(identity) {
+                bytes = bytes
+                    .saturating_add(size_of::<Vec<crate::ast::HoistOp>>())
+                    .saturating_add(
+                        hoist
+                            .capacity()
+                            .saturating_mul(size_of::<crate::ast::HoistOp>()),
+                    );
+                for op in hoist.iter() {
+                    match op {
+                        crate::ast::HoistOp::Var(name) => {
+                            bytes = bytes.saturating_add(name.capacity());
+                        }
+                        crate::ast::HoistOp::Fn(name, nested)
+                        | crate::ast::HoistOp::AnnexB(name, nested) => {
+                            bytes = bytes.saturating_add(name.capacity());
+                            self.function(nested);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(chunk) = function.code.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
+        if let Some(chunk) = function.code2.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
+        if let Some((function_map, prototype_map)) = function.fn_maps.get() {
+            self.props(function_map);
+            if let Some(prototype_map) = prototype_map {
+                self.props(prototype_map);
+            }
+        }
+        self.add_function_bytecode_bytes(bytes);
+    }
+
+    pub(crate) fn chunk(&mut self, chunk: &Rc<crate::bytecode::Chunk>) {
+        let identity = Rc::as_ptr(chunk) as usize;
+        if self.chunks.insert(identity) {
+            chunk.scan_retained_memory(self);
+        }
+    }
+
+    pub(crate) fn jit_code(&mut self, code: &Rc<crate::jit::JitCode>) {
+        let identity = Rc::as_ptr(code) as usize;
+        if self.jit_codes.insert(identity) {
+            self.add_jit_heap_metadata_bytes(code.retained_heap_metadata_bytes());
+        }
+    }
+
+    pub(crate) fn props(&mut self, props: &crate::value::Props) {
+        let (bytes, exact) = props.retained_requested_storage_bytes();
+        self.detached_property_storage = self.detached_property_storage.saturating_add(bytes);
+        self.detached_property_storage_opaque |= !exact;
+        for (name, property) in props.iter() {
+            self.rc_str(name);
+            self.value(&property.value());
+            if let Some(getter) = property.getter() {
+                self.value(getter);
+            }
+            if let Some(setter) = property.setter() {
+                self.value(setter);
+            }
+        }
+        for property in props.packed_values() {
+            self.value(&property.value());
         }
     }
 
@@ -335,7 +453,6 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
             property_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
         }
     }
-
     let mut scope_storage = Category::exact(0);
     for scope in scopes {
         let (bytes, exact) = visitor.scope(&scope.borrow());
@@ -343,6 +460,13 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         if !exact {
             scope_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
         }
+    }
+
+    // Function-owned maps can be reached while scanning either objects or scopes. Merge their
+    // storage only after both root families have completed so traversal order cannot omit it.
+    property_storage.add(visitor.detached_property_storage);
+    if visitor.detached_property_storage_opaque {
+        property_storage.make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
     let array_buffer_bytes = unique_array_buffer_capacity(interp.array_buffers.values());
@@ -361,6 +485,14 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         callable_metadata: Category::lower_bound(
             visitor.callable_metadata,
             "Function AST, bytecode, and native closure payloads are not yet traversed",
+        ),
+        function_bytecode_metadata: Category::lower_bound(
+            visitor.function_bytecode_metadata,
+            "nested AST allocations and uncommon Chunk plans are not yet fully traversed",
+        ),
+        jit_heap_metadata: Category::lower_bound(
+            visitor.jit_heap_metadata,
+            "heap sidecars are covered; executable mappings are reported separately",
         ),
         // The ordinary stores reached through this table are exact, but the category remains a
         // lower bound until shared/Wasm and host-created backing stores join the same layer.
@@ -421,11 +553,13 @@ mod tests {
             scope_storage: Category::exact(4),
             strings_symbols_bigints: Category::lower_bound(5, "test lower bound"),
             callable_metadata: Category::lower_bound(6, "test lower bound"),
+            function_bytecode_metadata: Category::lower_bound(8, "test lower bound"),
+            jit_heap_metadata: Category::lower_bound(9, "test lower bound"),
             array_buffer_backing: Category::lower_bound(7, "test lower bound"),
         }
         .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":null"));
-        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":21"));
+        assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":29"));
     }
 
     #[test]
@@ -481,5 +615,23 @@ mod tests {
             crate::value::heap_id(&first.gc_heap),
             crate::value::heap_id(&second.gc_heap)
         );
+    }
+
+    #[test]
+    fn compiled_function_metadata_is_retained_in_its_canonical_categories() {
+        let mut engine = crate::Engine::new();
+        engine.set_tier(crate::bytecode::Tier::Jit);
+        engine.set_tier_threshold(0);
+        engine
+            .eval(
+                "function f(o) { let n = 0; for (let i=0;i<20;i++) n += o.x+i; return n; } globalThis.keep=f; f({x:1});",
+                false,
+            )
+            .expect("metadata fixture parses");
+        let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let snapshot = measure(&engine.interp, &objects, &scopes);
+        assert!(snapshot.function_bytecode_metadata.bytes > 0);
+        assert!(snapshot.callable_metadata.bytes > 0);
     }
 }

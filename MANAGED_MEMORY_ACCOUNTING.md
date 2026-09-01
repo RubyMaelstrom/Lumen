@@ -132,6 +132,13 @@ Allocation attribution rules for the remaining slices:
   stable allocation identity and an externally-shared marker so a process aggregator can dedupe
   it across Agents without changing the useful per-Agent retained view.
 
+The Function/Chunk vertical slice now follows user callables through both compiled generations,
+deduplicates shared Functions, Chunks, hoist plans, and JIT sidecars, and accounts the principal
+bytecode, constant, name, feedback/IC, captured-binding, template, and plan-vector capacities.
+Recursive allocations inside retained AST `Stmt`/`Expr`/`Pattern`/`Class` trees and several
+uncommon Chunk plans remain a documented lower bound. JIT `pc_offsets` and its Rust payload are
+reported as heap metadata; executable mappings remain exclusively in generated-code metrics.
+
 ## Questions worth outside review
 
 1. Is a safepoint retention visitor the right short-term contract, or should Phase 0 explicitly
