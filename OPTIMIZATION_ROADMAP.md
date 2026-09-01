@@ -482,14 +482,16 @@ finish the baseline, but no later phase may claim a performance win against the 
   validates schema, scope, reserved bits, stable layout hash, site/slot counts, and every word;
   current shape-derived tokens may only return to the exact live vector that emitted them, with
   all mismatches reported as explicit drop reasons and accepted data merged without narrowing.
-- [ ] Record arithmetic operand/result categories, including integer, double, string, BigInt,
+- [x] Record arithmetic operand/result categories, including integer, double, string, BigInt,
   object, and mixed/megamorphic states.
   - [x] Record stable original-operand and successful-result classes for binary arithmetic,
     bitwise/shift, exponentiation, and unary numeric operators in both baseline and JIT execution.
     Int32-safe Number is distinguished from other binary64 Number values; mixed sites retain a
     bounded class bitset before widening to generic. Disabled mode allocates no word storage.
-  - [ ] Extend the same semantic observations through `++`/`--` local, environment, property, and
-    element update paths without losing their combined ToNumeric/write ordering.
+  - [x] Extend the same semantic observations through `++`/`--` local, environment, property,
+    element, private-field, immutable-target, and `super` update paths without losing their
+    combined ToNumeric/write ordering. The shared path also corrects object-to-BigInt ToNumeric
+    updates across the tree-walker, bytecode VM, and JIT.
 - [ ] Record abstract property receiver/holder layout identities, prototype depth, field location,
   and accessor/exotic outcomes; resolve identities to current shapes or future Maps through the
   active adapter.

@@ -88,15 +88,21 @@ Number/BigInt TypeError still describes both inputs and leaves the result uninit
 bits widen from monomorphic through a four-class polymorphic set to generic; old samples never
 overwrite or narrow newer evidence.
 
+Update expressions use the same abstract operand/result roles across local-slot, captured/free
+environment, named property, element, private-field, immutable-target, and `super` lowerings.
+Following ECMA-262 §7.1.3 and §13.4.2-5, the operand is the raw result of GetValue before ToNumeric;
+the result is the arithmetic `newValue`, recorded only after PutValue succeeds. Prefix/postfix
+selection affects the expression value returned to bytecode but not this arithmetic observation.
+An object that coerces to BigInt is therefore recorded as an Object operand with a BigInt result,
+and a throwing coercion or setter never publishes a successful result.
+
 Detailed arithmetic collection is opt-in through `LUMEN_FEEDBACK_PROFILE`. Disabled chunks retain
 one predictable boolean check at each arithmetic helper and never allocate observation words.
-Profile-enabled AArch64 chunks route numeric inline templates and register chains through the
-exact-PC helper so optimized executions are not omitted; the normal configuration keeps those
-fast paths unchanged. A second-stage transformed/inlined chunk has no exact transformed-PC to
-canonical-site map yet, so it is explicitly unbound and cannot write coincidentally matching PCs;
-its retained baseline chunk remains the feedback authority. Update-expression bytecodes
-(`++`/`--`) are a separate follow-up because their local, environment, property, and element forms
-combine arithmetic with a write.
+Profile-enabled AArch64 chunks route numeric inline templates, update fusions, and register chains
+through exact-PC observation paths so optimized executions are not omitted; the normal
+configuration keeps those fast paths unchanged. A second-stage transformed/inlined chunk has no
+exact transformed-PC to canonical-site map yet, so it is explicitly unbound and cannot write
+coincidentally matching PCs; its retained baseline chunk remains the feedback authority.
 
 Every optimizing consumer must treat missing, unknown, mixed, or invalidated feedback as a reason
 to use a guard plus exact semantic fallback. A guard failure resumes at the exact semantic point;

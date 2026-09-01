@@ -5419,6 +5419,76 @@ fn compiled_update_free_name() {
 }
 
 #[test]
+fn update_expression_tonumeric_preserves_object_produced_bigint_in_every_tier() {
+    // ECMA-262 §13.4.2-5 applies ToNumeric(GetValue(lhs)); testing only a primitive BigInt misses
+    // the observable ToPrimitive step and previously let compiled updates call ToNumber here.
+    let src = r#"
+      function wrapped(n, log) {
+        return { valueOf: function () { log.push('coerce:' + n); return BigInt(n); } };
+      }
+      function localCase(log) {
+        let value = wrapped(4, log);
+        let old = value++;
+        return old === 4n && value === 5n;
+      }
+      function capturedCase(log) {
+        let value = wrapped(6, log);
+        return function () {
+          let result = --value;
+          return result === 5n && value === 5n;
+        }();
+      }
+      function propertyCase(log) {
+        let object = { value: wrapped(8, log) };
+        let old = object.value--;
+        return old === 8n && object.value === 7n;
+      }
+      function elementCase(log) {
+        let values = [wrapped(10, log)];
+        let result = ++values[0];
+        return result === 11n && values[0] === 11n;
+      }
+      function throwingSetterCase(log) {
+        let holder = {};
+        Object.defineProperty(holder, 'value', {
+          get: function () { return wrapped(12, log); },
+          set: function (value) {
+            log.push('set:' + typeof value + ':' + value);
+            throw new Error('rejected');
+          }
+        });
+        try {
+          holder.value++;
+        } catch (error) {
+          return error.message === 'rejected';
+        }
+        return false;
+      }
+      let log = [];
+      [localCase(log), capturedCase(log), propertyCase(log), elementCase(log),
+       throwingSetterCase(log), log.join(',')].join('|');
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let got = match engine.eval(src, false).expect("parse") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        };
+        assert_eq!(
+            got,
+            "true|true|true|true|true|coerce:4,coerce:6,coerce:8,coerce:10,coerce:12,set:bigint:13",
+            "tier {tier:?}"
+        );
+    }
+}
+
+#[test]
 fn compiled_regexp_literal_is_fresh() {
     let src = r#"
       function make() { return /a+/gi; }

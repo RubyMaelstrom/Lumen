@@ -6403,16 +6403,25 @@ impl Interp {
         // Resolve the reference once, then GetValue/PutValue through it (spec Reference semantics).
         let mut lref = self.resolve_reference(arg, env)?;
         let old = self.get_reference(&mut lref)?;
-        if let Value::BigInt(n) = old {
-            let one = crate::bigint::JsBigInt::from_u64(1);
-            let new = if op == "++" { n.add(&one) } else { n.sub(&one) };
-            self.put_reference(&mut lref, Value::BigInt(new.clone()))?;
-            return Ok(Value::BigInt(if prefix { new } else { n }));
+        let old_numeric = self.to_numeric(old)?;
+        match old_numeric {
+            Value::BigInt(old) => {
+                let one = crate::bigint::JsBigInt::from_u64(1);
+                let new = if op == "++" {
+                    old.add(&one)
+                } else {
+                    old.sub(&one)
+                };
+                self.put_reference(&mut lref, Value::BigInt(new.clone()))?;
+                Ok(Value::BigInt(if prefix { new } else { old }))
+            }
+            Value::Num(old) => {
+                let new = if op == "++" { old + 1.0 } else { old - 1.0 };
+                self.put_reference(&mut lref, Value::Num(new))?;
+                Ok(Value::Num(if prefix { new } else { old }))
+            }
+            _ => unreachable!("ToNumeric returns only Number or BigInt"),
         }
-        let n = self.to_number(&old)?;
-        let new = if op == "++" { n + 1.0 } else { n - 1.0 };
-        self.put_reference(&mut lref, Value::Num(new))?;
-        Ok(Value::Num(if prefix { new } else { n }))
     }
 
     fn eval_assign(
@@ -7347,6 +7356,24 @@ impl Interp {
                 self.to_number(&p)?
             }
         })
+    }
+
+    /// ECMA-262 §7.1.3 ToNumeric: apply ToPrimitive with a number hint, preserve a BigInt
+    /// primitive, and otherwise apply ToNumber. Keeping this operation shared is important for
+    /// update expressions: an object can observably coerce to BigInt even though the original
+    /// reference value was not itself a BigInt.
+    pub(crate) fn to_numeric(&mut self, value: Value) -> Result<Value, Abrupt> {
+        match value {
+            numeric @ (Value::Num(_) | Value::BigInt(_)) => Ok(numeric),
+            other => {
+                let primitive = self.to_primitive(&other, Hint::Number)?;
+                if matches!(primitive, Value::BigInt(_)) {
+                    Ok(primitive)
+                } else {
+                    Ok(Value::Num(self.to_number(&primitive)?))
+                }
+            }
+        }
     }
 
     pub(crate) fn to_int32(&mut self, v: &Value) -> Result<i32, Abrupt> {

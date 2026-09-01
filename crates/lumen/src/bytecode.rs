@@ -2614,22 +2614,35 @@ fn feedback_layout_for_ops(
             | Op::SetPropDrop(..)
             | Op::SetPropThisDrop(..)
             | Op::SetPropLocalDrop(..)
-            | Op::AppendProp(..)
-            | Op::UpdateProp(..) => (
+            | Op::AppendProp(..) => (
                 OperationKind::NamedStore,
                 &[RECEIVER_LAYOUT, HOLDER_LAYOUT, VALUE_OPERAND_1],
+            ),
+            Op::UpdateProp(..) => (
+                OperationKind::NamedStore,
+                &[
+                    RECEIVER_LAYOUT,
+                    HOLDER_LAYOUT,
+                    VALUE_OPERAND_0,
+                    VALUE_RESULT,
+                ],
             ),
             Op::GetElem | Op::GetElemLocal(..) | Op::GetMethodElem => (
                 OperationKind::ElementLoad,
                 &[RECEIVER_LAYOUT, ELEMENT_ACCESS, HOLDER_LAYOUT, VALUE_RESULT],
             ),
-            Op::SetElem
-            | Op::SetElemDrop
-            | Op::SetElemLocal(..)
-            | Op::SetElemLocalDrop(..)
-            | Op::UpdateElem(..) => (
+            Op::SetElem | Op::SetElemDrop | Op::SetElemLocal(..) | Op::SetElemLocalDrop(..) => (
                 OperationKind::ElementStore,
                 &[RECEIVER_LAYOUT, ELEMENT_ACCESS, VALUE_OPERAND_1],
+            ),
+            Op::UpdateElem(..) => (
+                OperationKind::ElementStore,
+                &[
+                    RECEIVER_LAYOUT,
+                    ELEMENT_ACCESS,
+                    VALUE_OPERAND_0,
+                    VALUE_RESULT,
+                ],
             ),
             Op::Call(..)
             | Op::CallWithThis(..)
@@ -2668,6 +2681,13 @@ fn feedback_layout_for_ops(
             Op::Neg | Op::Plus | Op::BitNot => {
                 (OperationKind::Arithmetic, &[VALUE_OPERAND_0, VALUE_RESULT])
             }
+            Op::UpdateLocal(..)
+            | Op::UpdateCap(..)
+            | Op::UpdateName(..)
+            | Op::UpdateNameCached(..)
+            | Op::UpdateConst(..)
+            | Op::UpdatePrivate(..)
+            | Op::SuperUpdate(..) => (OperationKind::Arithmetic, &[VALUE_OPERAND_0, VALUE_RESULT]),
             Op::JumpIfFalse(..)
             | Op::JumpIfFalsePeek(..)
             | Op::JumpIfTruePeek(..)
@@ -3104,6 +3124,107 @@ mod feedback_layout_tests {
         assert_eq!(
             feedback
                 .read(site, ObservationKind::ValueClass, ObservationRole::Operand1)
+                .payload(),
+            ValueClass::NumberInt32.bit()
+        );
+        assert_eq!(
+            feedback
+                .read(site, ObservationKind::ValueClass, ObservationRole::Result)
+                .state(),
+            ObservationState::Uninitialized
+        );
+    }
+
+    #[test]
+    fn update_layout_covers_every_reference_lowering() {
+        let ops = [
+            Op::UpdateLocal(0, UpdKind::PostInc),
+            Op::UpdateCap(0, UpdKind::PreDec),
+            Op::UpdateName(0, UpdKind::IncDiscard),
+            Op::UpdateNameCached(0, 0, UpdKind::DecDiscard),
+            Op::UpdateConst(0, UpdKind::PostInc),
+            Op::UpdateProp(0, 0, UpdKind::PreInc),
+            Op::UpdateElem(UpdKind::PostDec),
+            Op::UpdatePrivate(0, UpdKind::PreDec),
+            Op::SuperUpdate(UpdKind::PostInc),
+        ];
+        let (layout, _) = feedback_layout_for_ops(&ops, &[Rc::from("value")]);
+        let sites = layout.site_ids().collect::<Vec<_>>();
+
+        assert_eq!(sites.len(), ops.len());
+        for site in sites {
+            let slots = layout.slots(site).expect("update site has slots");
+            assert!(slots.contains(&VALUE_OPERAND_0));
+            assert!(slots.contains(&VALUE_RESULT));
+        }
+    }
+
+    #[test]
+    fn profiled_update_records_raw_operand_and_successful_new_value() {
+        let (layout, bindings) = feedback_layout_for_ops(
+            &[Op::UpdateLocal(0, UpdKind::PostInc)],
+            &[Rc::from("value")],
+        );
+        let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
+        let mut interp = Interp::new();
+        let mut stored = None;
+
+        let expression = match step_value(
+            &mut interp,
+            &feedback,
+            0,
+            UpdKind::PostInc,
+            Value::str("4"),
+            |_, value| {
+                stored = Some(value);
+                Ok(())
+            },
+        ) {
+            Ok(Some(value)) => value,
+            Ok(None) => panic!("postfix update must return a value"),
+            Err(_) => panic!("string update must succeed"),
+        };
+
+        assert!(matches!(expression, Value::Num(4.0)));
+        assert!(matches!(stored, Some(Value::Num(5.0))));
+        let site = feedback.sites().next().unwrap().0;
+        assert_eq!(
+            feedback
+                .read(site, ObservationKind::ValueClass, ObservationRole::Operand0)
+                .payload(),
+            ValueClass::String.bit()
+        );
+        assert_eq!(
+            feedback
+                .read(site, ObservationKind::ValueClass, ObservationRole::Result)
+                .payload(),
+            ValueClass::NumberInt32.bit()
+        );
+    }
+
+    #[test]
+    fn failed_update_write_does_not_publish_a_result_class() {
+        let (layout, bindings) = feedback_layout_for_ops(
+            &[Op::UpdateProp(0, 0, UpdKind::PreInc)],
+            &[Rc::from("value")],
+        );
+        let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
+        let mut interp = Interp::new();
+
+        assert!(step_value(
+            &mut interp,
+            &feedback,
+            0,
+            UpdKind::PreInc,
+            Value::Num(2.0),
+            |interp, _| Err(interp.throw("TypeError", "setter rejected update")),
+        )
+        .is_err());
+
+        let site = feedback.sites().next().unwrap().0;
+        assert_eq!(
+            feedback
+                .read(site, ObservationKind::ValueClass, ObservationRole::Operand0)
                 .payload(),
             ValueClass::NumberInt32.bit()
         );
@@ -9854,12 +9975,15 @@ fn run_vm(
                     }
                     // Fast path: a numeric slot updates in place.
                     Value::Num(n) => {
+                        let profiling =
+                            observe_arithmetic_operand(&chunk.feedback, op_pc, &slots[idx]);
                         let old = *n;
                         let new = match kind {
                             UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => old + 1.0,
                             UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => old - 1.0,
                         };
                         slots[idx] = Value::Num(new);
+                        observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &slots[idx]);
                         match kind {
                             UpdKind::PreInc | UpdKind::PreDec => stack.push(Value::Num(new)),
                             UpdKind::PostInc | UpdKind::PostDec => stack.push(Value::Num(old)),
@@ -9869,6 +9993,8 @@ fn run_vm(
                     // BigInt updates stay BigInt (ToNumeric, not ToNumber) — never coerced to a
                     // Number and never thrown on like unary `+` would.
                     Value::BigInt(n) => {
+                        let profiling =
+                            observe_arithmetic_operand(&chunk.feedback, op_pc, &slots[idx]);
                         let old = n.clone();
                         let one = crate::bigint::JsBigInt::from_u64(1);
                         let new = match kind {
@@ -9880,30 +10006,24 @@ fn run_vm(
                             }
                         };
                         slots[idx] = Value::BigInt(new.clone());
+                        observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &slots[idx]);
                         match kind {
                             UpdKind::PreInc | UpdKind::PreDec => stack.push(Value::BigInt(new)),
                             UpdKind::PostInc | UpdKind::PostDec => stack.push(Value::BigInt(old)),
                             UpdKind::IncDiscard | UpdKind::DecDiscard => {}
                         }
                     }
-                    // Anything else: ToNumber (may run user `valueOf`), then a Number update. The
-                    // post value is the *coerced* number, matching the tree-walker's `eval_update`.
+                    // Anything else: the shared ToNumeric path may run user code and may produce
+                    // either Number or BigInt. This is cold compared with the two direct tags.
                     _ => {
                         let old = slots[idx].clone();
-                        let coerced = i.to_number(&old)?;
-                        let new = match kind {
-                            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => {
-                                coerced + 1.0
-                            }
-                            UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => {
-                                coerced - 1.0
-                            }
-                        };
-                        slots[idx] = Value::Num(new);
-                        match kind {
-                            UpdKind::PreInc | UpdKind::PreDec => stack.push(Value::Num(new)),
-                            UpdKind::PostInc | UpdKind::PostDec => stack.push(Value::Num(coerced)),
-                            UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+                        if let Some(value) =
+                            step_value(i, &chunk.feedback, op_pc, kind, old, |_, value| {
+                                slots[idx] = value;
+                                Ok(())
+                            })?
+                        {
+                            stack.push(value);
                         }
                     }
                 }
@@ -9932,7 +10052,7 @@ fn run_vm(
                     }
                     bd.value.clone()
                 };
-                step_and_store(i, stack, kind, old, |_, v| {
+                step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |_, v| {
                     if let Some(bd) = cap_env.borrow_mut().vars.get_mut(name) {
                         bd.value = v;
                     }
@@ -9942,12 +10062,16 @@ fn run_vm(
             Op::UpdateName(n, kind) => {
                 let name = &chunk.names[n as usize];
                 let old = i.get_var(name, env)?;
-                step_and_store(i, stack, kind, old, |i, v| i.assign_free_name(name, v, env))?;
+                step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
+                    i.assign_free_name(name, v, env)
+                })?;
             }
             Op::UpdateNameCached(n, c, kind) => {
                 let name = &chunk.names[n as usize];
                 let old = chunk.load_name_ic(i, env, n, c)?;
-                step_and_store(i, stack, kind, old, |i, v| i.assign_free_name(name, v, env))?;
+                step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
+                    i.assign_free_name(name, v, env)
+                })?;
             }
             Op::MakeClosure(fidx, name_n) => {
                 let v = i.make_function(chunk.funcs[fidx as usize].clone(), env.clone());
@@ -10012,7 +10136,7 @@ fn run_vm(
             Op::UpdateConst(n, kind) => {
                 let old = pop!();
                 let name = chunk.names[n as usize].clone();
-                step_value(i, kind, old, |i, _| {
+                step_value(i, &chunk.feedback, op_pc, kind, old, |i, _| {
                     Err(i.throw(
                         "TypeError",
                         format!("assignment to constant variable '{name}'"),
@@ -10633,7 +10757,7 @@ fn run_vm(
                 let name = &chunk.names[n as usize];
                 let cache = &chunk.caches[c as usize];
                 let old = i.get_prop_ic(&obj, name, cache)?;
-                step_and_store(i, stack, kind, old, |i, v| {
+                step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
                     i.set_prop_ic(&obj, name, v, cache)
                 })?;
             }
@@ -10641,19 +10765,31 @@ fn run_vm(
                 let key = pop!();
                 let obj = pop!();
                 // Dense-element fast path: numeric key on a plain array/object.
-                if let (Value::Obj(o), Value::Num(nk)) = (&obj, &key) {
-                    if let Some(Value::Num(old)) = i.fast_get_elem(o, *nk) {
-                        let new = match kind {
-                            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => old + 1.0,
-                            UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => old - 1.0,
-                        };
-                        if i.fast_set_elem(o, *nk, Value::Num(new)).is_ok() {
-                            match kind {
-                                UpdKind::PreInc | UpdKind::PreDec => stack.push(Value::Num(new)),
-                                UpdKind::PostInc | UpdKind::PostDec => stack.push(Value::Num(old)),
-                                UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+                // Detailed collection uses the exact-PC shared tail below; ordinary execution
+                // retains this allocation-free numeric path.
+                if !chunk.feedback.detailed_enabled() {
+                    if let (Value::Obj(o), Value::Num(nk)) = (&obj, &key) {
+                        if let Some(Value::Num(old)) = i.fast_get_elem(o, *nk) {
+                            let new = match kind {
+                                UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => {
+                                    old + 1.0
+                                }
+                                UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => {
+                                    old - 1.0
+                                }
+                            };
+                            if i.fast_set_elem(o, *nk, Value::Num(new)).is_ok() {
+                                match kind {
+                                    UpdKind::PreInc | UpdKind::PreDec => {
+                                        stack.push(Value::Num(new))
+                                    }
+                                    UpdKind::PostInc | UpdKind::PostDec => {
+                                        stack.push(Value::Num(old))
+                                    }
+                                    UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }
@@ -10664,7 +10800,9 @@ fn run_vm(
                 }
                 let k = i.to_property_key(&key)?;
                 let old = i.get_member(&obj, &k)?;
-                step_and_store(i, stack, kind, old, |i, v| i.set_member(&obj, &k, v))?;
+                step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
+                    i.set_member(&obj, &k, v)
+                })?;
             }
             Op::ToPropKeyLocal(s) => {
                 if matches!(slots[s as usize], Value::Undefined | Value::Null) {
@@ -11064,9 +11202,11 @@ fn run_vm(
             Op::UpdatePrivate(name, kind) => {
                 let base = pop!();
                 let old = i.private_get_vm(&chunk.names[name as usize], &base, env)?;
-                if let Some(value) = step_value(i, kind, old, |i, value| {
-                    i.private_set_vm(&chunk.names[name as usize], &base, value, env)
-                })? {
+                if let Some(value) =
+                    step_value(i, &chunk.feedback, op_pc, kind, old, |i, value| {
+                        i.private_set_vm(&chunk.names[name as usize], &base, value, env)
+                    })?
+                {
                     stack.push(value);
                 }
             }
@@ -11128,10 +11268,12 @@ fn run_vm(
                 }
                 let key = i.to_property_key(&key)?.into_string();
                 let old = i.get_member_recv(&base, &key, receiver.clone())?;
-                if let Some(value) = step_value(i, kind, old, |i, value| {
-                    i.set_member_recv(&base, &key, value, receiver.clone())
-                        .map(|_| ())
-                })? {
+                if let Some(value) =
+                    step_value(i, &chunk.feedback, op_pc, kind, old, |i, value| {
+                        i.set_member_recv(&base, &key, value, receiver.clone())
+                            .map(|_| ())
+                    })?
+                {
                     stack.push(value);
                 }
             }
@@ -12580,44 +12722,42 @@ impl VmCoro {
     }
 }
 
-/// Shared `++`/`--` tail for property/element updates: ToNumeric the old value, write old±1 back
-/// through `set`, and return the value to leave on the stack — old / new / nothing per `kind`.
-/// Post variants yield the *coerced* old value, matching the oracle's `eval_update`; a BigInt
-/// stays a BigInt.
+/// Shared `++`/`--` tail: ToNumeric the old value, write old±1 back through `set`, and return the
+/// value to leave on the stack — old / new / nothing per `kind`.
+///
+/// ECMA-262 §13.4.2-5 requires PutValue to succeed before either a prefix or postfix expression
+/// completes. Accordingly the raw GetValue result is observed before potentially abrupt
+/// ToNumeric, while the arithmetic `newValue` is published only after `set` succeeds. Postfix
+/// returns the coerced old numeric value; an object that coerces to BigInt therefore stays BigInt.
+#[inline]
 fn step_value(
     i: &mut Interp,
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
     kind: UpdKind,
     old: Value,
     set: impl FnOnce(&mut Interp, Value) -> Result<(), Abrupt>,
 ) -> Result<Option<Value>, Abrupt> {
+    let profiling = observe_arithmetic_operand(feedback, pc, &old);
     let inc = matches!(
         kind,
         UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
     );
-    Ok(match old {
-        Value::BigInt(n) => {
+    let old_numeric = i.to_numeric(old)?;
+    let new_value = match &old_numeric {
+        Value::BigInt(old) => {
             let one = crate::bigint::JsBigInt::from_u64(1);
-            let new = if inc { n.add(&one) } else { n.sub(&one) };
-            set(i, Value::BigInt(new.clone()))?;
-            match kind {
-                UpdKind::PreInc | UpdKind::PreDec => Some(Value::BigInt(new)),
-                UpdKind::PostInc | UpdKind::PostDec => Some(Value::BigInt(n)),
-                UpdKind::IncDiscard | UpdKind::DecDiscard => None,
-            }
+            Value::BigInt(if inc { old.add(&one) } else { old.sub(&one) })
         }
-        other => {
-            let oldn = match other {
-                Value::Num(n) => n,
-                other => i.to_number(&other)?,
-            };
-            let new = if inc { oldn + 1.0 } else { oldn - 1.0 };
-            set(i, Value::Num(new))?;
-            match kind {
-                UpdKind::PreInc | UpdKind::PreDec => Some(Value::Num(new)),
-                UpdKind::PostInc | UpdKind::PostDec => Some(Value::Num(oldn)),
-                UpdKind::IncDiscard | UpdKind::DecDiscard => None,
-            }
-        }
+        Value::Num(old) => Value::Num(if inc { old + 1.0 } else { old - 1.0 }),
+        _ => unreachable!("ToNumeric returns only Number or BigInt"),
+    };
+    set(i, new_value.clone())?;
+    observe_arithmetic_result(feedback, pc, profiling, &new_value);
+    Ok(match kind {
+        UpdKind::PreInc | UpdKind::PreDec => Some(new_value),
+        UpdKind::PostInc | UpdKind::PostDec => Some(old_numeric),
+        UpdKind::IncDiscard | UpdKind::DecDiscard => None,
     })
 }
 
@@ -12625,11 +12765,13 @@ fn step_value(
 fn step_and_store(
     i: &mut Interp,
     stack: &mut Vec<Value>,
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
     kind: UpdKind,
     old: Value,
     set: impl FnOnce(&mut Interp, Value) -> Result<(), Abrupt>,
 ) -> Result<(), Abrupt> {
-    if let Some(v) = step_value(i, kind, old, set)? {
+    if let Some(v) = step_value(i, feedback, pc, kind, old, set)? {
         stack.push(v);
     }
     Ok(())
@@ -15740,7 +15882,7 @@ unsafe fn jit_exec_inner(
                 ));
             }
             let old = slots[idx].clone();
-            if let Some(v) = step_value(i, kind, old, |_, v| {
+            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |_, v| {
                 slots[idx] = v;
                 Ok(())
             })? {
@@ -15771,7 +15913,7 @@ unsafe fn jit_exec_inner(
                 }
                 bd.value.clone()
             };
-            if let Some(v) = step_value(i, kind, old, |_, v| {
+            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |_, v| {
                 if let Some(bd) = env.borrow_mut().vars.get_mut(name) {
                     bd.value = v;
                 }
@@ -15783,14 +15925,18 @@ unsafe fn jit_exec_inner(
         Op::UpdateName(n, kind) => {
             let name = &chunk.names[n as usize];
             let old = i.get_var(name, env)?;
-            if let Some(v) = step_value(i, kind, old, |i, v| i.assign_free_name(name, v, env))? {
+            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                i.assign_free_name(name, v, env)
+            })? {
                 push!(v);
             }
         }
         Op::UpdateNameCached(n, c, kind) => {
             let name = &chunk.names[n as usize];
             let old = chunk.load_name_ic(i, env, n, c)?;
-            if let Some(v) = step_value(i, kind, old, |i, v| i.assign_free_name(name, v, env))? {
+            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                i.assign_free_name(name, v, env)
+            })? {
                 push!(v);
             }
         }
@@ -16094,26 +16240,30 @@ unsafe fn jit_exec_inner(
             let name = &chunk.names[n as usize];
             let cache = &chunk.caches[c as usize];
             let old = i.get_prop_ic(&obj, name, cache)?;
-            if let Some(v) = step_value(i, kind, old, |i, v| i.set_prop_ic(&obj, name, v, cache))? {
+            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                i.set_prop_ic(&obj, name, v, cache)
+            })? {
                 push!(v);
             }
         }
         Op::UpdateElem(kind) => {
             let key = pop!();
             let obj = pop!();
-            if let (Value::Obj(o), Value::Num(nk)) = (&obj, &key) {
-                if let Some(Value::Num(old)) = i.fast_get_elem(o, *nk) {
-                    let new = match kind {
-                        UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => old + 1.0,
-                        UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => old - 1.0,
-                    };
-                    if i.fast_set_elem(o, *nk, Value::Num(new)).is_ok() {
-                        match kind {
-                            UpdKind::PreInc | UpdKind::PreDec => push!(Value::Num(new)),
-                            UpdKind::PostInc | UpdKind::PostDec => push!(Value::Num(old)),
-                            UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+            if !chunk.feedback.detailed_enabled() {
+                if let (Value::Obj(o), Value::Num(nk)) = (&obj, &key) {
+                    if let Some(Value::Num(old)) = i.fast_get_elem(o, *nk) {
+                        let new = match kind {
+                            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => old + 1.0,
+                            UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => old - 1.0,
+                        };
+                        if i.fast_set_elem(o, *nk, Value::Num(new)).is_ok() {
+                            match kind {
+                                UpdKind::PreInc | UpdKind::PreDec => push!(Value::Num(new)),
+                                UpdKind::PostInc | UpdKind::PostDec => push!(Value::Num(old)),
+                                UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
                 }
             }
@@ -16122,7 +16272,9 @@ unsafe fn jit_exec_inner(
             }
             let k = i.to_property_key(&key)?;
             let old = i.get_member(&obj, &k)?;
-            if let Some(v) = step_value(i, kind, old, |i, v| i.set_member(&obj, &k, v))? {
+            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                i.set_member(&obj, &k, v)
+            })? {
                 push!(v);
             }
         }
