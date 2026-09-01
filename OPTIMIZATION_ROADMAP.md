@@ -580,8 +580,8 @@ finish the baseline, but no later phase may claim a performance win against the 
 - [x] Write a design record for the canonical tagged representation, including NaN handling,
   `-0`, infinities, ordinary numbers, small integers, pointers, strings, Symbols, BigInts,
   `undefined`, `null`, Boolean, and internal Empty/completion markers (`TAGGED_VALUE_DESIGN.md`).
-- [ ] Decide the initial pointer model and future compression boundary before encoding addresses
-  in generated code.
+- [x] Decide the initial pointer model and future compression boundary before encoding addresses
+  in generated code (`HEAP_POINTER_MODEL.md`: desktop cage offsets with a checked handle fallback).
 - [ ] Make heap pointers and immediate tags engine-owned rather than dependent on Rust enum or
   standard-library layouts.
 - [ ] Define one interpreter/bytecode/baseline/optimizing calling convention and frame layout.

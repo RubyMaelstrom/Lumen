@@ -78,14 +78,12 @@ ECMA-262 algorithms; raw-word equality is never a substitute for
 
 ## Heap reference boundary
 
-The pointer model is intentionally a separate decision (Phase 2, item 2).
-Before that decision, no `TaggedValue` may encode a native address. The
-recommended initial model is a 32-bit index/offset into an Agent-owned heap
-arena, with a generation or allocation-cookie check in debug/stress builds.
-This gives moving collection a single update point and leaves room for a
-pointer-compression cage later. A 48-bit canonical-address payload is an
-optimization option only after startup validation proves the platform address
-contract and after relocation/root tests cover it.
+The pointer model is recorded separately in `HEAP_POINTER_MODEL.md`: desktop
+Agents use a validated 32-bit cage offset, with a checked handle-table index as
+the portable fallback. Before the central heap exists, no `TaggedValue` may
+encode a native address. A 48-bit canonical-address payload is not an accepted
+ABI option; it would reintroduce the relocation and platform-address hazards
+that the cage/handle split avoids.
 
 References are always resolved through an Agent/heap context. A stale, zero, or
 wrong-kind reference is a verifier failure, never an implicit `undefined`.
@@ -127,4 +125,3 @@ handle families with their own ownership/accounting rules.
 No performance result can waive these correctness gates. A failed or ambiguous
 representation check falls back to the existing `Value`/bytecode path rather
 than guessing at a tag or pointer.
-
