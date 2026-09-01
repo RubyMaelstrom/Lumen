@@ -431,8 +431,10 @@ finish the baseline, but no later phase may claim a performance win against the 
     lower-bound quality for opaque standard-library queue backing/messages.
   - [x] Account identity-deduplicated collector registry/shape infrastructure; classify the opaque
     embedder wall clock and shared runtime-interrupt control handle as external ownership.
-  - [ ] Cover every remaining interpreter side table and bounded cache, shared/Wasm backing
-    stores, and host resources; reduce the inventory's `unaccounted` class to zero before changing
+  - [x] Add an explicit `RetainedBytes` hook for typed host state and resources, report any live
+    legacy/unreported entry as unavailable rather than zero, aggregate host state across nested
+    realms, and reduce the exhaustive `Interp` inventory's `unaccounted` class to zero.
+  - [ ] Cover shared/Wasm backing stores with cross-Agent identity deduplication before changing
     the report to complete.
 - [x] Create deterministic local browser replays for representative DOM/framework workloads so
   iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned

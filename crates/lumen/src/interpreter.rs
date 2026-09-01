@@ -1809,7 +1809,7 @@ interp_memory_inventory! {
     host_job_context_enter => "non_owning",
     host_job_context_leave => "non_owning",
     kept_alive => "measured",
-    host_state => "unaccounted",
+    host_state => "external",
     generators => "measured",
     gc_next => "non_owning",
     gc_suppressed => "non_owning",
@@ -1863,6 +1863,12 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
         );
     }
     assert_eq!(names.len(), 130);
+    assert!(
+        INTERP_MEMORY_INVENTORY
+            .iter()
+            .all(|(_, class)| *class != "unaccounted"),
+        "all Interp fields must have a retained-memory classification"
+    );
     let _tripwire: fn(&Interp) = interp_memory_inventory_exhaustive_pattern;
 }
 

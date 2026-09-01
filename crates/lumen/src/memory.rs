@@ -34,6 +34,50 @@ struct Category {
     reason: Option<&'static str>,
 }
 
+#[derive(Clone, Copy)]
+struct HostCategory {
+    reported_bytes: usize,
+    unavailable_entries: usize,
+    opaque_storage: bool,
+}
+
+impl HostCategory {
+    fn json(self) -> String {
+        if self.unavailable_entries != 0 {
+            return format!(
+                concat!(
+                    "{{\"bytes\":null,\"quality\":\"unavailable\",",
+                    "\"reason\":\"{} live host entries do not implement RetainedBytes\"}}"
+                ),
+                self.unavailable_entries
+            );
+        }
+        if self.opaque_storage {
+            return format!(
+                concat!(
+                    "{{\"bytes\":{},\"quality\":\"lower_bound\",",
+                    "\"reason\":\"opaque HashMap bucket and Rc allocation metadata\"}}"
+                ),
+                self.reported_bytes
+            );
+        }
+        format!(
+            "{{\"bytes\":{},\"quality\":\"exact\"}}",
+            self.reported_bytes
+        )
+    }
+}
+
+impl From<crate::host::HostRetainedMemory> for HostCategory {
+    fn from(memory: crate::host::HostRetainedMemory) -> Self {
+        Self {
+            reported_bytes: memory.reported_bytes,
+            unavailable_entries: memory.unavailable_entries,
+            opaque_storage: memory.opaque_storage,
+        }
+    }
+}
+
 impl Category {
     fn exact(bytes: usize) -> Self {
         Self {
@@ -91,6 +135,7 @@ pub(crate) struct Snapshot {
     engine_caches: Category,
     interpreter_side_tables: Category,
     array_buffer_backing: Category,
+    host_resources: HostCategory,
 }
 
 impl Snapshot {
@@ -117,8 +162,8 @@ impl Snapshot {
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
                 "\"safepoint\":\"post_gc\",\"complete\":false,",
-                "\"managed_requested_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"unavailable ownership categories are excluded\"}},",
-                "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"shared, Wasm, and host backing stores are not yet included\"}},",
+                "\"managed_requested_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"opaque allocator and container storage is excluded\"}},",
+                "\"managed_external_bytes\":{{\"bytes\":{},\"quality\":\"lower_bound\",\"reason\":\"shared and Wasm backing stores are not yet included\"}},",
                 "\"categories\":{{",
                 "\"object_bodies\":{},\"property_storage\":{},",
                 "\"scope_bodies\":{},\"scope_storage\":{},",
@@ -127,7 +172,7 @@ impl Snapshot {
                 "\"regexp_metadata\":{},\"engine_caches\":{},",
                 "\"interpreter_side_tables\":{},\"array_buffer_backing\":{},",
                 "\"shared_wasm_backing\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"cross-Agent backing-store identity policy has not landed\"}},",
-                "\"host_resources\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"host retained-size hook has not landed\"}}",
+                "\"host_resources\":{}",
                 "}}}}"
             ),
             agent_id,
@@ -146,6 +191,7 @@ impl Snapshot {
             self.engine_caches.json(),
             self.interpreter_side_tables.json(),
             self.array_buffer_backing.json(),
+            self.host_resources.json(),
         )
     }
 }
@@ -538,6 +584,7 @@ struct DirectTotals {
     scope_storage: Category,
     engine_caches: Category,
     interpreter_side_tables: Category,
+    host_resources: crate::host::HostRetainedMemory,
 }
 
 impl Default for DirectTotals {
@@ -549,6 +596,7 @@ impl Default for DirectTotals {
             scope_storage: Category::exact(0),
             engine_caches: Category::exact(0),
             interpreter_side_tables: Category::exact(0),
+            host_resources: crate::host::HostRetainedMemory::default(),
         }
     }
 }
@@ -563,6 +611,9 @@ fn scan_realm(
     totals.object_count = totals.object_count.saturating_add(objects.len());
     totals.scope_count = totals.scope_count.saturating_add(scopes.len());
     totals.interpreter_side_tables.add(size_of::<Interp>());
+    totals
+        .host_resources
+        .add(interp.host_state.retained_memory());
     let (gc_heap_bytes, gc_heap_exact) = visitor.gc_heap(&interp.gc_heap);
     totals.interpreter_side_tables.add(gc_heap_bytes);
     if !gc_heap_exact {
@@ -1578,8 +1629,9 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
         ),
         array_buffer_backing: Category::lower_bound(
             visitor.array_buffer_bytes,
-            "shared, Wasm, and host-created backing stores are not yet traversed",
+            "shared and Wasm backing stores are not yet traversed",
         ),
+        host_resources: totals.host_resources.into(),
     }
 }
 
@@ -1613,8 +1665,17 @@ pub(crate) fn json(interp: &Interp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::RetainedBytes;
     use crate::lstr::LStr;
     use crate::value::Props;
+
+    struct ReportedHostState(Vec<u8>);
+
+    impl RetainedBytes for ReportedHostState {
+        fn retained_bytes(&self) -> usize {
+            self.0.capacity()
+        }
+    }
 
     #[test]
     fn property_storage_counts_capacity_not_length() {
@@ -1639,10 +1700,44 @@ mod tests {
             engine_caches: Category::lower_bound(11, "test lower bound"),
             interpreter_side_tables: Category::lower_bound(12, "test lower bound"),
             array_buffer_backing: Category::lower_bound(7, "test lower bound"),
+            host_resources: HostCategory {
+                reported_bytes: 0,
+                unavailable_entries: 1,
+                opaque_storage: false,
+            },
         }
         .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":12"));
         assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":62"));
+        assert!(json.contains("\"host_resources\":{\"bytes\":null"));
+    }
+
+    #[test]
+    fn host_snapshot_requires_every_live_entry_to_report_retained_bytes() {
+        let empty = Interp::new();
+        let empty_snapshot = measure(&empty, &[], &[]);
+        assert_eq!(empty_snapshot.host_resources.reported_bytes, 0);
+        assert_eq!(empty_snapshot.host_resources.unavailable_entries, 0);
+        assert!(!empty_snapshot.host_resources.opaque_storage);
+        assert!(empty_snapshot
+            .json(1, 1)
+            .contains("\"host_resources\":{\"bytes\":0,\"quality\":\"exact\"}"));
+
+        let mut reported = Interp::new();
+        reported
+            .host_state
+            .put_retained(ReportedHostState(Vec::with_capacity(47)));
+        let reported_snapshot = measure(&reported, &[], &[]);
+        assert_eq!(reported_snapshot.host_resources.unavailable_entries, 0);
+        assert!(reported_snapshot.host_resources.reported_bytes >= 47);
+        assert!(reported_snapshot.host_resources.opaque_storage);
+
+        reported.host_state.put(String::from("opaque host state"));
+        let unavailable_snapshot = measure(&reported, &[], &[]);
+        assert_eq!(unavailable_snapshot.host_resources.unavailable_entries, 1);
+        let json = unavailable_snapshot.json(1, 1);
+        assert!(json.contains("\"host_resources\":{\"bytes\":null"));
+        assert!(json.contains("live host entries do not implement RetainedBytes"));
     }
 
     #[test]

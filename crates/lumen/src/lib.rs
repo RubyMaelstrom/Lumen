@@ -567,7 +567,7 @@ impl Engine {
 /// published crate; it stabilizes together with the `lumen-host`/`lumen-runtime` crates.
 #[cfg(feature = "embed")]
 pub mod embed {
-    pub use crate::host::{OpState, ResourceId, ResourceTable};
+    pub use crate::host::{OpState, ResourceId, ResourceTable, RetainedBytes};
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
     pub use crate::interpreter::{ArrayBufferBytes, Interp as Ctx, WeakValue};

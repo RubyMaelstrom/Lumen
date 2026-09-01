@@ -1,11 +1,11 @@
 # Managed-memory accounting design
 
-Status: implementation in vertical slices. The first post-collection visitor reports collector
-object/scope payloads, property/binding capacity, reachable shared string/Symbol/BigInt and
-callable lower bounds, and deduplicated ordinary `ArrayBuffer` capacity. Its versioned record
-marks the remaining side-table, cache, AST/bytecode, shared/Wasm, and host-resource owners as
-unavailable; the Phase 0 total is therefore explicitly a lower bound and the roadmap item remains
-open.
+Status: implementation in vertical slices. The post-collection visitor now classifies every
+`Interp` field, traverses the engine-owned side tables/caches described below, reports ordinary
+`ArrayBuffer` backing by identity, and exposes an opt-in retained-size contract for host state.
+Shared/Wasm backing remains unavailable, and any host entry that does not implement the contract
+makes the host category unavailable rather than silently contributing zero. The Phase 0 total is
+therefore explicitly incomplete and the roadmap item remains open.
 
 ## Why object count is not a byte count
 
@@ -35,9 +35,11 @@ At an explicit Agent safepoint after a forced collection, report all three layer
 
 1. `managed_requested_bytes`: unique live allocations semantically owned by the Agent, counting
    container capacity rather than length and deduplicating shared allocations by stable identity.
-2. `managed_external_bytes`: backing storage whose lifetime is controlled by a managed wrapper but
-   whose allocation is external to ordinary object/string/container storage. Buffers, WebAssembly
-   memories, and embedder resources belong here, with a category breakdown.
+2. `managed_external_bytes`: engine backing storage whose lifetime is controlled by a managed
+   wrapper but whose allocation is external to ordinary object/string/container storage. Buffers
+   and WebAssembly memories belong here, with a category breakdown. Host resources are a sibling
+   diagnostic and are never summed into this value, so shell and TRust records remain explicit
+   about their different embedder payloads.
 3. `allocator_live_bytes`, `allocator_cached_bytes`, and process current/peak RSS: implementation
    residency. These diagnose fragmentation and cache policy but do not replace layers 1 and 2.
 
@@ -111,10 +113,10 @@ Current implementation notes:
   information. They exclude allocator rounding and Rust's private `RcBox` header.
 - A standard-library `HashMap` makes its containing storage category a lower bound: its entry
   payload can be described, but its private bucket/control allocation cannot be measured exactly.
-- Adding the remaining owners is still required before `complete` can become true. A test-only
-  inventory macro expands one checked-in classification list into an exhaustive `Interp` struct
-  pattern with no `..`, so a newly added field fails test compilation until classified. Its
-  temporary `unaccounted` class is review-visible and must reach zero before completion.
+- The test-only inventory macro expands one checked-in classification list into an exhaustive
+  `Interp` struct pattern with no `..`, so a newly added field fails test compilation until
+  classified. The inventory now rejects every `unaccounted` entry. `complete` remains false until
+  the separately tracked shared/Wasm backing category has a cross-Agent identity policy.
 
 Allocation attribution rules for the remaining slices:
 
@@ -247,6 +249,14 @@ and free-list capacity, weak scope-registry capacity, and shape-transition entry
 Object/scope bodies remain in their existing canonical categories. The embedder wall-clock closure
 and shared runtime-interrupt handle are classified external: captured closure state and cross-engine
 Arc ownership cannot be assigned honestly to one Agent's managed total.
+
+Host ownership uses the public `RetainedBytes` contract. Existing `OpState::put` and
+`ResourceTable::add` calls remain source-compatible but deliberately register an unreported entry;
+the `host_resources` category then emits `null`/`unavailable`. Embedders that can describe owned
+capacity use `put_retained` or `add_retained`; Lumen adds the inline value size and aggregates the
+reported payload across the root realm and every ShadowRealm. HashMap bucket storage and private
+`Rc` allocation metadata remain a documented lower bound. Host bytes stay a sibling category and
+are not added to either engine-managed composite.
 
 ## Questions worth outside review
 
