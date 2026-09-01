@@ -466,10 +466,12 @@ finish the baseline, but no later phase may claim a performance win against the 
 
 ### Phase 1: measurement, feedback, and observability
 
-- [ ] Design a compact per-function feedback vector with stable site numbering and versioned,
+- [x] Design a compact per-function feedback vector with stable site numbering and versioned,
   abstract observation-slot kinds. Name semantic observations such as `ValueClass`,
   `ReceiverLayout`, `HolderLayout`, `ElementAccess`, and `CallTarget`; do not expose Rust enum
-  discriminants, raw pointers, or today's shape-number encoding as the profile contract.
+  discriminants, raw pointers, or today's shape-number encoding as the profile contract. Schema
+  version 1, its canonical baseline-bytecode numbering, lazy payload boundary, and adapter rules
+  are recorded in `FEEDBACK_SCHEMA.md` and compile into every eligible baseline chunk.
 - [ ] Define adapters that initially populate layout observations from current shape/prototype
   data, then migrate the same slots to heap Map handles and validity dependencies without changing
   bytecode site identity or the diagnostic file schema.

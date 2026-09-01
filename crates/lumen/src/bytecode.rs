@@ -930,6 +930,9 @@ pub struct Chunk {
     /// `Chunk` is shared across calls via `Rc`, so these persist. `Cell` is fine: the VM runs one
     /// thread at a time (coroutine ping-pong), like the rest of the engine's shared-`Rc` state.
     caches: Vec<std::cell::Cell<IcState>>,
+    /// Representation-independent semantic site layout. The detailed payload is lazy and does
+    /// not mirror raw IC words; a second-stage compile reuses the canonical baseline layout.
+    feedback: crate::feedback::FeedbackVector,
     /// One pre-shaped `Props` template per plain object-literal site (`Op::MakeObject`'s third
     /// operand indexes this; `u32::MAX` = duplicate keys, take the insert path). Built on first
     /// execution, cloned per instance — key hashing and shape transitions paid once per SITE.
@@ -1031,6 +1034,7 @@ impl Chunk {
             .saturating_add(vec_bytes!(call_caches, CallSite))
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
+        bytes = bytes.saturating_add(self.feedback.retained_bytes());
 
         for value in &self.consts {
             visitor.value(value);
@@ -2519,6 +2523,187 @@ impl CaptureScan {
 // Compiler
 // ---------------------------------------------------------------------------------------------
 
+const VALUE_OPERAND_0: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::ValueClass,
+    role: crate::feedback::ObservationRole::Operand0,
+};
+const VALUE_OPERAND_1: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::ValueClass,
+    role: crate::feedback::ObservationRole::Operand1,
+};
+const VALUE_RESULT: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::ValueClass,
+    role: crate::feedback::ObservationRole::Result,
+};
+const RECEIVER_LAYOUT: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::ReceiverLayout,
+    role: crate::feedback::ObservationRole::Receiver,
+};
+const HOLDER_LAYOUT: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::HolderLayout,
+    role: crate::feedback::ObservationRole::Holder,
+};
+const ELEMENT_ACCESS: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::ElementAccess,
+    role: crate::feedback::ObservationRole::Access,
+};
+const CALL_TARGET: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::CallTarget,
+    role: crate::feedback::ObservationRole::Target,
+};
+const BRANCH_OUTCOME: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::BranchCount,
+    role: crate::feedback::ObservationRole::Outcome,
+};
+const ALLOCATION_OUTCOME: crate::feedback::SlotDescriptor = crate::feedback::SlotDescriptor {
+    kind: crate::feedback::ObservationKind::Allocation,
+    role: crate::feedback::ObservationRole::Outcome,
+};
+
+/// Build the immutable semantic layout from the canonical baseline bytecode. Cache indexes and
+/// raw shape/callee state are intentionally ignored: a future adapter may read them, but they are
+/// not part of the profile schema. ECMA-262 §6.1, §10.1.8.1, and §13.3.6.2 define the semantic
+/// distinctions represented by these slots.
+fn feedback_layout_for_ops(ops: &[Op]) -> crate::feedback::FeedbackLayout {
+    use crate::feedback::{LayoutBuilder, OperationKind};
+
+    let mut builder = LayoutBuilder::default();
+    for (pc, op) in ops.iter().enumerate() {
+        let (operation, slots): (OperationKind, &[crate::feedback::SlotDescriptor]) = match op {
+            Op::GetProp(..) | Op::GetPropThis(..) | Op::GetPropLocal(..) | Op::GetMethod(..) => (
+                OperationKind::NamedLoad,
+                &[RECEIVER_LAYOUT, HOLDER_LAYOUT, VALUE_RESULT],
+            ),
+            Op::SetProp(..)
+            | Op::SetPropDrop(..)
+            | Op::SetPropThisDrop(..)
+            | Op::SetPropLocalDrop(..)
+            | Op::AppendProp(..)
+            | Op::UpdateProp(..) => (
+                OperationKind::NamedStore,
+                &[RECEIVER_LAYOUT, HOLDER_LAYOUT, VALUE_OPERAND_1],
+            ),
+            Op::GetElem | Op::GetElemLocal(..) | Op::GetMethodElem => (
+                OperationKind::ElementLoad,
+                &[RECEIVER_LAYOUT, ELEMENT_ACCESS, HOLDER_LAYOUT, VALUE_RESULT],
+            ),
+            Op::SetElem
+            | Op::SetElemDrop
+            | Op::SetElemLocal(..)
+            | Op::SetElemLocalDrop(..)
+            | Op::UpdateElem(..) => (
+                OperationKind::ElementStore,
+                &[RECEIVER_LAYOUT, ELEMENT_ACCESS, VALUE_OPERAND_1],
+            ),
+            Op::Call(..)
+            | Op::CallWithThis(..)
+            | Op::CallSpread(..)
+            | Op::CallSpreadThis(..)
+            | Op::CallArgsArray
+            | Op::CallArgsArrayThis
+            | Op::EvalCallArgsArray => (OperationKind::Call, &[CALL_TARGET, VALUE_RESULT]),
+            Op::New(..) | Op::NewArgsArray | Op::SuperCallArgsArray => {
+                (OperationKind::Construct, &[CALL_TARGET, VALUE_RESULT])
+            }
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr => (
+                OperationKind::Arithmetic,
+                &[VALUE_OPERAND_0, VALUE_OPERAND_1, VALUE_RESULT],
+            ),
+            Op::Neg | Op::Plus | Op::BitNot => {
+                (OperationKind::Arithmetic, &[VALUE_OPERAND_0, VALUE_RESULT])
+            }
+            Op::JumpIfFalse(..)
+            | Op::JumpIfFalsePeek(..)
+            | Op::JumpIfTruePeek(..)
+            | Op::JumpIfNotNullishPeek(..) => (OperationKind::Branch, &[BRANCH_OUTCOME]),
+            Op::Jump(target) if (*target as usize) <= pc => {
+                (OperationKind::Loop, &[BRANCH_OUTCOME])
+            }
+            Op::MakeClosure(..)
+            | Op::MakeRegExp(..)
+            | Op::MakeArray(..)
+            | Op::NewArray
+            | Op::MakeObject(..)
+            | Op::NewObject => (OperationKind::Allocation, &[ALLOCATION_OUTCOME]),
+            _ => continue,
+        };
+        builder.add_site(pc, operation, slots);
+    }
+    builder.finish()
+}
+
+#[cfg(test)]
+mod feedback_layout_tests {
+    use super::*;
+    use crate::feedback::{ObservationKind, ObservationRole, OperationKind};
+
+    #[test]
+    fn canonical_layout_ignores_raw_cache_and_name_indexes() {
+        let first = feedback_layout_for_ops(&[Op::GetProp(1, 4), Op::Add, Op::CallWithThis(2, 7)]);
+        let second =
+            feedback_layout_for_ops(&[Op::GetProp(99, 400), Op::Add, Op::CallWithThis(2, 700)]);
+
+        assert_eq!(first, second);
+        assert_eq!(first.version(), crate::feedback::SCHEMA_VERSION);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first.slot_len(), 8);
+        let sites = first.site_ids().collect::<Vec<_>>();
+        assert_eq!(
+            first.site(sites[0]).unwrap().operation,
+            OperationKind::NamedLoad
+        );
+        assert_eq!(
+            first.site(sites[1]).unwrap().operation,
+            OperationKind::Arithmetic
+        );
+        assert_eq!(first.site(sites[2]).unwrap().operation, OperationKind::Call);
+        assert_eq!(
+            first.slots(sites[2]).unwrap(),
+            &[
+                crate::feedback::SlotDescriptor {
+                    kind: ObservationKind::CallTarget,
+                    role: ObservationRole::Target,
+                },
+                VALUE_RESULT,
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_records_back_edges_separately_from_conditional_branches() {
+        let layout =
+            feedback_layout_for_ops(&[Op::JumpIfFalse(3), Op::Undef, Op::Jump(0), Op::ReturnUndef]);
+        let sites = layout.site_ids().collect::<Vec<_>>();
+
+        assert_eq!(sites.len(), 2);
+        assert_eq!(
+            layout.site(sites[0]).unwrap().operation,
+            OperationKind::Branch
+        );
+        assert_eq!(
+            layout.site(sites[1]).unwrap().operation,
+            OperationKind::Loop
+        );
+    }
+
+    #[test]
+    fn layout_stays_empty_for_bytecode_without_feedback_sites() {
+        let layout = feedback_layout_for_ops(&[Op::Undef, Op::Return]);
+        assert!(layout.is_empty());
+        assert_eq!(layout.slot_len(), 0);
+    }
+}
+
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     compile_inner(func, &Default::default(), None, None, false)
@@ -3061,6 +3246,9 @@ fn compile_inner(
     });
     let cap_cache_len = c.names.len();
     let op_count = c.ops.len();
+    let feedback_layout = hot
+        .map(|chunk| chunk.feedback.layout().clone())
+        .unwrap_or_else(|| feedback_layout_for_ops(&c.ops));
     Some(Rc::new(Chunk {
         ops: c.ops,
         consts: c.consts,
@@ -3085,6 +3273,7 @@ fn compile_inner(
         reuse_activation: c.reuse_activation,
         env_this: c.env_this,
         env_arguments: c.env_arguments,
+        feedback: crate::feedback::FeedbackVector::new(feedback_layout),
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),

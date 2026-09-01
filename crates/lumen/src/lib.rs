@@ -35,6 +35,7 @@ mod eval;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;
 mod fasthash;
+mod feedback;
 mod host;
 mod interpreter;
 mod interrupt;
