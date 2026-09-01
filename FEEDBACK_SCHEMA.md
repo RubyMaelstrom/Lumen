@@ -36,10 +36,9 @@ A second-stage or future optimizing compile reuses the baseline layout. It must 
 new numbering from inlined or transformed instructions. Feedback originating in an inlined
 callee remains in that callee's logical vector rather than acquiring caller-local identities.
 
-Source edits, parser/lowering changes, or a change to the meaning/numeric encoding of a schema
-type require a schema-version change or a separately validated compatible-layout hash before a
-serialized profile may be consumed. Version 1 profiles will initially be process-local only;
-serialization and upgrade/drop policy are separate Phase 1 gates.
+Source edits and parser/lowering changes produce a different compatible-layout hash. A change to
+the meaning or numeric encoding of a schema type requires a schema-version change. Neither check
+substitutes for the other when a serialized profile is consumed.
 
 ## Abstract slots
 
@@ -79,3 +78,43 @@ not change. Element and call adapters are intentionally separate following slice
 Every optimizing consumer must treat missing, unknown, mixed, or invalidated feedback as a reason
 to use a guard plus exact semantic fallback. A guard failure resumes at the exact semantic point;
 the tree-walker remains the differential oracle.
+
+## Serialized compatibility envelope
+
+The version-1 binary envelope is deliberately smaller in scope than the later machine-readable
+diagnostic format. It establishes the compatibility gate around observation words; it does not
+claim that current shape-derived layout tokens are portable. Every integer is little-endian:
+
+| Offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 8 | Magic `LUMENFB\0` |
+| 8 | 2 | Envelope format version (`1`) |
+| 10 | 2 | Feedback schema version (`1`) |
+| 12 | 1 | Scope (`1` = exact live vector only) |
+| 13 | 3 | Reserved, required to be zero |
+| 16 | 8 | Opaque process-session identity |
+| 24 | 8 | Lazily assigned feedback-vector identity |
+| 32 | 8 | Stable layout hash |
+| 40 | 4 | Site count |
+| 44 | 4 | Observation-slot count |
+| 48 | 8 × slots | Observation words |
+
+The layout hash covers the schema version and every specified numeric field of every site and slot.
+It never hashes Rust enum discriminants, struct bytes, padding, addresses, runtime IC bindings, or
+the adapter's raw shape table. Site and slot counts are checked independently rather than relying
+on the hash.
+
+Version 1 accepts no implicit upgrades. Unknown envelope versions, schema versions, scopes,
+reserved bits, lengths, observation states, process sessions, vector identities, or layouts each
+produce a distinct `ProfileDropReason`. A matching layout alone is insufficient: two vectors can
+intern the same dense token to different current shapes. Consequently, version-1 observations may
+only be merged back into the exact live vector that emitted them. A process restart, function
+recompile, cloned layout, or incompatible engine build drops them. Portable ingestion remains
+disabled until canonical Map identities and their validity dependencies can replace current
+profile-local tokens.
+
+Ingestion validates the complete envelope and every word before changing the vector. Valid words
+are merged monotonically: uninitialized state may gain information, but an existing polymorphic or
+generic state is never narrowed by an older snapshot. Conflicting specialized observations widen
+to polymorphic. Profile dump/ingestion code must report a drop reason and continue with empty or
+current feedback; it must never guess a conversion or make execution depend on profile presence.

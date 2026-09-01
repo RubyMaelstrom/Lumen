@@ -477,8 +477,11 @@ finish the baseline, but no later phase may claim a performance win against the 
   bytecode site identity or the diagnostic file schema. The first runtime-only adapter binds
   baseline named-property sites to their existing polymorphic ICs, interns current shapes as
   profile-local abstract tokens, and reserves the same slots for future Map identities.
-- [ ] Version serialized profiles and define explicit upgrade/drop behavior so an incompatible
-  engine build never interprets old observation bits as a new representation.
+- [x] Version serialized profiles and define explicit upgrade/drop behavior so an incompatible
+  engine build never interprets old observation bits as a new representation. Envelope version 1
+  validates schema, scope, reserved bits, stable layout hash, site/slot counts, and every word;
+  current shape-derived tokens may only return to the exact live vector that emitted them, with
+  all mismatches reported as explicit drop reasons and accepted data merged without narrowing.
 - [ ] Record arithmetic operand/result categories, including integer, double, string, BigInt,
   object, and mixed/megamorphic states.
 - [ ] Record abstract property receiver/holder layout identities, prototype depth, field location,
