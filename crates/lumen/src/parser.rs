@@ -82,7 +82,19 @@ pub fn parse_script_eval(
     };
     let strict_prologue = p.has_use_strict_prologue();
     p.strict = p.strict || strict_prologue;
-    let body = p.parse_stmts_until_eof()?;
+    // Keep parser timing separate from lexing; this is diagnostic-only and does not affect the
+    // grammar or any completion ordering.
+    let perf_started = crate::jit::perf_stage_start();
+    let body = match p.parse_stmts_until_eof() {
+        Ok(body) => {
+            crate::jit::perf_parse_end(perf_started, true);
+            body
+        }
+        Err(error) => {
+            crate::jit::perf_parse_end(perf_started, false);
+            return Err(error);
+        }
+    };
     // A direct eval sees the private names visible where it was called.
     let mut st: Vec<Vec<String>> = Vec::new();
     if !private_names.is_empty() {
@@ -150,7 +162,17 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         single_stmt: false,
         in_static_block: false,
     };
-    let body = p.parse_stmts_until_eof()?;
+    let perf_started = crate::jit::perf_stage_start();
+    let body = match p.parse_stmts_until_eof() {
+        Ok(body) => {
+            crate::jit::perf_parse_end(perf_started, true);
+            body
+        }
+        Err(error) => {
+            crate::jit::perf_parse_end(perf_started, false);
+            return Err(error);
+        }
+    };
     validate_module(&body)?;
     validate_private_names(&body).map_err(|message| ParseError {
         at_eof: false,

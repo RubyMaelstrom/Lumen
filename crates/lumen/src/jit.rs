@@ -51,10 +51,104 @@ static PERF_INLINE_PLAN_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic:
 static PERF_INLINE_SUCCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_INLINE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_INLINE_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_LEX_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_LEX_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_LEX_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_PARSE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_PARSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_PARSE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_BYTECODE_COMPILE_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_BYTECODE_COMPILE_SUCCESSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_BYTECODE_COMPILE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_SNAPSHOT_ENCODE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_SNAPSHOT_ENCODE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_SNAPSHOT_DECODE_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_SNAPSHOT_DECODE_SUCCESSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_SNAPSHOT_DECODE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
-fn perf_metrics_enabled() -> bool {
+pub(crate) fn perf_metrics_enabled() -> bool {
     *PERF_METRICS_ENABLED.get_or_init(|| std::env::var_os("LUMEN_PERF_METRICS").is_some())
+}
+
+#[inline]
+pub(crate) fn perf_stage_start() -> Option<std::time::Instant> {
+    perf_metrics_enabled().then(std::time::Instant::now)
+}
+
+#[inline]
+pub(crate) fn perf_lex_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_LEX_CALLS.fetch_add(1, Relaxed);
+    PERF_LEX_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if !success {
+        PERF_LEX_FAILURES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_parse_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_PARSE_CALLS.fetch_add(1, Relaxed);
+    PERF_PARSE_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if !success {
+        PERF_PARSE_FAILURES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_bytecode_compile_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_BYTECODE_COMPILE_ATTEMPTS.fetch_add(1, Relaxed);
+    PERF_BYTECODE_COMPILE_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if success {
+        PERF_BYTECODE_COMPILE_SUCCESSES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn perf_snapshot_encode_end(started: Option<std::time::Instant>) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_SNAPSHOT_ENCODE_CALLS.fetch_add(1, Relaxed);
+    PERF_SNAPSHOT_ENCODE_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+}
+
+#[inline]
+pub(crate) fn perf_snapshot_decode_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_SNAPSHOT_DECODE_ATTEMPTS.fetch_add(1, Relaxed);
+    PERF_SNAPSHOT_DECODE_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if success {
+        PERF_SNAPSHOT_DECODE_SUCCESSES.fetch_add(1, Relaxed);
+    }
 }
 
 #[inline]
@@ -123,11 +217,32 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let inline_successes = PERF_INLINE_SUCCESSES.load(Relaxed);
     let inline_failures = PERF_INLINE_FAILURES.load(Relaxed);
     let inline_suppressed = PERF_INLINE_SUPPRESSED.load(Relaxed);
+    let lex_calls = PERF_LEX_CALLS.load(Relaxed);
+    let lex_nanos = PERF_LEX_NANOS.load(Relaxed);
+    let lex_failures = PERF_LEX_FAILURES.load(Relaxed);
+    let parse_calls = PERF_PARSE_CALLS.load(Relaxed);
+    let parse_nanos = PERF_PARSE_NANOS.load(Relaxed);
+    let parse_failures = PERF_PARSE_FAILURES.load(Relaxed);
+    let bytecode_attempts = PERF_BYTECODE_COMPILE_ATTEMPTS.load(Relaxed);
+    let bytecode_successes = PERF_BYTECODE_COMPILE_SUCCESSES.load(Relaxed);
+    let bytecode_nanos = PERF_BYTECODE_COMPILE_NANOS.load(Relaxed);
+    let snapshot_encode_calls = PERF_SNAPSHOT_ENCODE_CALLS.load(Relaxed);
+    let snapshot_encode_nanos = PERF_SNAPSHOT_ENCODE_NANOS.load(Relaxed);
+    let snapshot_decode_attempts = PERF_SNAPSHOT_DECODE_ATTEMPTS.load(Relaxed);
+    let snapshot_decode_successes = PERF_SNAPSHOT_DECODE_SUCCESSES.load(Relaxed);
+    let snapshot_decode_nanos = PERF_SNAPSHOT_DECODE_NANOS.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},{gc},\"managed_memory\":{managed_memory}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
+        lex_nanos as f64 / 1_000_000_000.0,
+        parse_nanos as f64 / 1_000_000_000.0,
+        bytecode_attempts.saturating_sub(bytecode_successes),
+        bytecode_nanos as f64 / 1_000_000_000.0,
+        snapshot_encode_nanos as f64 / 1_000_000_000.0,
+        snapshot_decode_attempts.saturating_sub(snapshot_decode_successes),
+        snapshot_decode_nanos as f64 / 1_000_000_000.0,
     ))
 }
 

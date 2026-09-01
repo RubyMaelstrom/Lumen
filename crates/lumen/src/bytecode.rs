@@ -3764,7 +3764,10 @@ mod feedback_layout_tests {
 
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
-    compile_inner(func, &Default::default(), None, None, false)
+    let started = crate::jit::perf_stage_start();
+    let result = compile_inner(func, &Default::default(), None, None, false);
+    crate::jit::perf_bytecode_compile_end(started, result.is_some());
+    result
 }
 
 /// Compile a derived class constructor against a retained Function Environment Record.
@@ -3773,7 +3776,10 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
 /// and carries the active constructor and `new.target`; `super()` binds `this` and initializes the
 /// derived class's instance elements through the shared ECMA-262 algorithm.
 pub(crate) fn compile_derived_constructor(func: &Function) -> Option<Rc<Chunk>> {
-    compile_inner(func, &Default::default(), None, None, true)
+    let started = crate::jit::perf_stage_start();
+    let result = compile_inner(func, &Default::default(), None, None, true);
+    crate::jit::perf_bytecode_compile_end(started, result.is_some());
+    result
 }
 
 /// Compile a Source Text Module's already-instantiated body as a strict heap continuation.
@@ -3800,7 +3806,10 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         code2: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
     };
-    compile_inner(&function, &Default::default(), None, Some(bindings), false)
+    let started = crate::jit::perf_stage_start();
+    let result = compile_inner(&function, &Default::default(), None, Some(bindings), false);
+    crate::jit::perf_bytecode_compile_end(started, result.is_some());
+    result
 }
 
 /// Second-stage compile: same as [`compile`], with hot monomorphic callees from `plan` spliced
@@ -3813,7 +3822,10 @@ pub(crate) fn compile_with_inlines(
     let seed = std::env::var_os("LUMEN_JIT_NO_CACHE_SEED")
         .is_none()
         .then_some(hot);
-    compile_inner(func, plan, seed, None, false)
+    let started = crate::jit::perf_stage_start();
+    let result = compile_inner(func, plan, seed, None, false);
+    crate::jit::perf_bytecode_compile_end(started, result.is_some());
+    result
 }
 
 fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])> {

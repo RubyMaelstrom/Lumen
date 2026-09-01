@@ -210,38 +210,45 @@ fn intern_op(s: &str) -> R<&'static str> {
 
 /// Encode a parsed script body to a snapshot blob.
 pub fn encode(body: &[Stmt]) -> Vec<u8> {
+    let perf_started = crate::jit::perf_stage_start();
     let mut w = Writer {
         buf: Vec::with_capacity(body.len() * 32),
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
     enc_stmts(&mut w, body);
+    crate::jit::perf_snapshot_encode_end(perf_started);
     w.buf
 }
 
 /// Decode a snapshot blob back into a script body. `Err` (skew/truncation/corruption) tells the
 /// caller to fall back to parsing the original source.
 pub fn decode(bytes: &[u8]) -> R<Vec<Stmt>> {
-    if bytes.len() > MAX_SNAPSHOT_BYTES {
-        return Err("snapshot: input exceeds byte limit".into());
-    }
-    let mut r = Reader {
-        buf: bytes,
-        pos: 0,
-        allocated: 0,
-        depth: 0,
-    };
-    if r.uv()? != MAGIC as u64 {
-        return Err("snapshot: bad magic".into());
-    }
-    if r.uv()? != VERSION as u64 {
-        return Err("snapshot: version mismatch".into());
-    }
-    let body = dec_stmts(&mut r)?;
-    if r.pos != bytes.len() {
-        return Err("snapshot: trailing bytes".into());
-    }
-    Ok(body)
+    let perf_started = crate::jit::perf_stage_start();
+    let result = (|| {
+        if bytes.len() > MAX_SNAPSHOT_BYTES {
+            return Err("snapshot: input exceeds byte limit".into());
+        }
+        let mut r = Reader {
+            buf: bytes,
+            pos: 0,
+            allocated: 0,
+            depth: 0,
+        };
+        if r.uv()? != MAGIC as u64 {
+            return Err("snapshot: bad magic".into());
+        }
+        if r.uv()? != VERSION as u64 {
+            return Err("snapshot: version mismatch".into());
+        }
+        let body = dec_stmts(&mut r)?;
+        if r.pos != bytes.len() {
+            return Err("snapshot: trailing bytes".into());
+        }
+        Ok(body)
+    })();
+    crate::jit::perf_snapshot_decode_end(perf_started, result.is_ok());
+    result
 }
 
 // ---- Vec / Option helpers (monomorphized by hand to keep the reader borrow simple) ------------

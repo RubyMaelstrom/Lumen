@@ -541,6 +541,10 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [ ] Attribute guard failures, side exits, deoptimizations, and reoptimization suppression to
     stable bytecode sites without turning diagnostics into execution policy.
 - [ ] Record parser, preparser, bytecode, snapshot/cache-hit, and cache-deserialization time.
+  - [x] Expose opt-in lexer/parser timings, bytecode compile attempts/outcomes, and snapshot
+    encode/decode timings in the performance JSON. The existing snapshot decoder is the only
+    cache-deserialization path today; Lumen has no separate preparser, so no synthetic zero is
+    reported for one.
 - [ ] Record host/native call counts and time by stable operation identity without requiring
   source-name guesses.
 - [ ] Measure error construction as separate message conversion, object allocation, stack capture,

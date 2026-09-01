@@ -74,6 +74,8 @@ pub(crate) fn tokenize_goal_with_source(
     src: &str,
     html_comments: bool,
 ) -> Result<LexedSource, LexError> {
+    // Diagnostic-only stage timing; the disabled path takes no timestamp and allocates nothing.
+    let perf_started = crate::jit::perf_stage_start();
     let chars: Rc<Vec<char>> = Rc::new(src.chars().collect());
     let mut lx = Lexer {
         chars: chars.clone(),
@@ -92,11 +94,20 @@ pub(crate) fn tokenize_goal_with_source(
         control_paren_stack: Vec::new(),
         last_close_control: false,
     };
-    lx.run()?;
-    Ok(LexedSource {
-        tokens: lx.out,
-        chars,
-    })
+    let result = lx.run();
+    match result {
+        Ok(()) => {
+            crate::jit::perf_lex_end(perf_started, true);
+            Ok(LexedSource {
+                tokens: lx.out,
+                chars,
+            })
+        }
+        Err(error) => {
+            crate::jit::perf_lex_end(perf_started, false);
+            Err(error)
+        }
+    }
 }
 
 impl Lexer {
