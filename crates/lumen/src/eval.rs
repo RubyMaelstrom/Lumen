@@ -1664,17 +1664,25 @@ impl Interp {
     pub(crate) fn iterate(&mut self, v: &Value) -> Result<Vec<Value>, Abrupt> {
         match v {
             Value::Str(s) => {
-                return Ok(crate::jstr::CodePointIter::new(s)
+                let perf_started = crate::jit::perf_stage_start();
+                let result = Ok(crate::jstr::CodePointIter::new(s)
                     .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
                     .collect());
+                crate::jit::perf_iterate_fast_end(perf_started);
+                return result;
             }
             Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {
-                let len = self.checked_array_len(o)?;
-                let mut out = Vec::with_capacity(len.min(1024));
-                for i in 0..len {
-                    out.push(self.get_member(v, &i.to_string())?);
-                }
-                return Ok(out);
+                let perf_started = crate::jit::perf_stage_start();
+                let result: Result<Vec<Value>, Abrupt> = (|| {
+                    let len = self.checked_array_len(o)?;
+                    let mut out = Vec::with_capacity(len.min(1024));
+                    for i in 0..len {
+                        out.push(self.get_member(v, &i.to_string())?);
+                    }
+                    Ok(out)
+                })();
+                crate::jit::perf_iterate_fast_end(perf_started);
+                return result;
             }
             _ => {}
         }
@@ -1692,27 +1700,32 @@ impl Interp {
     /// Drive the iterator protocol on `v` using an already-resolved `@@iterator` method `itfn`
     /// (so callers that fetched it via GetMethod don't re-read the property).
     pub(crate) fn iterate_with(&mut self, v: &Value, itfn: Value) -> Result<Vec<Value>, Abrupt> {
-        let iter = self.call(itfn, v.clone(), &[])?;
-        let next = self.get_member(&iter, "next")?;
-        if !next.is_callable() {
-            return Err(self.throw("TypeError", "iterator.next is not a function"));
-        }
-        let mut out = Vec::new();
-        loop {
-            let res = self.call(next.clone(), iter.clone(), &[])?;
-            if !matches!(res, Value::Obj(_)) {
-                return Err(self.throw("TypeError", "iterator result is not an object"));
+        let perf_started = crate::jit::perf_stage_start();
+        let result: Result<Vec<Value>, Abrupt> = (|| {
+            let iter = self.call(itfn, v.clone(), &[])?;
+            let next = self.get_member(&iter, "next")?;
+            if !next.is_callable() {
+                return Err(self.throw("TypeError", "iterator.next is not a function"));
             }
-            let done = self.get_member(&res, "done")?;
-            if self.to_boolean(&done) {
-                break;
+            let mut out = Vec::new();
+            loop {
+                let res = self.call(next.clone(), iter.clone(), &[])?;
+                if !matches!(res, Value::Obj(_)) {
+                    return Err(self.throw("TypeError", "iterator result is not an object"));
+                }
+                let done = self.get_member(&res, "done")?;
+                if self.to_boolean(&done) {
+                    break;
+                }
+                out.push(self.get_member(&res, "value")?);
+                if out.len() > crate::interpreter::MAX_ARRAY_OP_LEN {
+                    return Err(self.throw("RangeError", "iterator produced too many values"));
+                }
             }
-            out.push(self.get_member(&res, "value")?);
-            if out.len() > crate::interpreter::MAX_ARRAY_OP_LEN {
-                return Err(self.throw("RangeError", "iterator produced too many values"));
-            }
-        }
-        Ok(out)
+            Ok(out)
+        })();
+        crate::jit::perf_iterate_protocol_end(perf_started, result.is_ok());
+        result
     }
 
     /// Snapshot the candidate keys for EnumerateObjectProperties. Each prototype level's

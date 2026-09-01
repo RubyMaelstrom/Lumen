@@ -566,8 +566,10 @@ finish the baseline, but no later phase may claim a performance win against the 
     counts; the wrappers preserve the existing ECMA-262 protocol ordering.
   - [x] Expose opt-in object-path `ToPrimitive`/`toString` timings and failures; primitive fast
     paths do not take a timestamp when diagnostics are disabled.
-  - [ ] Measure spread/ordinary-versus-symbol iteration paths with stable helper identities and
-    without adding a disabled-path timestamp to primitive fast cases.
+  - [x] Expose opt-in fast string/array versus `Symbol.iterator`-driven `iterate` timings; the
+    lower-level GetIterator/IteratorStep counters remain available for `for-of` and destructuring.
+  - [ ] Add stable helper identities and cover remaining spread/ordinary-versus-symbol iteration
+    distinctions without adding a disabled-path timestamp to primitive fast cases.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
 - [ ] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
   recover diagnostics.

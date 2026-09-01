@@ -113,6 +113,14 @@ static PERF_TO_STRING_OBJECT_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static PERF_TO_STRING_OBJECT_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static PERF_ITERATE_FAST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_ITERATE_FAST_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_ITERATE_PROTOCOL_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_ITERATE_PROTOCOL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PERF_ITERATE_PROTOCOL_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn perf_metrics_enabled() -> bool {
@@ -323,6 +331,31 @@ pub(crate) fn perf_to_string_object_end(started: Option<std::time::Instant>, suc
 }
 
 #[inline]
+pub(crate) fn perf_iterate_fast_end(started: Option<std::time::Instant>) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_ITERATE_FAST_CALLS.fetch_add(1, Relaxed);
+    PERF_ITERATE_FAST_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+}
+
+#[inline]
+pub(crate) fn perf_iterate_protocol_end(started: Option<std::time::Instant>, success: bool) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::Ordering::Relaxed;
+    PERF_ITERATE_PROTOCOL_CALLS.fetch_add(1, Relaxed);
+    PERF_ITERATE_PROTOCOL_NANOS.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Relaxed,
+    );
+    if !success {
+        PERF_ITERATE_PROTOCOL_FAILURES.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline]
 pub(crate) fn perf_inline_attempt() {
     if perf_metrics_enabled() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -426,9 +459,14 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let to_string_object_calls = PERF_TO_STRING_OBJECT_CALLS.load(Relaxed);
     let to_string_object_nanos = PERF_TO_STRING_OBJECT_NANOS.load(Relaxed);
     let to_string_object_failures = PERF_TO_STRING_OBJECT_FAILURES.load(Relaxed);
+    let iterate_fast_calls = PERF_ITERATE_FAST_CALLS.load(Relaxed);
+    let iterate_fast_nanos = PERF_ITERATE_FAST_NANOS.load(Relaxed);
+    let iterate_protocol_calls = PERF_ITERATE_PROTOCOL_CALLS.load(Relaxed);
+    let iterate_protocol_nanos = PERF_ITERATE_PROTOCOL_NANOS.load(Relaxed);
+    let iterate_protocol_failures = PERF_ITERATE_PROTOCOL_FAILURES.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
         lex_nanos as f64 / 1_000_000_000.0,
@@ -448,6 +486,8 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
         iterator_close_nanos as f64 / 1_000_000_000.0,
         to_primitive_nanos as f64 / 1_000_000_000.0,
         to_string_object_nanos as f64 / 1_000_000_000.0,
+        iterate_fast_nanos as f64 / 1_000_000_000.0,
+        iterate_protocol_nanos as f64 / 1_000_000_000.0,
     ))
 }
 
