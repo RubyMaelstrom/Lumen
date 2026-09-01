@@ -381,7 +381,9 @@ finish the baseline, but no later phase may claim a performance win against the 
   `object_count * size_of::<Object>()` or peak RSS for this ownership-aware measurement. The
   measurement contract and review questions are recorded in `MANAGED_MEMORY_ACCOUNTING.md`.
 - [ ] Create deterministic local browser replays for representative DOM/framework workloads so
-  iteration does not repeatedly contact or get blocked by public sites.
+  iteration does not repeatedly contact or get blocked by public sites. The initial hash-pinned
+  DOM-reconciliation/layout and event-loop/mutation fixtures now run through TRust's production
+  page pipeline; add at least one pinned third-party framework workload before closing this item.
 - [x] Record the accepted production TRust/Lumen hashes in every release-performance report.
 - [x] Define regression policy: statistically meaningful regressions require explanation and user
   approval even when an aggregate score improves.

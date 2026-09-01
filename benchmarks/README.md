@@ -39,6 +39,25 @@ scripts/bench-matrix.py --engine node --engine lumen-jit --workload regexp --sam
 scripts/bench-matrix.py --no-build --cpu none
 ```
 
+## Deterministic browser replays
+
+The sibling TRust checkout provides a no-window, no-TUI replay binary that runs self-contained HTML
+through the production Lumen page actor, DOM, virtual event loop, style, and layout pipeline. The
+fixtures are hash-pinned and must produce their checked-in semantic checksum with no script errors
+or panics:
+
+```sh
+scripts/run-browser-replays.sh quick       # one short debug smoke
+scripts/run-browser-replays.sh check       # every fixture, one debug sample
+scripts/run-browser-replays.sh benchmark   # optimized, 1 warmup + 5 measured samples
+```
+
+Reports are written under `benchmark-results/`. `quick` is intended for individual engine edits;
+`check` runs before a coherent commit; `benchmark` is the major-checkpoint performance gate. Set
+`TRUST_REPLAY_ROOT` for a non-sibling TRust checkout and `LUMEN_REPLAY_CPU=none` to disable the
+default affinity to CPU 5. The runner never contacts a public website: virtual time advances only
+to locally scheduled tasks and every fixture contains its scripts and expected result.
+
 Version mismatches fail by default because silently comparing different V8/Bun builds defeats the
 manifest. Use `--allow-version-mismatch` only to capture an explicitly exploratory result; the
 report records the mismatch and is not an accepted baseline. CLI overrides likewise remain in the

@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Deterministic event-loop replay</title>
+<main>
+  <button id="action" type="button">Run</button>
+  <ol id="events"></ol>
+  <output id="replay-result" data-replay-state="pending" data-replay-checksum="pending" data-replay-expected="click.click-promise.click-microtask.timer-one.timer-promise.timer-microtask.timer-two:6"></output>
+</main>
+<script>
+(() => {
+  "use strict";
+  const action = document.getElementById("action");
+  const events = document.getElementById("events");
+  const result = document.getElementById("replay-result");
+  const order = [];
+  let mutationRecords = 0;
+
+  function note(name) {
+    order.push(name);
+    const item = document.createElement("li");
+    item.textContent = name;
+    events.append(item);
+  }
+
+  const observer = new MutationObserver(records => {
+    mutationRecords += records.length;
+  });
+  observer.observe(events, { childList: true, subtree: true, characterData: true });
+
+  action.addEventListener("click", () => {
+    note("click");
+    Promise.resolve().then(() => note("click-promise"));
+    queueMicrotask(() => note("click-microtask"));
+    setTimeout(() => {
+      note("timer-one");
+      Promise.resolve().then(() => note("timer-promise"));
+      queueMicrotask(() => note("timer-microtask"));
+      setTimeout(() => {
+        note("timer-two");
+        const required = ["click", "click-promise", "click-microtask", "timer-one", "timer-promise", "timer-microtask", "timer-two"];
+        const positions = required.map(name => order.indexOf(name));
+        const ordered = positions.every((position, index) => position >= 0 && (index === 0 || positions[index - 1] < position));
+        if (!ordered || mutationRecords === 0) {
+          throw new Error(`invalid task order ${order.join(",")} mutations=${mutationRecords}`);
+        }
+        result.dataset.replayChecksum = `${order.join(".")}:${mutationRecords}`;
+        result.dataset.replayState = "complete";
+        result.textContent = "complete";
+        observer.disconnect();
+      }, 0);
+    }, 0);
+  });
+
+  action.click();
+})();
+</script>

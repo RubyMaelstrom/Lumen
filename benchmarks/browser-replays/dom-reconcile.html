@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Deterministic DOM reconciliation replay</title>
+<style>
+  body { margin: 0; font: 14px sans-serif; }
+  #rows { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; padding: 4px; }
+  .row { display: flex; justify-content: space-between; min-width: 0; padding: 2px 4px; }
+  .hot { background: #234; color: white; }
+  .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+<main>
+  <h1>DOM reconciliation replay</h1>
+  <section id="rows"></section>
+  <output id="replay-result" data-replay-state="pending" data-replay-checksum="pending" data-replay-expected="960:49:126386880"></output>
+</main>
+<script>
+(() => {
+  "use strict";
+  const rows = document.getElementById("rows");
+  const result = document.getElementById("replay-result");
+  const keyed = new Map();
+
+  function createRow(key, value) {
+    const row = document.createElement("article");
+    row.className = "row";
+    row.dataset.key = String(key);
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = `item-${key}`;
+    const amount = document.createElement("strong");
+    amount.textContent = String(value);
+    row.append(label, amount);
+    keyed.set(key, row);
+    return row;
+  }
+
+  const initial = document.createDocumentFragment();
+  for (let key = 0; key < 1200; key++) initial.append(createRow(key, key * 3));
+  rows.replaceChildren(initial);
+
+  for (let pass = 0; pass < 24; pass++) {
+    const next = document.createDocumentFragment();
+    const start = pass * 11;
+    for (let offset = 0; offset < 960; offset++) {
+      const key = (start + offset * 7) % 1440;
+      let row = keyed.get(key);
+      if (!row) row = createRow(key, key * 3);
+      const amount = row.lastElementChild;
+      const value = key * 3 + pass;
+      if (amount.textContent !== String(value)) amount.textContent = String(value);
+      row.classList.toggle("hot", (key + pass) % 19 === 0);
+      row.setAttribute("aria-posinset", String(offset + 1));
+      next.append(row);
+    }
+    rows.replaceChildren(next);
+  }
+
+  const live = rows.querySelectorAll(".row");
+  let checksum = 0;
+  let hot = 0;
+  for (const row of live) {
+    const key = Number(row.dataset.key);
+    const value = Number(row.lastElementChild.textContent);
+    checksum = (checksum + ((key + 1) * 131 + value * 17)) % 1000000007;
+    if (row.classList.contains("hot")) hot++;
+  }
+  result.dataset.replayChecksum = `${live.length}:${hot}:${checksum}`;
+  result.dataset.replayState = "complete";
+  result.textContent = "complete";
+})();
+</script>
