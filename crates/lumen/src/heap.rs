@@ -289,10 +289,7 @@ impl CentralHeap {
         }
     }
 
-    pub(crate) fn tagged_fields_mut(
-        &mut self,
-        reference: HeapRef,
-    ) -> Result<&mut [TaggedValue], HeapError> {
+    fn tagged_fields_mut(&mut self, reference: HeapRef) -> Result<&mut [TaggedValue], HeapError> {
         match &mut self.object_mut(reference)?.storage {
             HeapStorage::Tagged(fields) => Ok(fields),
             HeapStorage::Bytes(_) => Err(HeapError::PayloadKindMismatch),
