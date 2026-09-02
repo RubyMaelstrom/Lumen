@@ -19,23 +19,42 @@ const TAG_EMPTY: u64 = 0x7ffa_0000_0000_0000;
 const TAG_NULL: u64 = 0x7ffb_0000_0000_0000;
 const TAG_BOOLEAN: u64 = 0x7ffc_0000_0000_0000;
 const TAG_HEAP_REF: u64 = 0xfff9_0000_0000_0000;
+const HEAP_REF_INDEX_BITS: u32 = 20;
+const HEAP_REF_INDEX_MASK: u32 = (1 << HEAP_REF_INDEX_BITS) - 1;
+const HEAP_REF_COOKIE_MASK: u32 = (1 << (32 - HEAP_REF_INDEX_BITS)) - 1;
 
 /// A non-zero 32-bit offset/index owned by the active Agent's heap model.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct HeapRef(u32);
 
 impl HeapRef {
-    /// Construct a reference. Zero is reserved as an invalid/null reference.
+    /// Construct an encoded reference. The low 20 bits identify a slot and the high 12 bits are
+    /// its generation cookie; slot zero is reserved as an invalid/null reference.
     pub(crate) const fn new(raw: u32) -> Option<Self> {
-        if raw == 0 {
+        if raw == 0 || raw & HEAP_REF_INDEX_MASK == 0 {
             None
         } else {
             Some(Self(raw))
         }
     }
 
+    pub(crate) const fn from_parts(index: u32, cookie: u16) -> Option<Self> {
+        if index == 0 || index > HEAP_REF_INDEX_MASK || cookie as u32 > HEAP_REF_COOKIE_MASK {
+            return None;
+        }
+        Some(Self(((cookie as u32) << HEAP_REF_INDEX_BITS) | index))
+    }
+
     pub(crate) const fn get(self) -> u32 {
         self.0
+    }
+
+    pub(crate) const fn index(self) -> u32 {
+        self.0 & HEAP_REF_INDEX_MASK
+    }
+
+    pub(crate) const fn cookie(self) -> u16 {
+        (self.0 >> HEAP_REF_INDEX_BITS) as u16
     }
 }
 
@@ -583,6 +602,18 @@ mod tests {
         let tagged = TaggedValue::heap(reference);
         assert_eq!(tagged.validate(), Ok(()));
         assert_eq!(tagged.as_heap(), Some(reference));
+    }
+
+    #[test]
+    fn heap_refs_round_trip_slot_and_generation_cookie() {
+        let reference = HeapRef::from_parts(37, 0xabc).unwrap();
+        assert_eq!(reference.index(), 37);
+        assert_eq!(reference.cookie(), 0xabc);
+        assert_eq!(HeapRef::new(reference.get()), Some(reference));
+        assert_eq!(HeapRef::from_parts(0, 0), None);
+        assert_eq!(HeapRef::from_parts(1 << 20, 0), None);
+        assert_eq!(HeapRef::from_parts(1, 0x1000), None);
+        assert_eq!(HeapRef::new(0xfff0_0000), None);
     }
 
     #[test]

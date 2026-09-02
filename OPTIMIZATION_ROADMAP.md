@@ -649,8 +649,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   state, and forwarding information where required. The checked `CentralHeap` nucleus models this
   header and handle-table boundary without connecting it to live objects.
 - [x] Add a checked Agent-local handle-table heap nucleus with explicit payload accounting,
-  relocation forwarding, and fail-closed stale-reference tests. Slot reuse and generation cookies
-  remain deferred until the production relocation verifier exists.
+  relocation forwarding, deterministic slot reuse, generation cookies, and fail-closed
+  stale-reference tests. The 20/12 handle-mode packing is a nucleus-only ABI fixture; cage-mode
+  offsets remain a separate production layout choice.
 - [x] Add one traceable tagged-field leaf family to that nucleus and prove root/field rewriting of
   self-references before source reclamation. It remains a migration fixture, not a live object
   representation.

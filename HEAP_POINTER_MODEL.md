@@ -18,6 +18,12 @@ Handle entries carry a generation/cookie in debug and stress builds so stale
 references fail verification instead of resolving to a recycled object. The
 fallback is an explicit ABI mode, not a reinterpretation of native addresses.
 
+The current central-heap nucleus exercises that fallback with a 20-bit slot index
+and a 12-bit generation cookie in the 32-bit payload. A slot is retired rather
+than wrapping its cookie, so a stale tagged word cannot become valid again after
+cookie exhaustion. Cage-mode offsets remain a separate production layout choice;
+the nucleus does not claim that its handle-mode packing is the final cage ABI.
+
 This gives the common desktop path V8-like compressed-reference density while
 keeping the representation portable and making relocation an owned heap
 operation. It avoids the current `PackedValue` prototype's unsafe assumption
@@ -72,4 +78,3 @@ versioned shape/profile identities only.
 5. Benchmark both modes independently. Cage mode is an optimization, never a
    semantic precondition; a cage reservation or compression miss must not alter
    ECMAScript results.
-

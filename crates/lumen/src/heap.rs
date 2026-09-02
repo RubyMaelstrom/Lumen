@@ -73,10 +73,12 @@ pub(crate) enum HeapError {
 }
 
 /// A checked Agent-local handle table. Index zero is permanently reserved so a zero tagged
-/// payload can never accidentally resolve to an object. Slots are not reused in this nucleus;
-/// generation/reuse cookies belong to the production table once its relocation verifier exists.
+/// payload can never accidentally resolve to an object. Slots are reused only with generation
+/// cookies; a slot whose cookie would wrap is retired permanently.
 pub(crate) struct CentralHeap {
     objects: Vec<Option<HeapObject>>,
+    slot_cookies: Vec<u16>,
+    free_slots: Vec<usize>,
     requested_bytes: usize,
     no_gc: NoGcState,
     remembered: Vec<HeapRef>,
@@ -92,6 +94,8 @@ impl CentralHeap {
     pub(crate) fn new() -> Self {
         Self {
             objects: vec![None],
+            slot_cookies: vec![0],
+            free_slots: Vec::new(),
             requested_bytes: 0,
             no_gc: NoGcState::default(),
             remembered: Vec::new(),
@@ -108,6 +112,52 @@ impl CentralHeap {
         self.no_gc.require_safepoint()
     }
 
+    fn reserve_slot(&mut self) -> Result<(usize, HeapRef), HeapError> {
+        if let Some(index) = self.free_slots.pop() {
+            let cookie = self
+                .slot_cookies
+                .get(index)
+                .copied()
+                .ok_or(HeapError::ReferenceSpaceExhausted)?;
+            let raw_index = u32::try_from(index).map_err(|_| HeapError::ReferenceSpaceExhausted)?;
+            let reference =
+                HeapRef::from_parts(raw_index, cookie).ok_or(HeapError::ReferenceSpaceExhausted)?;
+            return Ok((index, reference));
+        }
+        let index = self.objects.len();
+        let raw_index = u32::try_from(index).map_err(|_| HeapError::ReferenceSpaceExhausted)?;
+        let reference =
+            HeapRef::from_parts(raw_index, 0).ok_or(HeapError::ReferenceSpaceExhausted)?;
+        self.objects.push(None);
+        self.slot_cookies.push(0);
+        Ok((index, reference))
+    }
+
+    fn release_slot(&mut self, index: usize) {
+        let Some(cookie) = self.slot_cookies.get_mut(index) else {
+            return;
+        };
+        // The 12-bit cookie is deliberately never wrapped. A slot that exhausts its cookie
+        // space is retired instead of allowing an old tagged word to become valid again.
+        if *cookie < 0x0fff {
+            *cookie += 1;
+            self.free_slots.push(index);
+        }
+    }
+
+    fn resolve_slot(&self, reference: HeapRef) -> Result<usize, HeapError> {
+        let index = usize::try_from(reference.index()).map_err(|_| HeapError::InvalidReference)?;
+        let cookie = self
+            .slot_cookies
+            .get(index)
+            .copied()
+            .ok_or(HeapError::InvalidReference)?;
+        if cookie != reference.cookie() {
+            return Err(HeapError::InvalidReference);
+        }
+        Ok(index)
+    }
+
     pub(crate) fn allocate(
         &mut self,
         layout: LayoutId,
@@ -115,11 +165,10 @@ impl CentralHeap {
         generation: HeapGeneration,
     ) -> Result<HeapRef, HeapError> {
         let size_units = u32::try_from(size_units).map_err(|_| HeapError::RequestTooLarge)?;
-        let index =
-            u32::try_from(self.objects.len()).map_err(|_| HeapError::ReferenceSpaceExhausted)?;
+        let (index, reference) = self.reserve_slot()?;
         let payload = vec![0; usize::try_from(size_units).unwrap()].into_boxed_slice();
         self.requested_bytes = self.requested_bytes.saturating_add(payload.len());
-        self.objects.push(Some(HeapObject {
+        self.objects[index] = Some(HeapObject {
             header: ObjectHeader {
                 size_units,
                 layout,
@@ -128,9 +177,8 @@ impl CentralHeap {
                 forwarding: None,
             },
             storage: HeapStorage::Bytes(payload),
-        }));
-        // `index` is at least one because slot zero is reserved by `new`.
-        Ok(HeapRef::new(index).expect("central heap never publishes a zero handle"))
+        });
+        Ok(reference)
     }
 
     pub(crate) fn allocate_tagged_fields(
@@ -143,13 +191,17 @@ impl CentralHeap {
         if fields.iter().any(|value| value.validate().is_err()) {
             return Err(HeapError::InvalidTaggedField);
         }
+        for field in &fields {
+            if let Some(child) = field.as_heap() {
+                self.object(child)?;
+            }
+        }
         let storage = HeapStorage::Tagged(fields.into_boxed_slice());
+        let (index, reference) = self.reserve_slot()?;
         self.requested_bytes = self
             .requested_bytes
             .saturating_add(storage.requested_bytes());
-        let index =
-            u32::try_from(self.objects.len()).map_err(|_| HeapError::ReferenceSpaceExhausted)?;
-        self.objects.push(Some(HeapObject {
+        self.objects[index] = Some(HeapObject {
             header: ObjectHeader {
                 size_units,
                 layout,
@@ -158,16 +210,16 @@ impl CentralHeap {
                 forwarding: None,
             },
             storage,
-        }));
-        let reference = HeapRef::new(index).expect("central heap never publishes a zero handle");
+        });
         self.refresh_remembered_reference(reference)?;
         Ok(reference)
     }
 
     fn object(&self, reference: HeapRef) -> Result<&HeapObject, HeapError> {
+        let index = self.resolve_slot(reference)?;
         let object = self
             .objects
-            .get(reference.get() as usize)
+            .get(index)
             .and_then(Option::as_ref)
             .ok_or(HeapError::InvalidReference)?;
         if object.header.forwarding.is_some() {
@@ -177,9 +229,10 @@ impl CentralHeap {
     }
 
     fn object_mut(&mut self, reference: HeapRef) -> Result<&mut HeapObject, HeapError> {
+        let index = self.resolve_slot(reference)?;
         let object = self
             .objects
-            .get_mut(reference.get() as usize)
+            .get_mut(index)
             .and_then(Option::as_mut)
             .ok_or(HeapError::InvalidReference)?;
         if object.header.forwarding.is_some() {
@@ -300,7 +353,10 @@ impl CentralHeap {
             }
             if has_young_edge {
                 let index = u32::try_from(index).expect("heap index is bounded by the table");
-                recomputed.push(HeapRef::new(index).expect("slot zero is reserved"));
+                let cookie = self.slot_cookies[index as usize];
+                recomputed.push(
+                    HeapRef::from_parts(index, cookie).expect("live slot has a valid handle"),
+                );
             }
         }
         Ok(recomputed)
@@ -400,12 +456,13 @@ impl CentralHeap {
                 return Err(HeapError::HeaderMismatch);
             }
             if let Some(target) = object.header.forwarding {
-                if target.get() as usize == index {
+                if target.index() as usize == index {
                     return Err(HeapError::HeaderMismatch);
                 }
+                let target_index = self.resolve_slot(target)?;
                 let target_object = self
                     .objects
-                    .get(target.get() as usize)
+                    .get(target_index)
                     .and_then(Option::as_ref)
                     .ok_or(HeapError::InvalidReference)?;
                 if target_object.header.forwarding.is_some() {
@@ -422,11 +479,7 @@ impl CentralHeap {
                 let Some(child) = field.as_heap() else {
                     continue;
                 };
-                let child_object = self
-                    .objects
-                    .get(child.get() as usize)
-                    .and_then(Option::as_ref)
-                    .ok_or(HeapError::InvalidReference)?;
+                let child_object = self.object(child)?;
                 if child_object.header.forwarding.is_some() {
                     return Err(HeapError::ForwardedReference);
                 }
@@ -441,7 +494,8 @@ impl CentralHeap {
     pub(crate) fn sweep_unmarked(&mut self) -> usize {
         let mut reclaimed = 0;
         let mut released_bytes: usize = 0;
-        for slot in self.objects.iter_mut().skip(1) {
+        let mut released_slots = Vec::new();
+        for (index, slot) in self.objects.iter_mut().enumerate().skip(1) {
             let remove = slot
                 .as_ref()
                 .is_some_and(|object| !object.header.marked && object.header.forwarding.is_none());
@@ -449,6 +503,7 @@ impl CentralHeap {
                 if let Some(object) = slot.take() {
                     released_bytes =
                         released_bytes.saturating_add(object.storage.requested_bytes());
+                    released_slots.push(index);
                     reclaimed += 1;
                 }
             } else if let Some(object) = slot {
@@ -456,15 +511,13 @@ impl CentralHeap {
             }
         }
         self.requested_bytes = self.requested_bytes.saturating_sub(released_bytes);
+        for index in released_slots {
+            self.release_slot(index);
+        }
         let remembered = std::mem::take(&mut self.remembered);
         self.remembered = remembered
             .into_iter()
-            .filter(|reference| {
-                self.objects
-                    .get(reference.get() as usize)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|object| object.header.forwarding.is_none())
-            })
+            .filter(|reference| self.object(*reference).is_ok())
             .collect();
         reclaimed
     }
@@ -475,9 +528,11 @@ impl CentralHeap {
             .enumerate()
             .skip(1)
             .filter_map(|(index, object)| {
-                object
-                    .as_ref()
-                    .and_then(|_| u32::try_from(index).ok().and_then(HeapRef::new))
+                object.as_ref().and_then(|_| {
+                    let index = u32::try_from(index).ok()?;
+                    let cookie = *self.slot_cookies.get(index as usize)?;
+                    HeapRef::from_parts(index, cookie)
+                })
             })
             .collect()
     }
@@ -486,28 +541,24 @@ impl CentralHeap {
     /// inaccessible through ordinary accessors until `reclaim_forwarded` runs, forcing callers to
     /// update every root and traced field before releasing from-space.
     pub(crate) fn relocate(&mut self, source: HeapRef) -> Result<HeapRef, HeapError> {
-        let source_object = self
-            .objects
-            .get(source.get() as usize)
-            .and_then(Option::as_ref)
+        self.validate_all()?;
+        let source_index = self.resolve_slot(source)?;
+        let source_object = self.objects[source_index]
+            .as_ref()
             .ok_or(HeapError::InvalidReference)?;
         if source_object.header.forwarding.is_some() {
             return Err(HeapError::AlreadyForwarded);
         }
         let mut moved = source_object.clone();
         moved.header.forwarding = None;
-        let target_index =
-            u32::try_from(self.objects.len()).map_err(|_| HeapError::ReferenceSpaceExhausted)?;
+        let (target_index, target) = self.reserve_slot()?;
         self.requested_bytes = self
             .requested_bytes
             .saturating_add(moved.storage.requested_bytes());
-        self.objects.push(Some(moved));
-        let target = HeapRef::new(target_index).expect("central heap never publishes zero handle");
+        self.objects[target_index] = Some(moved);
         self.refresh_remembered_reference(target)?;
-        let source_object = self
-            .objects
-            .get_mut(source.get() as usize)
-            .and_then(Option::as_mut)
+        let source_object = self.objects[source_index]
+            .as_mut()
             .ok_or(HeapError::InvalidReference)?;
         source_object.header.forwarding = Some(target);
         Ok(target)
@@ -516,44 +567,41 @@ impl CentralHeap {
     /// Reclaim a source only after its forwarding target has been published and all external
     /// references have been rewritten. The old handle then fails closed as invalid.
     pub(crate) fn reclaim_forwarded(&mut self, source: HeapRef) -> Result<HeapRef, HeapError> {
-        let object = self
-            .objects
-            .get_mut(source.get() as usize)
-            .and_then(Option::as_mut)
+        self.validate_all()?;
+        let index = self.resolve_slot(source)?;
+        let object = self.objects[index]
+            .as_ref()
             .ok_or(HeapError::InvalidReference)?;
         let target = object.header.forwarding.ok_or(HeapError::NotForwarded)?;
-        let released = self
-            .objects
-            .get_mut(source.get() as usize)
-            .and_then(Option::take)
+        let released = self.objects[index]
+            .take()
             .ok_or(HeapError::InvalidReference)?;
         self.requested_bytes = self
             .requested_bytes
             .saturating_sub(released.storage.requested_bytes());
         self.remembered.retain(|entry| *entry != source);
+        self.release_slot(index);
         Ok(target)
     }
 
     /// Remove one unreachable object. This path is intentionally separate from relocation so a
     /// collector cannot accidentally reclaim an object while a forwarding edge is still active.
     pub(crate) fn free(&mut self, reference: HeapRef) -> Result<(), HeapError> {
-        let object = self
-            .objects
-            .get_mut(reference.get() as usize)
-            .and_then(Option::as_mut)
+        let index = self.resolve_slot(reference)?;
+        let object = self.objects[index]
+            .as_ref()
             .ok_or(HeapError::InvalidReference)?;
         if object.header.forwarding.is_some() {
             return Err(HeapError::ForwardedReference);
         }
-        let released = self
-            .objects
-            .get_mut(reference.get() as usize)
-            .and_then(Option::take)
+        let released = self.objects[index]
+            .take()
             .ok_or(HeapError::InvalidReference)?;
         self.requested_bytes = self
             .requested_bytes
             .saturating_sub(released.storage.requested_bytes());
         self.remembered.retain(|entry| *entry != reference);
+        self.release_slot(index);
         Ok(())
     }
 }
@@ -604,6 +652,35 @@ mod tests {
         heap.free(reference).unwrap();
         assert_eq!(heap.payload(reference), Err(HeapError::InvalidReference));
         assert_eq!(heap.requested_bytes(), 0);
+        let replacement = heap
+            .allocate(LayoutId::new(2), 2, HeapGeneration::Young)
+            .unwrap();
+        assert_eq!(replacement.index(), reference.index());
+        assert_ne!(replacement.cookie(), reference.cookie());
+        assert_eq!(heap.payload(reference), Err(HeapError::InvalidReference));
+        assert_eq!(heap.payload(replacement).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exhausted_generation_cookie_retires_a_slot_instead_of_wrapping() {
+        let mut heap = CentralHeap::new();
+        let first = heap
+            .allocate(LayoutId::new(6), 1, HeapGeneration::Young)
+            .unwrap();
+        let mut current = first;
+        for _ in 0..0x0fff {
+            heap.free(current).unwrap();
+            current = heap
+                .allocate(LayoutId::new(6), 1, HeapGeneration::Young)
+                .unwrap();
+            assert_eq!(current.index(), first.index());
+        }
+        heap.free(current).unwrap();
+        let replacement = heap
+            .allocate(LayoutId::new(7), 1, HeapGeneration::Young)
+            .unwrap();
+        assert_ne!(replacement.index(), first.index());
+        assert_eq!(heap.payload(first), Err(HeapError::InvalidReference));
     }
 
     #[test]
@@ -788,6 +865,10 @@ mod tests {
             .unwrap();
         let target = heap.relocate(source).unwrap();
         assert_eq!(heap.validate_all(), Err(HeapError::ForwardedReference));
+        assert_eq!(
+            heap.reclaim_forwarded(source),
+            Err(HeapError::ForwardedReference)
+        );
         assert_eq!(heap.rewrite_tagged_references(source, target), 2);
         assert_eq!(heap.validate_all(), Ok(()));
         assert_eq!(heap.reclaim_forwarded(source), Ok(target));
