@@ -978,6 +978,60 @@ unsafe extern "C" fn jit_prepare_numeric_packed_array(
 
 pub const N_HELPERS: usize = 28;
 
+/// Stable diagnostic identities for the generated helper ABI. These labels are part of the
+/// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
+#[allow(dead_code)]
+pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
+    "exec",
+    "cond",
+    "return",
+    "push_handler",
+    "pop_handler",
+    "unwind",
+    "call",
+    "call_hit",
+    "direct_finish",
+    "drop_at",
+    "make_object",
+    "set_prop",
+    "get_prop",
+    "intrinsic",
+    "new",
+    "regexp_exec_loop",
+    "add_strings",
+    "regexp_literal_exec_discard",
+    "regexp_literal_replace_discard",
+    "regexp_literal_match_discard",
+    "instanceof",
+    "make_array",
+    "set_elem",
+    "drop_packed_at",
+    "strict_eq",
+    "make_regexp",
+    "interrupt",
+    "loop_backedge",
+];
+
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn helper_name(index: usize) -> &'static str {
+    HELPER_NAMES.get(index).copied().unwrap_or("invalid")
+}
+
+#[cfg(test)]
+mod helper_identity_tests {
+    use super::*;
+
+    #[test]
+    fn helper_identity_table_matches_the_machine_abi() {
+        assert_eq!(HELPER_NAMES.len(), N_HELPERS);
+        assert_eq!(helper_name(H_EXEC), "exec");
+        assert_eq!(helper_name(H_CALL_HIT), "call_hit");
+        assert_eq!(helper_name(H_LOOP_BACKEDGE), "loop_backedge");
+        assert_eq!(helper_name(N_HELPERS), "invalid");
+    }
+}
+
 /// ARM64 condition codes used by the inline templates.
 #[cfg(all(
     target_arch = "aarch64",

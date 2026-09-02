@@ -16728,7 +16728,10 @@ unsafe fn jit_callstat(
     thread_local! {
         static COUNTS: std::cell::RefCell<Dump> = std::cell::RefCell::new(Dump(Default::default()));
     }
-    struct NativeDump(crate::fasthash::FastMap<(usize, usize, bool), (String, u64)>);
+    // The profile identity is the explicit callable label plus its ABI shape. Do not key the
+    // report by a Rust function-pointer address: those addresses are process-local, unstable
+    // across builds, and cannot identify embedder operations in a portable profile.
+    struct NativeDump(crate::fasthash::FastMap<(String, usize, bool), (String, u64)>);
     impl Drop for NativeDump {
         fn drop(&mut self) {
             let mut v: Vec<_> = self.0.values().collect();
@@ -16748,24 +16751,22 @@ unsafe fn jit_callstat(
     {
         NATIVES.with(|counts| {
             let mut counts = counts.borrow_mut();
+            let name = match &*sp.sub(argc + 1) {
+                Value::Obj(o) => o
+                    .borrow()
+                    .props
+                    .get("name")
+                    .and_then(|p| match p.value() {
+                        Value::Str(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "<native>".to_string()),
+                _ => "<native>".to_string(),
+            };
             let entry = counts
                 .0
-                .entry((ic.native, argc, with_this))
-                .or_insert_with(|| {
-                    let name = match &*sp.sub(argc + 1) {
-                        Value::Obj(o) => o
-                            .borrow()
-                            .props
-                            .get("name")
-                            .and_then(|p| match p.value() {
-                                Value::Str(s) => Some(s.to_string()),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "<native>".to_string()),
-                        _ => "<native>".to_string(),
-                    };
-                    (format!("{name} argc={argc} this={with_this}"), 0)
-                });
+                .entry((name.clone(), argc, with_this))
+                .or_insert_with(|| (format!("{name} argc={argc} this={with_this}"), 0));
             entry.1 += 1;
         });
     }
