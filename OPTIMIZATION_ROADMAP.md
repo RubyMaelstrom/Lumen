@@ -837,6 +837,8 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   edge cases, and adversarial backtracking patterns.
 - [ ] Measure parse/compile, candidate scanning, instruction dispatch, capture copying,
   backtracking, interruption polling, and wrapper/result allocation separately.
+- [x] Project group-0 spans directly for proven dead-result `RegExp.exec` paths while retaining
+  internal capture slots for matching semantics; public executions still materialize captures.
 - [ ] Define matcher bytecode semantics precisely enough to differentially execute bytecode and
   native implementations instruction-by-instruction.
 - [ ] Add per-pattern tier-up ticks and execution/subject-shape feedback.

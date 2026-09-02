@@ -1126,9 +1126,16 @@ impl Regex {
         start: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<(usize, usize)> {
-        Ok(self
-            .exec_text_shared_entry_polled(text, start, control)?
-            .and_then(|captures| captures[0]))
+        match &text.ascii_src {
+            Some(s) => {
+                if let Some(literal) = &self.literal_ascii {
+                    find_ascii_literal(s.as_bytes(), start, literal, self.sticky, control)
+                } else {
+                    self.find_impl(s.as_bytes(), start, control)
+                }
+            }
+            None => self.find_impl(&text.elems[..], start, control),
+        }
     }
 
     fn exec_impl<I: ReInput>(
@@ -1137,6 +1144,36 @@ impl Regex {
         start: usize,
         control: &crate::RuntimeInterrupt,
     ) -> MatchResult<Captures> {
+        let groups = self.ngroups;
+        self.exec_impl_with(input, start, control, move |slots| {
+            Captures::from_slots(slots, groups)
+        })
+    }
+
+    /// Execute the matcher while retaining capture slots for backreferences and assertions, but
+    /// project only the group-0 span. RegExpBuiltinExec still creates the public match array when
+    /// required; discarded native/JIT calls use this projection so they do not allocate a second
+    /// capture-result container (ECMA-262 §22.2.7.1–2).
+    fn find_impl<I: ReInput>(
+        &self,
+        input: I,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+    ) -> MatchResult<(usize, usize)> {
+        self.exec_impl_with(input, start, control, |slots| {
+            let start = slots[0].expect("successful regexp match has a start");
+            let end = slots[1].expect("successful regexp match has an end");
+            (start.min(end), start.max(end))
+        })
+    }
+
+    fn exec_impl_with<I: ReInput, T, F: Fn(&[Option<usize>]) -> T>(
+        &self,
+        input: I,
+        start: usize,
+        control: &crate::RuntimeInterrupt,
+        project: F,
+    ) -> MatchResult<T> {
         if start > input.len() {
             return Ok(None);
         }
@@ -1227,7 +1264,7 @@ impl Regex {
             m.steps = 0;
             m.depth = 0;
             if m.run(&self.prog, 0, from) {
-                break 'scan Ok(Some(Captures::from_slots(&m.caps, self.ngroups)));
+                break 'scan Ok(Some(project(&m.caps)));
             }
             if let Some(error) = m.abort {
                 break 'scan Err(error);
@@ -4247,6 +4284,30 @@ mod internal_engine_diagnostics {
             .unwrap()
             .unwrap();
         assert_eq!(caps[0], Some((0, 13)));
+    }
+
+    #[test]
+    fn whole_match_projection_preserves_public_match_span() {
+        for (pattern, flags, input, start, expected) in [
+            ("(a)(b)(c)(d)(e)", "", "xxabcde", 0, Some((2, 7))),
+            ("needle", "", "xxneedle", 1, Some((2, 8))),
+            ("(😀)", "", "x😀y", 0, Some((1, 3))),
+            ("(😀)", "u", "x😀y", 0, Some((1, 2))),
+            ("needle", "", "haystack", 0, None),
+        ] {
+            let re = super::Regex::new(pattern, flags).unwrap();
+            let input = crate::lstr::LStr::from(input);
+            let text = super::ReText::new_rc(re.unicode, &input);
+            let captures = re
+                .exec_text_shared(&text, start, &crate::RuntimeInterrupt::default())
+                .unwrap()
+                .and_then(|caps| caps[0]);
+            let whole = re
+                .find_text_shared_entry_polled(&text, start, &crate::RuntimeInterrupt::default())
+                .unwrap();
+            assert_eq!(captures, expected);
+            assert_eq!(whole, expected);
+        }
     }
 
     #[test]
