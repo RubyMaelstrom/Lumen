@@ -47,6 +47,8 @@ impl LayoutId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObjectHeader {
     pub(crate) size_units: u32,
+    pub(crate) allocation_site: u32,
+    pub(crate) age: u8,
     pub(crate) layout: LayoutId,
     pub(crate) generation: HeapGeneration,
     pub(crate) marked: bool,
@@ -185,6 +187,16 @@ impl CentralHeap {
         size_units: usize,
         generation: HeapGeneration,
     ) -> Result<HeapRef, HeapError> {
+        self.allocate_at_site(layout, size_units, generation, 0)
+    }
+
+    pub(crate) fn allocate_at_site(
+        &mut self,
+        layout: LayoutId,
+        size_units: usize,
+        generation: HeapGeneration,
+        allocation_site: u32,
+    ) -> Result<HeapRef, HeapError> {
         let size_units = u32::try_from(size_units).map_err(|_| HeapError::RequestTooLarge)?;
         let (index, reference) = self.reserve_slot()?;
         let payload = vec![0; usize::try_from(size_units).unwrap()].into_boxed_slice();
@@ -192,6 +204,8 @@ impl CentralHeap {
         self.objects[index] = Some(HeapObject {
             header: ObjectHeader {
                 size_units,
+                allocation_site,
+                age: 0,
                 layout,
                 generation,
                 marked: false,
@@ -208,6 +222,16 @@ impl CentralHeap {
         layout: LayoutId,
         fields: Vec<TaggedValue>,
         generation: HeapGeneration,
+    ) -> Result<HeapRef, HeapError> {
+        self.allocate_tagged_fields_at_site(layout, fields, generation, 0)
+    }
+
+    pub(crate) fn allocate_tagged_fields_at_site(
+        &mut self,
+        layout: LayoutId,
+        fields: Vec<TaggedValue>,
+        generation: HeapGeneration,
+        allocation_site: u32,
     ) -> Result<HeapRef, HeapError> {
         let size_units = u32::try_from(fields.len()).map_err(|_| HeapError::RequestTooLarge)?;
         if fields.iter().any(|value| value.validate().is_err()) {
@@ -226,6 +250,8 @@ impl CentralHeap {
         self.objects[index] = Some(HeapObject {
             header: ObjectHeader {
                 size_units,
+                allocation_site,
+                age: 0,
                 layout,
                 generation,
                 marked: false,
@@ -498,6 +524,9 @@ impl CentralHeap {
         let previous = self.object(reference)?.header.generation;
         let object = self.object_mut(reference)?;
         object.header.generation = generation;
+        if previous == HeapGeneration::Young && generation != HeapGeneration::Young {
+            object.header.age = object.header.age.saturating_add(1);
+        }
         if previous != generation {
             self.stats.promotions = self.stats.promotions.saturating_add(1);
         }
@@ -881,7 +910,7 @@ mod tests {
     fn validation_and_sweep_preserve_marked_generation_and_accounting() {
         let mut heap = CentralHeap::new();
         let keep = heap
-            .allocate(LayoutId::new(4), 3, HeapGeneration::Young)
+            .allocate_at_site(LayoutId::new(4), 3, HeapGeneration::Young, 77)
             .unwrap();
         let discard = heap
             .allocate(LayoutId::new(5), 7, HeapGeneration::Old)
@@ -890,6 +919,11 @@ mod tests {
         heap.promote(keep, HeapGeneration::Old).unwrap();
         heap.mark(keep).unwrap();
         assert_eq!(heap.header(keep).unwrap().generation, HeapGeneration::Old);
+        assert_eq!(heap.header(keep).unwrap().allocation_site, 77);
+        assert_eq!(heap.header(keep).unwrap().age, 1);
+        assert_eq!(heap.stats().promotions, 1);
+        heap.promote(keep, HeapGeneration::Old).unwrap();
+        assert_eq!(heap.header(keep).unwrap().age, 1);
         assert_eq!(heap.stats().promotions, 1);
         assert_eq!(heap.sweep_unmarked(), 1);
         assert_eq!(heap.requested_bytes(), 3);

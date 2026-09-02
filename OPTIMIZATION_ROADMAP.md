@@ -540,6 +540,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     ECMA-262 §13.2.4/§13.2.5 completion ordering and is disabled without detailed profiling.
   - [ ] Associate allocation identities with survival age, promotion, exact requested bytes, and
     retained size once the central heap/root API exists; do not infer lifetime from site samples.
+    - [x] The central tagged-field fixture records allocation-site tokens, object kind/size,
+      generation age, and promotion transitions in its checked headers.
 - [ ] Record GC cause, generation, pause time, concurrent work, bytes scanned/copied/freed, and
   live-set size.
   - [x] Classify existing stop-the-world collections by allocation-threshold, host task-boundary,
