@@ -839,6 +839,8 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   backtracking, interruption polling, and wrapper/result allocation separately.
 - [x] Project group-0 spans directly for proven dead-result `RegExp.exec` paths while retaining
   internal capture slots for matching semantics; public executions still materialize captures.
+- [x] Keep immutable UnicodeSets metadata borrowed during matcher attempts instead of incrementing
+  its `Rc` count for each candidate; the matcher still owns no mutable pattern state.
 - [ ] Define matcher bytecode semantics precisely enough to differentially execute bytecode and
   native implementations instruction-by-instruction.
 - [ ] Add per-pattern tier-up ticks and execution/subject-shape feedback.

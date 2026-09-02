@@ -3566,8 +3566,7 @@ impl<I: ReInput> Matcher<'_, I> {
                     {
                         return false;
                     }
-                    let set = set.clone();
-                    for length in self.string_set_lengths(&set, pos) {
+                    for length in self.string_set_lengths(set, pos) {
                         let next = if self.back {
                             pos - length
                         } else {
@@ -3591,8 +3590,7 @@ impl<I: ReInput> Matcher<'_, I> {
                     max,
                     greedy,
                 } => {
-                    let (set, min, max, greedy) = (set.clone(), *min, *max, *greedy);
-                    return self.run_string_set_repeat(prog, pc, pos, &set, min, max, greedy);
+                    return self.run_string_set_repeat(prog, pc, pos, set, *min, *max, *greedy);
                 }
                 Inst::Save(slot) => {
                     let slot = *slot;
