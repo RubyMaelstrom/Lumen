@@ -547,6 +547,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     object/scope live-set counters.
   - [ ] Add generation, concurrent-work, and byte-level scan/copy/free accounting with the central
     heap; the current cycle collector has no generational or moving phase to report honestly.
+    - [x] The central tagged-field fixture now exposes allocation, promotion, mark/sweep scan,
+      relocation-copy, and freed-byte counters; live Agent metrics remain pending migration.
 - [ ] Record baseline/optimizing compile time, generated code size, inlining decisions, guard
   failures, side exits, deoptimizations, and reoptimization suppression.
   - [x] Expose opt-in JIT compile attempts/successes/failures, elapsed time, generated-code size,

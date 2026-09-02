@@ -16,6 +16,19 @@ pub(crate) enum HeapGeneration {
     Pinned,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HeapStats {
+    pub(crate) allocations: u64,
+    pub(crate) promotions: u64,
+    pub(crate) collections: u64,
+    pub(crate) mark_objects_scanned: u64,
+    pub(crate) mark_bytes_scanned: u64,
+    pub(crate) sweep_objects_scanned: u64,
+    pub(crate) sweep_bytes_scanned: u64,
+    pub(crate) copied_bytes: u64,
+    pub(crate) freed_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LayoutId(u32);
 
@@ -82,6 +95,7 @@ pub(crate) struct CentralHeap {
     requested_bytes: usize,
     no_gc: NoGcState,
     remembered: Vec<HeapRef>,
+    stats: HeapStats,
 }
 
 impl Default for CentralHeap {
@@ -99,6 +113,7 @@ impl CentralHeap {
             requested_bytes: 0,
             no_gc: NoGcState::default(),
             remembered: Vec::new(),
+            stats: HeapStats::default(),
         }
     }
 
@@ -178,6 +193,7 @@ impl CentralHeap {
             },
             storage: HeapStorage::Bytes(payload),
         });
+        self.stats.allocations = self.stats.allocations.saturating_add(1);
         Ok(reference)
     }
 
@@ -211,6 +227,7 @@ impl CentralHeap {
             },
             storage,
         });
+        self.stats.allocations = self.stats.allocations.saturating_add(1);
         self.refresh_remembered_reference(reference)?;
         Ok(reference)
     }
@@ -418,11 +435,16 @@ impl CentralHeap {
                     .filter_map(|field| field.as_heap())
                     .collect::<Vec<_>>(),
             };
-            let object = self.object_mut(reference)?;
+            let object = self.object(reference)?;
             if object.header.marked {
                 continue;
             }
+            let scanned_bytes = object.storage.requested_bytes() as u64;
+            let object = self.object_mut(reference)?;
             object.header.marked = true;
+            self.stats.mark_objects_scanned = self.stats.mark_objects_scanned.saturating_add(1);
+            self.stats.mark_bytes_scanned =
+                self.stats.mark_bytes_scanned.saturating_add(scanned_bytes);
             marked += 1;
             pending.extend(children);
         }
@@ -434,12 +456,21 @@ impl CentralHeap {
         reference: HeapRef,
         generation: HeapGeneration,
     ) -> Result<(), HeapError> {
-        self.object_mut(reference)?.header.generation = generation;
+        let previous = self.object(reference)?.header.generation;
+        let object = self.object_mut(reference)?;
+        object.header.generation = generation;
+        if previous != generation {
+            self.stats.promotions = self.stats.promotions.saturating_add(1);
+        }
         self.refresh_remembered_reference(reference)
     }
 
     pub(crate) fn requested_bytes(&self) -> usize {
         self.requested_bytes
+    }
+
+    pub(crate) fn stats(&self) -> HeapStats {
+        self.stats
     }
 
     /// Verify every live slot, header/storage size, forwarding edge, and tagged child reference.
@@ -494,8 +525,14 @@ impl CentralHeap {
     pub(crate) fn sweep_unmarked(&mut self) -> usize {
         let mut reclaimed = 0;
         let mut released_bytes: usize = 0;
+        let mut scanned_objects = 0;
+        let mut scanned_bytes: usize = 0;
         let mut released_slots = Vec::new();
         for (index, slot) in self.objects.iter_mut().enumerate().skip(1) {
+            if let Some(object) = slot.as_ref() {
+                scanned_objects += 1;
+                scanned_bytes = scanned_bytes.saturating_add(object.storage.requested_bytes());
+            }
             let remove = slot
                 .as_ref()
                 .is_some_and(|object| !object.header.marked && object.header.forwarding.is_none());
@@ -511,6 +548,19 @@ impl CentralHeap {
             }
         }
         self.requested_bytes = self.requested_bytes.saturating_sub(released_bytes);
+        self.stats.collections = self.stats.collections.saturating_add(1);
+        self.stats.sweep_objects_scanned = self
+            .stats
+            .sweep_objects_scanned
+            .saturating_add(scanned_objects);
+        self.stats.sweep_bytes_scanned = self
+            .stats
+            .sweep_bytes_scanned
+            .saturating_add(u64::try_from(scanned_bytes).unwrap_or(u64::MAX));
+        self.stats.freed_bytes = self
+            .stats
+            .freed_bytes
+            .saturating_add(u64::try_from(released_bytes).unwrap_or(u64::MAX));
         for index in released_slots {
             self.release_slot(index);
         }
@@ -551,11 +601,13 @@ impl CentralHeap {
         }
         let mut moved = source_object.clone();
         moved.header.forwarding = None;
+        let copied_bytes = u64::try_from(moved.storage.requested_bytes()).unwrap_or(u64::MAX);
         let (target_index, target) = self.reserve_slot()?;
         self.requested_bytes = self
             .requested_bytes
             .saturating_add(moved.storage.requested_bytes());
         self.objects[target_index] = Some(moved);
+        self.stats.copied_bytes = self.stats.copied_bytes.saturating_add(copied_bytes);
         self.refresh_remembered_reference(target)?;
         let source_object = self.objects[source_index]
             .as_mut()
@@ -579,6 +631,10 @@ impl CentralHeap {
         self.requested_bytes = self
             .requested_bytes
             .saturating_sub(released.storage.requested_bytes());
+        self.stats.freed_bytes = self
+            .stats
+            .freed_bytes
+            .saturating_add(u64::try_from(released.storage.requested_bytes()).unwrap_or(u64::MAX));
         self.remembered.retain(|entry| *entry != source);
         self.release_slot(index);
         Ok(target)
@@ -600,6 +656,10 @@ impl CentralHeap {
         self.requested_bytes = self
             .requested_bytes
             .saturating_sub(released.storage.requested_bytes());
+        self.stats.freed_bytes = self
+            .stats
+            .freed_bytes
+            .saturating_add(u64::try_from(released.storage.requested_bytes()).unwrap_or(u64::MAX));
         self.remembered.retain(|entry| *entry != reference);
         self.release_slot(index);
         Ok(())
@@ -625,6 +685,8 @@ mod tests {
             HeapGeneration::Young
         );
         assert_eq!(heap.payload(reference).unwrap().len(), 12);
+        assert_eq!(heap.stats().allocations, 1);
+        assert_eq!(heap.stats().mark_objects_scanned, 0);
         heap.payload_mut(reference).unwrap()[4] = 0xa5;
         assert_eq!(heap.payload(reference).unwrap()[4], 0xa5);
         heap.mark(reference).unwrap();
@@ -695,10 +757,12 @@ mod tests {
         let target = heap.relocate(source).unwrap();
         assert_eq!(heap.payload(source), Err(HeapError::ForwardedReference));
         assert_eq!(heap.payload(target).unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(heap.stats().copied_bytes, 4);
         assert_eq!(heap.relocate(source), Err(HeapError::AlreadyForwarded));
         assert_eq!(heap.reclaim_forwarded(source), Ok(target));
         assert_eq!(heap.payload(source), Err(HeapError::InvalidReference));
         assert_eq!(heap.requested_bytes(), 4);
+        assert_eq!(heap.stats().freed_bytes, 4);
     }
 
     #[test]
@@ -774,6 +838,7 @@ mod tests {
         heap.promote(keep, HeapGeneration::Old).unwrap();
         heap.mark(keep).unwrap();
         assert_eq!(heap.header(keep).unwrap().generation, HeapGeneration::Old);
+        assert_eq!(heap.stats().promotions, 1);
         assert_eq!(heap.sweep_unmarked(), 1);
         assert_eq!(heap.requested_bytes(), 3);
         assert_eq!(heap.live_handles(), vec![keep]);
@@ -813,6 +878,14 @@ mod tests {
         assert_eq!(heap.sweep_unmarked(), 1);
         assert_eq!(heap.payload(unreachable), Err(HeapError::InvalidReference));
         assert_eq!(heap.verify_remembered_set(), Ok(()));
+        let stats = heap.stats();
+        assert_eq!(stats.allocations, 3);
+        assert_eq!(stats.mark_objects_scanned, 2);
+        assert_eq!(stats.mark_bytes_scanned, 16);
+        assert_eq!(stats.collections, 1);
+        assert_eq!(stats.sweep_objects_scanned, 3);
+        assert_eq!(stats.sweep_bytes_scanned, 21);
+        assert_eq!(stats.freed_bytes, 5);
         assert_eq!(heap.validate_all(), Ok(()));
     }
 
