@@ -1915,7 +1915,7 @@ fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, 
     let len = ab(i.to_length(&o))?;
     let mut out = Vec::with_capacity(len.min(1024));
     for k in 0..len {
-        out.push(ab(i.get_member(v, &k.to_string()))?);
+        out.push(array_get_index(i, &o, v, k)?);
     }
     Ok(out)
 }
@@ -5347,7 +5347,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let from = k.to_string();
             let to = (k - 1).to_string();
             if ab(i.js_has_property(&ov, &from))? {
-                let v = ab(i.get_member(&ov, &from))?;
+                let v = array_get_index_after_has(i, &o, &ov, k, &from)?;
                 set_throw(i, &ov, &to, v)?;
             } else {
                 delete_or_throw(i, &ov, &to)?;
@@ -5370,7 +5370,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 let from = k.to_string();
                 let to = (k + n).to_string();
                 if ab(i.js_has_property(&ov, &from))? {
-                    let v = ab(i.get_member(&ov, &from))?;
+                    let v = array_get_index_after_has(i, &o, &ov, k as usize, &from)?;
                     set_throw(i, &ov, &to, v)?;
                 } else {
                     delete_or_throw(i, &ov, &to)?;
@@ -5402,7 +5402,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let key = k.to_string();
             // Preserve holes: only copy indices the source actually has (HasProperty).
             if ab(i.js_has_property(&ov, &key))? {
-                let v = ab(i.get_member(&this, &key))?;
+                let v = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
                 cdp_or_throw(i, &result, &to.to_string(), v)?;
             }
             k += 1;
@@ -5534,7 +5534,12 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 for k in 0..len {
                     let key = k.to_string();
                     if ab(i.js_has_property(v, &key))? {
-                        let elem = ab(i.get_member(v, &key))?;
+                        let elem = match v {
+                            Value::Obj(object) => {
+                                array_get_index_after_has(i, object, v, k as usize, &key)?
+                            }
+                            _ => ab(i.get_member(v, &key))?,
+                        };
                         cdp_or_throw(i, &result, &n.to_string(), elem)?;
                     }
                     n += 1; // increment for holes too, preserving their position
@@ -5597,7 +5602,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 cb_this.clone(),
                 &[v, Value::Num(k as f64), ov.clone()],
             ))?;
-            json_create_data_prop_or_throw(i, &result, &k.to_string(), mapped)?;
+            json_create_data_prop_or_throw(i, &result, &key, mapped)?;
         }
         Ok(result)
     });
@@ -5689,12 +5694,12 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             // HasProperty/Get the two ends, then swap — preserving holes (a hole moves as a
             // DeletePropertyOrThrow).
             let lower_val = if ab(i.js_has_property(&ov, &lower))? {
-                Some(ab(i.get_member(&ov, &lower))?)
+                Some(array_get_index_after_has(i, &o, &ov, k, &lower)?)
             } else {
                 None
             };
             let upper_val = if ab(i.js_has_property(&ov, &upper))? {
-                Some(ab(i.get_member(&ov, &upper))?)
+                Some(array_get_index_after_has(i, &o, &ov, len - 1 - k, &upper)?)
             } else {
                 None
             };
@@ -6113,7 +6118,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let fk = from.to_string();
             let tk = to.to_string();
             if ab(i.js_has_property(&ov, &fk))? {
-                let v = ab(i.get_member(&ov, &fk))?;
+                let v = array_get_index_after_has(i, &o, &ov, from as usize, &fk)?;
                 set_throw(i, &ov, &tk, v)?;
             } else {
                 delete_or_throw(i, &ov, &tk)?;
@@ -6281,7 +6286,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             i.make_array(Vec::new())
         };
         for k in 0..len {
-            let raw = ab(i.get_member(&ov, &k.to_string()))?;
+            let raw = array_get_index(i, &o, &ov, k)?;
             let v = if mapfn.is_callable() {
                 ab(i.call(
                     mapfn.clone(),
@@ -6531,7 +6536,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
     for k in 0..delete_count {
         let from = (start + k).to_string();
         if ab(i.js_has_property(&ov, &from))? {
-            let v = ab(i.get_member(&ov, &from))?;
+            let v = array_get_index_after_has(i, &o, &ov, (start + k) as usize, &from)?;
             json_create_data_prop_or_throw(i, &removed, &k.to_string(), v)?;
         }
     }
@@ -6543,7 +6548,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
             let from = (k + delete_count).to_string();
             let to = (k + item_count).to_string();
             if ab(i.js_has_property(&ov, &from))? {
-                let v = ab(i.get_member(&ov, &from))?;
+                let v = array_get_index_after_has(i, &o, &ov, (k + delete_count) as usize, &from)?;
                 set_throw(i, &ov, &to, v)?;
             } else {
                 delete_or_throw(i, &ov, &to)?;
@@ -6557,7 +6562,8 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
             let from = (k + delete_count - 1).to_string();
             let to = (k + item_count - 1).to_string();
             if ab(i.js_has_property(&ov, &from))? {
-                let v = ab(i.get_member(&ov, &from))?;
+                let v =
+                    array_get_index_after_has(i, &o, &ov, (k + delete_count - 1) as usize, &from)?;
                 set_throw(i, &ov, &to, v)?;
             } else {
                 delete_or_throw(i, &ov, &to)?;
