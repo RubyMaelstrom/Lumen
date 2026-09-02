@@ -992,6 +992,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     temporary-`String` allocations (ECMA-262 Annex B.2.1.2). The focused global-method tests now
     cover astral, escaped-pair, and lone-surrogate cases; the mixed release workload retained its
     ~0.046 s median while correcting the prior astral-unit truncation.
+  - [x] `%TypedArray%.prototype.set` uses one byte snapshot and one byte-range write when source
+    and target element types are identical, preserving overlap and bit-level encodings while
+    retaining per-element conversion for differing types (ECMA-262 §23.2.3.26.2). A release
+    workload copying 20,000 `Float64Array` elements 20 times improved from 0.067550 s to
+    0.033594 s median (about 50%); the typed-array semantic suite passed.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

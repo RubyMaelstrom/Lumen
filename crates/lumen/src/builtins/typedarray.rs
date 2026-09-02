@@ -1645,6 +1645,16 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
             ));
         }
         let offset = offset_n as usize;
+        if src_info.kind == info.kind {
+            // SetTypedArrayFromTypedArray copies bytes when element types match (ECMA-262
+            // §23.2.3.26.2), including overlapping views and NaN payloads. Snapshot the exact
+            // byte range once, then write it, avoiding one boxed `Value` and conversion per
+            // element while retaining the required overlap behavior.
+            if let Some(bytes) = i.ta_read_bytes(&src_info, 0, src_len) {
+                i.ta_write_bytes(&info, offset, &bytes);
+                return Ok(Value::Undefined);
+            }
+        }
         // Snapshot the source first so an overlapping same-buffer copy reads pre-write values.
         let vals: Vec<Value> = (0..src_len).map(|k| i.ta_read(&src_info, k)).collect();
         for (k, v) in vals.iter().enumerate() {
