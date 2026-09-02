@@ -953,6 +953,12 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     retaining stable ordering and comparator abrupt-completion behavior while removing recursive
     per-level vector allocations (ECMA-262 §23.1.3.30.1). An 11-sample 5,000-element release
     workload improved from 0.098384 s to 0.095119 s (about 3%).
+  - [x] Array `indexOf`, `lastIndexOf`, `some`, and `every` share the checked dense own-data
+    probe used by the other indexed callbacks, avoiding decimal-key construction and a separate
+    `HasProperty` walk for ordinary dense arrays while retaining hole/prototype/accessor/proxy
+    semantics (ECMA-262 §23.1.3.6, §23.1.3.20, §23.1.3.25). An 11-sample release workload with
+    10,000-element dense arrays improved from 0.281695 s to 0.277669 s (about 1.4%; within
+    normal host variance, but with no semantic or broad-suite regression).
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

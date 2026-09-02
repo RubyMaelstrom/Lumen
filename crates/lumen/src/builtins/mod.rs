@@ -5436,11 +5436,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         let ov = Value::Obj(o.clone());
         for k in from..len {
-            let key = k.to_string();
-            if !ab(i.js_has_property(&ov, &key))? {
+            let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue; // indexOf skips holes
-            }
-            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
+            };
             if i.strict_equals(&v, &target) {
                 return Ok(Value::Num(k as f64));
             }
@@ -5871,12 +5869,12 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         let ov = Value::Obj(o.clone());
         while k >= 0 {
-            let key = k.to_string();
-            if ab(i.js_has_property(&ov, &key))? {
-                let v = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
-                if i.strict_equals(&v, &target) {
-                    return Ok(Value::Num(k as f64));
-                }
+            let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? else {
+                k -= 1;
+                continue;
+            };
+            if i.strict_equals(&v, &target) {
+                return Ok(Value::Num(k as f64));
             }
             k -= 1;
         }
@@ -6452,11 +6450,9 @@ fn array_some_every(
     let cb_this = arg(args, 1);
     let ov = Value::Obj(o.clone());
     for k in 0..len {
-        let key = k.to_string();
-        if !ab(i.js_has_property(&ov, &key))? {
+        let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
             continue; // skip holes
-        }
-        let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
+        };
         let r = ab(i.call(
             cb.clone(),
             cb_this.clone(),
