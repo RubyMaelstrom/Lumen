@@ -504,19 +504,24 @@ impl CentralHeap {
             })
             .collect::<Vec<_>>();
         let mut promoted = 0;
+        // The public relocation/reclamation methods independently validate the whole table. A
+        // collection already has one validation at the mark boundary and one after all forwarding
+        // edges are rewritten, so avoid turning an N-object nursery into an O(N²) verifier walk.
+        self.validate_all()?;
         for source in young {
             if self.header(source).is_err() {
                 continue;
             }
-            let target = self.relocate(source)?;
+            let target = self.relocate_unchecked(source)?;
             roots.rewrite_heap_reference(source, target);
             self.rewrite_tagged_references(source, target);
             self.promote(target, HeapGeneration::Old)?;
-            self.reclaim_forwarded(source)?;
+            self.reclaim_forwarded_unchecked(source)?;
             promoted += 1;
         }
         self.remembered = self.recompute_remembered_set()?;
         let reclaimed = self.sweep_unmarked_young();
+        self.validate_all()?;
         Ok(NurseryCollection {
             promoted,
             reclaimed,
@@ -714,6 +719,10 @@ impl CentralHeap {
     /// update every root and traced field before releasing from-space.
     pub(crate) fn relocate(&mut self, source: HeapRef) -> Result<HeapRef, HeapError> {
         self.validate_all()?;
+        self.relocate_unchecked(source)
+    }
+
+    fn relocate_unchecked(&mut self, source: HeapRef) -> Result<HeapRef, HeapError> {
         let source_index = self.resolve_slot(source)?;
         let source_object = self.objects[source_index]
             .as_ref()
@@ -742,6 +751,10 @@ impl CentralHeap {
     /// references have been rewritten. The old handle then fails closed as invalid.
     pub(crate) fn reclaim_forwarded(&mut self, source: HeapRef) -> Result<HeapRef, HeapError> {
         self.validate_all()?;
+        self.reclaim_forwarded_unchecked(source)
+    }
+
+    fn reclaim_forwarded_unchecked(&mut self, source: HeapRef) -> Result<HeapRef, HeapError> {
         let index = self.resolve_slot(source)?;
         let object = self.objects[index]
             .as_ref()
