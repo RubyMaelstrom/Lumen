@@ -33,6 +33,17 @@ pub(crate) struct HeapStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AllocationSiteStats {
+    pub(crate) allocations: u64,
+    pub(crate) promotions: u64,
+    pub(crate) reclaimed: u64,
+    pub(crate) live_allocations: u64,
+    pub(crate) requested_bytes: u64,
+    pub(crate) live_requested_bytes: u64,
+    pub(crate) max_age: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NurseryCollection {
     pub(crate) promoted: usize,
     pub(crate) reclaimed: usize,
@@ -109,6 +120,7 @@ pub(crate) struct CentralHeap {
     no_gc: NoGcState,
     remembered: Vec<HeapRef>,
     stats: HeapStats,
+    allocation_sites: crate::fasthash::FastMap<u32, AllocationSiteStats>,
 }
 
 impl Default for CentralHeap {
@@ -127,7 +139,35 @@ impl CentralHeap {
             no_gc: NoGcState::default(),
             remembered: Vec::new(),
             stats: HeapStats::default(),
+            allocation_sites: Default::default(),
         }
+    }
+
+    fn record_site_allocation(&mut self, site: u32, bytes: usize, logical: bool) {
+        let stats = self.allocation_sites.entry(site).or_default();
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if logical {
+            stats.allocations = stats.allocations.saturating_add(1);
+            stats.requested_bytes = stats.requested_bytes.saturating_add(bytes);
+        }
+        stats.live_allocations = stats.live_allocations.saturating_add(1);
+        stats.live_requested_bytes = stats.live_requested_bytes.saturating_add(bytes);
+    }
+
+    fn record_site_release(&mut self, site: u32, bytes: usize, age: u8) {
+        let stats = self.allocation_sites.entry(site).or_default();
+        stats.reclaimed = stats.reclaimed.saturating_add(1);
+        stats.live_allocations = stats.live_allocations.saturating_sub(1);
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        stats.live_requested_bytes = stats.live_requested_bytes.saturating_sub(bytes);
+        stats.max_age = stats.max_age.max(age);
+    }
+
+    pub(crate) fn allocation_site_stats(&self, site: u32) -> AllocationSiteStats {
+        self.allocation_sites
+            .get(&site)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Enter a short raw-pointer region. The returned guard borrows this heap, so mutable
@@ -218,6 +258,7 @@ impl CentralHeap {
             },
             storage: HeapStorage::Bytes(payload),
         });
+        self.record_site_allocation(allocation_site, size_units as usize, true);
         self.stats.allocations = self.stats.allocations.saturating_add(1);
         Ok(reference)
     }
@@ -264,6 +305,13 @@ impl CentralHeap {
             },
             storage,
         });
+        self.record_site_allocation(
+            allocation_site,
+            self.objects[index]
+                .as_ref()
+                .map_or(0, |object| object.storage.requested_bytes()),
+            true,
+        );
         self.stats.allocations = self.stats.allocations.saturating_add(1);
         self.refresh_remembered_reference(reference)?;
         Ok(reference)
@@ -603,11 +651,18 @@ impl CentralHeap {
         let previous = self.object(reference)?.header.generation;
         let object = self.object_mut(reference)?;
         object.header.generation = generation;
+        let mut promoted_site = None;
         if previous == HeapGeneration::Young && generation != HeapGeneration::Young {
             object.header.age = object.header.age.saturating_add(1);
+            promoted_site = Some((object.header.allocation_site, object.header.age));
         }
         if previous != generation {
             self.stats.promotions = self.stats.promotions.saturating_add(1);
+        }
+        if let Some((site, age)) = promoted_site {
+            let stats = self.allocation_sites.entry(site).or_default();
+            stats.promotions = stats.promotions.saturating_add(1);
+            stats.max_age = stats.max_age.max(age);
         }
         self.refresh_remembered_reference(reference)
     }
@@ -675,6 +730,7 @@ impl CentralHeap {
         let mut scanned_objects = 0;
         let mut scanned_bytes: usize = 0;
         let mut released_slots = Vec::new();
+        let mut released_sites = Vec::new();
         for (index, slot) in self.objects.iter_mut().enumerate().skip(1) {
             if let Some(object) = slot.as_ref() {
                 scanned_objects += 1;
@@ -683,8 +739,9 @@ impl CentralHeap {
             let remove = slot.as_ref().is_some_and(&should_reclaim);
             if remove {
                 if let Some(object) = slot.take() {
-                    released_bytes =
-                        released_bytes.saturating_add(object.storage.requested_bytes());
+                    let bytes = object.storage.requested_bytes();
+                    released_bytes = released_bytes.saturating_add(bytes);
+                    released_sites.push((object.header.allocation_site, bytes, object.header.age));
                     released_slots.push(index);
                     reclaimed += 1;
                 }
@@ -706,6 +763,9 @@ impl CentralHeap {
             .stats
             .freed_bytes
             .saturating_add(u64::try_from(released_bytes).unwrap_or(u64::MAX));
+        for (site, bytes, age) in released_sites {
+            self.record_site_release(site, bytes, age);
+        }
         for index in released_slots {
             self.release_slot(index);
         }
@@ -766,11 +826,19 @@ impl CentralHeap {
         let mut moved = source_object.clone();
         moved.header.forwarding = None;
         let copied_bytes = u64::try_from(moved.storage.requested_bytes()).unwrap_or(u64::MAX);
+        let copied_payload_bytes = moved.storage.requested_bytes();
         let (target_index, target) = self.reserve_slot()?;
         self.requested_bytes = self
             .requested_bytes
             .saturating_add(moved.storage.requested_bytes());
         self.objects[target_index] = Some(moved);
+        self.record_site_allocation(
+            self.objects[target_index]
+                .as_ref()
+                .map_or(0, |object| object.header.allocation_site),
+            copied_payload_bytes,
+            false,
+        );
         self.stats.copied_bytes = self.stats.copied_bytes.saturating_add(copied_bytes);
         self.refresh_remembered_reference(target)?;
         let source_object = self.objects[source_index]
@@ -796,13 +864,17 @@ impl CentralHeap {
         let released = self.objects[index]
             .take()
             .ok_or(HeapError::InvalidReference)?;
-        self.requested_bytes = self
-            .requested_bytes
-            .saturating_sub(released.storage.requested_bytes());
+        let released_bytes = released.storage.requested_bytes();
+        self.requested_bytes = self.requested_bytes.saturating_sub(released_bytes);
+        self.record_site_release(
+            released.header.allocation_site,
+            released_bytes,
+            released.header.age,
+        );
         self.stats.freed_bytes = self
             .stats
             .freed_bytes
-            .saturating_add(u64::try_from(released.storage.requested_bytes()).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(released_bytes).unwrap_or(u64::MAX));
         self.remembered.retain(|entry| *entry != source);
         self.release_slot(index);
         Ok(target)
@@ -821,13 +893,17 @@ impl CentralHeap {
         let released = self.objects[index]
             .take()
             .ok_or(HeapError::InvalidReference)?;
-        self.requested_bytes = self
-            .requested_bytes
-            .saturating_sub(released.storage.requested_bytes());
+        let released_bytes = released.storage.requested_bytes();
+        self.requested_bytes = self.requested_bytes.saturating_sub(released_bytes);
+        self.record_site_release(
+            released.header.allocation_site,
+            released_bytes,
+            released.header.age,
+        );
         self.stats.freed_bytes = self
             .stats
             .freed_bytes
-            .saturating_add(u64::try_from(released.storage.requested_bytes()).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(released_bytes).unwrap_or(u64::MAX));
         self.remembered.retain(|entry| *entry != reference);
         self.release_slot(index);
         Ok(())
@@ -1018,6 +1094,40 @@ mod tests {
         assert_eq!(heap.payload(discard), Err(HeapError::InvalidReference));
         assert!(!heap.header(keep).unwrap().marked);
         assert_eq!(heap.validate_all(), Ok(()));
+    }
+
+    #[test]
+    fn allocation_site_stats_track_logical_bytes_age_and_relocation_without_double_counting() {
+        let mut heap = CentralHeap::new();
+        let keep = heap
+            .allocate_at_site(LayoutId::new(17), 3, HeapGeneration::Young, 77)
+            .unwrap();
+        let discard = heap
+            .allocate_at_site(LayoutId::new(18), 5, HeapGeneration::Young, 77)
+            .unwrap();
+        let initial = heap.allocation_site_stats(77);
+        assert_eq!(initial.allocations, 2);
+        assert_eq!(initial.requested_bytes, 8);
+        assert_eq!(initial.live_allocations, 2);
+        assert_eq!(initial.live_requested_bytes, 8);
+
+        heap.promote(keep, HeapGeneration::Old).unwrap();
+        heap.free(discard).unwrap();
+        let after_free = heap.allocation_site_stats(77);
+        assert_eq!(after_free.promotions, 1);
+        assert_eq!(after_free.reclaimed, 1);
+        assert_eq!(after_free.live_allocations, 1);
+        assert_eq!(after_free.live_requested_bytes, 3);
+        assert_eq!(after_free.max_age, 1);
+
+        let target = heap.relocate(keep).unwrap();
+        assert_eq!(heap.reclaim_forwarded(keep), Ok(target));
+        let after_relocation = heap.allocation_site_stats(77);
+        assert_eq!(after_relocation.allocations, 2);
+        assert_eq!(after_relocation.requested_bytes, 8);
+        assert_eq!(after_relocation.reclaimed, 2);
+        assert_eq!(after_relocation.live_allocations, 1);
+        assert_eq!(after_relocation.live_requested_bytes, 3);
     }
 
     #[test]
