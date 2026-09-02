@@ -1303,6 +1303,24 @@ fn iterator_protocol() {
         run("String.prototype[Symbol.iterator]=function*(){yield 'x'; yield 'y'}; [...'ab'].join(',')"),
         "x,y"
     );
+    assert_eq!(
+        run("String.prototype[Symbol.iterator]=function*(){yield 'x'; yield 'y'}; var out=''; for (var c of 'ab') out+=c; out"),
+        "xy"
+    );
+    assert_eq!(
+        run("String.prototype[Symbol.iterator]=function*(){yield 'x'; yield 'y'}; var [a,b]='ab'; a+b"),
+        "xy"
+    );
+    // IfAbruptCloseIterator closes an iterator when next() or IteratorValue throws, while
+    // preserving the original abrupt completion if return() also fails (ECMA-262 §7.4.13).
+    assert_eq!(
+        run("var closed=false; var src={[Symbol.iterator](){var n=0; return {next(){if(n++) throw Error('boom'); return {value:1,done:false}},return(){closed=true; throw Error('close')}}}}; try{[...src]}catch(e){} closed"),
+        "true"
+    );
+    assert_eq!(
+        run("var closed=false; var src={[Symbol.iterator](){return {next:1,return(){closed=true;return {}}}}}; try{[...src]}catch(e){} closed"),
+        "true"
+    );
 }
 
 #[test]

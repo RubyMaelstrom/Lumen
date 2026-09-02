@@ -1576,14 +1576,6 @@ impl Interp {
     pub(crate) fn get_iterator(&mut self, v: &Value) -> Result<(Value, Value), Abrupt> {
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<(Value, Value), Abrupt> = (|| {
-            // A primitive string iterates by code point (it has no own @@iterator method here).
-            if let Value::Str(s) = v {
-                let chars: Vec<Value> = crate::jstr::CodePointIter::new(s)
-                    .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
-                    .collect();
-                let arr = self.make_array(chars);
-                return self.get_iterator(&arr);
-            }
             let key = match &self.iterator_sym {
                 Some(s) => Interp::sym_key(s),
                 None => return Err(self.throw("TypeError", "no iterator symbol")),
@@ -1704,23 +1696,49 @@ impl Interp {
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<Vec<Value>, Abrupt> = (|| {
             let iter = self.call(itfn, v.clone(), &[])?;
+            // GetIteratorFromMethod rejects a primitive result before creating an Iterator Record;
+            // there is therefore nothing to close in this case.
+            if !matches!(iter, Value::Obj(_)) {
+                return Err(self.throw("TypeError", "@@iterator returned a non-object"));
+            }
             let next = self.get_member(&iter, "next")?;
             if !next.is_callable() {
-                return Err(self.throw("TypeError", "iterator.next is not a function"));
+                // GetIteratorDirect stores a non-callable next method in the record and the
+                // subsequent IteratorStep call closes that record on its abrupt completion.
+                let error = self.throw("TypeError", "iterator.next is not a function");
+                self.iterator_close(&iter);
+                return Err(error);
             }
             let mut out = Vec::new();
             loop {
-                let res = self.call(next.clone(), iter.clone(), &[])?;
-                if !matches!(res, Value::Obj(_)) {
-                    return Err(self.throw("TypeError", "iterator result is not an object"));
-                }
-                let done = self.get_member(&res, "done")?;
-                if self.to_boolean(&done) {
-                    break;
-                }
-                out.push(self.get_member(&res, "value")?);
-                if out.len() > crate::interpreter::MAX_ARRAY_OP_LEN {
-                    return Err(self.throw("RangeError", "iterator produced too many values"));
+                let step: Result<Option<Value>, Abrupt> = (|| {
+                    let res = self.call(next.clone(), iter.clone(), &[])?;
+                    if !matches!(res, Value::Obj(_)) {
+                        return Err(self.throw("TypeError", "iterator result is not an object"));
+                    }
+                    let done = self.get_member(&res, "done")?;
+                    if self.to_boolean(&done) {
+                        return Ok(None);
+                    }
+                    Ok(Some(self.get_member(&res, "value")?))
+                })();
+                match step {
+                    Ok(None) => break,
+                    Ok(Some(value)) => {
+                        out.push(value);
+                        if out.len() > crate::interpreter::MAX_ARRAY_OP_LEN {
+                            let error =
+                                self.throw("RangeError", "iterator produced too many values");
+                            self.iterator_close(&iter);
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => {
+                        // Spread/ArgumentListEvaluation use IfAbruptCloseIterator: preserve the
+                        // original abrupt completion and swallow any error from return().
+                        self.iterator_close(&iter);
+                        return Err(error);
+                    }
                 }
             }
             Ok(out)

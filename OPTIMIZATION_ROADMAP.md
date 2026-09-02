@@ -600,6 +600,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     - [x] Spread and argument-list fast paths now require the canonical array/string iterator
       methods (and intact iterator next methods), preserving GetIterator semantics after user
       code mutates either prototype.
+    - [x] Primitive-string GetIterator now uses String.prototype directly, and eager iterable
+      collection closes the Iterator Record on abrupt next/result/value failures.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
 - [x] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
   recover diagnostics. `PerformanceMetricsSampler` emits an immediate and then interval-spaced
