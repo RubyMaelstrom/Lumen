@@ -1069,6 +1069,11 @@ before changing broad execution behavior:
   record and `HEAP_SAFETY_MODEL.md`.
 - [ ] Migrate one bounded bytecode/frame/helper slice to the canonical tagged ABI and prove forced
   safepoint, relocation, frame walking, and differential behavior before widening the migration.
+  - [x] Add the allocation-free, immediate-only `TaggedNumericFrame` and route bytecode numeric
+    operators through it behind `LUMEN_TAGGED_ARITHMETIC=1`; non-Number values deopt to the complete
+    ECMA-262 helper path. IEEE-754 edge and full-suite differential tests pass with the switch on.
+  - [ ] Connect a migrated frame to published root maps and a forced safepoint/relocation test;
+    keep the switch opt-in until that proof exists.
 - [x] Write and review the Phase 3A heap safety/migration design, including every root family,
   object tracer, hybrid-edge rule, promotion destination, and old-to-young barrier
   (`HEAP_SAFETY_MODEL.md`). The document is a non-executable safety gate; object-family migration

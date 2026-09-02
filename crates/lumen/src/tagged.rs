@@ -323,6 +323,40 @@ impl TaggedFrame {
     }
 }
 
+/// A fixed, allocation-free tagged frame for the first execution migration slice.
+///
+/// The frame contains only Number operands, so it cannot cross a user-code, allocation, or
+/// safepoint boundary. Any other ECMAScript value must remain on the canonical `Value` path,
+/// where `+` can perform ToPrimitive/string concatenation and the other operators can perform
+/// their complete ToNumeric algorithms. Keeping this frame on the stack makes the migration
+/// auditable while avoiding a per-operation heap allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaggedNumericFrame {
+    slots: [TaggedValue; 2],
+}
+
+impl TaggedNumericFrame {
+    #[inline(always)]
+    pub(crate) fn new(left: f64, right: f64) -> Self {
+        Self {
+            slots: [TaggedValue::number(left), TaggedValue::number(right)],
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn binary<F>(self, f: F) -> TaggedValue
+    where
+        F: FnOnce(f64, f64) -> f64,
+    {
+        // `new` constructs both slots through the typed Number constructor. Avoid re-validating
+        // the tag on this no-safepoint path; the frame is private to the helper and cannot be
+        // mutated between construction and this call.
+        let left = f64::from_bits(self.slots[0].raw());
+        let right = f64::from_bits(self.slots[1].raw());
+        TaggedValue::number(f(left, right))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MaterializationRecipe {
     CopySlot(u16),
@@ -581,6 +615,22 @@ mod tests {
         assert_eq!(TaggedValue::null().validate(), Ok(()));
         assert_eq!(TaggedValue::boolean(false).as_boolean(), Some(false));
         assert_eq!(TaggedValue::boolean(true).as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn numeric_shadow_frame_preserves_ieee_number_bits() {
+        let frame = TaggedNumericFrame::new(-0.0, f64::INFINITY);
+        let result = frame.binary(|left, right| left + right);
+        assert_eq!(result.as_number(), Some(f64::INFINITY));
+
+        let frame = TaggedNumericFrame::new(-0.0, 0.0);
+        let result = frame.binary(|left, right| left + right);
+        assert_eq!(result.as_number().unwrap().to_bits(), 0.0f64.to_bits());
+
+        let frame = TaggedNumericFrame::new(f64::NAN, 1.0);
+        let result = frame.binary(|left, right| left + right);
+        assert!(result.as_number().is_some_and(f64::is_nan));
+        assert_eq!(result.raw(), TAG_CANON_NAN);
     }
 
     #[test]

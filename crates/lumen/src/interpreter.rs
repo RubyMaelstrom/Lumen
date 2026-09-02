@@ -1316,6 +1316,10 @@ pub struct Interp {
     pub(crate) tier: crate::bytecode::Tier,
     /// Calls before an eligible function tier-ups to bytecode (env `LUMEN_TIER_THRESHOLD`).
     pub(crate) tier_threshold: u32,
+    /// Opt-in first tagged execution slice (env `LUMEN_TAGGED_ARITHMETIC`). The flag is captured
+    /// once per Agent so hot bytecode operators do not repeatedly consult process synchronization
+    /// state; unset keeps the established numeric fast path unchanged.
+    pub(crate) tagged_arithmetic: bool,
     /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
     /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
     pub(crate) vm_pool: Vec<(Vec<Value>, Vec<Value>)>,
@@ -1731,6 +1735,7 @@ interp_memory_inventory! {
     strict => "non_owning",
     tier => "non_owning",
     tier_threshold => "non_owning",
+    tagged_arithmetic => "non_owning",
     vm_pool => "measured",
     stub_cache => "measured",
     stub_cache_names => "measured",
@@ -1862,7 +1867,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 130);
+    assert_eq!(names.len(), 131);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -2580,6 +2585,7 @@ impl Interp {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
+            tagged_arithmetic: std::env::var_os("LUMEN_TAGGED_ARITHMETIC").is_some(),
             vm_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),

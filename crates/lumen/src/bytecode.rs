@@ -3180,6 +3180,51 @@ mod feedback_layout_tests {
     }
 
     #[test]
+    fn tagged_numeric_binary_accepts_only_immediate_numbers() {
+        let add = |left: f64, right: f64| left + right;
+        let result = try_tagged_numeric_binary(&Value::Num(1.5), &Value::Num(2.0), &add)
+            .expect("Number operands use the tagged frame");
+        assert!(matches!(result, Value::Num(value) if value == 3.5));
+
+        let interp = Interp::new();
+        assert!(try_tagged_numeric_binary(&Value::str("x"), &Value::Num(2.0), &add).is_none());
+        assert!(try_tagged_numeric_binary(
+            &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
+            &Value::Num(2.0),
+            &add,
+        )
+        .is_none());
+        assert!(try_tagged_numeric_binary(
+            &Value::Obj(interp.new_object()),
+            &Value::Num(2.0),
+            &add
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn tagged_numeric_binary_keeps_ieee_edge_results() {
+        let add = |left: f64, right: f64| left + right;
+        let negative_zero = try_tagged_numeric_binary(&Value::Num(-0.0), &Value::Num(-0.0), &add)
+            .expect("numeric fast path");
+        assert!(
+            matches!(negative_zero, Value::Num(value) if value.to_bits() == (-0.0f64).to_bits())
+        );
+
+        let nan = try_tagged_numeric_binary(&Value::Num(f64::NAN), &Value::Num(1.0), &add)
+            .expect("numeric fast path");
+        assert!(matches!(nan, Value::Num(value) if value.is_nan()));
+
+        let infinity = try_tagged_numeric_binary(
+            &Value::Num(f64::INFINITY),
+            &Value::Num(f64::NEG_INFINITY),
+            &add,
+        )
+        .expect("numeric fast path");
+        assert!(matches!(infinity, Value::Num(value) if value.is_nan()));
+    }
+
+    #[test]
     fn profiled_binary_helper_records_original_operands_and_successful_result() {
         let (layout, bindings) = feedback_layout_for_ops(&[Op::Add], &[]);
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
@@ -13652,14 +13697,41 @@ fn bin_num(
     let b = stack.pop().expect("vm stack underflow");
     let a = stack.pop().expect("vm stack underflow");
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
-    let v = if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
-        Value::Num(f(*x, *y))
-    } else {
-        i.binary(op, a, b)?
+    let v = match i
+        .tagged_arithmetic
+        .then(|| try_tagged_numeric_binary(&a, &b, &f))
+        .flatten()
+    {
+        Some(value) => value,
+        None => match (&a, &b) {
+            (Value::Num(x), Value::Num(y)) => Value::Num(f(*x, *y)),
+            _ => i.binary(op, a, b)?,
+        },
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
     stack.push(v);
     Ok(())
+}
+
+/// Attempt the immediate-only tagged ABI path. Returning `None` is a deliberate deoptimization:
+/// heap values, strings, BigInts, symbols, objects, and the internal Empty marker all continue
+/// through the complete interpreter helper, preserving ToPrimitive/ToNumeric ordering and
+/// abrupt completion behavior mandated by ECMA-262 §13.15 (Additive Operators).
+#[inline(always)]
+fn try_tagged_numeric_binary<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+        return None;
+    };
+    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
+    let result = frame.binary(f);
+    Some(Value::Num(
+        result
+            .as_number()
+            .expect("tagged numeric result remains a Number"),
+    ))
 }
 
 #[inline]
