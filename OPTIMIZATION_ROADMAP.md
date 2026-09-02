@@ -959,6 +959,12 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     semantics (ECMA-262 §23.1.3.6, §23.1.3.20, §23.1.3.25). An 11-sample release workload with
     10,000-element dense arrays improved from 0.281695 s to 0.277669 s (about 1.4%; within
     normal host variance, but with no semantic or broad-suite regression).
+  - [x] Array `slice`, `concat`, and `reverse` now use the same checked presence probe when
+    reading ordinary dense elements, eliminating repeated decimal-key allocation and generic
+    lookup while preserving the specified `HasProperty`/`Get` and hole movement order
+    (ECMA-262 §23.1.3.2, §23.1.3.26, §23.1.3.28). A release copy workload (5 rounds over
+    2,000-element arrays) improved from 0.204867 s to 0.045815 s median; proxy, accessor, hole,
+    and inherited-property tests remain on the generic path.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

@@ -5399,10 +5399,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let mut k = start;
         let mut to = 0usize;
         while k < end {
-            let key = k.to_string();
             // Preserve holes: only copy indices the source actually has (HasProperty).
-            if ab(i.js_has_property(&ov, &key))? {
-                let v = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
+            if let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? {
                 cdp_or_throw(i, &result, &to.to_string(), v)?;
             }
             k += 1;
@@ -5535,14 +5533,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                     return Err(i.make_error("TypeError", "concat result is too long"));
                 }
                 for k in 0..len {
-                    let key = k.to_string();
-                    if ab(i.js_has_property(v, &key))? {
-                        let elem = match v {
-                            Value::Obj(object) => {
-                                array_get_index_after_has(i, object, v, k as usize, &key)?
-                            }
-                            _ => ab(i.get_member(v, &key))?,
-                        };
+                    let Value::Obj(object) = v else {
+                        unreachable!("spreadable values are objects")
+                    };
+                    if let Some(elem) = array_get_present_index(i, object, v, k as usize)? {
                         cdp_or_throw(i, &result, &n.to_string(), elem)?;
                     }
                     n += 1; // increment for holes too, preserving their position
@@ -5688,16 +5682,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let upper = (len - 1 - k).to_string();
             // HasProperty/Get the two ends, then swap — preserving holes (a hole moves as a
             // DeletePropertyOrThrow).
-            let lower_val = if ab(i.js_has_property(&ov, &lower))? {
-                Some(array_get_index_after_has(i, &o, &ov, k, &lower)?)
-            } else {
-                None
-            };
-            let upper_val = if ab(i.js_has_property(&ov, &upper))? {
-                Some(array_get_index_after_has(i, &o, &ov, len - 1 - k, &upper)?)
-            } else {
-                None
-            };
+            let lower_val = array_get_present_index(i, &o, &ov, k)?;
+            let upper_val = array_get_present_index(i, &o, &ov, len - 1 - k)?;
             match (lower_val, upper_val) {
                 (Some(lv), Some(uv)) => {
                     set_throw(i, &ov, &lower, uv)?;
