@@ -844,6 +844,7 @@ fn string_repeat_preserves_ascii_and_utf16_semantics() {
     assert_eq!(run("'ab'.repeat(0)"), "");
     assert_eq!(run("'😀'.repeat(2).length"), "4");
     assert_eq!(run("'\\uD800'.repeat(2).length"), "2");
+    assert_eq!(run("'\\uDC00\\uD800'.repeat(2).codePointAt(1)"), "65536");
 }
 
 #[test]

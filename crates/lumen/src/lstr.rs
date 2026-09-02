@@ -186,15 +186,14 @@ impl LStr {
         s
     }
 
-    /// Repeat an ASCII string directly into one engine allocation.
+    /// Repeat the byte representation directly into one engine allocation.
     ///
     /// The caller has already performed the observable `String.prototype.repeat` coercions and
     /// length check (ECMA-262 §22.1.3.18).  Keeping this representation-local avoids first
     /// building a Rust `String` and then copying it into an `LStr`.  The doubling copy uses
     /// `ptr::copy`, which is explicitly overlap-safe as each completed prefix becomes the source
     /// for the next block.
-    pub(crate) fn repeat_ascii(&self, count: usize) -> LStr {
-        debug_assert!(self.ascii_hint());
+    pub(crate) fn repeat_direct(&self, count: usize) -> LStr {
         let source_len = self.hdr().len.get() as usize;
         let total = source_len
             .checked_mul(count)
@@ -214,7 +213,15 @@ impl LStr {
             }
             repeated.hdr().len.set(total as u32);
         }
+        repeated.and_ascii(self.ascii_hint());
         repeated
+    }
+
+    /// Repeat an ASCII string directly into one engine allocation.
+    #[inline]
+    pub(crate) fn repeat_ascii(&self, count: usize) -> LStr {
+        debug_assert!(self.ascii_hint());
+        self.repeat_direct(count)
     }
 }
 

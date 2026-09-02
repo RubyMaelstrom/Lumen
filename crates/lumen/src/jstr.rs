@@ -285,6 +285,23 @@ pub fn needs_join_fixup(a: &str, b: &str) -> bool {
     }
 }
 
+/// Whether repeating `s` can create an adjacent smuggled surrogate pair that requires the
+/// canonicalizing `from_units` pass.  The scan also rejects a source that already contains such a
+/// pair; retaining the conservative fallback keeps direct byte copies limited to canonical input.
+pub fn needs_repeat_fixup(s: &str, count: usize) -> bool {
+    if count == 0 {
+        return false;
+    }
+    let mut prev_high = false;
+    for c in s.chars() {
+        if prev_high && smuggled_low(c).is_some() {
+            return true;
+        }
+        prev_high = smuggled_high(c).is_some();
+    }
+    count > 1 && needs_join_fixup(s, s)
+}
+
 /// Canonicalize any adjacent smuggled high+low surrogate pairs inside `s` (needed after building
 /// a string from independently produced pieces, e.g. `join` or `repeat`).
 pub fn canonicalize(s: &str) -> Option<String> {

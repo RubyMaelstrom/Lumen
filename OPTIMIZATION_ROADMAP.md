@@ -891,10 +891,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     (ECMA-262 §22.1.3.32–34).
   - [x] ASCII `padStart`/`padEnd` repeat and truncate fillers directly as bytes; non-ASCII
     fillers and receivers retain the UTF-16 unit path (ECMA-262 §22.1.3.17.1–2).
-  - [x] ASCII `String.prototype.repeat` writes one engine allocation directly, avoiding the
-    temporary Rust string and conversion copy while preserving the normative coercion/error
-    ordering (ECMA-262 §22.1.3.18); a 20,000-iteration release micro-workload improved from
-    0.117309 s median to 0.050930 s median on the pinned host.
+  - [x] Canonical `String.prototype.repeat` inputs whose repeated boundaries cannot join surrogate
+    units write one engine allocation directly, avoiding the temporary Rust string and conversion
+    copy while preserving the normative coercion/error ordering (ECMA-262 §22.1.3.18); an ASCII
+    20,000-iteration release micro-workload improved from 0.117309 s median to 0.050930 s median
+    on the pinned host.
   - [x] The one-argument `String.prototype.concat` path writes directly into one `LStr` after
     its completed ToString and surrogate-boundary checks (ECMA-262 §22.1.3.5); a 100,000-call
     release micro-workload improved from 0.101334 s median to 0.068875 s median on the pinned

@@ -10328,11 +10328,14 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
         // The observable coercion and implementation length guard above follow ECMA-262
-        // §22.1.3.18.  ASCII has a one-byte/one-code-unit representation, so repeat directly into
-        // the engine string and avoid the temporary Rust `String` plus conversion copy.  Strings
-        // carrying UTF-16 surrogate semantics retain the canonicalizing path below.
+        // §22.1.3.18.  Canonical inputs whose repeated boundaries cannot join surrogate units can
+        // be copied directly into the engine string, avoiding the temporary Rust `String` plus
+        // conversion copy.  Inputs needing UTF-16 canonicalization retain the path below.
         if s.ascii_hint() {
             return Ok(Value::Str(s.repeat_ascii(count)));
+        }
+        if !crate::jstr::needs_repeat_fixup(&s, count) {
+            return Ok(Value::Str(s.repeat_direct(count)));
         }
         let out = s.repeat(count);
         Ok(Value::from_string(
