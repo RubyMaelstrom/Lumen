@@ -10732,6 +10732,21 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
         return Ok(Value::from_string(s));
     }
     let need = target - cur;
+    if s.is_ascii() && pad.is_ascii() {
+        // StringPad repeats and truncates by UTF-16 code units (ECMA-262
+        // §22.1.3.17.2); ASCII bytes are those same units, so avoid building
+        // a temporary u16 vector for the common case.
+        let mut fill = String::with_capacity(need);
+        while fill.len() < need {
+            let take = (need - fill.len()).min(pad.len());
+            fill.push_str(&pad[..take]);
+        }
+        return Ok(Value::from_string(if at_start {
+            format!("{fill}{s}")
+        } else {
+            format!("{s}{fill}")
+        }));
+    }
     let pad_units = crate::jstr::units(&pad);
     let fill_units: Vec<u16> = pad_units.iter().copied().cycle().take(need).collect();
     let fill = crate::jstr::from_units(&fill_units);

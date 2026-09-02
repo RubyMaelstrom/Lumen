@@ -10798,6 +10798,13 @@ fn string_trim_feff() {
 }
 
 #[test]
+fn string_padding_ascii_fast_path_preserves_unit_truncation() {
+    assert_eq!(run("'ab'.padStart(7, 'xyz')"), "xyzxyab");
+    assert_eq!(run("'ab'.padEnd(7, 'xyz')"), "abxyzxy");
+    assert_eq!(run("'😀'.padStart(3, 'x')"), "x😀");
+}
+
+#[test]
 fn string_replace_substitution() {
     assert_eq!(run("'abc'.replace('b', '[$`]')"), "a[a]c");
     assert_eq!(run("'abc'.replace('b', \"[$']\")"), "a[c]c");
