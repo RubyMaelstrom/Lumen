@@ -283,12 +283,22 @@ impl RootMap {
         Ok(())
     }
 
-    fn is_root_slot(&self, slot: usize) -> bool {
-        let word = slot / 64;
-        let bit = 1u64 << (slot % 64);
-        self.tagged_slots[word] & bit != 0
-            || self.handle_slots[word] & bit != 0
-            || self.environment_slots[word] & bit != 0
+    /// Visit the union of all root classes in ascending logical-slot order. Callers validate the
+    /// map first; the bitmap walk then skips dead frame slots without touching their payloads.
+    fn try_for_each_root_slot<E>(
+        &self,
+        mut visit: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for word in 0..self.tagged_slots.len() {
+            let mut bits =
+                self.tagged_slots[word] | self.handle_slots[word] | self.environment_slots[word];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                visit(word * 64 + bit)?;
+                bits &= bits - 1;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -322,15 +332,18 @@ impl TaggedFrame {
             return Err(FrameMapError::FrameLengthMismatch);
         }
         let mut roots = Vec::new();
-        for (slot, value) in self.slots.iter().enumerate() {
-            if !map.is_root_slot(slot) {
-                continue;
-            }
+        map.try_for_each_root_slot(|slot| {
+            let value = self
+                .slots
+                .get(slot)
+                .copied()
+                .ok_or(FrameMapError::SlotOutOfRange)?;
             value
                 .validate()
                 .map_err(|_| FrameMapError::InvalidTaggedWord)?;
-            roots.push(*value);
-        }
+            roots.push(value);
+            Ok(())
+        })?;
         Ok(roots)
     }
 
@@ -348,16 +361,14 @@ impl TaggedFrame {
         }
         let replacement = TaggedValue::heap(to);
         let mut rewritten = 0;
-        for slot in 0..self.slots.len() {
-            if !map.is_root_slot(slot) {
-                continue;
-            }
+        map.try_for_each_root_slot(|slot| {
             let value = self.value_at(u16::try_from(slot).unwrap_or(u16::MAX))?;
             if value.as_heap() == Some(from) {
                 self.slots[slot] = replacement;
                 rewritten += 1;
             }
-        }
+            Ok(())
+        })?;
         Ok(rewritten)
     }
 }
@@ -612,6 +623,11 @@ impl NoGcState {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_active_for_test(&self, active: bool) {
+        self.active.set(active);
     }
 }
 

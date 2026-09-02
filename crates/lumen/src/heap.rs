@@ -6,7 +6,10 @@
 
 #![allow(dead_code)]
 
-use crate::tagged::{HeapRef, NoGcError, NoGcScope, NoGcState, RootSet, TaggedValue};
+use crate::tagged::{
+    FrameMapError, HeapRef, NoGcError, NoGcScope, NoGcState, RootMap, RootSet, RootedTagged,
+    TaggedFrame, TaggedValue,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapGeneration {
@@ -89,6 +92,8 @@ pub(crate) enum HeapError {
     FieldOutOfBounds,
     HeaderMismatch,
     RememberedSetMismatch,
+    InvalidFrameMap(FrameMapError),
+    SafepointForbidden,
     RequestTooLarge,
     ReferenceSpaceExhausted,
 }
@@ -487,6 +492,8 @@ impl CentralHeap {
         &mut self,
         roots: &RootSet,
     ) -> Result<NurseryCollection, HeapError> {
+        self.require_safepoint()
+            .map_err(|_| HeapError::SafepointForbidden)?;
         self.mark_roots(roots)?;
         let young = self
             .live_handles()
@@ -514,6 +521,40 @@ impl CentralHeap {
             promoted,
             reclaimed,
         })
+    }
+
+    /// Collect the fixture nursery while a tagged shadow frame is published at an exact
+    /// safepoint. Frame roots are temporarily held in the Agent root set, so relocation uses the
+    /// same mark/forwarding path as ordinary roots; the frame is rewritten before those temporary
+    /// handles are released. This is the bridge contract that a live execution tier will adopt.
+    pub(crate) fn collect_nursery_with_frame(
+        &mut self,
+        roots: &RootSet,
+        frame: &mut TaggedFrame,
+        map: &RootMap,
+    ) -> Result<NurseryCollection, HeapError> {
+        map.validate().map_err(HeapError::InvalidFrameMap)?;
+        let frame_values = frame.roots(map).map_err(HeapError::InvalidFrameMap)?;
+        let frame_handles: Vec<RootedTagged> = frame_values
+            .iter()
+            .copied()
+            .map(|value| roots.root(value).map_err(|_| HeapError::InvalidTaggedField))
+            .collect::<Result<_, _>>()?;
+
+        let result = self.collect_nursery(roots)?;
+
+        for (old, handle) in frame_values.iter().zip(&frame_handles) {
+            let Some(from) = old.as_heap() else {
+                continue;
+            };
+            let Some(to) = handle.value().and_then(TaggedValue::as_heap) else {
+                continue;
+            };
+            frame
+                .rewrite_heap_reference(map, from, to)
+                .map_err(HeapError::InvalidFrameMap)?;
+        }
+        Ok(result)
     }
 
     pub(crate) fn promote(
@@ -1108,20 +1149,115 @@ mod tests {
         };
         let mut frame = TaggedFrame::new(vec![TaggedValue::heap(source), TaggedValue::number(8.0)]);
         let roots = RootSet::new();
-        let _frame_root = roots.root(frame.roots(&map).unwrap()[0]).unwrap();
 
         let no_gc = heap.enter_no_gc().unwrap();
         assert_eq!(heap.require_safepoint(), Err(NoGcError::SafepointForbidden));
         drop(no_gc);
         assert_eq!(heap.require_safepoint(), Ok(()));
 
-        let target = heap.relocate(source).unwrap();
-        assert_eq!(heap.rewrite_tagged_references(source, target), 0);
-        assert_eq!(frame.rewrite_heap_reference(&map, source, target), Ok(1));
-        assert_eq!(roots.rewrite_heap_reference(source, target), 1);
-        assert_eq!(heap.reclaim_forwarded(source), Ok(target));
+        let result = heap
+            .collect_nursery_with_frame(&roots, &mut frame, &map)
+            .unwrap();
+        assert_eq!(result.promoted, 1);
+        assert_eq!(result.reclaimed, 0);
+        let target = frame.roots(&map).unwrap()[0].as_heap().unwrap();
+        assert_ne!(target, source);
+        assert_eq!(roots.active_len(), 0);
+        assert_eq!(heap.header(source), Err(HeapError::InvalidReference));
         assert_eq!(frame.roots(&map).unwrap()[0].as_heap(), Some(target));
-        assert_eq!(roots.snapshot().unwrap()[0].as_heap(), Some(target));
         assert_eq!(heap.validate_all(), Ok(()));
+    }
+
+    #[test]
+    fn frame_collection_ignores_poisoned_dead_slots() {
+        let mut heap = CentralHeap::new();
+        let source = heap
+            .allocate_tagged_fields(
+                LayoutId::new(14),
+                vec![TaggedValue::null()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        let map = RootMap {
+            safepoint: SafepointId::new(7),
+            bytecode_pc: BytecodePc::new(32),
+            slot_count: 2,
+            operand_depth: 1,
+            tagged_registers: 0,
+            tagged_slots: vec![0b01],
+            handle_slots: vec![0],
+            environment_slots: vec![0],
+        };
+        let mut frame = TaggedFrame::new(vec![
+            TaggedValue::heap(source),
+            TaggedValue::from_raw(0x7ffc_0000_0000_0002),
+        ]);
+        let roots = RootSet::new();
+        heap.collect_nursery_with_frame(&roots, &mut frame, &map)
+            .unwrap();
+        assert!(frame.roots(&map).unwrap()[0].as_heap().is_some());
+        assert_eq!(heap.validate_all(), Ok(()));
+    }
+
+    #[test]
+    fn frame_collection_rejects_invalid_map_without_mutating_heap_or_frame() {
+        let mut heap = CentralHeap::new();
+        let source = heap
+            .allocate_tagged_fields(
+                LayoutId::new(15),
+                vec![TaggedValue::null()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        let map = RootMap {
+            safepoint: SafepointId::new(8),
+            bytecode_pc: BytecodePc::new(33),
+            slot_count: 1,
+            operand_depth: 2,
+            tagged_registers: 0,
+            tagged_slots: vec![1],
+            handle_slots: vec![0],
+            environment_slots: vec![0],
+        };
+        let mut frame = TaggedFrame::new(vec![TaggedValue::heap(source)]);
+        let before = frame.clone();
+        let roots = RootSet::new();
+        assert_eq!(
+            heap.collect_nursery_with_frame(&roots, &mut frame, &map),
+            Err(HeapError::InvalidFrameMap(
+                FrameMapError::OperandDepthOutOfRange
+            ))
+        );
+        assert_eq!(frame, before);
+        assert_eq!(
+            heap.header(source).unwrap().generation,
+            HeapGeneration::Young
+        );
+        assert_eq!(roots.active_len(), 0);
+    }
+
+    #[test]
+    fn nursery_collection_rejects_a_forbidden_safepoint_before_marking() {
+        let mut heap = CentralHeap::new();
+        let source = heap
+            .allocate_tagged_fields(
+                LayoutId::new(16),
+                vec![TaggedValue::null()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        let roots = RootSet::new();
+        let _root = roots.root(TaggedValue::heap(source)).unwrap();
+        heap.no_gc.set_active_for_test(true);
+        assert_eq!(
+            heap.collect_nursery(&roots),
+            Err(HeapError::SafepointForbidden)
+        );
+        heap.no_gc.set_active_for_test(false);
+        assert_eq!(
+            heap.header(source).unwrap().generation,
+            HeapGeneration::Young
+        );
+        assert_eq!(heap.stats().collections, 0);
     }
 }
