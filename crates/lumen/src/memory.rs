@@ -528,6 +528,9 @@ impl Visitor {
                         .callable_metadata
                         .saturating_add(size_of_val(value.func.as_ref()));
                 }
+                // Keep the immutable registration label in the same canonical string family as
+                // every other engine string. It is distinct from the mutable JS `name` property.
+                self.rc_str(&value.identity);
                 if let Some(reporter) = &value.retained {
                     self.reported_native_closures.insert(closure_identity);
                     let reporter_identity = Rc::as_ptr(reporter) as *const () as usize;
@@ -2432,21 +2435,47 @@ mod tests {
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
                 func: first_func,
                 retained: Some(first_retained),
+                identity: Rc::from("first"),
             }));
         let (second_func, second_retained) = make_closure();
         let second_callable =
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
                 func: second_func,
                 retained: Some(second_retained),
+                identity: Rc::from("second"),
             }));
         visitor.callable(&first_callable);
         visitor.callable(&second_callable);
         assert_eq!(visitor.native_managed_allocations.len(), 1);
         assert_eq!(
             visitor.strings_symbols_bigints,
-            string.retained_requested_bytes()
+            string.retained_requested_bytes() + "first".len() + "second".len()
         );
         assert!(visitor.unreported_native_closures.is_empty());
+    }
+
+    #[test]
+    fn native_diagnostic_identity_is_not_the_mutable_name_property() {
+        let interp = Interp::new();
+        let callable = interp.make_native_closure(
+            "registeredOperation",
+            0,
+            Rc::new(|_i, _this, _args| Ok(Value::Undefined)),
+        );
+        callable.borrow_mut().props.insert(
+            "name",
+            crate::value::Property::data(
+                Value::from_string("authorRenamed".to_string()),
+                true,
+                false,
+                true,
+            ),
+        );
+        let identity = match &callable.borrow().call {
+            crate::value::Callable::NativeData(native) => native.identity.to_string(),
+            _ => panic!("expected data-carrying native"),
+        };
+        assert_eq!(identity, "registeredOperation");
     }
 
     #[test]

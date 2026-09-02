@@ -1864,6 +1864,7 @@ impl Interp {
         let after_catch = match result {
             Err(Abrupt::Throw(ex)) => {
                 if let Some((param, body)) = handler {
+                    crate::jit::perf_error_caught();
                     // The catch parameter lives in its own environment (flagged so a sloppy `eval`'s
                     // var-hoisting walk skips it); the body's lexicals + statements run in a child
                     // block environment.

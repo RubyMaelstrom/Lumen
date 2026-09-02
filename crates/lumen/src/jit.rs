@@ -78,6 +78,8 @@ static PERF_NATIVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static PERF_NATIVE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_ERROR_CONSTRUCTIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static PERF_ERROR_CAUGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_ERROR_ESCAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_ERROR_OBJECT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_ERROR_MESSAGE_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -218,6 +220,27 @@ pub(crate) fn perf_error_construction() {
     if perf_metrics_enabled() {
         use std::sync::atomic::Ordering::Relaxed;
         PERF_ERROR_CONSTRUCTIONS.fetch_add(1, Relaxed);
+    }
+}
+
+/// Count a thrown completion consumed by an actual `catch` clause. Finalizers and iterator
+/// cleanup handlers deliberately do not call this: they preserve/transform completions but do not
+/// consume a throw under ECMA-262's TryStatement algorithm.
+#[inline]
+pub(crate) fn perf_error_caught() {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_ERROR_CAUGHT.fetch_add(1, Relaxed);
+    }
+}
+
+/// Count a throw that reaches a public synchronous script boundary without a matching catch.
+/// This is a completion-lifecycle metric, separate from error-object construction.
+#[inline]
+pub(crate) fn perf_error_escaped() {
+    if perf_metrics_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_ERROR_ESCAPED.fetch_add(1, Relaxed);
     }
 }
 
@@ -439,6 +462,8 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let native_nanos = PERF_NATIVE_NANOS.load(Relaxed);
     let native_failures = PERF_NATIVE_FAILURES.load(Relaxed);
     let error_constructions = PERF_ERROR_CONSTRUCTIONS.load(Relaxed);
+    let error_caught = PERF_ERROR_CAUGHT.load(Relaxed);
+    let error_escaped = PERF_ERROR_ESCAPED.load(Relaxed);
     let error_object_nanos = PERF_ERROR_OBJECT_NANOS.load(Relaxed);
     let error_message_nanos = PERF_ERROR_MESSAGE_NANOS.load(Relaxed);
     let error_stack_capture_calls = PERF_ERROR_STACK_CAPTURE_CALLS.load(Relaxed);
@@ -466,7 +491,7 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let iterate_protocol_failures = PERF_ITERATE_PROTOCOL_FAILURES.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
         lex_nanos as f64 / 1_000_000_000.0,

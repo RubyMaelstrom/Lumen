@@ -442,6 +442,7 @@ impl Engine {
                 Ok(ExecutionOutcome::Value(self.render(&v)))
             }
             Err(interpreter::Abrupt::Throw(thrown)) => {
+                crate::jit::perf_error_escaped();
                 if let Err(reason) = self.interp.run_agent_event_loop() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
@@ -498,6 +499,7 @@ impl Engine {
                 Ok(ExecutionOutcome::Value(self.render(&v)))
             }
             Err(interpreter::Abrupt::Throw(thrown)) => {
+                crate::jit::perf_error_escaped();
                 if let Err(reason) = self.interp.run_agent_event_loop() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
@@ -612,6 +614,7 @@ impl Engine {
                 }
             },
             Err(interpreter::Abrupt::Throw(value)) => {
+                crate::jit::perf_error_escaped();
                 if let Err(reason) = self.interp.run_agent_event_loop() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
@@ -769,7 +772,10 @@ impl interpreter::Interp {
         Ok(match result {
             Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
             Ok(value) => Ok(value),
-            Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
+            Err(interpreter::Abrupt::Throw(value)) => {
+                crate::jit::perf_error_escaped();
+                Err(embed::EvalError::Throw(value))
+            }
             Err(interpreter::Abrupt::Interrupt(reason)) => {
                 Err(embed::EvalError::Interrupted(reason))
             }
@@ -802,7 +808,10 @@ impl interpreter::Interp {
         Ok(match result {
             Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
             Ok(value) => Ok(value),
-            Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
+            Err(interpreter::Abrupt::Throw(value)) => {
+                crate::jit::perf_error_escaped();
+                Err(embed::EvalError::Throw(value))
+            }
             Err(interpreter::Abrupt::Interrupt(reason)) => {
                 Err(embed::EvalError::Interrupted(reason))
             }
@@ -912,7 +921,10 @@ impl Engine {
         let result = match self.interp.run_program(&body) {
             Ok(Value::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
-            Err(interpreter::Abrupt::Throw(value)) => Err(embed::EvalError::Throw(value)),
+            Err(interpreter::Abrupt::Throw(value)) => {
+                crate::jit::perf_error_escaped();
+                Err(embed::EvalError::Throw(value))
+            }
             Err(interpreter::Abrupt::Interrupt(reason)) => {
                 self.interp.gc_task_boundary();
                 Err(embed::EvalError::Interrupted(reason))

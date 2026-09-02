@@ -575,6 +575,9 @@ finish the baseline, but no later phase may claim a performance win against the 
     ordinary dispatch and native-entry IC funnels; diagnostics do not alter dispatch policy.
   - [ ] Attach stable operation identities (including embedder-provided names) without relying on
     raw function-pointer addresses.
+    - [x] Data-carrying host callables retain an immutable registration label for diagnostics,
+      independent of the author-visible mutable `name` property; legacy bare `NativeFn` labels
+      remain explicitly identified as a compatibility limitation.
 - [ ] Measure error construction as separate message conversion, object allocation, stack capture,
   and stack formatting costs; distinguish constructed, thrown/caught, and escaping errors before
   considering lazy stack materialization for Lumen's non-standard `stack` extension.
@@ -582,8 +585,9 @@ finish the baseline, but no later phase may claim a performance win against the 
     timings at the existing error helpers; no error behavior or stack contents change.
   - [x] Add object-allocation timing; lifecycle classification (constructed versus caught or
     escaping) remains separate so a thrown completion is not conflated with an allocation site.
-  - [ ] Add lifecycle classification (constructed versus caught or escaping) without conflating a
-    thrown completion with an allocation site.
+  - [x] Add lifecycle classification counters at tree-walker, bytecode, and JIT catch boundaries
+    plus public synchronous script exits, without conflating a thrown completion with an allocation
+    site; finalizers and iterator cleanup remain excluded because they do not consume a throw.
 - [ ] Measure conversion and protocol helpers separately, including `ToPrimitive`, `toString`,
   `valueOf`, `GetIterator`, iterator stepping/closing, spread, and ordinary/symbol iteration.
   - [x] Expose opt-in GetIterator, IteratorStep, and both IteratorClose path timings/failure

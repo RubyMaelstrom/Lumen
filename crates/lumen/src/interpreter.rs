@@ -3661,8 +3661,11 @@ impl Interp {
         let obj = Object::new(Some(self.function_proto.clone()));
         {
             let mut b = obj.borrow_mut();
-            b.call =
-                Callable::NativeData(Rc::new(crate::value::NativeCallable { func: f, retained }));
+            b.call = Callable::NativeData(Rc::new(crate::value::NativeCallable {
+                func: f,
+                retained,
+                identity: Rc::from(name),
+            }));
             b.props.insert(
                 "length",
                 Property::data(Value::Num(len as f64), false, false, true),

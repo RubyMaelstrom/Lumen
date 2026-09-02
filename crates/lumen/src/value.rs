@@ -885,6 +885,10 @@ pub struct BoundCallable {
 pub struct NativeCallable {
     pub(crate) func: Rc<NativeClosure>,
     pub(crate) retained: Option<Rc<dyn NativeCallableRetained>>,
+    /// Registration identity used only by opt-in diagnostics. This is deliberately separate
+    /// from the observable `name` property: author code may rewrite that property at any time,
+    /// while a profile must continue to attribute calls to the operation the embedder registered.
+    pub(crate) identity: Rc<str>,
 }
 
 #[derive(Clone)]

@@ -10200,6 +10200,9 @@ fn drive_vm(
             Err(Abrupt::Throw(error)) => {
                 let mut error = Some(error);
                 if let Some(handler) = handlers.pop() {
+                    if matches!(handler.target, HandlerTarget::Catch { .. }) {
+                        crate::jit::perf_error_caught();
+                    }
                     let throw_pc = match handler.target {
                         HandlerTarget::Catch { throw_pc }
                         | HandlerTarget::Finally { throw_pc, .. }
@@ -16752,15 +16755,23 @@ unsafe fn jit_callstat(
         NATIVES.with(|counts| {
             let mut counts = counts.borrow_mut();
             let name = match &*sp.sub(argc + 1) {
-                Value::Obj(o) => o
-                    .borrow()
-                    .props
-                    .get("name")
-                    .and_then(|p| match p.value() {
-                        Value::Str(s) => Some(s.to_string()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "<native>".to_string()),
+                Value::Obj(o) => {
+                    let borrowed = o.borrow();
+                    match &borrowed.call {
+                        crate::value::Callable::NativeData(native) => native.identity.to_string(),
+                        // Bare native functions predate the data-carrying host API. Their
+                        // registration name remains the best available label, but unlike
+                        // NativeData it is necessarily observable/mutable legacy metadata.
+                        _ => borrowed
+                            .props
+                            .get("name")
+                            .and_then(|p| match p.value() {
+                                Value::Str(s) => Some(s.to_string()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "<native>".to_string()),
+                    }
+                }
                 _ => "<native>".to_string(),
             };
             let entry = counts
@@ -18116,6 +18127,7 @@ pub(crate) unsafe extern "C" fn jit_unwind(
             flag: sp as u64,
         },
         Some((catch_pc, saved_depth)) => {
+            crate::jit::perf_error_caught();
             // A handler may be installed while operands needed for BindingInitialization are
             // still live; the protected operation can consume them before throwing. Vec::truncate
             // (used by the bytecode VM) keeps the smaller current depth in that case. Mirroring
