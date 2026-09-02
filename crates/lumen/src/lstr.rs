@@ -241,6 +241,28 @@ impl LStr {
         debug_assert!(self.ascii_hint());
         self.repeat_direct(count)
     }
+
+    /// Map ASCII letters directly into one engine allocation. The caller must have already
+    /// selected the ASCII representation; non-ASCII case mappings (including one-to-many and
+    /// context-sensitive mappings) remain on the Unicode implementation path.
+    pub(crate) fn map_ascii_case(&self, upper: bool) -> LStr {
+        debug_assert!(self.ascii_hint());
+        let source = self.as_str().as_bytes();
+        let mapped = LStr::alloc("", u32::try_from(source.len()).expect("string too large"));
+        unsafe {
+            let destination = mapped.p.as_ptr().cast::<u8>().add(HDR);
+            for (index, &byte) in source.iter().enumerate() {
+                let byte = if upper {
+                    byte.to_ascii_uppercase()
+                } else {
+                    byte.to_ascii_lowercase()
+                };
+                destination.add(index).write(byte);
+            }
+        }
+        mapped.hdr().len.set(source.len() as u32);
+        mapped
+    }
 }
 
 impl Clone for LStr {

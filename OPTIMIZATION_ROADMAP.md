@@ -904,6 +904,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     length errors, then copies non-surrogate-joining pieces once into an `LStr`; a Unicode
     50,000-call release micro-workload improved from 0.050387 s median to 0.046722 s median on
     the pinned host, while joining-surrogate inputs use the exact stepwise fallback.
+  - [x] ASCII `toUpperCase`/`toLowerCase` return unchanged strings without allocation and map
+    changed ASCII strings directly into an `LStr`; a mixed 150,000-call release workload improved
+    from 0.150698 s median to 0.144595 s median (about 4%, with normal run-to-run noise), while
+    Unicode Default Case Conversion remains the fallback for one-to-many/context-sensitive cases.
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.

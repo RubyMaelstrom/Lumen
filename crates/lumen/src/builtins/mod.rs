@@ -10236,10 +10236,29 @@ fn install_string(it: &mut Interp) {
         create_html(i, t, "sup", "", &Value::Undefined)
     });
     it.def_method(&sp, "toUpperCase", 0, |i, this, _| {
-        Ok(Value::from_string(this_string(i, &this)?.to_uppercase()))
+        let s = this_string(i, &this)?;
+        // ECMA-262 §22.1.3.30 applies Unicode Default Case Conversion. ASCII has no
+        // one-to-many or context-sensitive mappings, so return unchanged strings by reference
+        // and map changed strings directly into one LStr allocation.
+        if s.ascii_hint() {
+            if !s.bytes().any(|byte| byte.is_ascii_lowercase()) {
+                return Ok(Value::Str(s));
+            }
+            return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, true)));
+        }
+        Ok(Value::from_string(s.to_uppercase()))
     });
     it.def_method(&sp, "toLowerCase", 0, |i, this, _| {
-        Ok(Value::from_string(this_string(i, &this)?.to_lowercase()))
+        let s = this_string(i, &this)?;
+        // ECMA-262 §22.1.3.28 uses the same Unicode mapping with lowercase output. The ASCII
+        // fast path is exact and avoids both a Unicode iterator and a temporary Rust String.
+        if s.ascii_hint() {
+            if !s.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return Ok(Value::Str(s));
+            }
+            return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, false)));
+        }
+        Ok(Value::from_string(s.to_lowercase()))
     });
     // lumen strings are valid UTF-8, so they're always well-formed.
     it.def_method(&sp, "isWellFormed", 0, |i, this, _| {

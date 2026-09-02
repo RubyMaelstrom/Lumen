@@ -10833,6 +10833,17 @@ fn string_trim_feff() {
 }
 
 #[test]
+fn string_case_ascii_fast_path_preserves_unicode_mappings() {
+    assert_eq!(run("'ABC 123'.toUpperCase()"), "ABC 123");
+    assert_eq!(run("'abc 123'.toLowerCase()"), "abc 123");
+    assert_eq!(run("'aBc'.toUpperCase()"), "ABC");
+    assert_eq!(run("'aBc'.toLowerCase()"), "abc");
+    // Unicode Default Case Conversion still handles one-to-many mappings off the ASCII path.
+    assert_eq!(run("'Straße'.toUpperCase()"), "STRASSE");
+    assert_eq!(run("'İ'.toLowerCase()"), "i\u{307}");
+}
+
+#[test]
 fn string_padding_ascii_fast_path_preserves_unit_truncation() {
     assert_eq!(run("'ab'.padStart(7, 'xyz')"), "xyzxyab");
     assert_eq!(run("'ab'.padEnd(7, 'xyz')"), "abxyzxy");
