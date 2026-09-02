@@ -614,6 +614,9 @@ finish the baseline, but no later phase may claim a performance win against the 
   JSON envelope, coalesces missed intervals, triggers the existing post-GC snapshot only when due,
   and remains inert unless `LUMEN_PERF_METRICS` is enabled.
 - [ ] Add a stable machine-readable profile format and a human summary tool.
+  - [x] The engine matrix and opt-in metrics records use versioned JSON, and
+    `scripts/summarize-engine-report.py` renders medians, confidence intervals, and component
+    ratios without recomputing or accepting incomplete reports.
 
 ### Phase 2: canonical tagged value and execution ABI
 

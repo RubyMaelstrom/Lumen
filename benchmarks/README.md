@@ -39,6 +39,13 @@ scripts/bench-matrix.py --engine node --engine lumen-jit --workload regexp --sam
 scripts/bench-matrix.py --no-build --cpu none
 ```
 
+To inspect a completed report without manually traversing its JSON, use the read-only summary
+helper:
+
+```sh
+scripts/summarize-engine-report.py benchmark-results/engine-matrix-<timestamp>.json
+```
+
 ## Deterministic browser replays
 
 The sibling TRust checkout provides a no-window, no-TUI replay binary that runs self-contained HTML
