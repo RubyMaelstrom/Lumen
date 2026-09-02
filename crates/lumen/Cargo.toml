@@ -28,6 +28,10 @@ embed = []
 # Exposes internal compilation stages (`lumen::bench_api`) for the `internals` benchmark. Not a
 # stability commitment — for measurement only.
 bench = []
+# Opt-in central-heap handle bridge used by migration tests. It records one checked handle per
+# live object while the existing `Rc<RefCell<Object>>` graph remains authoritative; never enabled
+# by the default production build until relocation and differential gates are complete.
+heap-bridge = []
 
 [lints]
 workspace = true

@@ -371,6 +371,32 @@ mod packed_value_tests {
         let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shapes.fresh()));
         assert!(exhausted.is_err(), "shape ids wrapped after exhaustion");
     }
+
+    #[cfg(feature = "heap-bridge")]
+    #[test]
+    fn object_allocations_attach_and_release_central_handles() {
+        let object = Object::new(None);
+        let heap = object.borrow().gc_heap.clone();
+        let reference = object
+            .borrow()
+            .central_ref
+            .get()
+            .expect("bridge-enabled object lacks a central handle");
+        assert_eq!(
+            heap.central.borrow().header(reference).unwrap().size_units,
+            0
+        );
+        assert_eq!(
+            heap.central.borrow().header(reference).unwrap().generation,
+            crate::heap::HeapGeneration::Young
+        );
+        assert_eq!(heap.central.borrow().requested_bytes(), 0);
+        drop(object);
+        assert_eq!(
+            heap.central.borrow().payload(reference),
+            Err(crate::heap::HeapError::InvalidReference)
+        );
+    }
 }
 
 /// A unique Symbol. Identity is the `id` (every `Symbol()` call gets a fresh one); `description` is
@@ -970,6 +996,10 @@ pub struct Object {
     /// every slot before sweeping can drop an object.
     pub(crate) gc_mark: Cell<bool>,
     pub(crate) gc_internal: Cell<u32>,
+    /// Opt-in central-heap identity used during the `heap-bridge` migration. The existing Rc
+    /// object remains authoritative until all fields and roots have relocation-aware descriptors.
+    #[cfg(feature = "heap-bridge")]
+    pub(crate) central_ref: Cell<Option<crate::tagged::HeapRef>>,
 }
 
 impl Object {
@@ -1005,6 +1035,16 @@ impl Object {
                 }
             };
             let slot_u32: u32 = slot.try_into().expect("object registry exceeded u32 slots");
+            #[cfg(feature = "heap-bridge")]
+            let central_ref = heap
+                .central
+                .borrow_mut()
+                .allocate_tagged_fields(
+                    crate::heap::LayoutId::new(1),
+                    Vec::new(),
+                    crate::heap::HeapGeneration::Young,
+                )
+                .expect("central heap handle space exhausted during bridge allocation");
             let obj = Rc::new(RefCell::new(Object {
                 gc_heap: heap.clone(),
                 proto,
@@ -1016,6 +1056,8 @@ impl Object {
                 is_constructor: false,
                 gc_mark: Cell::new(false),
                 gc_internal: Cell::new(slot_u32),
+                #[cfg(feature = "heap-bridge")]
+                central_ref: Cell::new(Some(central_ref)),
             }));
             reg.entries[slot] = Some(Rc::downgrade(&obj));
             obj
@@ -1034,6 +1076,10 @@ impl Drop for Object {
             reg.free.push(slot);
         }
         drop(reg);
+        #[cfg(feature = "heap-bridge")]
+        if let Some(reference) = self.central_ref.take() {
+            let _ = self.gc_heap.central.borrow_mut().free(reference);
+        }
         self.gc_heap.live.set(self.gc_heap.live.get() - 1);
     }
 }
@@ -1056,6 +1102,8 @@ pub(crate) struct GcState {
     array_length_shape: Cell<u32>,
     live: Cell<i64>,
     allocated: Cell<u64>,
+    #[cfg(feature = "heap-bridge")]
+    pub(crate) central: RefCell<crate::heap::CentralHeap>,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
@@ -1085,6 +1133,10 @@ pub(crate) fn scan_gc_heap_retained_memory(
             .capacity()
             .saturating_mul(std::mem::size_of::<Weak<RefCell<crate::interpreter::Scope>>>()),
     );
+    #[cfg(feature = "heap-bridge")]
+    {
+        bytes = bytes.saturating_add(heap.central.borrow().requested_bytes());
+    }
     let shapes = heap.shapes.borrow();
     bytes = bytes.saturating_add(
         shapes
@@ -1260,6 +1312,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         array_length_shape: Cell::new(SHAPE_EMPTY),
         live: Cell::new(0),
         allocated: Cell::new(0),
+        #[cfg(feature = "heap-bridge")]
+        central: RefCell::new(crate::heap::CentralHeap::new()),
     })
 }
 

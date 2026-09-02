@@ -651,6 +651,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [x] Add one traceable tagged-field leaf family to that nucleus and prove root/field rewriting of
   self-references before source reclamation. It remains a migration fixture, not a live object
   representation.
+- [x] Wire the checked handle table to real `Object` allocations behind the opt-in
+  `heap-bridge` feature and verify handle release on `Rc` destruction. The existing `Value` graph
+  remains authoritative; this bridge is not enabled in production until object fields and roots
+  migrate atomically.
 - [ ] Add page/arena allocation and bump-pointer allocation for common small objects.
 - [ ] Start with a correct stop-the-world old-generation mark/sweep tracer and bounded free lists
   behind the new root API. A nursery needs a collectible promotion destination; old-generation
