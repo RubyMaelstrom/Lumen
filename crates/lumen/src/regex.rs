@@ -265,10 +265,20 @@ struct CharClass {
     builtins: Vec<char>,
     /// Unicode property escapes `\p{…}` / `\P{…}`: `(negated, sorted codepoint ranges)`.
     props: Vec<(bool, &'static [(u32, u32)])>,
+    /// Exact membership for non-case-insensitive inputs in the byte range. Compiled classes
+    /// exercise this table for ASCII subjects; all other inputs retain the range/property path.
+    ascii_lut: Option<Box<[bool; 256]>>,
 }
 
 impl CharClass {
     fn matches(&self, u: u32, icase: bool, unicode: bool) -> bool {
+        if !icase {
+            if let Some(lut) = &self.ascii_lut {
+                if let Some(&hit) = lut.get(u as usize) {
+                    return hit;
+                }
+            }
+        }
         let mut hit = self.matches_raw2(u, icase, unicode);
         let c = char::from_u32(u);
         if !hit && icase {
@@ -1392,6 +1402,7 @@ fn char_class_requested_capacity(class: &CharClass) -> usize {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<(bool, &'static [(u32, u32)])>()),
         )
+        .saturating_add(class.ascii_lut.as_ref().map_or(0, |_| 256))
 }
 
 fn program_heap_bytes(program: &[Inst], capacity: usize) -> usize {
@@ -1474,6 +1485,7 @@ fn char_class_heap_bytes(class: &CharClass) -> usize {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<(bool, &'static [(u32, u32)])>()),
         )
+        .saturating_add(class.ascii_lut.as_ref().map_or(0, |_| 256))
 }
 
 /// Recycled matcher working buffers (see `Regex::exec_at`).
@@ -2877,12 +2889,19 @@ fn single_char_rep(node: &Node) -> Option<Rep> {
 }
 
 fn clone_class(cc: &CharClass) -> CharClass {
-    CharClass {
+    let mut cloned = CharClass {
         negate: cc.negate,
         ranges: cc.ranges.clone(),
         builtins: cc.builtins.clone(),
         props: cc.props.clone(),
+        ascii_lut: None,
+    };
+    let mut lut = Box::new([false; 256]);
+    for (code, slot) in lut.iter_mut().enumerate() {
+        *slot = cloned.matches_raw2(code as u32, false, false) ^ cloned.negate;
     }
+    cloned.ascii_lut = Some(lut);
+    cloned
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4166,6 +4185,7 @@ fn class_set_to_node(mut set: ClassSet) -> Node {
         ranges,
         builtins: Vec::new(),
         props: Vec::new(),
+        ascii_lut: None,
     };
     if set.strings.is_empty() {
         return Node::Class(class);

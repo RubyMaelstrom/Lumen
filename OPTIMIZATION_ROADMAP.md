@@ -976,6 +976,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     (ECMA-262 §23.2.3.12–§23.2.3.20). A release workload over a 20,000-element `Float64Array`
     improved from 0.133642 s to 0.107433 s median (about 20%), with typed-array conformance
     tests passing.
+  - [x] Compiled non-case-insensitive character classes cache exact membership for the 256 ASCII
+    code units. The matcher still uses its range/property and case-folding paths for non-ASCII or
+    case-insensitive subjects, and the table is included in retained RegExp metadata accounting
+    (ECMA-262 §22.2.7). The five-sample release RegExp workload improved from a 428 median score
+    (pre-table report) to 500 (about 17%); the focused 46-test RegExp suite passed.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
