@@ -10090,6 +10090,20 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "slice", 2, nf_string_slice);
     it.def_method(&sp, "substring", 2, |i, this, args| {
         let s = this_string(i, &this)?;
+        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii) {
+            // String.prototype.substring clamps and swaps UTF-16 indices (ECMA-262 §22.1.3.25).
+            // ASCII byte offsets are the same code-unit indices, so keep the common path flat.
+            let len = s.len() as i64;
+            let mut a = (ab(i.to_number(&arg(args, 0)))? as i64).clamp(0, len);
+            let mut b = match arg(args, 1) {
+                Value::Undefined => len,
+                v => (ab(i.to_number(&v))? as i64).clamp(0, len),
+            };
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            return Ok(Value::str(&s[a as usize..b as usize]));
+        }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         let mut a = (ab(i.to_number(&arg(args, 0)))? as i64).clamp(0, len);
@@ -10107,6 +10121,37 @@ fn install_string(it: &mut Interp) {
     // Annex B B.2.3.1 String.prototype.substr(start, length).
     it.def_method(&sp, "substr", 2, |i, this, args| {
         let s = this_string(i, &this)?;
+        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii) {
+            let size = s.len() as i64;
+            let n = ab(i.to_number(&arg(args, 0)))?;
+            let n = n.trunc();
+            let mut start = if n.is_nan() {
+                0
+            } else if n < 0.0 {
+                (size + n as i64).max(0)
+            } else {
+                (n as i64).min(size)
+            };
+            let len = match arg(args, 1) {
+                Value::Undefined => size,
+                v => {
+                    let l = ab(i.to_number(&v))?;
+                    if l.is_nan() {
+                        0
+                    } else {
+                        (l as i64).max(0)
+                    }
+                }
+            };
+            let count = len.min(size - start).max(0);
+            if count <= 0 {
+                return Ok(Value::str(""));
+            }
+            if start < 0 {
+                start = 0;
+            }
+            return Ok(Value::str(&s[start as usize..(start + count) as usize]));
+        }
         let chars = i.units_full(&s);
         let size = chars.len() as i64;
         let n = ab(i.to_number(&arg(args, 0)))?;

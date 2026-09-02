@@ -4886,6 +4886,8 @@ fn ascii_string_search_fast_paths_preserve_positions() {
     assert_eq!(run("'abcabc'.lastIndexOf('bc', 3)"), "1");
     assert_eq!(run("'abcabc'.lastIndexOf('bc', 99)"), "4");
     assert_eq!(run("'abcabc'.lastIndexOf('', 3)"), "3");
+    assert_eq!(run("'abcdef'.substring(4, 1)"), "bcd");
+    assert_eq!(run("'abcdef'.substr(-3, 2)"), "de");
     // Position coercion remains observable before the search.
     assert_eq!(
         run("var calls=0; var p={valueOf(){calls++;return 3}}; ['abcabc'.lastIndexOf('bc',p),calls].join('|')"),
