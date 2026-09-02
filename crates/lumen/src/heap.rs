@@ -444,6 +444,29 @@ impl CentralHeap {
         rewritten
     }
 
+    fn rewrite_tagged_references_many(
+        &mut self,
+        forwarding: &crate::fasthash::FastMap<HeapRef, HeapRef>,
+    ) -> usize {
+        let mut rewritten = 0;
+        for object in self.objects.iter_mut().flatten() {
+            let HeapStorage::Tagged(fields) = &mut object.storage else {
+                continue;
+            };
+            for field in fields.iter_mut() {
+                let Some(source) = field.as_heap() else {
+                    continue;
+                };
+                let Some(target) = forwarding.get(&source) else {
+                    continue;
+                };
+                *field = TaggedValue::heap(*target);
+                rewritten += 1;
+            }
+        }
+        rewritten
+    }
+
     pub(crate) fn mark(&mut self, reference: HeapRef) -> Result<(), HeapError> {
         self.object_mut(reference)?.header.marked = true;
         Ok(())
@@ -508,13 +531,23 @@ impl CentralHeap {
         // collection already has one validation at the mark boundary and one after all forwarding
         // edges are rewritten, so avoid turning an N-object nursery into an O(N²) verifier walk.
         self.validate_all()?;
+        let mut forwarding = Vec::with_capacity(young.len());
+        let mut forwarding_map =
+            crate::fasthash::FastMap::with_capacity_and_hasher(young.len(), Default::default());
         for source in young {
             if self.header(source).is_err() {
                 continue;
             }
             let target = self.relocate_unchecked(source)?;
             roots.rewrite_heap_reference(source, target);
-            self.rewrite_tagged_references(source, target);
+            forwarding.push((source, target));
+            forwarding_map.insert(source, target);
+        }
+        // Relocations are allocated in stable handle order above. Rewriting all fields in one
+        // table walk avoids rescanning the entire heap once per moved object, while the ordered
+        // list below preserves deterministic promotion and free-slot behavior.
+        self.rewrite_tagged_references_many(&forwarding_map);
+        for (source, target) in forwarding {
             self.promote(target, HeapGeneration::Old)?;
             self.reclaim_forwarded_unchecked(source)?;
             promoted += 1;
