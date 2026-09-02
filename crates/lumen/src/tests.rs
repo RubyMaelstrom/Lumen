@@ -12540,6 +12540,26 @@ fn array_iterator_exhaustion_and_ta_bounds() {
         ),
         "TypeError"
     );
+    // The fast packed-array path still observes a length change between iterator steps.
+    assert_eq!(
+        run(
+            "var a=[1,2]; var it=a.values(); var first=it.next().value; a.length=1; [first,it.next().done].join(',')"
+        ),
+        "1,true"
+    );
+    // Accessors and inherited indexed properties must use the specified Get operation.
+    assert_eq!(
+        run(
+            "var a=[1]; var it=a.values(); Object.defineProperty(a,'0',{get(){return 4},configurable:true}); it.next().value"
+        ),
+        "4"
+    );
+    assert_eq!(
+        run(
+            "var a=[]; a.length=1; Array.prototype[0]=7; var value=a.values().next().value; delete Array.prototype[0]; value"
+        ),
+        "7"
+    );
 }
 
 #[test]

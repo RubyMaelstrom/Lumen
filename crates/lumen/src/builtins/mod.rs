@@ -9258,6 +9258,16 @@ fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
         }
     } else {
         match &target {
+            // LengthOfArrayLike is a [[Get]] of "length". An ordinary Array's length is an
+            // array-exotic data slot, never an accessor, so reading the maintained slot is the
+            // same operation without allocating the property key or coercing a Number. Proxies,
+            // host objects, and ordinary array-likes retain the observable generic path.
+            Value::Obj(object)
+                if matches!(object.borrow().exotic, Exotic::Array)
+                    && i.ordinary_get_ptr(Rc::as_ptr(object) as usize) =>
+            {
+                i.array_length(object)
+            }
             // LengthOfArrayLike through [[Get]], so a proxy target's traps are honored.
             Value::Obj(_) => {
                 let lv = ab(i.get_member(&target, "length"))?;
@@ -9280,7 +9290,17 @@ fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
         return Ok(Value::Obj(result));
     }
     ab(i.set_member(&this, "__ai_index", Value::Num((idx + 1) as f64)))?;
-    let elem = ab(i.get_member(&target, &idx.to_string()))?;
+    // ArrayIteratorPrototype.next performs Get(array, ToString(index)). The ordinary dense
+    // element helper is an exact result for own data entries and falls back for holes, accessors,
+    // prototype properties, and exotics; this avoids the per-step index-string allocation in the
+    // common packed-array case while preserving the specified Get semantics on every miss.
+    let elem = ab(match &target {
+        Value::Obj(object) => i
+            .fast_get_elem(object, idx as f64)
+            .map(Ok)
+            .unwrap_or_else(|| i.get_member(&target, &idx.to_string())),
+        _ => i.get_member(&target, &idx.to_string()),
+    })?;
     let value = match kind {
         1 => Value::Num(idx as f64),
         2 => i.make_array(vec![Value::Num(idx as f64), elem]),
