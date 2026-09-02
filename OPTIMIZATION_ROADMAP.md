@@ -877,6 +877,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   - [x] `String.prototype.at` reuses its one representation classification and UTF-16 view for
     both length and indexed selection, avoiding duplicate short non-ASCII materialization while
     preserving `ToAbsoluteIndex` ordering and code-unit results (ECMA-262 §22.1.3.1).
+  - [x] ASCII `trim`, `trimStart`, and `trimEnd` use the equivalent byte whitespace set; strings
+    containing non-ASCII WhiteSpace or LineTerminator code points retain the Unicode path
+    (ECMA-262 §22.1.3.32–34).
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.
