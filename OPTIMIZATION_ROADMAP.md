@@ -942,6 +942,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     callback inputs, bypassing repeated key/HasProperty/Get work while retaining the generic path
     for holes, accessors, inherited values, proxies, and mutations; an 11-sample release workload
     improved from 0.463318 s to 0.434543 s (about 6%).
+  - [x] ASCII `String.prototype.split` keeps each byte-aligned substring as an `LStr` and applies
+    the limit while iterating, avoiding a Rust `String` temporary per piece; the standards-sensitive
+    UTF-16 and RegExp paths remain unchanged (ECMA-262 §22.1.3.23). An 11-sample release workload
+    improved from 0.499311 s to 0.444024 s (about 11%).
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

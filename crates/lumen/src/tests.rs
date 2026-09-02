@@ -13881,6 +13881,9 @@ fn string_match_search_delegate() {
 fn string_split_delegate() {
     // split builds through @@split for regexps and honors a custom @@split.
     assert_eq!(run("'a,b,c'.split(',').join('|')"), "a|b|c");
+    // The ASCII fast path must still apply the post-processing limit rather than returning an
+    // unsplit remainder (the behavior of splitn, not String.prototype.split).
+    assert_eq!(run("'a,b,c'.split(',',1).join('|')"), "a");
     assert_eq!(run("'a1b2c'.split(/[0-9]/).join('|')"), "a|b|c");
     assert_eq!(run("'x'.split({[Symbol.split](s){return ['S']}})[0]"), "S");
     assert_eq!(run("'abc'.split('').join('-')"), "a-b-c");

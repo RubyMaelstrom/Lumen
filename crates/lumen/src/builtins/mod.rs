@@ -9881,6 +9881,12 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                     .into_iter()
                     .map(|u| Value::Str(crate::jstr::unit_lstr(u)))
                     .collect()
+            } else if s.ascii_hint() && sep.is_ascii() {
+                // For ASCII operands, byte and UTF-16-unit boundaries coincide. Keep each
+                // substring as an LStr directly instead of allocating a Rust String before the
+                // engine copies it; `.take(limit)` preserves Split's post-processing truncation
+                // (unlike `splitn`, whose final remainder would be incorrect here).
+                s.split(sep.as_ref()).take(limit).map(Value::str).collect()
             } else {
                 s.split(sep.as_ref())
                     .map(|p| Value::from_string(p.to_string()))
