@@ -1273,9 +1273,12 @@ fn ta_native(
         })()),
         "join" => Some((|| {
             let sep = match args.first() {
-                Some(v) if !matches!(v, Value::Undefined) => ab(i.to_string(v))?.to_string(),
-                _ => ",".to_string(),
+                Some(v) if !matches!(v, Value::Undefined) => ab(i.to_string(v))?,
+                _ => crate::lstr::LStr::from(","),
             };
+            // %TypedArray%.prototype.join delegates its separator/element ordering to
+            // ECMA-262 §23.2.3.18 and §23.1.3.18. Keep the separator as an LStr so each element
+            // conversion can append directly without an intermediate Rust String.
             let mut out = String::new();
             for k in 0..len {
                 if k > 0 {

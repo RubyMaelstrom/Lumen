@@ -1886,6 +1886,12 @@ fn typed_arrays() {
         "15"
     );
     assert_eq!(run("var a = new Uint8Array([1,2,3]); a.join(',')"), "1,2,3");
+    assert_eq!(
+        run(
+            "var calls=[]; new Uint8Array([1,2]).join({toString(){calls.push('s');return '|'}})+'|'+calls"
+        ),
+        "1|2|s"
+    );
     assert_eq!(run("var a = new Int8Array([100]); a[0]=200; a[0]"), "-56"); // wraps i8
     assert_eq!(
         run("var a = new Uint8ClampedArray([1]); a[0]=300; a[0]"),
