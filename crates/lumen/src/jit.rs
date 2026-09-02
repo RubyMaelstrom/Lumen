@@ -38,7 +38,10 @@ use crate::value::Value;
 /// Opt-in process counters used by the reproducible benchmark runner. The enabled check occurs
 /// only when a chunk first attempts native compilation, never in generated code or ordinary JIT
 /// execution. Relaxed atomics are sufficient: these are aggregate diagnostics, not engine state.
-static PERF_METRICS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+// 0 = not initialized, 1 = disabled, 2 = enabled. The diagnostics switch is process-scoped and
+// sampled once; a relaxed byte load keeps disabled instrumentation at a predictable branch cost
+// without taking the `OnceLock` fast path on every iterator/conversion helper.
+static PERF_METRICS_ENABLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static PERF_COMPILE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_COMPILE_SUCCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_COMPILE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -126,7 +129,17 @@ static PERF_ITERATE_PROTOCOL_FAILURES: std::sync::atomic::AtomicU64 =
 
 #[inline]
 pub(crate) fn perf_metrics_enabled() -> bool {
-    *PERF_METRICS_ENABLED.get_or_init(|| std::env::var_os("LUMEN_PERF_METRICS").is_some())
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    match PERF_METRICS_ENABLED.load(Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let enabled = std::env::var_os("LUMEN_PERF_METRICS").is_some();
+            let state = if enabled { 2 } else { 1 };
+            let _ = PERF_METRICS_ENABLED.compare_exchange(0, state, Release, Relaxed);
+            enabled
+        }
+    }
 }
 
 #[inline]

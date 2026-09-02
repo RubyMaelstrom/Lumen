@@ -607,6 +607,8 @@ finish the baseline, but no later phase may claim a performance win against the 
     - [x] Primitive-string GetIterator now uses String.prototype directly, and eager iterable
       collection closes the Iterator Record on abrupt next/result/value failures.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
+  - [x] Hot-path diagnostics use a process-sampled relaxed byte gate; disabled iterator and
+    conversion probes avoid timestamps, allocations, and synchronization locks.
 - [x] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
   recover diagnostics. `PerformanceMetricsSampler` emits an immediate and then interval-spaced
   JSON envelope, coalesces missed intervals, triggers the existing post-GC snapshot only when due,
