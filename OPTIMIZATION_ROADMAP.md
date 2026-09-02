@@ -651,6 +651,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [x] Add one traceable tagged-field leaf family to that nucleus and prove root/field rewriting of
   self-references before source reclamation. It remains a migration fixture, not a live object
   representation.
+- [x] Add independent central-heap validation, generation promotion, and deterministic sweep
+  scaffolding with size, forwarding-edge, tagged-child, mark, and requested-byte checks. Wiring
+  this verifier to the live collector remains pending the root-family migration.
 - [x] Wire the checked handle table to real `Object` allocations behind the opt-in
   `heap-bridge` feature and verify handle release on `Rc` destruction. The existing `Value` graph
   remains authoritative; this bridge is not enabled in production until object fields and roots
@@ -663,8 +666,8 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   WebAssembly, host object, WeakRef, FinalizationRegistry, WeakMap, and WeakSet edge.
 - [ ] Implement ephemeron marking to a correct fixed point and preserve ECMA-262 weak-reference
   liveness requirements.
-- [ ] Add heap verification that independently walks object layouts and validates all tagged
-  pointers after collection.
+- [ ] Add heap verification to the live collector, independently walking object layouts and
+  validating all tagged pointers after collection (the central-heap verifier scaffold is above).
 - [ ] Add a copying nursery for eligible newly allocated objects.
 - [ ] Add old-to-young write barriers, remembered sets, and verification that recomputes the set
   independently in stress builds.

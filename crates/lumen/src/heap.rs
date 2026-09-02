@@ -65,6 +65,7 @@ pub(crate) enum HeapError {
     NotForwarded,
     PayloadKindMismatch,
     InvalidTaggedField,
+    HeaderMismatch,
     RequestTooLarge,
     ReferenceSpaceExhausted,
 }
@@ -228,8 +229,103 @@ impl CentralHeap {
         Ok(())
     }
 
+    pub(crate) fn promote(
+        &mut self,
+        reference: HeapRef,
+        generation: HeapGeneration,
+    ) -> Result<(), HeapError> {
+        self.object_mut(reference)?.header.generation = generation;
+        Ok(())
+    }
+
     pub(crate) fn requested_bytes(&self) -> usize {
         self.requested_bytes
+    }
+
+    /// Verify every live slot, header/storage size, forwarding edge, and tagged child reference.
+    /// This is intentionally an independent walk rather than a fast-path assertion so stress
+    /// collectors can run it before and after every relocation.
+    pub(crate) fn validate_all(&self) -> Result<(), HeapError> {
+        for (index, object) in self.objects.iter().enumerate().skip(1) {
+            let Some(object) = object else { continue };
+            let expected_units = match &object.storage {
+                HeapStorage::Bytes(payload) => payload.len(),
+                HeapStorage::Tagged(fields) => fields.len(),
+            };
+            if object.header.size_units as usize != expected_units {
+                return Err(HeapError::HeaderMismatch);
+            }
+            if let Some(target) = object.header.forwarding {
+                if target.get() as usize == index {
+                    return Err(HeapError::HeaderMismatch);
+                }
+                let target_object = self
+                    .objects
+                    .get(target.get() as usize)
+                    .and_then(Option::as_ref)
+                    .ok_or(HeapError::InvalidReference)?;
+                if target_object.header.forwarding.is_some() {
+                    return Err(HeapError::HeaderMismatch);
+                }
+            }
+            let HeapStorage::Tagged(fields) = &object.storage else {
+                continue;
+            };
+            for field in fields {
+                field
+                    .validate()
+                    .map_err(|_| HeapError::InvalidTaggedField)?;
+                let Some(child) = field.as_heap() else {
+                    continue;
+                };
+                let child_object = self
+                    .objects
+                    .get(child.get() as usize)
+                    .and_then(Option::as_ref)
+                    .ok_or(HeapError::InvalidReference)?;
+                if child_object.header.forwarding.is_some() {
+                    return Err(HeapError::ForwardedReference);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deterministically reclaim unmarked, non-forwarded slots. Mark bits are cleared for the
+    /// survivors so the next collection starts from a clean white set. Forwarded sources remain
+    /// until their explicit relocation handshake calls `reclaim_forwarded`.
+    pub(crate) fn sweep_unmarked(&mut self) -> usize {
+        let mut reclaimed = 0;
+        let mut released_bytes: usize = 0;
+        for slot in self.objects.iter_mut().skip(1) {
+            let remove = slot
+                .as_ref()
+                .is_some_and(|object| !object.header.marked && object.header.forwarding.is_none());
+            if remove {
+                if let Some(object) = slot.take() {
+                    released_bytes =
+                        released_bytes.saturating_add(object.storage.requested_bytes());
+                    reclaimed += 1;
+                }
+            } else if let Some(object) = slot {
+                object.header.marked = false;
+            }
+        }
+        self.requested_bytes = self.requested_bytes.saturating_sub(released_bytes);
+        reclaimed
+    }
+
+    pub(crate) fn live_handles(&self) -> Vec<HeapRef> {
+        self.objects
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(index, object)| {
+                object
+                    .as_ref()
+                    .and_then(|_| u32::try_from(index).ok().and_then(HeapRef::new))
+            })
+            .collect()
     }
 
     /// Copy one object to a new slot and publish a forwarding edge on the source. The source is
@@ -417,5 +513,45 @@ mod tests {
             heap.tagged_fields(bytes),
             Err(HeapError::PayloadKindMismatch)
         );
+    }
+
+    #[test]
+    fn validation_and_sweep_preserve_marked_generation_and_accounting() {
+        let mut heap = CentralHeap::new();
+        let keep = heap
+            .allocate(LayoutId::new(4), 3, HeapGeneration::Young)
+            .unwrap();
+        let discard = heap
+            .allocate(LayoutId::new(5), 7, HeapGeneration::Old)
+            .unwrap();
+        assert_eq!(heap.validate_all(), Ok(()));
+        heap.promote(keep, HeapGeneration::Old).unwrap();
+        heap.mark(keep).unwrap();
+        assert_eq!(heap.header(keep).unwrap().generation, HeapGeneration::Old);
+        assert_eq!(heap.sweep_unmarked(), 1);
+        assert_eq!(heap.requested_bytes(), 3);
+        assert_eq!(heap.live_handles(), vec![keep]);
+        assert_eq!(heap.payload(discard), Err(HeapError::InvalidReference));
+        assert!(!heap.header(keep).unwrap().marked);
+        assert_eq!(heap.validate_all(), Ok(()));
+    }
+
+    #[test]
+    fn validation_requires_relocation_edges_to_be_rewritten() {
+        let mut heap = CentralHeap::new();
+        let source = heap
+            .allocate_tagged_fields(
+                LayoutId::new(12),
+                vec![TaggedValue::undefined()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        heap.tagged_fields_mut(source).unwrap()[0] = TaggedValue::heap(source);
+        let target = heap.relocate(source).unwrap();
+        assert_eq!(heap.validate_all(), Err(HeapError::ForwardedReference));
+        assert_eq!(heap.rewrite_tagged_references(source, target), 2);
+        assert_eq!(heap.validate_all(), Ok(()));
+        assert_eq!(heap.reclaim_forwarded(source), Ok(target));
+        assert_eq!(heap.validate_all(), Ok(()));
     }
 }
