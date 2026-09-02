@@ -9950,19 +9950,23 @@ fn install_string(it: &mut Interp) {
         if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
             && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
         {
-            let max_start = s.len().saturating_sub(needle.len());
-            let start = match arg(args, 1) {
-                Value::Undefined => max_start,
-                v => {
-                    let p = ab(i.to_number(&v))?;
-                    if p.is_nan() {
-                        max_start
-                    } else {
-                        p.trunc().clamp(0.0, max_start as f64) as usize
-                    }
-                }
+            // ECMA-262 §22.1.3.11 performs ToNumber(position) before the early
+            // `maxStart < 0` return, so retain that observable coercion even when
+            // the search string is longer than the receiver.
+            let number_position = match arg(args, 1) {
+                Value::Undefined => None,
+                v => Some(ab(i.to_number(&v))?),
             };
-            let end = start.saturating_add(needle.len());
+            let Some(max_start) = s.len().checked_sub(needle.len()) else {
+                return Ok(Value::Num(-1.0));
+            };
+            let start = match number_position {
+                None => max_start,
+                Some(p) if p.is_nan() => max_start,
+                Some(p) => p.trunc().clamp(0.0, max_start as f64) as usize,
+            };
+            // `start <= max_start` proves this slice endpoint is in bounds.
+            let end = start + needle.len();
             let result = s[..end].rfind(needle.as_str());
             return Ok(Value::Num(result.map(|n| n as f64).unwrap_or(-1.0)));
         }

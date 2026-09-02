@@ -4886,6 +4886,11 @@ fn ascii_string_search_fast_paths_preserve_positions() {
     assert_eq!(run("'abcabc'.lastIndexOf('bc', 3)"), "1");
     assert_eq!(run("'abcabc'.lastIndexOf('bc', 99)"), "4");
     assert_eq!(run("'abcabc'.lastIndexOf('', 3)"), "3");
+    // The StringLastIndexOf algorithm returns -1 when the search string is
+    // longer than the receiver; this also exercises the ASCII fast path's
+    // checked endpoint calculation.
+    assert_eq!(run("'x'.lastIndexOf('xy')"), "-1");
+    assert_eq!(run("'x'.lastIndexOf('xy', 0)"), "-1");
     assert_eq!(run("'abcdef'.substring(4, 1)"), "bcd");
     assert_eq!(run("'abcdef'.substr(-3, 2)"), "de");
     assert_eq!(run("'abcdef'.at(-2)"), "e");
@@ -4897,6 +4902,10 @@ fn ascii_string_search_fast_paths_preserve_positions() {
     assert_eq!(
         run("var calls=0; var p={valueOf(){calls++;return 3}}; ['abcabc'.lastIndexOf('bc',p),calls].join('|')"),
         "1|1"
+    );
+    assert_eq!(
+        run("var calls=0; var p={valueOf(){calls++;return 0}}; ['x'.lastIndexOf('xy',p),calls].join('|')"),
+        "-1|1"
     );
     // Non-ASCII UTF-16 code-unit semantics still use the materialized fallback.
     assert_eq!(
