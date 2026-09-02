@@ -946,6 +946,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     the limit while iterating, avoiding a Rust `String` temporary per piece; the standards-sensitive
     UTF-16 and RegExp paths remain unchanged (ECMA-262 §22.1.3.23). An 11-sample release workload
     improved from 0.499311 s to 0.444024 s (about 11%).
+  - [x] Array `sort` uses one pair of reusable merge buffers and moves values between passes,
+    retaining stable ordering and comparator abrupt-completion behavior while removing recursive
+    per-level vector allocations (ECMA-262 §23.1.3.30.1). An 11-sample 5,000-element release
+    workload improved from 0.098384 s to 0.095119 s (about 3%).
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

@@ -6607,31 +6607,57 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
     if n <= 1 {
         return Ok(());
     }
-    let mid = n / 2;
-    let mut left = items[..mid].to_vec();
-    let mut right = items[mid..].to_vec();
-    merge_sort(i, &mut left, cmp)?;
-    merge_sort(i, &mut right, cmp)?;
-    let (mut a, mut b, mut k) = (0, 0, 0);
-    while a < left.len() && b < right.len() {
-        if compare_values(i, cmp, &left[a], &right[b])? != Ordering::Greater {
-            items[k] = left[a].clone();
-            a += 1;
-        } else {
-            items[k] = right[b].clone();
-            b += 1;
+
+    // SortIndexedProperties permits any stable implementation-defined comparison sequence
+    // (ECMA-262 §23.1.3.30.1). Keep one source and one destination buffer for all merge passes;
+    // the previous recursive implementation allocated two fresh vectors at every tree level.
+    // Values move between the buffers, so the only per-sort allocation is O(n), while an abrupt
+    // comparator completion still leaves the original array untouched because `items` is copied
+    // into `source` before sorting begins.
+    let mut source = items.to_vec();
+    let mut destination: Vec<Value> = (0..n).map(|_| Value::Undefined).collect();
+    let mut width = 1usize;
+    loop {
+        let mut start = 0usize;
+        while start < n {
+            let mid = start.saturating_add(width).min(n);
+            let end = mid.saturating_add(width).min(n);
+            let (mut left, mut right, mut out) = (start, mid, start);
+            while left < mid && right < end {
+                let take_left =
+                    compare_values(i, cmp, &source[left], &source[right])? != Ordering::Greater;
+                let selected = if take_left {
+                    let value = std::mem::replace(&mut source[left], Value::Undefined);
+                    left += 1;
+                    value
+                } else {
+                    let value = std::mem::replace(&mut source[right], Value::Undefined);
+                    right += 1;
+                    value
+                };
+                destination[out] = selected;
+                out += 1;
+            }
+            while left < mid {
+                destination[out] = std::mem::replace(&mut source[left], Value::Undefined);
+                left += 1;
+                out += 1;
+            }
+            while right < end {
+                destination[out] = std::mem::replace(&mut source[right], Value::Undefined);
+                right += 1;
+                out += 1;
+            }
+            start = end;
         }
-        k += 1;
+        std::mem::swap(&mut source, &mut destination);
+        if width >= n.div_ceil(2) {
+            break;
+        }
+        width = width.saturating_mul(2);
     }
-    while a < left.len() {
-        items[k] = left[a].clone();
-        a += 1;
-        k += 1;
-    }
-    while b < right.len() {
-        items[k] = right[b].clone();
-        b += 1;
-        k += 1;
+    for (slot, value) in items.iter_mut().zip(source) {
+        *slot = value;
     }
     Ok(())
 }
