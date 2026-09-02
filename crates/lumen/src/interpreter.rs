@@ -4273,6 +4273,13 @@ impl Interp {
     }
 
     fn plain_for_elems(&self, o: &Gc) -> bool {
+        // Numeric indexed access is an ordinary [[Get]] shortcut.  Proxies, typed arrays,
+        // module/deferred namespaces, and Web IDL indexed objects all have independent internal
+        // methods or backing stores; even an own-looking entry must not bypass those semantics
+        // (ECMA-262 §10.5.8 and §10.4.5).
+        if !self.ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+            return false;
+        }
         if !matches!(o.borrow().exotic, Exotic::Array | Exotic::None) {
             return false;
         }
