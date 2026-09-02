@@ -965,6 +965,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     (ECMA-262 §23.1.3.2, §23.1.3.26, §23.1.3.28). A release copy workload (5 rounds over
     2,000-element arrays) improved from 0.204867 s to 0.045815 s median; proxy, accessor, hole,
     and inherited-property tests remain on the generic path.
+  - [x] Array `shift`, `unshift`, `reduceRight`, and `copyWithin` use that checked presence probe
+    for their source reads as well, retaining direction, overlap, hole deletion, and callback
+    ordering while avoiding duplicate indexed lookups on dense arrays (ECMA-262 §23.1.3.6,
+    §23.1.3.24, §23.1.3.27, §23.1.3.37). The combined release copy/mutation workload improved
+    from 0.196909 s to 0.190414 s median, with the full array semantic suite passing.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

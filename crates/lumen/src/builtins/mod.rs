@@ -5344,10 +5344,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         let first = ab(i.get_member(&ov, "0"))?;
         for k in 1..len {
-            let from = k.to_string();
             let to = (k - 1).to_string();
-            if ab(i.js_has_property(&ov, &from))? {
-                let v = array_get_index_after_has(i, &o, &ov, k, &from)?;
+            if let Some(v) = array_get_present_index(i, &o, &ov, k)? {
                 set_throw(i, &ov, &to, v)?;
             } else {
                 delete_or_throw(i, &ov, &to)?;
@@ -5367,10 +5365,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Err(i.make_error("TypeError", "unshift result is too long"));
             }
             for k in (0..len).rev() {
-                let from = k.to_string();
                 let to = (k + n).to_string();
-                if ab(i.js_has_property(&ov, &from))? {
-                    let v = array_get_index_after_has(i, &o, &ov, k as usize, &from)?;
+                if let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? {
                     set_throw(i, &ov, &to, v)?;
                 } else {
                     delete_or_throw(i, &ov, &to)?;
@@ -6054,9 +6050,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         i.make_error("TypeError", "Reduce of empty array with no initial value")
                     );
                 }
-                let key = k.to_string();
-                if ab(i.js_has_property(&ov, &key))? {
-                    acc = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
+                if let Some(value) = array_get_present_index(i, &o, &ov, k as usize)? {
+                    acc = value;
                     k -= 1;
                     break;
                 }
@@ -6064,9 +6059,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         }
         while k >= 0 {
-            let key = k.to_string();
-            if ab(i.js_has_property(&ov, &key))? {
-                let v = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
+            if let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? {
                 acc = ab(i.call(
                     cb.clone(),
                     Value::Undefined,
@@ -6096,10 +6089,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             (start, target, 1i64)
         };
         while count > 0 {
-            let fk = from.to_string();
             let tk = to.to_string();
-            if ab(i.js_has_property(&ov, &fk))? {
-                let v = array_get_index_after_has(i, &o, &ov, from as usize, &fk)?;
+            if let Some(v) = array_get_present_index(i, &o, &ov, from as usize)? {
                 set_throw(i, &ov, &tk, v)?;
             } else {
                 delete_or_throw(i, &ov, &tk)?;
