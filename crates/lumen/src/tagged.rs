@@ -23,7 +23,8 @@ const HEAP_REF_INDEX_BITS: u32 = 20;
 const HEAP_REF_INDEX_MASK: u32 = (1 << HEAP_REF_INDEX_BITS) - 1;
 const HEAP_REF_COOKIE_MASK: u32 = (1 << (32 - HEAP_REF_INDEX_BITS)) - 1;
 
-/// A non-zero 32-bit offset/index owned by the active Agent's heap model.
+/// A non-zero 32-bit handle-mode slot/cookie word owned by the active Agent's heap model. Cage
+/// offsets use the same opaque type only after an explicit representation selection.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct HeapRef(u32);
 
