@@ -596,6 +596,9 @@ finish the baseline, but no later phase may claim a performance win against the 
     paths do not take a timestamp when diagnostics are disabled.
   - [x] Expose opt-in fast string/array versus `Symbol.iterator`-driven `iterate` timings; the
     lower-level GetIterator/IteratorStep counters remain available for `for-of` and destructuring.
+  - [x] Packed ordinary-array iterator steps reuse the maintained length and dense element slots;
+    holes, accessors, prototype fallback, proxies, typed arrays, and mutations retain the
+    ECMA-262 `LengthOfArrayLike`/`Get` path (`%ArrayIteratorPrototype%.next`, §23.1.5.2.1).
   - [ ] Add stable helper identities and cover remaining spread/ordinary-versus-symbol iteration
     distinctions without adding a disabled-path timestamp to primitive fast cases.
     - [x] Native-call diagnostics now aggregate by explicit callable label and ABI shape rather
