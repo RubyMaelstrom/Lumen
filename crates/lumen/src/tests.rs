@@ -5762,6 +5762,17 @@ fn bytecode_try_catch() {
 }
 
 #[test]
+fn array_join_streams_coercions_in_spec_order() {
+    assert_eq!(run("[1,,null,undefined,'x'].join('|')"), "1||||x");
+    assert_eq!(
+        run(
+            "var calls=[]; var a={length:2,0:{toString(){calls.push(0);return 'a'}},1:{toString(){calls.push(1);return 'b'}}}; Array.prototype.join.call(a,{toString(){calls.push('s');return ','}})+'|'+calls"
+        ),
+        "a,b|s,0,1"
+    );
+}
+
+#[test]
 fn array_species() {
     assert_eq!(run("[1,2,3].map(x=>x*2).join(',')"), "2,4,6");
     assert_eq!(run("[1,2,3,4].filter(x=>x%2===0).join(',')"), "2,4");

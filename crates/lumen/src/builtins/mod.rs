@@ -5486,18 +5486,23 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
         let sep = match arg(args, 0) {
-            Value::Undefined => ",".to_string(),
-            v => ab(i.to_string(&v))?.to_string(),
+            Value::Undefined => crate::lstr::LStr::from(","),
+            v => ab(i.to_string(&v))?,
         };
-        let mut parts = Vec::with_capacity(len);
+        // ECMA-262 §23.1.3.18 performs separator conversion before the left-to-right element
+        // Gets/ToStrings.  Append directly to one result buffer in that same order: `to_string`
+        // already returns an LStr, so this avoids one temporary Rust String per element while
+        // retaining the canonical UTF-16 fixup pass for the final sequence.
+        let mut out = String::new();
         for k in 0..len {
+            if k > 0 {
+                out.push_str(&sep);
+            }
             let v = array_get_index(i, &o, &ov, k)?;
-            parts.push(match v {
-                Value::Undefined | Value::Null => String::new(),
-                other => ab(i.to_string(&other))?.to_string(),
-            });
+            if !matches!(v, Value::Undefined | Value::Null) {
+                out.push_str(&ab(i.to_string(&v))?);
+            }
         }
-        let out = parts.join(&sep);
         Ok(Value::from_string(
             crate::jstr::canonicalize(&out).unwrap_or(out),
         ))
