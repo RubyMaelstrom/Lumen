@@ -8989,6 +8989,17 @@ fn string_iter_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         Some(Value::Num(n)) => n as usize,
         _ => 0,
     };
+    // An ASCII String has one UTF-16 code unit per byte.  Keep the iterator's observable
+    // code-point semantics while avoiding UTF-8 char decoding and a fresh allocation for each
+    // result; the shared single-unit strings are immutable and therefore valid String values.
+    if s.ascii_hint() {
+        let Some(&unit) = s.as_str().as_bytes().get(idx) else {
+            set_internal(&o, "__si_str", Value::Undefined);
+            return Ok(i.iter_result_obj(Value::Undefined, true));
+        };
+        set_internal(&o, "__si_index", Value::Num((idx + 1) as f64));
+        return Ok(i.iter_result_obj(Value::Str(crate::jstr::unit_lstr(unit as u16)), false));
+    }
     let mut rest = s[idx.min(s.len())..].chars();
     let Some(ch) = rest.next() else {
         // Exhausted: clear the string so the iterator stays done.
