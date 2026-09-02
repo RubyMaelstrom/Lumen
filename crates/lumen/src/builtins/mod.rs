@@ -10351,8 +10351,18 @@ fn install_string(it: &mut Interp) {
             return Ok(Value::Undefined);
         }
         let idx = n as usize;
-        Ok(match i.unit_at(&s, idx) {
-            Some(u) if (0xD800..0xDC00).contains(&u) => match i.unit_at(&s, idx + 1) {
+        // CodePointAt reads two adjacent UTF-16 code units at most. Reuse one cached
+        // representation for both reads; this is especially important for short non-ASCII
+        // strings, where two independent `unit_at` calls would each materialize a temporary
+        // vector. The observable order remains ToNumber(index), then the code-unit reads per
+        // ECMA-262 §22.1.3.3.
+        let units = i.units_of(&s);
+        let unit_at = |offset: usize| match &units {
+            crate::interpreter::StrUnits::Ascii => s.as_bytes().get(offset).map(|&b| b as u16),
+            crate::interpreter::StrUnits::Units(units) => units.get(offset).copied(),
+        };
+        Ok(match unit_at(idx) {
+            Some(u) if (0xD800..0xDC00).contains(&u) => match unit_at(idx + 1) {
                 Some(lo) if (0xDC00..0xE000).contains(&lo) => {
                     let c = 0x10000 + ((u as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00);
                     Value::Num(c as f64)

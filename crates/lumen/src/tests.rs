@@ -13396,6 +13396,10 @@ fn string_from_char_code_touint16() {
     assert_eq!(run("String.fromCharCode(65537).charCodeAt(0)"), "1");
     assert_eq!(run("String.fromCharCode(65).charCodeAt(0)"), "65");
     assert_eq!(run("String.fromCharCode(NaN).charCodeAt(0)"), "0");
+    // codePointAt must combine a valid surrogate pair while leaving lone halves as code units.
+    assert_eq!(run("'😀'.codePointAt(0)"), "128512");
+    assert_eq!(run("String.fromCharCode(0xD800).codePointAt(0)"), "55296");
+    assert_eq!(run("'😀'.codePointAt(1)"), "56832");
 }
 
 #[test]
