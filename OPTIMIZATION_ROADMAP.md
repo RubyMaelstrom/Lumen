@@ -1077,8 +1077,9 @@ before changing broad execution behavior:
     Two paired release bytecode Navier-Stokes samples measured 442/438 without the switch and
     426/429 with it; the roughly 3% cost is recorded as a migration gap, so the switch remains
     disabled by default.
-  - [ ] Connect a migrated frame to published root maps and a forced safepoint/relocation test;
-    keep the switch opt-in until that proof exists.
+  - [x] Connect the shadow migrated frame to a published root map and a forced safepoint/relocation
+    test; dead slots remain ignored and invalid root words fail closed. Keep the live switch opt-in
+    until the central heap owns production frames.
 - [x] Write and review the Phase 3A heap safety/migration design, including every root family,
   object tracer, hybrid-edge rule, promotion destination, and old-to-young barrier
   (`HEAP_SAFETY_MODEL.md`). The document is a non-executable safety gate; object-family migration
@@ -1086,6 +1087,9 @@ before changing broad execution behavior:
 - [ ] Implement and verify deoptimization metadata for a non-speculative toy/general SSA region as
   compiler scaffolding only; defer Map/property specialization until Phase 4 provides stable
   identities.
+  - [x] Publish conservative `DeoptRecord` recipes for selected SSA loop side exits with the exact
+    baseline resume PC, validate them before publication, and materialize tagged words/virtual-object
+    recipes in source order. Speculative guards and live-tier deoptimization remain disabled.
 - [ ] Run focused differential tests, Test262 slices, engine A/B benchmarks, a Speedometer slice,
   and the YouTube/Twitch/Steam semantic gates.
 - [ ] Commit that checkpoint before broadening tagged-value coverage or enabling heap migration.

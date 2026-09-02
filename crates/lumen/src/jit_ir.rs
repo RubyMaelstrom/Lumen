@@ -11,6 +11,9 @@
 #![allow(dead_code)]
 
 use crate::bytecode::{Chunk, Op, UpdKind};
+use crate::tagged::{
+    BytecodePc, DeoptId, DeoptRecord, MaterializationRecipe, RootMap, SafepointId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlockId(pub(crate) u32);
@@ -214,6 +217,10 @@ pub(crate) enum IrError {
     MissingBlock(BlockId),
     BadValue(ValueId),
     BadEdgeArgs { from: BlockId, to: BlockId },
+    MissingExit(usize),
+    FrameTooLarge,
+    PcTooLarge,
+    InvalidDeoptRecord,
 }
 
 /// Stack/local SSA for one natural loop.  It is deliberately architecture-neutral and keeps
@@ -762,6 +769,54 @@ impl RegionIr {
             }
         }
         Ok(())
+    }
+
+    /// Publish a conservative deoptimization record for one SSA side exit. Every logical local
+    /// and operand is copied from its baseline frame slot; speculative representation changes are
+    /// intentionally absent until the optimizing tier has an executable guard and resume path.
+    pub(crate) fn deopt_record_for_exit(
+        &self,
+        exit_index: usize,
+        deopt_id: u32,
+        safepoint_id: u32,
+    ) -> Result<DeoptRecord, IrError> {
+        let exit = self
+            .exits
+            .get(exit_index)
+            .ok_or(IrError::MissingExit(exit_index))?;
+        let slot_count = self
+            .n_slots
+            .checked_add(exit.stack.len())
+            .ok_or(IrError::FrameTooLarge)?;
+        let slot_count = u16::try_from(slot_count).map_err(|_| IrError::FrameTooLarge)?;
+        let bytecode_pc = u32::try_from(exit.resume_pc).map_err(|_| IrError::PcTooLarge)?;
+        let word_count = usize::from(slot_count).div_ceil(64);
+        let mut tagged_slots = vec![u64::MAX; word_count];
+        let excess = word_count * 64 - usize::from(slot_count);
+        if excess != 0 {
+            let last = tagged_slots.last_mut().expect("nonzero slot count");
+            *last &= u64::MAX >> excess;
+        }
+        let record = DeoptRecord {
+            id: DeoptId::new(deopt_id),
+            bytecode_pc: BytecodePc::new(bytecode_pc),
+            root_map: RootMap {
+                safepoint: SafepointId::new(safepoint_id),
+                bytecode_pc: BytecodePc::new(bytecode_pc),
+                slot_count,
+                operand_depth: u16::try_from(exit.stack.len())
+                    .map_err(|_| IrError::FrameTooLarge)?,
+                tagged_registers: 0,
+                tagged_slots,
+                handle_slots: vec![0; word_count],
+                environment_slots: vec![0; word_count],
+            },
+            recipes: (0..slot_count)
+                .map(MaterializationRecipe::CopySlot)
+                .collect(),
+        };
+        record.validate().map_err(|_| IrError::InvalidDeoptRecord)?;
+        Ok(record)
     }
 }
 
@@ -1630,5 +1685,40 @@ mod tests {
             ir.values[backedge.args[3].index()].def,
             ValueDef::RegionInput(FrameLoc::Local(3))
         ));
+    }
+
+    #[test]
+    fn ssa_side_exit_publishes_a_conservative_deopt_record() {
+        let ops = [
+            Op::LoadLocal(0),
+            Op::JumpIfFalse(6),
+            Op::Const(0),
+            Op::StoreLocal(1),
+            Op::Jump(0),
+            Op::ReturnUndef,
+            Op::LoadLocal(1),
+            Op::Return,
+        ];
+        let (_cfg, ir) = region(&ops, 0, 2);
+        let record = ir.deopt_record_for_exit(0, 11, 13).unwrap();
+        assert_eq!(record.bytecode_pc.get(), 6);
+        assert_eq!(record.root_map.safepoint, SafepointId::new(13));
+        assert_eq!(record.root_map.slot_count, 2);
+        assert_eq!(record.root_map.operand_depth, 0);
+        assert_eq!(record.recipes.len(), 2);
+        record.validate().unwrap();
+
+        let frame = crate::tagged::TaggedFrame::new(vec![
+            crate::tagged::TaggedValue::number(1.0),
+            crate::tagged::TaggedValue::number(2.0),
+        ]);
+        let values = record.materialize(&frame).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                crate::tagged::MaterializedValue::Word(crate::tagged::TaggedValue::number(1.0)),
+                crate::tagged::MaterializedValue::Word(crate::tagged::TaggedValue::number(2.0)),
+            ]
+        );
     }
 }

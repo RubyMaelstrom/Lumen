@@ -750,7 +750,7 @@ impl CentralHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tagged::RootSet;
+    use crate::tagged::{BytecodePc, RootMap, RootSet, SafepointId, TaggedFrame};
 
     #[test]
     fn allocation_uses_checked_handles_and_separate_payload_accounting() {
@@ -1083,6 +1083,45 @@ mod tests {
         assert_eq!(heap.rewrite_tagged_references(source, target), 2);
         assert_eq!(heap.validate_all(), Ok(()));
         assert_eq!(heap.reclaim_forwarded(source), Ok(target));
+        assert_eq!(heap.validate_all(), Ok(()));
+    }
+
+    #[test]
+    fn forced_safepoint_relocates_a_migrated_frame_before_reclaim() {
+        let mut heap = CentralHeap::new();
+        let source = heap
+            .allocate_tagged_fields(
+                LayoutId::new(13),
+                vec![TaggedValue::null()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        let map = RootMap {
+            safepoint: SafepointId::new(6),
+            bytecode_pc: BytecodePc::new(31),
+            slot_count: 2,
+            operand_depth: 1,
+            tagged_registers: 0,
+            tagged_slots: vec![0b01],
+            handle_slots: vec![0],
+            environment_slots: vec![0],
+        };
+        let mut frame = TaggedFrame::new(vec![TaggedValue::heap(source), TaggedValue::number(8.0)]);
+        let roots = RootSet::new();
+        let _frame_root = roots.root(frame.roots(&map).unwrap()[0]).unwrap();
+
+        let no_gc = heap.enter_no_gc().unwrap();
+        assert_eq!(heap.require_safepoint(), Err(NoGcError::SafepointForbidden));
+        drop(no_gc);
+        assert_eq!(heap.require_safepoint(), Ok(()));
+
+        let target = heap.relocate(source).unwrap();
+        assert_eq!(heap.rewrite_tagged_references(source, target), 0);
+        assert_eq!(frame.rewrite_heap_reference(&map, source, target), Ok(1));
+        assert_eq!(roots.rewrite_heap_reference(source, target), 1);
+        assert_eq!(heap.reclaim_forwarded(source), Ok(target));
+        assert_eq!(frame.roots(&map).unwrap()[0].as_heap(), Some(target));
+        assert_eq!(roots.snapshot().unwrap()[0].as_heap(), Some(target));
         assert_eq!(heap.validate_all(), Ok(()));
     }
 }

@@ -304,6 +304,18 @@ impl TaggedFrame {
         Self { slots }
     }
 
+    fn value_at(&self, slot: u16) -> Result<TaggedValue, FrameMapError> {
+        let value = self
+            .slots
+            .get(usize::from(slot))
+            .copied()
+            .ok_or(FrameMapError::SlotOutOfRange)?;
+        value
+            .validate()
+            .map_err(|_| FrameMapError::InvalidTaggedWord)?;
+        Ok(value)
+    }
+
     pub(crate) fn roots(&self, map: &RootMap) -> Result<Vec<TaggedValue>, FrameMapError> {
         map.validate()?;
         if self.slots.len() != usize::from(map.slot_count) {
@@ -320,6 +332,33 @@ impl TaggedFrame {
             roots.push(*value);
         }
         Ok(roots)
+    }
+
+    /// Rewrite one forwarding edge in the slots named by an exact safepoint map. Dead slots are
+    /// deliberately ignored: a poisoned non-root slot must never become an accidental strong edge.
+    pub(crate) fn rewrite_heap_reference(
+        &mut self,
+        map: &RootMap,
+        from: HeapRef,
+        to: HeapRef,
+    ) -> Result<usize, FrameMapError> {
+        map.validate()?;
+        if self.slots.len() != usize::from(map.slot_count) {
+            return Err(FrameMapError::FrameLengthMismatch);
+        }
+        let replacement = TaggedValue::heap(to);
+        let mut rewritten = 0;
+        for slot in 0..self.slots.len() {
+            if !map.is_root_slot(slot) {
+                continue;
+            }
+            let value = self.value_at(u16::try_from(slot).unwrap_or(u16::MAX))?;
+            if value.as_heap() == Some(from) {
+                self.slots[slot] = replacement;
+                rewritten += 1;
+            }
+        }
+        Ok(rewritten)
     }
 }
 
@@ -376,6 +415,26 @@ pub(crate) enum DeoptRecordError {
     InvalidConstant,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MaterializedValue {
+    Word(TaggedValue),
+    /// A virtual object remains an explicit recipe until a central heap can allocate its layout.
+    /// Fields point at earlier entries in the same materialization vector, never native memory.
+    VirtualObject {
+        layout: u32,
+        fields: Vec<usize>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeoptMaterializationError {
+    InvalidRecord(DeoptRecordError),
+    InvalidFrame(FrameMapError),
+    SlotNotNumber(u16),
+    SlotNotHandle(u16),
+    MissingDependency(usize),
+}
+
 /// Deoptimization metadata is validated before publication. Recipes refer only to prior recipes
 /// or logical frame slots, which makes reconstruction deterministic and prevents hidden native
 /// pointers from entering a resumed frame.
@@ -420,6 +479,70 @@ impl DeoptRecord {
             }
         }
         Ok(())
+    }
+
+    /// Reconstruct the logical values for a toy deoptimization handoff. This intentionally does
+    /// not allocate a heap object for `VirtualObject`; the central heap will own that operation
+    /// once a migrated object family exists. Every recipe is nevertheless checked and resolved in
+    /// source order, so a future native tier cannot smuggle an unvalidated pointer into a frame.
+    pub(crate) fn materialize(
+        &self,
+        frame: &TaggedFrame,
+    ) -> Result<Vec<MaterializedValue>, DeoptMaterializationError> {
+        self.validate()
+            .map_err(DeoptMaterializationError::InvalidRecord)?;
+        if frame.slots.len() != usize::from(self.root_map.slot_count) {
+            return Err(DeoptMaterializationError::InvalidFrame(
+                FrameMapError::FrameLengthMismatch,
+            ));
+        }
+
+        let mut values = Vec::with_capacity(self.recipes.len());
+        for recipe in &self.recipes {
+            let value = match recipe {
+                MaterializationRecipe::CopySlot(slot) => MaterializedValue::Word(
+                    frame
+                        .value_at(*slot)
+                        .map_err(DeoptMaterializationError::InvalidFrame)?,
+                ),
+                MaterializationRecipe::Constant(value) => MaterializedValue::Word(*value),
+                MaterializationRecipe::BoxNumber(slot) => {
+                    let value = frame
+                        .value_at(*slot)
+                        .map_err(DeoptMaterializationError::InvalidFrame)?;
+                    if value.as_number().is_none() {
+                        return Err(DeoptMaterializationError::SlotNotNumber(*slot));
+                    }
+                    // Numbers are immediate in the canonical word format. A future heap-backed
+                    // representation may replace this with a boxed Number allocation.
+                    MaterializedValue::Word(value)
+                }
+                MaterializationRecipe::Handle(slot) => {
+                    let value = frame
+                        .value_at(*slot)
+                        .map_err(DeoptMaterializationError::InvalidFrame)?;
+                    if value.as_heap().is_none() {
+                        return Err(DeoptMaterializationError::SlotNotHandle(*slot));
+                    }
+                    MaterializedValue::Word(value)
+                }
+                MaterializationRecipe::Duplicate(source) => values
+                    .get(*source)
+                    .cloned()
+                    .ok_or(DeoptMaterializationError::MissingDependency(*source))?,
+                MaterializationRecipe::VirtualObject { layout, fields } => {
+                    if let Some(source) = fields.iter().find(|source| **source >= values.len()) {
+                        return Err(DeoptMaterializationError::MissingDependency(*source));
+                    }
+                    MaterializedValue::VirtualObject {
+                        layout: *layout,
+                        fields: fields.clone(),
+                    }
+                }
+            };
+            values.push(value);
+        }
+        Ok(values)
     }
 }
 
@@ -734,6 +857,33 @@ mod tests {
     }
 
     #[test]
+    fn frame_root_map_rewrites_only_live_slots_at_a_safepoint() {
+        let old = HeapRef::from_parts(7, 2).unwrap();
+        let new = HeapRef::from_parts(7, 3).unwrap();
+        let map = RootMap {
+            safepoint: SafepointId::new(5),
+            bytecode_pc: BytecodePc::new(19),
+            slot_count: 3,
+            operand_depth: 2,
+            tagged_registers: 0,
+            tagged_slots: vec![0b001],
+            handle_slots: vec![0b010],
+            environment_slots: vec![0],
+        };
+        let mut frame = TaggedFrame::new(vec![
+            TaggedValue::heap(old),
+            TaggedValue::number(3.0),
+            // This is deliberately not named by the map; stress builds may poison it.
+            TaggedValue::from_raw(TAG_BOOLEAN | 2),
+        ]);
+        assert_eq!(frame.rewrite_heap_reference(&map, old, new), Ok(1));
+        assert_eq!(frame.slots[0].as_heap(), Some(new));
+        assert_eq!(frame.slots[1].as_number(), Some(3.0));
+        assert_eq!(frame.slots[2], TaggedValue::from_raw(TAG_BOOLEAN | 2));
+        assert_eq!(frame.roots(&map).unwrap()[0].as_heap(), Some(new));
+    }
+
+    #[test]
     fn deopt_recipes_are_forward_only_and_validate_constants() {
         let root_map = RootMap {
             safepoint: SafepointId::new(1),
@@ -772,6 +922,73 @@ mod tests {
         assert_eq!(
             bad_constant.validate(),
             Err(DeoptRecordError::InvalidConstant)
+        );
+    }
+
+    #[test]
+    fn deopt_materialization_reconstructs_words_and_virtual_objects() {
+        let handle = HeapRef::from_parts(9, 4).unwrap();
+        let record = DeoptRecord {
+            id: DeoptId::new(8),
+            bytecode_pc: BytecodePc::new(23),
+            root_map: RootMap {
+                safepoint: SafepointId::new(2),
+                bytecode_pc: BytecodePc::new(23),
+                slot_count: 2,
+                operand_depth: 1,
+                tagged_registers: 0,
+                tagged_slots: vec![0b01],
+                handle_slots: vec![0b10],
+                environment_slots: vec![0],
+            },
+            recipes: vec![
+                MaterializationRecipe::CopySlot(0),
+                MaterializationRecipe::BoxNumber(0),
+                MaterializationRecipe::Handle(1),
+                MaterializationRecipe::Duplicate(1),
+                MaterializationRecipe::VirtualObject {
+                    layout: 12,
+                    fields: vec![0, 2, 3],
+                },
+            ],
+        };
+        let frame = TaggedFrame::new(vec![TaggedValue::number(-0.0), TaggedValue::heap(handle)]);
+        assert_eq!(
+            record.materialize(&frame).unwrap(),
+            vec![
+                MaterializedValue::Word(TaggedValue::number(-0.0)),
+                MaterializedValue::Word(TaggedValue::number(-0.0)),
+                MaterializedValue::Word(TaggedValue::heap(handle)),
+                MaterializedValue::Word(TaggedValue::number(-0.0)),
+                MaterializedValue::VirtualObject {
+                    layout: 12,
+                    fields: vec![0, 2, 3],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deopt_materialization_rejects_wrong_recipe_slot_kind() {
+        let record = DeoptRecord {
+            id: DeoptId::new(9),
+            bytecode_pc: BytecodePc::new(24),
+            root_map: RootMap {
+                safepoint: SafepointId::new(3),
+                bytecode_pc: BytecodePc::new(24),
+                slot_count: 1,
+                operand_depth: 0,
+                tagged_registers: 0,
+                tagged_slots: vec![1],
+                handle_slots: vec![0],
+                environment_slots: vec![0],
+            },
+            recipes: vec![MaterializationRecipe::Handle(0)],
+        };
+        let frame = TaggedFrame::new(vec![TaggedValue::number(1.0)]);
+        assert_eq!(
+            record.materialize(&frame),
+            Err(DeoptMaterializationError::SlotNotHandle(0))
         );
     }
 
