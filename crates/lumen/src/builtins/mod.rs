@@ -5093,7 +5093,7 @@ pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> boo
 /// `length` is an own plain data property. Callers separately prove that the selected iterator is
 /// the intrinsic Array iterator. Holes and accessors deliberately miss so prototype lookup and
 /// side effects retain the ordinary iterator path.
-fn dense_array_snapshot(i: &Interp, value: &Value) -> Option<Vec<Value>> {
+pub(crate) fn dense_array_snapshot(i: &Interp, value: &Value) -> Option<Vec<Value>> {
     let Value::Obj(object) = value else {
         return None;
     };

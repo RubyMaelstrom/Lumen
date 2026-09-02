@@ -1282,6 +1282,10 @@ fn iterator_protocol() {
         "0:10,1:20"
     );
     assert_eq!(run("typeof [][Symbol.iterator]"), "function");
+    assert_eq!(
+        run("var a=[1,undefined,3]; [...a].map(x=>x===undefined?'u':x).join(',')"),
+        "1,u,3"
+    );
     let custom = "let obj = { [Symbol.iterator]() { let n=0; return { next(){ return n<3 ? {value:n++,done:false} : {value:undefined,done:true}; } }; } };";
     assert_eq!(
         run(&format!("{custom} let s=0; for (const x of obj) s+=x; s")),

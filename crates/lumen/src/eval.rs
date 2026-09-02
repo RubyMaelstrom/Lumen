@@ -1667,6 +1667,15 @@ impl Interp {
             Value::Obj(o) if crate::builtins::array_iterator_fast_path_is_safe(self, v) => {
                 let perf_started = crate::jit::perf_stage_start();
                 let result: Result<Vec<Value>, Abrupt> = (|| {
+                    // %ArrayIteratorPrototype%.next performs LengthOfArrayLike followed by
+                    // Get(array, ToString(index)) (ECMA-262 §23.1.5.2.1).  A dense ordinary
+                    // array whose indexed entries are all own plain data properties has no
+                    // observable work in that Get, so reuse the packed storage directly.  The
+                    // helper deliberately returns None for holes/accessors and those arrays
+                    // retain the checked property path below.
+                    if let Some(values) = crate::builtins::dense_array_snapshot(self, v) {
+                        return Ok(values);
+                    }
                     let len = self.checked_array_len(o)?;
                     let mut out = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
