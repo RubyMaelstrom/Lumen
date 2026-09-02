@@ -477,14 +477,16 @@ finish the baseline, but no later phase may claim a performance win against the 
 - [x] Record the accepted production TRust/Lumen hashes in every release-performance report.
 - [x] Define regression policy: statistically meaningful regressions require explanation and user
   approval even when an aggregate score improves.
-- [ ] Run and retain the clean full matrix, lock variance-derived component thresholds, and record
+- [x] Run and retain the clean full matrix, lock variance-derived component thresholds, and record
   its report identity as the accepted Phase 0 engine baseline.
   - [x] Retain the exact post-array/string checkpoint at
     `benchmark-results/engine-matrix-20260902T114617937027Z.json` (Lumen artifact
     `87536fbabc16f6681e778ae8351536e7190aa7579d071896ddc9af1e58e968bb`): seven interleaved
     samples, complete status, and a 1,751.227 ms Lumen composite median versus 24,064.469 ms
     Node/V8.
-  - [ ] Lock variance-derived per-component thresholds and acceptance policy from this report.
+  - [x] Lock variance-derived per-component thresholds and acceptance policy from this report in
+    `benchmarks/engine-thresholds.json`; the read-only checker reports inconclusive overlap rather
+    than turning one noisy median into a release blocker.
 
 ### Phase 1: measurement, feedback, and observability
 

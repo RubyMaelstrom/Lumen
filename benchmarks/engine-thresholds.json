@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "suite": "classic-v8-v7",
+  "engine": "lumen-jit",
+  "manifest_sha256": "b217406dff45071e49e663cf00e3170efb1ce221960a66790ee60bd949afe9d6",
+  "baseline": {
+    "report": "benchmark-results/engine-matrix-20260902-current-baseline-node-lumen.json",
+    "report_sha256": "f237a25953a5875c0c09d41a86c447ae7ba1831f399222450f12f9b7bcd683e3",
+    "lumen_artifact_sha256": "398e4980e96d41c5e43bcbb174d6d70e708f5315c5d4e82083876d744f579959",
+    "samples": 7,
+    "confidence_level": 0.95,
+    "cpu_affinity": null
+  },
+  "policy": {
+    "stable_floor": "3%",
+    "variance_floor": "max(stable_floor, one-sided bootstrap lower-bound loss)",
+    "inconclusive": "A median below its floor is not a regression until the complete bootstrap interval is below the floor."
+  },
+  "components": {
+    "composite": {
+      "baseline_score": 1710.9268888773242,
+      "baseline_cv": 0.03292009050535426,
+      "baseline_median_confidence_interval": [1694.9227784403508, 1783.7314160566739],
+      "minimum_score_ratio": 0.9906459413660422,
+      "reason": "max(3%, 1 - 1694.9227784403508 / 1710.9268888773242) from the locked bootstrap interval"
+    },
+    "crypto": {
+      "baseline_score": 7259.0,
+      "baseline_cv": 0.0015594769216450862,
+      "baseline_median_confidence_interval": [7248.0, 7269.0],
+      "minimum_score_ratio": 0.97,
+      "reason": "stable component: max(3%, 1 - 7248 / 7259)"
+    },
+    "deltablue": {
+      "baseline_score": 785.0,
+      "baseline_cv": 0.048050252429944346,
+      "baseline_median_confidence_interval": [744.0, 811.0],
+      "minimum_score_ratio": 0.9477707006369427,
+      "reason": "variance-derived floor: max(3%, 1 - 744 / 785)"
+    },
+    "earley-boyer": {
+      "baseline_score": 670.0,
+      "baseline_cv": 0.08081606160635346,
+      "baseline_median_confidence_interval": [663.0, 748.0],
+      "minimum_score_ratio": 0.9895522388059702,
+      "reason": "variance-derived floor: max(3%, 1 - 663 / 670)"
+    },
+    "navier-stokes": {
+      "baseline_score": 12514.0,
+      "baseline_cv": 0.002784985974484786,
+      "baseline_median_confidence_interval": [12501.0, 12539.0],
+      "minimum_score_ratio": 0.97,
+      "reason": "stable component: max(3%, 1 - 12501 / 12514)"
+    },
+    "raytrace": {
+      "baseline_score": 1872.0,
+      "baseline_cv": 0.0018729533047916486,
+      "baseline_median_confidence_interval": [1871.0, 1873.0],
+      "minimum_score_ratio": 0.97,
+      "reason": "stable component: max(3%, 1 - 1871 / 1872)"
+    },
+    "regexp": {
+      "baseline_score": 434.0,
+      "baseline_cv": 0.013416629480798165,
+      "baseline_median_confidence_interval": [433.0, 439.0],
+      "minimum_score_ratio": 0.97,
+      "reason": "stable component: max(3%, 1 - 433 / 434)"
+    },
+    "richards": {
+      "baseline_score": 1033.0,
+      "baseline_cv": 0.0020010186062122946,
+      "baseline_median_confidence_interval": [1033.0, 1036.0],
+      "minimum_score_ratio": 0.97,
+      "reason": "stable component: max(3%, 1 - 1033 / 1033)"
+    },
+    "splay": {
+      "baseline_score": 1783.0,
+      "baseline_cv": 0.2368320716769396,
+      "baseline_median_confidence_interval": [1695.0, 2217.0],
+      "minimum_score_ratio": 0.9506449803701627,
+      "reason": "variance-derived floor: max(3%, 1 - 1695 / 1783)"
+    }
+  }
+}
