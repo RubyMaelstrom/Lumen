@@ -185,6 +185,37 @@ impl LStr {
         s.and_ascii(x.is_ascii());
         s
     }
+
+    /// Repeat an ASCII string directly into one engine allocation.
+    ///
+    /// The caller has already performed the observable `String.prototype.repeat` coercions and
+    /// length check (ECMA-262 §22.1.3.18).  Keeping this representation-local avoids first
+    /// building a Rust `String` and then copying it into an `LStr`.  The doubling copy uses
+    /// `ptr::copy`, which is explicitly overlap-safe as each completed prefix becomes the source
+    /// for the next block.
+    pub(crate) fn repeat_ascii(&self, count: usize) -> LStr {
+        debug_assert!(self.ascii_hint());
+        let source_len = self.hdr().len.get() as usize;
+        let total = source_len
+            .checked_mul(count)
+            .expect("repeat length checked by caller");
+        let repeated = LStr::alloc("", u32::try_from(total).expect("string too large"));
+        if source_len == 0 || count == 0 {
+            return repeated;
+        }
+        unsafe {
+            let destination = repeated.p.as_ptr().cast::<u8>().add(HDR);
+            std::ptr::copy_nonoverlapping(self.data(), destination, source_len);
+            let mut filled = source_len;
+            while filled < total {
+                let copy_len = filled.min(total - filled);
+                std::ptr::copy(destination, destination.add(filled), copy_len);
+                filled += copy_len;
+            }
+            repeated.hdr().len.set(total as u32);
+        }
+        repeated
+    }
 }
 
 impl Clone for LStr {

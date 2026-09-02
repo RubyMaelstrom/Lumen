@@ -10327,6 +10327,13 @@ fn install_string(it: &mut Interp) {
         if s.len().saturating_mul(count) > MAX_STR_LEN {
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
+        // The observable coercion and implementation length guard above follow ECMA-262
+        // §22.1.3.18.  ASCII has a one-byte/one-code-unit representation, so repeat directly into
+        // the engine string and avoid the temporary Rust `String` plus conversion copy.  Strings
+        // carrying UTF-16 surrogate semantics retain the canonicalizing path below.
+        if s.ascii_hint() {
+            return Ok(Value::Str(s.repeat_ascii(count)));
+        }
         let out = s.repeat(count);
         Ok(Value::from_string(
             crate::jstr::canonicalize(&out).unwrap_or(out),

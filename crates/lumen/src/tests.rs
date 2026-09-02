@@ -839,6 +839,14 @@ fn memory_caps_convert_blowups_to_rangeerror() {
 }
 
 #[test]
+fn string_repeat_preserves_ascii_and_utf16_semantics() {
+    assert_eq!(run("'ab'.repeat(3)"), "ababab");
+    assert_eq!(run("'ab'.repeat(0)"), "");
+    assert_eq!(run("'😀'.repeat(2).length"), "4");
+    assert_eq!(run("'\\uD800'.repeat(2).length"), "2");
+}
+
+#[test]
 fn function_constructor() {
     assert_eq!(
         run("var f = new Function('a','b','return a+b'); f(2,3)"),
