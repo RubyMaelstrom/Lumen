@@ -10286,11 +10286,22 @@ fn install_string(it: &mut Interp) {
         let s = this_string(i, &this)?;
         // TrimString removes the ECMA-262 WhiteSpace + LineTerminator set
         // (ECMA-262 §22.1.3.32.1). For known ASCII strings that set is exactly
-        // Rust's ASCII trim set, so avoid Unicode scalar iteration.
+        // Rust's ASCII trim set, so avoid Unicode scalar iteration and preserve the original
+        // allocation when no code units are removed.
         if s.is_ascii() {
-            return Ok(Value::str(s.trim_ascii()));
+            let trimmed = s.trim_ascii();
+            return Ok(if trimmed.len() == s.len() {
+                Value::Str(s)
+            } else {
+                Value::str(trimmed)
+            });
         }
-        Ok(Value::from_string(s.trim_matches(is_js_ws).to_string()))
+        let trimmed = s.trim_matches(is_js_ws);
+        Ok(if trimmed.len() == s.len() {
+            Value::Str(s)
+        } else {
+            Value::Str(crate::lstr::LStr::from(trimmed))
+        })
     });
     it.def_method(&sp, "localeCompare", 1, |i, this, args| {
         // RequireObjectCoercible + ToString this, then delegate to Intl.Collator.
@@ -10461,18 +10472,36 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "trimStart", 0, |i, this, _| {
         let s = this_string(i, &this)?;
         if s.is_ascii() {
-            return Ok(Value::str(s.trim_ascii_start()));
+            let trimmed = s.trim_ascii_start();
+            return Ok(if trimmed.len() == s.len() {
+                Value::Str(s)
+            } else {
+                Value::str(trimmed)
+            });
         }
-        Ok(Value::from_string(
-            s.trim_start_matches(is_js_ws).to_string(),
-        ))
+        let trimmed = s.trim_start_matches(is_js_ws);
+        Ok(if trimmed.len() == s.len() {
+            Value::Str(s)
+        } else {
+            Value::Str(crate::lstr::LStr::from(trimmed))
+        })
     });
     it.def_method(&sp, "trimEnd", 0, |i, this, _| {
         let s = this_string(i, &this)?;
         if s.is_ascii() {
-            return Ok(Value::str(s.trim_ascii_end()));
+            let trimmed = s.trim_ascii_end();
+            return Ok(if trimmed.len() == s.len() {
+                Value::Str(s)
+            } else {
+                Value::str(trimmed)
+            });
         }
-        Ok(Value::from_string(s.trim_end_matches(is_js_ws).to_string()))
+        let trimmed = s.trim_end_matches(is_js_ws);
+        Ok(if trimmed.len() == s.len() {
+            Value::Str(s)
+        } else {
+            Value::Str(crate::lstr::LStr::from(trimmed))
+        })
     });
     // Annex B aliases: trimLeft/trimRight ARE trimStart/trimEnd (same function objects).
     for (alias, target) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
@@ -10817,19 +10846,22 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
 }
 
 fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Result<Value, Value> {
-    let s = this_string(i, &this)?.to_string();
+    let s = this_string(i, &this)?;
     let target = ab(i.to_number(&arg(args, 0)))? as usize;
     let cur = crate::jstr::unit_len(&s);
     if cur >= target {
-        return Ok(Value::from_string(s));
+        // ECMA-262 §22.1.3.17.1 returns the already-coerced string before it reads or coerces
+        // fillString. Keep that string allocation instead of copying it into a Rust String.
+        return Ok(Value::Str(s));
     }
     let pad = match arg(args, 1) {
         Value::Undefined => " ".to_string(),
         v => ab(i.to_string(&v))?.to_string(),
     };
     if pad.is_empty() {
-        return Ok(Value::from_string(s));
+        return Ok(Value::Str(s));
     }
+    let s = s.as_str();
     let need = target - cur;
     if s.is_ascii() && pad.is_ascii() {
         // StringPad repeats and truncates by UTF-16 code units (ECMA-262

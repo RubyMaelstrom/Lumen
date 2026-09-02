@@ -908,6 +908,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     changed ASCII strings directly into an `LStr`; a mixed 150,000-call release workload improved
     from 0.150698 s median to 0.144595 s median (about 4%, with normal run-to-run noise), while
     Unicode Default Case Conversion remains the fallback for one-to-many/context-sensitive cases.
+  - [x] `trim`, `trimStart`, `trimEnd`, and the no-op/empty-filler `padStart`/`padEnd` paths retain
+    the already-coerced `LStr` and avoid the temporary Rust `String`; an 11-sample release workload
+    improved from 0.363541 s median to 0.338775 s median (about 7%).
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.
