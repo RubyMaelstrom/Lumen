@@ -29,6 +29,12 @@ pub(crate) struct HeapStats {
     pub(crate) freed_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NurseryCollection {
+    pub(crate) promoted: usize,
+    pub(crate) reclaimed: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LayoutId(u32);
 
@@ -451,6 +457,42 @@ impl CentralHeap {
         Ok(marked)
     }
 
+    /// Evacuate the reachable young closure into the old generation. This is a deterministic
+    /// fixture for the eventual nursery; it moves only the tagged-field family and leaves weak,
+    /// external, and unsupported object families to their future policies.
+    pub(crate) fn collect_nursery(
+        &mut self,
+        roots: &RootSet,
+    ) -> Result<NurseryCollection, HeapError> {
+        self.mark_roots(roots)?;
+        let young = self
+            .live_handles()
+            .into_iter()
+            .filter(|reference| {
+                self.header(*reference)
+                    .is_ok_and(|header| header.generation == HeapGeneration::Young && header.marked)
+            })
+            .collect::<Vec<_>>();
+        let mut promoted = 0;
+        for source in young {
+            if self.header(source).is_err() {
+                continue;
+            }
+            let target = self.relocate(source)?;
+            roots.rewrite_heap_reference(source, target);
+            self.rewrite_tagged_references(source, target);
+            self.promote(target, HeapGeneration::Old)?;
+            self.reclaim_forwarded(source)?;
+            promoted += 1;
+        }
+        self.remembered = self.recompute_remembered_set()?;
+        let reclaimed = self.sweep_unmarked_young();
+        Ok(NurseryCollection {
+            promoted,
+            reclaimed,
+        })
+    }
+
     pub(crate) fn promote(
         &mut self,
         reference: HeapRef,
@@ -519,10 +561,10 @@ impl CentralHeap {
         Ok(())
     }
 
-    /// Deterministically reclaim unmarked, non-forwarded slots. Mark bits are cleared for the
-    /// survivors so the next collection starts from a clean white set. Forwarded sources remain
-    /// until their explicit relocation handshake calls `reclaim_forwarded`.
-    pub(crate) fn sweep_unmarked(&mut self) -> usize {
+    fn sweep_matching<F>(&mut self, should_reclaim: F) -> usize
+    where
+        F: Fn(&HeapObject) -> bool,
+    {
         let mut reclaimed = 0;
         let mut released_bytes: usize = 0;
         let mut scanned_objects = 0;
@@ -533,9 +575,7 @@ impl CentralHeap {
                 scanned_objects += 1;
                 scanned_bytes = scanned_bytes.saturating_add(object.storage.requested_bytes());
             }
-            let remove = slot
-                .as_ref()
-                .is_some_and(|object| !object.header.marked && object.header.forwarding.is_none());
+            let remove = slot.as_ref().is_some_and(&should_reclaim);
             if remove {
                 if let Some(object) = slot.take() {
                     released_bytes =
@@ -570,6 +610,21 @@ impl CentralHeap {
             .filter(|reference| self.object(*reference).is_ok())
             .collect();
         reclaimed
+    }
+
+    /// Deterministically reclaim unmarked, non-forwarded slots. Mark bits are cleared for the
+    /// survivors so the next collection starts from a clean white set. Forwarded sources remain
+    /// until their explicit relocation handshake calls `reclaim_forwarded`.
+    pub(crate) fn sweep_unmarked(&mut self) -> usize {
+        self.sweep_matching(|object| !object.header.marked && object.header.forwarding.is_none())
+    }
+
+    fn sweep_unmarked_young(&mut self) -> usize {
+        self.sweep_matching(|object| {
+            object.header.generation == HeapGeneration::Young
+                && !object.header.marked
+                && object.header.forwarding.is_none()
+        })
     }
 
     pub(crate) fn live_handles(&self) -> Vec<HeapRef> {
@@ -922,6 +977,58 @@ mod tests {
         heap.promote(old, HeapGeneration::Young).unwrap();
         assert!(heap.remembered_handles().is_empty());
         assert_eq!(heap.verify_remembered_set(), Ok(()));
+    }
+
+    #[test]
+    fn nursery_collection_promotes_reachable_closure_and_reclaims_garbage() {
+        let mut heap = CentralHeap::new();
+        let child = heap
+            .allocate_tagged_fields(
+                LayoutId::new(40),
+                vec![TaggedValue::null()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        let parent = heap
+            .allocate_tagged_fields(
+                LayoutId::new(41),
+                vec![TaggedValue::heap(child)],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        let garbage = heap
+            .allocate(LayoutId::new(42), 5, HeapGeneration::Young)
+            .unwrap();
+        let roots = RootSet::new();
+        let root = roots.root(TaggedValue::heap(parent)).unwrap();
+
+        let result = heap.collect_nursery(&roots).unwrap();
+        assert_eq!(
+            result,
+            NurseryCollection {
+                promoted: 2,
+                reclaimed: 1
+            }
+        );
+        let moved_parent = root.value().and_then(TaggedValue::as_heap).unwrap();
+        assert_ne!(moved_parent, parent);
+        assert_eq!(heap.header(parent), Err(HeapError::InvalidReference));
+        assert_eq!(heap.header(child), Err(HeapError::InvalidReference));
+        assert_eq!(heap.payload(garbage), Err(HeapError::InvalidReference));
+        assert_eq!(
+            heap.header(moved_parent).unwrap().generation,
+            HeapGeneration::Old
+        );
+        let moved_child = heap.tagged_fields(moved_parent).unwrap()[0]
+            .as_heap()
+            .unwrap();
+        assert_eq!(
+            heap.header(moved_child).unwrap().generation,
+            HeapGeneration::Old
+        );
+        assert!(heap.remembered_handles().is_empty());
+        assert_eq!(heap.verify_remembered_set(), Ok(()));
+        assert_eq!(heap.requested_bytes(), 16);
     }
 
     #[test]

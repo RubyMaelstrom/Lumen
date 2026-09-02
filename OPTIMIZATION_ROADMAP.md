@@ -679,6 +679,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [ ] Add heap verification to the live collector, independently walking object layouts and
   validating all tagged pointers after collection (the central-heap verifier scaffold is above).
 - [ ] Add a copying nursery for eligible newly allocated objects.
+  - [x] The central tagged-field fixture now marks roots, evacuates reachable young objects with
+    forwarding/root/field rewrites, promotes them, and sweeps unreachable young slots. Live Agent
+    integration and family-by-family eligibility remain pending.
 - [ ] Add old-to-young write barriers, remembered sets, and verification that recomputes the set
   independently in stress builds.
   - [x] The central tagged-field fixture records barriered old-to-young stores and independently
