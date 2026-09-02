@@ -1072,6 +1072,9 @@ before changing broad execution behavior:
   - [x] Add the allocation-free, immediate-only `TaggedNumericFrame` and route bytecode numeric
     operators through it behind `LUMEN_TAGGED_ARITHMETIC=1`; non-Number values deopt to the complete
     ECMA-262 helper path. IEEE-754 edge and full-suite differential tests pass with the switch on.
+    Two paired release bytecode Navier-Stokes samples measured 442/438 without the switch and
+    426/429 with it; the roughly 3% cost is recorded as a migration gap, so the switch remains
+    disabled by default.
   - [ ] Connect a migrated frame to published root maps and a forced safepoint/relocation test;
     keep the switch opt-in until that proof exists.
 - [x] Write and review the Phase 3A heap safety/migration design, including every root family,
