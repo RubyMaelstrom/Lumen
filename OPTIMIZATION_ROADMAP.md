@@ -137,6 +137,8 @@ not comparable because instrumentation is expensive; execution counts are the us
   other JS-heavy pages are required semantic workloads. Network availability, bot defenses, and
   changing content make them unsuitable as the only regression oracle, so repeatable local replay
   workloads are also required.
+- Ars Technica is intentionally excluded from future live-site rotation after the origin
+  rate-limited this test client; use other JS-heavy origins instead.
 
 ### Current Phase 0 evidence
 
