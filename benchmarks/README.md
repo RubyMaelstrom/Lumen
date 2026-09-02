@@ -46,6 +46,20 @@ helper:
 scripts/summarize-engine-report.py benchmark-results/engine-matrix-<timestamp>.json
 ```
 
+The accepted Phase 0 policy is checked separately, after a complete report has been retained:
+
+```sh
+scripts/check-engine-regression.py \
+  benchmark-results/engine-matrix-<timestamp>.json \
+  benchmarks/engine-thresholds.json
+```
+
+The policy is tied to the manifest hash and the Lumen engine id. A component is reported as
+`regressed` only when its complete bootstrap interval falls below its locked score floor; a point
+estimate below the floor with an overlapping interval is `inconclusive` and needs another
+interleaved run. A release-blocking standards or real-site failure remains a failure regardless of
+the performance result.
+
 ## Deterministic browser replays
 
 The sibling TRust checkout provides a no-window, no-TUI replay binary that runs self-contained HTML
