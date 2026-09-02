@@ -621,8 +621,11 @@ finish the baseline, but no later phase may claim a performance win against the 
 - [ ] Add scoped rooted handles for Rust builtins and embedders.
   - [x] Add the isolated `RootSet`/RAII tagged-handle scaffold and validation tests; Agent/heap
     integration remains pending until relocation exists.
-- [ ] Add a `NoGc`/no-safepoint discipline for short raw-pointer regions and make violations
-  auditable.
+- [x] Add an isolated non-nestable `NoGcState`/lexical-scope contract with explicit safepoint
+  checks and tests; the central-heap nucleus exposes the same guard. Runtime tier/collector
+  integration remains pending until migrated frames exist.
+- [ ] Integrate the `NoGc`/no-safepoint discipline into all short raw-pointer regions and make
+  violations auditable.
 - [ ] Migrate bytecode operands and local frames to the canonical tagged representation.
 - [ ] Migrate native helper arguments/results without repeatedly widening whole frames.
 - [ ] Retire runtime probing of `RcBox`, `Vec`, and `RefCell` layout from generated code.

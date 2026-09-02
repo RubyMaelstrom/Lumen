@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use crate::tagged::{HeapRef, TaggedValue};
+use crate::tagged::{HeapRef, NoGcError, NoGcScope, NoGcState, TaggedValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapGeneration {
@@ -76,6 +76,7 @@ pub(crate) enum HeapError {
 pub(crate) struct CentralHeap {
     objects: Vec<Option<HeapObject>>,
     requested_bytes: usize,
+    no_gc: NoGcState,
 }
 
 impl Default for CentralHeap {
@@ -89,7 +90,18 @@ impl CentralHeap {
         Self {
             objects: vec![None],
             requested_bytes: 0,
+            no_gc: NoGcState::default(),
         }
+    }
+
+    /// Enter a short raw-pointer region. The returned guard borrows this heap, so mutable
+    /// allocation, relocation, and reclamation cannot be called while the region is live.
+    pub(crate) fn enter_no_gc(&self) -> Result<NoGcScope<'_>, NoGcError> {
+        self.no_gc.enter()
+    }
+
+    pub(crate) fn require_safepoint(&self) -> Result<(), NoGcError> {
+        self.no_gc.require_safepoint()
     }
 
     pub(crate) fn allocate(
@@ -424,6 +436,17 @@ mod tests {
         assert_eq!(heap.payload(reference).unwrap()[4], 0xa5);
         heap.mark(reference).unwrap();
         assert!(heap.header(reference).unwrap().marked);
+    }
+
+    #[test]
+    fn no_gc_guard_is_owned_by_the_heap_and_blocks_nested_safepoints() {
+        let heap = CentralHeap::new();
+        let guard = heap.enter_no_gc().unwrap();
+        guard.assert_active();
+        assert_eq!(heap.require_safepoint(), Err(NoGcError::SafepointForbidden));
+        assert!(matches!(heap.enter_no_gc(), Err(NoGcError::AlreadyActive)));
+        drop(guard);
+        assert_eq!(heap.require_safepoint(), Ok(()));
     }
 
     #[test]

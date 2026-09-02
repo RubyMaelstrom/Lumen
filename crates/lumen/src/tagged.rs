@@ -7,7 +7,8 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
@@ -389,6 +390,72 @@ pub(crate) struct RootedTagged {
     index: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NoGcError {
+    AlreadyActive,
+    SafepointForbidden,
+}
+
+/// Agent-local state for short raw-pointer regions. The scope is deliberately non-nestable:
+/// requiring one lexical owner makes entry/exit ordering auditable and avoids a counter that could
+/// be corrupted by dropping nested guards out of order.
+#[derive(Default)]
+pub(crate) struct NoGcState {
+    active: Cell<bool>,
+}
+
+/// A lexical proof that the owning Agent is in a short no-safepoint region. The lifetime borrows
+/// the owner, while the marker keeps the guard thread-local even if the owner is later changed to
+/// use a synchronizable representation.
+pub(crate) struct NoGcScope<'a> {
+    state: &'a NoGcState,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl NoGcState {
+    pub(crate) fn enter(&self) -> Result<NoGcScope<'_>, NoGcError> {
+        if self.active.replace(true) {
+            return Err(NoGcError::AlreadyActive);
+        }
+        Ok(NoGcScope {
+            state: self,
+            _not_send: PhantomData,
+        })
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.get()
+    }
+
+    /// A collector, allocation slow path, host call, interrupt poll, or suspension must check
+    /// this boundary before becoming a safepoint. Raw-pointer code cannot silently cross it.
+    pub(crate) fn require_safepoint(&self) -> Result<(), NoGcError> {
+        if self.is_active() {
+            Err(NoGcError::SafepointForbidden)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl NoGcScope<'_> {
+    pub(crate) fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
+
+    /// Debug-only assertion for operations whose signatures already require a `NoGcScope`.
+    pub(crate) fn assert_active(&self) {
+        debug_assert!(self.is_active());
+    }
+}
+
+impl Drop for NoGcScope<'_> {
+    fn drop(&mut self) {
+        debug_assert!(self.state.is_active());
+        self.state.active.set(false);
+    }
+}
+
 impl RootSet {
     pub(crate) fn new() -> Self {
         Self {
@@ -654,6 +721,25 @@ mod tests {
         assert_eq!(roots.active_len(), 2);
         assert_eq!(second.value(), Some(TaggedValue::number(3.0)));
         assert_eq!(third.value(), Some(TaggedValue::undefined()));
+    }
+
+    #[test]
+    fn no_gc_scope_is_lexical_non_nestable_and_blocks_safepoints() {
+        let state = NoGcState::default();
+        assert!(!state.is_active());
+        assert_eq!(state.require_safepoint(), Ok(()));
+        {
+            let scope = state.enter().unwrap();
+            assert!(scope.is_active());
+            scope.assert_active();
+            assert_eq!(
+                state.require_safepoint(),
+                Err(NoGcError::SafepointForbidden)
+            );
+            assert!(matches!(state.enter(), Err(NoGcError::AlreadyActive)));
+        }
+        assert!(!state.is_active());
+        assert_eq!(state.require_safepoint(), Ok(()));
     }
 
     #[test]
