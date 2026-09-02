@@ -10788,6 +10788,9 @@ fn string_search_position_and_regexp() {
 #[test]
 fn string_trim_feff() {
     // U+FEFF (ZWNBSP) is whitespace for trim and ToNumber.
+    assert_eq!(run("'\\t hello \\n\\r'.trim()"), "hello");
+    assert_eq!(run("'\\n hello'.trimStart()"), "hello");
+    assert_eq!(run("'hello\\r'.trimEnd()"), "hello");
     assert_eq!(run("'\\uFEFF abc \\uFEFF'.trim()"), "abc");
     assert_eq!(run("'\\uFEFF5'.trimStart()"), "5");
     assert_eq!(run("Number('\\uFEFF42')"), "42");

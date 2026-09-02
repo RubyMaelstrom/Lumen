@@ -10255,9 +10255,14 @@ fn install_string(it: &mut Interp) {
         Ok(Value::from_string(fixed))
     });
     it.def_method(&sp, "trim", 0, |i, this, _| {
-        Ok(Value::from_string(
-            this_string(i, &this)?.trim_matches(is_js_ws).to_string(),
-        ))
+        let s = this_string(i, &this)?;
+        // TrimString removes the ECMA-262 WhiteSpace + LineTerminator set
+        // (ECMA-262 §22.1.3.32.1). For known ASCII strings that set is exactly
+        // Rust's ASCII trim set, so avoid Unicode scalar iteration.
+        if s.is_ascii() {
+            return Ok(Value::str(s.trim_ascii()));
+        }
+        Ok(Value::from_string(s.trim_matches(is_js_ws).to_string()))
     });
     it.def_method(&sp, "localeCompare", 1, |i, this, args| {
         // RequireObjectCoercible + ToString this, then delegate to Intl.Collator.
@@ -10355,18 +10360,20 @@ fn install_string(it: &mut Interp) {
         })
     });
     it.def_method(&sp, "trimStart", 0, |i, this, _| {
+        let s = this_string(i, &this)?;
+        if s.is_ascii() {
+            return Ok(Value::str(s.trim_ascii_start()));
+        }
         Ok(Value::from_string(
-            this_string(i, &this)?
-                .trim_start_matches(is_js_ws)
-                .to_string(),
+            s.trim_start_matches(is_js_ws).to_string(),
         ))
     });
     it.def_method(&sp, "trimEnd", 0, |i, this, _| {
-        Ok(Value::from_string(
-            this_string(i, &this)?
-                .trim_end_matches(is_js_ws)
-                .to_string(),
-        ))
+        let s = this_string(i, &this)?;
+        if s.is_ascii() {
+            return Ok(Value::str(s.trim_ascii_end()));
+        }
+        Ok(Value::from_string(s.trim_end_matches(is_js_ws).to_string()))
     });
     // Annex B aliases: trimLeft/trimRight ARE trimStart/trimEnd (same function objects).
     for (alias, target) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
