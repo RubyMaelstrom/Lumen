@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use crate::tagged::{HeapRef, NoGcError, NoGcScope, NoGcState, TaggedValue};
+use crate::tagged::{HeapRef, NoGcError, NoGcScope, NoGcState, RootSet, TaggedValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapGeneration {
@@ -239,6 +239,37 @@ impl CentralHeap {
     pub(crate) fn mark(&mut self, reference: HeapRef) -> Result<(), HeapError> {
         self.object_mut(reference)?.header.marked = true;
         Ok(())
+    }
+
+    /// Mark the transitive strong closure of tagged roots. The fixture heap has no weak or
+    /// external families yet, so every tagged child is a strong edge; those families must add
+    /// their own tracing policy before they are admitted to this walk.
+    pub(crate) fn mark_roots(&mut self, roots: &RootSet) -> Result<usize, HeapError> {
+        self.validate_all()?;
+        let mut pending = roots
+            .snapshot()
+            .map_err(|_| HeapError::InvalidTaggedField)?
+            .into_iter()
+            .filter_map(TaggedValue::as_heap)
+            .collect::<Vec<_>>();
+        let mut marked = 0;
+        while let Some(reference) = pending.pop() {
+            let children = match &self.object(reference)?.storage {
+                HeapStorage::Bytes(_) => Vec::new(),
+                HeapStorage::Tagged(fields) => fields
+                    .iter()
+                    .filter_map(|field| field.as_heap())
+                    .collect::<Vec<_>>(),
+            };
+            let object = self.object_mut(reference)?;
+            if object.header.marked {
+                continue;
+            }
+            object.header.marked = true;
+            marked += 1;
+            pending.extend(children);
+        }
+        Ok(marked)
     }
 
     pub(crate) fn promote(
@@ -556,6 +587,37 @@ mod tests {
         assert_eq!(heap.live_handles(), vec![keep]);
         assert_eq!(heap.payload(discard), Err(HeapError::InvalidReference));
         assert!(!heap.header(keep).unwrap().marked);
+        assert_eq!(heap.validate_all(), Ok(()));
+    }
+
+    #[test]
+    fn root_mark_walk_reaches_tagged_children_before_sweeping() {
+        let mut heap = CentralHeap::new();
+        let child = heap
+            .allocate_tagged_fields(
+                LayoutId::new(20),
+                vec![TaggedValue::null()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        let parent = heap
+            .allocate_tagged_fields(
+                LayoutId::new(21),
+                vec![TaggedValue::heap(child)],
+                HeapGeneration::Old,
+            )
+            .unwrap();
+        let unreachable = heap
+            .allocate(LayoutId::new(22), 5, HeapGeneration::Young)
+            .unwrap();
+        let roots = RootSet::new();
+        let _root = roots.root(TaggedValue::heap(parent)).unwrap();
+
+        assert_eq!(heap.mark_roots(&roots), Ok(2));
+        assert!(heap.header(parent).unwrap().marked);
+        assert!(heap.header(child).unwrap().marked);
+        assert_eq!(heap.sweep_unmarked(), 1);
+        assert_eq!(heap.payload(unreachable), Err(HeapError::InvalidReference));
         assert_eq!(heap.validate_all(), Ok(()));
     }
 

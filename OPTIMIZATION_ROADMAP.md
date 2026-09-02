@@ -657,6 +657,8 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [x] Add independent central-heap validation, generation promotion, and deterministic sweep
   scaffolding with size, forwarding-edge, tagged-child, mark, and requested-byte checks. Wiring
   this verifier to the live collector remains pending the root-family migration.
+- [x] Add a checked root-to-tagged-field mark walk for the fixture family and verify that only its
+  transitive strong closure survives sweeping; weak/external families remain intentionally absent.
 - [x] Wire the checked handle table to real `Object` allocations behind the opt-in
   `heap-bridge` feature and verify handle release on `Rc` destruction. The existing `Value` graph
   remains authoritative; this bridge is not enabled in production until object fields and roots
