@@ -544,6 +544,10 @@ finish the baseline, but no later phase may claim a performance win against the 
     retained size once the central heap/root API exists; do not infer lifetime from site samples.
     - [x] The central tagged-field fixture records allocation-site tokens, object kind/size,
       generation age, and promotion transitions in its checked headers.
+    - [x] The central fixture now aggregates exact per-site logical requested bytes, live payload
+      bytes, live allocation count, reclaimed count, promotion count, and maximum observed age;
+      relocation copies are tracked only as transient live payload and never double-counted as
+      logical allocations.
 - [ ] Record GC cause, generation, pause time, concurrent work, bytes scanned/copied/freed, and
   live-set size.
   - [x] Classify existing stop-the-world collections by allocation-threshold, host task-boundary,
@@ -632,10 +636,14 @@ finish the baseline, but no later phase may claim a performance win against the 
   integration remains pending until migrated frames exist.
 - [ ] Integrate the `NoGc`/no-safepoint discipline into all short raw-pointer regions and make
   violations auditable.
+  - [x] The central nursery fixture rejects collection while a no-safepoint guard is active and
+    publishes tagged shadow-frame roots through the same root set used by the collector.
 - [ ] Migrate bytecode operands and local frames to the canonical tagged representation.
 - [ ] Migrate native helper arguments/results without repeatedly widening whole frames.
 - [ ] Retire runtime probing of `RcBox`, `Vec`, and `RefCell` layout from generated code.
 - [ ] Add forced-safepoint, forced-relocation, root-poisoning, and frame-walk stress modes.
+  - [x] The central fixture covers forced safepoints, relocation forwarding, poisoned dead frame
+    slots, exact root-map walks, invalid-map rejection, and post-collection heap validation.
 - [ ] Differentially test every migrated opcode on interpreter, bytecode, and native tiers.
 
 ### Phase 3: central heap and generational collection
