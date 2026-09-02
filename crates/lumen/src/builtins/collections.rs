@@ -66,6 +66,83 @@ fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
         .map(|(key, _)| key.clone())
         .collect())
 }
+
+/// Find a SameValueZero match in a temporary result using the same hash partitioning as Map/Set.
+/// Set operations can otherwise devolve to an O(n²) scan when a set-like iterator yields many
+/// values. Hash collisions still go through the full equality check.
+fn result_index_find(
+    values: &[Value],
+    index: &crate::fasthash::FastMap<u64, Vec<usize>>,
+    key: &Value,
+) -> Option<usize> {
+    let hash = collection_key_hash(key);
+    index.get(&hash)?.iter().copied().find(|&offset| {
+        values
+            .get(offset)
+            .is_some_and(|candidate| same_value_zero(candidate, key))
+    })
+}
+
+fn result_index_insert(
+    values: &mut Vec<Value>,
+    index: &mut crate::fasthash::FastMap<u64, Vec<usize>>,
+    value: Value,
+) -> bool {
+    if result_index_find(values, index, &value).is_some() {
+        return false;
+    }
+    let offset = values.len();
+    let hash = collection_key_hash(&value);
+    values.push(value);
+    index.entry(hash).or_default().push(offset);
+    true
+}
+
+fn option_result_index_find(
+    values: &[Option<Value>],
+    index: &crate::fasthash::FastMap<u64, Vec<usize>>,
+    key: &Value,
+) -> Option<usize> {
+    let hash = collection_key_hash(key);
+    index.get(&hash)?.iter().copied().find(|&offset| {
+        values
+            .get(offset)
+            .and_then(Option::as_ref)
+            .is_some_and(|candidate| same_value_zero(candidate, key))
+    })
+}
+
+fn option_result_index_insert(
+    values: &mut Vec<Option<Value>>,
+    index: &mut crate::fasthash::FastMap<u64, Vec<usize>>,
+    value: Value,
+) -> bool {
+    if option_result_index_find(values, index, &value).is_some() {
+        return false;
+    }
+    let offset = values.len();
+    let hash = collection_key_hash(&value);
+    values.push(Some(value));
+    index.entry(hash).or_default().push(offset);
+    true
+}
+
+fn option_result_index_remove(
+    index: &mut crate::fasthash::FastMap<u64, Vec<usize>>,
+    key: &Value,
+    offset: usize,
+) {
+    let hash = collection_key_hash(key);
+    let mut empty = false;
+    if let Some(bucket) = index.get_mut(&hash) {
+        bucket.retain(|&candidate| candidate != offset);
+        empty = bucket.is_empty();
+    }
+    if empty {
+        index.remove(&hash);
+    }
+}
+
 /// Build a fresh Set from `values` (deduped via SameValueZero).
 fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
     let obj =
@@ -188,10 +265,15 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         // those getters make to the receiver are visible in the result.
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
         let mut vals = set_values(i, &this)?;
+        let mut result_index = crate::fasthash::FastMap::default();
+        for (offset, value) in vals.iter().enumerate() {
+            result_index
+                .entry(collection_key_hash(value))
+                .or_insert_with(Vec::new)
+                .push(offset);
+        }
         while let Some(k) = set_like_next(i, &iter, &next)? {
-            if !vals.iter().any(|v| same_value_zero(v, &k)) {
-                vals.push(k);
-            }
+            result_index_insert(&mut vals, &mut result_index, k);
         }
         Ok(new_set(i, vals))
     });
@@ -199,6 +281,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
         let mut out = Vec::new();
+        let mut result_index = crate::fasthash::FastMap::default();
         if (coll_live_len(i, ptr) as f64) <= other_size {
             // Walk this Set LIVE by index, probing the other's `has` — the callback may delete
             // and re-append entries, and the walk observes that (appended entries are visited).
@@ -213,18 +296,16 @@ pub(super) fn install_set_methods(it: &mut Interp) {
                 if is_tombstone(i, &k) {
                     continue;
                 }
-                if set_like_has(i, &has, &arg(a, 0), &k)?
-                    && !out.iter().any(|o| same_value_zero(o, &k))
-                {
-                    out.push(k);
+                if set_like_has(i, &has, &arg(a, 0), &k)? {
+                    result_index_insert(&mut out, &mut result_index, k);
                 }
             }
         } else {
             // Iterate the other's keys, probing this Set's LIVE data (no `has` calls on the other).
             let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
             while let Some(k) = set_like_next(i, &iter, &next)? {
-                if set_data_has(i, ptr, &k) && !out.iter().any(|o| same_value_zero(o, &k)) {
-                    out.push(k);
+                if set_data_has(i, ptr, &k) {
+                    result_index_insert(&mut out, &mut result_index, k);
                 }
             }
         }
@@ -260,18 +341,24 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         // the result (only in other). Removal empties the slot (order is preserved).
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
         let mut result: Vec<Option<Value>> = set_values(i, &this)?.into_iter().map(Some).collect();
+        let mut result_index = crate::fasthash::FastMap::default();
+        for (offset, value) in result.iter().enumerate() {
+            if let Some(value) = value {
+                result_index
+                    .entry(collection_key_hash(value))
+                    .or_insert_with(Vec::new)
+                    .push(offset);
+            }
+        }
         while let Some(k) = set_like_next(i, &iter, &next)? {
-            let in_result = result.iter().flatten().any(|v| same_value_zero(v, &k));
+            let result_offset = option_result_index_find(&result, &result_index, &k);
             if set_data_has(i, ptr, &k) {
-                if in_result {
-                    for slot in result.iter_mut() {
-                        if matches!(&slot, Some(v) if same_value_zero(v, &k)) {
-                            *slot = None;
-                        }
-                    }
+                if let Some(offset) = result_offset {
+                    result[offset] = None;
+                    option_result_index_remove(&mut result_index, &k, offset);
                 }
-            } else if !in_result {
-                result.push(Some(k));
+            } else if result_offset.is_none() {
+                option_result_index_insert(&mut result, &mut result_index, k);
             }
         }
         let out: Vec<Value> = result.into_iter().flatten().collect();
