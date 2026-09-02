@@ -5436,10 +5436,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         let ov = Value::Obj(o.clone());
         for k in from..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
+            let key = k.to_string();
+            if !ab(i.js_has_property(&ov, &key))? {
                 continue; // indexOf skips holes
             }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
             if i.strict_equals(&v, &target) {
                 return Ok(Value::Num(k as f64));
             }
@@ -5472,7 +5473,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         let ov = Value::Obj(o.clone());
         while k < len {
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let v = array_get_index(i, &o, &ov, k as usize)?;
             if same_value_zero(&v, &target) {
                 return Ok(Value::Bool(true));
             }
@@ -5490,7 +5491,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         let mut parts = Vec::with_capacity(len);
         for k in 0..len {
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let v = array_get_index(i, &o, &ov, k)?;
             parts.push(match v {
                 Value::Undefined | Value::Null => String::new(),
                 other => ab(i.to_string(&other))?.to_string(),
@@ -5562,10 +5563,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let cb_this = arg(args, 1);
         let ov = Value::Obj(o.clone());
         for k in 0..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
+            let key = k.to_string();
+            if !ab(i.js_has_property(&ov, &key))? {
                 continue; // skip array holes
             }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
             ab(i.call(
                 cb.clone(),
                 cb_this.clone(),
@@ -5585,10 +5587,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let ov = Value::Obj(o.clone());
         let result = array_species_create(i, &this, len)?;
         for k in 0..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
+            let key = k.to_string();
+            if !ab(i.js_has_property(&ov, &key))? {
                 continue; // holes stay holes in the result
             }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
             let mapped = ab(i.call(
                 cb.clone(),
                 cb_this.clone(),
@@ -5613,10 +5616,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let result = array_species_create(i, &this, 0)?;
         let mut to = 0usize;
         for k in 0..len {
-            if !ab(i.js_has_property(&ov, &k.to_string()))? {
+            let key = k.to_string();
+            if !ab(i.js_has_property(&ov, &key))? {
                 continue;
             }
-            let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
             let keep = ab(i.call(
                 cb.clone(),
                 cb_this.clone(),
@@ -5652,8 +5656,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         i.make_error("TypeError", "Reduce of empty array with no initial value")
                     );
                 }
-                if ab(i.js_has_property(&ov, &k.to_string()))? {
-                    acc = ab(i.get_member(&ov, &k.to_string()))?;
+                let key = k.to_string();
+                if ab(i.js_has_property(&ov, &key))? {
+                    acc = array_get_index_after_has(i, &o, &ov, k, &key)?;
                     k += 1;
                     break;
                 }
@@ -5661,8 +5666,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         }
         while k < len {
-            if ab(i.js_has_property(&ov, &k.to_string()))? {
-                let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let key = k.to_string();
+            if ab(i.js_has_property(&ov, &key))? {
+                let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
                 acc = ab(i.call(
                     cb.clone(),
                     Value::Undefined,
@@ -5743,7 +5749,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             if k > 0 {
                 out.push(',');
             }
-            let el = ab(i.get_member(&ov, &k.to_string()))?;
+            let el = array_get_index(i, &o, &ov, k)?;
             if !matches!(el, Value::Undefined | Value::Null) {
                 // ToString(? Invoke(element, "toLocaleString", « locales, options »)).
                 let tls = ab(i.get_member(&el, "toLocaleString"))?;
@@ -5766,7 +5772,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         if idx < 0 || idx >= len {
             return Ok(Value::Undefined);
         }
-        ab(i.get_member(&Value::Obj(o.clone()), &idx.to_string()))
+        let ov = Value::Obj(o.clone());
+        array_get_index(i, &o, &ov, idx as usize)
     });
     it.def_method(&ap, "find", 1, |i, this, args| {
         array_find(i, this, args, true, false)
@@ -5862,8 +5869,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         let ov = Value::Obj(o.clone());
         while k >= 0 {
-            if ab(i.js_has_property(&ov, &k.to_string()))? {
-                let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let key = k.to_string();
+            if ab(i.js_has_property(&ov, &key))? {
+                let v = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
                 if i.strict_equals(&v, &target) {
                     return Ok(Value::Num(k as f64));
                 }
@@ -5920,17 +5928,18 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             ));
         }
         let o = arr_to_object(i, &this)?;
+        let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
         // SortIndexedProperties: read only the present indices (holes are skipped, not read).
         let mut items = Vec::new();
         for k in 0..len {
-            if ab(i.js_has_property(&this, &k.to_string()))? {
-                items.push(ab(i.get_member(&this, &k.to_string()))?);
+            let key = k.to_string();
+            if ab(i.js_has_property(&ov, &key))? {
+                items.push(array_get_index_after_has(i, &o, &ov, k, &key)?);
             }
         }
         let item_count = items.len();
         merge_sort(i, &mut items, &cmp)?;
-        let ov = Value::Obj(o.clone());
         // Set(O, k, v, true): a failed write (non-writable element) always throws.
         for (k, v) in items.into_iter().enumerate() {
             let ok = ab(i.set_member_recv(&ov, &k.to_string(), v, ov.clone()))?;
@@ -5956,7 +5965,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // Elements are read from the end down (from = len - k - 1) into ascending targets.
         let mut items = Vec::with_capacity(len);
         for k in 0..len {
-            items.push(ab(i.get_member(&ov, &(len - k - 1).to_string()))?);
+            items.push(array_get_index(i, &o, &ov, len - k - 1)?);
         }
         Ok(i.make_array(items))
     });
@@ -5971,7 +5980,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let len = ab(i.checked_array_len(&o))?;
         let mut items = Vec::with_capacity(len);
         for k in 0..len {
-            items.push(ab(i.get_member(&ov, &k.to_string()))?);
+            items.push(array_get_index(i, &o, &ov, k)?);
         }
         merge_sort(i, &mut items, &cmp)?;
         Ok(i.make_array(items))
@@ -5997,7 +6006,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             if k == idx {
                 items.push(arg(args, 1));
             } else {
-                items.push(ab(i.get_member(&ov, &k.to_string()))?);
+                items.push(array_get_index(i, &o, &ov, k as usize)?);
             }
         }
         Ok(i.make_array(items))
@@ -6028,11 +6037,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // The discarded span is never read.
         let mut items = Vec::with_capacity(new_len as usize);
         for k in 0..start {
-            items.push(ab(i.get_member(&ov, &k.to_string()))?);
+            items.push(array_get_index(i, &o, &ov, k as usize)?);
         }
         items.extend(inserts);
         for k in (start + del)..len {
-            items.push(ab(i.get_member(&ov, &k.to_string()))?);
+            items.push(array_get_index(i, &o, &ov, k as usize)?);
         }
         Ok(i.make_array(items))
     });
@@ -6059,8 +6068,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         i.make_error("TypeError", "Reduce of empty array with no initial value")
                     );
                 }
-                if ab(i.js_has_property(&ov, &k.to_string()))? {
-                    acc = ab(i.get_member(&ov, &k.to_string()))?;
+                let key = k.to_string();
+                if ab(i.js_has_property(&ov, &key))? {
+                    acc = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
                     k -= 1;
                     break;
                 }
@@ -6068,8 +6078,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         }
         while k >= 0 {
-            if ab(i.js_has_property(&ov, &k.to_string()))? {
-                let v = ab(i.get_member(&ov, &k.to_string()))?;
+            let key = k.to_string();
+            if ab(i.js_has_property(&ov, &key))? {
+                let v = array_get_index_after_has(i, &o, &ov, k as usize, &key)?;
                 acc = ab(i.call(
                     cb.clone(),
                     Value::Undefined,
@@ -6329,6 +6340,44 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
     Ok(a)
 }
 
+/// Read an indexed array-like element using the exact generic `Get` fallback.
+///
+/// The dense probe is valid only for an own data property on an ordinary Array/plain object;
+/// misses deliberately stringify the index and dispatch through `[[Get]]`, preserving holes,
+/// accessors, prototypes, proxies, host indexed objects, and other exotics. This is the same
+/// observable operation required by ECMA-262 §23.1.3 (Array methods), with the allocation-free
+/// path only replacing an unobservable own-data lookup.
+#[inline]
+fn array_get_index(
+    i: &mut Interp,
+    object: &Gc,
+    receiver: &Value,
+    index: usize,
+) -> Result<Value, Value> {
+    if let Some(value) = i.fast_get_elem(object, index as f64) {
+        return Ok(value);
+    }
+    let key = index.to_string();
+    ab(i.get_member(receiver, &key))
+}
+
+/// `Get` after a caller has already performed the method's required `HasProperty` operation.
+/// Keeping the key supplied by the caller preserves the mandated order while avoiding a second
+/// decimal-index allocation on dense own-data arrays.
+#[inline]
+fn array_get_index_after_has(
+    i: &mut Interp,
+    object: &Gc,
+    receiver: &Value,
+    index: usize,
+    key: &str,
+) -> Result<Value, Value> {
+    if let Some(value) = i.fast_get_elem(object, index as f64) {
+        return Ok(value);
+    }
+    ab(i.get_member(receiver, key))
+}
+
 fn array_find(
     i: &mut Interp,
     this: Value,
@@ -6346,7 +6395,7 @@ fn array_find(
     let cb_this = arg(args, 1);
     for step in 0..len {
         let k = if from_last { len - 1 - step } else { step };
-        let v = ab(i.get_member(&ov, &k.to_string()))?;
+        let v = array_get_index(i, &o, &ov, k)?;
         let r = ab(i.call(
             cb.clone(),
             cb_this.clone(),
@@ -6378,10 +6427,11 @@ fn array_some_every(
     let cb_this = arg(args, 1);
     let ov = Value::Obj(o.clone());
     for k in 0..len {
-        if !ab(i.js_has_property(&ov, &k.to_string()))? {
+        let key = k.to_string();
+        if !ab(i.js_has_property(&ov, &key))? {
             continue; // skip holes
         }
-        let v = ab(i.get_member(&ov, &k.to_string()))?;
+        let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
         let r = ab(i.call(
             cb.clone(),
             cb_this.clone(),
@@ -6413,10 +6463,14 @@ fn flatten_into(
 ) -> Result<usize, Value> {
     let mut target_index = start;
     for k in 0..source_len {
-        if !ab(i.js_has_property(source, &k.to_string()))? {
+        let key = k.to_string();
+        if !ab(i.js_has_property(source, &key))? {
             continue; // FlattenIntoArray skips holes
         }
-        let mut element = ab(i.get_member(source, &k.to_string()))?;
+        let mut element = match source {
+            Value::Obj(object) => array_get_index_after_has(i, object, source, k, &key)?,
+            _ => ab(i.get_member(source, &key))?,
+        };
         if let Some(m) = mapper {
             element = ab(i.call(
                 m.clone(),

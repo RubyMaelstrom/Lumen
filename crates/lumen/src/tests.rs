@@ -11561,6 +11561,42 @@ fn array_sort_holes_and_delete() {
 }
 
 #[test]
+fn array_dense_index_fast_get_preserves_generic_observability() {
+    // Get-based methods read holes as undefined, while HasProperty-based methods skip them.
+    assert_eq!(run("var a=[1,,3]; a.includes(undefined)"), "true");
+    assert_eq!(run("var a=[1,,3]; a.indexOf(undefined)"), "-1");
+
+    // Own accessors and prototype properties must still run through [[Get]], rather than the
+    // dense data probe used for ordinary own elements.
+    assert_eq!(
+        run(
+            "var calls=0; var a=[1,2]; Object.defineProperty(a,'1',{get(){calls++;return 9},configurable:true}); [a.includes(9),calls].join('|')"
+        ),
+        "true|1"
+    );
+    assert_eq!(
+        run(
+            "var calls=0; var p=Object.create(Array.prototype); Object.defineProperty(p,'1',{get(){calls++;return 7}}); var a=[1,,3]; Object.setPrototypeOf(a,p); [a.includes(7),calls].join('|')"
+        ),
+        "true|1"
+    );
+
+    // Callback methods retain live mutation ordering and proxy observability.
+    assert_eq!(
+        run(
+            "var a=[1,2],seen=[]; a.forEach((v,k)=>{seen.push(v);if(k===0)a[1]=9}); seen.join(',')"
+        ),
+        "1,9"
+    );
+    assert_eq!(
+        run(
+            "var calls=0; var p=new Proxy([1,2],{has(t,k){calls++;return Reflect.has(t,k)},get(t,k,r){calls++;return Reflect.get(t,k,r)}}); p.map(x=>x); calls>0"
+        ),
+        "true"
+    );
+}
+
+#[test]
 fn array_flat_flatmap_holes() {
     // flatMap validates the callback and skips holes; flat skips holes too.
     assert_eq!(

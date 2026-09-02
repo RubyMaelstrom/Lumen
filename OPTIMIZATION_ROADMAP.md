@@ -609,8 +609,11 @@ finish the baseline, but no later phase may claim a performance win against the 
     - [x] Spread and argument-list fast paths now require the canonical array/string iterator
       methods (and intact iterator next methods), preserving GetIterator semantics after user
       code mutates either prototype.
-    - [x] Primitive-string GetIterator now uses String.prototype directly, and eager iterable
-      collection closes the Iterator Record on abrupt next/result/value failures.
+  - [x] Primitive-string GetIterator now uses String.prototype directly, and eager iterable
+    collection closes the Iterator Record on abrupt next/result/value failures.
+  - [x] Array indexed built-ins reuse one canonical index key for `HasProperty`/`Get` and probe
+    ordinary own dense data directly; holes, accessors, prototype properties, proxies, host
+    indexed objects, and other exotics retain the ECMA-262 §23.1.3 generic path.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
   - [x] Hot-path diagnostics use a process-sampled relaxed byte gate; disabled iterator and
     conversion probes avoid timestamps, allocations, and synchronization locks.
