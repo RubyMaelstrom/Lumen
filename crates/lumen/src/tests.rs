@@ -5019,6 +5019,7 @@ fn string_iterator() {
         run("var it='hi'[Symbol.iterator](); it.next().value+it.next().value"),
         "hi"
     );
+    assert_eq!(run("[...'hello'].join('')"), "hello");
     assert_eq!(run("var r=''; for(var c of 'xyz') r+=c; r"), "xyz");
 }
 #[test]

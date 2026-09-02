@@ -1658,8 +1658,19 @@ impl Interp {
         match v {
             Value::Str(s) if crate::builtins::intrinsic_string_iterator_is_unmodified(self) => {
                 let perf_started = crate::jit::perf_stage_start();
+                // String.prototype[@@iterator] returns one String value per code point
+                // (ECMA-262 §22.1.3.36).  ASCII code points are also one UTF-16 code unit, so
+                // use the thread-local immutable single-unit values instead of allocating a new
+                // LStr for every character.  Non-ASCII points retain the canonical UTF-16
+                // reconstruction, including lone-surrogate handling.
                 let result = Ok(crate::jstr::CodePointIter::new(s)
-                    .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
+                    .map(|point| {
+                        if point < 0x80 {
+                            Value::Str(crate::jstr::unit_lstr(point as u16))
+                        } else {
+                            Value::from_string(crate::jstr::from_code_point(point))
+                        }
+                    })
                     .collect());
                 crate::jit::perf_iterate_fast_end(perf_started);
                 return result;
