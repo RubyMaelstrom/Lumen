@@ -987,6 +987,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     receiver probes, iterator ordering, and tombstone behavior remain unchanged (ECMA-262
     §24.2.4.5, §24.2.4.9, §24.2.4.15, §24.2.4.16). An 8-round release workload over overlapping
     2,000-element sets improved from 0.264868 s to 0.214033 s median (about 19%).
+  - [x] Annex B `unescape` now parses the input as UTF-16 units with allocation-free hexadecimal
+    lookahead, preserving astral pairs and lone surrogates while removing per-escape `char` and
+    temporary-`String` allocations (ECMA-262 Annex B.2.1.2). The focused global-method tests now
+    cover astral, escaped-pair, and lone-surrogate cases; the mixed release workload retained its
+    ~0.046 s median while correcting the prior astral-unit truncation.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

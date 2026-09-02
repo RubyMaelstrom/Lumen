@@ -68,30 +68,31 @@ pub(super) fn install_globals(it: &mut Interp) {
     });
     global_fn(it, "unescape", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
-        let chars: Vec<char> = s.chars().collect();
-        let mut units: Vec<u16> = Vec::new();
+        // Annex B.2.1.2 Unescape: inspect UTF-16 code units, recognizing only `%XX` and
+        // `%uXXXX`; all other units pass through unchanged. Indexing the one unit snapshot keeps
+        // lookahead allocation-free and, unlike `char` casts, preserves astral pairs and lone
+        // surrogates exactly.
+        let input = crate::jstr::units(&s);
+        let mut units: Vec<u16> = Vec::with_capacity(input.len());
         let mut k = 0;
-        while k < chars.len() {
-            if chars[k] == '%' {
-                if k + 5 < chars.len() + 1 && chars.get(k + 1) == Some(&'u') {
-                    if let Some(h) = chars
-                        .get(k + 2..k + 6)
-                        .and_then(|s| u16::from_str_radix(&s.iter().collect::<String>(), 16).ok())
-                    {
+        while k < input.len() {
+            if input[k] == b'%' as u16 {
+                if k + 5 < input.len() && input[k + 1] == b'u' as u16 {
+                    if let Some(h) = parse_hex_units(&input[k + 2..k + 6]) {
                         units.push(h);
                         k += 6;
                         continue;
                     }
-                } else if let Some(h) = chars
-                    .get(k + 1..k + 3)
-                    .and_then(|s| u16::from_str_radix(&s.iter().collect::<String>(), 16).ok())
-                {
-                    units.push(h);
-                    k += 3;
-                    continue;
+                }
+                if k + 2 < input.len() {
+                    if let Some(h) = parse_hex_units(&input[k + 1..k + 3]) {
+                        units.push(h);
+                        k += 3;
+                        continue;
+                    }
                 }
             }
-            units.push(chars[k] as u16);
+            units.push(input[k]);
             k += 1;
         }
         Ok(Value::from_string(crate::jstr::from_units(&units)))
@@ -134,6 +135,21 @@ pub(super) fn install_globals(it: &mut Interp) {
     });
     set_builtin(&it.global, "eval", Value::Obj(eval_fn.clone()));
     it.eval_fn = Some(eval_fn);
+}
+
+#[inline]
+fn parse_hex_units(units: &[u16]) -> Option<u16> {
+    let mut value = 0u16;
+    for &unit in units {
+        let digit = match unit {
+            0x30..=0x39 => unit - 0x30,
+            0x61..=0x66 => unit - 0x61 + 10,
+            0x41..=0x46 => unit - 0x41 + 10,
+            _ => return None,
+        };
+        value = (value << 4) | digit;
+    }
+    Some(value)
 }
 
 pub(super) fn install_console(it: &mut Interp) {

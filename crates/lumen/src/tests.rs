@@ -4085,6 +4085,9 @@ fn missing_methods_batch2() {
     assert_eq!(run("Uint8Array.from('123').join(',')"), "1,2,3");
     assert_eq!(run("escape('a b+')"), "a%20b+");
     assert_eq!(run("unescape('a%20b%75')"), "a bu");
+    assert_eq!(run("unescape('😀')"), "😀");
+    assert_eq!(run("unescape('%uD83D%uDE00')"), "😀");
+    assert_eq!(run("unescape('%uD800').charCodeAt(0)"), "55296");
     assert_eq!(run("'a'.localeCompare('b')"), "-1");
     assert_eq!(run("(255).toLocaleString()"), "255");
 }
