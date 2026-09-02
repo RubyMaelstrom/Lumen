@@ -1002,6 +1002,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     for aliasing custom species results (ECMA-262 §23.2.3.27). A release workload slicing 19,800
     `Float64Array` elements 20 times improved from 0.085043 s to 0.055350 s median (about 35%),
     with species, overlap, and typed-array conformance tests passing.
+  - [x] `%TypedArray%.prototype.toReversed` snapshots and reverses same-type element bytes in one
+    result write when both views retain their captured lengths, preserving exact bit encodings;
+    unusual detach/shrink paths retain the per-element fallback (ECMA-262 §23.2.3.32). A release
+    workload reversing 20,000 `Float64Array` elements 20 times improved from 0.094753 s to
+    0.037062 s median (about 61%), with typed-array semantic tests passing.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

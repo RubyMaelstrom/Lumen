@@ -1219,6 +1219,20 @@ fn ta_native(
         })()),
         "toReversed" => Some((|| {
             let (new_ta, new_info) = ta_create_same(i, info.kind, len)?;
+            if i.ta_len(&info) == Some(len) && i.ta_len(&new_info) == Some(len) {
+                // TypedArrayCreateSameType gives the result its own buffer. Snapshot the source
+                // bytes once and reverse whole elements, preserving NaN payloads and avoiding a
+                // boxed read/conversion/write for every element (ECMA-262 §23.2.3.32).
+                let es = info.kind.elsize();
+                if let Some(source) = i.ta_read_bytes(&info, 0, len) {
+                    let mut reversed = Vec::with_capacity(source.len());
+                    for k in (0..len).rev() {
+                        reversed.extend_from_slice(&source[k * es..(k + 1) * es]);
+                    }
+                    i.ta_write_bytes(&new_info, 0, &reversed);
+                    return Ok(new_ta);
+                }
+            }
             for k in 0..len {
                 let v = i.ta_read(&info, len - 1 - k);
                 ab(i.ta_store(&new_info, k, &v))?;
