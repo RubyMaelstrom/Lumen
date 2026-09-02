@@ -865,6 +865,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [ ] Make length and indexed code-unit access O(1) for flat strings.
 - [ ] Specialize equality, hashing, comparison, search, substring, case conversion, normalization,
   iteration, and RegExp inputs by representation.
+  - [x] ASCII `indexOf`/`lastIndexOf`/`includes`/`startsWith`/`endsWith` use byte-equivalent
+    searches without allocating UTF-16 unit vectors; non-ASCII and surrogate-containing strings
+    retain the code-unit implementation (ECMA-262 §6.1.4.1–2, §22.1.3.7–11).
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.

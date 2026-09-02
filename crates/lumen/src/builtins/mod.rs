@@ -9944,6 +9944,28 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "lastIndexOf", 1, |i, this, args| {
         let s = this_string(i, &this)?;
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        // StringLastIndexOf operates on UTF-16 code-unit indices (ECMA-262 §6.1.4.2 and
+        // §22.1.3.11). For ASCII operands byte offsets are identical, so avoid materializing
+        // two unit vectors and search the bounded byte prefix directly.
+        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
+            && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
+        {
+            let max_start = s.len().saturating_sub(needle.len());
+            let start = match arg(args, 1) {
+                Value::Undefined => max_start,
+                v => {
+                    let p = ab(i.to_number(&v))?;
+                    if p.is_nan() {
+                        max_start
+                    } else {
+                        p.trunc().clamp(0.0, max_start as f64) as usize
+                    }
+                }
+            };
+            let end = start.saturating_add(needle.len());
+            let result = s[..end].rfind(needle.as_str());
+            return Ok(Value::Num(result.map(|n| n as f64).unwrap_or(-1.0)));
+        }
         // Optional `position`: search for the last occurrence starting at or before it.
         let chars = i.units_full(&s);
         let nchars = i.units_full(&needle);
@@ -10000,6 +10022,12 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("TypeError", "argument must not be a regular expression"));
         }
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
+            && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
+        {
+            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
+            return Ok(Value::Bool(s[pos..].contains(needle.as_str())));
+        }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -10014,6 +10042,12 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("TypeError", "argument must not be a regular expression"));
         }
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
+            && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
+        {
+            let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
+            return Ok(Value::Bool(s[pos..].starts_with(needle.as_str())));
+        }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -10028,6 +10062,19 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("TypeError", "argument must not be a regular expression"));
         }
         let needle = ab(i.to_string(&arg(args, 0)))?;
+        if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii)
+            && matches!(i.units_of(&needle), crate::interpreter::StrUnits::Ascii)
+        {
+            let end = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undefined) => {
+                    str_clamp_pos(i, Some(v), s.len() as i64)?
+                }
+                _ => s.len(),
+            };
+            return Ok(Value::Bool(
+                end >= needle.len() && s[..end].ends_with(needle.as_str()),
+            ));
+        }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
         // endsWith's optional argument is the END position (default = length).

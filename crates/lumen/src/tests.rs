@@ -4877,6 +4877,27 @@ fn string_lastindexof() {
     assert_eq!(run("'abc'.toLocaleUpperCase()"), "ABC");
     assert_eq!(run("'abab'.lastIndexOf('ab')"), "2");
 }
+
+#[test]
+fn ascii_string_search_fast_paths_preserve_positions() {
+    assert_eq!(run("'0123456789'.includes('345', 3)"), "true");
+    assert_eq!(run("'0123456789'.startsWith('345', 3)"), "true");
+    assert_eq!(run("'0123456789'.endsWith('789', 10)"), "true");
+    assert_eq!(run("'abcabc'.lastIndexOf('bc', 3)"), "1");
+    assert_eq!(run("'abcabc'.lastIndexOf('bc', 99)"), "4");
+    assert_eq!(run("'abcabc'.lastIndexOf('', 3)"), "3");
+    // Position coercion remains observable before the search.
+    assert_eq!(
+        run("var calls=0; var p={valueOf(){calls++;return 3}}; ['abcabc'.lastIndexOf('bc',p),calls].join('|')"),
+        "1|1"
+    );
+    // Non-ASCII UTF-16 code-unit semantics still use the materialized fallback.
+    assert_eq!(
+        run("var s=String.fromCharCode(0xd800)+'x'; s.includes(String.fromCharCode(0xd800))"),
+        "true"
+    );
+}
+
 #[test]
 fn arraylike_huge_length() {
     assert_eq!(
