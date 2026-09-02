@@ -4888,6 +4888,11 @@ fn ascii_string_search_fast_paths_preserve_positions() {
     assert_eq!(run("'abcabc'.lastIndexOf('', 3)"), "3");
     assert_eq!(run("'abcdef'.substring(4, 1)"), "bcd");
     assert_eq!(run("'abcdef'.substr(-3, 2)"), "de");
+    assert_eq!(run("'abcdef'.at(-2)"), "e");
+    assert_eq!(
+        run("var s=String.fromCharCode(0xd800)+'x'; s.at(0).charCodeAt(0).toString(16)"),
+        "d800"
+    );
     // Position coercion remains observable before the search.
     assert_eq!(
         run("var calls=0; var p={valueOf(){calls++;return 3}}; ['abcabc'.lastIndexOf('bc',p),calls].join('|')"),

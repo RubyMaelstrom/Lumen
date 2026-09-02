@@ -10303,7 +10303,15 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "split", 2, nf_string_split);
     it.def_method(&sp, "at", 1, |i, this, args| {
         let s = this_string(i, &this)?;
-        let len = i.str_len(&s) as i64;
+        // String.prototype.at performs ToAbsoluteIndex over UTF-16 code units
+        // (ECMA-262 §22.1.3.1). Keep the representation classification from
+        // `units_of` for both the length and selected unit so short non-ASCII
+        // strings are not materialized twice on this hot indexed-read path.
+        let units = i.units_of(&s);
+        let len = match &units {
+            crate::interpreter::StrUnits::Ascii => s.len(),
+            crate::interpreter::StrUnits::Units(units) => units.len(),
+        } as i64;
         let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
         if idx < 0 {
             idx += len;
@@ -10311,9 +10319,18 @@ fn install_string(it: &mut Interp) {
         Ok(if idx < 0 || idx >= len {
             Value::Undefined
         } else {
-            match i.unit_at(&s, idx as usize) {
-                Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
-                None => Value::Undefined,
+            match &units {
+                crate::interpreter::StrUnits::Ascii => s
+                    .as_bytes()
+                    .get(idx as usize)
+                    .map(|&unit| Value::Str(crate::jstr::unit_lstr(unit as u16)))
+                    .unwrap_or(Value::Undefined),
+                crate::interpreter::StrUnits::Units(units) => units
+                    .get(idx as usize)
+                    .copied()
+                    .map(crate::jstr::unit_lstr)
+                    .map(Value::Str)
+                    .unwrap_or(Value::Undefined),
             }
         })
     });

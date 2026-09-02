@@ -874,6 +874,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   - [x] ASCII `indexOf`/`lastIndexOf`/`includes`/`startsWith`/`endsWith` use byte-equivalent
     searches without allocating UTF-16 unit vectors; non-ASCII and surrogate-containing strings
     retain the code-unit implementation (ECMA-262 §6.1.4.1–2, §22.1.3.7–11).
+  - [x] `String.prototype.at` reuses its one representation classification and UTF-16 view for
+    both length and indexed selection, avoiding duplicate short non-ASCII materialization while
+    preserving `ToAbsoluteIndex` ordering and code-unit results (ECMA-262 §22.1.3.1).
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.
