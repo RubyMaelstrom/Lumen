@@ -997,6 +997,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     retaining per-element conversion for differing types (ECMA-262 §23.2.3.26.2). A release
     workload copying 20,000 `Float64Array` elements 20 times improved from 0.067550 s to
     0.033594 s median (about 50%); the typed-array semantic suite passed.
+  - [x] Same-type `%TypedArray%.prototype.slice` copies a non-overlapping source/result range in
+    one byte snapshot/write, preserving NaN payloads and retaining the forward per-element path
+    for aliasing custom species results (ECMA-262 §23.2.3.27). A release workload slicing 19,800
+    `Float64Array` elements 20 times improved from 0.085043 s to 0.055350 s median (about 35%),
+    with species, overlap, and typed-array conformance tests passing.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

@@ -1254,16 +1254,30 @@ fn ta_native(
                     i.make_error("TypeError", "TypedArray source is out of bounds")
                 })?;
                 if new_info.kind == info.kind {
-                    // Same element type: copy bitwise (NaN payloads must survive) — but element
-                    // by element, forward: a species constructor may hand back a view aliasing
-                    // the source buffer, and the spec's sequential Set makes later reads observe
-                    // earlier writes.
+                    // Same element type: copy bitwise (NaN payloads must survive). The ordinary
+                    // species result has a distinct buffer, so snapshot the whole range once;
+                    // a custom species may alias the source, in which case the spec's sequential
+                    // forward Set order must remain observable and we retain the element loop.
                     let es = info.kind.elsize();
-                    let n = count.min(curlen.saturating_sub(start));
-                    for j in 0..n {
-                        if let Some(bytes) = i.ta_read_bytes(&info, start + j, 1) {
-                            debug_assert_eq!(bytes.len(), es);
-                            i.ta_write_bytes(&new_info, j, &bytes);
+                    let target_len = i.ta_len(&new_info).unwrap_or(0);
+                    let n = count.min(curlen.saturating_sub(start)).min(target_len);
+                    let source_start = info.offset + start * es;
+                    let source_end = source_start + n * es;
+                    let target_start = new_info.offset;
+                    let target_end = target_start + n * es;
+                    let aliases = info.buffer == new_info.buffer
+                        && source_start < target_end
+                        && target_start < source_end;
+                    if !aliases {
+                        if let Some(bytes) = i.ta_read_bytes(&info, start, n) {
+                            i.ta_write_bytes(&new_info, 0, &bytes);
+                        }
+                    } else {
+                        for j in 0..n {
+                            if let Some(bytes) = i.ta_read_bytes(&info, start + j, 1) {
+                                debug_assert_eq!(bytes.len(), es);
+                                i.ta_write_bytes(&new_info, j, &bytes);
+                            }
                         }
                     }
                 } else {
