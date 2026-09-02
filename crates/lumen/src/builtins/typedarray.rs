@@ -908,12 +908,16 @@ fn ta_native(
             require_cb(i)?;
             let want_value = method == "find" || method == "findLast";
             let reverse = method == "findLast" || method == "findLastIndex";
-            let order: Vec<usize> = if reverse {
-                (0..len).rev().collect()
-            } else {
-                (0..len).collect()
-            };
-            for k in order {
+            // The spec captures [[ArrayLength]] once, then visits indices in direction order.
+            // Keep that order without allocating a temporary index vector for every call.
+            let mut remaining = len;
+            while remaining > 0 {
+                let k = if reverse {
+                    remaining - 1
+                } else {
+                    len - remaining
+                };
+                remaining -= 1;
                 let v = i.ta_read(&info, k);
                 let r = ab(i.call(
                     cb.clone(),
@@ -978,13 +982,8 @@ fn ta_native(
         "reduce" | "reduceRight" => Some((|| {
             require_cb(i)?;
             let right = method == "reduceRight";
-            let order: Vec<usize> = if right {
-                (0..len).rev().collect()
-            } else {
-                (0..len).collect()
-            };
             let mut acc: Value;
-            let mut start = 0;
+            let mut remaining = len;
             if args.len() >= 2 {
                 acc = arg(args, 1);
             } else {
@@ -993,10 +992,17 @@ fn ta_native(
                         i.make_error("TypeError", "Reduce of empty array with no initial value")
                     );
                 }
-                acc = i.ta_read(&info, order[0]);
-                start = 1;
+                let first = if right { len - 1 } else { 0 };
+                acc = i.ta_read(&info, first);
+                remaining -= 1;
             }
-            for &k in &order[start..] {
+            while remaining > 0 {
+                let k = if right {
+                    remaining - 1
+                } else {
+                    len - remaining
+                };
+                remaining -= 1;
                 let v = i.ta_read(&info, k);
                 acc = ab(i.call(
                     cb.clone(),
@@ -1032,29 +1038,31 @@ fn ta_native(
                 Some(l) => l,
                 None => return Ok(Value::Num(-1.0)),
             };
-            let order: Vec<i64> = if last {
+            let (mut k, end, step) = if last {
                 let k = if from >= 0.0 {
                     from.min((len - 1) as f64) as i64
                 } else {
-                    (len as f64 + from) as i64
+                    (len as f64 + from).max(-1.0) as i64
                 };
-                (0..=k).rev().collect()
+                (k, -1, -1)
             } else {
                 let k = if from >= 0.0 {
                     from as i64
                 } else {
                     (len as f64 + from).max(0.0) as i64
                 };
-                (k..len as i64).collect()
+                (k, len as i64, 1)
             };
-            for k in order {
+            while k != end {
                 if k < 0 || k as usize >= curlen {
+                    k += step;
                     continue;
                 }
                 let v = i.ta_read(&info, k as usize);
                 if i.strict_equals(&v, &search) {
                     return Ok(Value::Num(k as f64));
                 }
+                k += step;
             }
             Ok(Value::Num(-1.0))
         })()),

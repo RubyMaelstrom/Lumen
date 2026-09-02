@@ -970,6 +970,12 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     ordering while avoiding duplicate indexed lookups on dense arrays (ECMA-262 §23.1.3.6,
     §23.1.3.24, §23.1.3.27, §23.1.3.37). The combined release copy/mutation workload improved
     from 0.196909 s to 0.190414 s median, with the full array semantic suite passing.
+  - [x] Typed-array `find`/`reduce`/`indexOf` families now traverse the captured length directly
+    in forward or reverse order instead of allocating a temporary index vector per call. This
+    preserves detached/shrunk-buffer checks and callback ordering from the `%TypedArray%` methods
+    (ECMA-262 §23.2.3.12–§23.2.3.20). A release workload over a 20,000-element `Float64Array`
+    improved from 0.133642 s to 0.107433 s median (about 20%), with typed-array conformance
+    tests passing.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
