@@ -539,13 +539,13 @@ impl CentralHeap {
                 continue;
             }
             let target = self.relocate_unchecked(source)?;
-            roots.rewrite_heap_reference(source, target);
             forwarding.push((source, target));
             forwarding_map.insert(source, target);
         }
         // Relocations are allocated in stable handle order above. Rewriting all fields in one
         // table walk avoids rescanning the entire heap once per moved object, while the ordered
         // list below preserves deterministic promotion and free-slot behavior.
+        roots.rewrite_heap_references(&forwarding_map);
         self.rewrite_tagged_references_many(&forwarding_map);
         for (source, target) in forwarding {
             self.promote(target, HeapGeneration::Old)?;

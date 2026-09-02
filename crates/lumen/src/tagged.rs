@@ -710,6 +710,28 @@ impl RootSet {
         }
         rewritten
     }
+
+    /// Rewrite all relocated handles in one root-table walk. A nursery collector can move many
+    /// objects at one safepoint; batching avoids rescanning every root slot for each forwarding
+    /// edge while preserving the same fail-closed tagged-word representation.
+    pub(crate) fn rewrite_heap_references(
+        &self,
+        forwarding: &crate::fasthash::FastMap<HeapRef, HeapRef>,
+    ) -> usize {
+        let mut state = self.state.borrow_mut();
+        let mut rewritten = 0;
+        for slot in state.slots.iter_mut().flatten() {
+            let Some(source) = slot.as_heap() else {
+                continue;
+            };
+            let Some(target) = forwarding.get(&source) else {
+                continue;
+            };
+            *slot = TaggedValue::heap(*target);
+            rewritten += 1;
+        }
+        rewritten
+    }
 }
 
 impl RootedTagged {
