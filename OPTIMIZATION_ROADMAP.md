@@ -911,6 +911,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   - [x] `trim`, `trimStart`, `trimEnd`, and the no-op/empty-filler `padStart`/`padEnd` paths retain
     the already-coerced `LStr` and avoid the temporary Rust `String`; an 11-sample release workload
     improved from 0.363541 s median to 0.338775 s median (about 7%).
+  - [x] ASCII `padStart`/`padEnd` now concatenate the repeated filler and receiver directly into
+    the final `LStr`, avoiding a formatting temporary; an 11-sample release workload improved from
+    0.248842 s median to 0.216627 s median (about 13%).
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.

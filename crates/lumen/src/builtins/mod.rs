@@ -10872,10 +10872,13 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
             let take = (need - fill.len()).min(pad.len());
             fill.push_str(&pad[..take]);
         }
-        return Ok(Value::from_string(if at_start {
-            format!("{fill}{s}")
+        // Both operands are ASCII, so their UTF-16 concatenation needs no canonicalization pass.
+        // Build the final engine string directly instead of formatting a temporary Rust String
+        // and copying that result into an LStr.
+        return Ok(Value::Str(if at_start {
+            crate::lstr::LStr::concat2(&fill, s)
         } else {
-            format!("{s}{fill}")
+            crate::lstr::LStr::concat2(s, &fill)
         }));
     }
     let pad_units = crate::jstr::units(&pad);
