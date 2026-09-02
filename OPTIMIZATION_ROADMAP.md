@@ -599,6 +599,8 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Packed ordinary-array iterator steps reuse the maintained length and dense element slots;
     holes, accessors, prototype fallback, proxies, typed arrays, and mutations retain the
     ECMA-262 `LengthOfArrayLike`/`Get` path (`%ArrayIteratorPrototype%.next`, §23.1.5.2.1).
+  - [x] Validated TypedArray iterator steps read the checked backing view directly, retaining
+    per-step bounds validation and detached-buffer errors from the same algorithm.
   - [ ] Add stable helper identities and cover remaining spread/ordinary-versus-symbol iteration
     distinctions without adding a disabled-path timestamp to primitive fast cases.
     - [x] Native-call diagnostics now aggregate by explicit callable label and ABI shape rather

@@ -9251,7 +9251,8 @@ fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
     let kind = ab(i.to_number(&kind_v))? as u8;
     // A TypedArray target re-derives its length each step; an out-of-bounds (detached/shrunk-past)
     // view throws TypeError.
-    let len = if let Some(info) = map_ptr(&target).and_then(|p| i.typed_arrays.get(&p).copied()) {
+    let typed_info = map_ptr(&target).and_then(|p| i.typed_arrays.get(&p).copied());
+    let len = if let Some(info) = typed_info {
         match i.ta_len(&info) {
             Some(l) => l,
             None => return Err(i.make_error("TypeError", "TypedArray is out of bounds")),
@@ -9294,13 +9295,20 @@ fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
     // element helper is an exact result for own data entries and falls back for holes, accessors,
     // prototype properties, and exotics; this avoids the per-step index-string allocation in the
     // common packed-array case while preserving the specified Get semantics on every miss.
-    let elem = ab(match &target {
-        Value::Obj(object) => i
-            .fast_get_elem(object, idx as f64)
-            .map(Ok)
-            .unwrap_or_else(|| i.get_member(&target, &idx.to_string())),
-        _ => i.get_member(&target, &idx.to_string()),
-    })?;
+    let elem = if let Some(info) = typed_info {
+        // ValidateTypedArrayBounds above succeeded for this step. TypedArray [[Get]] of a
+        // canonical in-range integer index is the backing-store read, so avoid reconstructing a
+        // property key and dispatching through the generic indexed-property machinery.
+        i.ta_read(&info, idx)
+    } else {
+        ab(match &target {
+            Value::Obj(object) => i
+                .fast_get_elem(object, idx as f64)
+                .map(Ok)
+                .unwrap_or_else(|| i.get_member(&target, &idx.to_string())),
+            _ => i.get_member(&target, &idx.to_string()),
+        })?
+    };
     let value = match kind {
         1 => Value::Num(idx as f64),
         2 => i.make_array(vec![Value::Num(idx as f64), elem]),
