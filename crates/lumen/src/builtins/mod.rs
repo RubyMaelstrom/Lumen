@@ -10285,7 +10285,30 @@ fn install_string(it: &mut Interp) {
         Ok(Value::Str(this_string(i, &this)?))
     });
     it.def_method(&sp, "concat", 1, |i, this, args| {
-        let mut s = this_string(i, &this)?.to_string();
+        let s = this_string(i, &this)?;
+        // ECMA-262 §22.1.3.5 returns the receiver string unchanged when there are no
+        // arguments. String primitives have no observable identity, so avoid copying it.
+        if args.is_empty() {
+            return Ok(Value::Str(s));
+        }
+        // The one-argument form is common in generated code. Coerce the argument exactly once,
+        // then allocate the result directly when no surrogate-boundary canonicalization is needed.
+        if args.len() == 1 {
+            let next = ab(i.to_string(&args[0]))?;
+            let total = s
+                .len()
+                .checked_add(next.len())
+                .filter(|&len| len <= MAX_STR_LEN)
+                .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
+            if !crate::jstr::needs_join_fixup(&s, &next) {
+                let mut out = String::with_capacity(total);
+                out.push_str(&s);
+                out.push_str(&next);
+                return Ok(Value::from_string(out));
+            }
+            return Ok(Value::from_string(crate::jstr::concat(&s, &next)));
+        }
+        let mut s = s.to_string();
         for a in args {
             s = crate::jstr::concat(&s, &ab(i.to_string(a))?);
             if s.len() > MAX_STR_LEN {
