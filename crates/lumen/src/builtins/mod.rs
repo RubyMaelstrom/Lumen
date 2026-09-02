@@ -9914,9 +9914,31 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 // (unlike `splitn`, whose final remainder would be incorrect here).
                 s.split(sep.as_ref()).take(limit).map(Value::str).collect()
             } else {
-                s.split(sep.as_ref())
-                    .map(|p| Value::from_string(p.to_string()))
-                    .collect()
+                // String separators are matched by UTF-16 code units (ECMA-262 §22.1.3.23),
+                // not Rust scalar values. This matters when a separator is one half of an astral
+                // character: splitting `"😀"` on its high surrogate must leave the low surrogate
+                // in the second result. Convert once, search the unit sequence, and rebuild each
+                // piece independently so a separator boundary cannot accidentally recombine the
+                // pair across pieces.
+                let units = crate::jstr::units(&s);
+                let sep_units = crate::jstr::units(sep.as_ref());
+                let mut parts = Vec::new();
+                let mut start = 0usize;
+                while start <= units.len() && parts.len() < limit {
+                    let found = units[start..]
+                        .windows(sep_units.len())
+                        .position(|window| window == sep_units.as_slice())
+                        .map(|offset| start + offset);
+                    let Some(position) = found else {
+                        parts.push(Value::from_string(crate::jstr::from_units(&units[start..])));
+                        break;
+                    };
+                    parts.push(Value::from_string(crate::jstr::from_units(
+                        &units[start..position],
+                    )));
+                    start = position + sep_units.len();
+                }
+                parts
             };
             parts.truncate(limit);
             Ok(i.make_array(parts))

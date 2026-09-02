@@ -13887,6 +13887,16 @@ fn string_split_delegate() {
     assert_eq!(run("'a1b2c'.split(/[0-9]/).join('|')"), "a|b|c");
     assert_eq!(run("'x'.split({[Symbol.split](s){return ['S']}})[0]"), "S");
     assert_eq!(run("'abc'.split('').join('-')"), "a-b-c");
+    // String separators use UTF-16 units, so a separator can split an astral pair and leave a
+    // lone surrogate in the adjacent result.
+    assert_eq!(
+        run("const a='😀'.split(String.fromCharCode(0xD83D)); [a.length,a[0].length,a[1].charCodeAt(0).toString(16)].join(':')"),
+        "2:0:de00"
+    );
+    assert_eq!(
+        run("const a='😀'.split(String.fromCharCode(0xDE00)); [a.length,a[0].charCodeAt(0).toString(16),a[1].length].join(':')"),
+        "2:d83d:0"
+    );
 }
 
 #[test]

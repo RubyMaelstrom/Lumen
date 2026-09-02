@@ -891,6 +891,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     (ECMA-262 §22.1.3.32–34).
   - [x] ASCII `padStart`/`padEnd` repeat and truncate fillers directly as bytes; non-ASCII
     fillers and receivers retain the UTF-16 unit path (ECMA-262 §22.1.3.17.1–2).
+  - [x] String-separator `split` matches UTF-16 code units, including separators that split an
+    astral pair into lone-surrogate results; empty-separator and RegExp delegation retain their
+    specified paths (ECMA-262 §22.1.3.23).
   - [x] Canonical `String.prototype.repeat` inputs whose repeated boundaries cannot join surrogate
     units write one engine allocation directly, avoiding the temporary Rust string and conversion
     copy while preserving the normative coercion/error ordering (ECMA-262 §22.1.3.18); an ASCII
@@ -943,9 +946,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     for holes, accessors, inherited values, proxies, and mutations; an 11-sample release workload
     improved from 0.463318 s to 0.434543 s (about 6%).
   - [x] ASCII `String.prototype.split` keeps each byte-aligned substring as an `LStr` and applies
-    the limit while iterating, avoiding a Rust `String` temporary per piece; the standards-sensitive
-    UTF-16 and RegExp paths remain unchanged (ECMA-262 §22.1.3.23). An 11-sample release workload
-    improved from 0.499311 s to 0.444024 s (about 11%).
+    the limit while iterating, avoiding a Rust `String` temporary per piece; the UTF-16-unit and
+    RegExp paths retain their required semantics (ECMA-262 §22.1.3.23). An 11-sample release
+    workload improved from 0.499311 s to 0.444024 s (about 11%).
   - [x] Array `sort` uses one pair of reusable merge buffers and moves values between passes,
     retaining stable ordering and comparator abrupt-completion behavior while removing recursive
     per-level vector allocations (ECMA-262 §23.1.3.30.1). An 11-sample 5,000-element release
