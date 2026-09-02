@@ -13415,16 +13415,27 @@ fn string_from_char_code_touint16() {
 fn string_concat_fast_paths_preserve_coercion_and_surrogates() {
     assert_eq!(run("'abc'.concat()"), "abc");
     assert_eq!(run("'abc'.concat('def')"), "abcdef");
+    assert_eq!(run("'a'.concat('b', 'c', 'd')"), "abcd");
     assert_eq!(run("'😀'.concat('!')"), "😀!");
     // The engine's internal surrogate representation must still canonicalize across the join.
     assert_eq!(
         run("String.fromCharCode(0xD834).concat(String.fromCharCode(0xDF06)) === '𝌆'"),
         "true"
     );
+    assert_eq!(
+        run("String.fromCharCode(0xD834).concat(String.fromCharCode(0xDF06), '!') === '𝌆!'"),
+        "true"
+    );
     // ToString side effects occur once and before the result is assembled.
     assert_eq!(
         run("var calls=0; 'x'.concat({toString(){calls++;return 'y'}})+'|'+calls"),
         "xy|1"
+    );
+    assert_eq!(
+        run(
+            "var calls=[]; 'x'.concat({toString(){calls.push(1);return 'y'}},{toString(){calls.push(2);return 'z'}})+'|'+calls"
+        ),
+        "xyz|1,2"
     );
 }
 

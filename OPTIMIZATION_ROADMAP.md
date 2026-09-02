@@ -900,6 +900,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     its completed ToString and surrogate-boundary checks (ECMA-262 §22.1.3.5); a 100,000-call
     release micro-workload improved from 0.101334 s median to 0.068875 s median on the pinned
     host.
+  - [x] Multi-argument `String.prototype.concat` retains left-to-right coercion and per-step
+    length errors, then copies non-surrogate-joining pieces once into an `LStr`; a Unicode
+    50,000-call release micro-workload improved from 0.050387 s median to 0.046722 s median on
+    the pinned host, while joining-surrogate inputs use the exact stepwise fallback.
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.

@@ -10308,14 +10308,42 @@ fn install_string(it: &mut Interp) {
             }
             return Ok(Value::from_string(crate::jstr::concat(&s, &next)));
         }
-        let mut s = s.to_string();
-        for a in args {
-            s = crate::jstr::concat(&s, &ab(i.to_string(a))?);
-            if s.len() > MAX_STR_LEN {
-                return Err(i.make_error("RangeError", "Invalid string length"));
+        // Preserve the spec's left-to-right ToString order and the existing per-step length
+        // error timing.  If a surrogate boundary needs canonicalization, fall back immediately
+        // to the old stepwise path; otherwise each intermediate byte length is just the sum and
+        // all pieces can be copied once into one LStr allocation.
+        let mut parts = Vec::with_capacity(args.len() + 1);
+        parts.push(s);
+        let mut total = parts[0].len();
+        for (index, argument) in args.iter().enumerate() {
+            let next = ab(i.to_string(argument))?;
+            if parts
+                .last()
+                .is_some_and(|previous| crate::jstr::needs_join_fixup(previous, &next))
+            {
+                let mut out = parts[0].to_string();
+                for part in parts.iter().skip(1) {
+                    out.push_str(part);
+                }
+                out = crate::jstr::concat(&out, &next);
+                if out.len() > MAX_STR_LEN {
+                    return Err(i.make_error("RangeError", "Invalid string length"));
+                }
+                for remaining in args.iter().skip(index + 1) {
+                    out = crate::jstr::concat(&out, &ab(i.to_string(remaining))?);
+                    if out.len() > MAX_STR_LEN {
+                        return Err(i.make_error("RangeError", "Invalid string length"));
+                    }
+                }
+                return Ok(Value::from_string(out));
             }
+            total = total
+                .checked_add(next.len())
+                .filter(|&len| len <= MAX_STR_LEN)
+                .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
+            parts.push(next);
         }
-        Ok(Value::from_string(s))
+        Ok(Value::Str(crate::lstr::LStr::concat_many(&parts, total)))
     });
     it.def_method(&sp, "repeat", 1, |i, this, args| {
         let s = this_string(i, &this)?;

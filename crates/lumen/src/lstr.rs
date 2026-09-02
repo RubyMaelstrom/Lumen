@@ -104,6 +104,24 @@ impl LStr {
         s
     }
 
+    /// Concatenate already-coerced strings into one engine allocation.
+    pub(crate) fn concat_many(parts: &[LStr], total: usize) -> LStr {
+        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
+        let mut offset = 0;
+        unsafe {
+            let data = (s.p.as_ptr() as *mut u8).add(HDR);
+            for part in parts {
+                let bytes = part.as_str().as_bytes();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.add(offset), bytes.len());
+                offset += bytes.len();
+            }
+        }
+        debug_assert_eq!(offset, total);
+        s.hdr().len.set(total as u32);
+        s.and_ascii(parts.iter().all(LStr::ascii_hint));
+        s
+    }
+
     #[inline]
     fn hdr(&self) -> &Header {
         unsafe { self.p.as_ref() }
