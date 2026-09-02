@@ -5573,11 +5573,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let cb_this = arg(args, 1);
         let ov = Value::Obj(o.clone());
         for k in 0..len {
-            let key = k.to_string();
-            if !ab(i.js_has_property(&ov, &key))? {
+            let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue; // skip array holes
-            }
-            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
+            };
             ab(i.call(
                 cb.clone(),
                 cb_this.clone(),
@@ -5597,16 +5595,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let ov = Value::Obj(o.clone());
         let result = array_species_create(i, &this, len)?;
         for k in 0..len {
-            let key = k.to_string();
-            if !ab(i.js_has_property(&ov, &key))? {
+            let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue; // holes stay holes in the result
-            }
-            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
+            };
             let mapped = ab(i.call(
                 cb.clone(),
                 cb_this.clone(),
                 &[v, Value::Num(k as f64), ov.clone()],
             ))?;
+            let key = k.to_string();
             json_create_data_prop_or_throw(i, &result, &key, mapped)?;
         }
         Ok(result)
@@ -5626,11 +5623,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let result = array_species_create(i, &this, 0)?;
         let mut to = 0usize;
         for k in 0..len {
-            let key = k.to_string();
-            if !ab(i.js_has_property(&ov, &key))? {
+            let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue;
-            }
-            let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
+            };
             let keep = ab(i.call(
                 cb.clone(),
                 cb_this.clone(),
@@ -5666,9 +5661,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         i.make_error("TypeError", "Reduce of empty array with no initial value")
                     );
                 }
-                let key = k.to_string();
-                if ab(i.js_has_property(&ov, &key))? {
-                    acc = array_get_index_after_has(i, &o, &ov, k, &key)?;
+                if let Some(value) = array_get_present_index(i, &o, &ov, k)? {
+                    acc = value;
                     k += 1;
                     break;
                 }
@@ -5676,9 +5670,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         }
         while k < len {
-            let key = k.to_string();
-            if ab(i.js_has_property(&ov, &key))? {
-                let v = array_get_index_after_has(i, &o, &ov, k, &key)?;
+            if let Some(v) = array_get_present_index(i, &o, &ov, k)? {
                 acc = ab(i.call(
                     cb.clone(),
                     Value::Undefined,
@@ -6386,6 +6378,29 @@ fn array_get_index_after_has(
         return Ok(value);
     }
     ab(i.get_member(receiver, key))
+}
+
+/// Read an index for the HasProperty-based Array callbacks. An own dense data element has no
+/// observable `HasProperty`/`Get` work, so the existing checked element probe can answer both in
+/// one operation. Holes, accessors, inherited values, proxies, and other exotics retain the exact
+/// two-step generic algorithm from ECMA-262 §23.1.3.
+#[inline]
+fn array_get_present_index(
+    i: &mut Interp,
+    object: &Gc,
+    receiver: &Value,
+    index: usize,
+) -> Result<Option<Value>, Value> {
+    if let Some(value) = i.fast_get_elem(object, index as f64) {
+        return Ok(Some(value));
+    }
+    let key = index.to_string();
+    if !ab(i.js_has_property(receiver, &key))? {
+        return Ok(None);
+    }
+    Ok(Some(array_get_index_after_has(
+        i, object, receiver, index, &key,
+    )?))
 }
 
 fn array_find(

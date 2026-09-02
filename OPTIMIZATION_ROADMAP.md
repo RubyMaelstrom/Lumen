@@ -938,6 +938,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
+  - [x] Array `forEach`, `map`, `filter`, and `reduce` use the checked dense own-data probe for
+    callback inputs, bypassing repeated key/HasProperty/Get work while retaining the generic path
+    for holes, accessors, inherited values, proxies, and mutations; an 11-sample release workload
+    improved from 0.463318 s to 0.434543 s (about 6%).
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
