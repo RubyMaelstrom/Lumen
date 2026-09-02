@@ -1659,11 +1659,12 @@ impl Interp {
         result
     }
 
-    /// Collect every value an iterable yields. Strings and plain arrays use a fast path; everything
-    /// else goes through the `Symbol.iterator` protocol (call `@@iterator`, then drain `.next()`).
+    /// Collect every value an iterable yields. Strings and ordinary arrays use a fast path only
+    /// while their intrinsic iterator methods are provably unmodified; otherwise this follows
+    /// GetIterator (call `@@iterator`, then drain `.next()`) exactly.
     pub(crate) fn iterate(&mut self, v: &Value) -> Result<Vec<Value>, Abrupt> {
         match v {
-            Value::Str(s) => {
+            Value::Str(s) if crate::builtins::intrinsic_string_iterator_is_unmodified(self) => {
                 let perf_started = crate::jit::perf_stage_start();
                 let result = Ok(crate::jstr::CodePointIter::new(s)
                     .map(|point| Value::from_string(crate::jstr::from_code_point(point)))
@@ -1671,7 +1672,7 @@ impl Interp {
                 crate::jit::perf_iterate_fast_end(perf_started);
                 return result;
             }
-            Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {
+            Value::Obj(o) if crate::builtins::array_iterator_fast_path_is_safe(self, v) => {
                 let perf_started = crate::jit::perf_stage_start();
                 let result: Result<Vec<Value>, Abrupt> = (|| {
                     let len = self.checked_array_len(o)?;

@@ -594,6 +594,12 @@ finish the baseline, but no later phase may claim a performance win against the 
     lower-level GetIterator/IteratorStep counters remain available for `for-of` and destructuring.
   - [ ] Add stable helper identities and cover remaining spread/ordinary-versus-symbol iteration
     distinctions without adding a disabled-path timestamp to primitive fast cases.
+    - [x] Native-call diagnostics now aggregate by explicit callable label and ABI shape rather
+      than process-local Rust function addresses; the generated JIT helper table also has a
+      checked-in stable identity vocabulary.
+    - [x] Spread and argument-list fast paths now require the canonical array/string iterator
+      methods (and intact iterator next methods), preserving GetIterator semantics after user
+      code mutates either prototype.
 - [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
 - [x] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
   recover diagnostics. `PerformanceMetricsSampler` emits an immediate and then interval-spaced

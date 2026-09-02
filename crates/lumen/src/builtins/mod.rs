@@ -5041,11 +5041,52 @@ fn is_intrinsic_array_constructor(i: &Interp, value: &Value) -> bool {
 
 /// Array iteration also performs `Get(iterator, "next")`; retaining the original `values`
 /// function is insufficient if `%ArrayIteratorPrototype%.next` was replaced.
-fn intrinsic_array_iterator_is_unmodified(i: &Interp) -> bool {
+pub(crate) fn intrinsic_array_iterator_is_unmodified(i: &Interp) -> bool {
     i.extra_protos
         .get("%ArrayIteratorPrototype%")
         .and_then(|prototype| prototype.borrow().props.get("next").map(|p| p.value()))
         .is_some_and(|next| is_native_function(&next, array_iter_next))
+}
+
+/// Whether an array can use the allocation-free iterator snapshot in `Interp::iterate`.
+///
+/// The language-level spread and argument-list algorithms begin with `GetIterator`, so this
+/// proof must include the observable `@@iterator` lookup as well as the iterator's `next` method.
+/// Requiring the ordinary realm prototype and no own symbol override keeps the check entirely
+/// side-effect free; customized arrays take the protocol path.
+pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> bool {
+    let Value::Obj(object) = value else {
+        return false;
+    };
+    if !matches!(object.borrow().exotic, Exotic::Array)
+        || !i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+        || !matches!(
+            object.borrow().proto.as_ref(),
+            Some(proto) if Rc::ptr_eq(proto, &i.array_proto)
+        )
+    {
+        return false;
+    }
+    let Some(key) = i
+        .iterator_sym
+        .as_ref()
+        .map(|symbol| Interp::sym_key(symbol.as_ref()))
+    else {
+        return false;
+    };
+    if object.borrow().props.get(&key).is_some() {
+        return false;
+    }
+    let method = i
+        .array_proto
+        .borrow()
+        .props
+        .get(&key)
+        .filter(|property| !property.accessor())
+        .map(|property| property.value());
+    method.is_some_and(|method| {
+        is_native_function(&method, nf_array_values) && intrinsic_array_iterator_is_unmodified(i)
+    })
 }
 
 /// Snapshot an Array whose current iteration cannot execute ECMAScript code: every index below
@@ -9732,17 +9773,49 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
 }
 
+/// String.prototype[@@iterator]. Kept as a named native so iterator fast paths can prove that
+/// the realm still exposes the exact intrinsic method after user code mutates prototypes.
+fn nf_string_iterator(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let s = this_string(i, &this)?;
+    let obj = Object::new(i.extra_protos.get("%StringIteratorPrototype%").cloned());
+    set_internal(&obj, "__si_str", Value::Str(s));
+    set_internal(&obj, "__si_index", Value::Num(0.0));
+    Ok(Value::Obj(obj))
+}
+
+/// The primitive-string iterator fast path is valid only while both observable intrinsic
+/// functions are still installed. A replacement getter/function on String.prototype must be
+/// allowed to run through GetIterator.
+pub(crate) fn intrinsic_string_iterator_is_unmodified(i: &Interp) -> bool {
+    let Some(key) = i
+        .iterator_sym
+        .as_ref()
+        .map(|symbol| Interp::sym_key(symbol.as_ref()))
+    else {
+        return false;
+    };
+    let method = i
+        .string_proto
+        .borrow()
+        .props
+        .get(&key)
+        .filter(|property| !property.accessor())
+        .map(|property| property.value());
+    let next = i
+        .extra_protos
+        .get("%StringIteratorPrototype%")
+        .and_then(|prototype| prototype.borrow().props.get("next").map(|p| p.value()));
+    method.is_some_and(|method| {
+        is_native_function(&method, nf_string_iterator)
+            && next.is_some_and(|next| is_native_function(&next, string_iter_next))
+    })
+}
+
 fn install_string(it: &mut Interp) {
     let sp = it.string_proto.clone();
     // String.prototype[@@iterator]: a lazy String Iterator over the receiver, by code point.
     if let Some(sym) = it.iterator_sym.clone() {
-        let f = it.make_native("[Symbol.iterator]", 0, |i, this, _| {
-            let s = this_string(i, &this)?;
-            let obj = Object::new(i.extra_protos.get("%StringIteratorPrototype%").cloned());
-            set_internal(&obj, "__si_str", Value::Str(s));
-            set_internal(&obj, "__si_index", Value::Num(0.0));
-            Ok(Value::Obj(obj))
-        });
+        let f = it.make_native("[Symbol.iterator]", 0, nf_string_iterator);
         sp.borrow_mut()
             .props
             .insert(Interp::sym_key(&sym), Property::builtin(Value::Obj(f)));

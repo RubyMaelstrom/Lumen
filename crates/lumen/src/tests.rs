@@ -1288,6 +1288,21 @@ fn iterator_protocol() {
         "3"
     );
     assert_eq!(run(&format!("{custom} [...obj].join(',')")), "0,1,2");
+    // SpreadEvaluation performs GetIterator even for arrays; a customized @@iterator must not
+    // be bypassed by the dense-array fast path (ECMA-262 section 13.2.4.1).
+    assert_eq!(
+        run("var a=[1,2]; a[Symbol.iterator]=function*(){yield 9; yield 8}; [...a].join(',')"),
+        "9,8"
+    );
+    assert_eq!(
+        run("Array.prototype[Symbol.iterator]=function*(){yield 7}; [...[1,2]].join(',')"),
+        "7"
+    );
+    // Primitive strings likewise consult the mutable String.prototype @@iterator property.
+    assert_eq!(
+        run("String.prototype[Symbol.iterator]=function*(){yield 'x'; yield 'y'}; [...'ab'].join(',')"),
+        "x,y"
+    );
 }
 
 #[test]
