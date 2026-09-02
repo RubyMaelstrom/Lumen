@@ -1077,6 +1077,8 @@ before changing broad execution behavior:
     Two paired release bytecode Navier-Stokes samples measured 442/438 without the switch and
     426/429 with it; the roughly 3% cost is recorded as a migration gap, so the switch remains
     disabled by default.
+    A post-scaffold release bytecode spot check measured 424 without and 428 with the switch;
+    this remains within observed run-to-run variance and does not justify changing the default.
   - [x] Connect the shadow migrated frame to a published root map and a forced safepoint/relocation
     test; dead slots remain ignored and invalid root words fail closed. Keep the live switch opt-in
     until the central heap owns production frames.
