@@ -667,6 +667,8 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [ ] Start with a correct stop-the-world old-generation mark/sweep tracer and bounded free lists
   behind the new root API. A nursery needs a collectible promotion destination; old-generation
   sophistication may wait, old-generation correctness may not.
+  - [x] The central tagged-field fixture now performs checked root marking and deterministic
+    sweeping; integrating the complete interpreter root inventory remains pending.
 - [ ] Trace every interpreter side table, Realm, module, job, promise, iterator, coroutine,
   WebAssembly, host object, WeakRef, FinalizationRegistry, WeakMap, and WeakSet edge.
 - [ ] Implement ephemeron marking to a correct fixed point and preserve ECMA-262 weak-reference
@@ -676,6 +678,8 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [ ] Add a copying nursery for eligible newly allocated objects.
 - [ ] Add old-to-young write barriers, remembered sets, and verification that recomputes the set
   independently in stress builds.
+  - [x] The central tagged-field fixture records barriered old-to-young stores and independently
+    recomputes/verifies its remembered set; live field-store integration remains pending.
 - [ ] Add age/promotion policy and allocation-site survival telemetry.
 - [ ] Define large-object, pinned host-object, executable-code, and external-backing-store spaces
   explicitly rather than forcing them through the copying nursery.

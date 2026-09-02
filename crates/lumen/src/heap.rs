@@ -65,7 +65,9 @@ pub(crate) enum HeapError {
     NotForwarded,
     PayloadKindMismatch,
     InvalidTaggedField,
+    FieldOutOfBounds,
     HeaderMismatch,
+    RememberedSetMismatch,
     RequestTooLarge,
     ReferenceSpaceExhausted,
 }
@@ -77,6 +79,7 @@ pub(crate) struct CentralHeap {
     objects: Vec<Option<HeapObject>>,
     requested_bytes: usize,
     no_gc: NoGcState,
+    remembered: Vec<HeapRef>,
 }
 
 impl Default for CentralHeap {
@@ -91,6 +94,7 @@ impl CentralHeap {
             objects: vec![None],
             requested_bytes: 0,
             no_gc: NoGcState::default(),
+            remembered: Vec::new(),
         }
     }
 
@@ -155,7 +159,9 @@ impl CentralHeap {
             },
             storage,
         }));
-        Ok(HeapRef::new(index).expect("central heap never publishes a zero handle"))
+        let reference = HeapRef::new(index).expect("central heap never publishes a zero handle");
+        self.refresh_remembered_reference(reference)?;
+        Ok(reference)
     }
 
     fn object(&self, reference: HeapRef) -> Result<&HeapObject, HeapError> {
@@ -214,6 +220,101 @@ impl CentralHeap {
         match &mut self.object_mut(reference)?.storage {
             HeapStorage::Tagged(fields) => Ok(fields),
             HeapStorage::Bytes(_) => Err(HeapError::PayloadKindMismatch),
+        }
+    }
+
+    fn has_young_edge(&self, reference: HeapRef) -> Result<bool, HeapError> {
+        let object = self.object(reference)?;
+        if object.header.generation == HeapGeneration::Young {
+            return Ok(false);
+        }
+        let HeapStorage::Tagged(fields) = &object.storage else {
+            return Ok(false);
+        };
+        for field in fields {
+            let Some(child) = field.as_heap() else {
+                continue;
+            };
+            if self.object(child)?.header.generation == HeapGeneration::Young {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn refresh_remembered_reference(&mut self, reference: HeapRef) -> Result<(), HeapError> {
+        self.remembered.retain(|entry| *entry != reference);
+        if self.has_young_edge(reference)? {
+            self.remembered.push(reference);
+        }
+        Ok(())
+    }
+
+    /// Store through the barriered tagged-field primitive. Direct mutable slices are retained for
+    /// verifier fixtures, but migrated object families must use this method for every write.
+    pub(crate) fn store_tagged_field(
+        &mut self,
+        reference: HeapRef,
+        index: usize,
+        value: TaggedValue,
+    ) -> Result<(), HeapError> {
+        value
+            .validate()
+            .map_err(|_| HeapError::InvalidTaggedField)?;
+        if let Some(child) = value.as_heap() {
+            self.object(child)?;
+        }
+        let fields = self.tagged_fields_mut(reference)?;
+        let field = fields.get_mut(index).ok_or(HeapError::FieldOutOfBounds)?;
+        *field = value;
+        self.refresh_remembered_reference(reference)
+    }
+
+    pub(crate) fn remembered_handles(&self) -> Vec<HeapRef> {
+        self.remembered.clone()
+    }
+
+    /// Recompute old-to-young edges independently of the incremental barrier state.
+    pub(crate) fn recompute_remembered_set(&self) -> Result<Vec<HeapRef>, HeapError> {
+        self.validate_all()?;
+        let mut recomputed = Vec::new();
+        for (index, slot) in self.objects.iter().enumerate().skip(1) {
+            let Some(object) = slot else { continue };
+            if object.header.forwarding.is_some()
+                || object.header.generation == HeapGeneration::Young
+            {
+                continue;
+            }
+            let HeapStorage::Tagged(fields) = &object.storage else {
+                continue;
+            };
+            let mut has_young_edge = false;
+            for field in fields {
+                let Some(child) = field.as_heap() else {
+                    continue;
+                };
+                if self.object(child)?.header.generation == HeapGeneration::Young {
+                    has_young_edge = true;
+                    break;
+                }
+            }
+            if has_young_edge {
+                let index = u32::try_from(index).expect("heap index is bounded by the table");
+                recomputed.push(HeapRef::new(index).expect("slot zero is reserved"));
+            }
+        }
+        Ok(recomputed)
+    }
+
+    pub(crate) fn verify_remembered_set(&self) -> Result<(), HeapError> {
+        let mut recorded = self.remembered.clone();
+        let mut recomputed = self.recompute_remembered_set()?;
+        recorded.sort_by_key(|reference| reference.get());
+        recomputed.sort_by_key(|reference| reference.get());
+        if recorded == recomputed {
+            Ok(())
+        } else {
+            Err(HeapError::RememberedSetMismatch)
         }
     }
 
@@ -278,7 +379,7 @@ impl CentralHeap {
         generation: HeapGeneration,
     ) -> Result<(), HeapError> {
         self.object_mut(reference)?.header.generation = generation;
-        Ok(())
+        self.refresh_remembered_reference(reference)
     }
 
     pub(crate) fn requested_bytes(&self) -> usize {
@@ -355,6 +456,16 @@ impl CentralHeap {
             }
         }
         self.requested_bytes = self.requested_bytes.saturating_sub(released_bytes);
+        let remembered = std::mem::take(&mut self.remembered);
+        self.remembered = remembered
+            .into_iter()
+            .filter(|reference| {
+                self.objects
+                    .get(reference.get() as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|object| object.header.forwarding.is_none())
+            })
+            .collect();
         reclaimed
     }
 
@@ -392,6 +503,7 @@ impl CentralHeap {
             .saturating_add(moved.storage.requested_bytes());
         self.objects.push(Some(moved));
         let target = HeapRef::new(target_index).expect("central heap never publishes zero handle");
+        self.refresh_remembered_reference(target)?;
         let source_object = self
             .objects
             .get_mut(source.get() as usize)
@@ -418,6 +530,7 @@ impl CentralHeap {
         self.requested_bytes = self
             .requested_bytes
             .saturating_sub(released.storage.requested_bytes());
+        self.remembered.retain(|entry| *entry != source);
         Ok(target)
     }
 
@@ -440,6 +553,7 @@ impl CentralHeap {
         self.requested_bytes = self
             .requested_bytes
             .saturating_sub(released.storage.requested_bytes());
+        self.remembered.retain(|entry| *entry != reference);
         Ok(())
     }
 }
@@ -530,7 +644,8 @@ mod tests {
                 HeapGeneration::Young,
             )
             .unwrap();
-        heap.tagged_fields_mut(source).unwrap()[0] = TaggedValue::heap(source);
+        heap.store_tagged_field(source, 0, TaggedValue::heap(source))
+            .unwrap();
         let roots = RootSet::new();
         let root = roots.root(TaggedValue::heap(source)).unwrap();
 
@@ -613,12 +728,50 @@ mod tests {
         let roots = RootSet::new();
         let _root = roots.root(TaggedValue::heap(parent)).unwrap();
 
+        assert_eq!(heap.remembered_handles(), vec![parent]);
+        assert_eq!(heap.verify_remembered_set(), Ok(()));
         assert_eq!(heap.mark_roots(&roots), Ok(2));
         assert!(heap.header(parent).unwrap().marked);
         assert!(heap.header(child).unwrap().marked);
         assert_eq!(heap.sweep_unmarked(), 1);
         assert_eq!(heap.payload(unreachable), Err(HeapError::InvalidReference));
+        assert_eq!(heap.verify_remembered_set(), Ok(()));
         assert_eq!(heap.validate_all(), Ok(()));
+    }
+
+    #[test]
+    fn old_to_young_barrier_tracks_and_recomputes_edges() {
+        let mut heap = CentralHeap::new();
+        let old = heap
+            .allocate_tagged_fields(
+                LayoutId::new(30),
+                vec![TaggedValue::null()],
+                HeapGeneration::Old,
+            )
+            .unwrap();
+        let young = heap
+            .allocate_tagged_fields(
+                LayoutId::new(31),
+                vec![TaggedValue::undefined()],
+                HeapGeneration::Young,
+            )
+            .unwrap();
+        assert!(heap.remembered_handles().is_empty());
+        heap.store_tagged_field(old, 0, TaggedValue::heap(young))
+            .unwrap();
+        assert_eq!(heap.remembered_handles(), vec![old]);
+        assert_eq!(heap.verify_remembered_set(), Ok(()));
+
+        heap.store_tagged_field(old, 0, TaggedValue::null())
+            .unwrap();
+        assert!(heap.remembered_handles().is_empty());
+        assert_eq!(heap.verify_remembered_set(), Ok(()));
+
+        heap.store_tagged_field(old, 0, TaggedValue::heap(young))
+            .unwrap();
+        heap.promote(old, HeapGeneration::Young).unwrap();
+        assert!(heap.remembered_handles().is_empty());
+        assert_eq!(heap.verify_remembered_set(), Ok(()));
     }
 
     #[test]
@@ -631,7 +784,8 @@ mod tests {
                 HeapGeneration::Young,
             )
             .unwrap();
-        heap.tagged_fields_mut(source).unwrap()[0] = TaggedValue::heap(source);
+        heap.store_tagged_field(source, 0, TaggedValue::heap(source))
+            .unwrap();
         let target = heap.relocate(source).unwrap();
         assert_eq!(heap.validate_all(), Err(HeapError::ForwardedReference));
         assert_eq!(heap.rewrite_tagged_references(source, target), 2);
