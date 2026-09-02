@@ -1663,6 +1663,15 @@ impl Interp {
                 // use the thread-local immutable single-unit values instead of allocating a new
                 // LStr for every character.  Non-ASCII points retain the canonical UTF-16
                 // reconstruction, including lone-surrogate handling.
+                if s.ascii_hint() {
+                    let result = Ok(s
+                        .as_str()
+                        .bytes()
+                        .map(|unit| Value::Str(crate::jstr::unit_lstr(unit as u16)))
+                        .collect());
+                    crate::jit::perf_iterate_fast_end(perf_started);
+                    return result;
+                }
                 let result = Ok(crate::jstr::CodePointIter::new(s)
                     .map(|point| {
                         if point < 0x80 {
