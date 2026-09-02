@@ -2012,6 +2012,10 @@ fn proxy() {
         "9"
     );
     assert_eq!(
+        run("var key=''; var p = new Proxy({}, {set(t,k){key=k; return true}}); p[0]=3; key"),
+        "0"
+    );
+    assert_eq!(
         run("var p = new Proxy(function(){ this.v=1; }, {}); new p().v"),
         "1"
     ); // forward construct

@@ -4323,6 +4323,12 @@ impl Interp {
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return Err(v);
         }
+        // A Proxy/typed array/module/host object owns a different [[Set]] algorithm.  Do this
+        // identity check before probing the ordinary property storage so a future side-table
+        // representation cannot accidentally bypass its trap or backing store.
+        if !self.ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+            return Err(v);
+        }
         if (!self.module_ns.is_empty() || !self.deferred_ns.is_empty()) && {
             let ptr = Rc::as_ptr(o) as usize;
             self.module_ns.contains_key(&ptr) || self.deferred_ns.contains_key(&ptr)
