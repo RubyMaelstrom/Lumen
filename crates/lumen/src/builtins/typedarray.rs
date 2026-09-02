@@ -1243,6 +1243,20 @@ fn ta_native(
             if i.immutable_buffers.contains(&info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
+            if !i.shared_buffers.contains_key(&info.buffer) && i.ta_len(&info) == Some(len) {
+                if let Some(source) = i.ta_read_bytes(&info, 0, len) {
+                    // Ordinary TypedArray element swaps cannot invoke JavaScript. Snapshot and
+                    // rewrite the complete fixed-length byte range, preserving NaN payloads while
+                    // avoiding two boxed conversions per element (ECMA-262 §23.2.3.25).
+                    let es = info.kind.elsize();
+                    let mut reversed = Vec::with_capacity(source.len());
+                    for k in (0..len).rev() {
+                        reversed.extend_from_slice(&source[k * es..(k + 1) * es]);
+                    }
+                    i.ta_write_bytes(&info, 0, &reversed);
+                    return Ok(this.clone());
+                }
+            }
             for k in 0..len / 2 {
                 let a = i.ta_read(&info, k);
                 let b = i.ta_read(&info, len - 1 - k);

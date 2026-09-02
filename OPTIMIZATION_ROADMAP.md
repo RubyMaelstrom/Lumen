@@ -1007,6 +1007,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     unusual detach/shrink paths retain the per-element fallback (ECMA-262 §23.2.3.32). A release
     workload reversing 20,000 `Float64Array` elements 20 times improved from 0.094753 s to
     0.037062 s median (about 61%), with typed-array semantic tests passing.
+  - [x] Fixed-length ordinary-buffer `%TypedArray%.prototype.reverse` uses one source snapshot and
+    one reversed byte write, retaining the per-element path for shared, detached, or resized
+    buffers (ECMA-262 §23.2.3.25). An 11-sample release workload reversing 20,000 `Float64Array`
+    elements 20 times improved from 0.092922 s to 0.035680 s median (about 62%).
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
