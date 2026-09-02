@@ -10295,16 +10295,16 @@ fn install_string(it: &mut Interp) {
         // then allocate the result directly when no surrogate-boundary canonicalization is needed.
         if args.len() == 1 {
             let next = ab(i.to_string(&args[0]))?;
-            let total = s
-                .len()
+            s.len()
                 .checked_add(next.len())
                 .filter(|&len| len <= MAX_STR_LEN)
                 .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
             if !crate::jstr::needs_join_fixup(&s, &next) {
-                let mut out = String::with_capacity(total);
-                out.push_str(&s);
-                out.push_str(&next);
-                return Ok(Value::from_string(out));
+                // ECMA-262 §22.1.3.5 has already completed both ToString operations and only
+                // observes the resulting code-unit sequence.  With no surrogate-boundary fixup,
+                // retain that sequence directly in one LStr allocation instead of copying a
+                // temporary Rust String into the engine representation.
+                return Ok(Value::Str(crate::lstr::LStr::concat2(&s, &next)));
             }
             return Ok(Value::from_string(crate::jstr::concat(&s, &next)));
         }
