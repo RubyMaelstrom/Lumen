@@ -410,7 +410,6 @@ pub(super) fn install_set_methods(it: &mut Interp) {
     it.def_method(&sp, "isDisjointFrom", 1, |i, this, a| {
         let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
-        let vals = set_values(i, &this)?;
         if (coll_live_len(i, ptr) as f64) <= other_size {
             // Walk this Set LIVE by index (the `has` callback may mutate it), probing the other.
             let mut idx = 0usize;
@@ -432,7 +431,9 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // Iterate the other's keys lazily, probing this Set; close the iterator on early exit.
             let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
             while let Some(k) = set_like_next(i, &iter, &next)? {
-                if vals.iter().any(|v| same_value_zero(v, &k)) {
+                // SetDataHas is deliberately live: the arbitrary other's iterator can mutate the
+                // receiver between steps (ECMA-262 §24.2.4.10).
+                if set_data_has(i, ptr, &k) {
                     set_like_close(i, &iter);
                     return Ok(Value::Bool(false));
                 }
@@ -863,15 +864,28 @@ pub(super) fn install_map_like(
             }
             let elems = ab(i.iterate(&arg(a, 0)))?;
             let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            // GroupBy uses SameValueZero keys, so partition the temporary groups by the same
+            // collision-safe hash used by Map/Set instead of rescanning every prior group.
+            let mut group_index: crate::fasthash::FastMap<u64, Vec<usize>> = Default::default();
             for (idx, el) in elems.into_iter().enumerate() {
                 let key = ab(i.call(
                     cb.clone(),
                     Value::Undefined,
                     &[el.clone(), Value::Num(idx as f64)],
                 ))?;
-                match groups.iter_mut().find(|(k, _)| same_value_zero(k, &key)) {
-                    Some(g) => g.1.push(el),
-                    None => groups.push((key, vec![el])),
+                let hash = collection_key_hash(&key);
+                let existing = group_index.get(&hash).and_then(|bucket| {
+                    bucket
+                        .iter()
+                        .copied()
+                        .find(|&offset| same_value_zero(&groups[offset].0, &key))
+                });
+                if let Some(offset) = existing {
+                    groups[offset].1.push(el);
+                } else {
+                    let offset = groups.len();
+                    groups.push((key, vec![el]));
+                    group_index.entry(hash).or_default().push(offset);
                 }
             }
             let m = Object::new(i.extra_protos.get("Map").cloned());

@@ -11502,6 +11502,16 @@ fn set_operations_spec() {
     assert_eq!(run("new Set([1,2]).isSubsetOf(new Set([1,2,3]))"), "true");
     assert_eq!(run("new Set([1,2,3]).isSubsetOf(new Set([1,2]))"), "false");
     assert_eq!(run("new Set([1,2]).isDisjointFrom(new Set([3,4]))"), "true");
+    // The keys iterator is arbitrary and may mutate the receiver before yielding a key; the
+    // algorithm must probe the live [[SetData]] rather than a stale snapshot.
+    assert_eq!(
+        run("const s = new Set([1,2]); let step = 0;
+             const other = {size: 1, has(){return false;}, keys(){return {next(){
+               if (step++ === 0) s.delete(1);
+               return step === 1 ? {value:1,done:false} : {done:true};
+             }}}}; s.isDisjointFrom(other)"),
+        "true"
+    );
     // A negative set-like size throws RangeError.
     assert_eq!(
         throws("new Set([1]).union({size:-1, has(){}, keys(){}})"),
