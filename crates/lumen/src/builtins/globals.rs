@@ -10,16 +10,26 @@ pub(super) fn install_globals(it: &mut Interp) {
         Ok(Value::Undefined)
     });
     global_fn(it, "parseInt", 2, |i, _t, a| {
-        let s = ab(i.to_string(&arg(a, 0)))?;
+        // ToString is the identity for Strings (ECMA-262 §7.1.2); bypass the second
+        // clone for the common string-input case. Other inputs keep the full path.
+        let s = match arg(a, 0) {
+            Value::Str(s) => s,
+            v => ab(i.to_string(&v))?,
+        };
         // The radix is ToUint32'd (wrapping), so e.g. 2^32+2 means radix 2 and Infinity means 0.
+        // ToNumber is the identity for Numbers (§7.1.4), so apply ToUint32 directly.
         let radix = match arg(a, 1) {
             Value::Undefined => 0,
+            Value::Num(r) => to_uint32(r),
             v => ab(i.to_uint32(&v))?,
         };
         Ok(Value::Num(parse_int(&s, radix)))
     });
     global_fn(it, "parseFloat", 1, |i, _t, a| {
-        let s = ab(i.to_string(&arg(a, 0)))?;
+        let s = match arg(a, 0) {
+            Value::Str(s) => s,
+            v => ab(i.to_string(&v))?,
+        };
         Ok(Value::Num(parse_float(&s)))
     });
     // Number.parseInt / Number.parseFloat are the same functions as the globals.
@@ -41,10 +51,19 @@ pub(super) fn install_globals(it: &mut Interp) {
         }
     }
     global_fn(it, "isNaN", 1, |i, _t, a| {
-        Ok(Value::Bool(ab(i.to_number(&arg(a, 0)))?.is_nan()))
+        // ToNumber identity for Numbers (§7.1.4); other inputs keep the full coercive path.
+        let n = match arg(a, 0) {
+            Value::Num(n) => n,
+            v => ab(i.to_number(&v))?,
+        };
+        Ok(Value::Bool(n.is_nan()))
     });
     global_fn(it, "isFinite", 1, |i, _t, a| {
-        Ok(Value::Bool(ab(i.to_number(&arg(a, 0)))?.is_finite()))
+        let n = match arg(a, 0) {
+            Value::Num(n) => n,
+            v => ab(i.to_number(&v))?,
+        };
+        Ok(Value::Bool(n.is_finite()))
     });
     // Annex B escape/unescape.
     global_fn(it, "escape", 1, |i, _t, a| {

@@ -4047,6 +4047,33 @@ fn misc_globals() {
 }
 
 #[test]
+fn global_numeric_fast_paths_preserve_conversion_edges() {
+    assert_eq!(run("parseInt('42px')"), "42");
+    assert_eq!(run("parseInt('11', 2)"), "3");
+    assert_eq!(run("parseInt('11', '2')"), "3");
+    assert_eq!(run("parseInt('11', Infinity)"), "11");
+    assert_eq!(run("parseInt('11', 4294967298)"), "3");
+    assert_eq!(run("parseFloat('3.5x')"), "3.5");
+    assert_eq!(run("isNaN(NaN)"), "true");
+    assert_eq!(run("isNaN('NaN')"), "true");
+    assert_eq!(run("isFinite(42)"), "true");
+    assert_eq!(run("isFinite('42')"), "true");
+    assert_eq!(run("isFinite(Infinity)"), "false");
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 42}}; isFinite(o) && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("var hits=0; var o={toString(){hits++;return '11'}}; parseInt(o)===11 && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("try{isNaN(Symbol())}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+}
+
+#[test]
 fn destructuring_assignment() {
     assert_eq!(run("var a,b; [a,b]=[1,2]; a+','+b"), "1,2");
     assert_eq!(run("var a,b; ({a,b}={a:3,b:4}); a+','+b"), "3,4");

@@ -1050,6 +1050,14 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     §21.3.2). A matched 15-sample fat-LTO mixed workload improved from 328 ms to 319 ms median
     (about 2.9%); the matching rapid no-LTO pair was neutral (337 ms vs 339 ms, within noise).
     Edge/coercion tests, Test262 `built-ins/Math` 327/327, the full 814-test suite, and clippy pass.
+  - [x] Global `parseInt`/`parseFloat`/`isNaN`/`isFinite` bypass redundant ToString/ToNumber
+    dispatch for primitive string/Number inputs (`parseInt` radix uses direct ToUint32 for
+    Numbers), while generic calls retain complete coercion with abrupt completions and
+    valueOf/toString ordering (ECMA-262 §7.1.2–4, §19.2.5–6). A matched 15-sample fat-LTO
+    mixed workload improved from 228 ms to 225 ms median (about 1.3%); the matching rapid
+    no-LTO pair improved from 237 ms to 229 ms (about 3.6%). Edge/coercion tests, Test262
+    `parseInt`/`parseFloat`/`isNaN`/`isFinite` 139/139, the full 816-test suite, browser
+    `quick` replay green, and clippy pass.
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
