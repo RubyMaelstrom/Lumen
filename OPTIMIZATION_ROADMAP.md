@@ -591,11 +591,14 @@ finish the baseline, but no later phase may claim a performance win against the 
     JSON. Disabled runs retain the existing fast path.
   - [ ] Attribute guard failures, side exits, deoptimizations, and reoptimization suppression to
     stable bytecode sites without turning diagnostics into execution policy.
-- [ ] Record parser, preparser, bytecode, snapshot/cache-hit, and cache-deserialization time.
+- [x] Record parser, preparser, bytecode, snapshot/cache-hit, and cache-deserialization time.
   - [x] Expose opt-in lexer/parser timings, bytecode compile attempts/outcomes, and snapshot
     encode/decode timings in the performance JSON. The existing snapshot decoder is the only
     cache-deserialization path today; Lumen has no separate preparser, so no synthetic zero is
     reported for one.
+  - [x] Verified 2026-09-03: loop workload reports `lex:1 parse:1 bc:1/1` with nonzero
+    seconds plus `snapshot_encode/decode` attempts/outcomes in the same envelope; persistent
+    bytecode cache remains Phase 10 work, so snapshot decode stays the only deserialization metric.
 - [ ] Record host/native call counts and time by stable operation identity without requiring
   source-name guesses.
   - [x] Expose opt-in aggregate native invocation counts, failures, and elapsed time at both the
