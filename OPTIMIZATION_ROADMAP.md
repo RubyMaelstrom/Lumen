@@ -605,9 +605,14 @@ finish the baseline, but no later phase may claim a performance win against the 
     - [x] Data-carrying host callables retain an immutable registration label for diagnostics,
       independent of the author-visible mutable `name` property; legacy bare `NativeFn` labels
       remain explicitly identified as a compatibility limitation.
-- [ ] Measure error construction as separate message conversion, object allocation, stack capture,
+- [x] Measure error construction as separate message conversion, object allocation, stack capture,
   and stack formatting costs; distinguish constructed, thrown/caught, and escaping errors before
   considering lazy stack materialization for Lumen's non-standard `stack` extension.
+  - [x] Verified 2026-09-03 on `5d5c8e4`: 100-throw caught workload reports `constructions:100
+    caught:100 escaped:0` with nonzero `object/message/capture/format` timings and `capture:100
+    format:100` calls; `caught` fires only at `catch` clauses across tree-walker/bytecode/JIT
+    boundaries (finalizers/iterator cleanup excluded), `escaped` only at public sync exits.
+    Disabled gate is a cached `AtomicU8` + `None` start with early return, so no timestamp when off.
   - [x] Expose opt-in construction counts plus message-conversion, stack-capture, and stack-format
     timings at the existing error helpers; no error behavior or stack contents change.
   - [x] Add object-allocation timing; lifecycle classification (constructed versus caught or
