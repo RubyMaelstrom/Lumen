@@ -1320,6 +1320,11 @@ pub struct Interp {
     /// once per Agent so hot bytecode operators do not repeatedly consult process synchronization
     /// state; unset keeps the established numeric fast path unchanged.
     pub(crate) tagged_arithmetic: bool,
+    /// Raw argument list being forwarded by an active synthesized default constructor to its
+    /// `super(...)` call (ECMA-262 ClassDefinitionEvaluation): present only between a default
+    /// constructor's entry and its single super spread, so the spread forwards values without
+    /// the observable %Array.prototype% iterator evaluation. `None` outside those frames.
+    pub(crate) super_forward_args: Option<Rc<[Value]>>,
     /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
     /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
     pub(crate) vm_pool: Vec<(Vec<Value>, Vec<Value>)>,
@@ -1736,6 +1741,7 @@ interp_memory_inventory! {
     tier => "non_owning",
     tier_threshold => "non_owning",
     tagged_arithmetic => "non_owning",
+    super_forward_args => "measured",
     vm_pool => "measured",
     stub_cache => "measured",
     stub_cache_names => "measured",
@@ -1867,7 +1873,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 131);
+    assert_eq!(names.len(), 132);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -2586,6 +2592,7 @@ impl Interp {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
             tagged_arithmetic: std::env::var_os("LUMEN_TAGGED_ARITHMETIC").is_some(),
+            super_forward_args: None,
             vm_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
@@ -8400,7 +8407,19 @@ impl Interp {
             strict: func.is_strict,
             extra: None,
         });
+        // A synthesized default constructor forwards its raw argument list to `super(...)`
+        // (ECMA-262 ClassDefinitionEvaluation); restore any outer forward so nested default
+        // constructors inside field initializers do not leak theirs across frames.
+        let saved_forward = std::mem::replace(
+            &mut self.super_forward_args,
+            if func.default_ctor {
+                Some(Rc::from(args))
+            } else {
+                None
+            },
+        );
         let r = self.call_user_inner(func, closure, this, args, is_construct, fn_obj);
+        self.super_forward_args = saved_forward;
         self.fn_frames.pop();
         r
     }

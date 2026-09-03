@@ -653,6 +653,92 @@ fn classes_inheritance() {
 }
 
 #[test]
+fn default_constructor_forwards_args_without_iterator_protocol() {
+    // ECMA-262 ClassDefinitionEvaluation: the default constructor's super spread behaves like
+    // `constructor(...args) { super(...args); }` EXCEPT that it does not observably call
+    // %Symbol.iterator% on %Array.prototype%; the raw argument list is forwarded (see
+    // language/statements/class/subclass/default-constructor-spread-override.js).
+    let source = r#"
+        Array.prototype[Symbol.iterator] = function() { throw new Error('iterator invoked'); };
+        class Base { constructor(value, extra) { this.value = value; this.extra = extra; } }
+        class Derived extends Base {}
+        const instance = new Derived(5, 7);
+        String(instance.value) + ':' + String(instance.extra)
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(v) => assert_eq!(v, "5:7", "{tier:?}"),
+            Completion::Throw { name, message } => {
+                panic!("{tier:?} unexpectedly ran the iterator protocol: {name}: {message}")
+            }
+        }
+    }
+}
+
+#[test]
+fn written_constructor_spread_still_uses_iterator_protocol() {
+    // A user-written `constructor(...args) { super(...args); }` DOES perform argument
+    // evaluation; only the default constructor skips the observable %Symbol.iterator% call.
+    let source = r#"
+        Array.prototype[Symbol.iterator] = function() { throw new TypeError('iterator invoked'); };
+        class Base { constructor(value) { this.value = value; } }
+        class Derived extends Base { constructor(...args) { super(...args); } }
+        new Derived(5);
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(v) => panic!("{tier:?} skipped argument evaluation: {v}"),
+            Completion::Throw { name, message } => {
+                assert_eq!(name, "TypeError", "{tier:?}");
+                assert!(message.contains("iterator invoked"), "{tier:?}: {message}");
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_default_constructors_restore_super_forwarding() {
+    // A default constructor inside another default constructor's field initializer must not
+    // leak or steal the outer frame's forwarded argument list.
+    let source = r#"
+        class Base { constructor() { this.ok = true; } }
+        class D2 extends Base {}
+        class D1 extends Base { x = new D2(); }
+        let d = new D1();
+        d.ok && d.x.ok
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(v) => assert_eq!(v, "true", "{tier:?}"),
+            Completion::Throw { name, message } => {
+                panic!("{tier:?} threw {name}: {message}")
+            }
+        }
+    }
+}
+
+#[test]
 fn instanceof_default_intrinsic_and_override() {
     assert_eq!(
         run(

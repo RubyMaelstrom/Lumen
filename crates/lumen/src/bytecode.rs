@@ -3843,6 +3843,7 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         is_async: true,
         is_method: false,
         is_fn_expr: false,
+        default_ctor: false,
         source: None,
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
@@ -11777,6 +11778,14 @@ fn run_vm(
             Op::ArraySpread => {
                 let spread = pop!();
                 let array = stack.last().expect("array builder missing").clone();
+                // Default-constructor super spread forwards the raw argument list (ECMA-262
+                // ClassDefinitionEvaluation) without the observable %Symbol.iterator% call.
+                if let Some(forward) = i.super_forward_args.take() {
+                    for value in forward.iter() {
+                        array_literal_append(i, &array, Some(value.clone()))?;
+                    }
+                    continue;
+                }
                 let (iterator, next) = i.get_iterator(&spread)?;
                 while let Some(value) = i.iterator_step(&iterator, &next)? {
                     array_literal_append(i, &array, Some(value))?;

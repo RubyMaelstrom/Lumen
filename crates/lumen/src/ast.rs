@@ -407,6 +407,12 @@ pub struct Function {
     /// A function *expression* (`(function f(){})`): its own name binds immutably inside the
     /// function. A declaration's name binds (mutably) in the enclosing scope instead.
     pub is_fn_expr: bool,
+    /// The synthesized default constructor of a class (ECMA-262 ClassDefinitionEvaluation,
+    /// `ClassTail`: default constructors forward the raw argument list to `super` instead of
+    /// performing the observable `%Array.prototype%` iterator evaluation of a written
+    /// `constructor(...args) { super(...args); }`; see `default_constructor`). Always false for
+    /// parsed source; only the class member synthesis sets it.
+    pub default_ctor: bool,
     /// The source text this function was parsed from, for `Function.prototype.toString`.
     pub source: Option<Rc<str>>,
     /// Lazily-computed body facts (see [`Function::scan_flags`]): bit 0 = scanned, bit 1 =

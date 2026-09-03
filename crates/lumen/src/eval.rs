@@ -3547,7 +3547,14 @@ impl Interp {
         // bytecode VM uses the same two helpers with suspension between those phases.
         if matches!(callee, Expr::Super) {
             let (new_target, super_constructor) = self.prepare_super_call(env)?;
-            let argv = self.eval_args(args, env)?;
+            // The synthesized default constructor forwards the raw argument list to super
+            // (ECMA-262 ClassDefinitionEvaluation): the observable %Symbol.iterator% call of a
+            // written `super(...args)` does not happen. Any other frame falls through to the
+            // full argument evaluation below.
+            let argv = match self.super_forward_args.take() {
+                Some(forward) => Vec::from(&*forward),
+                None => self.eval_args(args, env)?,
+            };
             return self.finish_super_call(new_target, super_constructor, &argv, env);
         }
         // `super.m(...)` / `super[k](...)`: method on the super prototype, called with current `this`.
@@ -7811,6 +7818,7 @@ fn default_constructor(derived: bool) -> Function {
         is_async: false,
         is_method: false,
         is_fn_expr: false,
+        default_ctor: derived,
         source: None,
     }
 }

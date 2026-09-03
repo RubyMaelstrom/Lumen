@@ -1231,7 +1231,8 @@ fn enc_function(w: &mut Writer, f: &Function) {
         | (f.is_generator as u8) << 3
         | (f.is_async as u8) << 4
         | (f.is_method as u8) << 5
-        | (f.is_fn_expr as u8) << 6;
+        | (f.is_fn_expr as u8) << 6
+        | (f.default_ctor as u8) << 7;
     w.u8(flags);
     enc_opt_rcstr(w, &f.source);
 }
@@ -1266,6 +1267,7 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         is_async: flags & 16 != 0,
         is_method: flags & 32 != 0,
         is_fn_expr: flags & 64 != 0,
+        default_ctor: flags & 128 != 0,
         source,
         // Lazy runtime caches — start empty, exactly as the parser leaves them.
         scan: Cell::new(0),

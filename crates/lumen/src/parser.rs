@@ -3335,6 +3335,7 @@ impl Parser {
             is_async,
             is_method: false,
             is_fn_expr: is_expr,
+            default_ctor: false,
             source: self.src_slice(start, self.prev_end()),
         };
         // A function declaration/expression is never a derived constructor, so a `super(...)` call
@@ -3529,6 +3530,7 @@ impl Parser {
                 is_async: false,
                 is_method: false,
                 is_fn_expr: false,
+                default_ctor: false,
                 source: None,
             };
             return Ok(vec![ClassMember {
@@ -3706,6 +3708,7 @@ impl Parser {
             is_async,
             is_method: true,
             is_fn_expr: false,
+            default_ctor: false,
             source: self.src_slice(start, self.prev_end()),
         })
     }
@@ -3939,6 +3942,7 @@ impl Parser {
                 is_async,
                 is_method: false,
                 is_fn_expr: false,
+                default_ctor: false,
                 source: self.src_slice(start, self.prev_end()),
             }
         } else {
@@ -3960,6 +3964,7 @@ impl Parser {
                 is_async,
                 is_method: false,
                 is_fn_expr: false,
+                default_ctor: false,
                 source: self.src_slice(start, self.prev_end()),
             }
         };

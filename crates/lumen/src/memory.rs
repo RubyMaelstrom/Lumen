@@ -1476,6 +1476,16 @@ fn scan_realm(
     );
     visitor.value(&interp.new_target);
     visitor.value(&interp.pending_new_target);
+    // A default constructor's raw super-argument list is transient active-execution state: its
+    // storage is side-table scratch, its Values route to their canonical payload families.
+    if let Some(forward) = &interp.super_forward_args {
+        totals
+            .interpreter_side_tables
+            .add(forward.len().saturating_mul(size_of::<Value>()));
+        for value in forward.iter() {
+            visitor.value(value);
+        }
+    }
     for frame in &interp.fn_frames {
         if let Some(extra) = &frame.extra {
             totals
