@@ -1007,6 +1007,12 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     mixed workload improved from 438 ms to 397 ms median (about 9%), and the matching rapid no-LTO
     pair improved from 472 ms to 416 ms (about 12%); the full 812-test suite, clippy, and browser
     replay checks remain green (`960:49:126386880`, event-loop completion, and `100:100:100`).
+  - [x] Numeric `Math.pow`, `Math.atan2`, and `Math.imul` calls bypass redundant ToNumber/ToUint32
+    dispatch when both arguments are primitive Numbers, while generic and coercive calls retain
+    the complete normative algorithms (ECMA-262 §21.3.2.8, §21.3.2.20, §21.3.2.27). A matched
+    15-sample fat-LTO workload improved from 991 ms to 818 ms median (about 17.5%); the matching
+    rapid no-LTO pair improved from 1,027 ms to 910 ms. Edge/coercion tests, the full 812-test
+    suite, and clippy pass.
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).

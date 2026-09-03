@@ -178,6 +178,11 @@ pub(super) fn install_math(it: &mut Interp) {
         Ok(Value::Num(hypot_converted(&nums)))
     });
     it.def_method(&math, "imul", 2, |i, _t, a| {
+        if let [Value::Num(x), Value::Num(y)] = a {
+            let x = to_uint32(*x) as i32;
+            let y = to_uint32(*y) as i32;
+            return Ok(Value::Num(x.wrapping_mul(y) as f64));
+        }
         let x = to_uint32(ab(i.to_number(&arg(a, 0)))?) as i32;
         let y = to_uint32(ab(i.to_number(&arg(a, 1)))?) as i32;
         Ok(Value::Num(x.wrapping_mul(y) as f64))
@@ -196,18 +201,17 @@ pub(super) fn install_math(it: &mut Interp) {
     unary!("asin", f64::asin);
     unary!("acos", f64::acos);
     it.def_method(&math, "pow", 2, |i, _t, a| {
+        if let [Value::Num(base), Value::Num(exp)] = a {
+            return Ok(Value::Num(math_pow_numbers(*base, *exp)));
+        }
         let base = ab(i.to_number(&arg(a, 0)))?;
         let exp = ab(i.to_number(&arg(a, 1)))?;
-        // Number::exponentiate special cases Rust's powf doesn't share: a NaN exponent is NaN even
-        // for base 1, and a base of ±1 with an infinite exponent is NaN.
-        let r = if exp.is_nan() || (base.abs() == 1.0 && exp.is_infinite()) {
-            f64::NAN
-        } else {
-            base.powf(exp)
-        };
-        Ok(Value::Num(r))
+        Ok(Value::Num(math_pow_numbers(base, exp)))
     });
     it.def_method(&math, "atan2", 2, |i, _t, a| {
+        if let [Value::Num(y), Value::Num(x)] = a {
+            return Ok(Value::Num(y.atan2(*x)));
+        }
         Ok(Value::Num(
             ab(i.to_number(&arg(a, 0)))?.atan2(ab(i.to_number(&arg(a, 1)))?),
         ))
@@ -311,6 +315,16 @@ fn hypot_converted(values: &[f64]) -> f64 {
         }
     }
     max_abs * scaled_sum.sqrt()
+}
+
+fn math_pow_numbers(base: f64, exp: f64) -> f64 {
+    // Number::exponentiate special cases Rust's powf doesn't share: a NaN exponent is NaN even
+    // for base 1, and a base of ±1 with an infinite exponent is NaN.
+    if exp.is_nan() || (base.abs() == 1.0 && exp.is_infinite()) {
+        f64::NAN
+    } else {
+        base.powf(exp)
+    }
 }
 
 fn math_max_generic(i: &mut Interp, a: &[Value]) -> Result<Value, Value> {

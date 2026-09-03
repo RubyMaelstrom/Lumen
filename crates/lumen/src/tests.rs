@@ -11704,6 +11704,19 @@ fn math_min_max_numeric_fast_path_preserves_spec_edges() {
 }
 
 #[test]
+fn math_binary_numeric_fast_paths_preserve_conversion_edges() {
+    assert_eq!(run("Number.isNaN(Math.pow(1, NaN))"), "true");
+    assert_eq!(run("Number.isNaN(Math.pow(-1, Infinity))"), "true");
+    assert_eq!(run("Math.imul(4294967295, 5)"), "-5");
+    assert_eq!(run("Math.atan2(0, -0) === Math.PI"), "true");
+    assert_eq!(run("Object.is(Math.atan2(-0, 1), -0)"), "true");
+    assert_eq!(
+        run("var hits=0; var n={valueOf(){hits++;return 2}}; Math.pow(n,3); hits"),
+        "1"
+    );
+}
+
+#[test]
 fn jit_math_sqrt_intrinsic_preserves_fallbacks_and_identity_guards() {
     assert_eq!(
         run_jit(
