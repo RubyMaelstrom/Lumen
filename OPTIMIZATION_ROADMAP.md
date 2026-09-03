@@ -960,6 +960,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     retaining stable ordering and comparator abrupt-completion behavior while removing recursive
     per-level vector allocations (ECMA-262 §23.1.3.30.1). An 11-sample 5,000-element release
     workload improved from 0.098384 s to 0.095119 s (about 3%).
+  - [x] JSON array/object assembly streams already-serialized members into one output buffer,
+    removing the temporary `join` result while preserving ECMA-262 §25.5.2.5 ordering and
+    indentation. A nested 1,000-call release workload improved from 331 ms to 311 ms median
+    (about 6%).
   - [x] Array `indexOf`, `lastIndexOf`, `some`, and `every` share the checked dense own-data
     probe used by the other indexed callbacks, avoiding decimal-key construction and a separate
     `HasProperty` walk for ordinary dense arrays while retaining hole/prototype/accessor/proxy

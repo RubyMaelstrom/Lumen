@@ -451,16 +451,47 @@ fn join_json(
     inner: &str,
     outer: &str,
 ) -> String {
-    if parts.is_empty() {
-        format!("{open}{close}")
-    } else if gap.is_empty() {
-        format!("{open}{}{close}", parts.join(","))
+    // JSON.stringify's array/object assembly is a deterministic concatenation (ECMA-262
+    // §25.5.2.5). Stream the already-serialized members into one buffer instead of joining them
+    // into a temporary string and formatting a second copy.
+    let separators = if gap.is_empty() {
+        parts.len().saturating_sub(1)
     } else {
-        format!(
-            "{open}\n{inner}{}\n{outer}{close}",
-            parts.join(&format!(",\n{inner}"))
-        )
+        parts.len().saturating_sub(1) * (2 + inner.len()) + 2 + inner.len() + outer.len()
+    };
+    let capacity = open
+        .len()
+        .saturating_add(close.len())
+        .saturating_add(parts.iter().map(String::len).sum::<usize>())
+        .saturating_add(separators);
+    let mut out = String::with_capacity(capacity);
+    out.push_str(open);
+    if parts.is_empty() {
+        out.push_str(close);
+        return out;
     }
+    if gap.is_empty() {
+        for (index, part) in parts.iter().enumerate() {
+            if index != 0 {
+                out.push(',');
+            }
+            out.push_str(part);
+        }
+    } else {
+        out.push('\n');
+        out.push_str(inner);
+        for (index, part) in parts.iter().enumerate() {
+            if index != 0 {
+                out.push_str(",\n");
+                out.push_str(inner);
+            }
+            out.push_str(part);
+        }
+        out.push('\n');
+        out.push_str(outer);
+    }
+    out.push_str(close);
+    out
 }
 
 fn json_skip_ws(chars: &[char], pos: &mut usize) {
