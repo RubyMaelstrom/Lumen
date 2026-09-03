@@ -138,7 +138,31 @@ pub(super) fn install_json(it: &mut Interp) {
 }
 
 fn json_quote(s: &str) -> String {
-    let mut out = String::from("\"");
+    // QuoteJSONString (ECMA-262 §25.5.4.3) operates on UTF-16 code points. ASCII has no
+    // surrogate or multi-unit cases, so keep this common path byte-based and avoid the Unicode
+    // iterator/peek state entirely.
+    if s.is_ascii() {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for &b in s.as_bytes() {
+            match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                0x08 => out.push_str("\\b"),
+                0x0c => out.push_str("\\f"),
+                b if b < 0x20 => push_json_unicode_escape(&mut out, b as u16),
+                b => out.push(b as char),
+            }
+        }
+        out.push('"');
+        return out;
+    }
+
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
     let mut chars = s.chars().peekable();
     while let Some(mut c) = chars.next() {
         // A smuggled pair round-trips as its real character. If that character itself falls in
@@ -161,16 +185,26 @@ fn json_quote(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{0008}' => out.push_str("\\b"),
             '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => push_json_unicode_escape(&mut out, c as u16),
             c => match crate::jstr::smuggled(c) {
                 // Well-formed JSON.stringify: a lone surrogate is written as its \u escape.
-                Some(u) => out.push_str(&format!("\\u{u:04x}")),
+                Some(u) => push_json_unicode_escape(&mut out, u),
                 None => out.push(c),
             },
         }
     }
     out.push('"');
     out
+}
+
+#[inline]
+fn push_json_unicode_escape(out: &mut String, unit: u16) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push_str("\\u");
+    out.push(HEX[((unit >> 12) & 0x0f) as usize] as char);
+    out.push(HEX[((unit >> 8) & 0x0f) as usize] as char);
+    out.push(HEX[((unit >> 4) & 0x0f) as usize] as char);
+    out.push(HEX[(unit & 0x0f) as usize] as char);
 }
 
 /// JSON.stringify options: an optional function replacer and/or an array PropertyList of keys.

@@ -10908,6 +10908,21 @@ fn json_stringify_replacer() {
 }
 
 #[test]
+fn json_stringify_quote_escapes() {
+    // QuoteJSONString uses the short escapes for the listed controls and lowercase four-digit
+    // UnicodeEscape for every other control code unit (ECMA-262 §25.5.4.3–4).
+    assert_eq!(
+        run("JSON.stringify(String.fromCharCode(34,92,8,12,10,13,9,0,31))"),
+        r#""\"\\\b\f\n\r\t\u0000\u001f""#
+    );
+    // Astral code points remain encoded as UTF-8, while lone surrogate code units are escaped.
+    assert_eq!(
+        run("JSON.stringify(['😀', String.fromCharCode(0xD83D)])"),
+        r#"["😀","\ud83d"]"#
+    );
+}
+
+#[test]
 fn error_is_error_and_stack() {
     assert_eq!(run("Error.isError(new TypeError())"), "true");
     assert_eq!(run("Error.isError({})"), "false");
