@@ -1145,6 +1145,14 @@ fn ta_native(
                 .min(curlen as i64 - to as i64)
                 .min(curlen as i64 - from as i64);
             if count > 0 {
+                // TypedArray copyWithin has no user-observable conversion between reads and
+                // writes. Snapshot raw bytes before the write so overlapping ranges retain the
+                // specified source-before-target behavior and NaN payloads, while avoiding a
+                // boxed Value and numeric conversion per element (ECMA-262 §23.2.3.6).
+                if let Some(bytes) = i.ta_read_bytes(&info, from, count as usize) {
+                    i.ta_write_bytes(&info, to, &bytes);
+                    return Ok(this.clone());
+                }
                 let snap: Vec<Value> = (0..count as usize)
                     .map(|j| i.ta_read(&info, from + j))
                     .collect();

@@ -1011,6 +1011,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     one reversed byte write, retaining the per-element path for shared, detached, or resized
     buffers (ECMA-262 §23.2.3.25). An 11-sample release workload reversing 20,000 `Float64Array`
     elements 20 times improved from 0.092922 s to 0.035680 s median (about 62%).
+  - [x] `%TypedArray%.prototype.copyWithin` snapshots and writes the affected raw-byte range once,
+    preserving overlap and bit-level encodings while retaining the existing conversion fallback
+    if the byte snapshot is unavailable (ECMA-262 §23.2.3.6). A release workload moving 19,900
+    `Float64Array` elements 20 times improved from 0.076882 s to 0.055357 s median (about 28%).
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
