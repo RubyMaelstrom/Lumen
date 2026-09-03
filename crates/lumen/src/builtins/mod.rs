@@ -5614,7 +5614,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 &[v, Value::Num(k as f64), ov.clone()],
             ))?;
             let key = k.to_string();
-            json_create_data_prop_or_throw(i, &result, &key, mapped)?;
+            // ECMA-262 §23.1.3.21 step 6.3: CreateDataPropertyOrThrow.  The
+            // trap-aware helper keeps the ordinary fresh-array fast path while
+            // preserving species/proxy/exotic fallbacks.
+            cdp_or_throw(i, &result, &key, mapped)?;
         }
         Ok(result)
     });
@@ -5642,7 +5645,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 &[v.clone(), Value::Num(k as f64), ov.clone()],
             ))?;
             if i.to_boolean(&keep) {
-                json_create_data_prop_or_throw(i, &result, &to.to_string(), v)?;
+                // ECMA-262 §23.1.3.8 step 6.3.1: CreateDataPropertyOrThrow.
+                cdp_or_throw(i, &result, &to.to_string(), v)?;
                 to += 1;
             }
         }

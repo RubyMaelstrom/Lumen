@@ -957,6 +957,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     callback inputs, bypassing repeated key/HasProperty/Get work while retaining the generic path
     for holes, accessors, inherited values, proxies, and mutations; an 11-sample release workload
     improved from 0.463318 s to 0.434543 s (about 6%).
+  - [x] Array `map` and `filter` use the trap-aware `CreateDataPropertyOrThrow` helper for result
+    writes, avoiding a descriptor-object allocation for fresh ordinary Array species while retaining
+    the generic proxy/exotic/non-extensible path (ECMA-262 §23.1.3.8 and §23.1.3.21). An 11-sample
+    release callback workload improved from 0.45 s at the exact parent to 0.38 s (about 16%); species,
+    descriptor, sparse-array, and proxy tests remain covered.
   - [x] ASCII `String.prototype.split` keeps each byte-aligned substring as an `LStr` and applies
     the limit while iterating, avoiding a Rust `String` temporary per piece; the UTF-16-unit and
     RegExp paths retain their required semantics (ECMA-262 §22.1.3.23). An 11-sample release

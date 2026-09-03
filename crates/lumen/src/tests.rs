@@ -5785,6 +5785,12 @@ fn array_join_streams_coercions_in_spec_order() {
 fn array_species() {
     assert_eq!(run("[1,2,3].map(x=>x*2).join(',')"), "2,4,6");
     assert_eq!(run("[1,2,3,4].filter(x=>x%2===0).join(',')"), "2,4");
+    assert_eq!(
+        run(
+            "var m=Object.getOwnPropertyDescriptor([1].map(x=>x),'0'); var f=Object.getOwnPropertyDescriptor([1].filter(x=>x),'0'); [m.writable,m.enumerable,m.configurable,f.writable,f.enumerable,f.configurable].join(',')"
+        ),
+        "true,true,true,true,true,true"
+    );
     assert_eq!(run("[1,2,3,4,5].slice(1,3).join(',')"), "2,3");
     assert_eq!(
         run("class A extends Array {}; new A(1,2,3).map(x=>x).constructor.name"),
