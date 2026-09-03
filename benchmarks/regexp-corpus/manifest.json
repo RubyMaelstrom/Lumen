@@ -1,0 +1,455 @@
+{
+  "schema_version": 1,
+  "title": "Stable RegExp corpus for tiering, differential, and matcher work",
+  "created": "2026-09-03",
+  "categories": [
+    "fixture",
+    "real-page",
+    "conformance",
+    "unicode",
+    "adversarial"
+  ],
+  "harness": {
+    "probe": "RegExp.exec once per subject from fresh lastIndex; adversarial entries may terminate via the engine step budget",
+    "timing": "per-entry iteration loop over the first subject, scaled to ~40ms, capped per entry"
+  },
+  "entries": [
+    {
+      "id": "uri-regex",
+      "category": "fixture",
+      "pattern": "(((\\w+):\\/\\/)([^\\/:]*)(:(\\d+))?)?([^#?]*)(\\?([^#]*))?(#(.*))?",
+      "flags": "",
+      "note": "v8-v7 regexp.js re1 verbatim; optional-group heavy",
+      "subjects": [
+        "http://example.com:8080/path?q=1#frag",
+        "uggc://jjj.snprobbx.pbz/ybtva.cuc",
+        "plain",
+        "a://b?c#d"
+      ],
+      "expected_matches": 4,
+      "subjects_sha256": "37e064e1a8bdaf3f1807abcc1a3c1e5ef9a9b80776f1130276bc82dbbdcde254"
+    },
+    {
+      "id": "trim-whitespace",
+      "category": "fixture",
+      "pattern": "^\\s*|\\s*$",
+      "flags": "g",
+      "note": "v8-v7 regexp.js re2 verbatim (trim)",
+      "subjects": [
+        "  hi  ",
+        "nospace",
+        "\t\nx\r\n",
+        ""
+      ],
+      "expected_matches": 4,
+      "subjects_sha256": "900f90e84d8f76f9228d321df0925f4afc2d2a7c3f784edab13ee420be21e2b8"
+    },
+    {
+      "id": "word-boundary-word",
+      "category": "fixture",
+      "pattern": "\\bQBZPbageby_cynprubyqre\\b",
+      "flags": "",
+      "note": "v8-v7 regexp.js re3 verbatim",
+      "subjects": [
+        "QBZPbageby_cynprubyqre",
+        "x QBZPbageby_cynprubyqre y",
+        "QBZPbageby",
+        "none here"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "8a41ecc0ce94ecc66370eff5ee94cee389fbff203c18a7b0d5c2cb0498b9e2f5"
+    },
+    {
+      "id": "single-char",
+      "category": "fixture",
+      "pattern": ",",
+      "flags": "",
+      "note": "v8-v7 regexp.js re4 verbatim",
+      "subjects": [
+        "a,b",
+        "abc",
+        ",,,"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "0b0c672b9d5b5ce9dc16adf8f26c6ac1ffd21c1bd5c361a268306e45f2b1d894"
+    },
+    {
+      "id": "alternation-runs",
+      "category": "fixture",
+      "pattern": "qqqq|qqq|qq|q|ZZZZ|ZZZ|ZZ|Z|llll|ll|l|uu|u|UU|U|zz|z|ff|f|gg|g|sss|ss|s|mmm|mm|m",
+      "flags": "g",
+      "note": "v8-v7 regexp.js inline alternation verbatim",
+      "subjects": [
+        "qqqq, ZZZ q, llll",
+        "abc",
+        "uuUU"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "e5250eee3d4c785a46405a4394ff676b4c5c84b1d38099f085fb118c732676fc"
+    },
+    {
+      "id": "cookie-param",
+      "category": "real-page",
+      "pattern": "(?:^|;)\\s*sevraqfgre_ynat=([^;]*)",
+      "flags": "",
+      "note": "v8-v7 regexp.js s19 pattern verbatim",
+      "subjects": [
+        "sevraqfgre_ynat=nvq%3Q",
+        "x; sevraqfgre_ynat=abc; y=1",
+        "not here"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "9f949b3c5a477ed3d62279efd3fd6f4eb0ab12dec41df26f5b7de74c12761818"
+    },
+    {
+      "id": "casefold-alt",
+      "category": "real-page",
+      "pattern": "\\?[\\w\\W]*(sevraqvq|punaaryvq|tebhcvq)=([^\\&\\?#]*)",
+      "flags": "i",
+      "note": "v8-v7 regexp.js re13 verbatim (case-insensitive alternation)",
+      "subjects": [
+        "?Fcrpvny=1&punAArYvq=abc&tebhcvq=2",
+        "?other=1",
+        "tebhcvq=1"
+      ],
+      "expected_matches": 1,
+      "subjects_sha256": "acc275bf1629041b6556d58f1afd094b60bcb1f7e06d0c544ffb6197c83608c9"
+    },
+    {
+      "id": "url-path-lookahead",
+      "category": "real-page",
+      "pattern": "^\\/(?!api\\/)[a-z0-9\\-_]+(\\/[a-z0-9\\-_]+)*\\/?$",
+      "flags": "",
+      "note": "modern SPA route guard",
+      "subjects": [
+        "/a/b/",
+        "/api/x",
+        "/",
+        "caf\u00e9"
+      ],
+      "expected_matches": 1,
+      "subjects_sha256": "873d1aa4f3d0217f7c789975a8d92a2370ffa2c564bcafb921dad5d3ced9caa7"
+    },
+    {
+      "id": "template-vars",
+      "category": "real-page",
+      "pattern": "\\$\\{[^}]*\\}",
+      "flags": "g",
+      "note": "template literal interpolation extraction",
+      "subjects": [
+        "hello ${name}!",
+        "${a.b} ${c}",
+        "no vars",
+        "${}"
+      ],
+      "expected_matches": 3,
+      "subjects_sha256": "92f8b956b740fba96fc0aae4abc0106046cb45e2989c05ac902c67eb83485b11"
+    },
+    {
+      "id": "number-lexeme",
+      "category": "real-page",
+      "pattern": "^[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?$",
+      "flags": "",
+      "note": "strict numeric literal scanner",
+      "subjects": [
+        "3.14",
+        "-.5e-3",
+        "+42",
+        "1.",
+        "0x10",
+        "abc"
+      ],
+      "expected_matches": 4,
+      "subjects_sha256": "59c7a3b0951394b6761bc7b652fe9106e19ed57dd88f61c9eb440591043a2fcd"
+    },
+    {
+      "id": "iso-date",
+      "category": "real-page",
+      "pattern": "\\d{4}-\\d{2}-\\d{2}",
+      "flags": "",
+      "note": "ISO date scan; '99-1-1' lacks the four-digit year group",
+      "subjects": [
+        "2024-01-31",
+        "99-1-1",
+        "2024-13-99",
+        "today"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "43315d002071bd7a7438495058c04bf7d09391f0e7e0af832621e2adf6d6afa8"
+    },
+    {
+      "id": "hex-color",
+      "category": "real-page",
+      "pattern": "#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})\\b",
+      "flags": "",
+      "note": "CSS hex color",
+      "subjects": [
+        "color: #fff",
+        "#a1b2c3",
+        "#12345",
+        "red",
+        "#xyz"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "2200cdf28c1ec7d2a02062a251507c22e1a9f5c6e71708fab87b6111ebf9dfb4"
+    },
+    {
+      "id": "domain",
+      "category": "real-page",
+      "pattern": "[a-z0-9-]+(\\.[a-z0-9-]+)+",
+      "flags": "i",
+      "note": "hostname with at least one dot; '-.x' matches via [a-z0-9-]+ then .x",
+      "subjects": [
+        "sub.example.com",
+        "localhost",
+        "-.x",
+        "UPPER.CASE"
+      ],
+      "expected_matches": 3,
+      "subjects_sha256": "f64864ec05383827ad47e988cfe5eb7aeebfde5a1250e3b7c205d8c9c8d42c8f"
+    },
+    {
+      "id": "ipv4",
+      "category": "real-page",
+      "pattern": "(?:\\d{1,3}\\.){3}\\d{1,3}",
+      "flags": "",
+      "note": "loose IPv4 scan; 'x.4.5.6' has only three groups",
+      "subjects": [
+        "192.168.0.1",
+        "999.1.2.3",
+        "1.2.3",
+        "x.4.5.6"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "4843c588c62f4035e37a725de7f77e44f9947a6d7a067e663174326800a16cb1"
+    },
+    {
+      "id": "email",
+      "category": "real-page",
+      "pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$",
+      "flags": "",
+      "note": "form validation; 'a@b.c' fails the two-letter TLD tail",
+      "subjects": [
+        "user@example.com",
+        "a@b.c",
+        "@example.com",
+        "user+tag@sub.domain.co"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "dd0864c4da58c6f4959a7b167c837975d5ebe31d007e0d03de52e1c0982bf059"
+    },
+    {
+      "id": "slug",
+      "category": "real-page",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "flags": "",
+      "note": "URL slug validation",
+      "subjects": [
+        "my-slug-2",
+        "-lead",
+        "trail-",
+        "abc"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "45549fd7efcc0c742d31e6965dc0de23de111cba9e91613b8e48ede876810b72"
+    },
+    {
+      "id": "jwt-like",
+      "category": "real-page",
+      "pattern": "eyJ[a-zA-Z0-9_-]*\\.[a-zA-Z0-9_-]*\\.[a-zA-Z0-9_-]*",
+      "flags": "",
+      "note": "JWT header scan; pattern requires the literal eyJ prefix",
+      "subjects": [
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig",
+        "eyJx",
+        "header.payload.sig"
+      ],
+      "expected_matches": 1,
+      "subjects_sha256": "ad570949595ed1bb6ebb4b27983f0d6c2cc48125f55db87206964bc8300496be"
+    },
+    {
+      "id": "multiline-keys",
+      "category": "conformance",
+      "pattern": "^(\\w+) =",
+      "flags": "m",
+      "note": "anchored multiline key scan",
+      "subjects": [
+        "a = 1\nb = 2",
+        "no equals",
+        "= x",
+        "c =\nd"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "d98fc367bf23f1135e3b824e3a35d09c685ea7689223da3c192f7431f179f128"
+    },
+    {
+      "id": "backreference",
+      "category": "conformance",
+      "pattern": "(\\w+)\\s\\1",
+      "flags": "",
+      "note": "repeated-word detector",
+      "subjects": [
+        "the the",
+        "a a",
+        "ab cd",
+        "x x x"
+      ],
+      "expected_matches": 3,
+      "subjects_sha256": "ebced88c6c4a45a728c21d9c9c84d758f27c2c9c818bf7a7ce34f1a0111ec75d"
+    },
+    {
+      "id": "lookahead",
+      "category": "conformance",
+      "pattern": "(\\w+)(?=\\sX)",
+      "flags": "",
+      "note": "positive lookahead",
+      "subjects": [
+        "foo X",
+        "X foo",
+        "bar",
+        "baz X qux"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "71f2f555eb1fd8326adbc0ceede5948bc648a0d092b63faab6db79e59c211cef"
+    },
+    {
+      "id": "lookbehind",
+      "category": "conformance",
+      "pattern": "(?<=@)\\w+",
+      "flags": "",
+      "note": "positive lookbehind",
+      "subjects": [
+        "user@host",
+        "@",
+        "a@b c",
+        "no"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "ef4632914cf77dcadabb53cf59d65e3095a4c1f4f0bcb15352a09b31d62366aa"
+    },
+    {
+      "id": "sticky-flag",
+      "category": "conformance",
+      "pattern": "a",
+      "flags": "y",
+      "note": "sticky from lastIndex 0",
+      "subjects": [
+        "aaa",
+        "baa",
+        ""
+      ],
+      "expected_matches": 1,
+      "subjects_sha256": "22ea1db0786d68f2f8b72be4944cb11cf4f5db6369f04348b092ce830b13ccd4"
+    },
+    {
+      "id": "astral-emoji",
+      "category": "unicode",
+      "pattern": "[\\u{1F600}-\\u{1F64F}]",
+      "flags": "u",
+      "note": "astral-plane class in u mode",
+      "subjects": [
+        "hi \ud83d\ude00",
+        "plain",
+        "mid\ud83d\ude00end",
+        "\ud83d\ude00\ud83d\ude00"
+      ],
+      "expected_matches": 3,
+      "subjects_sha256": "00afda7bf0a0a02a82339920f969d6c516b49ede61f2597c10cef79779c5e98c"
+    },
+    {
+      "id": "lone-surrogate",
+      "category": "unicode",
+      "pattern": "[\\uD800-\\uDBFF]",
+      "flags": "u",
+      "note": "high-surrogate class in u mode: an astral pair is one code point, so 'a\\uD83D\\uDE00b' does not match",
+      "subjects": [
+        "\ud800x",
+        "ok",
+        "\udc00",
+        "a\ud83d\ude00b"
+      ],
+      "expected_matches": 1,
+      "subjects_sha256": "ad18379f2b02f42c646c7f7d1089cd453be32639c33af723e14e1f32cf3bdbd9"
+    },
+    {
+      "id": "unicode-sets-letter",
+      "category": "unicode",
+      "pattern": "[\\p{Letter}]",
+      "flags": "v",
+      "note": "UnicodeSets property class",
+      "subjects": [
+        "hello",
+        "h\u00e9llo",
+        "123",
+        "!"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "2115a2abf71561d0f7269b931ae398c8c85983dd854b64eb3fc22a6787b8e16a"
+    },
+    {
+      "id": "casefold-eszett",
+      "category": "unicode",
+      "pattern": "stra\u00dfe",
+      "flags": "i",
+      "note": "case-insensitive matching uses Unicode simple folding only: \u00df does not fold to ss (V8-identical)",
+      "subjects": [
+        "STRASSE",
+        "strasse",
+        "\u00df",
+        "xstra\u00dfe y"
+      ],
+      "expected_matches": 1,
+      "subjects_sha256": "b2fb9b7677afefca5c36bb545fb72bdecd9d3adf86aa96dfcf43eb20441e46df"
+    },
+    {
+      "id": "adversarial-nested-quant",
+      "category": "adversarial",
+      "pattern": "(a+)+$",
+      "flags": "",
+      "note": "nested quantifier over a long failing tail; engine step budget must terminate",
+      "subjects": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+      ],
+      "expected_matches": 0,
+      "subjects_sha256": "deb6e4d1e09eef5c949aa976d806afbd1a370fcf6f44f420b0dbb9571c9e2c08"
+    },
+    {
+      "id": "adversarial-alternation",
+      "category": "adversarial",
+      "pattern": "(a|aa)+$",
+      "flags": "",
+      "note": "ambiguous alternation under $",
+      "subjects": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+      ],
+      "expected_matches": 0,
+      "subjects_sha256": "deb6e4d1e09eef5c949aa976d806afbd1a370fcf6f44f420b0dbb9571c9e2c08"
+    },
+    {
+      "id": "adversarial-backref",
+      "category": "adversarial",
+      "pattern": "(x+x+)+y",
+      "flags": "",
+      "note": "classic RunawayRegularExpression pattern; 22 x's keeps budget-free engines (V8) bounded",
+      "subjects": [
+        "xxxxxxxxxxxxxxxxxxxxxxz"
+      ],
+      "expected_matches": 0,
+      "subjects_sha256": "9542b8da32d2dcf145b294cd759a271cb049c312c9f0b8c4cd634f4e5fac6e07"
+    },
+    {
+      "id": "deep-groups",
+      "category": "fixture",
+      "pattern": "((\\w+):)?(?:(\\d+)\\.){3}(\\d+)",
+      "flags": "",
+      "note": "alternating optional groups and repeated groups",
+      "subjects": [
+        "192.168.0.1",
+        "a:1.2.3.4",
+        "x"
+      ],
+      "expected_matches": 2,
+      "subjects_sha256": "4de7b83adc945bc21567a909712a690b3960c64a4d0dd6bd96cf52d05a9ef972"
+    }
+  ]
+}
