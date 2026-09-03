@@ -1789,6 +1789,29 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
                 i.ta_write_bytes(&info, offset, &bytes);
                 return Ok(Value::Undefined);
             }
+        } else if !i.shared_buffers.contains_key(&src_info.buffer)
+            && !i.shared_buffers.contains_key(&info.buffer)
+        {
+            // Different numeric element types still have no user-observable work between source
+            // reads and target writes. Snapshot the source encodings, convert each element once,
+            // and publish one target range; aliases therefore retain the specified source-before-
+            // target ordering without allocating a Value for every element (ECMA-262 §23.2.3.26.2).
+            if let Some(source) = i.ta_read_bytes(&src_info, 0, src_len) {
+                let source_es = src_info.kind.elsize();
+                let target_es = info.kind.elsize();
+                let mut converted = Vec::with_capacity(src_len * target_es);
+                for bytes in source.chunks_exact(source_es) {
+                    if info.kind.is_bigint() {
+                        converted.extend_from_slice(
+                            &info.kind.write_bigint(src_info.kind.read_bigint(bytes)),
+                        );
+                    } else {
+                        converted.extend_from_slice(&info.kind.write(src_info.kind.read(bytes)));
+                    }
+                }
+                i.ta_write_bytes(&info, offset, &converted);
+                return Ok(Value::Undefined);
+            }
         }
         // Snapshot the source first so an overlapping same-buffer copy reads pre-write values.
         let vals: Vec<Value> = (0..src_len).map(|k| i.ta_read(&src_info, k)).collect();

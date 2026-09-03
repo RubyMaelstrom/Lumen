@@ -997,6 +997,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     retaining per-element conversion for differing types (ECMA-262 §23.2.3.26.2). A release
     workload copying 20,000 `Float64Array` elements 20 times improved from 0.067550 s to
     0.033594 s median (about 50%); the typed-array semantic suite passed.
+  - [x] Cross-type `%TypedArray%.prototype.set` snapshots ordinary source bytes, converts each
+    element to the target representation, and publishes one target range; shared buffers and
+    generic fallback retain the specified per-element path (ECMA-262 §23.2.3.26.2). A release
+    workload converting 20,000 `Int32Array` elements to `Float64Array` 20 times improved from
+    0.0865 s to 0.0394 s median (about 54%), with numeric and BigInt conversion tests passing.
   - [x] Same-type `%TypedArray%.prototype.slice` copies a non-overlapping source/result range in
     one byte snapshot/write, preserving NaN payloads and retaining the forward per-element path
     for aliasing custom species results (ECMA-262 §23.2.3.27). A release workload slicing 19,800

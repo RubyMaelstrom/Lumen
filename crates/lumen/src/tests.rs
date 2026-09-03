@@ -12524,6 +12524,16 @@ fn typedarray_set_semantics() {
         run("var a=new Uint8ClampedArray(3); a.set([0.5,1.5,2.5]); a.join(',')"),
         "0,2,2"
     );
+    // Different numeric element types convert from the source values without changing order.
+    assert_eq!(
+        run("var s=new Int16Array([-1,257]); var d=new Float64Array(2); d.set(s); d.join(',')"),
+        "-1,257"
+    );
+    // BigInt element types may differ while retaining the source bit pattern.
+    assert_eq!(
+        run("var s=new BigInt64Array([-1n]); var d=new BigUint64Array(1); d.set(s); d[0]===18446744073709551615n"),
+        "true"
+    );
     // A negative offset is a RangeError; an oversized source too.
     assert_eq!(throws("new Int8Array(4).set([1],-1)"), "RangeError");
     assert_eq!(throws("new Int8Array(2).set([1,2,3])"), "RangeError");
