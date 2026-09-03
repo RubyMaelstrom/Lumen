@@ -106,6 +106,11 @@ pub struct Regex {
     /// Capture-free, case-sensitive ASCII literal program. Searching it directly is equivalent
     /// to executing `Save(0), Char*, Save(1), Match`, without paying the backtracking VM dispatch.
     literal_ascii: Option<Box<[u8]>>,
+    /// Capture-free case-insensitive (non-Unicode-mode) literal program, UTF-8 encoded. ECMA-262
+    /// canonicalization for a non-`u` `i` pattern folds only ASCII letters, so a byte-level
+    /// fold-aware search over an ASCII subject is exact — including non-ASCII pattern characters
+    /// (e.g. `ß`), which match by byte equality because canonicalization never folds them.
+    literal_fold: Option<Box<[u8]>>,
     /// Capture-free programs containing a string-valued UnicodeSets class can memoize failed
     /// continuation states without changing observable captures.
     memo_string_failures: bool,
@@ -879,6 +884,7 @@ impl Regex {
             .saturating_add(scan_program_references(&self.prog, visitor))
             .saturating_add(first)
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
+            .saturating_add(self.literal_fold.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
             .saturating_add(self.source.capacity())
             .saturating_add(self.flags.capacity())
@@ -910,6 +916,7 @@ impl Regex {
             .saturating_add(program_heap_bytes(&self.prog, self.prog.capacity()))
             .saturating_add(first)
             .saturating_add(self.literal_ascii.as_ref().map_or(0, |bytes| bytes.len()))
+            .saturating_add(self.literal_fold.as_ref().map_or(0, |bytes| bytes.len()))
             .saturating_add(self.first_lut.as_ref().map_or(0, |_| 256))
             .saturating_add(self.source.capacity())
             .saturating_add(self.flags.capacity())
@@ -1020,6 +1027,44 @@ impl Regex {
         } else {
             None
         };
+        // Non-`u` case-insensitive literal: the same `Save(0), Char*, Save(1), Match` shape
+        // becomes a UTF-8 fold-aware byte search (canonicalization only folds ASCII letters). A
+        // Char that is not a scalar value (a lone surrogate in the source) declines the fast
+        // path rather than guessing an encoding.
+        let literal_fold = if flags.contains('i') && !flags.contains('u') && p.ngroups == 0 {
+            let bytes = if prog.len() >= 4
+                && matches!(prog.first(), Some(Inst::Save(0)))
+                && matches!(prog.get(prog.len() - 2), Some(Inst::Save(1)))
+                && matches!(prog.last(), Some(Inst::Match))
+            {
+                let mut out = Vec::new();
+                let mut ok = true;
+                for inst in &prog[1..prog.len() - 2] {
+                    match inst {
+                        Inst::Char(c) => match char::from_u32(*c) {
+                            Some(ch) => {
+                                out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes())
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        },
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                ok.then_some(out)
+            } else {
+                None
+            }
+            .filter(|literal| !literal.is_empty());
+            bytes.map(Vec::into_boxed_slice)
+        } else {
+            None
+        };
         let memo_string_failures = p.ngroups == 0 && program_contains_string_set(&prog);
         let mut re = Regex {
             unicode,
@@ -1027,6 +1072,7 @@ impl Regex {
             first,
             first_byte,
             literal_ascii,
+            literal_fold,
             memo_string_failures,
             first_lut: None,
             prog,
@@ -1111,6 +1157,17 @@ impl Regex {
                         find_ascii_literal(s.as_bytes(), start, literal, self.sticky, control)?
                             .map(Captures::one),
                     )
+                } else if let Some(literal) = &self.literal_fold {
+                    Ok(
+                        find_ascii_fold_literal(
+                            s.as_bytes(),
+                            start,
+                            literal,
+                            self.sticky,
+                            control,
+                        )?
+                        .map(Captures::one),
+                    )
                 } else {
                     self.exec_impl(s.as_bytes(), start, control)
                 }
@@ -1140,6 +1197,8 @@ impl Regex {
             Some(s) => {
                 if let Some(literal) = &self.literal_ascii {
                     find_ascii_literal(s.as_bytes(), start, literal, self.sticky, control)
+                } else if let Some(literal) = &self.literal_fold {
+                    find_ascii_fold_literal(s.as_bytes(), start, literal, self.sticky, control)
                 } else {
                     self.find_impl(s.as_bytes(), start, control)
                 }
@@ -2944,6 +3003,75 @@ fn find_ascii_literal(
     Ok(None)
 }
 
+/// Canonicalize equivalence for a non-`u` case-insensitive pattern (ECMA-262 §22.2.8.3
+/// Canonicalize with `unicode` false): only ASCII letters fold, `A`↔`a` … `Z`↔`z`.
+#[inline(always)]
+fn icase_bytes_eq(a: u8, b: u8) -> bool {
+    a == b || (a.is_ascii_alphabetic() && b.is_ascii_alphabetic() && a | 0x20 == b | 0x20)
+}
+
+/// Case-insensitive literal search over an ASCII subject: the needle is the UTF-8 encoding of
+/// the pattern's literal characters, compared byte-wise under canonicalize equivalence. Every
+/// needle starts at a valid scalar value, so in Lumen's surrogate-smuggled, always-valid UTF-8
+/// subject a byte match can only align at a scalar boundary; non-ASCII pattern bytes (e.g. `ß`)
+/// match by byte equality because canonicalization never folds them. Semantically identical to
+/// `find_ascii_literal` plus the fold at every byte.
+fn find_ascii_fold_literal(
+    subject: &[u8],
+    start: usize,
+    literal: &[u8],
+    sticky: bool,
+    control: &crate::RuntimeInterrupt,
+) -> MatchResult<(usize, usize)> {
+    if start > subject.len() || literal.len() > subject.len().saturating_sub(start) {
+        return Ok(None);
+    }
+    if sticky {
+        return Ok((subject[start..].len() >= literal.len()
+            && match_literal_fold(&subject[start..start + literal.len()], literal))
+        .then_some((start, start + literal.len())));
+    }
+    let mut from = start;
+    while from + literal.len() <= subject.len() {
+        let Some(found) = find_fold_byte(subject, from, literal[0], control)? else {
+            return Ok(None);
+        };
+        if found + literal.len() > subject.len() {
+            return Ok(None);
+        }
+        if match_literal_fold(&subject[found..found + literal.len()], literal) {
+            return Ok(Some((found, found + literal.len())));
+        }
+        from = found + 1;
+    }
+    Ok(None)
+}
+
+/// Byte-equality fast path (memcmp) first, then the per-byte fold scan — most candidate hits
+/// agree exactly, so the common case avoids the per-byte branches.
+fn match_literal_fold(hay: &[u8], literal: &[u8]) -> bool {
+    hay == literal || hay.iter().zip(literal).all(|(a, b)| icase_bytes_eq(*a, *b))
+}
+
+/// First fold-byte scan, mirroring `ReInput::find_byte`'s interrupt-poll cadence.
+fn find_fold_byte(
+    subject: &[u8],
+    mut from: usize,
+    byte: u8,
+    control: &crate::RuntimeInterrupt,
+) -> MatchResult<usize> {
+    while from < subject.len() {
+        if icase_bytes_eq(subject[from], byte) {
+            return Ok(Some(from));
+        }
+        from += 1;
+        if from & INTERRUPT_POLL_MASK == 0 {
+            poll_interrupt(control)?;
+        }
+    }
+    Ok(None)
+}
+
 /// The matcher's view of a subject: element `i` as a code point / code unit. Monomorphized for
 /// bytes (an ASCII subject — the common case, matched with no `Vec<u32>` materialization at all)
 /// and for wide elements (anything non-ASCII).
@@ -4213,6 +4341,70 @@ mod internal_engine_diagnostics {
             re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default()),
             Err(super::MatchError::ResourceExhausted)
         ));
+    }
+
+    #[test]
+    fn case_insensitive_ascii_literal_uses_fold_search() {
+        let re = super::Regex::new("abc", "i").unwrap();
+        assert!(
+            re.literal_fold.is_some(),
+            "an ASCII icase literal gets the fold needle"
+        );
+        assert!(re.literal_ascii.is_none());
+        let text = |s: &str| super::ReText::new_rc(false, &crate::lstr::LStr::from(s));
+        let control = crate::RuntimeInterrupt::default();
+        // ASCII subjects run the fold-aware byte search: any case mix, correct spans.
+        assert_eq!(
+            re.exec_text_shared(&text("xxABCyy"), 0, &control)
+                .unwrap()
+                .unwrap()[0],
+            Some((2, 5))
+        );
+        assert_eq!(
+            re.exec_text_shared(&text("aBc"), 0, &control)
+                .unwrap()
+                .unwrap()[0],
+            Some((0, 3))
+        );
+        assert!(re
+            .exec_text_shared(&text("Abx"), 0, &control)
+            .unwrap()
+            .is_none());
+        // A non-ASCII subject keeps the matcher path but stays equivalent.
+        assert_eq!(
+            re.exec_text_shared(&text("éABC"), 0, &control)
+                .unwrap()
+                .unwrap()[0],
+            Some((1, 4))
+        );
+    }
+
+    #[test]
+    fn case_insensitive_literal_with_non_ascii_character() {
+        let re = super::Regex::new("straße", "i").unwrap();
+        assert!(
+            re.literal_fold.is_some(),
+            "UTF-8 needle with a non-ASCII fold-free char"
+        );
+        let text = |s: &str| super::ReText::new_rc(false, &crate::lstr::LStr::from(s));
+        let control = crate::RuntimeInterrupt::default();
+        // 'ß' does not fold to 'ss': simple folding only (verified against V8/test262).
+        assert!(re
+            .exec_text_shared(&text("STRASSE"), 0, &control)
+            .unwrap()
+            .is_none());
+        // Capital eszett (U+1E9E) is not folded by non-u canonicalization either.
+        assert!(re
+            .exec_text_shared(&text("STRAẞE"), 0, &control)
+            .unwrap()
+            .is_none());
+        // An exact fold hit with the raw char matches on the wide subject.
+        assert_eq!(
+            re.exec_text_shared(&text("XSTRAßE"), 0, &control)
+                .unwrap()
+                .unwrap()[0],
+            Some((1, 7))
+        );
     }
 
     #[test]

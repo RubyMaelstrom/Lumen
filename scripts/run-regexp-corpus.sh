@@ -94,7 +94,7 @@ while IFS= read -r line; do
   printf '%-24s %-12s' "$id" "$matches"
   for tag in lumen-jit lumen-bytecode node; do
     if [ -f "$TMP/$tag.txt" ]; then
-      own=$(grep "^$id matches=" "$TMP/$tag.txt" | head -1)
+      own=$(grep "^$id matches=" "$TMP/$tag.txt" | head -1 || true)
       [ -n "$own" ] || own="missing"
       ms=$(echo "$own" | sed -n 's/.* ms=\([0-9]*\).*/\1/p')
       budget=$(echo "$own" | sed -n 's/.*budget=\([0-9]*\).*/\1/p')
