@@ -1296,11 +1296,24 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     configs, and `git diff --check` all pass. Allocation strictly decreases (one fewer `Value` clone
     and one fewer dispatch per specialized argument); peak RSS moved only within the size-class
     allocator's caching high-water and is not a retention change.
-    Separately observed while differencing — **not caused by this change, not investigated, and
-    byte-identical before and after**: when a lone surrogate reaches console output, Lumen emits raw
-    WTF-8 where Node/V8 substitutes U+FFFD (22 of the 741 expressions differ on this alone). The
-    ECMAScript string *values* agree, which `charCodeAt`/`codePointAt` confirm, so this is the output
-    encoding boundary rather than string semantics; it belongs with Phase 7's native string work.
+    Separately observed while differencing — **not caused by this change, byte-identical before and
+    after it, and not a defect; recorded so a future Node/V8 comparison is not misread as a
+    regression**: 22 of the 741 expressions differ purely in how an unpaired surrogate reaches the
+    bare shell's `print`. Lumen writes its plane-16 smuggle scalar and Node/V8 writes U+FFFD. The
+    representation is deliberate, documented, and total: `jstr.rs` maps a lone surrogate unit to
+    `U+10F800 + (unit - 0xD800)` (the same scheme as Python's `surrogateescape`) so a JS string can
+    live in a valid Rust `str`, and a genuine character in that range is itself stored as its
+    smuggled surrogate *pair*. Both directions were checked here: the printed bytes are
+    well-formed UTF-8, and re-importing them yields `length` 1 with `charCodeAt(0)` 0xD800, so the
+    surrogate survives the round-trip that U+FFFD would destroy. The ECMAScript string *values*
+    agree throughout, which `charCodeAt`/`codePointAt` confirm.
+    The distinction that matters is the boundary, and Lumen already gets it right: where the
+    Encoding Standard actually governs byte production, UTF-8 encode must emit U+FFFD for a
+    surrogate (§8.1.2), and `new TextEncoder().encode("\ud800x")` in `lumen-runtime` was verified
+    to produce `ef bf bd 78`, matching Node; TRust's `TextEncoder` core documents the same
+    requirement. Only the engine shell's own console writer prints the internal scalar, and no
+    standard specifies console byte encoding. So the divergence is an unspecified debug-output
+    choice sitting on top of a correct design, not an encoding conformance gap.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
