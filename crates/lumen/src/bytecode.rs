@@ -11978,6 +11978,25 @@ fn run_vm(
                 let at = stack.len() - argc as usize;
                 let m = stack[at - 1].clone();
                 let this = stack[at - 2].clone();
+                // `CallWithThis` immediately followed by `Op::Pop` proves the result is dead: the
+                // JIT fuses this exact pattern into the allocation-free RegExp/string discard
+                // intrinsics, and the bytecode tier routes it through the same guarded routines.
+                // On a guard miss the fast path returns `None` without touching any state and the
+                // generic call below runs unmodified, so this is observably invisible.
+                if matches!(chunk.ops.get(*pc), Some(Op::Pop)) {
+                    match crate::builtins::vm_discard_call(i, &this, &m, &stack[at..]) {
+                        Ok(Some(_)) => {
+                            stack.truncate(at - 2);
+                            i.interrupt_poll_force()?;
+                            // The trailing `Op::Pop` discards this placeholder instead of the
+                            // call result; the discard routines already poll internally.
+                            stack.push(Value::Undefined);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Err(Abrupt::Throw(error)),
+                    }
+                }
                 let v = if chunk.feedback.detailed_enabled() {
                     call_profiled(i, chunk, op_pc, m, this, &stack[at..])?
                 } else {

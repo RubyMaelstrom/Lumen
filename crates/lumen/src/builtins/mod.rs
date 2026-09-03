@@ -84,12 +84,12 @@ pub(crate) fn nf_function_apply(
 ) -> Result<Value, Value> {
     let this_arg = arg(args, 0);
     let list = match arg(args, 1) {
-        Value::Undefined | Value::Null => Vec::new(),
+        Value::Undefined | Value::Null => i.take_native_arg_buf(0),
         Value::Obj(o) => {
             let len = ab(i.checked_array_len(&o))?;
-            let mut v = Vec::with_capacity(len);
             let direct_dense = i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
                 && !i.mapped_arguments.contains_key(&(Rc::as_ptr(&o) as usize));
+            let mut v = i.take_native_arg_buf(len);
             for k in 0..len {
                 // Arrays and unmapped arguments objects overwhelmingly contain plain own dense
                 // entries. Read those by slot: the generic path allocates a decimal key and walks
@@ -111,7 +111,11 @@ pub(crate) fn nf_function_apply(
         }
         _ => return Err(i.make_error("TypeError", "apply: argument list must be array-like")),
     };
-    ab(i.call(this, this_arg, &list))
+    // The recycled buffer is returned even when the call throws: `call` never retains the slice
+    // (every callee copies arguments into its own activation), so recycling is unobservable.
+    let call_result = i.call(this, this_arg, &list);
+    i.recycle_native_arg_buf(list);
+    ab(call_result)
 }
 
 fn this_obj(this: &Value) -> Option<Gc> {
@@ -2636,6 +2640,146 @@ pub(crate) fn string_split_discard_fast(
     limit: &Value,
 ) -> Option<Result<Value, Value>> {
     regexp::re_sym_split_discard_fast(i, input, separator, limit)
+}
+
+/// Allocation-free dead-result `String.prototype.match` for a direct ordinary RegExp argument.
+/// Every observable lookup (IsRegExp, `@@match`, flags, exec) is proven to resolve to the realm
+/// intrinsics; the matcher still runs and updates `lastIndex`/legacy statics, while the result
+/// array or `null` is never materialized. Returns `None` before touching any state on a guard
+/// miss, so the generic builtin runs unmodified.
+pub(crate) fn string_match_discard_fast(
+    i: &mut Interp,
+    input: &Value,
+    search: &Value,
+) -> Option<Result<Value, Value>> {
+    let (Value::Str(input), Value::Obj(obj)) = (input, search) else {
+        return None;
+    };
+    let ptr = Rc::as_ptr(obj) as usize;
+    let re = i.regexps.get(&ptr)?.clone();
+    let proto = i.extra_protos.get("RegExp")?.clone();
+    let match_key = well_known_key(i, "match")?;
+    {
+        let b = obj.borrow();
+        if !matches!(b.exotic, Exotic::None)
+            || b.props.contains(&match_key)
+            || b.proto.as_ref().is_none_or(|p| !Rc::ptr_eq(p, &proto))
+            || [
+                "exec",
+                "flags",
+                "hasIndices",
+                "global",
+                "ignoreCase",
+                "multiline",
+                "dotAll",
+                "unicode",
+                "unicodeSets",
+                "sticky",
+            ]
+            .iter()
+            .any(|name| b.props.contains(name))
+        {
+            return None;
+        }
+        let last = b.props.get("lastIndex")?;
+        if last.accessor() || !last.writable() {
+            return None;
+        }
+        match last.value() {
+            Value::Num(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => {}
+            _ => return None,
+        }
+    }
+    if !regexp::literal_match_dependencies_canonical(i) {
+        return None;
+    }
+    let canonical = {
+        let p = proto.borrow();
+        let Value::Obj(method) = p.props.get(&match_key)?.value() else {
+            return None;
+        };
+        let canonical = matches!(
+            method.borrow().call,
+            Callable::Native(nf)
+                if nf as usize == regexp::re_sym_match as *const () as usize
+        );
+        canonical
+    };
+    if !canonical {
+        return None;
+    }
+    Some(regexp::re_sym_match_discard_direct(i, obj, &re, input))
+}
+
+/// Dead-result call routing for the bytecode VM. A `CallWithThis` immediately followed by
+/// `Op::Pop` proves the call's result is unobservable; the JIT fuses exactly this pattern into
+/// the allocation-free discard intrinsics, and the bytecode VM now shares the same guarded
+/// routines for the three canonical natives (RegExp exec, String replace, String split). Every
+/// receiver/prototype/flag guard lives inside the discard routines, which return `None` before
+/// touching any state; the caller then runs the generic call unmodified, so a miss is
+/// observably identical. Errors from a committed discard path propagate as the thrown value.
+pub(crate) fn vm_discard_call(
+    i: &mut Interp,
+    this: &Value,
+    method: &Value,
+    args: &[Value],
+) -> Result<Option<Value>, Value> {
+    let Value::Obj(obj) = method else {
+        return Ok(None);
+    };
+    let Callable::Native(nf) = &obj.borrow().call else {
+        return Ok(None);
+    };
+    let native = (*nf) as usize;
+    if native == regexp_exec as *const () as usize {
+        // RegExp.prototype.exec(subject): receiver is the regexp, the subject is arg 0.
+        let Some((first, _)) = args.split_first() else {
+            return Ok(None);
+        };
+        let Value::Str(input) = first else {
+            return Ok(None);
+        };
+        return match regexp_exec_discard_fast(i, this, input) {
+            Some(Ok(_)) => Ok(Some(Value::Undefined)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        };
+    }
+    if native == nf_string_replace as *const () as usize {
+        // String.prototype.replace(search, replacement): receiver is the string.
+        if args.len() < 2 {
+            return Ok(None);
+        }
+        return match string_replace_discard_fast(i, this, &args[0], &args[1]) {
+            Some(Ok(value)) => Ok(Some(value)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        };
+    }
+    if native == nf_string_split as *const () as usize {
+        // String.prototype.split(separator): receiver is the string; only an undefined limit
+        // (the common statement form) takes the discard path, matching the JIT intrinsic.
+        if args.is_empty() {
+            return Ok(None);
+        }
+        return match string_split_discard_fast(i, this, &args[0], &Value::Undefined) {
+            Some(Ok(value)) => Ok(Some(value)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        };
+    }
+    if native == nf_string_match as *const () as usize {
+        // String.prototype.match(regexp): receiver is the string.
+        if args.is_empty() {
+            return Ok(None);
+        }
+        return match string_match_discard_fast(i, this, &args[0]) {
+            Some(Ok(value)) => Ok(Some(value)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        };
+    }
+    Ok(None)
 }
 
 /// Refresh the %RegExp% constructor's legacy static state after a successful RegExpBuiltinExec.

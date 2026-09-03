@@ -13130,6 +13130,82 @@ fn regexp_replace_dollar_substitutions() {
 }
 
 #[test]
+fn vm_discard_call_dead_regexp_results_match_all_tiers() {
+    // Dead-result exec/replace/split/match statements must be observably identical on every
+    // tier: the bytecode VM routes `CallWithThis; Pop` through the same allocation-free discard
+    // routines the JIT fuses, while the interpreter always runs the generic builtins.
+    let src = r#"
+        var re0 = /^ba/;
+        re0.exec("babc");
+        /(a)(b)/.exec("ab");
+        var out = "" + RegExp.$1;
+        var g = /x/g;
+        g.exec("xx"); g.exec("xx");
+        out = out + "|" + g.lastIndex;
+        var re2 = /^\s*|\s*$/g;
+        "  hi  ".replace(re2, "");
+        "a,b,c".replace(/,/g, "-");
+        "x;y;z".split(/\s?;\s?/);
+        "a+b, c".split(/[+, ]/);
+        "a1 b2".match(/\d/g);
+        "abc".match(/b/);
+        "ab".replace(/b/, 1);
+        "a,b".split(",", 1);
+        var m = /b/.exec("abc");
+        out = out + "|" + m[0] + "@" + m.index;
+        out = out + "|" + "aXb".replace(/X/, (c) => c.toUpperCase());
+        out = out + "|" + "a1".match(/\d/) + "|" + "a,b,c".split(",").length;
+        out
+    "#;
+    let mut interp = Engine::new();
+    interp.set_tier(crate::bytecode::Tier::Interp);
+    interp.set_tier_threshold(0);
+    let mut bytecode = Engine::new();
+    bytecode.set_tier(crate::bytecode::Tier::Bytecode);
+    bytecode.set_tier_threshold(0);
+    let mut jit = Engine::new();
+    jit.set_tier(crate::bytecode::Tier::Jit);
+    jit.set_tier_threshold(0);
+    let expected = "a|2|b@1|aXb|1|3";
+    for engine in [&mut interp, &mut bytecode, &mut jit] {
+        let got = match engine.eval(src, false).expect("script parses") {
+            Completion::Value(v) => v,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        };
+        assert_eq!(got, expected);
+    }
+}
+
+#[test]
+fn vm_discard_call_guards_honor_overrides() {
+    // Own/prototype tampering must force the generic path on the bytecode tier; the discard
+    // routines return None before touching state, so every observable behavior is preserved.
+    let src = r#"
+        var out = "";
+        var re = /x/;
+        Object.defineProperty(re, "exec", {value: function (s) { return ["OWN", s]; }});
+        var r = re.exec("x");
+        out = out + r[0] + "/" + r[1];
+        // A regexp with a replaced @@match still runs the supplied method.
+        var m = /z/;
+        var called = 0;
+        Object.defineProperty(m, Symbol.match, {value: function (s) { called++; return "custom:" + s; }});
+        out = out + "|" + "az".match(m) + "/" + called;
+        // Dead split with a non-undefined limit keeps the generic path (no crash, correct count).
+        out = out + "|" + (("a;b;c".split(/;/), "a;b;c".split(/;/, 2).length));
+        out
+    "#;
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Bytecode);
+    engine.set_tier_threshold(0);
+    let got = match engine.eval(src, false).expect("script parses") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    };
+    assert_eq!(got, "OWN/x|custom:az/1|2");
+}
+
+#[test]
 fn regexp_replace_flags_fast_path_shapes() {
     // Canonical direct RegExps read the engine-owned flags without dispatching the getter;
     // every replace shape must still match the observable flags string.

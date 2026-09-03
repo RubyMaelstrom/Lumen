@@ -657,6 +657,52 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         Ok(i.make_array(results))
     }
 }
+
+/// Execute a dead-result `String.prototype.match` for the fully canonical direct-RegExp case.
+/// Every observable lookup is proven by the caller to resolve to the realm intrinsics, so the
+/// matcher runs (updating `lastIndex` and the legacy statics exactly like live match) while the
+/// result array or `null` is never materialized. `global`/`unicode` come from the engine-owned
+/// flags under the same canonicality proof used by the replacement discard.
+pub(super) fn re_sym_match_discard_direct(
+    i: &mut Interp,
+    obj: &Gc,
+    re: &Rc<crate::regex::Regex>,
+    input: &crate::lstr::LStr,
+) -> Result<Value, Value> {
+    let global = re.global;
+    let unicode = re.unicode;
+    if global {
+        obj.borrow_mut()
+            .props
+            .get_mut("lastIndex")
+            .expect("direct match lastIndex guard")
+            .set_value(Value::Num(0.0));
+    }
+    loop {
+        let matched = regexp_exec_discard_direct(i, obj, re, input)?;
+        if !matched || !global {
+            break;
+        }
+        let empty = i
+            .regexp_last
+            .as_ref()
+            .and_then(|last| last.caps.first().copied().flatten())
+            .is_some_and(|(start, end)| start == end);
+        if empty {
+            let li = match obj.borrow().props.get("lastIndex").map(Property::value) {
+                Some(Value::Num(n)) => n as usize,
+                _ => unreachable!("direct match lastIndex guard"),
+            };
+            let next = advance_string_index(li, input, unicode);
+            obj.borrow_mut()
+                .props
+                .get_mut("lastIndex")
+                .expect("direct match lastIndex guard")
+                .set_value(Value::Num(next as f64));
+        }
+    }
+    Ok(Value::Undefined)
+}
 fn re_sym_search(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.search]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
