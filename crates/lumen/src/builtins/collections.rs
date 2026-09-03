@@ -60,11 +60,14 @@ pub(super) fn install_map_methods(it: &mut Interp) {
 fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
     // Requires a real Set [[SetData]] slot — a Map (which shares the map_data table) is rejected.
     let p = coll_ptr_kind(i, this, Some("Set"))?;
-    Ok(i.map_data[&p]
-        .iter()
-        .filter(|(key, _)| !is_tombstone(i, key))
-        .map(|(key, _)| key.clone())
-        .collect())
+    let mut values = Vec::with_capacity(coll_live_len(i, p));
+    values.extend(
+        i.map_data[&p]
+            .iter()
+            .filter(|(key, _)| !is_tombstone(i, key))
+            .map(|(key, _)| key.clone()),
+    );
+    Ok(values)
 }
 
 /// Find a SameValueZero match in a temporary result using the same hash partitioning as Map/Set.
@@ -149,8 +152,11 @@ fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
         new_from_ctor(i, "Set").unwrap_or_else(|_| Object::new(i.extra_protos.get("Set").cloned()));
     let ptr = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.map_data.insert(ptr, Vec::new());
-    i.collection_index.insert(ptr, Default::default());
+    i.map_data.insert(ptr, Vec::with_capacity(values.len()));
+    i.collection_index.insert(
+        ptr,
+        crate::fasthash::FastMap::with_capacity_and_hasher(values.len(), Default::default()),
+    );
     for value in values {
         let value = canonicalize_map_key(value);
         collection_set(i, ptr, value.clone(), value);

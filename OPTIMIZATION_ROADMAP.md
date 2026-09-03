@@ -1055,6 +1055,12 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     receiver probes, iterator ordering, and tombstone behavior remain unchanged (ECMA-262
     §24.2.4.5, §24.2.4.9, §24.2.4.15, §24.2.4.16). An 8-round release workload over overlapping
     2,000-element sets improved from 0.264868 s to 0.214033 s median (about 19%).
+  - [x] Set result snapshots and newly constructed sets reserve their known live/value capacities
+    up front, avoiding growth reallocations while preserving insertion order, SameValueZero
+    membership, and tombstone handling (ECMA-262 §24.2.4.*). Fifteen interleaved release samples
+    over common set operations improved from 0.219 s to 0.214 s median (about 2.3%); an asymmetric
+    20,000/5,000-element `difference` workload improved from 3.006 s to 2.552 s median (about
+    15%), with the collection semantic suite passing.
   - [x] `Set.prototype.isDisjointFrom` now probes the receiver's live `[[SetData]]` while walking
     an arbitrary set-like iterator, as required by ECMA-262 §24.2.4.10; a regression test covers
     an iterator that deletes a receiver entry before yielding it. This also removes an unnecessary
