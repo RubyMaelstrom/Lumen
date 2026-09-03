@@ -5039,6 +5039,27 @@ fn is_intrinsic_array_constructor(i: &Interp, value: &Value) -> bool {
     matches!((i.array_ctor.as_ref(), value), (Some(expected), Value::Obj(actual)) if Rc::ptr_eq(expected, actual))
 }
 
+/// Whether the intrinsic Array constructor still creates instances with this Realm's ordinary
+/// `%Array.prototype%`. `Array.of` reads the constructor's `prototype` through GetPrototypeFrom
+/// Constructor, so changing that writable property (or replacing it with an accessor) must disable
+/// allocation shortcuts even when the constructor function itself is still the intrinsic.
+fn intrinsic_array_constructor_is_default(i: &Interp, value: &Value) -> bool {
+    let Value::Obj(actual) = value else {
+        return false;
+    };
+    if !matches!(i.array_ctor.as_ref(), Some(expected) if Rc::ptr_eq(expected, actual)) {
+        return false;
+    }
+    actual
+        .borrow()
+        .props
+        .get("prototype")
+        .filter(|property| !property.accessor())
+        .is_some_and(|property| {
+            matches!(property.value(), Value::Obj(proto) if Rc::ptr_eq(&proto, &i.array_proto))
+        })
+}
+
 /// Array iteration also performs `Get(iterator, "next")`; retaining the original `values`
 /// function is insufficient if `%ArrayIteratorPrototype%.next` was replaced.
 pub(crate) fn intrinsic_array_iterator_is_unmodified(i: &Interp) -> bool {
@@ -6149,6 +6170,14 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     it.def_method(&ctor, "of", 0, |i, this, args| {
         // If `this` is a constructor, build the result via `new this(len)`; else a plain Array.
         let len = args.len();
+        // For the untouched intrinsic constructor, ArrayCreate plus the ordered
+        // CreateDataPropertyOrThrow loop has the same result as the engine's dense allocation.
+        // Keep the generic path for subclasses, replaced `Array.prototype`, and every other
+        // constructor because GetPrototypeFromConstructor and user code remain observable
+        // (ECMA-262 §23.1.2.4).
+        if intrinsic_array_constructor_is_default(i, &this) {
+            return Ok(i.make_array(args.to_vec()));
+        }
         let arr = if is_constructor_value(&this) {
             ab(i.construct(this.clone(), &[Value::Num(len as f64)]))?
         } else {

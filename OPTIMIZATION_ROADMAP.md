@@ -960,6 +960,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     retaining stable ordering and comparator abrupt-completion behavior while removing recursive
     per-level vector allocations (ECMA-262 §23.1.3.30.1). An 11-sample 5,000-element release
     workload improved from 0.098384 s to 0.095119 s (about 3%).
+  - [x] `Array.of` uses one dense allocation for the untouched intrinsic Array constructor, while
+    custom/non-constructor receivers retain the normative Construct/CreateDataProperty path
+    (ECMA-262 §23.1.2.4). A 500-call release workload over 2,000 values improved from 3,488 ms to
+    74 ms median (about 98%); custom-constructor and non-constructor tests remain covered.
   - [x] JSON array/object assembly streams already-serialized members into one output buffer,
     removing the temporary `join` result while preserving ECMA-262 §25.5.2.5 ordering and
     indentation. A nested 1,000-call release workload improved from 331 ms to 311 ms median
