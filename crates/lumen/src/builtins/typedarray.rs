@@ -2063,7 +2063,19 @@ const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxy
 
 fn b64_encode(bytes: &[u8], url: bool, pad: bool) -> String {
     let alpha = if url { B64_URL } else { B64_STD };
-    let mut out = String::new();
+    // RFC 4648 emits four characters per complete three-byte group.  Reserve the exact
+    // output size up front so a large Uint8Array does not repeatedly grow the result.
+    let complete = bytes.len() / 3;
+    let remainder = bytes.len() % 3;
+    let tail = match (remainder, pad) {
+        (0, _) => 0,
+        (1, true) => 4,
+        (1, false) => 2,
+        (2, true) => 4,
+        (2, false) => 3,
+        _ => unreachable!(),
+    };
+    let mut out = String::with_capacity(complete.saturating_mul(4).saturating_add(tail));
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -2091,6 +2103,31 @@ fn b64_encode(bytes: &[u8], url: bool, pad: bool) -> String {
     }
     out
 }
+
+#[inline]
+fn b64_value(c: char, url: bool) -> Option<u8> {
+    match c {
+        'A'..='Z' => Some(c as u8 - b'A'),
+        'a'..='z' => Some(c as u8 - b'a' + 26),
+        '0'..='9' => Some(c as u8 - b'0' + 52),
+        '+' if !url => Some(62),
+        '-' if url => Some(62),
+        '/' if !url => Some(63),
+        '_' if url => Some(63),
+        _ => None,
+    }
+}
+
+#[inline]
+fn hex_value(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// FromBase64: decode at most `max_len` bytes honoring `handling` (loose / strict /
 /// stop-before-partial). Returns `(read, bytes)` where `read` is the code units consumed through
 /// the last fully decoded chunk; `Err(())` is a syntax error.
@@ -2120,12 +2157,15 @@ fn b64_decode_spec(s: &str, url: bool, handling: &str, max_len: usize) -> (usize
         }
         Ok(())
     };
-    let mut bytes = Vec::new();
     if max_len == 0 {
-        return (0, bytes, false);
+        return (0, Vec::new(), false);
     }
+    // Four input characters produce at most three bytes.  Whitespace and padding can only
+    // reduce this, so this bound avoids growth reallocations without over-reserving by max_len.
+    let capacity = (len / 4).saturating_mul(3).saturating_add(3).min(max_len);
+    let mut bytes = Vec::with_capacity(capacity);
     let (mut read, mut index) = (0usize, 0usize);
-    let mut chunk: Vec<u8> = Vec::new();
+    let mut chunk: Vec<u8> = Vec::with_capacity(4);
     loop {
         while index < len && is_ws(chars[index]) {
             index += 1;
@@ -2147,7 +2187,7 @@ fn b64_decode_spec(s: &str, url: bool, handling: &str, max_len: usize) -> (usize
             }
             return (len, bytes, false);
         }
-        let mut c = chars[index];
+        let c = chars[index];
         index += 1;
         if c == '=' {
             if chunk.len() < 2 {
@@ -2179,15 +2219,7 @@ fn b64_decode_spec(s: &str, url: bool, handling: &str, max_len: usize) -> (usize
             }
             return (len, bytes, false);
         }
-        if url {
-            c = match c {
-                '+' | '/' => return (read, bytes, true),
-                '-' => '+',
-                '_' => '/',
-                other => other,
-            };
-        }
-        let Some(v) = B64_STD.iter().position(|&a| a as char == c) else {
+        let Some(v) = b64_value(c, url) else {
             return (read, bytes, true);
         };
         let remaining = max_len - bytes.len();
@@ -2209,8 +2241,28 @@ fn b64_decode_spec(s: &str, url: bool, handling: &str, max_len: usize) -> (usize
 }
 /// FromHex: decode at most `max_len` bytes; `read` is the number of code units consumed.
 fn hex_decode_spec(s: &str, max_len: usize) -> (usize, Vec<u8>, bool) {
+    // FromHex accepts only ASCII hexits.  Keep the UTF-16-aware character path below for
+    // unusual engine strings, but avoid materializing a Vec<char> for the overwhelmingly common
+    // ASCII case (ECMA-262 §23.3.3.8).
+    if s.is_ascii() {
+        let input = s.as_bytes();
+        let mut out = Vec::with_capacity((input.len() / 2).min(max_len));
+        if !input.len().is_multiple_of(2) {
+            return (0, out, true);
+        }
+        let mut index = 0;
+        while index < input.len() && out.len() < max_len {
+            let (Some(hi), Some(lo)) = (hex_value(input[index]), hex_value(input[index + 1]))
+            else {
+                return (index, out, true);
+            };
+            out.push((hi << 4) | lo);
+            index += 2;
+        }
+        return (index, out, false);
+    }
     let chars: Vec<char> = s.chars().collect();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity((chars.len() / 2).min(max_len));
     if !chars.len().is_multiple_of(2) {
         return (0, out, true);
     }
@@ -2307,8 +2359,10 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
     it.def_method(&proto, "toHex", 0, |i, this, _| {
         let bytes = u8_bytes(i, &this)?;
         let mut s = String::with_capacity(bytes.len() * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
         for b in bytes {
-            s.push_str(&format!("{b:02x}"));
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0x0f) as usize] as char);
         }
         Ok(Value::from_string(s))
     });

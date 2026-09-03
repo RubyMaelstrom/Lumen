@@ -1033,6 +1033,12 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     through raw element encodings, while comparator, BigInt, shared-buffer, and unusual-buffer
     paths retain their existing algorithms (ECMA-262 §23.2.3.29). A release workload sorting a
     20,000-element `Float64Array` ten times improved from 0.294 s to 0.280 s median (about 5%).
+  - [x] Uint8Array base64/hex helpers reserve their result capacity, use direct ASCII digit/value
+    tables, and retain the UTF-16 fallback for unusual strings. The RFC 4648 encoding and
+    ECMA-262 §23.3.2.3–4 / §23.3.3.7–8 observable ordering and error behavior are unchanged.
+    On an 8-sample release workload over 262,144-byte arrays, `toHex` improved from 0.735 s to
+    0.295 s median (about 60%), and `fromBase64` from 0.690 s to 0.360 s (about 48%); the
+    combined encode/decode workload improved from 0.770 s to 0.365 s (about 53%).
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
