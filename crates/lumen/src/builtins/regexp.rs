@@ -311,7 +311,11 @@ pub(super) fn install_regexp(it: &mut Interp) {
         let src = ab(i.to_string(&src_v))?;
         let flags_v = ab(i.get_member(&this, "flags"))?;
         let flags = ab(i.to_string(&flags_v))?;
-        Ok(Value::from_string(format!("/{src}/{flags}")))
+        // RegExp.prototype.toString performs the two observable Gets/ToStrings above, then
+        // concatenates the four pieces directly (ECMA-262 §22.2.6.17).
+        Ok(Value::Str(crate::lstr::LStr::concat4(
+            "/", &src, "/", &flags,
+        )))
     });
     let ctor = it.make_native("RegExp", 2, |i, _t, a| {
         let pattern = arg(a, 0);

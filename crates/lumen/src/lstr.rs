@@ -124,6 +124,32 @@ impl LStr {
         s
     }
 
+    /// The four pieces concatenated into one engine allocation.
+    #[inline]
+    pub(crate) fn concat4(a: &str, b: &str, c: &str, d: &str) -> LStr {
+        let total = a
+            .len()
+            .checked_add(b.len())
+            .and_then(|total| total.checked_add(c.len()))
+            .and_then(|total| total.checked_add(d.len()))
+            .expect("string too large");
+        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
+        unsafe {
+            let data = (s.p.as_ptr() as *mut u8).add(HDR);
+            std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
+            std::ptr::copy_nonoverlapping(c.as_ptr(), data.add(a.len() + b.len()), c.len());
+            std::ptr::copy_nonoverlapping(
+                d.as_ptr(),
+                data.add(a.len() + b.len() + c.len()),
+                d.len(),
+            );
+            s.hdr().len.set(total as u32);
+        }
+        s.and_ascii(a.is_ascii() && b.is_ascii() && c.is_ascii() && d.is_ascii());
+        s
+    }
+
     /// Concatenate already-coerced strings into one engine allocation.
     pub(crate) fn concat_many(parts: &[LStr], total: usize) -> LStr {
         let s = LStr::alloc("", u32::try_from(total).expect("string too large"));

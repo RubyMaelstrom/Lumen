@@ -971,6 +971,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     callable checks, source-text preservation, and implementation-defined native syntax remain
     unchanged (ECMA-262 §20.2.3.5). A 15-sample release workload over 280,000 mixed source/native
     stringifications improved from 0.308 s to 0.286 s median (about 7%).
+  - [x] `RegExp.prototype.toString` concatenates the already-coerced source and flags directly into
+    one engine string after the required receiver check and observable Gets/ToStrings, preserving
+    generic receivers and abrupt completion ordering (ECMA-262 §22.2.6.17). A 15-sample no-LTO
+    release workload over 300,000 direct and generic calls improved from 0.527253 s to 0.508552 s
+    median (about 3.5%); the candidate remains subject to the canonical fat-LTO gate.
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).

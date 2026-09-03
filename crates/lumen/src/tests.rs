@@ -5254,6 +5254,15 @@ fn regexp_proto_getters() {
     assert_eq!(run("/abc/d.hasIndices"), "true");
 }
 #[test]
+fn regexp_to_string_uses_source_and_flags() {
+    assert_eq!(run("/abc/gi.toString()"), "/abc/gi");
+    assert_eq!(
+        run("RegExp.prototype.toString.call({source:'x', flags:'m'})"),
+        "/x/m"
+    );
+    assert_eq!(throws("RegExp.prototype.toString.call(null)"), "TypeError");
+}
+#[test]
 fn date_format_methods() {
     assert_eq!(run("new Date(0).toDateString()"), "Thu Jan 01 1970");
     assert_eq!(
