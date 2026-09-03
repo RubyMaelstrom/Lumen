@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
 #
-# Pre-push: the wasm32 target must compile before anything leaves this machine — jit.rs is
-# aarch64-macos-gated, so a native build happily passes while a bytecode/interpreter change
-# breaks the wasm CI (it has, more than once).
+# Pre-push: everything in the workspace must still compile before anything leaves this machine.
+# The engine is gated per-architecture (jit.rs is aarch64-gated with an x86-64 fallback), so a
+# native run on one host happily passes while a bytecode/interpreter change breaks another tier.
+# `--all-targets` includes tests, benches and examples, where that kind of rot usually hides.
+#
+# This deliberately does NOT install toolchains or targets. Cross-target checks (wasm32, other
+# architectures) belong in CI or in an explicit manual build, not in a hook that mutates the
+# local toolchain on every push.
 #
 # Enable once per clone:   git config core.hooksPath .githooks
 # Skip in an emergency:    git push --no-verify
 set -euo pipefail
 
-export PATH="$HOME/.cargo/bin:$PATH"
-
-if ! rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
-  echo "pre-push: installing wasm32-unknown-unknown target ..." >&2
-  rustup target add wasm32-unknown-unknown >&2
-fi
-
-echo "pre-push: cargo check --target wasm32-unknown-unknown (lumen, lumen-wasm) ..." >&2
-cargo check -q -p lumen -p lumen-wasm --target wasm32-unknown-unknown
-echo "pre-push: wasm check OK" >&2
+echo "pre-push: cargo check --workspace --all-targets ..." >&2
+cargo check -q --workspace --all-targets
+echo "pre-push: workspace check OK" >&2
