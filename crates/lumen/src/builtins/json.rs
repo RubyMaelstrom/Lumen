@@ -581,6 +581,20 @@ impl JsonInput<'_> {
             Self::Chars(chars) => chars[start..end].iter().collect(),
         }
     }
+
+    fn parse_number(self, start: usize, end: usize) -> Result<f64, ()> {
+        match self {
+            Self::Bytes(bytes) => std::str::from_utf8(&bytes[start..end])
+                .map_err(|_| ())?
+                .parse::<f64>()
+                .map_err(|_| ()),
+            Self::Chars(chars) => chars[start..end]
+                .iter()
+                .collect::<String>()
+                .parse::<f64>()
+                .map_err(|_| ()),
+        }
+    }
 }
 
 fn json_skip_ws(input: JsonInput<'_>, pos: &mut usize) {
@@ -705,8 +719,10 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
                     *pos += 1;
                 }
             }
-            let s = input.to_string(start, *pos);
-            s.parse::<f64>().map(Value::Num).map_err(|_| err())
+            input
+                .parse_number(start, *pos)
+                .map(Value::Num)
+                .map_err(|_| err())
         }
         _ => Err(i.make_error("SyntaxError", "Unexpected token in JSON")),
     }
