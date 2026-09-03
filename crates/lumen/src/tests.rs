@@ -13130,6 +13130,66 @@ fn regexp_replace_dollar_substitutions() {
 }
 
 #[test]
+fn regexp_replace_flags_fast_path_shapes() {
+    // Canonical direct RegExps read the engine-owned flags without dispatching the getter;
+    // every replace shape must still match the observable flags string.
+    assert_eq!(run("'qvi .so_zrah'.replace(/\\./g, '')"), "qvi so_zrah");
+    assert_eq!(run("'QBZPbagebyQBZPbageby'.replace(/QBZPbageby/g, '')"), "");
+    assert_eq!(
+        run("'John Smith'.replace(/(\\w+)\\s(\\w+)/, '$2 $1')"),
+        "Smith John"
+    );
+    assert_eq!(run("'abc'.replace(/b/g, (m) => m.toUpperCase())"), "aBc");
+    assert_eq!(run("'no match here'.replace(/zzz/g, 'X')"), "no match here");
+    // Unicode flag propagation: empty-match advancement is code-point based.
+    assert_eq!(run("'a𝌆b'.replace(/𝌆/u, 'X')"), "aXb");
+    assert_eq!(run("'aXb'.replace(/(?:)/g, '-')"), "-a-X-b-");
+}
+
+#[test]
+fn regexp_replace_flags_own_override_takes_generic_path() {
+    // An own `global` data property (defineProperty) changes the observable flags string to no
+    // longer include "g"; replace must follow it, so the guard declines the direct engine-side
+    // read and uses the generic getter. A plain assignment is a silent no-op on a setter-less
+    // accessor (own property is never created), matching Node/V8.
+    assert_eq!(
+        run("var re = /x/g; Object.defineProperty(re, 'global', {value: false}); 'axax'.replace(re, 'Y')"),
+        "aYax"
+    );
+    assert_eq!(
+        run("var re = /x/; re.global = true; 'axax'.replace(re, 'Y')"),
+        "aYax"
+    );
+}
+
+#[test]
+fn regexp_replace_flags_proto_override_takes_generic_path() {
+    // Replacing a %RegExp.prototype% flag accessor (defineProperty) changes the observable
+    // flags string; replace must honor it (generic path via the dependency guard). A plain
+    // assignment is a silent no-op, matching Node/V8.
+    assert_eq!(
+        run("Object.defineProperty(RegExp.prototype, 'global', {value: false}); 'axax'.replace(/x/g, 'Y')"),
+        "aYax"
+    );
+    assert_eq!(
+        run("RegExp.prototype.flags = 'g'; 'axax'.replace(/x/, 'Y')"),
+        "aYax"
+    );
+}
+
+#[test]
+fn regexp_match_fast_path_shapes() {
+    assert_eq!(run("'a1 b2 c3'.match(/[a-z]\\d/g).join(',')"), "a1,b2,c3");
+    assert_eq!(run("'a1'.match(/[a-z]\\d/)"), "a1");
+    assert_eq!(run("'xyz'.match(/q/)"), "null");
+    // Own flag override takes the generic @@match path with observable (non-global) flags.
+    assert_eq!(
+        run("var re = /z/g; Object.defineProperty(re, 'global', {value: false}); 'zz'.match(re)"),
+        "z"
+    );
+}
+
+#[test]
 fn regexp_d_flag_indices() {
     assert_eq!(run("/b/d.exec('abc').indices[0].join(',')"), "1,2");
     assert_eq!(run("'has indices: '+/x/d.hasIndices"), "has indices: true");

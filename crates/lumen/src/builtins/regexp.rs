@@ -224,6 +224,48 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
             })
 }
 
+/// Flag names `RegExp.prototype.flags` observes on its receiver (ECMA-262 §22.2.6.6). An own
+/// property with any of these names makes the observable flags string depend on that property,
+/// so the generic `Get` path must run instead of a direct engine-side read.
+const FLAG_PROP_NAMES: [&str; 9] = [
+    "hasIndices",
+    "global",
+    "ignoreCase",
+    "multiline",
+    "dotAll",
+    "unicode",
+    "unicodeSets",
+    "sticky",
+    "flags",
+];
+
+/// Read the engine-owned flags of a RegExp without dispatching the `flags` getter, when the
+/// observable `RegExp.prototype.flags` string is provably canonical: `this` is an ordinary
+/// direct-RegExp instance with no own flag-named property overrides, and the live
+/// %RegExp.prototype% still carries the canonical `flags` and component-flag getters. Returns
+/// the compiled Regex for a direct read; `None` keeps the generic getter with its observable
+/// Gets (a user-overridden `flags`, a subclass prototype, or an own flag property all force it).
+fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::regex::Regex>> {
+    let Value::Obj(obj) = this else {
+        return None;
+    };
+    let ptr = Rc::as_ptr(obj) as usize;
+    let re = i.regexps.get(&ptr).cloned()?;
+    let b = obj.borrow();
+    if !matches!(b.exotic, Exotic::None)
+        || !b
+            .proto
+            .as_ref()
+            .zip(i.extra_protos.get("RegExp"))
+            .is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+        || FLAG_PROP_NAMES.iter().any(|name| b.props.contains(name))
+    {
+        return None;
+    }
+    drop(b);
+    literal_match_dependencies_canonical(i).then_some(re)
+}
+
 /// The second (flags) argument to RegExp / RegExp.prototype.compile: undefined → "", else ToString.
 fn regexp_flags_arg(i: &mut Interp, a: &[Value]) -> Result<String, Value> {
     match arg(a, 1) {
@@ -576,12 +618,22 @@ fn require_regexp_this(i: &mut Interp, this: &Value, name: &str) -> Result<(), V
 pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.match]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
-    let flags = ab(i.get_member(&this, "flags"))?;
-    let flags = ab(i.to_string(&flags))?;
+    let (flags, unicode) = match direct_reg_exp_flags(i, &this) {
+        Some(re) => {
+            let flags = re.flags.clone();
+            let unicode = flags.contains('u') || flags.contains('v');
+            (flags, unicode)
+        }
+        None => {
+            let flags_v = ab(i.get_member(&this, "flags"))?;
+            let flags = ab(i.to_string(&flags_v))?.to_string();
+            let unicode = flags.contains('u') || flags.contains('v');
+            (flags, unicode)
+        }
+    };
     if !flags.contains('g') {
         return regexp_exec_abstract(i, &this, s);
     }
-    let unicode = flags.contains('u') || flags.contains('v');
     set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
     let mut results: Vec<Value> = Vec::new();
     loop {
@@ -689,11 +741,24 @@ fn re_sym_replace_impl(
     } else {
         ab(i.to_string(&repl))?
     };
-    // Globalness/unicodeness come from the `flags` string (whose getter Gets each flag prop).
-    let flags_v = ab(i.get_member(&this, "flags"))?;
-    let flags = ab(i.to_string(&flags_v))?;
-    let global = flags.contains('g');
-    let unicode = flags.contains('u') || flags.contains('v');
+    // Globalness/unicodeness come from the `flags` string. The hot path reads the engine-owned
+    // flags directly when the observable `flags` getter result is provably canonical, avoiding
+    // the getter's eight observable [[Get]]s and per-flag native dispatches on every call.
+    let (flags, global, unicode) = match direct_reg_exp_flags(i, &this) {
+        Some(re) => {
+            let flags = re.flags.clone();
+            let global = flags.contains('g');
+            let unicode = flags.contains('u') || flags.contains('v');
+            (flags, global, unicode)
+        }
+        None => {
+            let flags_v = ab(i.get_member(&this, "flags"))?;
+            let flags = ab(i.to_string(&flags_v))?.to_string();
+            let global = flags.contains('g');
+            let unicode = flags.contains('u') || flags.contains('v');
+            (flags, global, unicode)
+        }
+    };
     if global {
         set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
     }
