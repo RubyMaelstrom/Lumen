@@ -666,10 +666,13 @@ finish the baseline, but no later phase may claim a performance win against the 
   recover diagnostics. `PerformanceMetricsSampler` emits an immediate and then interval-spaced
   JSON envelope, coalesces missed intervals, triggers the existing post-GC snapshot only when due,
   and remains inert unless `LUMEN_PERF_METRICS` is enabled.
-- [ ] Add a stable machine-readable profile format and a human summary tool.
+- [x] Add a stable machine-readable profile format and a human summary tool.
   - [x] The engine matrix and opt-in metrics records use versioned JSON, and
     `scripts/summarize-engine-report.py` renders medians, confidence intervals, and component
     ratios without recomputing or accepting incomplete reports.
+  - [x] Verified 2026-09-03: metrics + matrix both `schema_version:1` with version-gated
+    ingestion (`bench-matrix.py` rejects mismatch/incomplete); `summarize` renders locked
+    baseline; `bench-matrix.test.py` 6 passed, `summarize-engine-report.test.py` 2 passed.
 
 ### Phase 2: canonical tagged value and execution ABI
 
