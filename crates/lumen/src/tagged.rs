@@ -421,6 +421,68 @@ impl TaggedNumericFrame {
         let right = f64::from_bits(self.slots[1].raw());
         TaggedValue::boolean(f(left, right))
     }
+
+    /// Apply an f64 transcendental over the two slots and produce a Number immediate. For
+    /// exponentiation the caller-level predicate is the complete Number::exponentiate distinction:
+    /// an f64 `powf` alone would disagree with ECMA-262 §6.1.6.1.20 on `1 ** ±Infinity` (NaN, not
+    /// 1.0) and on a NaN exponent with base 1, so this mirrors the exact guard the canonical
+    /// `Interp::binary` fast path already applies before delegating to `powf`.
+    #[inline(always)]
+    pub(crate) fn pow(self) -> TaggedValue {
+        let left = f64::from_bits(self.slots[0].raw());
+        let right = f64::from_bits(self.slots[1].raw());
+        TaggedValue::number(
+            if right.is_nan() || (left.abs() == 1.0 && right.is_infinite()) {
+                f64::NAN
+            } else {
+                left.powf(right)
+            },
+        )
+    }
+
+    /// Apply an i32 transform over the two slots and produce a Number immediate. The int32
+    /// conversion (ECMA-262 §7.1.5) runs on the extracted bits exactly like `bin_i32`, so NaN,
+    /// infinities, fractions, and values outside the int32 range wrap identically; the f64 result
+    /// widening is exact for every int32.
+    #[inline(always)]
+    pub(crate) fn bitwise<F>(self, f: F) -> TaggedValue
+    where
+        F: FnOnce(i32, i32) -> i32,
+    {
+        let left = f64::from_bits(self.slots[0].raw());
+        let right = f64::from_bits(self.slots[1].raw());
+        TaggedValue::number(f(crate::eval::to_int32(left), crate::eval::to_int32(right)) as f64)
+    }
+}
+
+/// A fixed, allocation-free one-slot tagged frame for the unary execution slice. It models a
+/// single Number operand slot, the same shape a migrated local or VM operand will have; it cannot
+/// cross a user-code, allocation, or safepoint boundary. Any non-Number value must remain on the
+/// canonical `Value` path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaggedNumberFrame {
+    slot: TaggedValue,
+}
+
+impl TaggedNumberFrame {
+    #[inline(always)]
+    pub(crate) fn new(value: f64) -> Self {
+        Self {
+            slot: TaggedValue::number(value),
+        }
+    }
+
+    /// Apply one f64 unary transform and produce a Number immediate. The canonical paths route
+    /// here with the exact closure they would run on the `Value` fast path: negation (which flips
+    /// signed zero), `+` identity, and bitwise NOT (which converts through ToInt32 first, then
+    /// widens the i32 result exactly).
+    #[inline(always)]
+    pub(crate) fn unary<F>(self, f: F) -> TaggedValue
+    where
+        F: FnOnce(f64) -> f64,
+    {
+        TaggedValue::number(f(f64::from_bits(self.slot.raw())))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

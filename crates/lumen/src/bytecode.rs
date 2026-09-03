@@ -3315,6 +3315,146 @@ mod feedback_layout_tests {
     }
 
     #[test]
+    fn tagged_numeric_i32_accepts_only_immediate_numbers_and_wraps() {
+        let band = |left: i32, right: i32| left & right;
+        let result = try_tagged_numeric_i32(&Value::Num(12.0), &Value::Num(10.0), &band)
+            .expect("Number operands use the tagged frame");
+        assert!(matches!(result, Value::Num(value) if value == 8.0));
+
+        // ToInt32 wrapping is applied inside the frame to the exact extracted bits.
+        assert!(matches!(
+            try_tagged_numeric_i32(&Value::Num(4294967296.0), &Value::Num(1.0), &band),
+            Some(Value::Num(value)) if value == 0.0
+        ));
+        assert!(matches!(
+            try_tagged_numeric_i32(&Value::Num(-0.5), &Value::Num(1.0), &band),
+            Some(Value::Num(value)) if value == 0.0
+        ));
+        assert!(matches!(
+            try_tagged_numeric_i32(&Value::Num(f64::NAN), &Value::Num(1.0), &band),
+            Some(Value::Num(value)) if value == 0.0
+        ));
+        assert!(matches!(
+            try_tagged_numeric_i32(&Value::Num(-1.0), &Value::Num(2.0), &band),
+            Some(Value::Num(value)) if value == 2.0
+        ));
+
+        let interp = Interp::new();
+        assert!(try_tagged_numeric_i32(&Value::str("x"), &Value::Num(2.0), &band).is_none());
+        assert!(try_tagged_numeric_i32(
+            &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
+            &Value::Num(2.0),
+            &band,
+        )
+        .is_none());
+        assert!(
+            try_tagged_numeric_i32(&Value::Obj(interp.new_object()), &Value::Num(2.0), &band)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tagged_numeric_unary_accepts_only_immediate_numbers() {
+        // Negation flips signed zero exactly like the canonical fast path.
+        let neg = try_tagged_numeric_unary(&Value::Num(0.0), |n| -n)
+            .expect("Number operand uses the tagged frame");
+        assert!(matches!(neg, Value::Num(value) if value.to_bits() == (-0.0f64).to_bits()));
+        let neg_neg = try_tagged_numeric_unary(&Value::Num(-0.0), |n| -n)
+            .expect("Number operand uses the tagged frame");
+        assert!(matches!(neg_neg, Value::Num(value) if value.to_bits() == 0.0f64.to_bits()));
+
+        // NaN, infinities, and subnormals round-trip through the frame.
+        assert!(matches!(
+            try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| n),
+            Some(Value::Num(value)) if value.is_nan()
+        ));
+        assert!(matches!(
+            try_tagged_numeric_unary(&Value::Num(f64::INFINITY), |n| -n),
+            Some(Value::Num(value)) if value == f64::NEG_INFINITY
+        ));
+        let subnormal = f64::from_bits(1);
+        assert!(matches!(
+            try_tagged_numeric_unary(&Value::Num(subnormal), |n| -n),
+            Some(Value::Num(value)) if value.to_bits() == (-subnormal).to_bits()
+        ));
+
+        // Bitwise NOT converts through ToInt32 before inverting.
+        assert!(matches!(
+            try_tagged_numeric_unary(&Value::Num(0.0), |n| !crate::eval::to_int32(n) as f64),
+            Some(Value::Num(value)) if value == -1.0
+        ));
+        assert!(matches!(
+            try_tagged_numeric_unary(&Value::Num(-1.0), |n| !crate::eval::to_int32(n) as f64),
+            Some(Value::Num(value)) if value == 0.0
+        ));
+        assert!(matches!(
+            try_tagged_numeric_unary(&Value::Num(f64::NAN), |n| !crate::eval::to_int32(n) as f64),
+            Some(Value::Num(value)) if value == -1.0
+        ));
+
+        let interp = Interp::new();
+        assert!(try_tagged_numeric_unary(&Value::str("x"), |n| -n).is_none());
+        assert!(try_tagged_numeric_unary(&Value::Obj(interp.new_object()), |n| -n).is_none());
+    }
+
+    #[test]
+    fn tagged_numeric_pow_keeps_exponentiate_edges() {
+        // The Number::exponentiate cases where raw powf disagrees with ECMA-262 §6.1.6.1.20.
+        // Step 8 fires before the ±1 special cases: a negative base with a non-integral exponent
+        // (and -+∞ are never integral Numbers) is NaN, so `-1 ** ±∞` is NaN, matching Node/V8.
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::INFINITY)),
+            Some(Value::Num(value)) if value.is_nan()
+        ));
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NEG_INFINITY)),
+            Some(Value::Num(value)) if value.is_nan()
+        ));
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::INFINITY)),
+            Some(Value::Num(value)) if value.is_nan()
+        ));
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(-1.0), &Value::Num(f64::NEG_INFINITY)),
+            Some(Value::Num(value)) if value.is_nan()
+        ));
+
+        // Ordinary cases agree with powf: NaN exponent is NaN even for base 1, `0 ** -1` is
+        // +Infinity, negative base with fractional exponent is NaN, `NaN ** 0` is 1.
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(1.0), &Value::Num(f64::NAN)),
+            Some(Value::Num(value)) if value.is_nan()
+        ));
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(0.0), &Value::Num(-1.0)),
+            Some(Value::Num(value)) if value == f64::INFINITY
+        ));
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(-2.0), &Value::Num(0.5)),
+            Some(Value::Num(value)) if value.is_nan()
+        ));
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(f64::NAN), &Value::Num(0.0)),
+            Some(Value::Num(value)) if value == 1.0
+        ));
+        assert!(matches!(
+            try_tagged_numeric_pow(&Value::Num(2.0), &Value::Num(-1.0)),
+            Some(Value::Num(value)) if value == 0.5
+        ));
+
+        let interp = Interp::new();
+        assert!(try_tagged_numeric_pow(&Value::str("x"), &Value::Num(2.0)).is_none());
+        assert!(try_tagged_numeric_pow(
+            &Value::BigInt(crate::bigint::JsBigInt::from_u64(2)),
+            &Value::Num(2.0),
+        )
+        .is_none());
+        assert!(
+            try_tagged_numeric_pow(&Value::Obj(interp.new_object()), &Value::Num(2.0)).is_none()
+        );
+    }
+
+    #[test]
     fn profiled_binary_helper_records_original_operands_and_successful_result() {
         let (layout, bindings) = feedback_layout_for_ops(&[Op::Add], &[]);
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
@@ -11629,16 +11769,47 @@ fn run_vm(
                 let b = pop!();
                 let a = pop!();
                 let profiling = observe_arithmetic_operands(&chunk.feedback, op_pc, &a, &b);
-                let v = i.binary(&chunk.names[n as usize], a, b)?;
+                // Exponentiation keeps a dedicated dispatch so Number⊕Number never enters the
+                // generic `binary` helper: same observable steps (no coercion for two Numbers),
+                // same Number::exponentiate guard, one less indirect match per hot op. The
+                // tagged slice rides the same path behind the opt-in switch.
+                let v = if &*chunk.names[n as usize] == "**" {
+                    match i
+                        .tagged_arithmetic
+                        .then(|| try_tagged_numeric_pow(&a, &b))
+                        .flatten()
+                    {
+                        Some(value) => value,
+                        None => match (&a, &b) {
+                            (Value::Num(x), Value::Num(y)) => {
+                                if y.is_nan() || (x.abs() == 1.0 && y.is_infinite()) {
+                                    Value::Num(f64::NAN)
+                                } else {
+                                    Value::Num(x.powf(*y))
+                                }
+                            }
+                            _ => i.binary(&chunk.names[n as usize], a, b)?,
+                        },
+                    }
+                } else {
+                    i.binary(&chunk.names[n as usize], a, b)?
+                };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
             }
             Op::Neg => {
                 let a = pop!();
                 let profiling = observe_arithmetic_operand(&chunk.feedback, op_pc, &a);
-                let v = match a {
-                    Value::Num(n) => Value::Num(-n),
-                    other => i.eval_unary_vm("-", other)?,
+                let v = match i
+                    .tagged_arithmetic
+                    .then(|| try_tagged_numeric_unary(&a, |n| -n))
+                    .flatten()
+                {
+                    Some(value) => value,
+                    None => match a {
+                        Value::Num(n) => Value::Num(-n),
+                        other => i.eval_unary_vm("-", other)?,
+                    },
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
@@ -11646,9 +11817,16 @@ fn run_vm(
             Op::Plus => {
                 let a = pop!();
                 let profiling = observe_arithmetic_operand(&chunk.feedback, op_pc, &a);
-                let v = match a {
-                    Value::Num(n) => Value::Num(n),
-                    other => i.eval_unary_vm("+", other)?,
+                let v = match i
+                    .tagged_arithmetic
+                    .then(|| try_tagged_numeric_unary(&a, |n| n))
+                    .flatten()
+                {
+                    Some(value) => value,
+                    None => match a {
+                        Value::Num(n) => Value::Num(n),
+                        other => i.eval_unary_vm("+", other)?,
+                    },
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
@@ -11660,9 +11838,16 @@ fn run_vm(
             Op::BitNot => {
                 let a = pop!();
                 let profiling = observe_arithmetic_operand(&chunk.feedback, op_pc, &a);
-                let v = match a {
-                    Value::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
-                    other => i.eval_unary_vm("~", other)?,
+                let v = match i
+                    .tagged_arithmetic
+                    .then(|| try_tagged_numeric_unary(&a, |n| !crate::eval::to_int32(n) as f64))
+                    .flatten()
+                {
+                    Some(value) => value,
+                    None => match a {
+                        Value::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
+                        other => i.eval_unary_vm("~", other)?,
+                    },
                 };
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
@@ -13860,6 +14045,66 @@ where
     ))
 }
 
+/// Attempt the immediate-only tagged ABI path for bitwise and shift operators. Returning `None`
+/// keeps the complete `Interp::binary` helper: heap values, strings, BigInts, symbols, and objects
+/// preserve ToNumeric ordering and the BigInt mixing check of ECMA-262 §13.7–13.8. Number operands
+/// run ToInt32 (§7.1.5) inside the frame on the exact extracted bits, identical to `bin_i32`.
+#[inline(always)]
+fn try_tagged_numeric_i32<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
+where
+    F: Fn(i32, i32) -> i32,
+{
+    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+        return None;
+    };
+    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
+    let result = frame.bitwise(f);
+    Some(Value::Num(
+        result
+            .as_number()
+            .expect("tagged bitwise result remains a Number"),
+    ))
+}
+
+/// Attempt the immediate-only tagged ABI path for unary numeric operators. Returning `None` keeps
+/// the complete `eval_unary_vm` helper with its ToNumber/ToNumeric ordering and abrupt completions
+/// (ECMA-262 §13.5.5–6, §13.5.9). The closure is the same f64 transform the canonical fast path
+/// runs, so signed-zero negation, `+` identity, and ToInt32-based bitwise NOT match exactly.
+#[inline(always)]
+fn try_tagged_numeric_unary<F>(value: &Value, f: F) -> Option<Value>
+where
+    F: FnOnce(f64) -> f64,
+{
+    let Value::Num(n) = value else {
+        return None;
+    };
+    let frame = crate::tagged::TaggedNumberFrame::new(*n);
+    let result = frame.unary(f);
+    Some(Value::Num(
+        result
+            .as_number()
+            .expect("tagged unary result remains a Number"),
+    ))
+}
+
+/// Attempt the immediate-only tagged ABI path for exponentiation, mirroring the canonical
+/// `Interp::binary` fast path's Number::exponentiate guard exactly (NaN exponent, and |base| = 1
+/// with an infinite exponent, are NaN even though raw `powf` would round them to 1.0). Returning
+/// `None` keeps the complete helper with BigInt mixing and ToNumeric ordering (ECMA-262 §13.9).
+#[inline(always)]
+fn try_tagged_numeric_pow(left: &Value, right: &Value) -> Option<Value> {
+    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+        return None;
+    };
+    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
+    let result = frame.pow();
+    Some(Value::Num(
+        result
+            .as_number()
+            .expect("tagged exponentiation result remains a Number"),
+    ))
+}
+
 #[inline]
 fn bin_i32(
     i: &mut Interp,
@@ -13872,10 +14117,19 @@ fn bin_i32(
     let b = stack.pop().expect("vm stack underflow");
     let a = stack.pop().expect("vm stack underflow");
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
-    let v = if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
-        Value::Num(f(crate::eval::to_int32(*x), crate::eval::to_int32(*y)) as f64)
-    } else {
-        i.binary(op, a, b)?
+    let v = match i
+        .tagged_arithmetic
+        .then(|| try_tagged_numeric_i32(&a, &b, &f))
+        .flatten()
+    {
+        Some(value) => value,
+        None => {
+            if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
+                Value::Num(f(crate::eval::to_int32(*x), crate::eval::to_int32(*y)) as f64)
+            } else {
+                i.binary(op, a, b)?
+            }
+        }
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
     stack.push(v);
