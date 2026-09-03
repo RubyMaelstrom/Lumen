@@ -10946,6 +10946,26 @@ fn error_is_error_and_stack() {
     assert_eq!(run("Error.isError(new TypeError())"), "true");
     assert_eq!(run("Error.isError({})"), "false");
     assert_eq!(run("Error.isError(null)"), "false");
+    assert_eq!(
+        run("Error.prototype.toString.call({name:undefined,message:undefined})"),
+        "Error"
+    );
+    assert_eq!(
+        run("Error.prototype.toString.call({name:'',message:'detail'})"),
+        "detail"
+    );
+    assert_eq!(
+        run("Error.prototype.toString.call({name:'Kind',message:''})"),
+        "Kind"
+    );
+    assert_eq!(
+        run("Error.prototype.toString.call({name:'Kind',message:'detail'})"),
+        "Kind: detail"
+    );
+    assert_eq!(
+        run("var log=[]; Error.prototype.toString.call({get name(){log.push('name'); return {toString(){log.push('nameToString'); return 'N'}}}, get message(){log.push('message'); return {toString(){log.push('messageToString'); return 'M'}}}}); log.join(',')"),
+        "name,nameToString,message,messageToString"
+    );
     // stack is an accessor; the setter shadows it with an own data property.
     assert_eq!(
         run("typeof Object.getOwnPropertyDescriptor(Error.prototype,'stack').get"),

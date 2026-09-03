@@ -25,19 +25,19 @@ pub(super) fn install_errors(it: &mut Interp) {
             ));
         }
         let name = match ab(i.get_member(&this, "name"))? {
-            Value::Undefined => "Error".to_string(),
-            v => ab(i.to_string(&v))?.to_string(),
+            Value::Undefined => crate::lstr::LStr::from("Error"),
+            v => ab(i.to_string(&v))?,
         };
         let msg = match ab(i.get_member(&this, "message"))? {
-            Value::Undefined => String::new(),
-            v => ab(i.to_string(&v))?.to_string(),
+            Value::Undefined => crate::lstr::LStr::from(""),
+            v => ab(i.to_string(&v))?,
         };
-        Ok(Value::from_string(if msg.is_empty() {
+        Ok(Value::Str(if msg.is_empty() {
             name
         } else if name.is_empty() {
             msg
         } else {
-            format!("{name}: {msg}")
+            crate::lstr::LStr::concat3(&name, ": ", &msg)
         }))
     });
     // Error.prototype.stack accessor (error-stack-accessor proposal). The frames are snapshotted

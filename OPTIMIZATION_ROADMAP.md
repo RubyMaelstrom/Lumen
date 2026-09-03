@@ -950,6 +950,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   - [x] `Array.prototype.join` streams separator conversion, indexed Gets, and element ToStrings
     into one result buffer in the exact ECMA-262 §23.1.3.18 order; release micro-workloads improved
     7% for ASCII values and 33% for Unicode-heavy values by removing per-element String copies.
+  - [x] `Error.prototype.toString` retains the `LStr` results of the normative `Get`/`ToString`
+    steps and writes the `name: message` form directly into one engine allocation, preserving the
+    empty-name/message branches and observable coercion order (ECMA-262 §20.5.3.4). A 15-sample
+    release workload over 307,200 error stringifications improved from 0.688 s to 0.606 s median
+    (about 12%).
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
