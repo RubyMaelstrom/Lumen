@@ -646,9 +646,14 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Array indexed built-ins reuse one canonical index key for `HasProperty`/`Get` and probe
     ordinary own dense data directly; holes, accessors, prototype properties, proxies, host
     indexed objects, and other exotics retain the ECMA-262 §23.1.3 generic path.
-- [ ] Make all detailed instrumentation opt-in and nearly free when disabled.
+- [x] Make all detailed instrumentation opt-in and nearly free when disabled.
   - [x] Hot-path diagnostics use a process-sampled relaxed byte gate; disabled iterator and
     conversion probes avoid timestamps, allocations, and synchronization locks.
+  - [x] Verified 2026-09-03 on `ee21a91`: `PERF_METRICS_ENABLED` is a cached `AtomicU8` relaxed
+    byte load (no `OnceLock` per-helper); `perf_stage_start` returns `None` when off so no
+    `Instant::now`, and every `_end` returns early with no atomic/lock/alloc. Feedback
+    `observe_*` returns before touching `OnceCell` words when `detailed_enabled` is false.
+    Disabled run emits 0 stderr bytes with correct `caught=100`; enabled emits full timings.
 - [x] Add bounded periodic dumps for long-lived browser Agents; do not require process exit to
   recover diagnostics. `PerformanceMetricsSampler` emits an immediate and then interval-spaced
   JSON envelope, coalesces missed intervals, triggers the existing post-GC snapshot only when due,
