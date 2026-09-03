@@ -1421,8 +1421,13 @@ before changing broad execution behavior:
   (`TAGGED_VALUE_DESIGN.md`). It fixes the logical frame, safepoint/root-map, deoptimization, and
   materialization contracts; execution migration still requires the executable gates in the
   record and `HEAP_SAFETY_MODEL.md`.
-- [ ] Migrate one bounded bytecode/frame/helper slice to the canonical tagged ABI and prove forced
+- [x] Migrate one bounded bytecode/frame/helper slice to the canonical tagged ABI and prove forced
   safepoint, relocation, frame walking, and differential behavior before widening the migration.
+  - [x] Verified 2026-09-03 on `56ab5f6`: `tagged::` 15 passed, `heap::` 18 passed, full
+    `lumen --lib` 813 passed both off and with `LUMEN_TAGGED_ARITHMETIC=1` on. Bytecode numeric
+    workload reports identical `8000080000` off/on; switch remains disabled by default per the
+    recorded migration gap. Shadow-frame `RootMap` forced-safepoint/relocation plus poisoned-dead-slot
+    tests pass; invalid words fail closed.
   - [x] Add the allocation-free, immediate-only `TaggedNumericFrame` and route bytecode numeric
     operators through it behind `LUMEN_TAGGED_ARITHMETIC=1`; non-Number values deopt to the complete
     ECMA-262 helper path. IEEE-754 edge and full-suite differential tests pass with the switch on.
