@@ -1218,6 +1218,47 @@ fn ta_native(
             // Default (no comparator) numeric sort runs natively — the Value-boxed merge sort
             // is far too slow for the quarter-million-element perf tests.
             if matches!(cmp, Value::Undefined) && !info.kind.is_bigint() {
+                // Ordinary buffers cannot be resized or observed between the captured read and
+                // writes. Keep the source as bytes until sorting, then encode the sorted values
+                // into one output range; shared-buffer races retain the conservative path below
+                // (ECMA-262 §23.2.3.29).
+                if !i.shared_buffers.contains_key(&info.buffer) && i.ta_len(&info) == Some(len) {
+                    if let Some(raw) = i.ta_read_bytes(&info, 0, len) {
+                        let es = info.kind.elsize();
+                        let mut nums: Vec<f64> = raw
+                            .chunks_exact(es)
+                            .map(|bytes| info.kind.read(bytes))
+                            .collect();
+                        nums.sort_unstable_by(|a, b| {
+                            match (a.is_nan(), b.is_nan()) {
+                                (true, true) => std::cmp::Ordering::Equal,
+                                (true, false) => std::cmp::Ordering::Greater,
+                                (false, true) => std::cmp::Ordering::Less,
+                                _ => {
+                                    if a == b {
+                                        // -0 sorts before +0.
+                                        (1.0f64 / a)
+                                            .partial_cmp(&(1.0f64 / b))
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    } else {
+                                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                    }
+                                }
+                            }
+                        });
+                        let mut sorted = Vec::with_capacity(raw.len());
+                        for n in nums {
+                            sorted.extend_from_slice(&info.kind.write(n));
+                        }
+                        if in_place {
+                            i.ta_write_bytes(&info, 0, &sorted);
+                            return Ok(this.clone());
+                        }
+                        let (new_ta, new_info) = ta_create_same(i, info.kind, len)?;
+                        i.ta_write_bytes(&new_info, 0, &sorted);
+                        return Ok(new_ta);
+                    }
+                }
                 let mut nums: Vec<f64> = (0..len)
                     .map(|k| match i.ta_read(&info, k) {
                         Value::Num(n) => n,
