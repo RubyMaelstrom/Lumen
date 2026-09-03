@@ -599,23 +599,28 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Verified 2026-09-03: loop workload reports `lex:1 parse:1 bc:1/1` with nonzero
     seconds plus `snapshot_encode/decode` attempts/outcomes in the same envelope; persistent
     bytecode cache remains Phase 10 work, so snapshot decode stays the only deserialization metric.
-- [ ] Record host/native call counts and time by stable operation identity without requiring
+- [x] Record host/native call counts and time by stable operation identity without requiring
   source-name guesses.
   - [x] Expose opt-in aggregate native invocation counts, failures, and elapsed time at both the
     ordinary dispatch and native-entry IC funnels; diagnostics do not alter dispatch policy.
-  - [ ] Attach stable operation identities (including embedder-provided names) without relying on
+  - [x] Attach stable operation identities (including embedder-provided names) without relying on
     raw function-pointer addresses.
     - [x] Data-carrying host callables retain an immutable registration label for diagnostics,
       independent of the author-visible mutable `name` property; legacy bare `NativeFn` labels
       remain explicitly identified as a compatibility limitation.
-    - [x] In progress 2026-09-03: per-operation `native_by_operation` inventory implemented
-      (registration labels for bare fns, immutable identity for data-carrying callables,
+    - [x] Verified 2026-09-03: per-operation `native_by_operation` inventory (registration labels
+      for bare fns with first-wins ICF rule, immutable identity for data-carrying callables,
       `ns.op` qualification for embedder namespaces, 1024-label cap with `<overflow>`, JSON
-      escaping, deterministic order, zero addresses). Unit tests (6), Test262 Function apply/call
-      97/97, full 824-test suite, browser `quick` green, harness tests 7+2 pass. Live demo:
-      per-op rows sum exactly to aggregate `native_calls`. Disabled-neutral A/B PENDING: host
-      saturated by an unrelated vLLM/nvcc build (load ~20/20 cores) since 16:20 UTC, invalidating
-      micro-timing; re-run interleaved pinned A/B on a quiet host before closing.
+      escaping, deterministic order, zero addresses). Dispatch passes a `Copy` source enum resolved
+      after the enabled gate; the funnel splits into a tiny inline wrapper plus an outlined slow
+      path so disabled dispatch keeps its prior shape. Unit tests (7), harness tolerance test
+      (7+2 green), Test262 Function apply/call 97/97 plus parseInt/parseFloat/isNaN/isFinite/Math
+      466/466, full 825-test suite, browser `quick` green. Live demo: rows sum exactly to
+      aggregate `native_calls` (15001/15001). Quiet-host A/B (pinned, interleaved, 12–15 samples):
+      disabled neutral (math +0.91%, globals +1.50%, self-noise ±0.3%, no consistent slowdown);
+      enabled costs ~18% on adversarial native-dense loops (lock+maps per call; counts stay the
+      robust signal under instrumentation, times are diagnostic). An early `Option<String>` token
+      design measured ~1% disabled cost and was reworked before commit.
 - [x] Measure error construction as separate message conversion, object allocation, stack capture,
   and stack formatting costs; distinguish constructed, thrown/caught, and escaping errors before
   considering lazy stack materialization for Lumen's non-standard `stack` extension.

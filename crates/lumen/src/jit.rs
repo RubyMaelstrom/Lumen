@@ -256,6 +256,10 @@ pub(crate) fn perf_snapshot_decode_end(started: Option<std::time::Instant>, succ
     }
 }
 
+/// Native-call funnel exit. Stays tiny so it inlines to a single enabled-gate branch at both
+/// dispatch sites; all counting, timing, and per-operation work lives in
+/// `perf_native_end_enabled`, which runs only when diagnostics are on. Disabled dispatch therefore
+/// keeps the exact shape (and cost) of the previous aggregate-only funnel.
 #[inline]
 pub(crate) fn perf_native_end(
     started: Option<std::time::Instant>,
@@ -263,6 +267,14 @@ pub(crate) fn perf_native_end(
     label_src: NativeLabelSrc<'_>,
 ) {
     let Some(started) = started else { return };
+    perf_native_end_enabled(started, success, label_src);
+}
+
+fn perf_native_end_enabled(
+    started: std::time::Instant,
+    success: bool,
+    label_src: NativeLabelSrc<'_>,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     PERF_NATIVE_CALLS.fetch_add(1, Relaxed);
@@ -271,16 +283,35 @@ pub(crate) fn perf_native_end(
         PERF_NATIVE_FAILURES.fetch_add(1, Relaxed);
     }
     let mut tables = native_op_tables();
-    let label = match label_src {
+    record_native_op_src(&mut tables, label_src, nanos, success);
+}
+
+/// Attribute one call to its stable label. Takes `&mut NativeOpTables` directly (not the
+/// mutex guard) so the names lookup and the stats update borrow disjoint struct fields.
+fn record_native_op_src(
+    tables: &mut NativeOpTables,
+    src: NativeLabelSrc<'_>,
+    nanos: u64,
+    success: bool,
+) {
+    let label: &str = match src {
         NativeLabelSrc::Call(call) => match call {
             // Immutable registration identity, independent of the mutable `name` property.
-            crate::value::Callable::NativeData(data) => data.identity.to_string(),
-            crate::value::Callable::Native(f) => resolve_native_name(&tables, *f as usize),
+            crate::value::Callable::NativeData(data) => &data.identity,
+            crate::value::Callable::Native(f) => tables
+                .names
+                .get(&(*f as usize))
+                .map(String::as_str)
+                .unwrap_or(NATIVE_OP_UNKNOWN),
             _ => return,
         },
-        NativeLabelSrc::Addr(addr) => resolve_native_name(&tables, addr),
+        NativeLabelSrc::Addr(addr) => tables
+            .names
+            .get(&addr)
+            .map(String::as_str)
+            .unwrap_or(NATIVE_OP_UNKNOWN),
     };
-    record_native_op(&mut tables, label, nanos, success);
+    record_native_op(&mut tables.stats, label, nanos, success);
 }
 
 /// Lock the process tables, recovering from a poisoned mutex rather than panicking diagnostics.
@@ -317,14 +348,6 @@ fn relabel_native_name(tables: &mut NativeOpTables, addr: usize, label: String) 
     tables.names.insert(addr, label);
 }
 
-fn resolve_native_name(tables: &NativeOpTables, addr: usize) -> String {
-    tables
-        .names
-        .get(&addr)
-        .cloned()
-        .unwrap_or_else(|| NATIVE_OP_UNKNOWN.to_string())
-}
-
 /// What to attribute one native call to. Passed by value (`Copy`, pointer-sized, no drop glue)
 /// so disabled dispatch pays only register traffic: callers construct it unconditionally and
 /// `perf_native_end` resolves it only after the enabled gate.
@@ -336,18 +359,37 @@ pub(crate) enum NativeLabelSrc<'a> {
     Addr(usize),
 }
 
-fn record_native_op(tables: &mut NativeOpTables, label: String, nanos: u64, success: bool) {
-    let key = if tables.stats.len() >= NATIVE_OP_LABEL_CAP && !tables.stats.contains_key(&label) {
-        NATIVE_OP_OVERFLOW.to_string()
-    } else {
-        label
-    };
-    let entry = tables.stats.entry(key).or_default();
-    entry.calls += 1;
-    entry.nanos += nanos;
-    if !success {
-        entry.failures += 1;
+fn record_native_op(
+    stats: &mut BTreeMap<String, NativeOpStats>,
+    label: &str,
+    nanos: u64,
+    success: bool,
+) {
+    // New labels allocate exactly once (first sighting); steady-state hits borrow and update in
+    // place, so enabled profiling adds no per-call allocation on hot operations.
+    if stats.len() >= NATIVE_OP_LABEL_CAP && !stats.contains_key(label) {
+        let entry = stats.entry(NATIVE_OP_OVERFLOW.to_string()).or_default();
+        entry.calls += 1;
+        entry.nanos += nanos;
+        if !success {
+            entry.failures += 1;
+        }
+        return;
     }
+    if let Some(entry) = stats.get_mut(label) {
+        entry.calls += 1;
+        entry.nanos += nanos;
+        if !success {
+            entry.failures += 1;
+        }
+        return;
+    }
+    let entry = NativeOpStats {
+        calls: 1,
+        nanos,
+        failures: u64::from(!success),
+    };
+    stats.insert(label.to_string(), entry);
 }
 
 fn json_escape_into(out: &mut String, text: &str) {
@@ -1246,34 +1288,72 @@ mod native_op_tests {
 
     #[test]
     fn first_registration_wins_for_folded_addresses() {
+        fn probe_op(_: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+            Ok(Value::Undefined)
+        }
         let mut t = tables();
-        register_native_name(&mut t, 0x1000, "first");
-        register_native_name(&mut t, 0x1000, "second");
-        assert_eq!(resolve_native_name(&t, 0x1000), "first");
+        register_native_name(&mut t, probe_op as usize, "first");
+        register_native_name(&mut t, probe_op as usize, "second");
+        let call = crate::value::Callable::Native(probe_op);
+        record_native_op_src(&mut t, NativeLabelSrc::Call(&call), 5, true);
+        let rendered = render_native_ops(&t);
+        assert!(
+            rendered.contains("\"operation\":\"first\",\"calls\":1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("\"operation\":\"second\""), "{rendered}");
     }
 
     #[test]
     fn relabel_overwrites_for_namespaces() {
+        fn probe_ns_op(_: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+            Ok(Value::Undefined)
+        }
         let mut t = tables();
-        register_native_name(&mut t, 0x2000, "read");
-        relabel_native_name(&mut t, 0x2000, "fs.read".to_string());
-        assert_eq!(resolve_native_name(&t, 0x2000), "fs.read");
+        register_native_name(&mut t, probe_ns_op as usize, "read");
+        relabel_native_name(&mut t, probe_ns_op as usize, "fs.read".to_string());
+        record_native_op_src(&mut t, NativeLabelSrc::Addr(probe_ns_op as usize), 5, true);
+        let rendered = render_native_ops(&t);
+        assert!(rendered.contains("\"operation\":\"fs.read\""), "{rendered}");
+    }
+
+    #[test]
+    fn data_callables_report_their_immutable_identity() {
+        let func: Rc<crate::value::NativeClosure> =
+            Rc::new(|_, _, _| Err(crate::value::Value::Undefined));
+        let data = Rc::new(crate::value::NativeCallable {
+            func,
+            retained: None,
+            identity: Rc::from("test.extension.op"),
+        });
+        let call = crate::value::Callable::NativeData(data);
+        let mut t = tables();
+        record_native_op_src(&mut t, NativeLabelSrc::Call(&call), 5, true);
+        let rendered = render_native_ops(&t);
+        assert!(
+            rendered.contains("\"operation\":\"test.extension.op\""),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn unknown_addresses_never_render_as_numbers() {
-        let t = tables();
-        assert_eq!(resolve_native_name(&t, 0xDEAD), "<native>");
+        let mut t = tables();
+        record_native_op_src(&mut t, NativeLabelSrc::Addr(0xDEAD), 5, true);
         let rendered = render_native_ops(&t);
-        assert_eq!(rendered, "[]");
+        assert!(
+            rendered.contains("\"operation\":\"<native>\""),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("0x"), "{rendered}");
+        assert!(!rendered.contains("57005"), "{rendered}");
     }
 
     #[test]
     fn aggregation_counts_failures_and_time() {
         let mut t = tables();
-        let label = "Math.abs".to_string();
-        record_native_op(&mut t, label.clone(), 10, true);
-        record_native_op(&mut t, label.clone(), 20, false);
+        record_native_op(&mut t.stats, "Math.abs", 10, true);
+        record_native_op(&mut t.stats, "Math.abs", 20, false);
         let rendered = render_native_ops(&t);
         assert!(
             rendered.contains("\"operation\":\"Math.abs\",\"calls\":2,\"failures\":1"),
@@ -1285,7 +1365,7 @@ mod native_op_tests {
     fn rendering_is_deterministic_and_escapes_labels() {
         let mut t = tables();
         for label in ["b", "a\"q", "c\\d", "e\nf", "g\u{1}h"] {
-            record_native_op(&mut t, label.to_string(), 0, true);
+            record_native_op(&mut t.stats, label, 0, true);
         }
         let rendered = render_native_ops(&t);
         let a = rendered.find("\"operation\":\"a").expect("a row");
@@ -1303,7 +1383,8 @@ mod native_op_tests {
     fn overflow_bucket_bounds_distinct_labels() {
         let mut t = tables();
         for i in 0..(NATIVE_OP_LABEL_CAP + 3) {
-            record_native_op(&mut t, format!("op{i}"), 1, true);
+            let label = format!("op{i}");
+            record_native_op(&mut t.stats, &label, 1, true);
         }
         assert_eq!(t.stats.len(), NATIVE_OP_LABEL_CAP + 1);
         let rendered = render_native_ops(&t);
