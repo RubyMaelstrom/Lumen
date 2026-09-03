@@ -9741,22 +9741,24 @@ pub(crate) fn nf_string_replace(
             }
         }
     }
-    let s = this_string(i, &this)?.to_string();
+    // ECMA-262 §22.1.3.19 returns `string` unchanged when StringIndexOf finds no match.
+    // Keep the already-coerced LStr in that branch: converting it to a Rust String and then
+    // allocating a second engine string is pure overhead, while replacement coercion above still
+    // preserves the specified observable ordering.
+    let s = this_string(i, &this)?;
     let pat = ab(i.to_string(&arg(args, 0)))?;
     let repl = prep_repl(i, &arg(args, 1))?;
-    match s.find(pat.as_ref()) {
-        None => Ok(Value::from_string(s)),
-        Some(pos) => {
-            let matched = &s[pos..pos + pat.len()];
-            let rep = string_replacement(i, &repl, matched, &s, pos)?;
-            Ok(Value::from_string(format!(
-                "{}{}{}",
-                &s[..pos],
-                rep,
-                &s[pos + pat.len()..]
-            )))
-        }
-    }
+    let Some(pos) = s.as_str().find(pat.as_ref()) else {
+        return Ok(Value::Str(s));
+    };
+    let matched = &s[pos..pos + pat.len()];
+    let rep = string_replacement(i, &repl, matched, &s, pos)?;
+    Ok(Value::from_string(format!(
+        "{}{}{}",
+        &s[..pos],
+        rep,
+        &s[pos + pat.len()..]
+    )))
 }
 
 pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
@@ -10680,7 +10682,9 @@ fn install_string(it: &mut Interp) {
                 }
             }
         }
-        let s = this_string(i, &this)?.to_string();
+        // Keep the engine string through matching so the no-match result can reuse it directly;
+        // replacement coercion above still occurs before this search (ECMA-262 §22.1.3.20).
+        let s = this_string(i, &this)?;
         let pat = ab(i.to_string(&arg(args, 0)))?;
         // ToString(replaceValue) happens exactly once, before any matching.
         let repl = prep_repl(i, &arg(args, 1))?;
@@ -10696,9 +10700,14 @@ fn install_string(it: &mut Interp) {
             out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
             return Ok(Value::from_string(out));
         }
-        let mut out = String::new();
-        let mut rest = s.as_str();
-        let mut base = 0usize;
+        let Some(first) = s.as_str().find(pat.as_ref()) else {
+            return Ok(Value::Str(s));
+        };
+        let mut out = String::with_capacity(s.len());
+        out.push_str(&s[..first]);
+        out.push_str(&string_replacement(i, &repl, pat.as_ref(), &s, first)?);
+        let mut rest = &s[first + pat.len()..];
+        let mut base = first + pat.len();
         while let Some(pos) = rest.find(pat.as_ref()) {
             out.push_str(&rest[..pos]);
             let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;

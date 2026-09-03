@@ -917,6 +917,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   - [x] ASCII `padStart`/`padEnd` now concatenate the repeated filler and receiver directly into
     the final `LStr`, avoiding a formatting temporary; an 11-sample release workload improved from
     0.248842 s median to 0.216627 s median (about 13%).
+  - [x] `String.prototype.replace` and `replaceAll` retain the already-coerced receiver when the
+    string search has no match, and `replaceAll` allocates its output only after the first match;
+    replacement coercion and empty-search behavior remain in spec order (ECMA-262 §22.1.3.19–20).
+    A 50,000-call release no-match `replace` workload improved from 84 ms to 28 ms median on the
+    pinned host.
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.

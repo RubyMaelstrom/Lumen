@@ -10860,6 +10860,15 @@ fn string_replace_substitution() {
     assert_eq!(run("'aaa'.replaceAll('a', '$&$&')"), "aaaaaa");
     // An empty search inserts between every character.
     assert_eq!(run("'ab'.replaceAll('', '-')"), "-a-b-");
+    // The replacement is still coerced before the no-match return (ECMA-262 §22.1.3.19).
+    assert_eq!(
+        run("var calls=0; var r={toString(){calls++;return 'x'}}; 'abc'.replace('z',r); calls"),
+        "1"
+    );
+    assert_eq!(
+        run("var calls=0; var r={toString(){calls++;return 'x'}}; 'abc'.replaceAll('z',r); calls"),
+        "1"
+    );
 }
 
 #[test]
