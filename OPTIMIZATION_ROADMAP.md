@@ -898,6 +898,17 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   adversarial entries terminate via the engine step budget in ~20 ms while V8/Node needs
   114 s (nested-quant at 32 chars), 197 ms (alternation), 67 ms (backref) — the divergence this
   corpus exists to track.
+
+  The corpus's per-exec measurements immediately justified the first matcher fast path
+  (verified 2026-09-03 on `ec60633`): case-insensitive (non-`u`) literals compile to a
+  `literal_fold` UTF-8 needle searched with byte-level canonicalize equivalence (ASCII-only
+  folding per ECMA-262 §22.2.8.3), exact over Lumen's always-valid surrogate-smuggled UTF-8
+  subjects and covering non-ASCII pattern characters like `ß` by byte equality. Corpus
+  `casefold-eszett` fell 355 → 105 ns/exec (3.4×, to parity with the case-sensitive literal
+  path); all 30 entries still pass, the full 842-test suite passes both tagged-switch modes,
+  and difftest seed-1 276/24/0 plus seed-100 185/15/0 stay green. Remaining corpus gaps for
+  later matcher work: `casefold-alt` (folded alternation) 12.2×, and the class/anchor family
+  (`domain` 5.4×, `url-path-lookahead` 4.8×, ...).
 - [ ] Measure parse/compile, candidate scanning, instruction dispatch, capture copying,
   backtracking, interruption polling, and wrapper/result allocation separately.
 - [x] Project group-0 spans directly for proven dead-result `RegExp.exec` paths while retaining
