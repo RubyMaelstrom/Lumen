@@ -156,27 +156,26 @@ pub(super) fn install_math(it: &mut Interp) {
     });
     it.def_method(&math, "hypot", 2, |i, _t, a| {
         // Coerce every argument (in order), then: any infinite operand yields +Infinity (even
-        // alongside a NaN), otherwise any NaN yields NaN, otherwise the Euclidean norm.
-        let mut sum = 0.0;
-        let mut any_inf = false;
-        let mut any_nan = false;
-        for v in a {
-            let n = ab(i.to_number(v))?;
-            if n.is_infinite() {
-                any_inf = true;
-            } else if n.is_nan() {
-                any_nan = true;
-            } else {
-                sum += n * n;
+        // alongside a NaN), otherwise any NaN yields NaN, otherwise the Euclidean norm. A pair of
+        // Numbers can use the platform's stable two-operand implementation without any coercion
+        // work; small numeric calls use the allocation-free common-case helper below
+        // (ECMA-262 §21.3.2.19).
+        match a {
+            [Value::Num(x)] => return Ok(Value::Num(x.abs())),
+            [Value::Num(x), Value::Num(y)] => return Ok(Value::Num(x.hypot(*y))),
+            [Value::Num(x), Value::Num(y), Value::Num(z)] => {
+                return Ok(Value::Num(hypot_converted(&[*x, *y, *z])))
             }
+            [Value::Num(x), Value::Num(y), Value::Num(z), Value::Num(w)] => {
+                return Ok(Value::Num(hypot_converted(&[*x, *y, *z, *w])))
+            }
+            _ => {}
         }
-        Ok(Value::Num(if any_inf {
-            f64::INFINITY
-        } else if any_nan {
-            f64::NAN
-        } else {
-            sum.sqrt()
-        }))
+        let mut nums = Vec::with_capacity(a.len());
+        for v in a {
+            nums.push(ab(i.to_number(v))?);
+        }
+        Ok(Value::Num(hypot_converted(&nums)))
     });
     it.def_method(&math, "imul", 2, |i, _t, a| {
         let x = to_uint32(ab(i.to_number(&arg(a, 0)))?) as i32;
@@ -261,6 +260,57 @@ pub(super) fn install_math(it: &mut Interp) {
     });
     set_to_string_tag(it, &math, "Math");
     set_builtin(&it.global, "Math", Value::Obj(math));
+}
+
+/// Compute Math.hypot after all arguments have completed ToNumber. The ordinary range uses the
+/// cheaper direct sum; the scaled retry protects finite values from overflow/underflow while
+/// retaining the specification's implementation-approximated result allowance.
+fn hypot_converted(values: &[f64]) -> f64 {
+    let mut naive_sum = 0.0;
+    let mut has_nonzero = false;
+    let mut any_inf = false;
+    let mut any_nan = false;
+    for &n in values {
+        if n.is_infinite() {
+            any_inf = true;
+        } else if n.is_nan() {
+            any_nan = true;
+        } else {
+            has_nonzero |= n != 0.0;
+            naive_sum += n * n;
+        }
+    }
+    if any_inf {
+        return f64::INFINITY;
+    }
+    if any_nan {
+        return f64::NAN;
+    }
+    if !has_nonzero {
+        return 0.0;
+    }
+    if naive_sum.is_finite() && naive_sum != 0.0 {
+        return naive_sum.sqrt();
+    }
+
+    let mut max_abs = 0.0;
+    let mut scaled_sum = 0.0;
+    for &n in values {
+        let abs = n.abs();
+        if abs > max_abs {
+            scaled_sum = if max_abs == 0.0 {
+                1.0
+            } else {
+                let ratio = max_abs / abs;
+                scaled_sum * ratio * ratio + 1.0
+            };
+            max_abs = abs;
+        } else if max_abs != 0.0 {
+            let ratio = abs / max_abs;
+            scaled_sum += ratio * ratio;
+        }
+    }
+    max_abs * scaled_sum.sqrt()
 }
 
 fn math_max_generic(i: &mut Interp, a: &[Value]) -> Result<Value, Value> {

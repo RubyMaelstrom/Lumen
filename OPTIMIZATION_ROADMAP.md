@@ -1000,6 +1000,13 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     from 609 ms to 541 ms median (about 11%), while a larger numeric workload improved from
     1,583 ms to 1,366 ms (about 14%); the matching rapid no-LTO pair improved 548 ms to 534 ms.
     The focused edge tests and full 812-test suite pass, as does clippy.
+  - [x] `Math.hypot` uses allocation-free one- and two-Number fast paths and keeps ordinary
+    three/four-Number calls on a direct sum, while a scaled retry handles finite overflow and
+    underflow (including `Number.MAX_VALUE` and `Number.MIN_VALUE` inputs); generic calls still
+    complete every ToNumber before reduction (ECMA-262 §21.3.2.19). A matched 11-sample fat-LTO
+    mixed workload improved from 438 ms to 397 ms median (about 9%), and the matching rapid no-LTO
+    pair improved from 472 ms to 416 ms (about 12%); the full 812-test suite, clippy, and browser
+    replay checks remain green (`960:49:126386880`, event-loop completion, and `100:100:100`).
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).

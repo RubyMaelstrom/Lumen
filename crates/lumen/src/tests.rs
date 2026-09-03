@@ -11675,6 +11675,14 @@ fn math_constants_and_hypot() {
     assert_eq!(run("Math.hypot(Infinity, NaN)"), "Infinity");
     assert_eq!(run("Math.hypot(3, 4)"), "5");
     assert_eq!(run("Number.isNaN(Math.hypot(NaN, 2))"), "true");
+    assert_eq!(
+        run("Math.hypot(Number.MAX_VALUE) === Number.MAX_VALUE"),
+        "true"
+    );
+    assert_eq!(
+        run("Math.hypot(Number.MIN_VALUE, Number.MIN_VALUE) > 0"),
+        "true"
+    );
 }
 
 #[test]
