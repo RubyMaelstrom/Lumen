@@ -978,9 +978,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     (about 3.6%); the matching no-LTO pair was also positive at 0.527253 s versus 0.508552 s.
   - [x] `RegExp.prototype.source` returns the retained source directly when EscapeRegExpPattern has
     no solidus or line terminator to escape; empty, solidus, and line-terminator patterns retain
-    the full escaping algorithm (ECMA-262 §22.2.6.13–13.1). A 15-sample no-LTO release workload
-    over 300,000 plain/escaping getter calls improved from 0.328760 s to 0.319037 s median (about
-    3%); the candidate remains subject to the canonical fat-LTO gate.
+    the full escaping algorithm (ECMA-262 §22.2.6.13–13.1). A 15-sample release workload over
+    300,000 plain/escaping getter calls improved from 0.308172 s to 0.297044 s median (about 3.6%);
+    the matching no-LTO pair improved from 0.328760 s to 0.319037 s.
   - [x] `Symbol.prototype.toString` builds the descriptive string directly from the retained
     description (including the specified empty-description branch), without a formatting temporary;
     `ThisSymbolValue` and wrapper behavior remain unchanged (ECMA-262 §20.4.3.3). A 15-sample
