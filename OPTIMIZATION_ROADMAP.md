@@ -962,6 +962,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     the generic proxy/exotic/non-extensible path (ECMA-262 §23.1.3.8 and §23.1.3.21). An 11-sample
     release callback workload improved from 0.45 s at the exact parent to 0.38 s (about 16%); species,
     descriptor, sparse-array, and proxy tests remain covered.
+  - [x] `FlattenIntoArray` and the deleted-array portion of `Array.prototype.splice` share the same
+    trap-aware `CreateDataPropertyOrThrow` helper, removing per-element descriptor objects while
+    retaining species, proxy, exotic, and failure behavior (ECMA-262 §23.1.3.13.1 and §23.1.3.31).
+    A seven-sample release `flat` workload improved from a 9.57 s exact-parent median to 6.97 s
+    (about 27%); flat/flatMap, splice-hole, species, and non-extensible-result tests remain green.
   - [x] ASCII `String.prototype.split` keeps each byte-aligned substring as an `LStr` and applies
     the limit while iterating, avoiding a Rust `String` temporary per piece; the UTF-16-unit and
     RegExp paths retain their required semantics (ECMA-262 §22.1.3.23). An 11-sample release

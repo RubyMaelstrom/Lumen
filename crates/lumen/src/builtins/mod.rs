@@ -1297,38 +1297,6 @@ fn global_fn(it: &Interp, name: &str, len: usize, f: NativeFn) {
 // Function.prototype
 // ---------------------------------------------------------------------------------------------
 
-/// CreateDataPropertyOrThrow: like `json_create_data_prop` but a false [[DefineOwnProperty]]
-/// result (e.g. a non-extensible target) throws a TypeError instead of being ignored.
-fn json_create_data_prop_or_throw(
-    i: &mut Interp,
-    holder: &Value,
-    key: &str,
-    v: Value,
-) -> Result<(), Value> {
-    let desc = i.new_object();
-    set_data(&desc, "value", v);
-    set_data(&desc, "writable", Value::Bool(true));
-    set_data(&desc, "enumerable", Value::Bool(true));
-    set_data(&desc, "configurable", Value::Bool(true));
-    let ok = if let Some((target, handler)) = proxy_pair(i, holder) {
-        ab(proxy_define_property(
-            i,
-            &target,
-            &handler,
-            key,
-            &Value::Obj(desc),
-        ))?
-    } else if let Value::Obj(o) = holder {
-        ab(define_own_property(i, o, key, &Value::Obj(desc)))?
-    } else {
-        false
-    };
-    if !ok {
-        return Err(i.make_error("TypeError", "cannot create data property"));
-    }
-    Ok(())
-}
-
 /// OrdinarySet(target, key, value, receiver): walks target's prototype chain to find the controlling
 /// descriptor, then applies the result on `receiver` (which may differ from `target`). Returns the
 /// success boolean. Proxies on the chain fall back to the receiver-less [[Set]].
@@ -6554,7 +6522,7 @@ fn flatten_into(
                             i.make_error("TypeError", "flattened array length exceeds 2^53 - 1")
                         );
                     }
-                    json_create_data_prop_or_throw(i, target, &target_index.to_string(), element)?;
+                    cdp_or_throw(i, target, &target_index.to_string(), element)?;
                     target_index += 1;
                 }
             }
@@ -6596,7 +6564,7 @@ fn flatten_into(
             if target_index as u64 >= 9_007_199_254_740_991 {
                 return Err(i.make_error("TypeError", "flattened array length exceeds 2^53 - 1"));
             }
-            json_create_data_prop_or_throw(i, target, &target_index.to_string(), element)?;
+            cdp_or_throw(i, target, &target_index.to_string(), element)?;
             target_index += 1;
         }
     }
@@ -6641,7 +6609,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
         let from = (start + k).to_string();
         if ab(i.js_has_property(&ov, &from))? {
             let v = array_get_index_after_has(i, &o, &ov, (start + k) as usize, &from)?;
-            json_create_data_prop_or_throw(i, &removed, &k.to_string(), v)?;
+            cdp_or_throw(i, &removed, &k.to_string(), v)?;
         }
     }
     ab(i.set_member(&removed, "length", Value::Num(delete_count as f64)))?;
