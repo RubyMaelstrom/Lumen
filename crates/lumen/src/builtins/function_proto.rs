@@ -81,12 +81,14 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         if let Value::Obj(o) = &this {
             if let Callable::User(user) = &o.borrow().call {
                 if let Some(src) = &user.func.source {
-                    return Ok(Value::from_string(src.to_string()));
+                    // SourceText is already immutable; copy it directly into the engine string
+                    // instead of materializing an intermediate Rust String first.
+                    return Ok(Value::Str(crate::lstr::LStr::from(src.as_ref())));
                 }
             }
             let name = match o.borrow().props.get("name").map(|p| p.value()) {
-                Some(Value::Str(n)) => n.to_string(),
-                _ => String::new(),
+                Some(Value::Str(n)) => n,
+                _ => crate::lstr::LStr::from(""),
             };
             // Render the name only when it's a well-formed PropertyName (optionally get/set
             // prefixed, or a computed [Symbol.x] form) — a bound function's "bound f" is not.
@@ -105,8 +107,10 @@ pub(super) fn install_function_proto(it: &mut Interp) {
                     .or_else(|| name.strip_prefix("set "))
                     .is_some_and(is_ident);
             let name = if renderable { name.as_str() } else { "" };
-            return Ok(Value::from_string(format!(
-                "function {name}() {{ [native code] }}"
+            return Ok(Value::Str(crate::lstr::LStr::concat3(
+                "function ",
+                name,
+                "() { [native code] }",
             )));
         }
         Ok(Value::str("function () { [native code] }"))

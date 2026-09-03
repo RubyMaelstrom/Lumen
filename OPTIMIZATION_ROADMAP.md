@@ -955,6 +955,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     empty-name/message branches and observable coercion order (ECMA-262 §20.5.3.4). A 15-sample
     release workload over 307,200 error stringifications improved from 0.688 s to 0.606 s median
     (about 12%).
+  - [x] `Function.prototype.toString` copies retained user-function source text directly into an
+    engine string and builds native-function representations without an intermediate Rust `String`;
+    callable checks, source-text preservation, and implementation-defined native syntax remain
+    unchanged (ECMA-262 §20.2.3.5). A 15-sample release workload over 280,000 mixed source/native
+    stringifications improved from 0.308 s to 0.286 s median (about 7%).
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
