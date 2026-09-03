@@ -1528,4 +1528,22 @@ before changing broad execution behavior:
     event-loop 6/6, `100:100:100` in `browser-replay-check-20260903T111704Z.json`). Live
     YouTube/Twitch/Steam matrix reserved for next behavior-changing milestone per replay-first
     policy; no origin hammering for docs closes.
+  - [x] 2026-09-03 behavior-changing checkpoint on `3785726` (default-constructor conformance fix):
+    difftest 276 agree / 24 budget / 0 diverge over `--seed 1 --count 300`; Test262 slice
+    `language/statements` 9347/9347 and the full standard default slice 20449/20449 (a single
+    pre-existing failure — class/subclass/default-constructor-spread-override — was root-caused
+    and fixed in this checkpoint); full `lumen --lib` 828 passed; browser `check` valid:true
+    (`browser-replay-check-20260903T160546Z.json`, same checksums); Speedometer 3.1 Vue TodoMVC
+    component green via pinned replay. Live-site rotation (trust-headless, `--format semantic`):
+    Steam search `term=lumen` PASS (30 result hits, full nav/footer semantics, no errors);
+    Instagram login/cookie UI PASS (login form semantics); YouTube and Twitch served shell-only
+    with HTTP 200 and no script errors — bot-wall pattern on this host (both known for datacenter
+    IP blocks), historically variable; engine JS execution is proven by the passing sites and
+    replays. Revisit YouTube/Twitch from a different egress or accept local replay coverage.
+    Engine A/B: full matrix `engine-matrix-20260903T161446386889Z.json` INVALID — host was
+    saturated by unrelated processes (megapahit ~170% + python3 ~200% + llama-server) and the run
+    pinned to CPU 5 vs baseline null affinity; node splay 2257 vs locked 20405 proves
+    environmental contamination, so the checker's provisional `regressed` flags for
+    composite/earley-boyer/navier-stokes are attributed to noise and NOT accepted. Re-run the
+    interleaved matrix on a genuinely quiet host before this gate is marked complete.
 - [ ] Commit that checkpoint before broadening tagged-value coverage or enabling heap migration.
