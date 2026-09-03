@@ -1519,7 +1519,7 @@ before changing broad execution behavior:
   - [x] Publish conservative `DeoptRecord` recipes for selected SSA loop side exits with the exact
     baseline resume PC, validate them before publication, and materialize tagged words/virtual-object
     recipes in source order. Speculative guards and live-tier deoptimization remain disabled.
-- [ ] Run focused differential tests, Test262 slices, engine A/B benchmarks, a Speedometer slice,
+- [x] Run focused differential tests, Test262 slices, engine A/B benchmarks, a Speedometer slice,
   and the YouTube/Twitch/Steam semantic gates.
   - [x] 2026-09-03 gate sweep on `2f882e9` (docs-only since `6ca85be` math): difftest 49 agree
     1 budget-skip 0 diverged; Test262 `built-ins/Math` 327/327 and pow/atan2/imul 44/44;
@@ -1546,4 +1546,39 @@ before changing broad execution behavior:
     environmental contamination, so the checker's provisional `regressed` flags for
     composite/earley-boyer/navier-stokes are attributed to noise and NOT accepted. Re-run the
     interleaved matrix on a genuinely quiet host before this gate is marked complete.
-- [ ] Commit that checkpoint before broadening tagged-value coverage or enabling heap migration.
+  - [x] 2026-09-03 quiet-host engine-matrix re-run closes the pending gate item. Report
+    `engine-matrix-20260903T191930Z-quiet-gate.json` (SHA-256
+    `a0e4770b00e95f44400381971078a8ba1a4c0168b84abf4f98ceea77f10b0a72`) run against the current
+    release artifact (`be792b6118eb6421`) with the locked baseline's configuration: engines
+    `node`+`lumen-jit`, manifest-default `cpu_affinity:[5]`, 7 samples, 1 warmup, seed
+    1592639215, 0.95 confidence, 10000 bootstrap resamples, `LUMEN_`/`TRUST_` env cleared.
+    Checker exits 0 with **all nine components pass**, every bootstrap interval entirely above its
+    floor (composite 1902.745, CI [1887.118, 1904.840] vs floor 1694.923; tightest margins
+    navier-stokes 12256/12138.58 and raytrace 1853/1815.84). Host was quieter than the baseline
+    lock itself (load average 1.49–1.93 vs 2.98–3.59); reference-engine node composite recovered to
+    20511 against the invalid run's 16245 and the baseline's 18292, so contamination is gone.
+    **Interpretation kept narrow:** this run proves no regression; it does not demonstrate a
+    throughput gain. Lumen rose +11.2% absolute while node rose +12.1% on the same host, leaving
+    the lumen/node ratio at −0.82% (within noise), i.e. the machine was simply faster than at
+    baseline lock. The 90 intervening commits are largely docs, diagnostics and conformance plus
+    targeted builtin micro-specializations that V8 v7 does not exercise, so a flat ratio is the
+    expected reading rather than a surprise. Baseline remains locked at the 2026-09-02 artifact;
+    re-locking is deferred until a commit actually moves this suite.
+    Two corrections to the entry above, both from re-reading the evidence: (1) affinity was never
+    the problem — the locked baseline report records `cpu_affinity:[5]` itself, and the `null` seen
+    in `benchmarks/engine-thresholds.json` was stale documentary metadata that the checker never
+    reads; it is now corrected to `[5]`. (2) node splay is a poor contention canary (baseline
+    median 3077, CV 0.70, range 2363–12036) and the quoted "locked 20405" figure does not appear in
+    either report — use node composite, as here.
+    Bun is excluded from this matrix because bun 1.4.0 aborts `crypto` with
+    `ReferenceError: setupEngine is not defined` (it rejects base.js's undeclared-global assignment
+    that node and lumen tolerate); bun is `required: false` and the locked baseline used
+    `node`+`lumen-jit` only, so excluding it matches the baseline rather than narrowing it.
+    YouTube/Twitch shell-only coverage is resolved by the recorded replay-first policy: local
+    replay (`browser-replay-check-20260903T160546Z.json`) plus the Speedometer 3.1 Vue component
+    stand in as the JS-execution oracle, with a different egress optional rather than blocking.
+- [x] Commit that checkpoint before broadening tagged-value coverage or enabling heap migration.
+  The checkpoint landed as `3785726`; this gate sweep is committed alongside it; and the branch
+  line was consolidated onto `private/main` at `f183d00` (force-push from `3325b39`, whose sole
+  unique commit duplicated `3afc669`), so `main` is now the primary working branch and
+  `spike/trust-integration` is retired.

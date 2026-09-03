@@ -9,7 +9,7 @@
     "lumen_artifact_sha256": "398e4980e96d41c5e43bcbb174d6d70e708f5315c5d4e82083876d744f579959",
     "samples": 7,
     "confidence_level": 0.95,
-    "cpu_affinity": null
+    "cpu_affinity": [5]
   },
   "policy": {
     "stable_floor": "3%",
