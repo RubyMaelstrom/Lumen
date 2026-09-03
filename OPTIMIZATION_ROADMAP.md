@@ -993,6 +993,13 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     1.143814 s to 1.088303 s median (about 4.9%); the matching rapid no-LTO pair improved from
     1.194537 s to 1.109982 s (about 7.1%). The 811-test suite, clippy, and browser replay checks
     remain green (`960:49:126386880`, event-loop completion, and `100:100:100`).
+  - [x] `Math.max` and `Math.min` reduce all-Number argument lists in one pass without allocating
+    the spec's intermediate List; any non-Number restarts through the complete left-to-right
+    ToNumber path, preserving coercion side effects, abrupt completions, NaN handling, and signed
+    zero ordering (ECMA-262 §21.3.2.25–26). A matched 15-sample fat-LTO mixed workload improved
+    from 609 ms to 541 ms median (about 11%), while a larger numeric workload improved from
+    1,583 ms to 1,366 ms (about 14%); the matching rapid no-LTO pair improved 548 ms to 534 ms.
+    The focused edge tests and full 812-test suite pass, as does clippy.
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).

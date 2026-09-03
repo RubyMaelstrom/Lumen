@@ -11678,6 +11678,24 @@ fn math_constants_and_hypot() {
 }
 
 #[test]
+fn math_min_max_numeric_fast_path_preserves_spec_edges() {
+    assert_eq!(run("Math.max()"), "-Infinity");
+    assert_eq!(run("Math.min()"), "Infinity");
+    assert_eq!(run("Object.is(Math.max(-0, +0), +0)"), "true");
+    assert_eq!(run("Object.is(Math.min(-0, +0), -0)"), "true");
+    assert_eq!(run("Number.isNaN(Math.max(1, NaN, 3))"), "true");
+    assert_eq!(run("Number.isNaN(Math.min(1, NaN, 3))"), "true");
+    assert_eq!(
+        run("var hits=0; var n={valueOf(){hits++;return 4}}; Math.max(NaN,n); hits"),
+        "1"
+    );
+    assert_eq!(
+        run("var hits=0; var n={valueOf(){hits++;return 4}}; Math.min(NaN,n); hits"),
+        "1"
+    );
+}
+
+#[test]
 fn jit_math_sqrt_intrinsic_preserves_fallbacks_and_identity_guards() {
     assert_eq!(
         run_jit(

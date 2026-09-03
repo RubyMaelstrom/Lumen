@@ -214,40 +214,92 @@ pub(super) fn install_math(it: &mut Interp) {
         ))
     });
     it.def_method(&math, "max", 2, |i, _t, a| {
-        // ToNumber every argument first (side effects in order), then reduce. +0 is larger than -0.
-        let mut nums = Vec::with_capacity(a.len());
+        // Number arguments are already the result of ToNumber, so this branch can reduce them
+        // without allocating the spec's intermediate List (ECMA-262 §21.3.2.25). If a non-Number
+        // appears, restart through the complete coercion path so every argument is still coerced
+        // in order.
+        let mut highest = f64::NEG_INFINITY;
+        let mut saw_nan = false;
         for v in a {
-            nums.push(ab(i.to_number(v))?);
-        }
-        let mut m = f64::NEG_INFINITY;
-        for &n in &nums {
-            if n.is_nan() {
-                return Ok(Value::Num(f64::NAN));
+            let Value::Num(number) = v else {
+                return math_max_generic(i, a);
+            };
+            if number.is_nan() {
+                saw_nan = true;
+            } else if (*number == 0.0
+                && highest == 0.0
+                && number.is_sign_positive()
+                && highest.is_sign_negative())
+                || *number > highest
+            {
+                highest = *number;
             }
-            if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative()) {
-                m = n;
-            }
         }
-        Ok(Value::Num(m))
+        Ok(Value::Num(if saw_nan { f64::NAN } else { highest }))
     });
     it.def_method(&math, "min", 2, |i, _t, a| {
-        let mut nums = Vec::with_capacity(a.len());
+        // See Math.max above: the all-Number case has no observable coercion work to perform
+        // (ECMA-262 §21.3.2.26).
+        let mut lowest = f64::INFINITY;
+        let mut saw_nan = false;
         for v in a {
-            nums.push(ab(i.to_number(v))?);
-        }
-        let mut m = f64::INFINITY;
-        for &n in &nums {
-            if n.is_nan() {
-                return Ok(Value::Num(f64::NAN));
+            let Value::Num(number) = v else {
+                return math_min_generic(i, a);
+            };
+            if number.is_nan() {
+                saw_nan = true;
+            } else if (*number == 0.0
+                && lowest == 0.0
+                && number.is_sign_negative()
+                && lowest.is_sign_positive())
+                || *number < lowest
+            {
+                lowest = *number;
             }
-            if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive()) {
-                m = n;
-            }
         }
-        Ok(Value::Num(m))
+        Ok(Value::Num(if saw_nan { f64::NAN } else { lowest }))
     });
     set_to_string_tag(it, &math, "Math");
     set_builtin(&it.global, "Math", Value::Obj(math));
+}
+
+fn math_max_generic(i: &mut Interp, a: &[Value]) -> Result<Value, Value> {
+    // ToNumber every argument first (side effects in order), then reduce. +0 is larger than -0.
+    let mut nums = Vec::with_capacity(a.len());
+    for v in a {
+        nums.push(ab(i.to_number(v))?);
+    }
+    let mut highest = f64::NEG_INFINITY;
+    for n in nums {
+        if n.is_nan() {
+            return Ok(Value::Num(f64::NAN));
+        }
+        if n > highest
+            || (n == 0.0 && highest == 0.0 && n.is_sign_positive() && highest.is_sign_negative())
+        {
+            highest = n;
+        }
+    }
+    Ok(Value::Num(highest))
+}
+
+fn math_min_generic(i: &mut Interp, a: &[Value]) -> Result<Value, Value> {
+    let mut nums = Vec::with_capacity(a.len());
+    for v in a {
+        nums.push(ab(i.to_number(v))?);
+    }
+    let mut lowest = f64::INFINITY;
+    for n in nums {
+        if n.is_nan() {
+            return Ok(Value::Num(f64::NAN));
+        }
+        if n < lowest
+            || (n == 0.0 && lowest == 0.0 && n.is_sign_negative() && lowest.is_sign_positive())
+        {
+            lowest = n;
+        }
+    }
+    Ok(Value::Num(lowest))
 }
 
 /// Correctly-rounded sum of finite f64s, via Shewchuk's nonoverlapping-partials algorithm with
