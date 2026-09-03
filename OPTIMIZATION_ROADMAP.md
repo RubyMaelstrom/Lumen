@@ -1023,6 +1023,26 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     the full escaping algorithm (ECMA-262 §22.2.6.13–13.1). A 15-sample release workload over
     300,000 plain/escaping getter calls improved from 0.308172 s to 0.297044 s median (about 3.6%);
     the matching no-LTO pair improved from 0.328760 s to 0.319037 s.
+  - [x] `RegExp.prototype[Symbol.replace]`/`[Symbol.match]` read the engine-owned flags string
+    directly when the observable `flags` result is provably canonical, eliminating the getter's
+    eight observable [[Get]]s and native accessor dispatches per call. Verified 2026-09-03 on
+    `d83998c`: a measured `native_by_operation` inventory of the full classic suite ranks RegExp
+    natives as the dominant cost (replace 19.2 s/1.34M, exec 22M, split 11.3 s, flags 5.5 s), with
+    ~5.5 s+ of `[Symbol.replace]` purely the per-call flags machinery. The direct read is guarded
+    by the cached `literal_match_dependencies_canonical` proto-slot check (flags + every flag
+    getter + exec) plus no own flag-named properties on the instance and a canonical direct
+    prototype; subclasses, tampered prototypes, and own `defineProperty` flag overrides keep the
+    generic getter (plain assignment to a setter-less accessor is a silent no-op, verified
+    identical to Node/V8). Focused tests cover global removal, captures, functional replacers,
+    unicode empty-match advance, and both guard-escape directions with terminate-safe cases.
+    Full 838-test suite (both tagged-switch modes), difftest `--seed 1 --count 300` 276 agree /
+    24 budget / 0 diverge, and the full standard test262 default slice 20449/20449 with the
+    tagged switch on. Paired parent-vs-child release A/B on the RegExp component (bytecode tier,
+    3 samples each): score 130→144 median (+10.8%) with wall time 24.6→22.3 s (−9.4%), every
+    sample improved; a follow-up full-suite inventory confirms `get flags` fell from 5.52 s
+    (1,396,080 calls) to 0.175 s (the residual 44,975 reads are `[Symbol.split]`'s per-call
+    getter), all eight per-flag accessor rows disappeared, and `[Symbol.replace]` dropped
+    18.59→12.58 s.
   - [x] `Symbol.prototype.toString` builds the descriptive string directly from the retained
     description (including the specified empty-description branch), without a formatting temporary;
     `ThisSymbolValue` and wrapper behavior remain unchanged (ECMA-262 §20.4.3.3). A 15-sample
