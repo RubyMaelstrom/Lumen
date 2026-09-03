@@ -339,6 +339,12 @@ fn register_native_name(tables: &mut NativeOpTables, addr: usize, label: &str) {
 /// Overwrite the label for a fn address (embedder namespaces qualify `op` as `ns.op`).
 /// Only called from `feature = "embed"` registration paths (plus tests).
 #[cfg(any(feature = "embed", test))]
+// The sole caller lives in the optional `embed` module, so a default-feature test build sees the
+// `test` cfg without that caller; the embed build and CI keep it genuinely live.
+#[cfg_attr(
+    not(feature = "embed"),
+    expect(dead_code, reason = "caller is behind feature `embed`")
+)]
 pub(crate) fn perf_native_relabel(addr: usize, label: String) {
     relabel_native_name(&mut native_op_tables(), addr, label);
 }
@@ -1292,8 +1298,8 @@ mod native_op_tests {
             Ok(Value::Undefined)
         }
         let mut t = tables();
-        register_native_name(&mut t, probe_op as usize, "first");
-        register_native_name(&mut t, probe_op as usize, "second");
+        register_native_name(&mut t, probe_op as *const () as usize, "first");
+        register_native_name(&mut t, probe_op as *const () as usize, "second");
         let call = crate::value::Callable::Native(probe_op);
         record_native_op_src(&mut t, NativeLabelSrc::Call(&call), 5, true);
         let rendered = render_native_ops(&t);
@@ -1310,9 +1316,18 @@ mod native_op_tests {
             Ok(Value::Undefined)
         }
         let mut t = tables();
-        register_native_name(&mut t, probe_ns_op as usize, "read");
-        relabel_native_name(&mut t, probe_ns_op as usize, "fs.read".to_string());
-        record_native_op_src(&mut t, NativeLabelSrc::Addr(probe_ns_op as usize), 5, true);
+        register_native_name(&mut t, probe_ns_op as *const () as usize, "read");
+        relabel_native_name(
+            &mut t,
+            probe_ns_op as *const () as usize,
+            "fs.read".to_string(),
+        );
+        record_native_op_src(
+            &mut t,
+            NativeLabelSrc::Addr(probe_ns_op as *const () as usize),
+            5,
+            true,
+        );
         let rendered = render_native_ops(&t);
         assert!(rendered.contains("\"operation\":\"fs.read\""), "{rendered}");
     }
