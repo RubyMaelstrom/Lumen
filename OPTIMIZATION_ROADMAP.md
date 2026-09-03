@@ -888,8 +888,16 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 
 ### Phase 6: native RegExp tier
 
-- [ ] Capture a stable RegExp benchmark corpus from Test262, real pages, engine fixtures, Unicode
-  edge cases, and adversarial backtracking patterns.
+- [x] Capture a stable RegExp benchmark corpus from Test262, real pages, engine fixtures, Unicode
+  edge cases, and adversarial backtracking patterns. `benchmarks/regexp-corpus/manifest.json`
+  (locked 2026-09-03 on `2fd5fcd`) pins 30 entries across those five categories with inline
+  subjects locked by per-entry sha256 and match-count expectations verified against V8/Node;
+  `scripts/gen-regexp-corpus.py` emits a self-verifying harness (exit 3 on any expectation
+  divergence, refusing tampered manifests) and `scripts/run-regexp-corpus.sh` runs lumen jit +
+  bytecode by default with node opt-in. Baseline: all 30 entries pass on both tiers in ~6 s;
+  adversarial entries terminate via the engine step budget in ~20 ms while V8/Node needs
+  114 s (nested-quant at 32 chars), 197 ms (alternation), 67 ms (backref) — the divergence this
+  corpus exists to track.
 - [ ] Measure parse/compile, candidate scanning, instruction dispatch, capture copying,
   backtracking, interruption polling, and wrapper/result allocation separately.
 - [x] Project group-0 spans directly for proven dead-result `RegExp.exec` paths while retaining
