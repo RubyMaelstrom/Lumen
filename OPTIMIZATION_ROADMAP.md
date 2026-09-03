@@ -1058,6 +1058,14 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     no-LTO pair improved from 237 ms to 229 ms (about 3.6%). Edge/coercion tests, Test262
     `parseInt`/`parseFloat`/`isNaN`/`isFinite` 139/139, the full 816-test suite, browser
     `quick` replay green, and clippy pass.
+  - [x] `String.prototype.slice` bypasses redundant ToNumber dispatch for primitive Number start/end
+    indices on both ASCII and UTF-16 paths (`undefined` end keeps its `len` default), while generic
+    calls retain complete coercion with abrupt completions and valueOf/toString ordering (ECMA-262
+    §7.1.4, §22.1.3.24; slicing stays code-unit based with `norm_index` handling NaN/infinities).
+    A matched 15-sample fat-LTO slice-heavy workload improved from 216 ms to 208 ms median (about
+    3.3%); the matching rapid no-LTO pair improved from 222 ms to 215 ms (about 2.9%).
+    Edge/coercion tests (including surrogate code-unit slicing), Test262 `String/prototype/slice`
+    38/38, the full 818-test suite, browser `quick` replay green, and clippy pass.
   - [x] `String.fromCharCode`/`fromCodePoint` bypass redundant ToNumber dispatch per argument
     for primitive Numbers (ToUint16 conversion and code-point validation identical either way),
     while generic calls retain complete coercion with throws and valueOf ordering (ECMA-262

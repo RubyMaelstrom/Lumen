@@ -11120,11 +11120,19 @@ fn install_string(it: &mut Interp) {
 /// Named entry so the bytecode call cache can recognize and specialize ASCII string slicing.
 pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_string(i, &this)?;
+    // Index coercion is ToNumber (ECMA-262 §22.1.3.24); Numbers are already coerced (§7.1.4
+    // identity), so bypass the generic dispatch for the common numeric-index case. All other inputs keep the full path with its abrupt
+    // completions and valueOf/toString ordering. `undefined` end keeps its fast `len` default.
     if let crate::interpreter::StrUnits::Ascii = i.units_of(&s) {
         let len = s.len() as i64;
-        let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
+        let start_num = match arg(args, 0) {
+            Value::Num(n) => n,
+            v => ab(i.to_number(&v))?,
+        };
+        let start = norm_index(start_num, len);
         let end = match arg(args, 1) {
             Value::Undefined => len,
+            Value::Num(n) => norm_index(n, len),
             v => norm_index(ab(i.to_number(&v))?, len),
         };
         return Ok(if start < end {
@@ -11135,9 +11143,14 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     let chars = i.units_full(&s);
     let len = chars.len() as i64;
-    let start = norm_index(ab(i.to_number(&arg(args, 0)))?, len);
+    let start_num = match arg(args, 0) {
+        Value::Num(n) => n,
+        v => ab(i.to_number(&v))?,
+    };
+    let start = norm_index(start_num, len);
     let end = match arg(args, 1) {
         Value::Undefined => len,
+        Value::Num(n) => norm_index(n, len),
         v => norm_index(ab(i.to_number(&v))?, len),
     };
     let out = if start < end {

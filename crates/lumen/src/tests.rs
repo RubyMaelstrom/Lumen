@@ -13705,6 +13705,27 @@ fn string_from_code_units_fast_paths_preserve_conversion_edges() {
 }
 
 #[test]
+fn string_slice_numeric_indices_preserve_coercion_edges() {
+    assert_eq!(run("'hello'.slice(1,3)"), "el");
+    assert_eq!(run("'hello'.slice(-3)"), "llo");
+    assert_eq!(run("'hello'.slice('1','3')"), "el");
+    assert_eq!(run("'hello'.slice()"), "hello");
+    // Slice operates on UTF-16 code units: '😀' is two units, so slice(1) keeps the
+    // trailing surrogate (length 3) and slice(2) drops the pair.
+    assert_eq!(run("'😀ab'.slice(1).length"), "3");
+    assert_eq!(run("'😀ab'.slice(1).charCodeAt(0).toString(16)"), "de00");
+    assert_eq!(run("'😀ab'.slice(2)"), "ab");
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 1}}; 'hello'.slice(o)==='ello' && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("try{'x'.slice(Symbol())}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+}
+
+#[test]
 fn string_concat_fast_paths_preserve_coercion_and_surrogates() {
     assert_eq!(run("'abc'.concat()"), "abc");
     assert_eq!(run("'abc'.concat('def')"), "abcdef");
