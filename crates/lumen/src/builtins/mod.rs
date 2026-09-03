@@ -3839,14 +3839,24 @@ fn install_object(it: &mut Interp) {
         } else {
             builtin_tag(i, &this)
         };
-        let tag = match to_string_tag_key(i) {
+        // Object.prototype.toString's final step is the concatenation of three strings
+        // (ECMA-262 §20.1.3.6). Keep a String @@toStringTag borrowed through the one result
+        // allocation instead of copying it into a temporary Rust `String` first.
+        match to_string_tag_key(i) {
             Some(key) => match ab(i.get_member(&this, &key))? {
-                Value::Str(s) => s.to_string(),
-                _ => builtin.to_string(),
+                Value::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
+                    "[object ",
+                    s.as_str(),
+                    "]",
+                ))),
+                _ => Ok(Value::Str(crate::lstr::LStr::concat3(
+                    "[object ", builtin, "]",
+                ))),
             },
-            None => builtin.to_string(),
-        };
-        Ok(Value::str(format!("[object {tag}]")))
+            None => Ok(Value::Str(crate::lstr::LStr::concat3(
+                "[object ", builtin, "]",
+            ))),
+        }
     });
     it.def_method(&op, "valueOf", 0, |i, this, _args| {
         to_object_arg(i, this, "Object.prototype.valueOf").map(Value::Obj)
@@ -5708,14 +5718,21 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             } else {
                 builtin_tag(i, &ov)
             };
-            let tag = match to_string_tag_key(i) {
+            match to_string_tag_key(i) {
                 Some(key) => match ab(i.get_member(&ov, &key))? {
-                    Value::Str(s) => s.to_string(),
-                    _ => builtin.to_string(),
+                    Value::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
+                        "[object ",
+                        s.as_str(),
+                        "]",
+                    ))),
+                    _ => Ok(Value::Str(crate::lstr::LStr::concat3(
+                        "[object ", builtin, "]",
+                    ))),
                 },
-                None => builtin.to_string(),
-            };
-            Ok(Value::str(format!("[object {tag}]")))
+                None => Ok(Value::Str(crate::lstr::LStr::concat3(
+                    "[object ", builtin, "]",
+                ))),
+            }
         }
     });
     it.def_method(&ap, "toLocaleString", 0, |i, this, args| {
