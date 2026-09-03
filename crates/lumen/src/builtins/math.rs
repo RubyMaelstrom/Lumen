@@ -3,6 +3,9 @@
 use super::*;
 
 pub(crate) fn nf_math_sqrt(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let [Value::Num(x)] = args {
+        return Ok(Value::Num(x.sqrt()));
+    }
     let x = ab(i.to_number(&arg(args, 0)))?;
     Ok(Value::Num(x.sqrt()))
 }
@@ -33,6 +36,13 @@ pub(super) fn install_math(it: &mut Interp) {
     macro_rules! unary {
         ($name:expr, $f:expr) => {
             it.def_method(&math, $name, 1, |i, _t, a| {
+                // ECMA-262 ToNumber is the identity for Numbers with no observable effects
+                // (§7.1.4), so bypass the generic dispatch for the common numeric case.
+                // All other inputs retain the complete coercive path with its abrupt
+                // completions and valueOf/toString side effects in order.
+                if let [Value::Num(x)] = a {
+                    return Ok(Value::Num($f(*x)));
+                }
                 let x = ab(i.to_number(&arg(a, 0)))?;
                 Ok(Value::Num($f(x)))
             });

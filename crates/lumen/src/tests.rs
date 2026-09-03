@@ -11717,6 +11717,23 @@ fn math_binary_numeric_fast_paths_preserve_conversion_edges() {
 }
 
 #[test]
+fn math_unary_numeric_fast_paths_preserve_conversion_edges() {
+    assert_eq!(run("Object.is(Math.floor(-0), -0)"), "true");
+    assert_eq!(run("Object.is(Math.abs(-0), 0)"), "true");
+    assert_eq!(run("Number.isNaN(Math.sqrt(-1))"), "true");
+    assert_eq!(run("Math.floor('3.7')"), "3");
+    assert_eq!(run("Math.sqrt(9)"), "3");
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 3.7}}; Math.floor(o)===3 && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("try{Math.abs(Symbol())}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+}
+
+#[test]
 fn jit_math_sqrt_intrinsic_preserves_fallbacks_and_identity_guards() {
     assert_eq!(
         run_jit(

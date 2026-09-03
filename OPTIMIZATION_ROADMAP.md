@@ -1042,6 +1042,14 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     15-sample fat-LTO workload improved from 991 ms to 818 ms median (about 17.5%); the matching
     rapid no-LTO pair improved from 1,027 ms to 910 ms. Edge/coercion tests, the full 812-test
     suite, and clippy pass.
+  - [x] Unary `Math` functions (`abs`/`floor`/`ceil`/`round`/`trunc`/`sqrt`/`cbrt`/`sign`/
+    `expm1`/`log1p`/`sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh`/`fround`/`f16round`/`clz32` and
+    the remaining `unary!` members) bypass redundant ToNumber dispatch when the single argument
+    is a primitive Number, while generic and coercive calls retain the complete normative
+    algorithm with its abrupt completions and valueOf/toString ordering (ECMA-262 §7.1.4,
+    §21.3.2). A matched 15-sample fat-LTO mixed workload improved from 328 ms to 319 ms median
+    (about 2.9%); the matching rapid no-LTO pair was neutral (337 ms vs 339 ms, within noise).
+    Edge/coercion tests, Test262 `built-ins/Math` 327/327, the full 814-test suite, and clippy pass.
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
