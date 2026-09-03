@@ -341,9 +341,10 @@ pub(super) fn install_symbol(it: &mut Interp) {
     let sp = it.symbol_proto.clone();
     it.def_method(&sp, "toString", 0, |i, this, _| {
         match this_symbol(i, &this) {
-            Ok(s) => Ok(Value::from_string(format!(
-                "Symbol({})",
-                s.description.as_deref().unwrap_or("")
+            Ok(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
+                "Symbol(",
+                s.description.as_deref().unwrap_or(""),
+                ")",
             ))),
             Err(e) => Err(e),
         }

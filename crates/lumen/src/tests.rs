@@ -925,6 +925,7 @@ fn symbols() {
     assert_eq!(run("Symbol.for('k') === Symbol.for('k')"), "true"); // registry
     assert_eq!(run("String(Symbol('hi'))"), "Symbol(hi)");
     assert_eq!(run("Symbol('z').toString()"), "Symbol(z)");
+    assert_eq!(run("Symbol().toString()"), "Symbol()");
     assert_eq!(throws("Symbol() + ''"), "TypeError"); // no implicit string coercion
     assert_eq!(throws("+Symbol()"), "TypeError"); // no number coercion
 }
