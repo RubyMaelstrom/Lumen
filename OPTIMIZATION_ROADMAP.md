@@ -1019,6 +1019,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     range for ordinary buffers, retaining the element-by-element path for shared buffers (ECMA-262
     §23.2.3.9). A release workload filling 19,800 `Float64Array` elements 20 times improved from
     0.0382 s to 0.0126 s median (about 67%), with the typed-array semantic suite passing.
+  - [x] `%TypedArray%.prototype.with` snapshots the ordinary source bytes and patches the one
+    replacement element after `ToNumber`/`ToBigInt` and index validation, retaining the boxed path
+    for shared or resized buffers (ECMA-262 §23.2.3.36). A release workload copying 20,000
+    `Float64Array` elements 20 times improved from 0.0875 s to 0.0455 s median (about 48%), with
+    same-type, BigInt, and resizable-buffer ordering tests passing.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

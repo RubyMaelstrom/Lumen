@@ -12592,6 +12592,26 @@ fn typedarray_slice_and_subclass_buffer() {
 }
 
 #[test]
+fn typedarray_with_semantics() {
+    // `with` returns a new same-type array, preserving the source and exact numeric conversion.
+    assert_eq!(
+        run("var a=new Float64Array([1,2,3]); var b=a.with(1,-0); a.join(',')+'|'+(1/b[1])+'|'+b.join(',')"),
+        "1,2,3|-Infinity|1,0,3"
+    );
+    // BigInt typed arrays retain their content type through the replacement.
+    assert_eq!(
+        run("new BigInt64Array([1n,2n]).with(-1,3n).join(',')"),
+        "1,3"
+    );
+    // The replacement is coerced before the index validity check, as required for resizable
+    // backing buffers.
+    assert_eq!(
+        run("var b=new ArrayBuffer(4,{maxByteLength:8}); var a=new Int8Array(b); var r=a.with(1,{valueOf(){b.resize(8);return 7;}}); r.join(',')+'|'+b.byteLength"),
+        "0,7,0,0|8"
+    );
+}
+
+#[test]
 fn typedarray_subarray_semantics() {
     // subarray shares the buffer (a view, not a copy).
     assert_eq!(

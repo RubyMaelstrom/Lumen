@@ -655,6 +655,27 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
         let actual = actual as usize;
         // `with` uses TypedArrayCreateSameType — it ignores `@@species`.
         let (new_ta, new_info) = ta_create_same(i, info.kind, len)?;
+        if !i.shared_buffers.contains_key(&info.buffer) && i.ta_len(&info) == Some(len) {
+            if let Some(mut bytes) = i.ta_read_bytes(&info, 0, len) {
+                // TypedArrayCreateSameType gives the result a distinct ordinary buffer. Once the
+                // required coercions and index check have completed, copy the source encoding and
+                // patch the replacement element without boxing every other element (ECMA-262
+                // §23.2.3.36).
+                let replacement = match &coerced {
+                    Value::BigInt(n) if info.kind.is_bigint() => {
+                        info.kind.write_bigint(n.to_i128_wrapping())
+                    }
+                    Value::Num(n) if !info.kind.is_bigint() => info.kind.write(*n),
+                    _ => Vec::new(),
+                };
+                if replacement.len() == info.kind.elsize() {
+                    let offset = actual * replacement.len();
+                    bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+                    i.ta_write_bytes(&new_info, 0, &bytes);
+                    return Ok(new_ta);
+                }
+            }
+        }
         for k in 0..len {
             let val = if k == actual {
                 coerced.clone()
