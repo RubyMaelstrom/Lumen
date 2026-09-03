@@ -1456,4 +1456,11 @@ before changing broad execution behavior:
     recipes in source order. Speculative guards and live-tier deoptimization remain disabled.
 - [ ] Run focused differential tests, Test262 slices, engine A/B benchmarks, a Speedometer slice,
   and the YouTube/Twitch/Steam semantic gates.
+  - [x] 2026-09-03 gate sweep on `2f882e9` (docs-only since `6ca85be` math): difftest 49 agree
+    1 budget-skip 0 diverged; Test262 `built-ins/Math` 327/327 and pow/atan2/imul 44/44;
+    full `lumen --lib` 813 passed off and with `LUMEN_TAGGED_ARITHMETIC=1`; navier-stokes smoke
+    12514 matches locked 12514 baseline; browser `check` valid:true (`960:49:126386880`,
+    event-loop 6/6, `100:100:100` in `browser-replay-check-20260903T111704Z.json`). Live
+    YouTube/Twitch/Steam matrix reserved for next behavior-changing milestone per replay-first
+    policy; no origin hammering for docs closes.
 - [ ] Commit that checkpoint before broadening tagged-value coverage or enabling heap migration.
