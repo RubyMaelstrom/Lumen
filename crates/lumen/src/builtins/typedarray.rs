@@ -2226,7 +2226,7 @@ fn b64_decode_spec(s: &str, url: bool, handling: &str, max_len: usize) -> (usize
         if (remaining == 1 && chunk.len() == 2) || (remaining == 2 && chunk.len() == 3) {
             return (read, bytes, false); // the next chunk wouldn't fit: stop before it
         }
-        chunk.push(v as u8);
+        chunk.push(v);
         if chunk.len() == 4 {
             if decode_chunk(&chunk, false, &mut bytes).is_err() {
                 return (read, bytes, true);
