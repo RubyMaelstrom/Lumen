@@ -1119,6 +1119,29 @@ fn ta_native(
                 .ok_or_else(|| i.make_error("TypeError", "TypedArray is out of bounds"))?;
             let start = start.min(curlen);
             let end = end.min(curlen);
+            if !i.shared_buffers.contains_key(&info.buffer) {
+                // After the required coercions and bounds recheck, ordinary-buffer fill has no
+                // user-observable operation between element writes. Encode the value once and
+                // write the repeated bytes in one range, avoiding a boxed conversion and dirty
+                // tracking update for every element (ECMA-262 §23.2.3.9).
+                let element = match &value {
+                    Value::BigInt(n) if info.kind.is_bigint() => {
+                        info.kind.write_bigint(n.to_i128_wrapping())
+                    }
+                    Value::Num(n) if !info.kind.is_bigint() => info.kind.write(*n),
+                    _ => Vec::new(),
+                };
+                if !element.is_empty() || start == end {
+                    let count = end.saturating_sub(start);
+                    let total = count.saturating_mul(element.len());
+                    let mut bytes = Vec::with_capacity(total);
+                    for _ in 0..count {
+                        bytes.extend_from_slice(&element);
+                    }
+                    i.ta_write_bytes(&info, start, &bytes);
+                    return Ok(this.clone());
+                }
+            }
             for k in start..end {
                 ab(i.ta_store(&info, k, &value))?;
             }

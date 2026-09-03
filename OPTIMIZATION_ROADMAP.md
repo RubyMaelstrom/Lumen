@@ -1015,6 +1015,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     preserving overlap and bit-level encodings while retaining the existing conversion fallback
     if the byte snapshot is unavailable (ECMA-262 §23.2.3.6). A release workload moving 19,900
     `Float64Array` elements 20 times improved from 0.076882 s to 0.055357 s median (about 28%).
+  - [x] `%TypedArray%.prototype.fill` encodes the coerced element once and writes a repeated raw-byte
+    range for ordinary buffers, retaining the element-by-element path for shared buffers (ECMA-262
+    §23.2.3.9). A release workload filling 19,800 `Float64Array` elements 20 times improved from
+    0.0382 s to 0.0126 s median (about 67%), with the typed-array semantic suite passing.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.
