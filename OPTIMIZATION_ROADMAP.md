@@ -986,6 +986,13 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     `ThisSymbolValue` and wrapper behavior remain unchanged (ECMA-262 §20.4.3.3). A 15-sample
     release workload over 300,000 described/empty calls improved from 0.297073 s to 0.277595 s
     median (about 6.6%); the matching no-LTO pair improved from 0.312106 s to 0.294290 s.
+  - [x] `Object.prototype.toString` and the Array fallback concatenate the specified
+    `"[object "`, tag, and `"]"` pieces directly into one `LStr`, avoiding a temporary Rust
+    `String` for both built-in and string `@@toStringTag` results (ECMA-262 §20.1.3.6). An
+    11-sample fat-LTO workload over 750,000 mixed ordinary/Array/custom-tag calls improved from
+    1.143814 s to 1.088303 s median (about 4.9%); the matching rapid no-LTO pair improved from
+    1.194537 s to 1.109982 s (about 7.1%). The 811-test suite, clippy, and browser replay checks
+    remain green (`960:49:126386880`, event-loop completion, and `100:100:100`).
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
