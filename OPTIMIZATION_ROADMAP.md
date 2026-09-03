@@ -608,6 +608,14 @@ finish the baseline, but no later phase may claim a performance win against the 
     - [x] Data-carrying host callables retain an immutable registration label for diagnostics,
       independent of the author-visible mutable `name` property; legacy bare `NativeFn` labels
       remain explicitly identified as a compatibility limitation.
+    - [x] In progress 2026-09-03: per-operation `native_by_operation` inventory implemented
+      (registration labels for bare fns, immutable identity for data-carrying callables,
+      `ns.op` qualification for embedder namespaces, 1024-label cap with `<overflow>`, JSON
+      escaping, deterministic order, zero addresses). Unit tests (6), Test262 Function apply/call
+      97/97, full 824-test suite, browser `quick` green, harness tests 7+2 pass. Live demo:
+      per-op rows sum exactly to aggregate `native_calls`. Disabled-neutral A/B PENDING: host
+      saturated by an unrelated vLLM/nvcc build (load ~20/20 cores) since 16:20 UTC, invalidating
+      micro-timing; re-run interleaved pinned A/B on a quiet host before closing.
 - [x] Measure error construction as separate message conversion, object allocation, stack capture,
   and stack formatting costs; distinguish constructed, thrown/caught, and escaping errors before
   considering lazy stack materialization for Lumen's non-standard `stack` extension.

@@ -24,6 +24,7 @@
     allow(dead_code)
 )]
 
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::bytecode::Chunk;
@@ -79,6 +80,47 @@ static PERF_SNAPSHOT_DECODE_NANOS: std::sync::atomic::AtomicU64 =
 static PERF_NATIVE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_NATIVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PERF_NATIVE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stable per-operation native-call inventory (Phase 1 host/native observability).
+///
+/// Raw function-pointer addresses vary with ASLR and code layout, so they are never a reported
+/// identity and never leave the process: they serve only as in-process lookup keys from a
+/// registration site (which knows the static operation name) to the diagnostic label. The
+/// reported identity is always the label string. Bare `NativeFn` builtins that share one
+/// implementation address through identical-code folding keep the first-registered label, and
+/// overloaded names such as `toString` aggregate across prototypes by design; both limits are
+/// covered by tests below. Data-carrying callables and embedder namespaces carry their own
+/// immutable labels (resolved inside `perf_native_end` via `NativeLabelSrc`). Phase 8's generated host ABI owns true
+/// per-operation identities; this table is the migration inventory, not its replacement.
+#[derive(Default)]
+struct NativeOpStats {
+    calls: u64,
+    failures: u64,
+    nanos: u64,
+}
+
+#[derive(Default)]
+struct NativeOpTables {
+    names: HashMap<usize, String>,
+    /// Label-aggregated counters in deterministic byte order for stable JSON emission.
+    stats: BTreeMap<String, NativeOpStats>,
+}
+
+/// Process-aggregate tables behind one mutex. Initialized on first registration; never touched
+/// on the disabled per-call path (callers return before any lock, timestamp, or allocation).
+/// Registration itself runs only on cold paths (realm/extension setup) with a bounded number of
+/// distinct entries, so disabled processes pay no per-event cost.
+static NATIVE_OP_TABLES: std::sync::OnceLock<std::sync::Mutex<NativeOpTables>> =
+    std::sync::OnceLock::new();
+
+/// Bound on distinct operation labels. Embedders may register arbitrary names, so diagnostics
+/// must not become an unbounded-growth vector: past the cap, further labels aggregate into a
+/// single `<overflow>` row while call/failure/time totals stay exact.
+const NATIVE_OP_LABEL_CAP: usize = 1024;
+/// Fallback label for fn addresses with no registration (never an address rendering).
+const NATIVE_OP_UNKNOWN: &str = "<native>";
+/// Aggregation row for labels past the distinct-label cap.
+const NATIVE_OP_OVERFLOW: &str = "<overflow>";
 static PERF_ERROR_CONSTRUCTIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static PERF_ERROR_CAUGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -215,17 +257,140 @@ pub(crate) fn perf_snapshot_decode_end(started: Option<std::time::Instant>, succ
 }
 
 #[inline]
-pub(crate) fn perf_native_end(started: Option<std::time::Instant>, success: bool) {
+pub(crate) fn perf_native_end(
+    started: Option<std::time::Instant>,
+    success: bool,
+    label_src: NativeLabelSrc<'_>,
+) {
     let Some(started) = started else { return };
     use std::sync::atomic::Ordering::Relaxed;
+    let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     PERF_NATIVE_CALLS.fetch_add(1, Relaxed);
-    PERF_NATIVE_NANOS.fetch_add(
-        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-        Relaxed,
-    );
+    PERF_NATIVE_NANOS.fetch_add(nanos, Relaxed);
     if !success {
         PERF_NATIVE_FAILURES.fetch_add(1, Relaxed);
     }
+    let mut tables = native_op_tables();
+    let label = match label_src {
+        NativeLabelSrc::Call(call) => match call {
+            // Immutable registration identity, independent of the mutable `name` property.
+            crate::value::Callable::NativeData(data) => data.identity.to_string(),
+            crate::value::Callable::Native(f) => resolve_native_name(&tables, *f as usize),
+            _ => return,
+        },
+        NativeLabelSrc::Addr(addr) => resolve_native_name(&tables, addr),
+    };
+    record_native_op(&mut tables, label, nanos, success);
+}
+
+/// Lock the process tables, recovering from a poisoned mutex rather than panicking diagnostics.
+fn native_op_tables() -> std::sync::MutexGuard<'static, NativeOpTables> {
+    NATIVE_OP_TABLES
+        .get_or_init(|| std::sync::Mutex::new(NativeOpTables::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record a registration label for a bare native fn address. Cold path only
+/// (realm/extension setup); first registration wins, which is deterministic per binary because
+/// builtin installation order is fixed.
+pub(crate) fn perf_native_register(addr: usize, label: &str) {
+    register_native_name(&mut native_op_tables(), addr, label);
+}
+
+fn register_native_name(tables: &mut NativeOpTables, addr: usize, label: &str) {
+    tables
+        .names
+        .entry(addr)
+        .or_insert_with(|| label.to_string());
+}
+
+/// Overwrite the label for a fn address (embedder namespaces qualify `op` as `ns.op`).
+/// Only called from `feature = "embed"` registration paths (plus tests).
+#[cfg(any(feature = "embed", test))]
+pub(crate) fn perf_native_relabel(addr: usize, label: String) {
+    relabel_native_name(&mut native_op_tables(), addr, label);
+}
+
+#[cfg(any(feature = "embed", test))]
+fn relabel_native_name(tables: &mut NativeOpTables, addr: usize, label: String) {
+    tables.names.insert(addr, label);
+}
+
+fn resolve_native_name(tables: &NativeOpTables, addr: usize) -> String {
+    tables
+        .names
+        .get(&addr)
+        .cloned()
+        .unwrap_or_else(|| NATIVE_OP_UNKNOWN.to_string())
+}
+
+/// What to attribute one native call to. Passed by value (`Copy`, pointer-sized, no drop glue)
+/// so disabled dispatch pays only register traffic: callers construct it unconditionally and
+/// `perf_native_end` resolves it only after the enabled gate.
+#[derive(Clone, Copy)]
+pub(crate) enum NativeLabelSrc<'a> {
+    /// Ordinary dispatch: the dispatched callable is still borrowed by the caller.
+    Call(&'a crate::value::Callable),
+    /// Native-entry IC funnel: only the bare fn address is available in scope.
+    Addr(usize),
+}
+
+fn record_native_op(tables: &mut NativeOpTables, label: String, nanos: u64, success: bool) {
+    let key = if tables.stats.len() >= NATIVE_OP_LABEL_CAP && !tables.stats.contains_key(&label) {
+        NATIVE_OP_OVERFLOW.to_string()
+    } else {
+        label
+    };
+    let entry = tables.stats.entry(key).or_default();
+    entry.calls += 1;
+    entry.nanos += nanos;
+    if !success {
+        entry.failures += 1;
+    }
+}
+
+fn json_escape_into(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let v = c as u32;
+                out.push_str("\\u00");
+                out.push(HEX[(v >> 4) as usize] as char);
+                out.push(HEX[(v & 0xF) as usize] as char);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+fn render_native_ops(tables: &NativeOpTables) -> String {
+    let mut out = String::from("[");
+    for (index, (label, stats)) in tables.stats.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        let mut escaped = String::with_capacity(label.len());
+        json_escape_into(&mut escaped, label);
+        out.push_str(&format!(
+            "{{\"operation\":\"{escaped}\",\"calls\":{},\"failures\":{},\"seconds\":{:.9}}}",
+            stats.calls,
+            stats.failures,
+            stats.nanos as f64 / 1_000_000_000.0
+        ));
+    }
+    out.push(']');
+    out
+}
+
+fn native_op_json() -> String {
+    render_native_ops(&native_op_tables())
 }
 
 #[inline]
@@ -474,6 +639,7 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let native_calls = PERF_NATIVE_CALLS.load(Relaxed);
     let native_nanos = PERF_NATIVE_NANOS.load(Relaxed);
     let native_failures = PERF_NATIVE_FAILURES.load(Relaxed);
+    let native_by_op = native_op_json();
     let error_constructions = PERF_ERROR_CONSTRUCTIONS.load(Relaxed);
     let error_caught = PERF_ERROR_CAUGHT.load(Relaxed);
     let error_escaped = PERF_ERROR_ESCAPED.load(Relaxed);
@@ -504,7 +670,7 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let iterate_protocol_failures = PERF_ITERATE_PROTOCOL_FAILURES.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory},\"native_by_operation\":{native_by_op}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
         lex_nanos as f64 / 1_000_000_000.0,
@@ -1067,6 +1233,84 @@ mod helper_identity_tests {
         assert_eq!(helper_name(H_CALL_HIT), "call_hit");
         assert_eq!(helper_name(H_LOOP_BACKEDGE), "loop_backedge");
         assert_eq!(helper_name(N_HELPERS), "invalid");
+    }
+}
+
+#[cfg(test)]
+mod native_op_tests {
+    use super::*;
+
+    fn tables() -> NativeOpTables {
+        NativeOpTables::default()
+    }
+
+    #[test]
+    fn first_registration_wins_for_folded_addresses() {
+        let mut t = tables();
+        register_native_name(&mut t, 0x1000, "first");
+        register_native_name(&mut t, 0x1000, "second");
+        assert_eq!(resolve_native_name(&t, 0x1000), "first");
+    }
+
+    #[test]
+    fn relabel_overwrites_for_namespaces() {
+        let mut t = tables();
+        register_native_name(&mut t, 0x2000, "read");
+        relabel_native_name(&mut t, 0x2000, "fs.read".to_string());
+        assert_eq!(resolve_native_name(&t, 0x2000), "fs.read");
+    }
+
+    #[test]
+    fn unknown_addresses_never_render_as_numbers() {
+        let t = tables();
+        assert_eq!(resolve_native_name(&t, 0xDEAD), "<native>");
+        let rendered = render_native_ops(&t);
+        assert_eq!(rendered, "[]");
+    }
+
+    #[test]
+    fn aggregation_counts_failures_and_time() {
+        let mut t = tables();
+        let label = "Math.abs".to_string();
+        record_native_op(&mut t, label.clone(), 10, true);
+        record_native_op(&mut t, label.clone(), 20, false);
+        let rendered = render_native_ops(&t);
+        assert!(
+            rendered.contains("\"operation\":\"Math.abs\",\"calls\":2,\"failures\":1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn rendering_is_deterministic_and_escapes_labels() {
+        let mut t = tables();
+        for label in ["b", "a\"q", "c\\d", "e\nf", "g\u{1}h"] {
+            record_native_op(&mut t, label.to_string(), 0, true);
+        }
+        let rendered = render_native_ops(&t);
+        let a = rendered.find("\"operation\":\"a").expect("a row");
+        let b = rendered.find("\"operation\":\"b\"").expect("b row");
+        let c = rendered.find("\"operation\":\"c").expect("c row");
+        assert!(a < b && b < c, "{rendered}");
+        assert!(rendered.contains("a\\\"q"), "{rendered}");
+        assert!(rendered.contains("c\\\\d"), "{rendered}");
+        assert!(rendered.contains("e\\nf"), "{rendered}");
+        assert!(rendered.contains("g\\u0001h"), "{rendered}");
+        assert!(!rendered.contains("0x"), "{rendered}");
+    }
+
+    #[test]
+    fn overflow_bucket_bounds_distinct_labels() {
+        let mut t = tables();
+        for i in 0..(NATIVE_OP_LABEL_CAP + 3) {
+            record_native_op(&mut t, format!("op{i}"), 1, true);
+        }
+        assert_eq!(t.stats.len(), NATIVE_OP_LABEL_CAP + 1);
+        let rendered = render_native_ops(&t);
+        assert!(
+            rendered.contains("\"operation\":\"<overflow>\",\"calls\":3"),
+            "{rendered}"
+        );
     }
 }
 

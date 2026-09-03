@@ -3600,7 +3600,11 @@ impl Interp {
             }
             _ => unreachable!("dispatch_native on a non-native callable"),
         };
-        crate::jit::perf_native_end(perf_started, result.is_ok());
+        crate::jit::perf_native_end(
+            perf_started,
+            result.is_ok(),
+            crate::jit::NativeLabelSrc::Call(call),
+        );
         // A native may run nested JavaScript (for example `$262.evalScript`). Host interruption
         // from that execution must override its Value-shaped native error before author `catch`.
         self.interrupt_poll_force()?;
@@ -3680,6 +3684,7 @@ impl Interp {
 
     pub fn make_native(&self, name: &str, len: usize, f: NativeFn) -> Gc {
         let obj = Object::new(Some(self.function_proto.clone()));
+        crate::jit::perf_native_register(f as usize, name);
         {
             let mut b = obj.borrow_mut();
             b.call = Callable::Native(f);
@@ -8641,7 +8646,11 @@ impl Interp {
             Ok(()) => with_execution_stack(self.depth, || {
                 let perf_started = crate::jit::perf_stage_start();
                 let result = nf(self, unsafe { &*this_slot }.clone(), args_ref);
-                crate::jit::perf_native_end(perf_started, result.is_ok());
+                crate::jit::perf_native_end(
+                    perf_started,
+                    result.is_ok(),
+                    crate::jit::NativeLabelSrc::Addr(nf as usize),
+                );
                 result
             }),
             Err(interrupt) => {

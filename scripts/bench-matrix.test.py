@@ -173,6 +173,18 @@ class UnitTests(unittest.TestCase):
         parsed = bench_matrix.parse_engine_metrics(unavailable, "[lumen-perf] ")
         self.assertIsNone(parsed["managed_memory"]["managed_requested_bytes"]["bytes"])
 
+    def test_engine_metrics_parser_tolerates_native_by_operation(self) -> None:
+        stderr = (
+            '[lumen-perf] {"schema_version":1,"native_calls":3,"native_seconds":0.1,'
+            '"gc_collections":0,"native_by_operation":['
+            '{"operation":"Math.abs","calls":2,"failures":0,"seconds":0.06},'
+            '{"operation":"ns.op","calls":1,"failures":1,"seconds":0.04}]}\n'
+        )
+        metrics = bench_matrix.parse_engine_metrics(stderr, "[lumen-perf] ")
+        self.assertEqual(metrics["native_calls"], 3)
+        self.assertEqual(len(metrics["native_by_operation"]), 2)
+        self.assertEqual(metrics["native_by_operation"][1]["operation"], "ns.op")
+
 
 class IntegrationTest(unittest.TestCase):
     def test_offline_matrix_checkpoints_raw_samples_and_paired_ratio(self) -> None:

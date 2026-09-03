@@ -951,6 +951,9 @@ impl Engine {
         let ns = self.interp.new_object();
         for (op, len, f) in ops {
             self.interp.def_method(&ns, op, *len, *f);
+            // Qualify the diagnostic identity (`ns.op`); the bare `op` label recorded by
+            // `def_method` would otherwise collide across namespaces sharing method names.
+            crate::jit::perf_native_relabel(*f as usize, format!("{name}.{op}"));
         }
         self.interp
             .global
