@@ -13681,6 +13681,30 @@ fn string_from_char_code_touint16() {
 }
 
 #[test]
+fn string_from_code_units_fast_paths_preserve_conversion_edges() {
+    assert_eq!(run("String.fromCharCode('65').charCodeAt(0)"), "65");
+    assert_eq!(run("String.fromCodePoint(128512)"), "😀");
+    assert_eq!(run("String.fromCodePoint('65').charCodeAt(0)"), "65");
+    assert_eq!(run("String.fromCharCode(Infinity).charCodeAt(0)"), "0");
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 65}}; String.fromCharCode(o).charCodeAt(0)===65 && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("try{String.fromCharCode(Symbol())}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+    assert_eq!(
+        run("try{String.fromCodePoint(-1)}catch(e){e instanceof RangeError}"),
+        "true"
+    );
+    assert_eq!(
+        run("try{String.fromCodePoint(0x110000)}catch(e){e instanceof RangeError}"),
+        "true"
+    );
+}
+
+#[test]
 fn string_concat_fast_paths_preserve_coercion_and_surrogates() {
     assert_eq!(run("'abc'.concat()"), "abc");
     assert_eq!(run("'abc'.concat('def')"), "abcdef");

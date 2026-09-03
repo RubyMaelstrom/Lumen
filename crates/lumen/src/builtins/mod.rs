@@ -11052,7 +11052,12 @@ fn install_string(it: &mut Interp) {
         let mut units: Vec<u16> = Vec::with_capacity(args.len());
         for a in args {
             // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.
-            let num = ab(i.to_number(a))?;
+            // ToNumber is the identity for Numbers (ECMA-262 §7.1.4); other inputs keep
+            // the full coercive path with its throws and valueOf ordering.
+            let num = match a {
+                Value::Num(num) => *num,
+                v => ab(i.to_number(v))?,
+            };
             units.push(if num.is_finite() {
                 num.trunc().rem_euclid(65536.0) as u16
             } else {
@@ -11084,7 +11089,11 @@ fn install_string(it: &mut Interp) {
     it.def_method(&ctor, "fromCodePoint", 1, |i, _this, args| {
         let mut s = String::new();
         for a in args {
-            let n = ab(i.to_number(a))?;
+            // ToNumber identity for Numbers; validation below is identical either way.
+            let n = match a {
+                Value::Num(n) => *n,
+                v => ab(i.to_number(v))?,
+            };
             // Each argument must be an integer code point in [0, 0x10FFFF].
             if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > 0x10FFFF as f64 {
                 return Err(i.make_error("RangeError", "Invalid code point"));

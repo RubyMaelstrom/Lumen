@@ -1058,6 +1058,13 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     no-LTO pair improved from 237 ms to 229 ms (about 3.6%). Edge/coercion tests, Test262
     `parseInt`/`parseFloat`/`isNaN`/`isFinite` 139/139, the full 816-test suite, browser
     `quick` replay green, and clippy pass.
+  - [x] `String.fromCharCode`/`fromCodePoint` bypass redundant ToNumber dispatch per argument
+    for primitive Numbers (ToUint16 conversion and code-point validation identical either way),
+    while generic calls retain complete coercion with throws and valueOf ordering (ECMA-262
+    §7.1.4, §22.1.2.1–2). A matched 15-sample fat-LTO decode-style workload improved from
+    53.8 ms to 52.2 ms median (about 2.9%); the matching rapid no-LTO pair was neutral
+    (54.7 ms vs 54.9 ms, within noise). Edge/coercion tests, Test262 `fromCharCode`/
+    `fromCodePoint` 28/28, the full 817-test suite, browser `quick` replay green, and clippy pass.
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
