@@ -960,6 +960,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     retaining stable ordering and comparator abrupt-completion behavior while removing recursive
     per-level vector allocations (ECMA-262 §23.1.3.30.1). An 11-sample 5,000-element release
     workload improved from 0.098384 s to 0.095119 s (about 3%).
+  - [x] Default-comparator Array `sort`/`toSorted` precompute primitive ToString keys once before
+    stable merging; objects, Symbols, and internal values retain the coercing comparator path
+    (ECMA-262 §23.1.3.30.2). A 300-call release `toSorted` workload over 3,000 numeric values
+    improved from 767 ms to 194 ms median (about 75%), with Symbol/error and comparator tests
+    covering the fallback behavior.
   - [x] `Array.of` uses one dense allocation for the untouched intrinsic Array constructor, while
     custom/non-constructor receivers retain the normative Construct/CreateDataProperty path
     (ECMA-262 §23.1.2.4). A 500-call release workload over 2,000 values improved from 3,488 ms to

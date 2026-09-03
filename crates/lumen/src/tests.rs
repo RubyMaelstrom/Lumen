@@ -10493,6 +10493,9 @@ fn sort_comparator_validation() {
     assert_eq!(run("[3,1,2].sort().join(',')"), "1,2,3");
     assert_eq!(run("[3,1,2].sort((a,b)=>a-b).join(',')"), "1,2,3");
     assert_eq!(run("[3,1,2].sort(undefined).join(',')"), "1,2,3");
+    // Default Array sorting is lexicographic and Symbols still throw from ToString.
+    assert_eq!(run("[10,4,6,8].toSorted().join(',')"), "10,4,6,8");
+    assert_eq!(throws("[Symbol(), Symbol()].toSorted()"), "TypeError");
 }
 #[test]
 fn string_replace_all_regex() {

@@ -3,6 +3,7 @@
 //! the global functions. test262 exercises this realm as the primary conformance oracle.
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
+use crate::lstr::LStr;
 use crate::value::*;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -6640,6 +6641,16 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
         return Ok(());
     }
 
+    // CompareArrayElements with an absent comparator calls ToString for each pair
+    // (ECMA-262 §23.1.3.30.2). Primitive values have no user code in ToString, so precompute
+    // their stable sort keys once. Objects, Symbols, and internal values retain the complete
+    // comparison path because coercion can throw or execute observable code.
+    if !cmp.is_callable() {
+        if let Some(keys) = default_sort_keys(i, items)? {
+            return merge_sort_with_keys(items, keys);
+        }
+    }
+
     // SortIndexedProperties permits any stable implementation-defined comparison sequence
     // (ECMA-262 §23.1.3.30.1). Keep one source and one destination buffer for all merge passes;
     // the previous recursive implementation allocated two fresh vectors at every tree level.
@@ -6692,6 +6703,86 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
         *slot = value;
     }
     Ok(())
+}
+
+fn default_sort_keys(i: &mut Interp, items: &[Value]) -> Result<Option<Vec<Option<LStr>>>, Value> {
+    let mut keys = Vec::with_capacity(items.len());
+    for value in items {
+        match value {
+            Value::Undefined => keys.push(None),
+            Value::Bool(_) | Value::Null | Value::Num(_) | Value::Str(_) | Value::BigInt(_) => {
+                keys.push(Some(ab(i.to_string(value))?));
+            }
+            // Objects may invoke user-defined coercion; Symbols throw from ToString. Preserve
+            // the ordinary comparator so its exact completion behavior remains observable.
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(keys))
+}
+
+fn merge_sort_with_keys(items: &mut [Value], keys: Vec<Option<LStr>>) -> Result<(), Value> {
+    let n = items.len();
+    debug_assert_eq!(n, keys.len());
+    let mut source: Vec<(Value, Option<LStr>)> = items.iter().cloned().zip(keys).collect();
+    let mut destination: Vec<(Value, Option<LStr>)> =
+        (0..n).map(|_| (Value::Undefined, None)).collect();
+    let mut width = 1usize;
+    loop {
+        let mut start = 0usize;
+        while start < n {
+            let mid = start.saturating_add(width).min(n);
+            let end = mid.saturating_add(width).min(n);
+            let (mut left, mut right, mut out) = (start, mid, start);
+            while left < mid && right < end {
+                let take_left =
+                    compare_sort_keys(&source[left].1, &source[right].1) != Ordering::Greater;
+                let selected = if take_left {
+                    let value = std::mem::replace(&mut source[left], (Value::Undefined, None));
+                    left += 1;
+                    value
+                } else {
+                    let value = std::mem::replace(&mut source[right], (Value::Undefined, None));
+                    right += 1;
+                    value
+                };
+                destination[out] = selected;
+                out += 1;
+            }
+            while left < mid {
+                destination[out] = std::mem::replace(&mut source[left], (Value::Undefined, None));
+                left += 1;
+                out += 1;
+            }
+            while right < end {
+                destination[out] = std::mem::replace(&mut source[right], (Value::Undefined, None));
+                right += 1;
+                out += 1;
+            }
+            start = end;
+        }
+        std::mem::swap(&mut source, &mut destination);
+        if width >= n.div_ceil(2) {
+            break;
+        }
+        width = width.saturating_mul(2);
+    }
+    for (slot, (value, _)) in items.iter_mut().zip(source) {
+        *slot = value;
+    }
+    Ok(())
+}
+
+#[inline]
+fn compare_sort_keys(a: &Option<LStr>, b: &Option<LStr>) -> Ordering {
+    // `None` is the precomputed marker for undefined, which CompareArrayElements always moves to
+    // the end. Equal keys use <= at the merge site, preserving stable ordering.
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) => a.as_ref().cmp(b.as_ref()),
+    }
 }
 
 fn compare_values(i: &mut Interp, cmp: &Value, a: &Value, b: &Value) -> Result<Ordering, Value> {
