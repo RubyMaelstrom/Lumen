@@ -1443,9 +1443,14 @@ before changing broad execution behavior:
   object tracer, hybrid-edge rule, promotion destination, and old-to-young barrier
   (`HEAP_SAFETY_MODEL.md`). The document is a non-executable safety gate; object-family migration
   remains blocked until its relocation and differential tests exist.
-- [ ] Implement and verify deoptimization metadata for a non-speculative toy/general SSA region as
+- [x] Implement and verify deoptimization metadata for a non-speculative toy/general SSA region as
   compiler scaffolding only; defer Map/property specialization until Phase 4 provides stable
   identities.
+  - [x] Verified 2026-09-03 on `db159e9`: `jit_ir::` 15 passed including
+    `ssa_side_exit_publishes_a_conservative_deopt_record`, `tagged::deopt` 3 passed.
+    `deopt_record_for_exit` publishes exact resume PC + validated `RootMap` + source-order
+    `CopySlot` recipes and `materialize` round-trips; module remains `allow(dead_code)`
+    scaffolding with no live-tier caller and speculative guards disabled.
   - [x] Publish conservative `DeoptRecord` recipes for selected SSA loop side exits with the exact
     baseline resume PC, validate them before publication, and materialize tagged words/virtual-object
     recipes in source order. Speculative guards and live-tier deoptimization remain disabled.
