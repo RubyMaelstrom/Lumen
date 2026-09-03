@@ -849,6 +849,49 @@ fn json_parse_string(
 ) -> Result<String, Value> {
     *pos += 1; // opening quote
     let mut s = String::new();
+    // Most JSON strings contain no escapes. Scan that prefix in bulk and copy it once; the
+    // character-by-character loop below remains the exact path for escapes, controls, and
+    // surrogate decoding.
+    let plain_start = *pos;
+    match input {
+        JsonInput::Bytes(bytes) => {
+            while *pos < bytes.len() {
+                match bytes[*pos] {
+                    b'"' => {
+                        let plain = String::from_utf8(bytes[plain_start..*pos].to_vec())
+                            .expect("ASCII JSON input is valid UTF-8");
+                        *pos += 1;
+                        return Ok(plain);
+                    }
+                    b'\\' | 0..=0x1f => break,
+                    _ => *pos += 1,
+                }
+            }
+            if *pos > plain_start {
+                s.push_str(
+                    std::str::from_utf8(&bytes[plain_start..*pos])
+                        .expect("ASCII JSON input is valid UTF-8"),
+                );
+            }
+        }
+        JsonInput::Chars(chars) => {
+            while *pos < chars.len() {
+                match chars[*pos] {
+                    '"' => {
+                        let plain: String = chars[plain_start..*pos].iter().collect();
+                        *pos += 1;
+                        return Ok(plain);
+                    }
+                    '\\' => break,
+                    c if (c as u32) < 0x20 => break,
+                    _ => *pos += 1,
+                }
+            }
+            if *pos > plain_start {
+                s.extend(chars[plain_start..*pos].iter().copied());
+            }
+        }
+    }
     loop {
         let c = input
             .get(*pos)

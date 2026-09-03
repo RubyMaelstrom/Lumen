@@ -1009,6 +1009,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     temporary Rust `String` for each numeric value while retaining the same validated grammar and
     `f64` conversion (ECMA-262 §25.5.1). Fifteen interleaved release pairs over a 5,000-number
     document parsed 100 times improved from 0.122 s to 0.109 s median (about 11%).
+  - [x] JSON strings with no escapes or controls scan their plain prefix and copy it once, while
+    escaped, control, and surrogate cases continue through the normative decoder (ECMA-262
+    §25.5.1). Fifteen interleaved release pairs over the mixed 500-record document improved from
+    0.390 s to 0.310 s median (about 20.5%); Unicode, escape, and invalid-control tests remain
+    covered.
   - [x] JSON replacer-array PropertyList construction uses a SameValueZero-equivalent string hash
     set for first-occurrence deduplication while retaining source order (ECMA-262 §25.5.4.1). A
     4,000-entry/2,000-key release workload improved from 2,888 ms to 433 ms median (about 85%).
