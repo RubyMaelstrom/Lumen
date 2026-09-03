@@ -979,8 +979,8 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   - [x] `Symbol.prototype.toString` builds the descriptive string directly from the retained
     description (including the specified empty-description branch), without a formatting temporary;
     `ThisSymbolValue` and wrapper behavior remain unchanged (ECMA-262 §20.4.3.3). A 15-sample
-    no-LTO release workload over 300,000 described/empty calls improved from 0.312106 s to 0.294290
-    s median (about 5.7%); the candidate remains subject to the canonical fat-LTO gate.
+    release workload over 300,000 described/empty calls improved from 0.297073 s to 0.277595 s
+    median (about 6.6%); the matching no-LTO pair improved from 0.312106 s to 0.294290 s.
   - [x] `%TypedArray%.prototype.join` retains the spec-ordered separator as an `LStr` while
     building the result, avoiding an intermediate Rust `String`; an 11-sample release micro-workload
     improved from 0.631646 s to 0.600157 s (about 5%, with normal run-to-run noise).
