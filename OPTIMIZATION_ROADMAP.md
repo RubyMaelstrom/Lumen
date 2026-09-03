@@ -403,10 +403,18 @@ finish the baseline, but no later phase may claim a performance win against the 
   scores.
 - [x] Add exact collector-boundary object/scope populations, reclaimed-node counts, and bounded
   GC pause-distribution reporting to the locked engine runner.
-- [ ] Add live/post-collection managed-byte accounting across object/property/element storage,
+- [x] Add live/post-collection managed-byte accounting across object/property/element storage,
   shared strings, scopes, side tables/caches, and external buffers. Do not substitute
   `object_count * size_of::<Object>()` or peak RSS for this ownership-aware measurement. The
   measurement contract and review questions are recorded in `MANAGED_MEMORY_ACCOUNTING.md`.
+  - [x] Verified 2026-09-03 on `6ca85be`: `memory::` 37 passed, full `lumen --lib` 813 passed,
+    `clippy -D warnings` and `fmt --check` clean. Opt-in `LUMEN_PERF_METRICS=1` emits one
+    post-GC envelope outside the pause timer; disabled runs emit nothing via the `OnceLock` gate.
+    Locked baseline `engine-matrix-20260902T114617937027Z.json` (artifact `87536fba...968bb`)
+    reports `complete:true` with `managed_requested_bytes` 2,841,702 lower-bound (opaque HashMap
+    buckets documented per-category) and `managed_external_bytes` exact; trivial workload reports
+    520,273 lower-bound `complete:true` with zero `unavailable`. Browser replays remain
+    `valid:true` (`960:49:126386880`, event-loop 6/6, `100:100:100`).
   - [x] Land the versioned post-GC report, capacity-aware collector object/scope/property/binding
     slice, shared-allocation deduplication, and explicit exact/lower-bound/unavailable labels.
   - [x] Add an exact `Interp`-field destructuring tripwire and checked-in ownership classification;
