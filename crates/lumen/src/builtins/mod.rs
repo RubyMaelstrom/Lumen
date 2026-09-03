@@ -5965,6 +5965,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let o = arr_to_object(i, &this)?;
         let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
+        // Change-by-copy methods use ArrayCreate and Get. A dense ordinary Array has no
+        // observable work in those indexed Gets, so snapshot its own data once and reverse the
+        // values in place (ECMA-262 §23.1.3.33).
+        if len <= MAX_ARRAY_OP_LEN {
+            if let Some(mut items) = dense_array_snapshot(i, &ov) {
+                items.reverse();
+                return Ok(i.make_array(items));
+            }
+        }
         // Elements are read from the end down (from = len - k - 1) into ascending targets.
         let mut items = Vec::with_capacity(len);
         for k in 0..len {
@@ -5981,6 +5990,12 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let o = arr_to_object(i, &this)?;
         let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
+        if len <= MAX_ARRAY_OP_LEN {
+            if let Some(mut items) = dense_array_snapshot(i, &ov) {
+                merge_sort(i, &mut items, &cmp)?;
+                return Ok(i.make_array(items));
+            }
+        }
         let mut items = Vec::with_capacity(len);
         for k in 0..len {
             items.push(array_get_index(i, &o, &ov, k)?);
@@ -6002,6 +6017,12 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         if idx < 0 || idx >= len {
             return Err(i.make_error("RangeError", "invalid index"));
+        }
+        if len as usize <= MAX_ARRAY_OP_LEN {
+            if let Some(mut items) = dense_array_snapshot(i, &ov) {
+                items[idx as usize] = arg(args, 1);
+                return Ok(i.make_array(items));
+            }
         }
         // The replaced index is never read.
         let mut items = Vec::with_capacity(len as usize);
@@ -6036,6 +6057,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         if new_len as usize > MAX_ARRAY_OP_LEN {
             return Err(i.make_error("RangeError", "array length exceeds engine limit"));
+        }
+        if len as usize <= MAX_ARRAY_OP_LEN {
+            if let Some(source) = dense_array_snapshot(i, &ov) {
+                let mut items = Vec::with_capacity(new_len as usize);
+                items.extend_from_slice(&source[..start as usize]);
+                items.extend(inserts);
+                items.extend_from_slice(&source[(start + del) as usize..len as usize]);
+                return Ok(i.make_array(items));
+            }
         }
         // The discarded span is never read.
         let mut items = Vec::with_capacity(new_len as usize);

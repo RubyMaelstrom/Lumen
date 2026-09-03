@@ -964,6 +964,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     custom/non-constructor receivers retain the normative Construct/CreateDataProperty path
     (ECMA-262 §23.1.2.4). A 500-call release workload over 2,000 values improved from 3,488 ms to
     74 ms median (about 98%); custom-constructor and non-constructor tests remain covered.
+  - [x] Dense ordinary arrays use a single snapshot for `toReversed`, `toSorted`, `with`, and
+    `toSpliced` indexed reads before their existing result construction/sort (ECMA-262
+    §23.1.3.33–35, §23.1.3.39). The combined 300-round release workload improved from 1,630 ms to
+    1,511 ms median (about 7%); holes, accessors, proxies, and generic array-likes retain the
+    normative property path.
   - [x] JSON array/object assembly streams already-serialized members into one output buffer,
     removing the temporary `join` result while preserving ECMA-262 §25.5.2.5 ordering and
     indentation. A nested 1,000-call release workload improved from 331 ms to 311 ms median
