@@ -21,4 +21,4 @@ __pycache__/
 /site/pkg/
 /site/version.json
 examples/ejs/code.js
-regexp-corpus/generated-harness.js
+benchmarks/regexp-corpus/generated-harness.js
