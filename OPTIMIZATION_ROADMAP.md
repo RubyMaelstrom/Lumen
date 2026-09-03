@@ -1043,6 +1043,31 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     (1,396,080 calls) to 0.175 s (the residual 44,975 reads are `[Symbol.split]`'s per-call
     getter), all eight per-flag accessor rows disappeared, and `[Symbol.replace]` dropped
     18.59→12.58 s.
+  - [x] Route dead-result RegExp/string calls through the discard intrinsics on the bytecode
+    tier: `CallWithThis` immediately followed by `Op::Pop` now shares the JIT's guarded
+    allocation-free routines for `RegExp.prototype.exec`, `String.prototype.replace`, and
+    `String.prototype.split`, and a new `string_match_discard_fast`/`re_sym_match_discard_direct`
+    covers dead `String.prototype.match` (previously unoptimized on every tier). Guards return
+    `None` before touching state, so a miss runs the generic builtin observably identically.
+    Verified 2026-09-03 on `ca1fdb7`: bytecode-tier full-suite inventory shows the exec funnel
+    falling 21.5M calls/12.37 s → 12.7k/0.009 s with replace/split/match vanishing from the
+    native table entirely, and the RegExp component improving 130 → 411–426 (3.2×, wall
+    24.6 → 8.9 s median) while every other component stays within noise (Richards 157, DeltaBlue
+    150, Crypto 201, RayTrace 335, EarleyBoyer 400, Splay 1148, NavierStokes 442). Full 840-test
+    suite off and with `LUMEN_TAGGED_ARITHMETIC=1`, difftest `--seed 1 --count 300` 276/24/0,
+    and the standard test262 default slice 20449/20449 two changes green; three-tier differential
+    tests pin `lastIndex` advancement, legacy statics (`RegExp.$1` after a dead capture exec),
+    live results after discard-shaped sites, and own/prototype override guards.
+  - [x] Recycle `Function.prototype.apply` argument buffers through a bounded 64-entry pool
+    (same discipline as `vm_pool`, cleared on return, exactly accounted in the managed-memory
+    walker as `native_arg_pool => "measured"`) so a hot `f.apply(null, denseArray)` loop stops
+    allocating a fresh `Vec` per call (2.66M per classic-suite bytecode run). The buffer is
+    returned even on throw because every callee copies arguments into its own activation.
+    Verified 2026-09-03 on `fe13a9a`: classic-suite measurement is neutral (apply native time
+    2.858 s vs 2.843 s parent — the call dispatch dominates, not the vector), EarleyBoyer 400
+    vs 395 parent (noise), while per-run allocation count drops by 2.66M tiny vectors; full
+    840-test suite both tagged-switch modes, difftest 276/24/0, test262 default slice
+    20449/20449.
   - [x] `Symbol.prototype.toString` builds the descriptive string directly from the retained
     description (including the specified empty-description branch), without a formatting temporary;
     `ThisSymbolValue` and wrapper behavior remain unchanged (ECMA-262 §20.4.3.3). A 15-sample
