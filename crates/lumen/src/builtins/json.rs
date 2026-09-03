@@ -20,6 +20,10 @@ pub(super) fn install_json(it: &mut Interp) {
                 _ => 0,
             };
             let mut list: Vec<String> = Vec::new();
+            // JSON.stringify's PropertyList keeps the first occurrence of each String while
+            // preserving input order (ECMA-262 §25.5.4.1). Hash the already-coerced keys so a
+            // large replacer array does not repeatedly rescan the prefix of `list`.
+            let mut list_seen = crate::fasthash::FastSet::default();
             for k in 0..len {
                 let item = ab(i.get_member(&replacer, &k.to_string()))?;
                 // String/Number primitives and their wrappers contribute a key via ToString.
@@ -34,7 +38,7 @@ pub(super) fn install_json(it: &mut Interp) {
                     _ => None,
                 };
                 if let Some(key) = key {
-                    if !list.contains(&key) {
+                    if list_seen.insert(key.clone()) {
                         list.push(key);
                     }
                 }

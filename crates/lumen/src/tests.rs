@@ -10899,6 +10899,11 @@ fn json_stringify_replacer() {
         run("JSON.stringify({a:1,b:2,c:3}, ['c','a'])"),
         r#"{"c":3,"a":1}"#
     );
+    // The PropertyList keeps only the first occurrence of each key, in source order.
+    assert_eq!(
+        run("JSON.stringify({a:1,b:2}, ['b','a','b','a'])"),
+        r#"{"b":2,"a":1}"#
+    );
     assert_eq!(run("JSON.stringify({a:1,b:2}, [])"), "{}");
     // Function replacer transforms values.
     assert_eq!(

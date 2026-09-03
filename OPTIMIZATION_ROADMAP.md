@@ -964,6 +964,9 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     removing the temporary `join` result while preserving ECMA-262 §25.5.2.5 ordering and
     indentation. A nested 1,000-call release workload improved from 331 ms to 311 ms median
     (about 6%).
+  - [x] JSON replacer-array PropertyList construction uses a SameValueZero-equivalent string hash
+    set for first-occurrence deduplication while retaining source order (ECMA-262 §25.5.4.1). A
+    4,000-entry/2,000-key release workload improved from 2,888 ms to 433 ms median (about 85%).
   - [x] Array `indexOf`, `lastIndexOf`, `some`, and `every` share the checked dense own-data
     probe used by the other indexed callbacks, avoiding decimal-key construction and a separate
     `HasProperty` walk for ordinary dense arrays while retaining hole/prototype/accessor/proxy
