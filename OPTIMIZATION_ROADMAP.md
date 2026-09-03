@@ -1014,6 +1014,10 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     §25.5.1). Fifteen interleaved release pairs over the mixed 500-record document improved from
     0.390 s to 0.310 s median (about 20.5%); Unicode, escape, and invalid-control tests remain
     covered.
+  - [x] ASCII `String.prototype.padStart`/`padEnd` write the repeated fill and source directly
+    into one final LStr allocation after the existing UTF-16 length/coercion checks (ECMA-262
+    §22.1.3.17). A 15-sample release workload over 180,000 alternating pads improved from 0.229 s
+    to 0.220 s median (about 3.9%); unit-truncation and non-ASCII tests remain covered.
   - [x] JSON replacer-array PropertyList construction uses a SameValueZero-equivalent string hash
     set for first-occurrence deduplication while retaining source order (ECMA-262 §25.5.4.1). A
     4,000-entry/2,000-key release workload improved from 2,888 ms to 433 ms median (about 85%).

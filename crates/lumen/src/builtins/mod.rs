@@ -11204,20 +11204,11 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     if s.is_ascii() && pad.is_ascii() {
         // StringPad repeats and truncates by UTF-16 code units (ECMA-262
         // §22.1.3.17.2); ASCII bytes are those same units, so avoid building
-        // a temporary u16 vector for the common case.
-        let mut fill = String::with_capacity(need);
-        while fill.len() < need {
-            let take = (need - fill.len()).min(pad.len());
-            fill.push_str(&pad[..take]);
-        }
-        // Both operands are ASCII, so their UTF-16 concatenation needs no canonicalization pass.
-        // Build the final engine string directly instead of formatting a temporary Rust String
-        // and copying that result into an LStr.
-        return Ok(Value::Str(if at_start {
-            crate::lstr::LStr::concat2(&fill, s)
-        } else {
-            crate::lstr::LStr::concat2(s, &fill)
-        }));
+        // a temporary fill string. Both operands are ASCII, so their UTF-16 concatenation needs
+        // no canonicalization pass; write the fill and source into one final LStr allocation.
+        return Ok(Value::Str(crate::lstr::LStr::pad_ascii(
+            s, &pad, need, at_start,
+        )));
     }
     let pad_units = crate::jstr::units(&pad);
     let fill_units: Vec<u16> = pad_units.iter().copied().cycle().take(need).collect();

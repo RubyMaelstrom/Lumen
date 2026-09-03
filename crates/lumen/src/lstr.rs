@@ -242,6 +242,37 @@ impl LStr {
         self.repeat_direct(count)
     }
 
+    /// Build an ASCII-padded string directly in its final engine allocation. The caller has
+    /// already applied StringPad's UTF-16 length and coercion rules, and both operands are known
+    /// ASCII, so repeating/truncating the fill cannot require surrogate fixup.
+    pub(crate) fn pad_ascii(source: &str, pad: &str, need: usize, at_start: bool) -> LStr {
+        debug_assert!(source.is_ascii() && pad.is_ascii() && !pad.is_empty());
+        let total = source.len() + need;
+        let padded = LStr::alloc("", u32::try_from(total).expect("string too large"));
+        unsafe {
+            let destination = padded.p.as_ptr().cast::<u8>().add(HDR);
+            let (fill_start, source_start) = if at_start {
+                (0, need)
+            } else {
+                (source.len(), 0)
+            };
+            let mut offset = fill_start;
+            while offset < fill_start + need {
+                let copy_len = (fill_start + need - offset).min(pad.len());
+                std::ptr::copy_nonoverlapping(pad.as_ptr(), destination.add(offset), copy_len);
+                offset += copy_len;
+            }
+            std::ptr::copy_nonoverlapping(
+                source.as_ptr(),
+                destination.add(source_start),
+                source.len(),
+            );
+        }
+        padded.hdr().len.set(total as u32);
+        padded.and_ascii(true);
+        padded
+    }
+
     /// Map ASCII letters directly into one engine allocation. The caller must have already
     /// selected the ASCII representation; non-ASCII case mappings (including one-to-many and
     /// context-sensitive mappings) remain on the Unicode implementation path.
