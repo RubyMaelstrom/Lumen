@@ -1565,6 +1565,21 @@ before changing broad execution behavior:
     3.8–6.1): the shadow transport remains a migration gap, so the switch stays disabled by
     default exactly as before. Remaining families for later widening: bitwise/shift, unary numeric,
     and exponentiation.
+  - [x] Complete the numeric families in the slice: bitwise/shift (`bin_i32` via
+    `TaggedNumericFrame::bitwise`), unary (`Op::Neg`/`Plus`/`BitNot` via a new one-slot
+    `TaggedNumberFrame`), and exponentiation (`Op::GenBin("**")` via `TaggedNumericFrame::pow`),
+    all behind the same switch; `>>>` already rode `bin_num`. `Op::GenBin("**")` also gained a
+    dedicated canonical dispatch so Number⊕Number never enters the generic `binary()` helper.
+    Verified 2026-09-03 on `a4715ed`: 834-pass full suite off and with the switch on; focused
+    tests pin ToInt32 wrapping (NaN/fractional/out-of-range), signed-zero negation and bitwise-
+    NOT edges, and exponentiate NaN cases (step 8 before the ±1 special cases makes
+    `-1 ** ±Infinity` NaN, verified against Node/V8 and test262). Difftest `--seed 1 --count 300`
+    still reports 276 agree / 24 budget / 0 diverge with the switch on; the full standard test262
+    default slice still passes 20449/20449 with the switch on; a numeric-family bytecode script is
+    byte-identical off/on and value-identical to Node. The switch remains disabled by default. A
+    paired parent-vs-child release A/B on a synthetic `**`-hot bytecode loop measured 134→110 ms
+    median (3 samples each, shared host, every sample improved): directional evidence for the
+    dedicated dispatch, with no claim on general workloads where `**` is rare.
 - [x] Write and review the Phase 3A heap safety/migration design, including every root family,
   object tracer, hybrid-edge rule, promotion destination, and old-to-young barrier
   (`HEAP_SAFETY_MODEL.md`). The document is a non-executable safety gate; object-family migration
