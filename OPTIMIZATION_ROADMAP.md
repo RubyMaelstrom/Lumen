@@ -1000,6 +1000,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     indentation. Object member construction also appends quoted keys, separators, and values
     directly instead of using a formatting temporary. The nested 1,000-call release workload
     improved from 331 ms to 280 ms median across the combined changes (about 15%).
+  - [x] `JSON.parse` keeps ASCII source in a byte-indexed parser instead of widening every input
+    byte to a temporary `Vec<char>`; non-ASCII input and `\\u` escapes retain the UTF-16-safe
+    parser and surrogate handling (ECMA-262 §25.5.1). An 11-sample release workload parsing a
+    500-record ASCII document 1,000 times improved from 0.439 s to 0.384 s median (about 12.5%),
+    with direct Unicode, escaped-pair, lone-surrogate, reviver, and source-context tests passing.
   - [x] JSON replacer-array PropertyList construction uses a SameValueZero-equivalent string hash
     set for first-occurrence deduplication while retaining source order (ECMA-262 §25.5.4.1). A
     4,000-entry/2,000-key release workload improved from 2,888 ms to 433 ms median (about 85%).

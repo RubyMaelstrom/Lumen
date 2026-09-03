@@ -1352,6 +1352,11 @@ fn json_and_reflect() {
     );
     assert_eq!(run("JSON.parse('{\"a\":1,\"b\":[2,3]}').b[1]"), "3");
     assert_eq!(run("JSON.parse('\"hi\\\\n\"').length"), "3");
+    // ASCII source uses the byte parser, while direct Unicode and escaped surrogate pairs keep
+    // the UTF-16-safe path and representation.
+    assert_eq!(run("JSON.parse('\"caf\u{00E9}\"')"), "café");
+    assert_eq!(run("JSON.parse('\"\\\\uD83D\\\\uDE00\"')"), "😀");
+    assert_eq!(run("JSON.parse('\"\\\\uD800\"').length"), "1");
     assert_eq!(run("JSON.stringify({a:1}, null, 2)"), "{\n  \"a\": 1\n}");
     assert_eq!(throws("var o={}; o.self=o; JSON.stringify(o)"), "TypeError");
     assert_eq!(run("Reflect.has({a:1}, 'a')"), "true");

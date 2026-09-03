@@ -83,46 +83,57 @@ pub(super) fn install_json(it: &mut Interp) {
     });
     it.def_method(&j, "parse", 2, |i, _t, args| {
         let text = ab(i.to_string(&arg(args, 0)))?;
-        let chars: Vec<char> = text.chars().collect();
+        // JSON grammar is ASCII-delimited. Keep ASCII source in its original byte slice rather
+        // than widening every byte to a four-byte `char`; escaped `\u` sequences are still
+        // decoded by `json_parse_string` into the engine's UTF-16 representation.
+        let chars = (!text.as_str().is_ascii()).then(|| text.chars().collect::<Vec<_>>());
+        let input = match chars.as_deref() {
+            Some(chars) => JsonInput::Chars(chars),
+            None => JsonInput::Bytes(text.as_str().as_bytes()),
+        };
         let mut pos = 0;
         let reviver = arg(args, 1);
         // A callable reviver walks the result via InternalizeJSONProperty from a `{ "": v }` root,
         // recording primitive source spans for its `context` argument.
         if reviver.is_callable() {
-            let (v, record) = json_parse_recorded(i, &chars, &mut pos)?;
-            json_skip_ws(&chars, &mut pos);
-            if pos != chars.len() {
+            let (v, record) = json_parse_recorded(i, input, &mut pos)?;
+            json_skip_ws(input, &mut pos);
+            if pos != input.len() {
                 return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
             }
             let root = i.new_object();
             set_data(&root, "", v);
             return internalize_json_property(i, &Value::Obj(root), "", &reviver, Some(&record));
         }
-        let v = json_parse_value(i, &chars, &mut pos)?;
-        json_skip_ws(&chars, &mut pos);
-        if pos != chars.len() {
+        let v = json_parse_value(i, input, &mut pos)?;
+        json_skip_ws(input, &mut pos);
+        if pos != input.len() {
             return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
         }
         Ok(v)
     });
     it.def_method(&j, "rawJSON", 1, |i, _t, args| {
         let text = ab(i.to_string(&arg(args, 0)))?.to_string();
-        let bytes: Vec<char> = text.chars().collect();
-        if bytes.is_empty() {
+        let chars = (!text.is_ascii()).then(|| text.chars().collect::<Vec<_>>());
+        let input = match chars.as_deref() {
+            Some(chars) => JsonInput::Chars(chars),
+            None => JsonInput::Bytes(text.as_bytes()),
+        };
+        if input.is_empty() {
             return Err(i.make_error("SyntaxError", "JSON.rawJSON: empty string"));
         }
         let is_ws = |c: char| matches!(c, '\t' | '\n' | '\r' | ' ');
-        if is_ws(bytes[0]) || is_ws(*bytes.last().unwrap()) {
+        if is_ws(input.get(0).unwrap()) || is_ws(input.get(input.len() - 1).unwrap()) {
             return Err(i.make_error("SyntaxError", "JSON.rawJSON: leading/trailing whitespace"));
         }
-        if bytes[0] == '{' || bytes[0] == '[' {
+        if matches!(input.get(0), Some('{') | Some('[')) {
             return Err(i.make_error("SyntaxError", "JSON.rawJSON value must be a primitive"));
         }
         // Validate it is exactly one JSON value.
         let mut pos = 0;
-        json_parse_value(i, &bytes, &mut pos)?;
-        json_skip_ws(&bytes, &mut pos);
-        if pos != bytes.len() {
+        json_parse_value(i, input, &mut pos)?;
+        json_skip_ws(input, &mut pos);
+        if pos != input.len() {
             return Err(i.make_error("SyntaxError", "JSON.rawJSON: invalid JSON text"));
         }
         let o = i.new_object();
@@ -535,41 +546,78 @@ fn join_json(
     out
 }
 
-fn json_skip_ws(chars: &[char], pos: &mut usize) {
-    while *pos < chars.len() && matches!(chars[*pos], ' ' | '\t' | '\n' | '\r') {
+#[derive(Clone, Copy)]
+enum JsonInput<'a> {
+    Bytes(&'a [u8]),
+    Chars(&'a [char]),
+}
+
+impl JsonInput<'_> {
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Chars(chars) => chars.len(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn get(self, index: usize) -> Option<char> {
+        match self {
+            Self::Bytes(bytes) => bytes.get(index).copied().map(char::from),
+            Self::Chars(chars) => chars.get(index).copied(),
+        }
+    }
+
+    fn to_string(self, start: usize, end: usize) -> String {
+        match self {
+            Self::Bytes(bytes) => String::from_utf8(bytes[start..end].to_vec())
+                .expect("ASCII JSON input is valid UTF-8"),
+            Self::Chars(chars) => chars[start..end].iter().collect(),
+        }
+    }
+}
+
+fn json_skip_ws(input: JsonInput<'_>, pos: &mut usize) {
+    while *pos < input.len() && matches!(input.get(*pos), Some(' ' | '\t' | '\n' | '\r')) {
         *pos += 1;
     }
 }
 
-fn json_parse_value(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<Value, Value> {
-    json_skip_ws(chars, pos);
-    let c = *chars
+fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Result<Value, Value> {
+    json_skip_ws(input, pos);
+    let c = input
         .get(*pos)
         .ok_or_else(|| i.make_error("SyntaxError", "Unexpected end of JSON input"))?;
     match c {
         '{' => {
             *pos += 1;
             let obj = i.new_object();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&'}') {
+            json_skip_ws(input, pos);
+            if input.get(*pos) == Some('}') {
                 *pos += 1;
                 return Ok(Value::Obj(obj));
             }
             loop {
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&'"') {
+                json_skip_ws(input, pos);
+                if input.get(*pos) != Some('"') {
                     return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
                 }
-                let key = json_parse_string(i, chars, pos)?;
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&':') {
+                let key = json_parse_string(i, input, pos)?;
+                json_skip_ws(input, pos);
+                if input.get(*pos) != Some(':') {
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
                 }
                 *pos += 1;
-                let v = json_parse_value(i, chars, pos)?;
+                let v = json_parse_value(i, input, pos)?;
                 set_data(&obj, &key, v);
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
+                json_skip_ws(input, pos);
+                match input.get(*pos) {
                     Some(',') => {
                         *pos += 1;
                     }
@@ -589,15 +637,15 @@ fn json_parse_value(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<V
         '[' => {
             *pos += 1;
             let mut items = Vec::new();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&']') {
+            json_skip_ws(input, pos);
+            if input.get(*pos) == Some(']') {
                 *pos += 1;
                 return Ok(i.make_array(items));
             }
             loop {
-                items.push(json_parse_value(i, chars, pos)?);
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
+                items.push(json_parse_value(i, input, pos)?);
+                json_skip_ws(input, pos);
+                match input.get(*pos) {
                     Some(',') => {
                         *pos += 1;
                     }
@@ -614,16 +662,16 @@ fn json_parse_value(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<V
             }
             Ok(i.make_array(items))
         }
-        '"' => Ok(Value::from_string(json_parse_string(i, chars, pos)?)),
-        't' => json_parse_lit(i, chars, pos, "true", Value::Bool(true)),
-        'f' => json_parse_lit(i, chars, pos, "false", Value::Bool(false)),
-        'n' => json_parse_lit(i, chars, pos, "null", Value::Null),
+        '"' => Ok(Value::from_string(json_parse_string(i, input, pos)?)),
+        't' => json_parse_lit(i, input, pos, "true", Value::Bool(true)),
+        'f' => json_parse_lit(i, input, pos, "false", Value::Bool(false)),
+        'n' => json_parse_lit(i, input, pos, "null", Value::Null),
         '-' | '0'..='9' => {
             let start = *pos;
             // Strict JSON number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)? — no leading
             // zeros, a mandatory integer part, and at least one digit after `.` / exponent.
             let err = || i.make_error("SyntaxError", "Invalid number in JSON");
-            let at = |p: usize| chars.get(p).copied();
+            let at = |p: usize| input.get(p);
             if at(*pos) == Some('-') {
                 *pos += 1;
             }
@@ -657,7 +705,7 @@ fn json_parse_value(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<V
                     *pos += 1;
                 }
             }
-            let s: String = chars[start..*pos].iter().collect();
+            let s = input.to_string(start, *pos);
             s.parse::<f64>().map(Value::Num).map_err(|_| err())
         }
         _ => Err(i.make_error("SyntaxError", "Unexpected token in JSON")),
@@ -676,11 +724,11 @@ enum JsonRecord {
 /// primitive leaves delegate to `json_parse_value` and capture their exact source span.
 fn json_parse_recorded(
     i: &mut Interp,
-    chars: &[char],
+    input: JsonInput<'_>,
     pos: &mut usize,
 ) -> Result<(Value, JsonRecord), Value> {
-    json_skip_ws(chars, pos);
-    let c = *chars
+    json_skip_ws(input, pos);
+    let c = input
         .get(*pos)
         .ok_or_else(|| i.make_error("SyntaxError", "Unexpected end of JSON input"))?;
     match c {
@@ -688,28 +736,28 @@ fn json_parse_recorded(
             *pos += 1;
             let obj = i.new_object();
             let mut rec: Vec<(String, JsonRecord)> = Vec::new();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&'}') {
+            json_skip_ws(input, pos);
+            if input.get(*pos) == Some('}') {
                 *pos += 1;
                 return Ok((Value::Obj(obj), JsonRecord::Obj(rec)));
             }
             loop {
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&'"') {
+                json_skip_ws(input, pos);
+                if input.get(*pos) != Some('"') {
                     return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
                 }
-                let key = json_parse_string(i, chars, pos)?;
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&':') {
+                let key = json_parse_string(i, input, pos)?;
+                json_skip_ws(input, pos);
+                if input.get(*pos) != Some(':') {
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
                 }
                 *pos += 1;
-                let (v, vr) = json_parse_recorded(i, chars, pos)?;
+                let (v, vr) = json_parse_recorded(i, input, pos)?;
                 set_data(&obj, &key, v);
                 rec.retain(|(k, _)| k != &key);
                 rec.push((key, vr));
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
+                json_skip_ws(input, pos);
+                match input.get(*pos) {
                     Some(',') => *pos += 1,
                     Some('}') => {
                         *pos += 1;
@@ -728,17 +776,17 @@ fn json_parse_recorded(
             *pos += 1;
             let mut items = Vec::new();
             let mut rec = Vec::new();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&']') {
+            json_skip_ws(input, pos);
+            if input.get(*pos) == Some(']') {
                 *pos += 1;
                 return Ok((i.make_array(items), JsonRecord::Arr(rec)));
             }
             loop {
-                let (v, vr) = json_parse_recorded(i, chars, pos)?;
+                let (v, vr) = json_parse_recorded(i, input, pos)?;
                 items.push(v);
                 rec.push(vr);
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
+                json_skip_ws(input, pos);
+                match input.get(*pos) {
                     Some(',') => *pos += 1,
                     Some(']') => {
                         *pos += 1;
@@ -755,8 +803,8 @@ fn json_parse_recorded(
         }
         _ => {
             let start = *pos;
-            let v = json_parse_value(i, chars, pos)?;
-            let src: String = chars[start..*pos].iter().collect();
+            let v = json_parse_value(i, input, pos)?;
+            let src = input.to_string(start, *pos);
             Ok((v.clone(), JsonRecord::Prim(src, v)))
         }
     }
@@ -764,13 +812,13 @@ fn json_parse_recorded(
 
 fn json_parse_lit(
     i: &mut Interp,
-    chars: &[char],
+    input: JsonInput<'_>,
     pos: &mut usize,
     lit: &str,
     val: Value,
 ) -> Result<Value, Value> {
     for expect in lit.chars() {
-        if chars.get(*pos) != Some(&expect) {
+        if input.get(*pos) != Some(expect) {
             return Err(i.make_error("SyntaxError", "Invalid literal in JSON"));
         }
         *pos += 1;
@@ -778,18 +826,22 @@ fn json_parse_lit(
     Ok(val)
 }
 
-fn json_parse_string(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<String, Value> {
+fn json_parse_string(
+    i: &mut Interp,
+    input: JsonInput<'_>,
+    pos: &mut usize,
+) -> Result<String, Value> {
     *pos += 1; // opening quote
     let mut s = String::new();
     loop {
-        let c = *chars
+        let c = input
             .get(*pos)
             .ok_or_else(|| i.make_error("SyntaxError", "Unterminated JSON string"))?;
         *pos += 1;
         match c {
             '"' => return Ok(s),
             '\\' => {
-                let e = *chars
+                let e = input
                     .get(*pos)
                     .ok_or_else(|| i.make_error("SyntaxError", "Bad escape in JSON"))?;
                 *pos += 1;
@@ -803,19 +855,19 @@ fn json_parse_string(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<
                     'b' => s.push('\u{0008}'),
                     'f' => s.push('\u{000C}'),
                     'u' => {
-                        let hex: String = chars[*pos..(*pos + 4).min(chars.len())].iter().collect();
+                        let hex = input.to_string(*pos, (*pos + 4).min(input.len()));
                         *pos += 4;
                         let n = u32::from_str_radix(&hex, 16)
                             .map_err(|_| i.make_error("SyntaxError", "Bad \\u escape in JSON"))?;
                         if (0xD800..0xDC00).contains(&n)
-                            && chars.get(*pos) == Some(&'\\')
-                            && chars.get(*pos + 1) == Some(&'u')
+                            && input.get(*pos) == Some('\\')
+                            && input.get(*pos + 1) == Some('u')
                         {
                             // A high surrogate followed by \uDCxx forms a pair.
-                            let hex2: String = chars
-                                [(*pos + 2).min(chars.len())..(*pos + 6).min(chars.len())]
-                                .iter()
-                                .collect();
+                            let hex2 = input.to_string(
+                                (*pos + 2).min(input.len()),
+                                (*pos + 6).min(input.len()),
+                            );
                             if let Ok(n2) = u32::from_str_radix(&hex2, 16) {
                                 if (0xDC00..0xE000).contains(&n2) {
                                     *pos += 6;
