@@ -1316,9 +1316,11 @@ pub struct Interp {
     pub(crate) tier: crate::bytecode::Tier,
     /// Calls before an eligible function tier-ups to bytecode (env `LUMEN_TIER_THRESHOLD`).
     pub(crate) tier_threshold: u32,
-    /// Opt-in first tagged execution slice (env `LUMEN_TAGGED_ARITHMETIC`). The flag is captured
+    /// Opt-in tagged execution slices (env `LUMEN_TAGGED_ARITHMETIC`). The flag is captured
     /// once per Agent so hot bytecode operators do not repeatedly consult process synchronization
-    /// state; unset keeps the established numeric fast path unchanged.
+    /// state; unset keeps the established numeric fast paths unchanged. Covers the binary
+    /// arithmetic family and, since the comparison slice, the relational/equality family so long
+    /// as both operands are primitive Numbers.
     pub(crate) tagged_arithmetic: bool,
     /// Raw argument list being forwarded by an active synthesized default constructor to its
     /// `super(...)` call (ECMA-262 ClassDefinitionEvaluation): present only between a default

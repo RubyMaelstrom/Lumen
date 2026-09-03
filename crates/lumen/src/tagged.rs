@@ -405,6 +405,22 @@ impl TaggedNumericFrame {
         let right = f64::from_bits(self.slots[1].raw());
         TaggedValue::number(f(left, right))
     }
+
+    /// Apply an f64 predicate over the two slots and produce a Boolean immediate. The predicate
+    /// is the exact float comparison the canonical `Value` path would run, so NaN (always false
+    /// for the relational and equality operators), `-0 == +0`, infinities, and subnormals behave
+    /// identically on this no-safepoint frame. Equality ops are routed here exactly like
+    /// `Op::EqEq`/`Op::StrictEq` route through `bin_cmp`, whose f64 closure is the specified
+    /// Number comparison after both operands are already primitive Numbers.
+    #[inline(always)]
+    pub(crate) fn cmp<F>(self, f: F) -> TaggedValue
+    where
+        F: FnOnce(f64, f64) -> bool,
+    {
+        let left = f64::from_bits(self.slots[0].raw());
+        let right = f64::from_bits(self.slots[1].raw());
+        TaggedValue::boolean(f(left, right))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -3225,6 +3225,96 @@ mod feedback_layout_tests {
     }
 
     #[test]
+    fn tagged_numeric_cmp_accepts_only_immediate_numbers() {
+        let lt = |left: f64, right: f64| left < right;
+        let result = try_tagged_numeric_cmp(&Value::Num(1.5), &Value::Num(2.0), &lt)
+            .expect("Number operands use the tagged frame");
+        assert!(matches!(result, Value::Bool(true)));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(2.0), &Value::Num(1.5), &lt),
+            Some(Value::Bool(false))
+        ));
+
+        let interp = Interp::new();
+        assert!(try_tagged_numeric_cmp(&Value::str("x"), &Value::Num(2.0), &lt).is_none());
+        assert!(try_tagged_numeric_cmp(
+            &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
+            &Value::Num(2.0),
+            &lt,
+        )
+        .is_none());
+        assert!(
+            try_tagged_numeric_cmp(&Value::Obj(interp.new_object()), &Value::Num(2.0), &lt)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tagged_numeric_cmp_keeps_ieee_edge_results() {
+        // Every NaN case reduces to false for the relational/equality operators on Number
+        // operands (ECMA-262 §13.11-12 of the abstract-relation/equality algorithms), which is
+        // exactly what the f64 predicates produce.
+        let lt = |left: f64, right: f64| left < right;
+        let le = |left: f64, right: f64| left <= right;
+        let eq = |left: f64, right: f64| left == right;
+        let ne = |left: f64, right: f64| left != right;
+        let gt = |left: f64, right: f64| left > right;
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &lt),
+            Some(Value::Bool(false))
+        ));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(1.0), &le),
+            Some(Value::Bool(false))
+        ));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &eq),
+            Some(Value::Bool(false))
+        ));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(f64::NAN), &Value::Num(f64::NAN), &ne),
+            Some(Value::Bool(true))
+        ));
+
+        // `-0` and `+0` compare equal, exactly as the f64 predicates do.
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &eq),
+            Some(Value::Bool(true))
+        ));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &lt),
+            Some(Value::Bool(false))
+        ));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(-0.0), &Value::Num(0.0), &ne),
+            Some(Value::Bool(false))
+        ));
+
+        // Infinities and subnormals round-trip their exact bits through the frame.
+        assert!(matches!(
+            try_tagged_numeric_cmp(
+                &Value::Num(f64::NEG_INFINITY),
+                &Value::Num(f64::INFINITY),
+                &lt,
+            ),
+            Some(Value::Bool(true))
+        ));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(f64::INFINITY), &Value::Num(f64::INFINITY), &le),
+            Some(Value::Bool(true))
+        ));
+        let subnormal = f64::from_bits(1);
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(subnormal), &Value::Num(0.0), &gt),
+            Some(Value::Bool(true))
+        ));
+        assert!(matches!(
+            try_tagged_numeric_cmp(&Value::Num(0.0), &Value::Num(subnormal), &gt),
+            Some(Value::Bool(false))
+        ));
+    }
+
+    #[test]
     fn profiled_binary_helper_records_original_operands_and_successful_result() {
         let (layout, bindings) = feedback_layout_for_ops(&[Op::Add], &[]);
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
@@ -13746,6 +13836,30 @@ where
     ))
 }
 
+/// Attempt the immediate-only tagged ABI path for relational and equality operators. Returning
+/// `None` is the same deliberate deoptimization as the arithmetic slice: heap values, strings,
+/// BigInts, symbols, and objects all continue through the complete interpreter helper, preserving
+/// the abstract-relation/equality ordering and coercion mandated by ECMA-262 §13.11 (Relational
+/// Operators) and §13.12 (Equality Operators). Both operands must already be primitive Numbers,
+/// where the f64 predicate is exactly the specified comparison (including `-0 == +0` and every
+/// NaN case reducing to `false`).
+#[inline(always)]
+fn try_tagged_numeric_cmp<F>(left: &Value, right: &Value, f: &F) -> Option<Value>
+where
+    F: Fn(f64, f64) -> bool,
+{
+    let (Value::Num(left), Value::Num(right)) = (left, right) else {
+        return None;
+    };
+    let frame = crate::tagged::TaggedNumericFrame::new(*left, *right);
+    let result = frame.cmp(f);
+    Some(Value::Bool(
+        result
+            .as_boolean()
+            .expect("tagged comparison result remains a Boolean"),
+    ))
+}
+
 #[inline]
 fn bin_i32(
     i: &mut Interp,
@@ -13777,6 +13891,14 @@ fn bin_cmp(
 ) -> Result<(), Abrupt> {
     let b = stack.pop().expect("vm stack underflow");
     let a = stack.pop().expect("vm stack underflow");
+    if let Some(v) = i
+        .tagged_arithmetic
+        .then(|| try_tagged_numeric_cmp(&a, &b, &f))
+        .flatten()
+    {
+        stack.push(v);
+        return Ok(());
+    }
     if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
         stack.push(Value::Bool(f(*x, *y)));
         return Ok(());

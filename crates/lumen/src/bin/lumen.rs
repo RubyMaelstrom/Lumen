@@ -160,6 +160,7 @@ Environment:
   LUMEN_TIER=TIER         Default execution tier (--tier overrides it)
   LUMEN_TIER_THRESHOLD=N  Default tier-up threshold (--tier-threshold overrides it)
   LUMEN_TAGGED_ARITHMETIC=1  Enable the opt-in tagged Number frame migration slice
+                            (arithmetic and comparison operators in the bytecode VM)
 
 Diagnostics (env, unstable):
   LUMEN_TIER_LOG=1        Report the AST construct a compile bail came from
