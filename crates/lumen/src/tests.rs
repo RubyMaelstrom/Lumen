@@ -3710,6 +3710,25 @@ fn primitive_wrappers() {
 }
 
 #[test]
+fn number_numeric_conversion_edges() {
+    assert_eq!(run("(255).toString(16)"), "ff");
+    assert_eq!(run("(255).toString('16')"), "ff");
+    assert_eq!(run("(5).toFixed(2)"), "5.00");
+    assert_eq!(run("(5).toFixed('2')"), "5.00");
+    assert_eq!(run("(12345).toPrecision(2)"), "1.2e+4");
+    assert_eq!(run("Number(3.5)"), "3.5");
+    assert_eq!(run("Number('3.5')"), "3.5");
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 2}}; (8).toFixed(o); hits"),
+        "1"
+    );
+    assert_eq!(
+        run("try{(8).toFixed(Symbol())}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+}
+
+#[test]
 fn host_262() {
     assert_eq!(run("typeof $262"), "object");
     assert_eq!(run("$262.global === globalThis"), "true");
