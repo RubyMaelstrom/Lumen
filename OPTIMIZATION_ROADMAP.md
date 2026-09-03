@@ -190,6 +190,17 @@ checkpoint and inspected component-by-component rather than presented as a direc
 to Node. Node/V8 ratios apply only to identical engine workloads. All percentages above use
 interleaved distributions, not a single best run.
 
+For rapid implementation feedback, an isolated optimized release target may disable LTO with
+`cargo build --offline --locked --release -p lumen --config profile.release.lto=false
+--config profile.release.codegen-units=16 --target-dir target/release-no-lto`. Build the parent and
+candidate with exactly the same override and run interleaved A/B samples; never mix those binaries
+with the canonical `target/release` artifact. This shortens link time substantially (the clean
+no-LTO target took 1m18s here versus about 3m37s for fat LTO), but code-generation differences can
+hide or reverse small wins: the Function.prototype.toString change measured about 7% faster in the
+fat-LTO pair while the matching 15-sample no-LTO pair was effectively neutral (0.300785 s versus
+0.300594 s median). Any candidate retained after rapid iteration still requires the canonical
+fat-LTO build and release-profile A/B before its roadmap result is accepted.
+
 ## Current architecture: strengths to preserve
 
 - The tree walker provides a broad, standards-oriented semantic oracle.
