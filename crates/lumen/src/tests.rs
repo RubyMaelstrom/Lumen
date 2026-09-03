@@ -10872,6 +10872,27 @@ fn string_replace_substitution() {
 }
 
 #[test]
+fn string_replace_uses_utf16_code_units() {
+    // Literal search is StringIndexOf over UTF-16 units, so an astral scalar can be matched by
+    // either lone surrogate half (ECMA-262 §6.1.4.1, §22.1.3.19–20).
+    assert_eq!(run(r#"'😀'.replace('\uD83D', 'X').length"#), "2");
+    assert_eq!(run(r#"'😀'.replace('\uD83D', 'X').charCodeAt(1)"#), "56832");
+    assert_eq!(
+        run(r#"'😀'.replaceAll('\uD83D', 'X').charCodeAt(1)"#),
+        "56832"
+    );
+    // An empty search inserts at every UTF-16 position, splitting the pair into lone halves.
+    assert_eq!(
+        run(r#"[...'😀'.replaceAll('', '-')].map(x=>x.charCodeAt(0)).join(',')"#),
+        "45,55357,45,56832,45"
+    );
+    assert_eq!(
+        run(r#"var p; '😀'.replace('\uDE00', (m, n) => { p=n; return 'X'; }); p"#),
+        "1"
+    );
+}
+
+#[test]
 fn json_stringify_replacer() {
     // Array replacer restricts (and orders) the keys.
     assert_eq!(

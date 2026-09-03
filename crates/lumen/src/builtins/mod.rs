@@ -9748,17 +9748,48 @@ pub(crate) fn nf_string_replace(
     let s = this_string(i, &this)?;
     let pat = ab(i.to_string(&arg(args, 0)))?;
     let repl = prep_repl(i, &arg(args, 1))?;
-    let Some(pos) = s.as_str().find(pat.as_ref()) else {
+    // `ascii_hint` is representation-local and avoids an LRU lookup on every hot literal call;
+    // a cleared hint conservatively falls through to the exact UTF-16 path.
+    let source_ascii = s.ascii_hint();
+    let pattern_ascii = pat.ascii_hint();
+    if source_ascii && pattern_ascii {
+        let Some(pos) = s.as_str().find(pat.as_ref()) else {
+            return Ok(Value::Str(s));
+        };
+        let matched = &s[pos..pos + pat.len()];
+        let rep = string_replacement(i, &repl, matched, &s, pos)?;
+        return Ok(Value::from_string(format!(
+            "{}{}{}",
+            &s[..pos],
+            rep,
+            &s[pos + pat.len()..]
+        )));
+    }
+    // A pure-ASCII receiver cannot contain a non-ASCII search string. This check avoids
+    // materializing the receiver's UTF-16 cache for the guaranteed no-match case.
+    if source_ascii {
+        return Ok(Value::Str(s));
+    }
+    // StringIndexOf is defined over UTF-16 code units (ECMA-262 §6.1.4.1). The engine stores
+    // UTF-8, so a non-ASCII search uses the cached unit view; this also permits matching one half
+    // of an astral code point, which has no UTF-8 byte boundary.
+    let source_units = i.units_full(&s);
+    let pattern_units = i.units_full(&pat);
+    let Some(pos) = source_units
+        .windows(pattern_units.len())
+        .position(|window| window == pattern_units.as_ref())
+    else {
         return Ok(Value::Str(s));
     };
-    let matched = &s[pos..pos + pat.len()];
-    let rep = string_replacement(i, &repl, matched, &s, pos)?;
-    Ok(Value::from_string(format!(
-        "{}{}{}",
-        &s[..pos],
-        rep,
-        &s[pos + pat.len()..]
-    )))
+    let end = pos + pattern_units.len();
+    let before = crate::jstr::from_units(&source_units[..pos]);
+    let matched = crate::jstr::from_units(&source_units[pos..end]);
+    let after = crate::jstr::from_units(&source_units[end..]);
+    let rep = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
+    let joined = crate::jstr::concat(&crate::jstr::concat(&before, &rep), &after);
+    Ok(Value::from_string(
+        crate::jstr::canonicalize(&joined).unwrap_or(joined),
+    ))
 }
 
 pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
@@ -10689,34 +10720,121 @@ fn install_string(it: &mut Interp) {
         // ToString(replaceValue) happens exactly once, before any matching.
         let repl = prep_repl(i, &arg(args, 1))?;
         if pat.is_empty() {
-            // An empty search matches at every position: insert the replacement between each char.
-            let mut out = String::new();
-            let mut byte = 0usize;
-            for ch in s.chars() {
+            // An empty search matches at every UTF-16 code-unit position (ECMA-262
+            // §22.1.3.20), not merely between Rust Unicode scalar values. Keep the existing byte
+            // path for ASCII; astral and lone-surrogate inputs use the cached unit view so a pair
+            // is split into its two specified code-unit results.
+            if s.ascii_hint() {
+                let mut out = String::new();
+                let mut byte = 0usize;
+                for ch in s.chars() {
+                    out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
+                    out.push(ch);
+                    byte += ch.len_utf8();
+                }
                 out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
-                out.push(ch);
-                byte += ch.len_utf8();
+                return Ok(Value::from_string(out));
             }
-            out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
+            let units = i.units_full(&s);
+            let needs_context = replacement_needs_context(&repl);
+            let mut out = String::new();
+            for pos in 0..=units.len() {
+                let before = if needs_context {
+                    crate::jstr::from_units(&units[..pos])
+                } else {
+                    String::new()
+                };
+                let after = if needs_context {
+                    crate::jstr::from_units(&units[pos..])
+                } else {
+                    String::new()
+                };
+                out.push_str(&string_replacement_parts(
+                    i, &repl, "", &s, pos, &before, &after,
+                )?);
+                if let Some(&unit) = units.get(pos) {
+                    out.push_str(&crate::jstr::unit_str(unit));
+                }
+            }
+            return Ok(Value::from_string(
+                crate::jstr::canonicalize(&out).unwrap_or(out),
+            ));
+        }
+        let source_ascii = s.ascii_hint();
+        let pattern_ascii = pat.ascii_hint();
+        if source_ascii && pattern_ascii {
+            let Some(first) = s.as_str().find(pat.as_ref()) else {
+                return Ok(Value::Str(s));
+            };
+            if let Repl::Text(template) = &repl {
+                if !template.as_bytes().contains(&b'$') {
+                    return Ok(Value::from_string(replace_all_ascii_literal(
+                        &s, &pat, template, first,
+                    )));
+                }
+            }
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..first]);
+            out.push_str(&string_replacement(i, &repl, pat.as_ref(), &s, first)?);
+            let mut rest = &s[first + pat.len()..];
+            let mut base = first + pat.len();
+            while let Some(pos) = rest.find(pat.as_ref()) {
+                out.push_str(&rest[..pos]);
+                let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;
+                out.push_str(&rep);
+                rest = &rest[pos + pat.len()..];
+                base += pos + pat.len();
+            }
+            out.push_str(rest);
             return Ok(Value::from_string(out));
         }
-        let Some(first) = s.as_str().find(pat.as_ref()) else {
+        // A pure-ASCII receiver cannot contain a non-ASCII search string. Avoid allocating a
+        // UTF-16 view when the result is necessarily the original string.
+        if source_ascii {
+            return Ok(Value::Str(s));
+        }
+        let source_units = i.units_full(&s);
+        let pattern_units = i.units_full(&pat);
+        let Some(first) = source_units
+            .windows(pattern_units.len())
+            .position(|window| window == pattern_units.as_ref())
+        else {
             return Ok(Value::Str(s));
         };
+        let pattern_len = pattern_units.len();
+        let needs_context = replacement_needs_context(&repl);
         let mut out = String::with_capacity(s.len());
-        out.push_str(&s[..first]);
-        out.push_str(&string_replacement(i, &repl, pat.as_ref(), &s, first)?);
-        let mut rest = &s[first + pat.len()..];
-        let mut base = first + pat.len();
-        while let Some(pos) = rest.find(pat.as_ref()) {
-            out.push_str(&rest[..pos]);
-            let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;
-            out.push_str(&rep);
-            rest = &rest[pos + pat.len()..];
-            base += pos + pat.len();
+        let mut cursor = 0usize;
+        let mut pos = first;
+        loop {
+            out.push_str(&crate::jstr::from_units(&source_units[cursor..pos]));
+            let matched = crate::jstr::from_units(&source_units[pos..pos + pattern_len]);
+            let before = if needs_context {
+                crate::jstr::from_units(&source_units[..pos])
+            } else {
+                String::new()
+            };
+            let after = if needs_context {
+                crate::jstr::from_units(&source_units[pos + pattern_len..])
+            } else {
+                String::new()
+            };
+            out.push_str(&string_replacement_parts(
+                i, &repl, &matched, &s, pos, &before, &after,
+            )?);
+            cursor = pos + pattern_len;
+            let Some(next) = source_units[cursor..]
+                .windows(pattern_len)
+                .position(|window| window == pattern_units.as_ref())
+            else {
+                break;
+            };
+            pos = cursor + next;
         }
-        out.push_str(rest);
-        Ok(Value::from_string(out))
+        out.push_str(&crate::jstr::from_units(&source_units[cursor..]));
+        Ok(Value::from_string(
+            crate::jstr::canonicalize(&out).unwrap_or(out),
+        ))
     });
 
     let ctor = it.make_native("String", 1, |i, _this, args| {
@@ -10971,6 +11089,42 @@ fn prep_repl(i: &mut Interp, v: &Value) -> Result<Repl, Value> {
     }
 }
 
+/// Whether a string replacement needs the potentially expensive preceding/following context.
+/// `$&`, `$$`, and a callable replacement do not inspect those contexts, so UTF-16 empty-search
+/// loops can avoid rebuilding a prefix and suffix for every insertion.
+fn replacement_needs_context(repl: &Repl) -> bool {
+    match repl {
+        Repl::Fn(_) => false,
+        Repl::Text(template) => template
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair == b"$`" || pair == b"$'"),
+    }
+}
+
+/// Fast literal replacement for an ASCII `replaceAll`. With no `$` marker, GetSubstitution is
+/// exactly the replacement text, so avoid reparsing the template and constructing a temporary
+/// `String` for every match (ECMA-262 §22.1.3.20.15.3–4).
+fn replace_all_ascii_literal(
+    source: &crate::lstr::LStr,
+    pattern: &crate::lstr::LStr,
+    replacement: &str,
+    first: usize,
+) -> String {
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..first]);
+    out.push_str(replacement);
+    let mut rest = &source[first + pattern.len()..];
+    while let Some(pos) = rest.find(pattern.as_ref()) {
+        out.push_str(&rest[..pos]);
+        out.push_str(replacement);
+        rest = &rest[pos + pattern.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[inline(always)]
 fn string_replacement(
     i: &mut Interp,
     repl: &Repl,
@@ -10978,9 +11132,34 @@ fn string_replacement(
     whole: &str,
     pos: usize,
 ) -> Result<String, Value> {
+    let before = &whole[..pos.min(whole.len())];
+    let after = whole.get(pos + matched.len()..).unwrap_or("");
+    // Text replacements never consume the callback offset; avoid rescanning a long ASCII prefix
+    // for every match. Callable replacements still receive the required UTF-16 position.
+    let unit_pos = if matches!(repl, Repl::Fn(_)) {
+        crate::jstr::unit_len(before)
+    } else {
+        0
+    };
+    string_replacement_parts(i, repl, matched, whole, unit_pos, before, after)
+}
+
+/// Replacement construction with explicitly separated UTF-16 context. Literal string search can
+/// match one half of an astral code point, which has no UTF-8 byte boundary; callers on that path
+/// rebuild `matched`/`before`/`after` from code units before entering this helper (ECMA-262
+/// §22.1.3.19–20).
+#[inline(always)]
+fn string_replacement_parts(
+    i: &mut Interp,
+    repl: &Repl,
+    matched: &str,
+    whole: &str,
+    unit_pos: usize,
+    before: &str,
+    after: &str,
+) -> Result<String, Value> {
     if let Repl::Fn(f) = repl {
         // The callback's position argument counts UTF-16 code units, not bytes.
-        let unit_pos = crate::jstr::unit_len(&whole[..pos.min(whole.len())]);
         let r = ab(i.call(
             f.clone(),
             Value::Undefined,
@@ -11000,8 +11179,6 @@ fn string_replacement(
         // GetSubstitution for a string match: $$ → $, $& → match, $` → preceding, $' → following.
         // (No captures, so $n and $<name> stay literal.) Growth past the engine's string
         // ceiling dies as a RangeError, not an OOM.
-        let before = &whole[..pos.min(whole.len())];
-        let after = whole.get(pos + matched.len()..).unwrap_or("");
         let tchars: Vec<char> = template.chars().collect();
         let mut out = String::new();
         let mut k = 0;
