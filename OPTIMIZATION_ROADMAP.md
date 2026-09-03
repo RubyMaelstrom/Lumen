@@ -924,6 +924,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     remain in spec order (ECMA-262 §6.1.4.1, §22.1.3.19–20). A 50,000-call release no-match
     `replace` workload improved from 84 ms to 27 ms median, and a repeated ASCII `replaceAll`
     workload improved from about 11.5 s to 4.3 s on the pinned host.
+  - [x] `String.prototype.replace` GetSubstitution scans replacement templates with one-character
+    lookahead instead of materializing a `Vec<char>` for every match; `$$`, `$&`, ``$` ``, and `$'`
+    handling remains in the normative order, with unsupported `$` forms preserved literally
+    (ECMA-262 §22.1.3.19.3). A 100,000-call release workload with a 288-byte literal replacement
+    improved from 411 ms to 311 ms median (about 24%).
 - [ ] Integrate string references with the tracing heap and write barriers.
 - [ ] Add JIT nodes/intrinsics for common string length, indexing, concatenation, equality, and
   search paths.

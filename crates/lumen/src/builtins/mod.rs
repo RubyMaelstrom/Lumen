@@ -11376,37 +11376,42 @@ fn string_replacement_parts(
         // GetSubstitution for a string match: $$ → $, $& → match, $` → preceding, $' → following.
         // (No captures, so $n and $<name> stay literal.) Growth past the engine's string
         // ceiling dies as a RangeError, not an OOM.
-        let tchars: Vec<char> = template.chars().collect();
-        let mut out = String::new();
-        let mut k = 0;
-        while k < tchars.len() {
-            if tchars[k] == '$' && k + 1 < tchars.len() {
-                match tchars[k + 1] {
+        // Scan the template directly. The previous Vec<char> materialization made every
+        // replacement pay an allocation even though GetSubstitution only needs one-character
+        // lookahead; iterator peeking preserves the exact `$` handling without that temporary.
+        let mut out = String::with_capacity(template.len());
+        let mut chars = template.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '$' {
+                let Some(&next) = chars.peek() else {
+                    out.push('$');
+                    continue;
+                };
+                match next {
                     '$' => {
                         out.push('$');
-                        k += 2;
+                        chars.next();
                         continue;
                     }
                     '&' => {
                         out.push_str(matched);
-                        k += 2;
+                        chars.next();
                         continue;
                     }
                     '`' => {
                         out.push_str(before);
-                        k += 2;
+                        chars.next();
                         continue;
                     }
                     '\'' => {
                         out.push_str(after);
-                        k += 2;
+                        chars.next();
                         continue;
                     }
                     _ => {}
                 }
             }
-            out.push(tchars[k]);
-            k += 1;
+            out.push(ch);
         }
         Ok(out)
     }
