@@ -6025,7 +6025,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let d = if d.is_nan() { 0.0 } else { d.trunc().max(0.0) };
             (d.min((len - start) as f64)) as u64
         };
-        let inserts: Vec<Value> = args.iter().skip(2).cloned().collect();
+        // The rest parameter is already an immutable argument slice. Borrow it directly instead
+        // of cloning every insertion into a temporary Vec before the result is built; the
+        // specification processes these values only after the source indices are determined.
+        let inserts = args.get(2..).unwrap_or(&[]);
         let new_len = len - del + inserts.len() as u64;
         if new_len > 9007199254740991 {
             return Err(i.make_error("TypeError", "toSpliced result is too long"));
@@ -6037,7 +6040,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             if let Some(source) = dense_array_snapshot(i, &ov) {
                 let mut items = Vec::with_capacity(new_len as usize);
                 items.extend_from_slice(&source[..start as usize]);
-                items.extend(inserts);
+                items.extend(inserts.iter().cloned());
                 items.extend_from_slice(&source[(start + del) as usize..len as usize]);
                 return Ok(i.make_array(items));
             }
@@ -6047,7 +6050,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         for k in 0..start {
             items.push(array_get_index(i, &o, &ov, k as usize)?);
         }
-        items.extend(inserts);
+        items.extend(inserts.iter().cloned());
         for k in (start + del)..len {
             items.push(array_get_index(i, &o, &ov, k as usize)?);
         }

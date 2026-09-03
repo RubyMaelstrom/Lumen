@@ -999,6 +999,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     §23.1.3.33–35, §23.1.3.39). The combined 300-round release workload improved from 1,630 ms to
     1,511 ms median (about 7%); holes, accessors, proxies, and generic array-likes retain the
     normative property path.
+  - [x] `Array.prototype.toSpliced` borrows the already-captured insertion argument slice instead
+    of cloning it into a temporary vector before result assembly; `ToClampedIndex`, source `Get`s,
+    insertion order, and the length limit remain unchanged (ECMA-262 §23.1.3.35). A 15-sample
+    release workload over 9,000 five-item calls improved from 0.101 s to 0.096 s median (about 5%),
+    with array semantic tests passing.
   - [x] `Array.prototype.flat` batches indexed reads for dense ordinary source arrays when the
     species result is a distinct ordinary Array, recursively retaining the normative
     `HasProperty`/`Get`/`CreateDataPropertyOrThrow` path for holes, accessors, proxies, aliases, and
