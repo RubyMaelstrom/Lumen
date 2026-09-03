@@ -5494,8 +5494,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let recv = Value::Obj(arr_to_object(i, &this)?);
         let result = array_species_create(i, &recv, 0)?;
         let mut n = 0u64;
-        let items: Vec<Value> = std::iter::once(recv).chain(args.iter().cloned()).collect();
-        for v in &items {
+        // ECMA-262 §23.1.3.2 prepends the receiver to `items`, then processes each item in order.
+        // Borrow that sequence directly so ordinary concat calls do not allocate a temporary
+        // argument vector or clone every argument before the observable spreadability checks.
+        for v in std::iter::once(&recv).chain(args.iter()) {
             // IsConcatSpreadable: @@isConcatSpreadable if defined, else IsArray.
             let spreadable = if let Value::Obj(_) = v {
                 let key = well_known_key(i, "isConcatSpreadable");

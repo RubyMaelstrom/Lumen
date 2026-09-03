@@ -967,6 +967,11 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     the generic proxy/exotic/non-extensible path (ECMA-262 §23.1.3.8 and §23.1.3.21). An 11-sample
     release callback workload improved from 0.45 s at the exact parent to 0.38 s (about 16%); species,
     descriptor, sparse-array, and proxy tests remain covered.
+  - [x] `Array.prototype.concat` processes the receiver and argument list through a borrowed iterator
+    instead of first allocating and cloning a temporary item vector; spreadability, `HasProperty`/
+    `Get` ordering, holes, species, and length checks remain unchanged (ECMA-262 §23.1.3.2). A
+    15-sample release workload over five concatenated items improved from 0.433 s to 0.412 s median
+    (about 4.8%), with array semantic and proxy tests passing.
   - [x] `FlattenIntoArray` and the deleted-array portion of `Array.prototype.splice` share the same
     trap-aware `CreateDataPropertyOrThrow` helper, removing per-element descriptor objects while
     retaining species, proxy, exotic, and failure behavior (ECMA-262 §23.1.3.13.1 and §23.1.3.31).
