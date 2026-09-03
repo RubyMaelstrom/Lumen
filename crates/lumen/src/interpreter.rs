@@ -1330,6 +1330,10 @@ pub struct Interp {
     /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
     /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
     pub(crate) vm_pool: Vec<(Vec<Value>, Vec<Value>)>,
+    /// Recycled argument buffers for `Function.prototype.apply` list assembly, so a hot
+    /// `f.apply(null, denseArray)` loop doesn't allocate a fresh `Vec` per call. Buffers are
+    /// cleared before recycling; the memory walker counts their payload exactly like `vm_pool`.
+    pub(crate) native_arg_pool: Vec<Vec<Value>>,
     /// Megamorphic stub cache: a global open-addressed table keyed by (receiver shape, site name)
     /// holding the last derived [`crate::bytecode::IcState`] for that pair. Probed when
     /// both of a site's ways miss, so a site rotating through more receiver shapes than it has
@@ -1745,6 +1749,7 @@ interp_memory_inventory! {
     tagged_arithmetic => "non_owning",
     super_forward_args => "measured",
     vm_pool => "measured",
+    native_arg_pool => "measured",
     stub_cache => "measured",
     stub_cache_names => "measured",
     frame_pool => "measured",
@@ -1875,7 +1880,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 132);
+    assert_eq!(names.len(), 133);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -2596,6 +2601,7 @@ impl Interp {
             tagged_arithmetic: std::env::var_os("LUMEN_TAGGED_ARITHMETIC").is_some(),
             super_forward_args: None,
             vm_pool: Vec::new(),
+            native_arg_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
             frame_pool: FramePool(Vec::new()),
@@ -6563,6 +6569,28 @@ impl Interp {
         match obj.borrow().props.length_property().map(|p| p.value()) {
             Some(Value::Num(n)) => n as usize,
             _ => 0,
+        }
+    }
+
+    /// Array length for an operation that will iterate/allocate proportional to it. Errors with a
+    /// RangeError past [`MAX_ARRAY_OP_LEN`] so a huge `.length` cannot overwhelm memory.
+    ///
+    /// Take a recycled native-argument buffer (or allocate one) sized for `len` entries; callers
+    /// must clear and return it through [`Interp::recycle_native_arg_buf`] after the call finishes.
+    pub(crate) fn take_native_arg_buf(&mut self, len: usize) -> Vec<Value> {
+        let mut buf = self.native_arg_pool.pop().unwrap_or_default();
+        buf.clear();
+        if buf.capacity() < len {
+            buf.reserve(len.saturating_sub(buf.capacity()));
+        }
+        buf
+    }
+
+    /// Return a cleared native-argument buffer to the bounded pool (same cap as `vm_pool`).
+    pub(crate) fn recycle_native_arg_buf(&mut self, mut buf: Vec<Value>) {
+        buf.clear();
+        if self.native_arg_pool.len() < 64 {
+            self.native_arg_pool.push(buf);
         }
     }
 

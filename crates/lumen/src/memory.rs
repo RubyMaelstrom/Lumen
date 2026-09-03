@@ -1106,6 +1106,18 @@ fn scan_realm(
         );
         debug_assert!(slots.is_empty() && stack.is_empty());
     }
+    totals.engine_caches.add(
+        interp
+            .native_arg_pool
+            .capacity()
+            .saturating_mul(size_of::<Vec<Value>>()),
+    );
+    for buf in &interp.native_arg_pool {
+        totals
+            .engine_caches
+            .add(buf.capacity().saturating_mul(size_of::<Value>()));
+        debug_assert!(buf.is_empty());
+    }
     for name in interp.stub_cache_names.borrow().iter().flatten() {
         visitor.rc_str(name);
     }
