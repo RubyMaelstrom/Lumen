@@ -30,6 +30,16 @@ fn re_source_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
             if re.source.is_empty() {
                 return Ok(Value::str("(?:)"));
             }
+            // EscapeRegExpPattern only needs to alter solidus and line terminators for a
+            // non-empty source. When none occur, the original source is already a valid literal
+            // body and can be retained directly (ECMA-262 §22.2.6.13.1).
+            if re
+                .source
+                .chars()
+                .all(|c| !matches!(c, '/' | '\n' | '\r' | '\u{2028}' | '\u{2029}'))
+            {
+                return Ok(Value::Str(crate::lstr::LStr::from(re.source.as_str())));
+            }
             // EscapeRegExpPattern: "/" and line terminators are escaped so "/"+S+"/"+F re-parses.
             let mut out = String::new();
             let mut escaped = false;

@@ -5233,6 +5233,8 @@ fn regexp_symbol_methods() {
 #[test]
 fn regexp_proto_getters() {
     assert_eq!(run("/abc/gi.source"), "abc");
+    assert_eq!(run("new RegExp('/').source"), "\\/");
+    assert_eq!(run("new RegExp('a\\nb').source"), "a\\nb");
     assert_eq!(run("/abc/gi.flags"), "gi");
     assert_eq!(run("/abc/g.global"), "true");
     assert_eq!(run("/abc/.global"), "false");
