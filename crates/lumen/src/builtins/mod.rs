@@ -40,6 +40,20 @@ fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
 }
 
+/// ToNumber of an argument position, with the Number identity fast path.
+///
+/// ECMA-262 §7.1.4.1 makes `ToNumber` the identity for a Number and it has no other observable
+/// effect, so a primitive `Number` argument can skip the generic coercion dispatch entirely. Every
+/// other input — including an absent argument, which is `undefined` and coerces to NaN — keeps the
+/// complete coercive path with its abrupt completions and `valueOf`/`toString` ordering.
+#[inline]
+fn arg_to_number(i: &mut Interp, args: &[Value], idx: usize) -> Result<f64, Value> {
+    match args.get(idx) {
+        Some(Value::Num(n)) => Ok(*n),
+        _ => ab(i.to_number(&arg(args, idx))),
+    }
+}
+
 /// Map an `Abrupt` (which, from inside a native function, can only be a `Throw`) to its value so it
 /// fits the native `Result<_, Value>` contract.
 fn ab<T>(r: Result<T, Abrupt>) -> Result<T, Value> {
@@ -9883,7 +9897,9 @@ fn arg_is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
 
 /// ToIntegerOrInfinity of an optional position argument, clamped to `[0, len]`.
 fn str_clamp_pos(i: &mut Interp, v: Option<&Value>, len: i64) -> Result<usize, Value> {
+    // `Value::Num` is the ToNumber identity (§7.1.4.1); everything else keeps the coercive path.
     let n = match v {
+        Some(Value::Num(n)) => *n,
         Some(v) if !matches!(v, Value::Undefined) => ab(i.to_number(v))?,
         _ => 0.0,
     };
@@ -10369,10 +10385,11 @@ fn install_string(it: &mut Interp) {
             // String.prototype.substring clamps and swaps UTF-16 indices (ECMA-262 §22.1.3.25).
             // ASCII byte offsets are the same code-unit indices, so keep the common path flat.
             let len = s.len() as i64;
-            let mut a = (ab(i.to_number(&arg(args, 0)))? as i64).clamp(0, len);
-            let mut b = match arg(args, 1) {
-                Value::Undefined => len,
-                v => (ab(i.to_number(&v))? as i64).clamp(0, len),
+            let mut a = (arg_to_number(i, args, 0)? as i64).clamp(0, len);
+            let mut b = match args.get(1) {
+                None | Some(Value::Undefined) => len,
+                Some(Value::Num(n)) => (*n as i64).clamp(0, len),
+                Some(v) => (ab(i.to_number(v))? as i64).clamp(0, len),
             };
             if a > b {
                 std::mem::swap(&mut a, &mut b);
@@ -10381,10 +10398,11 @@ fn install_string(it: &mut Interp) {
         }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
-        let mut a = (ab(i.to_number(&arg(args, 0)))? as i64).clamp(0, len);
-        let mut b = match arg(args, 1) {
-            Value::Undefined => len,
-            v => (ab(i.to_number(&v))? as i64).clamp(0, len),
+        let mut a = (arg_to_number(i, args, 0)? as i64).clamp(0, len);
+        let mut b = match args.get(1) {
+            None | Some(Value::Undefined) => len,
+            Some(Value::Num(n)) => (*n as i64).clamp(0, len),
+            Some(v) => (ab(i.to_number(v))? as i64).clamp(0, len),
         };
         if a > b {
             std::mem::swap(&mut a, &mut b);
@@ -10398,8 +10416,7 @@ fn install_string(it: &mut Interp) {
         let s = this_string(i, &this)?;
         if matches!(i.units_of(&s), crate::interpreter::StrUnits::Ascii) {
             let size = s.len() as i64;
-            let n = ab(i.to_number(&arg(args, 0)))?;
-            let n = n.trunc();
+            let n = arg_to_number(i, args, 0)?.trunc();
             let mut start = if n.is_nan() {
                 0
             } else if n < 0.0 {
@@ -10407,16 +10424,17 @@ fn install_string(it: &mut Interp) {
             } else {
                 (n as i64).min(size)
             };
-            let len = match arg(args, 1) {
-                Value::Undefined => size,
-                v => {
-                    let l = ab(i.to_number(&v))?;
-                    if l.is_nan() {
-                        0
-                    } else {
-                        (l as i64).max(0)
-                    }
-                }
+            // The whole-length default stays on `undefined`; a primitive Number needs no coercion
+            // and everything else retains the full coercive path in its original position.
+            let length = match args.get(1) {
+                None | Some(Value::Undefined) => None,
+                Some(Value::Num(l)) => Some(*l),
+                Some(v) => Some(ab(i.to_number(v))?),
+            };
+            let len = match length {
+                None => size,
+                Some(l) if l.is_nan() => 0,
+                Some(l) => (l as i64).max(0),
             };
             let count = len.min(size - start).max(0);
             if count <= 0 {
@@ -10429,9 +10447,8 @@ fn install_string(it: &mut Interp) {
         }
         let chars = i.units_full(&s);
         let size = chars.len() as i64;
-        let n = ab(i.to_number(&arg(args, 0)))?;
         // ToIntegerOrInfinity truncates first, so -0.5 is +0, not a from-the-end index.
-        let n = n.trunc();
+        let n = arg_to_number(i, args, 0)?.trunc();
         let mut start = if n.is_nan() {
             0
         } else if n < 0.0 {
@@ -10439,16 +10456,15 @@ fn install_string(it: &mut Interp) {
         } else {
             (n as i64).min(size)
         };
-        let len = match arg(args, 1) {
-            Value::Undefined => size,
-            v => {
-                let l = ab(i.to_number(&v))?;
-                if l.is_nan() {
-                    0
-                } else {
-                    (l as i64).max(0)
-                }
-            }
+        let length = match args.get(1) {
+            None | Some(Value::Undefined) => None,
+            Some(Value::Num(l)) => Some(*l),
+            Some(v) => Some(ab(i.to_number(v))?),
+        };
+        let len = match length {
+            None => size,
+            Some(l) if l.is_nan() => 0,
+            Some(l) => (l as i64).max(0),
         };
         let count = len.min(size - start).max(0);
         if count <= 0 {
@@ -10648,7 +10664,7 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "repeat", 1, |i, this, args| {
         let s = this_string(i, &this)?;
-        let n = ab(i.to_number(&arg(args, 0)))?;
+        let n = arg_to_number(i, args, 0)?;
         if n < 0.0 || n.is_infinite() {
             return Err(i.make_error("RangeError", "invalid count value"));
         }
@@ -10683,7 +10699,7 @@ fn install_string(it: &mut Interp) {
             crate::interpreter::StrUnits::Ascii => s.len(),
             crate::interpreter::StrUnits::Units(units) => units.len(),
         } as i64;
-        let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
+        let mut idx = arg_to_number(i, args, 0)? as i64;
         if idx < 0 {
             idx += len;
         }
@@ -10707,7 +10723,7 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "codePointAt", 1, |i, this, args| {
         let s = this_string(i, &this)?;
-        let n = ab(i.to_number(&arg(args, 0)))?;
+        let n = arg_to_number(i, args, 0)?;
         let n = if n.is_nan() { 0.0 } else { n.trunc() };
         if n < 0.0 || !n.is_finite() {
             return Ok(Value::Undefined);

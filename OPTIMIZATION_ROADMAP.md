@@ -1267,6 +1267,40 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     On an 8-sample release workload over 262,144-byte arrays, `toHex` improved from 0.735 s to
     0.295 s median (about 60%), and `fromBase64` from 0.690 s to 0.360 s (about 48%); the
     combined encode/decode workload improved from 0.770 s to 0.365 s (about 53%).
+  - [x] `String.prototype.substring`/`substr`/`at`/`repeat`/`codePointAt` and the shared position
+    clamp behind `indexOf`/`lastIndexOf`/`includes`/`startsWith`/`endsWith` bypass redundant ToNumber
+    dispatch for primitive Number index/position arguments (§7.1.4.1 makes ToNumber the identity for
+    a Number with no other observable effect). Every other input — including an absent argument, the
+    `undefined` whole-string/whole-length defaults, and objects whose `valueOf` runs at that exact
+    evaluation position — keeps the complete coercive path, so truncation, clamp-to-range, the
+    substring reverse-swap, `substr`'s truncate-before-sign rule, and every `RangeError`/`TypeError`
+    stay unchanged (§22.1.3.25, Annex B §B.2.3.1, §22.1.3.1, §22.1.3.17, §22.1.3.4). One `arg_to_number`
+    helper plus the identity arm in the existing `str_clamp_pos` covers the five search methods at
+    once; the second argument reads `args.get(1)` to avoid the previous `Value` clone.
+    Selection was measured, not guessed: the new `native_by_operation` inventory ranked the whole
+    classic suite, and the two hottest natives (`Array` 270k calls/0.092 s, `String` 66.8k/0.042 s)
+    were examined and rejected because their cost is real allocation and number formatting, not
+    redundant coercion dispatch. Fifteen paired interleaved release samples over an index/position
+    heavy workload (which also runs a generic-coercion leg to catch cost displaced onto the object
+    path) improved from 11.261 s to 11.041 s median — −1.88% median, −2.12% mean, faster in 15/15
+    paired rounds. A 741-expression differential (each method × `undefined`/`null`/`NaN`/±Infinity/
+    ±0/fractional/out-of-range/string/boolean/array/object/BigInt/Symbol arguments, on both the ASCII
+    and UTF-16 receivers, with `valueOf` hit counts and a throwing `valueOf`) is byte-identical
+    between the pre- and post-specialization builds and identical across the interpreter, bytecode,
+    and JIT tiers; 64 curated expectations additionally match Node/V8 exactly. Test262
+    `built-ins/String` 1223/1223 and `annexB` 1086/1086 (substring 46, indexOf 47, lastIndexOf 25,
+    includes 27, startsWith 21, endsWith 27, repeat 16, codePointAt 16, at 11, and `annexB` String
+    111/111 covering all 61 `substr` cases; `slice` 38/38 re-run as an unchanged control). Difftest
+    276 agree / 24 budget / 0 diverge, the full 829-test suite, browser `quick` replay green
+    (`...timer-two:6`, `browser-replay-quick-20260903T200838Z.json`), `cargo fmt --check`, clippy both
+    configs, and `git diff --check` all pass. Allocation strictly decreases (one fewer `Value` clone
+    and one fewer dispatch per specialized argument); peak RSS moved only within the size-class
+    allocator's caching high-water and is not a retention change.
+    Separately observed while differencing — **not caused by this change, not investigated, and
+    byte-identical before and after**: when a lone surrogate reaches console output, Lumen emits raw
+    WTF-8 where Node/V8 substitutes U+FFFD (22 of the 741 expressions differ on this alone). The
+    ECMAScript string *values* agree, which `charCodeAt`/`codePointAt` confirm, so this is the output
+    encoding boundary rather than string semantics; it belongs with Phase 7's native string work.
 - [ ] Preserve a clear, auditable slow implementation matching the normative algorithm.
 - [ ] Add dependency/protector guards for fast builtins affected by user-visible prototype or
   intrinsic mutation.

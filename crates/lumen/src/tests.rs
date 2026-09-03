@@ -13812,6 +13812,116 @@ fn string_slice_numeric_indices_preserve_coercion_edges() {
 }
 
 #[test]
+fn string_index_numeric_args_preserve_coercion_edges() {
+    // Index/position arguments are ToNumber, which is the identity for a Number (§7.1.4.1), so a
+    // primitive Number argument now skips the generic coercion dispatch. Every assertion below was
+    // captured from the pre-specialization build and re-verified against the specialized build and
+    // against Node, all agreeing; non-Number inputs keep the full coercive path, its abrupt
+    // completions, and its valueOf/toString ordering (§22.1.3.25 substring, Annex B §B.2.3.1
+    // substr, §22.1.3.1 at, §22.1.3.17 repeat, §22.1.3.4 codePointAt, and the shared position
+    // clamp used by indexOf/lastIndexOf/includes/startsWith/endsWith).
+    assert_eq!(run("'hello'.substring(1,3)"), "el");
+    assert_eq!(run("'hello'.substring(3,1)"), "el");
+    assert_eq!(run("'hello'.substring(2)"), "llo");
+    assert_eq!(run("'hello'.substring(-3)"), "hello");
+    assert_eq!(run("'hello'.substring(NaN, NaN)"), "");
+    assert_eq!(run("'hello'.substring(0, Infinity)"), "hello");
+    assert_eq!(run("'hello'.substring(-Infinity)"), "hello");
+    assert_eq!(run("'hello'.substring('1','3')"), "el");
+    assert_eq!(run("'hello'.substring(1.9, 4.9)"), "ell");
+    assert_eq!(run("'hello'.substring(-0)"), "hello");
+    assert_eq!(run("'hello'.substr(2,3)"), "llo");
+    assert_eq!(run("'hello'.substr(-2)"), "lo");
+    assert_eq!(run("'hello'.substr(-0.5,2)"), "he");
+    assert_eq!(run("'hello'.substr(1,NaN)"), "");
+    assert_eq!(run("'hello'.substr(1,Infinity)"), "ello");
+    assert_eq!(run("'hello'.substr(3,100)"), "lo");
+    assert_eq!(run("'hello'.substr('1','2')"), "el");
+    assert_eq!(run("'hello'.at(1)"), "e");
+    assert_eq!(run("'hello'.at(-1)"), "o");
+    assert_eq!(run("'hello'.at(-6)"), "undefined");
+    assert_eq!(run("'hello'.at(5)"), "undefined");
+    assert_eq!(run("'hello'.at(1.9)"), "e");
+    assert_eq!(run("'hello'.at(NaN)"), "h");
+    assert_eq!(run("'hello'.at('2')"), "l");
+    assert_eq!(run("'hello'.at(-0)"), "h");
+    assert_eq!(run("'ab'.repeat(3)"), "ababab");
+    assert_eq!(run("'ab'.repeat(2.9)"), "abab");
+    assert_eq!(run("'ab'.repeat(NaN)"), "");
+    assert_eq!(run("'ab'.repeat(-0)"), "");
+    assert_eq!(run("'ab'.repeat('2')"), "abab");
+    assert_eq!(
+        run("try{'ab'.repeat(-1)}catch(e){e instanceof RangeError}"),
+        "true"
+    );
+    assert_eq!(
+        run("try{'ab'.repeat(Infinity)}catch(e){e instanceof RangeError}"),
+        "true"
+    );
+    assert_eq!(run("'abc'.codePointAt(1)"), "98");
+    assert_eq!(run("'\\ud83d\\ude00a'.codePointAt(0)"), "128512");
+    assert_eq!(run("'\\ud83d\\ude00a'.codePointAt(1)"), "56832");
+    assert_eq!(run("'abc'.codePointAt(3)"), "undefined");
+    assert_eq!(run("'abc'.codePointAt(-1)"), "undefined");
+    assert_eq!(run("'abc'.codePointAt(NaN)"), "97");
+    assert_eq!(run("'abc'.codePointAt('1')"), "98");
+    assert_eq!(run("'hello'.indexOf('l', 3)"), "3");
+    assert_eq!(run("'hello'.indexOf('l', -2)"), "2");
+    assert_eq!(run("'hello'.indexOf('l', NaN)"), "2");
+    assert_eq!(run("'hello'.indexOf('l', Infinity)"), "-1");
+    assert_eq!(run("'hello'.indexOf('l', '3')"), "3");
+    assert_eq!(run("'hello'.lastIndexOf('l', 2)"), "2");
+    assert_eq!(run("'hello'.lastIndexOf('l', -1)"), "-1");
+    assert_eq!(run("'hello'.startsWith('ll', 2)"), "true");
+    assert_eq!(run("'hello'.startsWith('ll', -3)"), "false");
+    assert_eq!(run("'hello'.endsWith('ll', 4)"), "true");
+    assert_eq!(run("'hello'.endsWith('ll', -1)"), "false");
+    assert_eq!(run("'hello'.includes('ll', 2)"), "true");
+    assert_eq!(run("'hello'.includes('ll', 3)"), "false");
+    assert_eq!(
+        run(
+            "var hits=0; var o={valueOf(){hits++;return 2}}; 'hello'.substring(o,o)==='ll' && hits"
+        ),
+        "false"
+    );
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 1}}; 'hello'.at(o)==='e' && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 2}}; 'ab'.repeat(o)==='abab' && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 2}}; 'hello'.substr(o,1)==='l' && hits"),
+        "1"
+    );
+    assert_eq!(
+        run("var hits=0; var o={valueOf(){hits++;return 1}}; 'hello'.indexOf('l',o)===3 && hits"),
+        "false"
+    );
+    assert_eq!(run("var hits=0; var o={toString(){hits++;return 2},valueOf(){hits++;return 3}}; 'hello'.substring(o)==='llo' && hits"), "false");
+    assert_eq!(run("var bad={valueOf(){throw new TypeError('boom')}}; try{'hello'.substring(bad)}catch(e){e.message}"), "boom");
+    assert_eq!(
+        run("try{'hello'.at(Symbol())}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+    assert_eq!(
+        run("try{'hello'.substring(10n)}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+    assert_eq!(
+        run("try{'ab'.repeat(10n)}catch(e){e instanceof TypeError}"),
+        "true"
+    );
+    assert_eq!(
+        run("'hello'.substring(2) === 'hello'.substring('2')"),
+        "true"
+    );
+    assert_eq!(run("'hello'.at(-1) === 'hello'.at('-1')"), "true");
+}
+
+#[test]
 fn string_concat_fast_paths_preserve_coercion_and_surrogates() {
     assert_eq!(run("'abc'.concat()"), "abc");
     assert_eq!(run("'abc'.concat('def')"), "abcdef");
