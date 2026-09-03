@@ -6519,6 +6519,44 @@ fn flatten_into(
     mapper: Option<&Value>,
     mapper_this: &Value,
 ) -> Result<usize, Value> {
+    // FlattenIntoArray uses HasProperty/Get for every source index. If no mapper is present and
+    // both source and target are distinct ordinary Arrays, a dense own-data snapshot proves those
+    // operations cannot execute JavaScript; recurse through the same algorithm for nested arrays.
+    // A non-ordinary target, proxy, hole, accessor, or alias deliberately stays on the generic path
+    // because target writes could otherwise affect later source Gets (ECMA-262 §23.1.3.13.1).
+    if mapper.is_none()
+        && source_len <= MAX_ARRAY_OP_LEN
+        && flatten_dense_target_safe(i, target, source)
+    {
+        if let Some(values) = dense_array_snapshot(i, source) {
+            let mut target_index = start;
+            for element in values {
+                if depth > 0 && json_is_array(i, &element)? {
+                    let len_val = ab(i.get_member(&element, "length"))?;
+                    let el_len = to_length_val(i, &len_val)?;
+                    target_index = flatten_into(
+                        i,
+                        target,
+                        &element,
+                        el_len,
+                        target_index,
+                        depth - 1,
+                        None,
+                        &Value::Undefined,
+                    )?;
+                } else {
+                    if target_index as u64 >= 9_007_199_254_740_991 {
+                        return Err(
+                            i.make_error("TypeError", "flattened array length exceeds 2^53 - 1")
+                        );
+                    }
+                    json_create_data_prop_or_throw(i, target, &target_index.to_string(), element)?;
+                    target_index += 1;
+                }
+            }
+            return Ok(target_index);
+        }
+    }
     let mut target_index = start;
     for k in 0..source_len {
         let key = k.to_string();
@@ -6559,6 +6597,15 @@ fn flatten_into(
         }
     }
     Ok(target_index)
+}
+
+fn flatten_dense_target_safe(i: &Interp, target: &Value, source: &Value) -> bool {
+    let (Value::Obj(target), Value::Obj(source)) = (target, source) else {
+        return false;
+    };
+    !Rc::ptr_eq(target, source)
+        && matches!(target.borrow().exotic, Exotic::Array)
+        && i.ordinary_get_ptr(Rc::as_ptr(target) as usize)
 }
 
 fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {

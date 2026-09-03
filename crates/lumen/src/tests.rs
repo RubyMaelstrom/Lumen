@@ -14263,6 +14263,14 @@ fn array_flat_flatmap_species_and_throw() {
         ),
         "TypeError"
     );
+    // A species constructor may deliberately return the source itself; the dense fast path must
+    // stay disabled for this alias because target writes can affect later source reads.
+    assert_eq!(
+        run(
+            "var a=[1,[2]];a.constructor={[Symbol.species]:function(){return a}};var r=a.flat();String(r===a)+':'+r.join(',')"
+        ),
+        "true:1,2"
+    );
 }
 
 #[test]

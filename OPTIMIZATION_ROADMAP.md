@@ -974,6 +974,12 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     §23.1.3.33–35, §23.1.3.39). The combined 300-round release workload improved from 1,630 ms to
     1,511 ms median (about 7%); holes, accessors, proxies, and generic array-likes retain the
     normative property path.
+  - [x] `Array.prototype.flat` batches indexed reads for dense ordinary source arrays when the
+    species result is a distinct ordinary Array, recursively retaining the normative
+    `HasProperty`/`Get`/`CreateDataPropertyOrThrow` path for holes, accessors, proxies, aliases, and
+    custom targets (ECMA-262 §23.1.3.13.1). A 500-call release workload over 1,000 nested arrays
+    improved from 8,099 ms to 7,777 ms median (about 4%), while the flat/flatMap and species/error
+    tests remained green.
   - [x] JSON array/object assembly streams already-serialized members into one output buffer,
     removing the temporary `join` result while preserving ECMA-262 §25.5.2.5 ordering and
     indentation. Object member construction also appends quoted keys, separators, and values
