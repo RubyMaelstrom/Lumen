@@ -1551,6 +1551,20 @@ before changing broad execution behavior:
   - [x] Connect the shadow migrated frame to a published root map and a forced safepoint/relocation
     test; dead slots remain ignored and invalid root words fail closed. Keep the live switch opt-in
     until the central heap owns production frames.
+  - [x] Widen the slice to the relational/equality family: `TaggedNumericFrame::cmp` produces a
+    Boolean immediate via the exact f64 predicate, and `bin_cmp` (`< > <= >= == != === !==`) routes
+    Number-only operand pairs through it behind the same `LUMEN_TAGGED_ARITHMETIC=1` switch;
+    mixed/coercive pairs still take the complete ECMA-262 §13.11–13.12 helper path. Verified
+    2026-09-03 on `845ab32` (831-pass full `lumen --lib` suite both off and with the switch on); the two new
+    focused tests pin the immediate-only guard plus NaN (all false/`!` true), `-0 == +0`, infinities,
+    and subnormal round-trips. Difftest `--seed 1 --count 300` reports 276 agree / 24 budget /
+    0 diverge identically with the switch on, and the full standard test262 default slice
+    (`language/expressions` + `language/statements`) passes 20449/20449 with the switch on. A
+    bytecode-tier comparison-heavy script is byte-identical off/on, and a dense pure-comparison
+    release micro-workload measured about 5.7 s off versus 6.5 s on on a non-idle host (load
+    3.8–6.1): the shadow transport remains a migration gap, so the switch stays disabled by
+    default exactly as before. Remaining families for later widening: bitwise/shift, unary numeric,
+    and exponentiation.
 - [x] Write and review the Phase 3A heap safety/migration design, including every root family,
   object tracer, hybrid-edge rule, promotion destination, and old-to-young barrier
   (`HEAP_SAFETY_MODEL.md`). The document is a non-executable safety gate; object-family migration
