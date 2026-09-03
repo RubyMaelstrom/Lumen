@@ -470,7 +470,10 @@ fn json_str(
                 for k in &keys {
                     if let Some(vs) = json_str(i, &value, k, opts, gap, &new_indent, seen)? {
                         let colon = if gap.is_empty() { ":" } else { ": " };
-                        parts.push(format!("{}{colon}{vs}", json_quote(k)));
+                        let mut member = json_quote(k);
+                        member.push_str(colon);
+                        member.push_str(&vs);
+                        parts.push(member);
                     }
                 }
                 join_json("{", "}", parts, gap, &new_indent, indent)
