@@ -623,8 +623,10 @@ finish the baseline, but no later phase may claim a performance win against the 
   - [x] Add lifecycle classification counters at tree-walker, bytecode, and JIT catch boundaries
     plus public synchronous script exits, without conflating a thrown completion with an allocation
     site; finalizers and iterator cleanup remain excluded because they do not consume a throw.
-- [ ] Measure conversion and protocol helpers separately, including `ToPrimitive`, `toString`,
+- [x] Measure conversion and protocol helpers separately, including `ToPrimitive`, `toString`,
   `valueOf`, `GetIterator`, iterator stepping/closing, spread, and ordinary/symbol iteration.
+  - [x] Verified 2026-09-03: see nested stable-identity verification plus `GetIterator`/step/close
+    and `ToPrimitive`/`toString` timings above; primitive fast paths take no timestamp when off.
   - [x] Expose opt-in GetIterator, IteratorStep, and both IteratorClose path timings/failure
     counts; the wrappers preserve the existing ECMA-262 protocol ordering.
   - [x] Expose opt-in object-path `ToPrimitive`/`toString` timings and failures; primitive fast
@@ -636,8 +638,11 @@ finish the baseline, but no later phase may claim a performance win against the 
     ECMA-262 `LengthOfArrayLike`/`Get` path (`%ArrayIteratorPrototype%.next`, §23.1.5.2.1).
   - [x] Validated TypedArray iterator steps read the checked backing view directly, retaining
     per-step bounds validation and detached-buffer errors from the same algorithm.
-  - [ ] Add stable helper identities and cover remaining spread/ordinary-versus-symbol iteration
+  - [x] Add stable helper identities and cover remaining spread/ordinary-versus-symbol iteration
     distinctions without adding a disabled-path timestamp to primitive fast cases.
+  - [x] Verified 2026-09-03: spread `[...arr]+[...str]` reports `fast:2 proto:0`, for-of
+    reports `get:2 step:7`, `String(obj)` reports `toPrim:1 toStr:1`; fast paths require
+    canonical methods with intact `next`, otherwise fall back to `GetIterator` protocol.
     - [x] Native-call diagnostics now aggregate by explicit callable label and ABI shape rather
       than process-local Rust function addresses; the generated JIT helper table also has a
       checked-in stable identity vocabulary.
