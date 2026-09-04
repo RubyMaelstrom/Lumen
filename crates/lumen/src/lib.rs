@@ -120,6 +120,11 @@ pub use interrupt::{InterruptReason, RuntimeInterrupt};
 /// diagnostic state. `engine` selects the Agent-owned memory snapshot; process JIT/GC counters
 /// remain aggregate diagnostics. This is intentionally not a stable embedder API.
 #[doc(hidden)]
+/// Opt-in matcher profiling report (`LUMEN_REGEXP_PROF=1`); `None` when disabled or idle.
+pub fn unstable_regexp_prof_report() -> Option<String> {
+    crate::regex::regexp_prof_report()
+}
+
 pub fn unstable_performance_metrics_json(engine: &Engine) -> Option<String> {
     let managed_memory = memory::json(&engine.interp);
     jit::performance_metrics_json(&managed_memory)

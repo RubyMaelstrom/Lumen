@@ -909,8 +909,22 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   and difftest seed-1 276/24/0 plus seed-100 185/15/0 stay green. Remaining corpus gaps for
   later matcher work: `casefold-alt` (folded alternation) 12.2×, and the class/anchor family
   (`domain` 5.4×, `url-path-lookahead` 4.8×, ...).
-- [ ] Measure parse/compile, candidate scanning, instruction dispatch, capture copying,
+- [x] Measure parse/compile, candidate scanning, instruction dispatch, capture copying,
   backtracking, interruption polling, and wrapper/result allocation separately.
+  - [x] `LUMEN_REGEXP_PROF=1` (2026-09-04) exposes opt-in per-instruction dispatch counts plus
+    scan positions, candidate attempts, and backtracking entries per process, reported by the
+    CLI at exit (`[regexp-prof] matcher inst[...] scan:… attempts:… backtrack:…`). Disabled
+    matching costs one relaxed OnceLock load per exec and a single predicted branch per
+    instruction: the RegExp component A/B stayed within noise (413–427 vs 403–426), and the
+    842-test suite, difftest 276/24/0, and the corpus 30/30 pass unchanged. Findings on the
+    corpus's worst entries (jit tier): `domain` spends 1.66M backtrack entries vs 262k
+    character checks on the uncapture-heavy suffix re-exploration of an O(n²) class scan;
+    `uri-regex` burns 2.1M `save` vs 524k `char` (six saves per split) through its ten nested
+    optional groups; `casefold-alt` spends 830k `char` re-checking the folded alternation at
+    every `[\w\W]*` suffix. The residual ~4–5× gap versus Node/V8 on these families is
+    per-step interpreter dispatch plus structural backtracking, i.e. Phase 6's native-tier
+    item rather than a bounded Rust fast path (the icase-literal case above already captured
+    the literal subset).
 - [x] Project group-0 spans directly for proven dead-result `RegExp.exec` paths while retaining
   internal capture slots for matching semantics; public executions still materialize captures.
 - [x] Keep immutable UnicodeSets metadata borrowed during matcher attempts instead of incrementing

@@ -9,11 +9,107 @@
 //! explicit resource error instead of hanging or being mistaken for an ordinary no-match.
 
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 const MAX_REPEAT: usize = 1000;
 const STEP_LIMIT: u64 = 2_000_000;
 const INLINE_CAPTURES: usize = 4;
 const INTERRUPT_POLL_MASK: usize = 0x3fff;
+
+/// Number of [`Inst`] variants, one counter per kind for the opt-in matcher profiling report.
+const REGEXP_PROF_INST_KINDS: usize = 22;
+const REGEXP_PROF_INST_NAMES: [&str; REGEXP_PROF_INST_KINDS] = [
+    "char",
+    "any",
+    "class",
+    "string_set",
+    "string_set_repeat",
+    "save",
+    "split",
+    "jmp",
+    "match",
+    "assert_start",
+    "assert_end",
+    "word_boundary",
+    "backref",
+    "backref_alt",
+    "clear_caps",
+    "look",
+    "look_behind",
+    "many",
+    "push_flags",
+    "pop_flags",
+    "set_mark",
+    "check_progress",
+];
+
+/// Opt-in matcher profiling (`LUMEN_REGEXP_PROF=1`): per-instruction dispatch counts, scan
+/// positions, candidate attempts, and backtracking entries, reported once at process exit.
+/// Disabled matching costs one relaxed load per exec plus a single predicted branch per
+/// instruction; the counters live in a thread-local so the engine's single-threaded Agent
+/// boundary keeps them consistent.
+pub(crate) struct RegexpProf {
+    pub(crate) inst: [u64; REGEXP_PROF_INST_KINDS],
+    pub(crate) scan_positions: u64,
+    pub(crate) attempts: u64,
+    pub(crate) backtrack_entries: u64,
+}
+
+impl RegexpProf {
+    const fn zero() -> Self {
+        Self {
+            inst: [0; REGEXP_PROF_INST_KINDS],
+            scan_positions: 0,
+            attempts: 0,
+            backtrack_entries: 0,
+        }
+    }
+}
+
+impl Default for RegexpProf {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+static REGEXP_PROF_GATE: OnceLock<bool> = OnceLock::new();
+
+fn regexp_prof_enabled() -> bool {
+    *REGEXP_PROF_GATE.get_or_init(|| std::env::var_os("LUMEN_REGEXP_PROF").is_some())
+}
+
+thread_local! {
+    static REGEXP_PROF: std::cell::RefCell<RegexpProf> =
+        const { std::cell::RefCell::new(RegexpProf::zero()) };
+}
+
+/// Index the one instruction kind that dispatched (see [`REGEXP_PROF_INST_NAMES`]).
+fn regexp_prof_kind(inst: &Inst) -> usize {
+    match inst {
+        Inst::Char(_) => 0,
+        Inst::Any => 1,
+        Inst::Class(_) => 2,
+        Inst::StringSet(_) => 3,
+        Inst::StringSetRepeat { .. } => 4,
+        Inst::Save(_) => 5,
+        Inst::Split(..) => 6,
+        Inst::Jmp(_) => 7,
+        Inst::Match => 8,
+        Inst::AssertStart => 9,
+        Inst::AssertEnd => 10,
+        Inst::WordBoundary(_) => 11,
+        Inst::Backref(_) => 12,
+        Inst::BackrefAlt(_) => 13,
+        Inst::ClearCaps(..) => 14,
+        Inst::Look { .. } => 15,
+        Inst::LookBehind { .. } => 16,
+        Inst::Many { .. } => 17,
+        Inst::PushFlags(..) => 18,
+        Inst::PopFlags => 19,
+        Inst::SetMark(_) => 20,
+        Inst::CheckProgress(_) => 21,
+    }
+}
 
 /// A matcher implementation limit is not an ECMAScript match failure. RegExpBuiltinExec may
 /// return `null` only after its matcher returns failure (ECMA-262 §22.2.7.2); collapsing exhausted
@@ -1275,11 +1371,16 @@ impl Regex {
             // failures turns ambiguous emoji-sequence repetition into dynamic programming while
             // preserving the specification's alternative order.
             string_failures: self.memo_string_failures.then(Default::default),
+            prof: regexp_prof_enabled(),
         };
         let mut from = start;
+        let prof = m.prof;
         let result = 'scan: loop {
             if from > input.len() {
                 break 'scan Ok(None);
+            }
+            if prof {
+                REGEXP_PROF.with(|p| p.borrow_mut().attempts += 1);
             }
             // Prescan: skip positions that cannot begin a match. Sticky regexes get exactly one
             // attempt at `start`, so the filter only ever saves that single attempt for them.
@@ -1315,6 +1416,9 @@ impl Regex {
                                     break;
                                 }
                                 from += 1;
+                                if prof {
+                                    REGEXP_PROF.with(|p| p.borrow_mut().scan_positions += 1);
+                                }
                                 if from & INTERRUPT_POLL_MASK == 0 {
                                     poll_interrupt(control)?;
                                 }
@@ -1352,6 +1456,38 @@ impl Regex {
         });
         result
     }
+}
+
+/// One-line matcher profiling report (`LUMEN_REGEXP_PROF=1`), mirroring the JIT opstat style:
+/// per-instruction dispatch counts, scan positions, candidate attempts, and backtracking entries.
+/// `None` (and zero work) when the gate is off or nothing matched.
+pub(crate) fn regexp_prof_report() -> Option<String> {
+    if !regexp_prof_enabled() {
+        return None;
+    }
+    REGEXP_PROF.with(|cell| {
+        let prof = cell.borrow();
+        if prof.inst.iter().all(|c| *c == 0)
+            && prof.scan_positions == 0
+            && prof.attempts == 0
+            && prof.backtrack_entries == 0
+        {
+            return None;
+        }
+        let mut body = String::new();
+        for (name, count) in REGEXP_PROF_INST_NAMES.iter().zip(prof.inst.iter()) {
+            if *count > 0 {
+                body.push_str(&format!(" {name}:{count}"));
+            }
+        }
+        Some(format!(
+            "matcher inst[{}] scan:{} attempts:{} backtrack:{}",
+            body.trim(),
+            prof.scan_positions,
+            prof.attempts,
+            prof.backtrack_entries
+        ))
+    })
 }
 
 fn scan_program_references(program: &[Inst], visitor: &mut crate::memory::Visitor) -> usize {
@@ -3171,6 +3307,8 @@ struct Matcher<'a, I: ReInput> {
     control: &'a crate::RuntimeInterrupt,
     abort: Option<MatchError>,
     string_failures: Option<std::collections::HashSet<(usize, usize, usize, usize, bool, u8)>>,
+    /// Opt-in instruction/backtrack profiling gate (see [`REGEXP_PROF`]).
+    prof: bool,
 }
 
 impl<I: ReInput> Matcher<'_, I> {
@@ -3655,6 +3793,9 @@ impl<I: ReInput> Matcher<'_, I> {
             return false;
         }
         self.depth += 1;
+        if self.prof {
+            REGEXP_PROF.with(|p| p.borrow_mut().backtrack_entries += 1);
+        }
         let r = self.run_inner(prog, pc, pos);
         self.depth -= 1;
         r
@@ -3667,6 +3808,12 @@ impl<I: ReInput> Matcher<'_, I> {
         loop {
             if !self.tick() {
                 return false;
+            }
+            if self.prof {
+                REGEXP_PROF.with(|cell| {
+                    let mut prof = cell.borrow_mut();
+                    prof.inst[regexp_prof_kind(&prog[pc])] += 1;
+                });
             }
             match &prog[pc] {
                 Inst::Match => return true,

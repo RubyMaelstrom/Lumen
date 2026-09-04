@@ -123,6 +123,9 @@ fn main() {
 /// the shell (and behind the existing opt-in switch) so library embedders retain control of their
 /// own idle/collection boundaries and normal CLI runs do no extra work.
 fn finalize_performance_metrics(engine: &mut Engine) {
+    if let Some(report) = lumen::unstable_regexp_prof_report() {
+        eprintln!("[regexp-prof] {report}");
+    }
     if std::env::var_os("LUMEN_PERF_METRICS").is_some() {
         engine.unstable_collect_for_performance_metrics();
         if let Some(metrics) = lumen::unstable_performance_metrics_json(engine) {
@@ -167,6 +170,7 @@ Diagnostics (env, unstable):
   LUMEN_JIT_DUMP=SUBSTR   Dump the op stream of JIT'd chunks whose slot names match
   LUMEN_JIT_CODEDUMP=SUB  Dump the finished machine code of matching chunks (hex)
   LUMEN_JIT_OPSTAT=1      Tally ops that reach the JIT slow path (top at exit; =2 pinpoints sites)
+  LUMEN_REGEXP_PROF=1     Report matcher instruction/scan/attempt/backtrack counts at exit
   LUMEN_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
   LUMEN_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
   LUMEN_PERF_METRICS=1    Print one JSON JIT/collector performance summary at normal exit
