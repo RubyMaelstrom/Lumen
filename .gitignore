@@ -22,3 +22,16 @@ __pycache__/
 /site/version.json
 examples/ejs/code.js
 benchmarks/regexp-corpus/generated-harness.js
+# Local investigation tools; keep these out of the repository.
+/examples/hono-app/cold-start.py
+/scripts/bench-matrix.py
+/scripts/bench-matrix.test.py
+/scripts/check-engine-regression.py
+/scripts/check-engine-regression.test.py
+/scripts/fetch-browser-replay-assets.py
+/scripts/fetch-v8-v7.py
+/scripts/gen-regexp-corpus.py
+/scripts/gen-regexp-native-harness.py
+/scripts/run-wpt.py
+/scripts/summarize-engine-report.py
+/scripts/summarize-engine-report.test.py
