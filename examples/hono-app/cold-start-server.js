@@ -1,5 +1,5 @@
-// One Hono app, served through whichever runtime is running it — so cold-start.py can time the
-// same program on lumen, Bun, and Node. Reads PORT from the environment. Bind fast, answer '/'.
+// One Hono app, served through whichever runtime is running it. Reads PORT from the environment.
+// Bind fast, answer '/'.
 import { Hono } from 'hono';
 
 const app = new Hono();

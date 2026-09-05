@@ -10,23 +10,5 @@ Speedometer 3.1 Vue TodoMVC workload: Vue 3.2.47 mounts the application, then th
 the official 100-add, 100-complete, and 100-delete interaction shape.
 
 The third-party JavaScript and CSS are not checked into Lumen. Their upstream repository, revision,
-paths, and SHA-256 digests are pinned in `../browser-replay-assets.json`; the runner verifies the
-local cache before starting and cannot provision it. Provision once, separately:
-
-```sh
-scripts/fetch-browser-replay-assets.py
-# Or copy and verify from an audited checkout of the pinned revision:
-scripts/fetch-browser-replay-assets.py --source-checkout /path/to/Speedometer
-```
-
-Run the gates from the Lumen root:
-
-```sh
-scripts/run-browser-replays.sh quick      # one small debug replay, normally about one second
-scripts/run-browser-replays.sh check      # every replay once in debug
-scripts/run-browser-replays.sh benchmark  # release, one warmup and five measured rounds
-```
-
-The runner builds the sibling `../TRust` checkout offline and writes a hash-bearing JSON report to
-the ignored `benchmark-results/` directory. `TRUST_REPLAY_ROOT` selects another TRust checkout,
-`LUMEN_REPLAY_CPU=none` disables affinity, and another integer selects a different CPU.
+paths, and SHA-256 digests remain pinned in `../browser-replay-assets.json` for historical
+reference. The local provisioning and replay helpers have been removed.

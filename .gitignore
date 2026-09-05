@@ -3,7 +3,7 @@ __pycache__/
 # tc39/test262 conformance suite (cloned on demand by scripts/test262-clone.sh) + its score report.
 /test262/
 /test262-report/
-# web-platform-tests checkout (cloned on demand by scripts/wpt-clone.sh) + focused report.
+# Local web-platform-tests checkout and focused report.
 /wpt/
 /wpt-report/
 # Official WebAssembly core specification checkout and generated runner report.
@@ -11,11 +11,11 @@ __pycache__/
 /wasm-spec-report/
 # Autobahn WebSocket Testsuite client reports.
 /autobahn-reports/
-# Classic V8 benchmark suite (downloaded on demand by scripts/run-v8bench.sh).
+# Local classic V8 benchmark fixtures.
 /v8-v7/
-# Pinned third-party browser replay assets (provisioned on demand and never fetched by a run).
+# Local pinned third-party browser replay assets.
 /browser-replay-fixtures/
-# Machine-readable local performance reports from scripts/bench-matrix.py.
+# Machine-readable local performance reports.
 /benchmark-results/
 # Playground wasm bundle + build stamp (built by wasm-pack in .github/workflows/pages.yml).
 /site/pkg/

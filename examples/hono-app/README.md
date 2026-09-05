@@ -32,10 +32,9 @@ curl -X POST localhost:3000/echo -H 'content-type: application/json' -d '{"hi":"
 - `app.js` — the Hono app (routes, middleware, JSON, path params, custom 404).
 - `serve-http.js` — serves `app.js` over HTTP with `Lumen.serve(app.fetch, { port })`.
 - `ant-style.js` — the `import { logger } from 'hono/logger'` + `export default app` example,
-  adapted to `Lumen.serve` and `Lumen.version` (see [cold start](#cold-start)).
+  adapted to `Lumen.serve` and `Lumen.version`.
 - `serve.js` — drives `app.fetch` in-process (no listening socket); handy for testing routing.
 - `bench.mjs` — in-process throughput bench (`app.fetch` in a loop; runtime-agnostic).
-- `cold-start-server.js` + `cold-start.py` — cold-start benchmark (below).
 
 ## `Lumen.serve`
 
@@ -53,27 +52,3 @@ This isn't a WinterTC API — the Minimum Common API standardizes fetch/Request/
 not a server — so it follows the cross-runtime `serve(handler)` convention. **v1 limitations**
 (see `crates/lumen-web/src/server.rs`): one connection accepted at a time, `Connection: close`
 (no keep-alive), buffered request/response bodies (no streaming), http only (no TLS), no HTTP/2.
-
-## Cold start
-
-`cold-start.py` measures wall time from spawning the runtime to its server answering the first
-request — the metric [ant](https://github.com/theMackabu/ant#cold-start) reports. It runs the
-same `cold-start-server.js` on any runtime (it picks `Lumen.serve`, `Bun.serve`, or a small
-`node:http` adapter automatically):
-
-```sh
-./cold-start.py --runs 20 --warmup -- ../../target/release/lumen-cli cold-start-server.js
-./cold-start.py --runs 20 --warmup -- bun  cold-start-server.js
-./cold-start.py --runs 20 --warmup -- node cold-start-server.js
-```
-
-Representative medians on an Apple-silicon laptop (lower is better):
-
-| runtime | cold start (median) |
-|---|---|
-| lumen | ~15.8 ms |
-| bun   | ~16.3 ms |
-| node  | ~53.9 ms |
-
-Most of lumen's number is a fixed startup floor (process spawn + engine realm + extension JS
-glue); Hono parsing and the first dispatch add well under 1 ms.

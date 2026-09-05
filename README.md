@@ -191,7 +191,6 @@ cargo build --release -p lumen --bin lumen
 scripts/test262-clone.sh    # one-time: clone the suite into ./test262
 scripts/run-test262.sh      # run it (see crates/test262-runner for env knobs)
 LUMEN_TIER=jit scripts/run-test262.sh    # same suite against the compiled tiers
-scripts/run-wpt.py          # focused shell-compatible web-platform-tests slices
 ```
 
 The execution tiers are also held together by a differential fuzzer: every generated program
@@ -206,14 +205,6 @@ cargo run --release -p lumen-difftest -- --count 2000
 ## Benchmarks
 
 ```sh
-scripts/fetch-v8-v7.py      # one-time provisioning of the revision-pinned classic V8 fixtures
-scripts/bench-matrix.py     # accepted offline/interleaved Node + Bun + Lumen JSON measurement
-scripts/fetch-browser-replay-assets.py  # one-time pinned Speedometer/Vue asset provisioning
-scripts/run-browser-replays.sh quick    # fast production-page-pipeline correctness gate
-scripts/run-browser-replays.sh check    # all offline DOM/event-loop/framework replay gates
-scripts/run-v8bench.sh      # quick directional classic V8 suite run on lumen
-scripts/bench-compare.sh    # quick one-sample markdown table; not an accepted performance result
-
 git clone https://github.com/chromium/octane.git ../octane   # one-time: Octane checkout
 scripts/run-octane.sh                    # full Octane suite
 scripts/run-octane.sh richards crypto    # selected benchmarks
