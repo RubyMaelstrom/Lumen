@@ -86,6 +86,59 @@ The next major allocation target remains the production Agent-owned object/value
 precise VM/native/host roots and nursery allocation. Shared keys remove duplicated field metadata;
 they do not remove reference counting, individual object allocations, or full-heap cycle scanning.
 
+## 2026-09-06/07 follow-on: release real-site CPU costs
+
+Patient, five-minute release-browser observations of YouTube and Twitch identified large
+algorithmic costs in production engine paths: repeated string-prefix ASCII scans/copies,
+linear dense-index mutation lookup, and repeated full-object tracing during one collection.
+The fixes are enabled by default in `70bb494`, with bounded collection-local edge reuse;
+this is not a nursery migration, a site-specific workaround, or browser promotion.
+
+At the first checkpoint, YouTube's observed CPU falls from a fresh baseline 155.32 to 103.47 seconds (33.4% less),
+and late background CPU from 0.377 to 0.248 CPU/core. Native samples confirm the large prefix
+scan has disappeared and all-caller copying falls to 2.25 seconds. These are live, logged-out
+observations, not fixed-work throughput, V8 parity, or final privacy-notice/SVG painting times.
+Twitch's corresponding observation falls from its original 45.76 to 34.44 CPU-seconds (24.7% less);
+the last string-ownership step itself is flat/slightly slower than the preceding 33.92-second
+GC run. Subsequent broader scans and fresh comparisons are recorded below.
+
+That checkpoint's unit gate passes 1,037 engine/host/web tests (one existing network test
+ignored). The expanded release Test262 selection passes 33,391 files in each of the three
+tiers, with zero failures and two existing exclusions per tier. Fixed-work probes isolate
+9.0×/14.9× bytecode/JIT local string accumulation and 30.7% shorter repeated collections.
+Numeric/call and classic controls comparing the last two variants are effectively flat.
+
+The broader scans found a much larger compilation defect in Photopea: native branch widening
+repeatedly inserted into the code buffer and rescanned every label and patch. Commit `91960a3`
+replaces that quadratic pass with bounded batched relaxation and a single final buffer build.
+The generic large-function probe improves native compilation from 24.91 s to 0.0717 s with
+identical code size; Photopea's actual startup task drops from 29.68 s to 1.91 s. Both site runs
+still reach the same missing `ImageData` platform error, so this is removal of engine work,
+not successful editor loading. Its actor CPU drops 29.40 → 1.80 s. The branch follow-up passes
+943 engine tests, 33,391 selected release-JIT Test262 files, and effectively flat ordinary-workload
+controls. YouTube observes 101.49 CPU-seconds and Twitch 32.05 with this compiler fix.
+
+Commit `bacc912` additionally replaces repeated scans of large compiler name pools with a
+compile-only index, preserving bytecode IDs, literal-key ranges, and speculative rollback.
+The largest fixed-work bytecode compilation drops 5.161 → 0.0729 s (70.8×); ordinary execution
+controls remain effectively flat. It also repairs the async-declaration lexical goal exposed
+by VS Code and declaration/default-export grammar defects found by the negative tests.
+The final gate passes 1,045 engine/host/web unit tests and 35,054 selected release Test262 files
+per tier (105,162 passing case-runs, zero failures, two unchanged exclusions per tier).
+
+The latest release observations use 100.88 CPU-seconds on YouTube, **35.1% below its fresh
+baseline**, and 33.95 on Twitch, **27.8% below the fresh reverse-order baseline of 47.01**.
+The latest Twitch run is 5.9% higher than the preceding compiler candidate, not another gain.
+VS Code's workbench is independently blocked by TRust's 16 MiB decoded-body truncation; the
+full captured bundle is 18,917,924 bytes. Excalidraw reaches its empty editor controls and goes
+idle, but that observation does not establish active-editing or canvas-paint performance.
+
+Full-heap collection, bytecode execution, and general object/call overhead remain major
+costs. The measured results and limitations supersede assuming that heap/nursery scaffolding
+alone guarantees a throughput breakthrough. See the [baseline investigation](REAL_SITE_PROFILING_2026-09-06.md)
+and [optimization evidence](REAL_SITE_OPTIMIZATIONS_2026-09-06.md) for exact binaries, standards,
+conformance gates, failed/repaired tests, and broader application follow-ups.
+
 ## Non-negotiable engineering rules
 
 - Official standards define observable behavior. ECMA-262, ECMA-402, WebAssembly, WHATWG, W3C,
