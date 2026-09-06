@@ -1645,6 +1645,7 @@ pub struct SpFlag {
 mod asm {
     /// Instruction buffer with label/patch support. Registers are plain u32 numbers (x0..x30,
     /// sp=31 where encodable); labels are indices into `patches`.
+    #[cfg_attr(test, derive(Clone))]
     pub struct Asm {
         pub buf: Vec<u32>,
         /// (instruction index, label id, kind) — resolved in `finish`.
@@ -1656,7 +1657,7 @@ mod asm {
     enum PatchKind {
         /// Unconditional B: imm26.
         B,
-        /// CBZ/CBNZ: imm19.
+        /// B.cond/CBZ/CBNZ: imm19.
         Cb,
     }
 
@@ -2098,37 +2099,7 @@ mod asm {
         /// veneers move those destinations just as they move ordinary branch labels.
         /// Panics on an unbound label (a compiler bug).
         pub fn finish_with_offsets(mut self, exported: &[usize]) -> (Vec<u32>, Vec<u32>) {
-            // Relax imm19 branches that cannot reach after final layout. Invert the local
-            // condition over an imm26 B and update every later label/patch for the inserted word.
-            // Iteration matters: one insertion can push another branch just over its limit.
-            while let Some(k) = self.patches.iter().position(|(at, label, kind)| {
-                if !matches!(kind, PatchKind::Cb) {
-                    return false;
-                }
-                let target = self.labels[*label].expect("unbound jit label");
-                let delta = target as i64 - *at as i64;
-                !(-(1 << 18)..(1 << 18)).contains(&delta)
-            }) {
-                let (at, label, _) = self.patches[k];
-                let insn = self.buf[at];
-                self.buf[at] = if insn & 0xff00_0000 == 0x5400_0000 {
-                    insn ^ 1 // B.cond: invert the low condition bit
-                } else {
-                    insn ^ 0x0100_0000 // CBZ <-> CBNZ
-                } | (2 << 5); // skip the following B
-                self.buf.insert(at + 1, 0x1400_0000);
-                for bound in self.labels.iter_mut().flatten() {
-                    if *bound > at {
-                        *bound += 1;
-                    }
-                }
-                for (patch_at, _, _) in &mut self.patches {
-                    if *patch_at > at {
-                        *patch_at += 1;
-                    }
-                }
-                self.patches[k] = (at + 1, label, PatchKind::B);
-            }
+            self.relax_branches(8);
             for (at, label, kind) in std::mem::take(&mut self.patches) {
                 let target = self.labels[label].expect("unbound jit label");
                 let delta = target as i64 - at as i64; // in instructions
@@ -2156,6 +2127,100 @@ mod asm {
                 })
                 .collect();
             (self.buf, offsets)
+        }
+
+        /// Resolve widening in immutable instruction coordinates, then copy code once. The old
+        /// per-branch Vec::insert plus complete label/patch rescans was quadratic on large
+        /// functions. Prefix counts relocate branches and catch labels consistently (ECMA-262
+        /// TryStatement Evaluation); the emitted imm19/imm26 encodings are unchanged.
+        fn relax_branches(&mut self, exact_batches: usize) {
+            let fits = |delta: i64| (-(1 << 18)..(1 << 18)).contains(&delta);
+            if !self.patches.iter().any(|&(at, label, kind)| {
+                matches!(kind, PatchKind::Cb)
+                    && !fits(self.labels[label].expect("unbound jit label") as i64 - at as i64)
+            }) {
+                return; // Ordinary functions need no extra allocation or code-buffer copy.
+            }
+            debug_assert!(self.patches.windows(2).all(|p| p[0].0 < p[1].0));
+            let count = self.patches.len();
+            // Inserting after instruction P moves labels strictly after P, not labels at P.
+            // Unbound, unused labels are legal; only referenced/exported labels must be bound.
+            let cuts: Vec<_> = self
+                .labels
+                .iter()
+                .map(|label| label.map(|at| self.patches.partition_point(|p| p.0 < at)))
+                .collect();
+            let mut wide = vec![false; count];
+            let mut prefix = vec![0usize; count + 1];
+            let rebuild = |prefix: &mut [usize], wide: &[bool]| {
+                for (k, &widen) in wide.iter().enumerate() {
+                    prefix[k + 1] = prefix[k] + usize::from(widen);
+                }
+            };
+            let mut settled = false;
+            for _ in 0..exact_batches {
+                let mut changed = false;
+                for (k, &(at, label, kind)) in self.patches.iter().enumerate() {
+                    if wide[k] || !matches!(kind, PatchKind::Cb) {
+                        continue;
+                    }
+                    let target = self.labels[label].expect("unbound jit label")
+                        + prefix[cuts[label].expect("unbound jit label")];
+                    if !fits(target as i64 - (at + prefix[k]) as i64) {
+                        wide[k] = true;
+                        changed = true;
+                    }
+                }
+                rebuild(&mut prefix, &wide);
+                if !changed {
+                    settled = true;
+                    break;
+                }
+            }
+            if !settled {
+                // Bound even adversarial one-branch-per-round cascades. Hypothetically widening
+                // EVERY conditional gives an upper bound on each branch's absolute distance.
+                // Widen any remaining branch whose bound does not fit. All retained short
+                // branches then provably fit for the actual subset, without more iterations.
+                // Only this rare fallback may choose a larger layout than the least fixed point.
+                for (k, &(_, _, kind)) in self.patches.iter().enumerate() {
+                    prefix[k + 1] = prefix[k] + usize::from(matches!(kind, PatchKind::Cb));
+                }
+                for (k, &(at, label, kind)) in self.patches.iter().enumerate() {
+                    if !wide[k] && matches!(kind, PatchKind::Cb) {
+                        let target = self.labels[label].expect("unbound jit label")
+                            + prefix[cuts[label].expect("unbound jit label")];
+                        wide[k] = !fits(target as i64 - (at + prefix[k]) as i64);
+                    }
+                }
+                rebuild(&mut prefix, &wide);
+            }
+            for (label, cut) in self.labels.iter_mut().zip(cuts) {
+                if let (Some(at), Some(cut)) = (label, cut) {
+                    *at += prefix[cut];
+                }
+            }
+            let mut code = Vec::with_capacity(self.buf.len() + prefix[count]);
+            let mut from = 0;
+            for (k, (at, _, kind)) in self.patches.iter_mut().enumerate() {
+                let old_at = *at;
+                code.extend_from_slice(&self.buf[from..=old_at]);
+                *at = code.len() - 1;
+                if wide[k] {
+                    let insn = code[*at];
+                    code[*at] = if insn & 0xff00_0000 == 0x5400_0000 {
+                        insn ^ 1 // B.cond: invert the low condition bit.
+                    } else {
+                        insn ^ 0x0100_0000 // CBZ <-> CBNZ, preserving register and width.
+                    } | (2 << 5); // The inverted branch skips the following B.
+                    code.push(0x1400_0000);
+                    *at += 1;
+                    *kind = PatchKind::B;
+                }
+                from = old_at + 1;
+            }
+            code.extend_from_slice(&self.buf[from..]);
+            self.buf = code;
         }
     }
 
@@ -2322,6 +2387,150 @@ mod asm {
             let back = code.len() - 2;
             let delta = ((code[back] << 6) as i32) >> 6;
             assert_eq!(back as i64 + delta as i64, offsets[1] as i64 / 4);
+        }
+
+        /// The previous insertion algorithm is retained only as a differential oracle.
+        fn reference_finish(mut a: super::Asm, exported: &[usize]) -> (Vec<u32>, Vec<u32>) {
+            while let Some(k) = a.patches.iter().position(|&(at, label, kind)| {
+                matches!(kind, super::PatchKind::Cb)
+                    && !(-(1 << 18)..(1 << 18))
+                        .contains(&(a.labels[label].unwrap() as i64 - at as i64))
+            }) {
+                let (at, label, _) = a.patches[k];
+                let insn = a.buf[at];
+                a.buf[at] = if insn & 0xff00_0000 == 0x5400_0000 {
+                    insn ^ 1
+                } else {
+                    insn ^ 0x0100_0000
+                } | (2 << 5);
+                a.buf.insert(at + 1, 0x1400_0000);
+                for bound in a.labels.iter_mut().flatten() {
+                    if *bound > at {
+                        *bound += 1;
+                    }
+                }
+                for (patch_at, _, _) in &mut a.patches {
+                    if *patch_at > at {
+                        *patch_at += 1;
+                    }
+                }
+                a.patches[k] = (at + 1, label, super::PatchKind::B);
+            }
+            a.finish_with_offsets(exported)
+        }
+
+        fn checked_relaxation(mut a: super::Asm, batches: usize) -> (Vec<u32>, Vec<u32>) {
+            let original: Vec<_> = a.patches.iter().map(|p| (a.buf[p.0], p.2)).collect();
+            a.relax_branches(batches);
+            let patches = a.patches.clone();
+            let labels = a.labels.clone();
+            let exported: Vec<_> = labels
+                .iter()
+                .enumerate()
+                .filter_map(|(k, p)| p.map(|_| k))
+                .collect();
+            let result = a.finish_with_offsets(&exported);
+            for ((insn, old_kind), &(at, label, kind)) in original.into_iter().zip(&patches) {
+                let word = result.0[at];
+                let delta = match kind {
+                    super::PatchKind::B => ((word << 6) as i32 >> 6) as i64,
+                    super::PatchKind::Cb => ((word << 8) as i32 >> 13) as i64,
+                };
+                assert_eq!(at as i64 + delta, labels[label].unwrap() as i64);
+                match (old_kind, kind) {
+                    (super::PatchKind::Cb, super::PatchKind::B) => {
+                        let inverse = if insn & 0xff00_0000 == 0x5400_0000 {
+                            insn ^ 1
+                        } else {
+                            insn ^ 0x0100_0000
+                        };
+                        assert_eq!(result.0[at - 1], inverse | (2 << 5));
+                        assert_eq!(word & 0xfc00_0000, 0x1400_0000);
+                    }
+                    (super::PatchKind::B, super::PatchKind::B) => {
+                        assert_eq!(word & 0xfc00_0000, insn); // Preserve B versus BL.
+                    }
+                    (super::PatchKind::Cb, super::PatchKind::Cb) => {
+                        assert_eq!(word & !(0x7ffff << 5), insn);
+                    }
+                    _ => panic!("unconditional branch was narrowed"),
+                }
+            }
+            for (&label, &offset) in exported.iter().zip(&result.1) {
+                assert_eq!(offset as usize, labels[label].unwrap() * 4);
+            }
+            result
+        }
+
+        #[test]
+        fn batched_relaxation_cascades_at_both_signed_boundaries() {
+            for backward in [false, true] {
+                let mut a = super::Asm::new();
+                let start = a.new_label();
+                let middle = a.new_label();
+                let end = a.new_label();
+                a.bind(start);
+                if !backward {
+                    a.b_cond(super::super::C_EQ, middle);
+                }
+                a.cbz(7, true, end); // Widening this pushes the initially fitting branch out.
+                a.buf
+                    .resize(if backward { 1 << 18 } else { (1 << 18) - 1 }, 0xaa00_03e0);
+                a.bind(middle);
+                if backward {
+                    a.cbnz(9, false, start);
+                }
+                a.buf.resize((1 << 18) + 100, 0xaa00_03e0);
+                a.bind(end);
+                a.ret();
+                let expected = reference_finish(a.clone(), &[start, middle, end]);
+                assert_eq!(checked_relaxation(a.clone(), 8), expected);
+                // Force the bounded conservative fallback as well as the ordinary fixed point.
+                checked_relaxation(a, 0);
+            }
+        }
+
+        #[test]
+        fn batched_relaxation_matches_reference_and_preserves_every_patch_family() {
+            for seed in 0u64..12 {
+                let mut a = super::Asm::new();
+                let mut random = seed + 1;
+                for k in 0..96 {
+                    random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    a.buf.resize(k * 3500, 0xaa00_03e0);
+                    let label = a.new_label();
+                    a.labels[label] = Some((random as usize % 101) * 3500);
+                    match k % 6 {
+                        0 => a.b_cond((k / 6 % 14) as u32, label),
+                        1 => a.cbz(k as u32 % 32, k % 4 == 1, label),
+                        2 => a.cbnz(k as u32 % 32, k % 4 == 2, label),
+                        3 => a.b(label),
+                        4 => a.bl_label(label),
+                        _ => a.b_cond(super::super::C_NE, label),
+                    }
+                }
+                a.buf.resize(360_000, 0xaa00_03e0);
+                let labels: Vec<_> = (0..a.labels.len()).collect();
+                let expected = reference_finish(a.clone(), &labels);
+                assert_eq!(checked_relaxation(a.clone(), 8), expected, "seed {seed}");
+                checked_relaxation(a, 0);
+            }
+        }
+
+        #[test]
+        fn batched_relaxation_handles_many_far_branches_and_unused_labels() {
+            let mut a = super::Asm::new();
+            let end = a.new_label();
+            a.new_label(); // Unbound but unused: do not demand an exported destination for it.
+            for k in 0..16_000 {
+                a.cbz(k % 32, k % 2 == 0, end);
+            }
+            a.buf.resize(280_000, 0xaa00_03e0);
+            a.bind(end);
+            a.ret();
+            let (words, offsets) = checked_relaxation(a, 8);
+            assert_eq!(words.len(), 296_001);
+            assert_eq!(offsets, [296_000 * 4]);
         }
     }
 }
