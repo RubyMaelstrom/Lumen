@@ -6902,6 +6902,17 @@ impl Interp {
                 _ => {}
             }
         }
+        // Primitive strings cannot invoke conversion hooks. Transfer the operand handles so
+        // all tiers can reuse unique temporary buffers, just like native string addition.
+        if op == "+" && matches!((&l, &r), (Value::Str(_), Value::Str(_))) {
+            let (Value::Str(left), Value::Str(right)) = (l, r) else {
+                unreachable!()
+            };
+            if left.len().saturating_add(right.len()) > MAX_STR_LEN {
+                return Err(self.throw("RangeError", "Invalid string length"));
+            }
+            return Ok(Value::Str(left.concat_owned(&right)));
+        }
         // Arithmetic, bitwise, and `+` convert both operands to primitives first (left then right),
         // then dispatch on BigInt / string (for `+`) / number. ToPrimitive runs before the BigInt
         // mixing check so a wrapped BigInt object coerces correctly.
@@ -6982,11 +6993,7 @@ impl Interp {
                 if ls.len() + rs.len() > MAX_STR_LEN {
                     return Err(self.throw("RangeError", "Invalid string length"));
                 }
-                return Ok(Value::Str(if crate::jstr::needs_join_fixup(&ls, &rs) {
-                    crate::jstr::concat(&ls, &rs).into()
-                } else {
-                    crate::lstr::LStr::concat2(&ls, &rs)
-                }));
+                return Ok(Value::Str(ls.concat_owned(&rs)));
             }
             if matches!(lp, Value::BigInt(_)) || matches!(rp, Value::BigInt(_)) {
                 if let (Value::BigInt(x), Value::BigInt(y)) = (&lp, &rp) {

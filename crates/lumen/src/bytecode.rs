@@ -12025,7 +12025,26 @@ fn run_vm(
                 stack.push(obj);
                 stack.push(m);
             }
-            Op::Add => bin_num(i, stack, &chunk.feedback, op_pc, "+", |a, b| a + b)?,
+            Op::Add => {
+                // A following local store retires an owner of the old left string. Both
+                // operands are already evaluated; only the non-coercing, non-throwing string
+                // case may release that owner before addition. The existing Add/Store ops and
+                // feedback remain intact, and real aliases still prevent in-place mutation.
+                if let [.., Value::Str(left), Value::Str(right)] = stack.as_slice() {
+                    if left.len().saturating_add(right.len()) <= crate::interpreter::MAX_STR_LEN {
+                        match chunk.ops.get(op_pc + 1) {
+                            Some(Op::StoreLocal(slot)) => {
+                                release_overwritten_string_local(&mut slots[*slot as usize], left);
+                            }
+                            Some(Op::StoreCap(name)) => {
+                                chunk.release_overwritten_captured_string(cap_env, *name, left);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                bin_num(i, stack, &chunk.feedback, op_pc, "+", |a, b| a + b)?;
+            }
             Op::Sub => bin_num(i, stack, &chunk.feedback, op_pc, "-", |a, b| a - b)?,
             Op::Mul => bin_num(i, stack, &chunk.feedback, op_pc, "*", |a, b| a * b)?,
             Op::Div => bin_num(i, stack, &chunk.feedback, op_pc, "/", |a, b| a / b)?,
@@ -14311,6 +14330,17 @@ fn bin_num(
     Ok(())
 }
 
+/// Retire only the local owner that the immediately following StoreLocal will overwrite.
+/// ECMA-262 assignment evaluation still reads the left value before the RHS, and conversion
+/// hooks must still see the binding: callers restrict this to already-primitive strings after
+/// the length guard. No JS, coercion, safepoint or recoverable error may occur before the store.
+#[inline]
+fn release_overwritten_string_local(slot: &mut Value, left: &crate::lstr::LStr) {
+    if matches!(slot, Value::Str(current) if crate::lstr::LStr::ptr_eq(current, left)) {
+        *slot = Value::Undefined;
+    }
+}
+
 /// Attempt the immediate-only tagged ABI path. Returning `None` is a deliberate deoptimization:
 /// heap values, strings, BigInts, symbols, objects, and the internal Empty marker all continue
 /// through the complete interpreter helper, preserving ToPrimitive/ToNumeric ordering and
@@ -14824,6 +14854,16 @@ impl Chunk {
             binding.initialized = true;
         }
         Ok(())
+    }
+
+    /// The captured-cell equivalent of the adjacent Add/StoreLocal ownership handoff.
+    /// Only initialized mutable declarative cells qualify; name resolution, globals, imports,
+    /// TDZ and immutable stores retain their ordinary paths (ECMA-262 SetMutableBinding).
+    fn release_overwritten_captured_string(&self, env: &Env, n: u32, left: &crate::lstr::LStr) {
+        let binding = unsafe { &mut *self.cap_binding_ptr(env, n) };
+        if binding.initialized && binding.mutable && binding.import_ref.is_none() {
+            release_overwritten_string_local(&mut binding.value, left);
+        }
     }
 
     /// Reject PutValue to a compiler-proven immutable captured binding without cloning its old
@@ -15668,7 +15708,7 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
         return unsafe { jit_exec(ctx, pc, sp) };
     }
 
-    let Value::Str(mut left) = (unsafe { base.read() }) else {
+    let Value::Str(left) = (unsafe { base.read() }) else {
         unreachable!()
     };
     let Value::Str(right) = (unsafe { base.add(1).read() }) else {
@@ -15681,12 +15721,33 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
         return crate::jit::SpFlag { sp: base, flag: 1 };
     }
 
-    if crate::jstr::needs_join_fixup(&left, &right) {
-        left = crate::jstr::concat(&left, &right).into();
-    } else if !left.append_in_place(&right) {
-        left = left.concat_grown(&right);
+    let ctx = unsafe { &mut *ctx };
+    let chunk = unsafe { &*ctx.chunk };
+    if let Some(Op::StoreLocal(slot)) = chunk.ops.get(pc as usize + 1) {
+        if ctx.slots_packed {
+            // Inspect/retire this one packed owner; never widen an entire native frame for
+            // each appended character. The operand `left` keeps its allocation alive here.
+            let word = unsafe { ctx.slots.cast::<u64>().add(*slot as usize) };
+            let current = unsafe { crate::value::PackedValue::clone_raw(word) };
+            let same = matches!(&current, Value::Str(current) if crate::lstr::LStr::ptr_eq(current, &left));
+            drop(current);
+            if same {
+                unsafe { crate::value::PackedValue::replace_raw(word, Value::Undefined) };
+            }
+        } else {
+            let slot = unsafe { &mut *ctx.slots.add(*slot as usize) };
+            release_overwritten_string_local(slot, &left);
+        }
+    } else if let Some(Op::StoreCap(name)) = chunk.ops.get(pc as usize + 1) {
+        // As in jit_exec_inner, env_raw is the activation swapped for this native frame, not
+        // a borrowed pointer to the caller's environment. Its existing owner outlives the call.
+        let env = std::mem::ManuallyDrop::new(unsafe {
+            Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+        });
+        chunk.release_overwritten_captured_string(&env, *name, &left);
     }
-    unsafe { base.write(Value::Str(left)) };
+
+    unsafe { base.write(Value::Str(left.concat_owned(&right))) };
     crate::jit::SpFlag {
         sp: unsafe { base.add(1) },
         flag: 0,
@@ -18983,4 +19044,11 @@ pub(crate) unsafe extern "C" fn jit_loop_backedge(
     let ctx = unsafe { &*ctx };
     unsafe { (&*ctx.chunk).feedback.observe_loop_backedge(pc as usize) };
     sp
+}
+
+#[cfg(test)]
+impl Chunk {
+    pub(crate) fn test_ops(&self) -> &[Op] {
+        &self.ops
+    }
 }

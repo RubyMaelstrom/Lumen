@@ -10007,9 +10007,10 @@ fn this_string(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value>
     }
 }
 
-/// JS WhiteSpace + LineTerminator (includes U+FEFF, which Rust's char::is_whitespace omits).
+/// The same WhiteSpace + LineTerminator set as RegExp's `\s`: unlike Rust's Unicode
+/// whitespace predicate, it includes U+FEFF but excludes U+0085 (NEL).
 fn is_js_ws(c: char) -> bool {
-    c.is_whitespace() || c == '\u{FEFF}'
+    crate::regex::js_whitespace(c)
 }
 
 /// IsRegExp(arg): true if it has a truthy `@@match`, or (fallback) is a compiled RegExp object.
@@ -10698,11 +10699,11 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "trim", 0, |i, this, _| {
         let s = this_string(i, &this)?;
         // TrimString removes the ECMA-262 WhiteSpace + LineTerminator set
-        // (ECMA-262 §22.1.3.32.1). For known ASCII strings that set is exactly
-        // Rust's ASCII trim set, so avoid Unicode scalar iteration and preserve the original
-        // allocation when no code units are removed.
-        if s.is_ascii() {
-            let trimmed = s.trim_ascii();
+        // (ECMA-262 §22.1.3.32.1). The ASCII subset includes VT (U+000B), which Rust's
+        // trim_ascii excludes. Consult cached ASCII metadata rather than scanning the body,
+        // and preserve the allocation when no code units are removed.
+        if s.ascii_hint() {
+            let trimmed = s.trim_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
             return Ok(if trimmed.len() == s.len() {
                 Value::Str(s)
             } else {
@@ -10747,14 +10748,7 @@ fn install_string(it: &mut Interp) {
                 .checked_add(next.len())
                 .filter(|&len| len <= MAX_STR_LEN)
                 .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
-            if !crate::jstr::needs_join_fixup(&s, &next) {
-                // ECMA-262 §22.1.3.5 has already completed both ToString operations and only
-                // observes the resulting code-unit sequence.  With no surrogate-boundary fixup,
-                // retain that sequence directly in one LStr allocation instead of copying a
-                // temporary Rust String into the engine representation.
-                return Ok(Value::Str(crate::lstr::LStr::concat2(&s, &next)));
-            }
-            return Ok(Value::from_string(crate::jstr::concat(&s, &next)));
+            return Ok(Value::Str(s.concat_owned(&next)));
         }
         // Preserve the spec's left-to-right ToString order and the existing per-step length
         // error timing.  If a surrogate boundary needs canonicalization, fall back immediately
@@ -10884,8 +10878,8 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "trimStart", 0, |i, this, _| {
         let s = this_string(i, &this)?;
-        if s.is_ascii() {
-            let trimmed = s.trim_ascii_start();
+        if s.ascii_hint() {
+            let trimmed = s.trim_start_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
             return Ok(if trimmed.len() == s.len() {
                 Value::Str(s)
             } else {
@@ -10901,8 +10895,8 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&sp, "trimEnd", 0, |i, this, _| {
         let s = this_string(i, &this)?;
-        if s.is_ascii() {
-            let trimmed = s.trim_ascii_end();
+        if s.ascii_hint() {
+            let trimmed = s.trim_end_matches(|c| matches!(c, '\u{9}'..='\u{d}' | ' '));
             return Ok(if trimmed.len() == s.len() {
                 Value::Str(s)
             } else {

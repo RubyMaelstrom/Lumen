@@ -57,14 +57,21 @@ fn layout(cap: u32) -> Layout {
 impl LStr {
     /// Allocate with `cap` bytes of capacity, seeding `content` (must fit).
     fn alloc(content: &str, cap: u32) -> LStr {
+        Self::alloc_with_hint(content, cap, content.is_ascii())
+    }
+
+    /// Reuse representation metadata when copying an engine string. A conservative false
+    /// hint is valid; never rescan a growing prefix just to rediscover that it is ASCII.
+    fn alloc_with_hint(content: &str, cap: u32, ascii: bool) -> LStr {
         debug_assert!(content.len() <= cap as usize);
-        debug_assert!(cap & ASCII_HINT == 0, "capacity claims the hint bit");
+        assert!(cap & ASCII_HINT == 0, "capacity claims the hint bit");
+        debug_assert!(!ascii || content.is_ascii());
         unsafe {
             let p = alloc(layout(cap)) as *mut Header;
             let p = NonNull::new(p).expect("allocation failed");
             // The hint holds for `content`; constructors that append more bytes afterwards
             // re-AND it with the extra bytes' ASCII-ness (see concat2/concat_grown).
-            let hint = if content.is_ascii() { ASCII_HINT } else { 0 };
+            let hint = if ascii { ASCII_HINT } else { 0 };
             p.as_ptr().write(Header {
                 strong: Cell::new(1),
                 len: Cell::new(content.len() as u32),
@@ -216,6 +223,10 @@ impl LStr {
     /// is what makes the mutation invisible: no other handle can observe the content, and the
     /// caller must not hold a `&str` borrow of `self` across the call (enforced by `&mut self`).
     pub fn append_in_place(&mut self, x: &str) -> bool {
+        self.append_with_hint(x, x.is_ascii())
+    }
+
+    fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
         let h = self.hdr();
         if h.strong.get() != 1 {
             return false;
@@ -229,25 +240,53 @@ impl LStr {
             std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(len), x.len());
         }
         h.len.set((len + x.len()) as u32);
-        self.and_ascii(x.is_ascii());
+        self.and_ascii(ascii);
         true
     }
 
     /// `self + x` with growth capacity: used by the fused append ops when in-place didn't apply.
     /// Doubles (at least) so a rebuilt accumulator amortizes the next appends.
     pub fn concat_grown(&self, x: &str) -> LStr {
-        let need = self.as_str().len() + x.len();
-        let cap = u32::try_from((need * 2).max(32))
-            .unwrap_or(ASCII_HINT - 1)
-            .min(ASCII_HINT - 1); // the top bit is the ASCII hint, never capacity
-        let s = LStr::alloc(self.as_str(), cap.max(need as u32));
+        self.grow_with_hint(x, x.is_ascii())
+    }
+
+    fn grow_with_hint(&self, x: &str, ascii: bool) -> LStr {
+        let need = self.len().checked_add(x.len()).expect("string too large");
+        assert!(need < ASCII_HINT as usize, "string too large");
+        let cap = need
+            .saturating_mul(2)
+            .max(32)
+            .min((ASCII_HINT - 1) as usize) as u32;
+        let s = LStr::alloc_with_hint(self.as_str(), cap, self.ascii_hint());
         unsafe {
             let data = (s.p.as_ptr() as *mut u8).add(HDR);
             std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(self.as_str().len()), x.len());
         }
         s.hdr().len.set(need as u32);
-        s.and_ascii(x.is_ascii());
+        s.and_ascii(ascii);
         s
+    }
+
+    /// ECMAScript code-unit concatenation after the caller's coercions and length check.
+    /// Shared by all execution tiers and String#concat. Cached ASCII hints eliminate prefix
+    /// rescans; moving the left handle also permits amortized appends to unique temporaries.
+    /// Aliases (including `s + s`) keep the strong count above one and force a separate buffer.
+    pub(crate) fn concat_owned(mut self, right: &LStr) -> LStr {
+        if right.is_empty() {
+            return self;
+        }
+        if self.is_empty() {
+            return right.clone();
+        }
+        if !self.ascii_hint() && !right.ascii_hint() && crate::jstr::needs_join_fixup(&self, right)
+        {
+            return crate::jstr::concat(&self, right).into();
+        }
+        if self.append_with_hint(right.as_str(), right.ascii_hint()) {
+            self
+        } else {
+            self.grow_with_hint(right.as_str(), right.ascii_hint())
+        }
     }
 
     /// Repeat the byte representation directly into one engine allocation.
@@ -455,5 +494,60 @@ impl From<&LStr> for std::rc::Rc<str> {
 impl From<LStr> for std::rc::Rc<str> {
     fn from(s: LStr) -> std::rc::Rc<str> {
         std::rc::Rc::from(s.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_concat_reuses_unique_capacity_and_preserves_aliases() {
+        let mut s = LStr::from("a").concat_owned(&LStr::from("b"));
+        let p = s.as_ptr();
+        s = s.concat_owned(&LStr::from("c"));
+        assert_eq!(s.as_ptr(), p);
+        assert_eq!(s.as_str(), "abc");
+        assert!(s.ascii_hint());
+        let alias = s.clone();
+        s = s.concat_owned(&LStr::from("d"));
+        assert!(!LStr::ptr_eq(&s, &alias));
+        assert_eq!(alias.as_str(), "abc");
+        assert_eq!(s.as_str(), "abcd");
+        let right = s.clone();
+        s = s.concat_owned(&right);
+        assert_eq!(right.as_str(), "abcd");
+        assert_eq!(s.as_str(), "abcdabcd");
+    }
+
+    #[test]
+    fn owned_concat_retains_conservative_hints_and_clears_for_unicode() {
+        let s = LStr::alloc_with_hint("abc", 3, false);
+        let s = s.concat_owned(&LStr::from("d"));
+        assert!(!s.ascii_hint(), "growth must not rescan the prefix");
+        assert_eq!(s.as_str(), "abcd");
+        let s = LStr::from("abc").concat_owned(&LStr::alloc_with_hint("d", 1, false));
+        assert!(!s.ascii_hint(), "right hint must also be preserved");
+        let s = LStr::from("a").concat_owned(&LStr::from("b"));
+        let p = s.as_ptr();
+        let s = s.concat_owned(&LStr::from("é"));
+        assert_eq!(s.as_ptr(), p);
+        assert!(!s.ascii_hint());
+        assert_eq!(s.as_str(), "abé");
+    }
+
+    #[test]
+    fn owned_concat_empty_and_surrogate_boundaries() {
+        let s = LStr::from("abc");
+        let p = s.as_ptr();
+        let s = s.concat_owned(&LStr::from(""));
+        assert_eq!(s.as_ptr(), p);
+        assert!(LStr::ptr_eq(&LStr::from("").concat_owned(&s), &s));
+        let high = LStr::from(crate::jstr::from_units(&[0xD834]));
+        let low = LStr::from(crate::jstr::from_units(&[0xDF06]));
+        assert_eq!(high.concat_owned(&low).as_str(), "𝌆");
+        assert_eq!(std::mem::size_of::<LStr>(), std::mem::size_of::<usize>());
+        assert_eq!(LEN_OFF, std::mem::size_of::<usize>());
+        assert_eq!(CAP_OFF, LEN_OFF + 4);
     }
 }

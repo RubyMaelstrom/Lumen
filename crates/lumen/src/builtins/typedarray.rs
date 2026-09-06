@@ -1068,7 +1068,10 @@ fn ta_native(
                 (k, -1, -1)
             } else {
                 let k = if from >= 0.0 {
-                    from as i64
+                    // ToClampedIndex (ECMA-262 e28783d5, spec.html:5841/42775):
+                    // fromIndex >= length, including +Infinity, performs no search. Without
+                    // this clamp the equality-terminated loop can step away from its end.
+                    from.min(len as f64) as i64
                 } else {
                     (len as f64 + from).max(0.0) as i64
                 };

@@ -223,6 +223,11 @@ impl PackedValue {
         }
     }
 
+    #[inline]
+    fn object(&self) -> Option<Gc> {
+        (self.tag() == PACK_OBJ).then(|| unsafe { self.clone_word() })
+    }
+
     /// Consume the packed owner without a refcount round trip. Pointer payload bits become the
     /// returned `Value`'s ownership; `ManuallyDrop` prevents this container from releasing them.
     pub(crate) fn into_value(self) -> Value {
@@ -1112,9 +1117,9 @@ pub struct Object {
     pub(crate) ic_plain: Cell<bool>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
-    /// GC scratch: mark bit and internal-reference count while collection runs. Between
-    /// collections `gc_internal` holds this object's weak-registry slot; the collector restores
-    /// every slot before sweeping can drop an object.
+    /// GC scratch: internal-reference count during root classification, then snapshot index
+    /// during marking. Between collections this holds the object's weak-registry slot; the
+    /// collector restores every slot before sweeping can drop an object.
     pub(crate) gc_mark: Cell<bool>,
     pub(crate) gc_internal: Cell<u32>,
     /// Opt-in central-heap identity used during the `heap-bridge` migration. The existing Rc
@@ -1939,6 +1944,14 @@ impl Property {
     #[inline]
     pub(crate) fn value(&self) -> Value {
         self.packed.unpack()
+    }
+    #[inline]
+    pub(crate) fn object_value(&self) -> Option<Gc> {
+        self.packed.object()
+    }
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.packed.tag() == PACK_EMPTY
     }
     #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
@@ -3327,6 +3340,23 @@ impl Props {
     /// then on (an emptied-but-once-large map keeps using it).
     #[inline(always)]
     fn find(&self, key: &str) -> Option<usize> {
+        // Every classic dense element already records its entry slot. This must serve mutable
+        // lookups, replacement, deletion and slot ICs as well as reads: array maps deliberately
+        // omit a redundant numeric-key hash index, so scanning here made those operations linear
+        // in the number of elements. Packed elements have no entry slot and are handled by the
+        // caller. With no far insertion, a sidecar miss proves that no named entry can contain
+        // this canonical index (the same invariant used by `get`).
+        if let Some(n) = canonical_index(key) {
+            if let Some(&slot) = self.elems.get(n as usize).filter(|&&slot| slot != NO_SLOT) {
+                debug_assert!(
+                    matches!(self.entries.get(slot as usize), Some((k, _)) if &**k == key)
+                );
+                return Some(slot as usize);
+            }
+            if !self.has_far.get() {
+                return None;
+            }
+        }
         // `length` and `prototype` are the hottest keys in array-heavy / allocation-heavy code
         // (every push/pop/length read; every `new`); their slots are memoized — answer without
         // hashing or scanning.
@@ -3766,7 +3796,7 @@ impl Props {
             .packed_ref()
             .into_iter()
             .flat_map(|p| p.iter())
-            .filter(|p| !matches!(p.value(), Value::Empty))
+            .filter(|p| !p.is_empty())
             .chain(self.entries.fields.iter())
     }
 
@@ -3777,7 +3807,7 @@ impl Props {
             .packed_ref()
             .into_iter()
             .flat_map(|properties| properties.iter())
-            .filter(|property| !matches!(property.value(), Value::Empty))
+            .filter(|property| !property.is_empty())
     }
 
     pub(crate) fn highest_nonconfig_index_from(&self, from: usize) -> Option<usize> {

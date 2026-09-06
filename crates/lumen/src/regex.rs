@@ -1671,7 +1671,7 @@ fn fold_orbit(u: u32) -> impl Iterator<Item = u32> {
 
 /// The JS WhiteSpace + LineTerminator set: includes U+FEFF and NBSP, but NOT U+0085 (NEL) or
 /// other control characters Rust's `is_whitespace` accepts.
-fn js_whitespace(c: char) -> bool {
+pub(crate) fn js_whitespace(c: char) -> bool {
     matches!(
         c,
         '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'

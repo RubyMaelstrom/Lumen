@@ -5020,15 +5020,12 @@ impl Interp {
         }
         // Take the slot's handle and release the stack copy: unique unless shared elsewhere
         // (then the grow-copy path runs once and the rebuilt handle is unique from here on).
-        let mut cur = match p.take_value() {
+        let cur = match p.take_value() {
             Value::Str(s) => s,
             _ => unreachable!("checked above"),
         };
         drop(lval);
-        if !cur.append_in_place(x) {
-            cur = cur.concat_grown(x);
-        }
-        p.set_value(Value::Str(cur));
+        p.set_value(Value::Str(cur.concat_owned(x)));
         Ok(())
     }
 
@@ -6748,6 +6745,13 @@ impl Interp {
     /// cache entirely (the O(len) walk is trivial; caching them would just churn the LRU under
     /// code that touches thousands of small strings once each).
     pub(crate) fn units_of(&mut self, s: &crate::lstr::LStr) -> StrUnits {
+        // An ASCII byte already is its UTF-16 code unit (ECMA-262 String type).
+        // No derived representation needs caching. Besides avoiding prefix scans, bypassing
+        // the owning LRU keeps metadata/character reads from pinning an otherwise unique
+        // accumulator and forcing its next append to copy the entire prefix.
+        if s.ascii_hint() {
+            return StrUnits::Ascii;
+        }
         if s.len() < 64 {
             return if s.is_ascii() {
                 StrUnits::Ascii
@@ -6949,7 +6953,9 @@ impl Interp {
     }
 
     fn push_property_objects(property: &Property, refs: &mut Vec<Gc>) {
-        Self::push_value_object(&property.value(), refs);
+        if let Some(object) = property.object_value() {
+            refs.push(object);
+        }
         if let Some(getter) = property.getter() {
             Self::push_value_object(getter, refs);
         }
@@ -6965,7 +6971,7 @@ impl Interp {
             refs.push(p.clone());
         }
         for prop in b.props.values() {
-            if let Value::Obj(p) = prop.value() {
+            if let Some(p) = prop.object_value() {
                 refs.push(p);
             }
             if let Some(Value::Obj(p)) = prop.getter() {
@@ -7106,6 +7112,14 @@ impl Interp {
     }
 
     fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
+        self.gc_collect_with_edge_budget(cause, crate::gc_edges::EDGE_CACHE_BYTES);
+    }
+
+    pub(crate) fn gc_collect_with_edge_budget(
+        &mut self,
+        cause: crate::value::GcCause,
+        edge_budget: usize,
+    ) {
         let performance_started = crate::value::gc_performance_metrics_start();
         let live = crate::value::heap_gc_snapshot(&self.gc_heap);
         // Scopes are graph nodes too: a closure's captured environment references objects (its
@@ -7129,18 +7143,24 @@ impl Interp {
         }
         let mut object_refs = Vec::new();
         let mut scope_refs = Vec::new();
+        let mut edge_cache = crate::gc_edges::GcEdgeCache::new(live.len(), edge_budget);
         for o in &live {
             self.obj_refs_into(o, &mut object_refs);
-            for p in object_refs.drain(..) {
-                let pb = p.borrow();
-                pb.gc_internal.set(pb.gc_internal.get() + 1);
-            }
             self.obj_scope_refs_into(o, &mut scope_refs);
-            for e in scope_refs.drain(..) {
-                if let Some(&k) = sidx.get(&(Rc::as_ptr(&e) as usize)) {
-                    s_internal[k] += 1;
+            let cached = edge_cache.prepare(object_refs.len(), scope_refs.len());
+            // A retained scratch handle is an extra collector-owned edge, NOT an external
+            // root. Count both it and the actual graph edge before comparing strong counts.
+            let owners = if cached { 2 } else { 1 };
+            for p in &object_refs {
+                let pb = p.borrow();
+                pb.gc_internal.set(pb.gc_internal.get() + owners);
+            }
+            for e in &scope_refs {
+                if let Some(&k) = sidx.get(&(Rc::as_ptr(e) as usize)) {
+                    s_internal[k] += owners;
                 }
             }
+            edge_cache.record(cached, &mut object_refs, &mut scope_refs, &sidx);
         }
         for e in &scopes {
             let b = e.borrow();
@@ -7299,6 +7319,13 @@ impl Interp {
             }
         }
 
+        // The reference counts are no longer needed after root classification/debug dumping.
+        // Reuse that scratch word to locate cached edges without another per-node hash lookup.
+        // The strong heap snapshot keeps every object alive until registry slots are restored.
+        for (index, object) in live.iter().enumerate() {
+            object.borrow().gc_internal.set(index as u32);
+        }
+
         // Root classification is complete, so temporary clones can no longer distort it. These
         // compact groups let either an intrinsic object or its global scope activate the realm in
         // time proportional to that realm's intrinsic set.
@@ -7359,19 +7386,40 @@ impl Interp {
         // until the owner and key have independently acquired a mark.
         loop {
             if let Some(o) = stack.pop() {
-                self.obj_refs_into(&o, &mut object_refs);
-                for p in object_refs.drain(..) {
-                    if !p.borrow().gc_mark.get() {
-                        p.borrow().gc_mark.set(true);
-                        stack.push(p);
+                let index = o.borrow().gc_internal.get() as usize;
+                let cached = live
+                    .get(index)
+                    .filter(|entry| Rc::ptr_eq(entry, &o))
+                    .and_then(|_| edge_cache.get(index));
+                if let Some((objects, scopes)) = cached {
+                    for p in objects {
+                        if !p.borrow().gc_mark.get() {
+                            p.borrow().gc_mark.set(true);
+                            stack.push(p.clone());
+                        }
                     }
-                }
-                self.obj_scope_refs_into(&o, &mut scope_refs);
-                for e in scope_refs.drain(..) {
-                    if let Some(&k) = sidx.get(&(Rc::as_ptr(&e) as usize)) {
-                        if !s_mark[k] {
-                            s_mark[k] = true;
-                            sstack.push(e);
+                    for (k, e) in scopes {
+                        if !s_mark[*k] {
+                            s_mark[*k] = true;
+                            sstack.push(e.clone());
+                        }
+                    }
+                } else {
+                    // Budget overflow or a foreign-heap object: preserve the original trace.
+                    self.obj_refs_into(&o, &mut object_refs);
+                    for p in object_refs.drain(..) {
+                        if !p.borrow().gc_mark.get() {
+                            p.borrow().gc_mark.set(true);
+                            stack.push(p);
+                        }
+                    }
+                    self.obj_scope_refs_into(&o, &mut scope_refs);
+                    for e in scope_refs.drain(..) {
+                        if let Some(&k) = sidx.get(&(Rc::as_ptr(&e) as usize)) {
+                            if !s_mark[k] {
+                                s_mark[k] = true;
+                                sstack.push(e);
+                            }
                         }
                     }
                 }
@@ -7487,6 +7535,7 @@ impl Interp {
         // `gc_internal` doubles as the O(1) weak-registry slot outside collection. Restore it
         // before the sweep clears any property/side-table edge that could drop an object.
         crate::value::gc_restore_registry_slots(&self.gc_heap);
+        drop(edge_cache);
 
         let garbage_objects: crate::fasthash::FastSet<usize> = live
             .iter()

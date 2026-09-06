@@ -26,6 +26,8 @@ mod builtins;
 pub mod bytecode;
 mod cache;
 mod coroutine;
+#[cfg(test)]
+mod dense_slot_tests;
 mod eval;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
 /// per JS object/scope) run 15-30% faster than on the system allocator. NOT registered here: a
@@ -36,6 +38,7 @@ mod eval;
 pub mod fastalloc;
 mod fasthash;
 mod feedback;
+mod gc_edges;
 mod heap;
 mod host;
 mod interpreter;
@@ -58,9 +61,13 @@ mod regex_fold;
 #[cfg(test)]
 mod shared_layout_tests;
 mod snapshot;
+#[cfg(test)]
+mod string_concat_tests;
 mod tagged;
 mod temporal;
 mod token;
+#[cfg(test)]
+mod typedarray_search_tests;
 mod tz;
 #[rustfmt::skip]
 mod tzdata;
