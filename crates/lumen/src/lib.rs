@@ -55,6 +55,8 @@ mod parser;
 mod regex;
 mod regex_emoji;
 mod regex_fold;
+#[cfg(test)]
+mod shared_layout_tests;
 mod snapshot;
 mod tagged;
 mod temporal;
@@ -1098,10 +1100,10 @@ impl Engine {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tail_tests;
+mod call_guard_tests;
 #[cfg(test)]
 mod entry_tests;
 #[cfg(test)]
-mod call_guard_tests;
+mod tail_tests;
+#[cfg(test)]
+mod tests;

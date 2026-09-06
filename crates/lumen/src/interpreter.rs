@@ -1427,12 +1427,17 @@ pub struct Interp {
     /// caches, validated by the same epoch. The `Weak` pins the callee's address against
     /// recycling (ABA), exactly like `Chunk::call_pins`.
     construct_ics: crate::fasthash::FastMap<usize, ConstructIc>,
-    /// Small final named-map sizes learned from successful ordinary construction, keyed and
+    /// Small ordered key layouts learned from successful ordinary construction, keyed and
     /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
-    /// wrappers), so their fresh instances can reserve enough slots for creation-IC appends.
-    pub(crate) construct_capacity_hints:
-        crate::fasthash::FastMap<usize, (std::rc::Weak<RefCell<crate::value::Object>>, u8)>,
+    /// wrappers), so fresh instances share keys and reserve slots for creation-IC appends.
+    pub(crate) construct_capacity_hints: crate::fasthash::FastMap<
+        usize,
+        (
+            std::rc::Weak<RefCell<crate::value::Object>>,
+            crate::value::PropertyLayout,
+        ),
+    >,
     /// `Symbol.iterator`, cached so the iterator protocol can look up `obj[@@iterator]` cheaply.
     pub(crate) iterator_sym: Option<Rc<SymbolData>>,
     /// Well-known symbols, minted once per Interp — additional realms (`$262.createRealm()`) reuse
@@ -4762,8 +4767,15 @@ impl Interp {
                 || (matches!(rb.exotic, Exotic::StrWrap(_)) && non_digit);
             if recv_shape_ok && rb.ic_plain.get() && rb.props.shape() == st.recv_shape {
                 if depth == 0 {
-                    if let Some((k, p)) = rb.props.entry_at(st.slot as usize) {
-                        if (!keychk || &**k == name) && !p.accessor() {
+                    let property = if keychk {
+                        rb.props
+                            .entry_at(st.slot as usize)
+                            .and_then(|(key, p)| (&**key == name).then_some(p))
+                    } else {
+                        rb.props.property_at(st.slot as usize)
+                    };
+                    if let Some(p) = property {
+                        if !p.accessor() {
                             return Some(p.value());
                         }
                     }
@@ -4790,8 +4802,15 @@ impl Interp {
                         || (keychk && matches!(hb.exotic, Exotic::Array));
                     if holder_exotic_ok && hb.ic_plain.get() && hb.props.shape() == st.holder_shape
                     {
-                        if let Some((k, p)) = hb.props.entry_at(st.slot as usize) {
-                            if (!keychk || &**k == name) && !p.accessor() {
+                        let property = if keychk {
+                            hb.props
+                                .entry_at(st.slot as usize)
+                                .and_then(|(key, p)| (&**key == name).then_some(p))
+                        } else {
+                            hb.props.property_at(st.slot as usize)
+                        };
+                        if let Some(p) = property {
+                            if !p.accessor() {
                                 return Some(p.value());
                             }
                         }
@@ -4842,7 +4861,7 @@ impl Interp {
                 }
                 absent_ok = absent_ok && matches!(b.exotic, Exotic::None);
                 if let Some(slot) = b.props.slot_of(name) {
-                    let (_, p) = b.props.entry_at(slot).unwrap();
+                    let p = b.props.property_at(slot).unwrap();
                     if p.accessor() {
                         return None; // getter — must run through [[Get]]
                     }
@@ -5033,7 +5052,7 @@ impl Interp {
         for k in 0..crate::bytecode::PROP_IC_WAYS {
             let st = self.ic_way(cache, k).get();
             if st.depth == 0 && b.props.shape() == st.recv_shape {
-                if let Some((_, p)) = b.props.entry_at(st.slot as usize) {
+                if let Some(p) = b.props.property_at(st.slot as usize) {
                     if !p.accessor() && p.writable() {
                         b.props
                             .entry_at_mut(st.slot as usize)
@@ -5053,7 +5072,7 @@ impl Interp {
             let shape = b.props.shape();
             if let Some(e) = self.stub_cache_get(shape, name) {
                 if e.st.recv_shape == shape && e.st.depth == 0 {
-                    if let Some((_, p)) = b.props.entry_at(e.st.slot as usize) {
+                    if let Some(p) = b.props.property_at(e.st.slot as usize) {
                         if !p.accessor() && p.writable() {
                             b.props
                                 .entry_at_mut(e.st.slot as usize)
@@ -5096,7 +5115,7 @@ impl Interp {
         }
         match b.props.slot_of(name) {
             Some(slot) => {
-                let p = &b.props.entry_at(slot).unwrap().1;
+                let p = b.props.property_at(slot).unwrap();
                 if p.accessor() || !p.writable() {
                     return false; // setter, or non-writable (strict-throw) — slow path
                 }
@@ -5172,7 +5191,7 @@ impl Interp {
                     return false;
                 }
                 if let Some(slot) = hb.props.slot_of(name) {
-                    let inherited = &hb.props.entry_at(slot).unwrap().1;
+                    let inherited = hb.props.property_at(slot).unwrap();
                     if inherited.accessor() || !inherited.writable() {
                         return false;
                     }
@@ -9011,27 +9030,33 @@ impl Interp {
     /// # Safety
     /// Same contract as `call_jit_cached`: `args..args+argc` must be live operand-stack values
     /// the caller forgets on `Some`.
-    fn learned_construct_capacity(&self, constructor: &Gc) -> usize {
+    fn learned_construct_layout(&self, constructor: &Gc) -> Option<crate::value::PropertyLayout> {
         let key = Rc::as_ptr(constructor) as usize;
         self.construct_capacity_hints
             .get(&key)
-            .and_then(|(pin, capacity)| {
-                (pin.as_ptr() == Rc::as_ptr(constructor)).then_some(*capacity as usize)
+            .and_then(|(pin, layout)| {
+                (pin.as_ptr() == Rc::as_ptr(constructor)).then(|| layout.clone())
             })
-            .unwrap_or(0)
     }
 
     fn observe_construct_capacity(&mut self, constructor: &Gc, instance: &Gc) {
-        let observed = instance.borrow().props.observed_instance_capacity();
+        let instance = instance.borrow();
+        let observed = instance.props.observed_instance_capacity();
         if observed == 0 {
             return;
         }
         let key = Rc::as_ptr(constructor) as usize;
-        if let Some((_, capacity)) = self.construct_capacity_hints.get_mut(&key) {
-            *capacity = (*capacity).max(observed as u8);
+        let layout = instance
+            .props
+            .shared_layout()
+            .expect("non-empty instance layout");
+        if let Some((_, cached)) = self.construct_capacity_hints.get_mut(&key) {
+            if cached.len() < observed {
+                *cached = layout.clone();
+            }
         } else if self.construct_capacity_hints.len() < 65536 {
             self.construct_capacity_hints
-                .insert(key, (Rc::downgrade(constructor), observed as u8));
+                .insert(key, (Rc::downgrade(constructor), layout.clone()));
         }
     }
 
@@ -9209,6 +9234,14 @@ impl Interp {
                 .expect("initializer plan checked above");
             chunk.note_forwarded_capacity(plan.len());
             let mut object = this.borrow_mut();
+            let empty_receiver = object.props.shape() == 0;
+            let initialized_layout =
+                empty_receiver && initializer_chunk.initializer_layout().is_some();
+            if empty_receiver {
+                if let Some(layout) = initializer_chunk.instance_layout() {
+                    object.props.predict_empty_layout(layout);
+                }
+            }
             for field in 0..plan.len() {
                 let (slot, default, name, _) = initializer_chunk.jit_initializer_field(plan, field);
                 let value = if slot < argc {
@@ -9223,13 +9256,27 @@ impl Interp {
                 } else {
                     default.cloned().unwrap_or(Value::Undefined)
                 };
-                object
-                    .props
-                    .append_proven_plain(name.clone(), Property::plain(value));
+                if initialized_layout {
+                    object
+                        .props
+                        .append_initialized_field(name, Property::plain(value));
+                } else {
+                    object
+                        .props
+                        .append_proven_plain(name, Property::plain(value));
+                }
             }
             object
                 .props
                 .finish_proven_plain_shape(shapes[plan.len() - 1]);
+            if empty_receiver {
+                initializer_chunk.note_initializer_layout(
+                    object
+                        .props
+                        .shared_layout()
+                        .expect("created initializer fields"),
+                );
+            }
             drop(object);
             drop_args();
             return Some(Ok(Value::Undefined));
@@ -9390,9 +9437,7 @@ impl Interp {
         let proto = {
             let b = o.borrow();
             let property = if b.props.shape() == prototype_shape {
-                b.props
-                    .entry_at(prototype_slot as usize)
-                    .map(|(_, property)| property)
+                b.props.property_at(prototype_slot as usize)
             } else {
                 b.props.get("prototype")
             };
@@ -9409,14 +9454,27 @@ impl Interp {
         // A non-zero chunk hint is already the exact straight-line `this.x = ...` prefix that
         // dominates ordinary constructors. Avoid two constructor-identity hash probes per
         // allocation (read learned hint now, observe/write it after return) in that common case.
-        // Dynamic/forwarding constructors have a zero static hint and retain the learned path.
-        let instance_capacity = if static_capacity != 0 {
-            static_capacity
+        // Dynamic/forwarding constructors without a static key layout retain the learned path.
+        // Guarded forwarding plans select their initializer's layout after resolving the live
+        // method. The wrapper chunk may be shared by closures with different initializers.
+        // Its existing capacity hint is enough here; avoid both identity-table probes per new.
+        let forwarded_reservation = arguments_apply_forwarder && chunk.has_forwarded_capacity();
+        let instance_layout = if forwarded_reservation {
+            None
         } else {
-            self.learned_construct_capacity(o)
+            chunk
+                .instance_layout()
+                .cloned()
+                .or_else(|| self.learned_construct_layout(o))
         };
+        let instance_capacity =
+            static_capacity.max(instance_layout.as_ref().map_or(0, |keys| keys.len()));
         let proto_ptr = Rc::as_ptr(&proto) as usize;
-        let this = crate::value::Object::new_with_capacity(Some(proto), instance_capacity);
+        let this = crate::value::Object::new_with_parts(
+            Some(proto),
+            crate::value::Props::with_layout(instance_capacity, instance_layout),
+            crate::value::Exotic::None,
+        );
         let this_val = Value::Obj(this.clone());
         // --- committed: identical shape to call_jit_cached's committed path ---
         self.depth += 1;
@@ -9495,6 +9553,7 @@ impl Interp {
             };
             if let Some(shapes) = shapes {
                 let mut object = this.borrow_mut();
+                let initialized_layout = chunk.initializer_layout().is_some();
                 for field in 0..simple.len() {
                     let (slot, name, _) = simple.field(field);
                     let value = if slot < argc {
@@ -9505,13 +9564,21 @@ impl Interp {
                     } else {
                         Value::Undefined
                     };
-                    object
-                        .props
-                        .append_proven_plain(name.clone(), Property::plain(value));
+                    if initialized_layout {
+                        object
+                            .props
+                            .append_initialized_field(name, Property::plain(value));
+                    } else {
+                        object
+                            .props
+                            .append_proven_plain(name, Property::plain(value));
+                    }
                 }
                 object
                     .props
                     .finish_proven_plain_shape(shapes[simple.len() - 1]);
+                chunk
+                    .note_initializer_layout(object.props.shared_layout().expect("created fields"));
                 drop(object);
                 unsafe {
                     for k in 0..argc {
@@ -9608,7 +9675,7 @@ impl Interp {
             }
         }
         self.depth -= 1;
-        if r.is_ok() && static_capacity == 0 {
+        if r.is_ok() && chunk.instance_layout().is_none() && !forwarded_reservation {
             self.observe_construct_capacity(o, &this);
         }
         // A constructor explicitly returning an object overrides the instance.
@@ -9665,7 +9732,7 @@ impl Interp {
         let (prototype_shape, prototype_slot) = {
             let b = o.borrow();
             let slot = b.props.slot_of("prototype")?;
-            let (_, property) = b.props.entry_at(slot)?;
+            let property = b.props.property_at(slot)?;
             if property.accessor() || !matches!(property.value(), Value::Obj(_)) {
                 return None;
             }
@@ -10015,7 +10082,10 @@ impl Interp {
                     let _ = func.code.set(compiled);
                 }
             }
-            if let Some(chunk) = func.code2.get().or_else(|| func.code.get())
+            if let Some(chunk) = func
+                .code2
+                .get()
+                .or_else(|| func.code.get())
                 .and_then(Option::as_ref)
                 .filter(|chunk| !chunk.prepared_entry && (!is_construct || !chunk.has_tail_calls()))
             {
@@ -10056,8 +10126,13 @@ impl Interp {
         // Debug: `LUMEN_AST_HOT=1` reports functions whose bodies keep executing on the
         // tree-walker (each time the per-function call count crosses a power of ten).
         static AST_HOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !func.code.get().and_then(Option::as_ref).is_some_and(|chunk| chunk.prepared_entry)
-            && *AST_HOT.get_or_init(|| std::env::var_os("LUMEN_AST_HOT").is_some()) {
+        if !func
+            .code
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|chunk| chunk.prepared_entry)
+            && *AST_HOT.get_or_init(|| std::env::var_os("LUMEN_AST_HOT").is_some())
+        {
             let n = func.calls.get().saturating_add(1);
             func.calls.set(n);
             if n >= 1000 && (n == 1000 || n == 10_000 || n == 100_000 || n == 1_000_000) {
@@ -10287,8 +10362,14 @@ impl Interp {
         // parameters/defaults/destructuring, mapped arguments, self-name and hoisted closures
         // execute once. Only body evaluation changes tier. Its chunk reuses these live bindings
         // rather than constructing a second activation or replaying initializers.
-        if !matches!(self.tier, crate::bytecode::Tier::Interp) && !is_construct && allow_compiled_body {
-            if let Some(chunk) = func.code.get().and_then(Option::as_ref)
+        if !matches!(self.tier, crate::bytecode::Tier::Interp)
+            && !is_construct
+            && allow_compiled_body
+        {
+            if let Some(chunk) = func
+                .code
+                .get()
+                .and_then(Option::as_ref)
                 .filter(|chunk| chunk.prepared_entry)
             {
                 let this_value = if chunk.needs_frame_this() {
@@ -11007,8 +11088,13 @@ impl Interp {
                     }
                 };
                 let ctor_key = Rc::as_ptr(&obj) as usize;
-                let learned_capacity = self.learned_construct_capacity(&obj);
-                let this = Object::new_with_capacity(proto, learned_capacity);
+                let layout = self.learned_construct_layout(&obj);
+                let capacity = layout.as_ref().map_or(0, |keys| keys.len());
+                let this = Object::new_with_parts(
+                    proto,
+                    crate::value::Props::with_layout(capacity, layout),
+                    crate::value::Exotic::None,
+                );
                 let this_val = Value::Obj(this.clone());
                 self.pending_new_target = new_target.clone();
                 // Class constructors run field initializers (and, when derived, defer `this` setup

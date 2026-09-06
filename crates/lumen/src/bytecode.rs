@@ -907,9 +907,15 @@ pub struct Chunk {
     /// `new` uses this to reserve the instance property vector exactly once; it costs no bytes
     /// per object and avoids retaining geometric-growth slack.
     instance_capacity_hint: u8,
+    /// Predicted ordered keys only: reserving this layout does not create any own properties.
+    instance_layout: Option<crate::value::PropertyLayout>,
     /// Field count learned from a structurally proven `initialize.apply(this, arguments)`
     /// forwarder. Once set it is as stable as the immutable forwarding/initializer chunks.
     forwarded_capacity_hint: std::cell::Cell<u8>,
+    /// Key-only prediction learned from this chunk's guarded initializer plan. Forwarding
+    /// closures may share a wrapper chunk while selecting different initializers, so the keys
+    /// belong to the initializer, not the wrapper. Live plan guards remain authoritative.
+    initializer_layout: std::cell::OnceCell<crate::value::PropertyLayout>,
     /// Inner function templates for `MakeClosure`.
     funcs: Vec<Rc<Function>>,
     /// Tagged-template sites retained by the chunk. Each entry carries the Parse Node identity
@@ -1010,12 +1016,20 @@ pub struct Chunk {
 
 impl Chunk {
     pub(crate) fn has_tail_calls(&self) -> bool {
-        self.ops.iter().any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray))
+        self.ops
+            .iter()
+            .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray))
     }
     /// Scan the directly-owned bytecode/feedback payload. Shared AST nodes, Functions, strings,
     /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
     /// allocation-family visitor for identity deduplication.
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
+        if let Some(layout) = &self.instance_layout {
+            visitor.property_layout(layout);
+        }
+        if let Some(layout) = self.initializer_layout.get() {
+            visitor.property_layout(layout);
+        }
         refresh_current_layout_feedback(&self.feedback, &self.feedback_shapes, &self.caches);
         macro_rules! vec_bytes {
             ($field:ident, $ty:ty) => {
@@ -1375,9 +1389,25 @@ impl Chunk {
         self.instance_capacity_hint
             .max(self.forwarded_capacity_hint.get()) as usize
     }
+    pub(crate) fn instance_layout(&self) -> Option<&crate::value::PropertyLayout> {
+        self.initializer_layout
+            .get()
+            .or(self.instance_layout.as_ref())
+    }
     pub(crate) fn note_forwarded_capacity(&self, capacity: usize) {
         self.forwarded_capacity_hint
             .set(self.forwarded_capacity_hint.get().max(capacity as u8));
+    }
+    pub(crate) fn has_forwarded_capacity(&self) -> bool {
+        self.forwarded_capacity_hint.get() != 0
+    }
+    pub(crate) fn initializer_layout(&self) -> Option<&crate::value::PropertyLayout> {
+        self.initializer_layout.get()
+    }
+    pub(crate) fn note_initializer_layout(&self, layout: &crate::value::PropertyLayout) {
+        if self.initializer_layout.get().is_none() {
+            let _ = self.initializer_layout.set(layout.clone());
+        }
     }
     pub(crate) fn construct_cache(&self, cache: u32) -> ConstructSite {
         self.construct_caches[cache as usize].get()
@@ -4059,12 +4089,11 @@ mod feedback_layout_tests {
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, &Default::default(), None, None, false, false)
-        .or_else(|| {
-            (!func.is_async && !func.is_generator)
-                .then(|| compile_inner(func, &Default::default(), None, None, false, true))
-                .flatten()
-        });
+    let result = compile_inner(func, &Default::default(), None, None, false, false).or_else(|| {
+        (!func.is_async && !func.is_generator)
+            .then(|| compile_inner(func, &Default::default(), None, None, false, true))
+            .flatten()
+    });
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4107,7 +4136,14 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         fn_maps: std::cell::OnceCell::new(),
     };
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(&function, &Default::default(), None, Some(bindings), false, false);
+    let result = compile_inner(
+        &function,
+        &Default::default(),
+        None,
+        Some(bindings),
+        false,
+        false,
+    );
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4263,7 +4299,12 @@ fn compile_inner(
             .params
             .iter()
             .any(|param| matches!(&param.pattern, Pattern::Ident(name) if name == "arguments"));
-    if uses_arguments && !func.is_arrow && !is_coroutine && !prepared_entry && !func.params.is_empty() {
+    if uses_arguments
+        && !func.is_arrow
+        && !is_coroutine
+        && !prepared_entry
+        && !func.params.is_empty()
+    {
         log_bail("fn", "arguments with arrow/async/parameters");
         return None;
     }
@@ -4299,7 +4340,9 @@ fn compile_inner(
         if !hoisted_vars(&func.body, true, func.is_strict, &mut captured) {
             return None;
         }
-        for (name, _) in block_lets.drain(..) { runtime_lexicals.insert(name); }
+        for (name, _) in block_lets.drain(..) {
+            runtime_lexicals.insert(name);
+        }
     }
     let mut c = Compiler {
         // A module already has its own `this` binding, initialized to undefined. Reuse that
@@ -4650,6 +4693,14 @@ fn compile_inner(
                 .collect::<Vec<_>>()
         );
     }
+    let instance_layout = (instance_capacity_hint != 0).then(|| {
+        Rc::new(
+            instance_names[..instance_capacity_hint as usize]
+                .iter()
+                .map(|&name| c.names[name as usize].clone())
+                .collect(),
+        )
+    });
     Some(Rc::new(Chunk {
         prepared_entry,
         ops: c.ops,
@@ -4664,7 +4715,9 @@ fn compile_inner(
         lexical_this: c.lexical_this,
         strict: c.strict,
         instance_capacity_hint,
+        instance_layout,
         forwarded_capacity_hint: std::cell::Cell::new(0),
+        initializer_layout: std::cell::OnceCell::new(),
         funcs: c.funcs,
         templates: c.templates,
         eval_exprs: c.eval_exprs,
@@ -6570,7 +6623,13 @@ impl Compiler {
         let result = (|| {
             for statement in body {
                 self.stmt(statement)?;
-                if matches!(statement, Stmt::VarDecl { kind: DeclKind::Using | DeclKind::AwaitUsing, .. }) {
+                if matches!(
+                    statement,
+                    Stmt::VarDecl {
+                        kind: DeclKind::Using | DeclKind::AwaitUsing,
+                        ..
+                    }
+                ) {
                     self.tail_blocked = saved + 1;
                 }
             }
@@ -6631,7 +6690,9 @@ impl Compiler {
                 self.transfer_last_call()?;
                 if !shorts.is_empty() {
                     let done = self.emit(Op::Jump(0));
-                    for short in shorts { self.patch(short); }
+                    for short in shorts {
+                        self.patch(short);
+                    }
                     self.emit(Op::Undef);
                     self.patch(done);
                 }
@@ -7048,7 +7109,9 @@ impl Compiler {
                             Op::PushHandler(target) => *target = catch_pc,
                             _ => unreachable!(),
                         }
-                        self.without_tail(|compiler| compiler.catch_clause(param.as_ref(), catch_body))?;
+                        self.without_tail(|compiler| {
+                            compiler.catch_clause(param.as_ref(), catch_body)
+                        })?;
                         self.patch(after_catch);
                     } else {
                         self.push_compile_scope();
@@ -8578,7 +8641,9 @@ impl Compiler {
                         }
                     };
                 }
-                compiler.without_tail(|compiler| compiler.for_loop_core(labels, None, test, update, body, None))
+                compiler.without_tail(|compiler| {
+                    compiler.for_loop_core(labels, None, test, update, body, None)
+                })
             });
         }
         self.for_loop_core(labels, init, test, update, body, None)
@@ -11577,7 +11642,9 @@ fn run_vm(
                         let spread = pop!();
                         let mut args = stack.split_off(stack.len() - (argc as usize - 1));
                         let (iterator, next) = i.get_iterator(&spread)?;
-                        while let Some(value) = i.iterator_step(&iterator, &next)? { args.push(value); }
+                        while let Some(value) = i.iterator_step(&iterator, &next)? {
+                            args.push(value);
+                        }
                         args
                     }
                     CallArgsMode::Array => argument_array_values(i, pop!()),
@@ -14553,7 +14620,7 @@ impl Chunk {
             {
                 return None;
             }
-            let (_, p) = g.props.entry_at(ic.binding as u32 as usize)?;
+            let p = g.props.property_at(ic.binding as u32 as usize)?;
             if p.accessor() {
                 return None;
             }
@@ -14655,7 +14722,7 @@ impl Chunk {
             return None;
         }
         let slot = g.props.slot_of(&self.names[n as usize])?;
-        let (_, p) = g.props.entry_at(slot)?;
+        let p = g.props.property_at(slot)?;
         if p.accessor() {
             return None;
         }
@@ -15322,7 +15389,9 @@ impl Chunk {
             Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => (3, 1),
             Op::TailCall(mode, with_this) => {
                 let count = match mode {
-                    CallArgsMode::Fixed(count) | CallArgsMode::FinalSpread(count) => *count as usize,
+                    CallArgsMode::Fixed(count) | CallArgsMode::FinalSpread(count) => {
+                        *count as usize
+                    }
                     CallArgsMode::Array => 1,
                 };
                 (count + 1 + usize::from(*with_this), 1)
@@ -16868,6 +16937,13 @@ unsafe fn jit_new_inner(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_JIT_SET_PROP_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// Dedicated property-store entry (same contract as [`jit_exec`]): straight into
 /// [`crate::interpreter::Interp::set_prop_ic`] for the four store shapes, skipping the
 /// generic op decode — creation-heavy code (`node.value = x` on a shape that lacks the key)
@@ -16877,6 +16953,8 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     pc: u32,
     mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    #[cfg(test)]
+    TEST_JIT_SET_PROP_HELPERS.with(|count| count.set(count.get() + 1));
     let _wide_slots = unsafe { JitWideSlots::enter(ctx) };
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -17893,14 +17971,20 @@ unsafe fn jit_exec_inner(
             let args = match mode {
                 CallArgsMode::Fixed(argc) => {
                     *sp = sp.sub(argc as usize);
-                    (0..argc as usize).map(|index| sp.add(index).read()).collect()
+                    (0..argc as usize)
+                        .map(|index| sp.add(index).read())
+                        .collect()
                 }
                 CallArgsMode::FinalSpread(argc) => {
                     let spread = pop!();
                     *sp = sp.sub(argc as usize - 1);
-                    let mut args: Vec<Value> = (0..argc as usize - 1).map(|index| sp.add(index).read()).collect();
+                    let mut args: Vec<Value> = (0..argc as usize - 1)
+                        .map(|index| sp.add(index).read())
+                        .collect();
                     let (iterator, next) = i.get_iterator(&spread)?;
-                    while let Some(value) = i.iterator_step(&iterator, &next)? { args.push(value); }
+                    while let Some(value) = i.iterator_step(&iterator, &next)? {
+                        args.push(value);
+                    }
                     args
                 }
                 CallArgsMode::Array => argument_array_values(i, pop!()),

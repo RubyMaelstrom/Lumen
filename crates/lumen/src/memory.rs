@@ -406,6 +406,7 @@ pub(crate) struct Visitor {
     gc_heaps: HashSet<usize>,
     lstrs: HashSet<usize>,
     rc_strs: HashSet<usize>,
+    property_layouts: HashSet<usize>,
     symbols: HashSet<usize>,
     bigints: HashSet<usize>,
     callable_allocations: HashSet<usize>,
@@ -809,12 +810,27 @@ impl Visitor {
         }
     }
 
+    pub(crate) fn property_layout(&mut self, layout: &crate::value::PropertyLayout) {
+        if self.property_layouts.insert(Rc::as_ptr(layout) as usize) {
+            // Requested payload, like the other Rc-backed categories: one Vec header and key
+            // buffer per layout, not private allocator/refcount headers or one copy per instance.
+            self.detached_property_storage = self.detached_property_storage.saturating_add(
+                size_of::<Vec<Rc<str>>>() + layout.capacity() * size_of::<Rc<str>>(),
+            );
+            for key in layout.iter() {
+                self.rc_str(key);
+            }
+        }
+    }
+
     pub(crate) fn props(&mut self, props: &crate::value::Props) {
+        if let Some(layout) = props.shared_layout() {
+            self.property_layout(layout);
+        }
         let (bytes, exact) = props.retained_requested_storage_bytes();
         self.detached_property_storage = self.detached_property_storage.saturating_add(bytes);
         self.detached_property_storage_opaque |= !exact;
-        for (name, property) in props.iter() {
-            self.rc_str(name);
+        for (_, property) in props.iter() {
             self.value(&property.value());
             if let Some(getter) = property.getter() {
                 self.value(getter);
@@ -829,8 +845,10 @@ impl Visitor {
     }
 
     fn object(&mut self, object: &Object) -> (usize, bool) {
-        for (name, property) in object.props.iter() {
-            self.rc_str(name);
+        if let Some(layout) = object.props.shared_layout() {
+            self.property_layout(layout);
+        }
+        for (_, property) in object.props.iter() {
             let value = property.value();
             self.value(&value);
             if let Some(getter) = property.getter() {
@@ -1196,7 +1214,10 @@ fn scan_realm(
                 interp
                     .construct_capacity_hints
                     .len()
-                    .saturating_mul(size_of::<(usize, (std::rc::Weak<RefCell<Object>>, u8))>()),
+                    .saturating_mul(size_of::<(
+                        usize,
+                        (std::rc::Weak<RefCell<Object>>, crate::value::PropertyLayout),
+                    )>()),
             )
             .saturating_add(
                 interp
@@ -1207,6 +1228,9 @@ fn scan_realm(
     );
     for line in &interp.console {
         totals.interpreter_side_tables.add(line.capacity());
+    }
+    for (_, layout) in interp.construct_capacity_hints.values() {
+        visitor.property_layout(layout);
     }
     if let Some(meta) = &interp.import_meta {
         visitor.value(meta);
@@ -2154,7 +2178,29 @@ mod tests {
         let props = Props::with_capacity(17);
         let (bytes, exact) = props.retained_requested_storage_bytes();
         assert!(exact);
-        assert!(bytes >= 17 * size_of::<(Rc<str>, crate::value::Property)>());
+        assert!(bytes >= 17 * size_of::<crate::value::Property>());
+    }
+
+    #[test]
+    fn shared_property_layouts_are_counted_once_including_unused_predictions() {
+        let layout = Rc::new(vec![Rc::from("a"), Rc::from("b"), Rc::from("unused")]);
+        let mut a = Props::with_layout(1, Some(layout.clone()));
+        let mut b = Props::with_layout(2, Some(layout.clone()));
+        a.insert("a", crate::value::Property::plain(Value::Undefined));
+        b.insert("a", crate::value::Property::plain(Value::Undefined));
+        b.insert("b", crate::value::Property::plain(Value::Undefined));
+        let mut visitor = Visitor::default();
+        visitor.props(&a);
+        visitor.props(&b);
+        visitor.property_layout(&layout); // also retained by a hypothetical constructor hint
+        assert_eq!(visitor.property_layouts.len(), 1);
+        assert_eq!(visitor.rc_strs.len(), 3);
+        assert_eq!(
+            visitor.detached_property_storage,
+            3 * size_of::<crate::value::Property>()
+                + size_of::<Vec<Rc<str>>>()
+                + layout.capacity() * size_of::<Rc<str>>()
+        );
     }
 
     #[test]

@@ -388,11 +388,61 @@ mod packed_value_tests {
     fn shape_identity_exhaustion_never_wraps_or_reuses_an_id() {
         let mut shapes = ShapeTable {
             transitions: Default::default(),
+            layouts: Vec::new(),
+            cached_layouts: 0,
             next: u32::MAX - 1,
         };
         assert_eq!(shapes.fresh(), u32::MAX - 1);
         let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shapes.fresh()));
         assert!(exhausted.is_err(), "shape ids wrapped after exhaustion");
+    }
+
+    #[test]
+    fn shared_layout_cache_is_bounded_and_does_not_own_the_agent() {
+        let heap = new_gc_heap();
+        let symbols = new_symbol_agent();
+        let weak_heap = Rc::downgrade(&heap);
+        let active = enter_agent(&heap, &symbols);
+        for n in 0..SHARED_LAYOUT_CACHE_LIMIT + 32 {
+            let mut props = Props::new();
+            props.insert(format!("field{n}"), Property::plain(Value::Undefined));
+            assert!(props.contains(&format!("field{n}")));
+        }
+        let shapes = heap.shapes.borrow();
+        assert_eq!(shapes.cached_layouts, SHARED_LAYOUT_CACHE_LIMIT);
+        assert_eq!(
+            shapes.layouts.iter().filter(|s| s.is_some()).count(),
+            SHARED_LAYOUT_CACHE_LIMIT
+        );
+        assert!(shapes
+            .layouts
+            .iter()
+            .filter_map(Option::as_ref)
+            .all(|keys| keys.len() <= SHARED_LAYOUT_MAX_FIELDS));
+        drop(shapes);
+        let mut a = Props::new();
+        let mut b = Props::new();
+        for n in 0..40 {
+            a.insert(format!("late{n}"), Property::plain(Value::Num(n as f64)));
+            b.insert(
+                format!("late{n}"),
+                Property::plain(Value::Num((n + 1) as f64)),
+            );
+        }
+        assert_eq!(
+            a.shape(),
+            b.shape(),
+            "uncached layouts still retain correct shape identities"
+        );
+        a.remove("late1");
+        assert!(b.contains("late1"));
+        assert_eq!(a.keys().len(), 39);
+        drop(active);
+        drop(heap);
+        assert!(
+            weak_heap.upgrade().is_none(),
+            "layout cache retained its Agent"
+        );
     }
 
     #[cfg(feature = "heap-bridge")]
@@ -559,8 +609,15 @@ pub struct JitLayout {
     pub obj_extensible: usize,
     pub props_shape: usize,
     pub props_proto_flag: usize,
-    /// The `entries` `Vec` within `Props`.
+    /// The contiguous instance-field `Vec<Property>` within `Props`.
     pub props_entries: usize,
+    /// Nullable stored Rc pointer to the shared key Vec; live keys are its fields-length prefix.
+    pub props_layout: usize,
+    /// Stored layout Rc pointer -> the key Vec header.
+    pub layout_data_off: usize,
+    /// Owning Agent heap Rc within Object, and its stored Rc pointer -> shape-layout Vec.
+    pub obj_heap: usize,
+    pub heap_layouts: usize,
     /// The data-pointer word within a `Vec` (not necessarily offset 0 — RawVec layout is unstable).
     pub vec_ptr_off: usize,
     /// The length word within a `Vec` (probed like `vec_ptr_off`).
@@ -578,15 +635,15 @@ pub struct JitLayout {
     pub dense_packed: usize,
     /// The `mirror_flags` byte within `Props`.
     pub props_mirror_flags: usize,
-    /// `size_of::<(Rc<str>, Property)>()` — the entry stride.
+    /// `size_of::<Property>()` — the keyless instance-field stride.
     pub entry_size: usize,
-    /// `Value` within an entry `(Rc<str>, Property)`.
+    /// Packed value within a keyless instance field.
     pub entry_value: usize,
     /// Descriptor flags byte within an entry (used to test `PROP_ACCESSOR`).
     pub entry_accessor: usize,
     /// Descriptor flags byte within an entry (used to test `PROP_WRITABLE`).
     pub entry_writable: usize,
-    /// Standalone `Property` layout used by keyless packed elements (not tuple-entry offsets).
+    /// Standalone `Property` layout used by keyless packed elements.
     pub property_size: usize,
     pub property_value: usize,
     pub property_meta: usize,
@@ -609,8 +666,6 @@ pub struct JitLayout {
     pub binding_mutable: usize,
     /// `initialized` bool within a `Binding` (TDZ check).
     pub binding_init: usize,
-    /// The `Rc<str>` key within an entry `(Rc<str>, Property)` (tuple field order is unstable).
-    pub entry_key: usize,
     /// The length word within an `Rc<str>` fat pointer (0 or 8 — layout is unstable).
     pub str_len_word: usize,
     /// The pointer word within an `Rc<str>` fat pointer (the other one).
@@ -664,18 +719,51 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
 
     // Vec data-pointer and length words (RawVec layout is not guaranteed — locate them by value).
     // Capacity 3 / length 1 makes the three words distinguishable.
-    let mut v: Vec<(Rc<str>, Property)> = Vec::with_capacity(3);
-    v.push((Rc::from("p"), Property::plain(Value::Num(0.0))));
+    let mut v: Vec<Property> = Vec::with_capacity(3);
+    v.push(Property::plain(Value::Num(0.0)));
     let vptr = v.as_ptr() as usize;
     let vwords = unsafe {
         std::slice::from_raw_parts(
             &v as *const Vec<_> as *const usize,
-            std::mem::size_of::<Vec<(Rc<str>, Property)>>() / 8,
+            std::mem::size_of::<Vec<Property>>() / 8,
         )
     };
     let vec_ptr_off = vwords.iter().position(|&w| w == vptr).map(|i| i * 8);
     let vec_len_off = vwords.iter().position(|&w| w == 1).map(|i| i * 8);
     let vec_cap_off = vwords.iter().position(|&w| w == 3).map(|i| i * 8);
+    let mut keys = Vec::with_capacity(3);
+    keys.push(Rc::<str>::from("key"));
+    let key_ptr = keys.as_ptr() as usize;
+    let key_words =
+        unsafe { std::slice::from_raw_parts(&keys as *const Vec<Rc<str>> as *const usize, 3) };
+    let key_vec_ok = vec_ptr_off.is_some_and(|o| key_words[o / 8] == key_ptr)
+        && vec_len_off.is_some_and(|o| key_words[o / 8] == 1)
+        && vec_cap_off.is_some_and(|o| key_words[o / 8] == 3);
+    let key_layout = Some(Rc::new(keys));
+    let layout_word = unsafe { *(&key_layout as *const Option<PropertyLayout> as *const usize) };
+    let layout_data_off =
+        (Rc::as_ptr(key_layout.as_ref().unwrap()) as usize).wrapping_sub(layout_word);
+    let empty_layout: Option<PropertyLayout> = None;
+    let layout_ok = layout_data_off < 256
+        && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
+        && unsafe { *((layout_word + rc_strong_off) as *const usize) }
+            == Rc::strong_count(key_layout.as_ref().unwrap())
+        && unsafe { *(&empty_layout as *const Option<PropertyLayout> as *const usize) } == 0;
+    let object = sample.borrow();
+    let heap_word = unsafe { *(&object.gc_heap as *const GcHeap as *const usize) };
+    let shapes = object.gc_heap.shapes.borrow();
+    let heap_layouts =
+        (&shapes.layouts as *const Vec<Option<PropertyLayout>> as usize).wrapping_sub(heap_word);
+    let heap_vec_words = unsafe {
+        std::slice::from_raw_parts(
+            &shapes.layouts as *const Vec<Option<PropertyLayout>> as *const usize,
+            3,
+        )
+    };
+    let heap_layouts_ok = heap_layouts < 32768
+        && vec_ptr_off.is_some_and(|o| heap_vec_words[o / 8] == shapes.layouts.as_ptr() as usize)
+        && vec_len_off.is_some_and(|o| heap_vec_words[o / 8] == shapes.layouts.len())
+        && vec_cap_off.is_some_and(|o| heap_vec_words[o / 8] == shapes.layouts.capacity());
     // The element templates index a `Vec<u32>` (`Props::elems`) with the same offsets; verify the
     // layout really is per-Vec-struct, not per-element-type.
     let mut v32: Vec<u32> = Vec::with_capacity(3);
@@ -757,7 +845,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && vec_len_off.is_some()
         && vec_cap_off.is_some()
         && vec32_ok
-        && thin_vec_ok;
+        && thin_vec_ok
+        && key_vec_ok
+        && layout_ok
+        && heap_layouts_ok;
     JitLayout {
         obj_from_rc,
         gc_data_off,
@@ -770,7 +861,11 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         obj_extensible: offset_of!(Object, extensible),
         props_shape: offset_of!(Props, shape),
         props_proto_flag: offset_of!(Props, proto_flag),
-        props_entries: offset_of!(Props, entries),
+        props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, fields),
+        props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
+        layout_data_off,
+        obj_heap: offset_of!(Object, gc_heap),
+        heap_layouts,
         vec_ptr_off: vec_ptr_off.unwrap_or(0),
         vec_len_off: vec_len_off.unwrap_or(0),
         vec_cap_off: vec_cap_off.unwrap_or(0),
@@ -779,15 +874,14 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         dense_mirror: offset_of!(DenseBuffers, mirror),
         dense_packed: offset_of!(DenseBuffers, packed),
         props_mirror_flags: offset_of!(Props, mirror_flags),
-        entry_size: std::mem::size_of::<(Rc<str>, Property)>(),
-        entry_key: offset_of!((Rc<str>, Property), 0),
+        entry_size: std::mem::size_of::<Property>(),
         str_len_word,
         str_ptr_word,
         str_data_off,
         key_probe_ok,
-        entry_value: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, packed),
-        entry_accessor: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, meta),
-        entry_writable: offset_of!((Rc<str>, Property), 1) + offset_of!(Property, meta),
+        entry_value: offset_of!(Property, packed),
+        entry_accessor: offset_of!(Property, meta),
+        entry_writable: offset_of!(Property, meta),
         property_size: std::mem::size_of::<Property>(),
         property_value: offset_of!(Property, packed),
         property_meta: offset_of!(Property, meta),
@@ -1171,8 +1265,13 @@ pub(crate) fn scan_gc_heap_retained_memory(
             .len()
             .saturating_mul(std::mem::size_of::<((u32, Rc<str>), u32)>()),
     );
+    bytes = bytes
+        .saturating_add(shapes.layouts.capacity() * std::mem::size_of::<Option<PropertyLayout>>());
     for (_, key) in shapes.transitions.keys() {
         visitor.rc_str(key);
+    }
+    for layout in shapes.layouts.iter().flatten() {
+        visitor.property_layout(layout);
     }
     (bytes, shapes.transitions.is_empty())
 }
@@ -1691,7 +1790,7 @@ pub enum TaIndex {
 
 /// A property descriptor. A data property uses `value`/`writable`; an accessor uses the boxed
 /// getter/setter pair. The low bits of `meta` hold the four descriptor flags; its aligned upper
-/// bits point to an accessor pair only for accessor properties. Thus ordinary properties are 32
+/// bits point to an accessor pair only for accessor properties. Thus ordinary properties are 16
 /// bytes and allocate no metadata, while still keeping the flags directly readable by the JIT.
 pub struct Property {
     packed: PackedValue,
@@ -2162,9 +2261,121 @@ impl std::ops::IndexMut<usize> for DenseStorage {
     }
 }
 
+/// Shared ordered keys, independent of instance values and descriptor attributes. A constructor
+/// may reserve a longer layout than its live prefix; only `NamedEntries::fields.len()` keys are
+/// observable. Layouts contain no JS values, prototypes, or SymbolData ownership.
+pub(crate) type PropertyLayout = Rc<Vec<Rc<str>>>;
+
+#[derive(Clone, Default)]
+struct NamedEntries {
+    fields: Vec<Property>,
+    layout: Option<PropertyLayout>,
+}
+
+impl NamedEntries {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            fields: Vec::with_capacity(capacity),
+            layout: None,
+        }
+    }
+    fn len(&self) -> usize {
+        self.fields.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+    fn capacity(&self) -> usize {
+        self.fields.capacity()
+    }
+    fn reserve_exact(&mut self, additional: usize) {
+        self.fields.reserve_exact(additional);
+    }
+    fn keys(&self) -> &[Rc<str>] {
+        self.layout
+            .as_deref()
+            .map_or(&[], |keys| &keys[..self.len()])
+    }
+    fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Property)> {
+        self.keys().iter().zip(&self.fields)
+    }
+    fn get(&self, slot: usize) -> Option<(&Rc<str>, &Property)> {
+        Some((self.keys().get(slot)?, self.fields.get(slot)?))
+    }
+    fn get_mut(&mut self, slot: usize) -> Option<(&Rc<str>, &mut Property)> {
+        Some((self.layout.as_ref()?.get(slot)?, self.fields.get_mut(slot)?))
+    }
+    fn push(&mut self, (key, property): (Rc<str>, Property)) {
+        let len = self.len();
+        // A template/constructor's predicted next key is already owned once by the layout.
+        // A mismatch detaches before mutation; speculation never creates an observable key.
+        if !self
+            .layout
+            .as_ref()
+            .is_some_and(|keys| keys.get(len) == Some(&key))
+        {
+            if len == 0 && &*key == "length" {
+                // Array builders outside the native literal helper share this key-only prefix
+                // too; element slots remain in their existing independent dense representation.
+                self.layout = Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone));
+            } else {
+                let keys = Rc::make_mut(self.layout.get_or_insert_with(|| Rc::new(Vec::new())));
+                keys.truncate(len);
+                keys.push(key);
+            }
+        }
+        self.fields.push(property);
+    }
+    fn predicts(&self, key: &Rc<str>) -> bool {
+        self.layout
+            .as_ref()
+            .is_some_and(|keys| keys.get(self.len()) == Some(key))
+    }
+    fn pop(&mut self) -> Option<(Rc<str>, Property)> {
+        let key = self.keys().last()?.clone();
+        let property = self.fields.pop()?;
+        // Do not retain the tail of large, shrinking arrays through an unused prediction.
+        if let Some(keys) = self.layout.as_mut().and_then(Rc::get_mut) {
+            keys.truncate(self.fields.len());
+        }
+        Some((key, property))
+    }
+    fn remove(&mut self, slot: usize) {
+        let len = self.len();
+        let keys = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
+        keys.truncate(len);
+        keys.remove(slot);
+        self.fields.remove(slot);
+    }
+    fn retain(&mut self, mut keep: impl FnMut((&Rc<str>, &Property)) -> bool) {
+        let len = self.len();
+        if len == 0 {
+            return;
+        }
+        let keys = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
+        keys.truncate(len);
+        let mut slot = 0;
+        let mut retained = 0;
+        self.fields.retain(|property| {
+            let yes = keep((&keys[slot], property));
+            if yes {
+                keys.swap(retained, slot);
+                retained += 1;
+            }
+            slot += 1;
+            yes
+        });
+        keys.truncate(retained);
+    }
+    fn clear(&mut self) {
+        self.fields.clear();
+        self.layout = None;
+    }
+}
+
 #[derive(Clone)]
 pub struct Props {
-    entries: Vec<(Rc<str>, Property)>,
+    entries: NamedEntries,
     /// This object serves (or once served) as some object's prototype: structural changes to it
     /// bump the global [`proto_epoch`], invalidating every property-*creation* inline cache
     /// (their fill-time chain walks proved "no hop shadows this name" — see
@@ -2292,13 +2503,25 @@ pub(crate) fn bump_proto_epoch() {
 /// ever holds — forcing a re-derive.
 struct ShapeTable {
     transitions: crate::fasthash::FastMap<(u32, Rc<str>), u32>,
+    /// Direct shape-ID lookup for already-validated creation ICs. Bounded independently of IDs.
+    layouts: Vec<Option<PropertyLayout>>,
+    cached_layouts: usize,
     next: u32,
 }
+
+// Eager prefix sharing is bounded independently of the existing shape identity table. Larger or
+// highly irregular maps use private copy-on-write keys; they do not build a quadratic collection
+// of full layouts. Layouts contain key strings only, never JS objects, prototype chains or values.
+const SHARED_LAYOUT_MAX_FIELDS: usize = 16;
+const SHARED_LAYOUT_CACHE_LIMIT: usize = 4096;
+const SHARED_LAYOUT_SHAPE_LIMIT: usize = 65536;
 
 impl ShapeTable {
     fn new() -> ShapeTable {
         ShapeTable {
             transitions: Default::default(),
+            layouts: Vec::new(),
+            cached_layouts: 0,
             next: 1, // 0 is reserved for SHAPE_EMPTY.
         }
     }
@@ -2318,15 +2541,70 @@ impl ShapeTable {
 }
 
 /// The child shape reached by adding `key` to shape `parent` (memoized so it is shared).
-fn shape_transition(parent: u32, key: &Rc<str>) -> u32 {
+fn shape_transition(
+    parent: u32,
+    key: &Rc<str>,
+    prefix: Option<&[Rc<str>]>,
+) -> (u32, Option<PropertyLayout>) {
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
-        if let Some(&child) = shapes.transitions.get(&(parent, key.clone())) {
-            return child;
+        let pair = (parent, key.clone());
+        let id = if let Some(&id) = shapes.transitions.get(&pair) {
+            id
+        } else {
+            let id = shapes.fresh();
+            shapes.transitions.insert(pair, id);
+            id
+        };
+        let Some(prefix) = prefix else {
+            return (id, None);
+        };
+        if let Some(Some(layout)) = shapes.layouts.get(id as usize) {
+            return (id, Some(layout.clone()));
         }
-        let child = shapes.fresh();
-        shapes.transitions.insert((parent, key.clone()), child);
-        child
+        if prefix.len() >= SHARED_LAYOUT_MAX_FIELDS
+            || shapes.cached_layouts >= SHARED_LAYOUT_CACHE_LIMIT
+            || id as usize >= SHARED_LAYOUT_SHAPE_LIMIT
+        {
+            return (id, None);
+        }
+        let mut names = Vec::with_capacity(prefix.len() + 1);
+        names.extend_from_slice(prefix);
+        names.push(key.clone());
+        let layout = Rc::new(names);
+        if shapes.layouts.len() <= id as usize {
+            shapes.layouts.resize(id as usize + 1, None);
+        }
+        shapes.layouts[id as usize] = Some(layout.clone());
+        shapes.cached_layouts += 1;
+        // Cold transition learning: a previously seen prefix can predict the rest of this
+        // ordered insertion chain. Existing instances retain their pinned layout; subsequent
+        // instances can reserve once and append into its live prefix without another lookup.
+        // Extend only matching predictions, never oscillate between incompatible branches.
+        // No shape identity or observable property changes: field count still defines presence.
+        let mut prefix_shape = SHAPE_EMPTY;
+        for name in prefix {
+            let Some(&prefix_id) = shapes.transitions.get(&(prefix_shape, name.clone())) else {
+                break;
+            };
+            if let Some(Some(prediction)) = shapes.layouts.get_mut(prefix_id as usize) {
+                if prediction.len() < layout.len() && layout.starts_with(prediction.as_slice()) {
+                    *prediction = layout.clone();
+                }
+            }
+            prefix_shape = prefix_id;
+        }
+        (id, Some(layout))
+    })
+}
+
+fn shape_layout(id: u32) -> Option<PropertyLayout> {
+    with_active_gc_heap(|heap| {
+        heap.shapes
+            .borrow()
+            .layouts
+            .get(id as usize)
+            .and_then(Clone::clone)
     })
 }
 
@@ -2352,6 +2630,8 @@ thread_local! {
         Rc::from("prototype"),
         Rc::from("constructor"),
     ];
+    /// Key-only layout has no Agent identities or JS values, like FN_KEYS itself.
+    static ARRAY_LENGTH_LAYOUT: PropertyLayout = Rc::new(vec![fn_key(0)]);
 }
 
 /// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals create
@@ -2413,7 +2693,27 @@ impl Props {
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> Props {
-        Self::with_entries(Vec::with_capacity(capacity))
+        Self::with_entries(NamedEntries::with_capacity(capacity))
+    }
+
+    pub(crate) fn with_layout(capacity: usize, layout: Option<PropertyLayout>) -> Props {
+        Self::with_entries(NamedEntries {
+            fields: Vec::with_capacity(capacity),
+            layout,
+        })
+    }
+
+    pub(crate) fn shared_layout(&self) -> Option<&PropertyLayout> {
+        self.entries.layout.as_ref()
+    }
+
+    /// Supply keys to a fresh, still-empty receiver after its initializer plan is validated.
+    /// The existing field capacity remains usable; no predicted property becomes observable.
+    pub(crate) fn predict_empty_layout(&mut self, layout: &PropertyLayout) {
+        assert_eq!(self.shape, SHAPE_EMPTY);
+        assert!(self.entries.is_empty());
+        self.entries.fields.reserve_exact(layout.len());
+        self.entries.layout = Some(layout.clone());
     }
 
     /// Requested bytes in allocations owned directly by this property map. The `Props` body is
@@ -2424,9 +2724,9 @@ impl Props {
         let mut bytes = self
             .entries
             .capacity()
-            .saturating_mul(std::mem::size_of::<(Rc<str>, Property)>());
+            .saturating_mul(std::mem::size_of::<Property>());
         let mut exact = true;
-        for (_, property) in &self.entries {
+        for property in &self.entries.fields {
             bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
         }
         if let Some(dense) = self.elems.0.as_deref() {
@@ -2474,7 +2774,7 @@ impl Props {
         (bytes, exact)
     }
 
-    fn with_entries(entries: Vec<(Rc<str>, Property)>) -> Props {
+    fn with_entries(entries: NamedEntries) -> Props {
         debug_assert!(entries.is_empty());
         Props {
             entries,
@@ -2506,10 +2806,10 @@ impl Props {
         let length_key = fn_key(0);
         let shape = array_length_shape(&length_key);
         Props {
-            entries: vec![(
-                length_key,
-                Property::data(Value::Num(len as f64), true, false, false),
-            )],
+            entries: NamedEntries {
+                fields: vec![Property::data(Value::Num(len as f64), true, false, false)],
+                layout: Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone)),
+            },
             shape,
             elems: DenseStorage(Some(Box::new(DenseBuffers {
                 index: None,
@@ -2544,14 +2844,10 @@ impl Props {
         I: ExactSizeIterator<Item = Value>,
     {
         assert_eq!(values.len(), self.entries.len(), "object-template arity");
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for (key, _) in &self.entries {
-            entries.push((
-                key.clone(),
-                Property::plain(values.next().expect("object-template value")),
-            ));
-        }
-        debug_assert!(values.next().is_none());
+        let entries = NamedEntries {
+            fields: values.by_ref().map(Property::plain).collect(),
+            layout: self.entries.layout.clone(),
+        };
         Props {
             entries,
             proto_flag: std::cell::Cell::new(false),
@@ -2567,12 +2863,15 @@ impl Props {
     }
 
     /// Grow tiny property maps exactly: `Vec`'s default first allocation has room for four
-    /// 40-byte entries, while one- and two-property objects dominate real heaps. Past two entries
+    /// 16-byte fields, while one- and two-property objects dominate real heaps. Past two entries
     /// resume geometric growth so larger maps retain amortized insertion.
     #[inline]
     fn reserve_entry(&mut self) {
         if self.entries.len() == self.entries.capacity() {
-            let additional = if self.entries.len() < 2 {
+            let predicted = self.entries.layout.as_ref().map_or(0, |keys| keys.len());
+            let additional = if predicted > self.entries.len() {
+                predicted - self.entries.len()
+            } else if self.entries.len() < 2 {
                 1
             } else {
                 self.entries.len()
@@ -2655,11 +2954,11 @@ impl Props {
         let s = self.len_slot.get();
         if s != NO_SLOT {
             debug_assert!(matches!(self.entries.get(s as usize), Some((k, _)) if &**k == "length"));
-            return self.entries.get(s as usize).map(|(_, p)| p);
+            return self.entries.fields.get(s as usize);
         }
         let slot = self.find("length")?;
         self.len_slot.set(slot as u32);
-        Some(&self.entries[slot].1)
+        Some(&self.entries.fields[slot])
     }
 
     /// Mark this object as a live prototype (see `proto_flag`).
@@ -2706,7 +3005,7 @@ impl Props {
         if slot == NO_SLOT {
             return None;
         }
-        Some(&self.entries[slot as usize].1)
+        Some(&self.entries.fields[slot as usize])
     }
 
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).
@@ -2730,7 +3029,7 @@ impl Props {
             self.mirror_invalidate();
             return;
         }
-        let p = &self.entries[slot].1;
+        let p = &self.entries.fields[slot];
         match p.value() {
             Value::Num(f) if !p.accessor() && p.writable() && f.to_bits() != MIRROR_HOLE => {
                 if !f64_exact_i32(f) {
@@ -2756,7 +3055,7 @@ impl Props {
         // Peek the value first: an object-element array (its very first push, typically) must
         // not pay a buffer allocation just to invalidate it.
         {
-            let p = &self.entries[slot].1;
+            let p = &self.entries.fields[slot];
             let ok = matches!(p.value(), Value::Num(f) if f.to_bits() != MIRROR_HOLE)
                 && !p.accessor()
                 && p.writable();
@@ -2812,7 +3111,7 @@ impl Props {
         if slot == NO_SLOT {
             return Err(v);
         }
-        let p = &mut self.entries[slot as usize].1;
+        let p = &mut self.entries.fields[slot as usize];
         if p.accessor() || !p.writable() {
             return Err(v);
         }
@@ -2831,7 +3130,7 @@ impl Props {
                 _ => self.mirror_invalidate(),
             }
         }
-        let p = &mut self.entries[slot as usize].1;
+        let p = &mut self.entries.fields[slot as usize];
         p.set_value(v);
         Ok(())
     }
@@ -2842,7 +3141,7 @@ impl Props {
         if slot >= NO_SLOT as usize {
             return;
         }
-        let key = &self.entries[slot].0;
+        let key = &self.entries.keys()[slot];
         if !key.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
             return;
         }
@@ -2999,7 +3298,7 @@ impl Props {
         if slot == NO_SLOT || slot as usize + 1 != self.entries.len() {
             return None;
         }
-        let p = &self.entries[slot as usize].1;
+        let p = &self.entries.fields[slot as usize];
         if p.accessor() || !p.configurable() {
             return None;
         }
@@ -3086,7 +3385,7 @@ impl Props {
                 return None;
             }
         }
-        self.find(key).map(|i| &self.entries[i].1)
+        self.find(key).map(|i| &self.entries.fields[i])
     }
     /// Semantic lookup plus the named-entry slot when the result lives in `entries`. Dense
     /// indexed results have no named field slot. Used by opt-in feedback collection so it can
@@ -3101,7 +3400,7 @@ impl Props {
             }
         }
         self.find(key)
-            .map(|slot| (&self.entries[slot].1, Some(slot)))
+            .map(|slot| (&self.entries.fields[slot], Some(slot)))
     }
     /// The memoized own `prototype` slot, for guarded constructor fast paths.
     #[inline]
@@ -3123,7 +3422,7 @@ impl Props {
             self.mirror_invalidate(); // could be an element (see `mirror`)
         }
         match self.find(key) {
-            Some(i) => Some(&mut self.entries[i].1),
+            Some(i) => Some(&mut self.entries.fields[i]),
             None => None,
         }
     }
@@ -3139,12 +3438,18 @@ impl Props {
     /// The (key, property) at `slot`, or `None` if out of range. The caller re-checks the key —
     /// slots shift on `remove`, so a cached slot is only trusted after the key matches.
     #[inline]
-    pub(crate) fn entry_at(&self, slot: usize) -> Option<&(Rc<str>, Property)> {
+    pub(crate) fn entry_at(&self, slot: usize) -> Option<(&Rc<str>, &Property)> {
         self.entries.get(slot)
+    }
+    /// A live field at an already-resolved slot. Shape/memo-validated callers do not need to
+    /// follow the key layout; array-holder ICs still use `entry_at` to re-check their key.
+    #[inline]
+    pub(crate) fn property_at(&self, slot: usize) -> Option<&Property> {
+        self.entries.fields.get(slot)
     }
     /// Mutable [`entry_at`], for the property write inline cache.
     #[inline]
-    pub(crate) fn entry_at_mut(&mut self, slot: usize) -> Option<&mut (Rc<str>, Property)> {
+    pub(crate) fn entry_at_mut(&mut self, slot: usize) -> Option<(&Rc<str>, &mut Property)> {
         if self
             .entries
             .get(slot)
@@ -3187,9 +3492,9 @@ impl Props {
     }
 
     /// Insert a key *known to be absent* (the caller shape-validated the map), landing on a
-    /// *known* child shape: skips both the existence scan and the transition-table lookup that
-    /// [`Props::insert`] pays. `new_shape` must be the memoized `shape_transition(shape, key)`
-    /// result recorded when this (shape, key) pair was first inserted the slow way.
+    /// *known* child shape: skips the existence scan. A predicted constructor layout also skips
+    /// the transition table; otherwise a bounded small-layout lookup supplies shared keys.
+    /// `new_shape` must be the transition recorded when this pair was first inserted normally.
     pub(crate) fn append_new(&mut self, key: Rc<str>, prop: Property, new_shape: u32) {
         self.elems.retain_symbol_key(&key);
         self.note_structural();
@@ -3199,6 +3504,16 @@ impl Props {
         } else if self.should_build_index(&key) {
             self.build_index();
             self.elems.index_mut().unwrap().insert(key.clone(), slot);
+        }
+        // If the constructor did not predict this key, reuse the small ordinary transition's
+        // key layout. The creation IC still saves the semantic absence/prototype-chain walk.
+        if !self.elem_mode.get()
+            && !self.entries.predicts(&key)
+            && self.entries.len() < SHARED_LAYOUT_MAX_FIELDS
+        {
+            if let Some(layout) = shape_layout(new_shape) {
+                self.entries.layout = Some(layout);
+            }
         }
         self.shape = new_shape;
         self.reserve_entry();
@@ -3210,13 +3525,25 @@ impl Props {
     /// every key absent/non-indexed and supplied the complete shape chain. Up to the small-map
     /// threshold no dense/index sidecar or special-slot memo can be required, so the whole batch
     /// is just entry appends followed by its already-known final shape.
-    pub(crate) fn append_proven_plain(&mut self, key: Rc<str>, prop: Property) {
-        self.elems.retain_symbol_key(&key);
+    pub(crate) fn append_proven_plain(&mut self, key: &Rc<str>, prop: Property) {
+        self.elems.retain_symbol_key(key);
         debug_assert!(self.entries.len() < INDEX_THRESHOLD);
-        debug_assert!(canonical_index(&key).is_none());
+        debug_assert!(canonical_index(key).is_none());
         debug_assert!(self.elems.0.is_none());
         self.reserve_entry();
-        self.entries.push((key, prop));
+        if self.entries.predicts(key) {
+            self.entries.fields.push(prop);
+        } else {
+            self.entries.push((key.clone(), prop));
+        }
+    }
+
+    /// The immutable initializer plan proved this exact ordered layout before the batch began.
+    /// No key ownership or runtime key comparison is needed while moving its field values.
+    pub(crate) fn append_initialized_field(&mut self, key: &Rc<str>, prop: Property) {
+        debug_assert!(self.entries.predicts(key));
+        self.elems.retain_symbol_key(key);
+        self.entries.fields.push(prop);
     }
 
     pub(crate) fn finish_proven_plain_shape(&mut self, shape: u32) {
@@ -3245,7 +3572,7 @@ impl Props {
             self.has_far.set(true);
         }
         if let Some(i) = self.find(&key) {
-            self.entries[i].1 = prop;
+            self.entries.fields[i] = prop;
             if self.mirror_flags & MIRROR_OK != 0
                 && key.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
             {
@@ -3269,7 +3596,15 @@ impl Props {
                 self.elems.index_mut().unwrap().insert(key.clone(), slot);
             }
             if !(self.elem_mode.get() && canonical_index(&key).is_some()) {
-                self.shape = shape_transition(self.shape, &key);
+                let prefix = (!self.elem_mode.get()
+                    && self.entries.len() < SHARED_LAYOUT_MAX_FIELDS
+                    && !self.entries.predicts(&key))
+                .then(|| self.entries.keys());
+                let (shape, layout) = shape_transition(self.shape, &key, prefix);
+                self.shape = shape;
+                if let Some(layout) = layout {
+                    self.entries.layout = Some(layout);
+                }
             }
             if &*key == "length" {
                 self.len_slot.set(slot as u32);
@@ -3402,7 +3737,7 @@ impl Props {
                     .map(|(n, _)| (n as u32, index_key(n))),
             );
         }
-        for (k, _) in &self.entries {
+        for k in self.entries.keys() {
             if crate::interpreter::Interp::is_private_key(k) {
                 continue; // private-element slot — not an observable own key
             }
@@ -3422,7 +3757,7 @@ impl Props {
             .collect()
     }
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Property)> {
-        self.entries.iter().map(|(k, p)| (k, p))
+        self.entries.iter()
     }
 
     /// Every live property value, including keyless packed elements (for GC tracing).
@@ -3432,7 +3767,7 @@ impl Props {
             .into_iter()
             .flat_map(|p| p.iter())
             .filter(|p| !matches!(p.value(), Value::Empty))
-            .chain(self.entries.iter().map(|(_, p)| p))
+            .chain(self.entries.fields.iter())
     }
 
     /// Keyless packed elements only. Managed-memory traversal visits named entries together with

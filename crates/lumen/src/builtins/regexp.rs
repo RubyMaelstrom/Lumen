@@ -183,7 +183,7 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
     let property_at = |index: usize| {
         p.props
             .entry_at(slots[index] as usize)
-            .filter(|(key, _)| &**key == names[index])
+            .filter(|(key, _)| &***key == names[index])
             .map(|(_, property)| property)
     };
     let getter_is = |index: usize, native: NativeFn| {

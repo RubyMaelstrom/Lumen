@@ -4561,6 +4561,18 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.entry_value + 16 < 256
         && layout.rc_strong_off < 256
         && layout.entry_size < 0x1_0000
+        && (layout.obj_props + layout.props_layout).is_multiple_of(8)
+        && (layout.obj_props + layout.props_layout) / 8 < 4096
+        && (layout.layout_data_off + layout.vec_ptr_off).is_multiple_of(8)
+        && (layout.layout_data_off + layout.vec_len_off).is_multiple_of(8)
+        && layout.layout_data_off + layout.vec_ptr_off < 4096
+        && layout.layout_data_off + layout.vec_len_off < 4096
+        && layout.obj_heap.is_multiple_of(8)
+        && layout.obj_heap / 8 < 4096
+        && (layout.heap_layouts + layout.vec_ptr_off).is_multiple_of(8)
+        && (layout.heap_layouts + layout.vec_len_off).is_multiple_of(8)
+        && (layout.heap_layouts + layout.vec_ptr_off) / 8 < 4096
+        && (layout.heap_layouts + layout.vec_len_off) / 8 < 4096
 }
 
 #[cfg(all(
@@ -5162,12 +5174,17 @@ fn emit_prop_load_inline(
         a.ldr_imm(15, 11, en);
         a.mov_imm64(16, es);
         a.madd(15, 13, 16, 15);
-        let klen = (layout.entry_key + layout.str_len_word) as i32;
-        let kptr = (layout.entry_key + layout.str_ptr_word) as i32;
-        a.ldur(16, 15, klen);
+        // Named fields have no inline key: follow the holder's shared layout at the same slot.
+        a.ldr_imm(17, 11, (layout.obj_props + layout.props_layout) as u32);
+        a.cbz(17, true, slow);
+        a.ldr_imm(17, 17, (layout.layout_data_off + layout.vec_ptr_off) as u32);
+        a.add_shifted(17, 17, 13, 4); // sizeof(Rc<str>) == 16
+        let klen = layout.str_len_word as i32;
+        let kptr = layout.str_ptr_word as i32;
+        a.ldur(16, 17, klen);
         a.cmp_imm_x(16, name.len() as u32);
         a.b_cond(C_NE, slow);
-        a.ldur(16, 15, kptr); // stored Rc<str> word (RcBox base)
+        a.ldur(16, 17, kptr); // stored Rc<str> word (RcBox base)
         let d = layout.str_data_off as u32;
         let bytes = name.as_bytes();
         let mut off = 0usize;
@@ -5900,8 +5917,8 @@ fn set_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && cap.is_multiple_of(8)
         && cap / 8 < 4096
         && layout.gc_data_off < 4096
-        && layout.entry_key + layout.str_ptr_word < 256
-        && layout.entry_key + layout.str_len_word < 256
+        && layout.str_ptr_word < 256
+        && layout.str_len_word < 256
 }
 
 /// Inline `this.x++` / `--` (`UpdateProp`): the read and the write both target the cached own
@@ -6412,7 +6429,8 @@ fn emit_instanceof_inline(
 ///
 /// Probe one polymorphic property-creation way. Entry has x11 at the receiver Object and the
 /// incoming value at sp-16. A hit leaves x12 at its IcState and x13 holding the current entries
-/// length, then branches to `commit`; a miss has no side effects.
+/// length and x7 at a replacement layout Rc (zero keeps the current prediction), then branches
+/// to `commit`; a miss has no side effects.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -6421,12 +6439,13 @@ fn emit_prop_create_probe(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     cache_ptr: usize,
+    name: &str,
     miss: usize,
     commit: usize,
 ) {
     use crate::bytecode::{
-        IC_CREATE, IC_OFF_DEPTH, IC_OFF_MID2_SHAPE, IC_OFF_MID_SHAPE, IC_OFF_RECV_SHAPE,
-        IC_OFF_SLOT,
+        IC_CREATE, IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID_SHAPE,
+        IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
     };
     let sh = (layout.obj_props + layout.props_shape) as u32;
     a.mov_imm64(12, cache_ptr as u64);
@@ -6452,6 +6471,83 @@ fn emit_prop_create_probe(
     a.ldr_imm(14, 11, cap_off);
     a.cmp_reg_x(13, 14);
     a.b_cond(C_HS, miss);
+    let transition_layout = a.new_label();
+    let key_ready = a.new_label();
+    a.movz(7, 0, 0);
+    // A predicted layout already owns the next key. Otherwise the creation IC's destination
+    // shape can supply a cached layout, with no allocation or string-keyed lookup.
+    a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
+    a.cbz(16, true, transition_layout);
+    a.ldr_imm(17, 16, (layout.layout_data_off + layout.vec_len_off) as u32);
+    a.cmp_reg_x(13, 17);
+    a.b_cond(C_HS, transition_layout);
+    a.ldr_imm(16, 16, (layout.layout_data_off + layout.vec_ptr_off) as u32);
+    a.add_shifted(16, 16, 13, 4);
+    a.ldur(17, 16, layout.str_len_word as i32);
+    a.mov_imm64(14, name.len() as u64);
+    a.cmp_reg_x(17, 14);
+    a.b_cond(C_NE, transition_layout);
+    a.ldur(17, 16, layout.str_ptr_word as i32);
+    a.mov_imm64(14, (name.as_ptr() as usize - layout.str_data_off) as u64);
+    a.cmp_reg_x(17, 14);
+    // Layouts can be learned before compilation or shared with another creation site. Equal
+    // property names need not own the same Rc allocation. Keep identity as the cheap case,
+    // then compare short names by content without calling out or changing any ownership.
+    if name.len() <= 32 {
+        let key_matches = a.new_label();
+        a.b_cond(C_EQ, key_matches);
+        let d = layout.str_data_off as u32;
+        let bytes = name.as_bytes();
+        let mut off = 0usize;
+        while bytes.len() - off >= 4 {
+            let imm = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            a.ldr_w_imm(16, 17, d + off as u32);
+            a.movz(14, imm & 0xFFFF, 0);
+            a.movk(14, imm >> 16, 1);
+            a.cmp_reg_w(16, 14);
+            a.b_cond(C_NE, transition_layout);
+            off += 4;
+        }
+        if bytes.len() - off >= 2 {
+            let imm = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as u32;
+            a.ldrh_imm(16, 17, d + off as u32);
+            a.movz(14, imm, 0);
+            a.cmp_reg_w(16, 14);
+            a.b_cond(C_NE, transition_layout);
+            off += 2;
+        }
+        if bytes.len() - off == 1 {
+            a.ldrb_imm(16, 17, d + off as u32);
+            a.cmp_imm_w(16, bytes[off] as u32);
+            a.b_cond(C_NE, transition_layout);
+        }
+        a.bind(key_matches);
+    } else {
+        a.b_cond(C_NE, transition_layout);
+    }
+    a.b(key_ready);
+    a.bind(transition_layout);
+    // The receiver's owning heap pins cached layouts. The shape table cannot change between
+    // this probe and commit: no helper, allocation, GC or user code runs in that interval.
+    a.ldr_imm(16, 11, layout.obj_heap as u32);
+    a.ldr_w_imm(14, 12, IC_OFF_HOLDER_SHAPE);
+    a.ldr_imm(17, 16, (layout.heap_layouts + layout.vec_len_off) as u32);
+    a.cmp_reg_x(14, 17);
+    a.b_cond(C_HS, miss);
+    a.ldr_imm(16, 16, (layout.heap_layouts + layout.vec_ptr_off) as u32);
+    a.add_shifted(16, 16, 14, 3); // Option<PropertyLayout> is one nullable Rc word.
+    a.ldr_imm(7, 16, 0);
+    a.cbz(7, true, miss);
+    a.ldr_imm(17, 7, (layout.layout_data_off + layout.vec_len_off) as u32);
+    a.cmp_reg_x(13, 17);
+    a.b_cond(C_HS, miss);
+    // Replacing a last-owned private key buffer would run a destructor: let Rust do that.
+    a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
+    a.cbz(16, true, key_ready);
+    a.ldur(17, 16, layout.rc_strong_off as i32);
+    a.cmp_imm_x(17, 1);
+    a.b_cond(C_LS, miss);
+    a.bind(key_ready);
     // Same live global epoch recorded by the fill; saturation is never cacheable.
     a.mov_imm64(16, crate::value::proto_epoch_ptr() as usize as u64);
     a.ldr_w_imm(16, 16, 0);
@@ -6565,13 +6661,27 @@ fn emit_set_prop_inline(
                 a.new_label()
             };
             let way_ptr = cache_ptr + way * stride;
-            emit_prop_create_probe(a, layout, way_ptr, miss, create_commit);
+            emit_prop_create_probe(a, layout, way_ptr, name, miss, create_commit);
             if way + 1 != crate::bytecode::PROP_IC_WAYS {
                 a.bind(miss);
             }
         }
 
         a.bind(create_commit);
+        let layout_installed = a.new_label();
+        a.cbz(7, true, layout_installed);
+        a.ldur(17, 7, strong);
+        a.add_imm(17, 17, 1);
+        a.stur(17, 7, strong);
+        a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
+        let old_layout_released = a.new_label();
+        a.cbz(16, true, old_layout_released);
+        a.ldur(17, 16, strong);
+        a.sub_imm(17, 17, 1);
+        a.stur(17, 16, strong);
+        a.bind(old_layout_released);
+        a.str_imm(7, 11, (layout.obj_props + layout.props_layout) as u32);
+        a.bind(layout_installed);
         // From here no branch can fail: compute the vacant entry and pack the incoming value.
         a.ldr_imm(15, 11, en);
         a.mov_imm64(16, es);
@@ -6623,15 +6733,8 @@ fn emit_set_prop_inline(
             a.b(packed);
         }
         a.bind(packed);
-        // Clone the site's pinned Rc<str> into the tuple entry, then install Property::plain.
-        let key_stored = name.as_ptr() as usize - layout.str_data_off;
-        a.mov_imm64(17, key_stored as u64);
-        a.ldur(14, 17, strong);
-        a.add_imm(14, 14, 1);
-        a.stur(14, 17, strong);
-        a.stur(17, 15, (layout.entry_key + layout.str_ptr_word) as i32);
-        a.mov_imm64(14, name.len() as u64);
-        a.stur(14, 15, (layout.entry_key + layout.str_len_word) as i32);
+        // The predicted key is already owned by the shared layout (validated pre-commit).
+        // Only install Property::plain; no per-instance key ownership operation is needed.
         a.stur(16, 15, ev);
         a.movz(
             14,

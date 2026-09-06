@@ -60,6 +60,32 @@ See [the guarded-call checkpoint](GUARDED_CALLS_2026-09-06.md) for evidence, sem
 and remaining call/activation and object/value work. These commits are not browser promotion or
 completion of the architectural phases below.
 
+## 2026-09-06 follow-on: production shared object layouts
+
+Named properties now use shared ordered keys and contiguous 16-byte instance fields instead of
+32-byte key/property entries. Literal templates, constructor plans, dynamic insertion chains,
+VM reads, native creation/access, and GC/memory accounting use this representation by default.
+This is a production storage migration, not another disabled heap experiment.
+
+The combined unit run passes 1,016 tests (one ignored), including fifteen new storage/integration
+tests. The exact final binary passes 29,448 Test262 files independently in all three tiers.
+Seven-round matched object probes show dynamic records at 836→728 ms (12.9% shorter), literals
+319→294 ms (7.8% shorter), and constructors 496→483 ms (2.6% shorter). The retained-graph diagnostic
+reports 26.2% fewer managed requested bytes after GC. This is a lower-bound payload census, not
+a peak-heap or whole-browser result.
+
+Costs remain explicit: JSON state processing is 1.0% slower, the Proxy probe 3.2% slower, and the
+unchanged Vue kernel 2.0% slower; Vue's reported managed bytes increase 2.9%. The classic
+eight-component median-score geomean is 0.6% lower. Retain this as an
+engine-development storage checkpoint, not satisfaction of Phase 4's aggregate throughput/helper
+targets or browser promotion. The installed executable and browser acceptance records are
+unchanged. See [the shared-layout report](SHARED_OBJECT_LAYOUTS_2026-09-06.md) for distributions,
+classic components, memory costs, rejected iterations, and exact provenance.
+
+The next major allocation target remains the production Agent-owned object/value family with
+precise VM/native/host roots and nursery allocation. Shared keys remove duplicated field metadata;
+they do not remove reference counting, individual object allocations, or full-heap cycle scanning.
+
 ## Non-negotiable engineering rules
 
 - Official standards define observable behavior. ECMA-262, ECMA-402, WebAssembly, WHATWG, W3C,
@@ -850,6 +876,16 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
   process-wide guess.
 
 ### Phase 4: Map, property, elements, and buffer-view model
+
+2026-09-06 storage prerequisite: production named-property storage now separates shared ordered
+keys from contiguous 16-byte per-instance fields, across literals, constructors, dynamic inserts,
+the VM, native property paths, and GC/memory accounting. See
+[the shared-layout checkpoint](SHARED_OBJECT_LAYOUTS_2026-09-06.md) for exact measurements and
+remaining regressions. This work is independent of moving allocation: descriptor attributes are
+still instance-local, the object header is still reference-counted, large-map indexes still own
+keys, and arrays still have the old elements/mirror model. It does not complete the Map model,
+nursery prerequisites, or this phase's aggregate performance/browser gates; the checklist below
+therefore remains open.
 
 - [ ] Design a shared heap Map/hidden-class object containing prototype identity, instance size,
   descriptor count, field locations/representations, transition data, and validity dependencies.

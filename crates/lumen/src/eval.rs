@@ -6016,9 +6016,9 @@ impl Interp {
 
     /// [`Interp::make_plain_object_vm`] through a per-site pre-shaped map (distinct keys only —
     /// the compiler guarantees it): the first execution builds the final `Props` once via the
-    /// insert path with placeholder values; every later instance clones it (entry-vector copy,
-    /// key refcount bumps) and writes the values slot by slot — no hashing, no shape
-    /// transitions. Values arrive in key order, one slot per key.
+    /// insert path with placeholder values; later instances share its key layout and move values
+    /// into a fresh contiguous field vector — no per-key ownership, hashing, or shape transitions.
+    /// Values arrive in key order, one slot per key.
     pub(crate) fn make_plain_object_templated(
         &mut self,
         tmpl: &std::cell::OnceCell<crate::value::Props>,
