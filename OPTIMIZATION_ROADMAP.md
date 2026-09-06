@@ -16,6 +16,32 @@ conformance tests, performance measurements, and required real-site gates are co
 important measurements and design decisions near the relevant item rather than relying on
 memory or transient files under `/tmp`.
 
+## 2026-09-06 implementation checkpoint: compiled application code
+
+The first implementation from the [V8-parity review](PERFORMANCE_REVIEW_2026-09-06.md) now enables
+compiled proper tail transfers, general compiled-body entry after normative function setup,
+creation-time named-function self environments, and lean lexical-arrow bodies by default. This
+removes whole-function interpreter exclusions without switching on incomplete heap/value
+prototypes. Two pre-existing optional-super call-lowering defects found by the forced-tier gate
+were also corrected.
+
+The combined engine/host/web unit run passes 994 tests (one ignored). A 22,524-file Test262 slice
+passes independently in interpreter, bytecode, and JIT modes, with threshold zero in the compiled
+modes. Implementation details, exact build/source provenance, performance distributions, remaining
+constructor/VM boundaries, and promotion limitations are recorded in
+[the compiled-execution checkpoint](COMPILED_EXECUTION_2026-09-06.md).
+
+Seven-round clean A/B measurements against the exact pre-change binary show the unchanged Vue
+reactivity workload at 1,584→1,197 ms (24.4% shorter), with compilation successes increasing from
+48/57 to 57/57. Named-function and lexical-arrow probes improve 4.52× and 2.28×. The arguments
+probe is 2.2% slower; the classic object/numeric suites are effectively flat. These are bounded
+engine-level gains, not full Speedometer or V8-parity claims.
+
+This is not completion of the central-heap or general-optimizer phases, and is not a browser
+release acceptance. The next architectural checkpoint remains a complete production object/value
+family through precise tracing and live VM/native/host roots, exercised by real allocation,
+property and call workloads—not more isolated migration scaffolding.
+
 ## Non-negotiable engineering rules
 
 - Official standards define observable behavior. ECMA-262, ECMA-402, WebAssembly, WHATWG, W3C,
@@ -925,17 +951,64 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
     per-step interpreter dispatch plus structural backtracking, i.e. Phase 6's native-tier
     item rather than a bounded Rust fast path (the icase-literal case above already captured
     the literal subset).
+- [x] Validate the bounded one-byte path against an optimized local A/B probe (2026-09-04,
+  documented contract in `REGEXP_NATIVE_CONTRACT.md`): no-LTO release `/a.c/` was 1.81 s promoted
+  versus 1.88 s with `LUMEN_REGEXP_TIER_UP_AT=0`, and `/é./` was 1.97 s versus 2.04 s over one
+  million repeated tests. These are directional single-run microbenchmarks, not the Phase 6
+  release-corpus exit measurement; the profiler reported 199,937 specialized executions out of
+  200,000 calls in each promoted probe.
+- [x] Add the first native terminal-loop specialization for capture-free `Many` instructions
+  (2026-09-04): `a+`, lazy and bounded character repeats, one-byte class repeats, and `.*` use a
+  bounded direct loop with the same greedy/lazy, sticky, UTF-16-offset, line-terminator, and
+  interruption behavior as the reference matcher. Terminal repeats remain outside the fixed-width
+  machine emitter until its repeat-counter poll path is implemented. Three-sample no-LTO release
+  A/B probes over one million calls improved `/a+/` 1.898 s → 1.740 s (~8.3%), `/[a-z]+/` 1.900 s
+  → 1.786 s (~6.0%), and `/a+?/` 1.933 s → 1.830 s (~5.3%); the focused and generated
+  differential gates pass.
 - [x] Project group-0 spans directly for proven dead-result `RegExp.exec` paths while retaining
   internal capture slots for matching semantics; public executions still materialize captures.
 - [x] Keep immutable UnicodeSets metadata borrowed during matcher attempts instead of incrementing
   its `Rc` count for each candidate; the matcher still owns no mutable pattern state.
-- [ ] Define matcher bytecode semantics precisely enough to differentially execute bytecode and
-  native implementations instruction-by-instruction.
-- [ ] Add per-pattern tier-up ticks and execution/subject-shape feedback.
-- [ ] Keep cold patterns in compact matcher bytecode.
+- [x] Define matcher bytecode semantics precisely enough to differentially execute bytecode and
+  native implementations instruction-by-instruction. The reference instruction contract and
+  generated gate are recorded in `REGEXP_NATIVE_CONTRACT.md` and emitted to
+  `crates/lumen/src/regex_native_generated.rs` by `scripts/gen-regexp-native-harness.py`.
+  - [x] Differentially compare the first `Char`/`Any`/ASCII-`Class` straight-line subset against
+    the existing matcher over match/no-match, scan-start, sticky, and ASCII line-terminator cases
+    (2026-09-04); the generated corpus also covers range, negated, builtin, and Latin-1 class
+    forms and is checked for stale output before the test suite.
+- [x] Add per-pattern tier-up ticks and execution/subject-shape feedback. Verified 2026-09-04:
+  patterns keep saturating execution ticks and an ASCII/one-byte/UTF-16/astral subject-shape bit
+  set; `LUMEN_REGEXP_PROF=1` reports tier attempts, successful promotions, and specialized-path
+  executions. `LUMEN_REGEXP_TIER_UP_AT=N` is an A/B kill switch (`0` disables promotion), and
+  unsupported case-folding/dotAll patterns record a failed promotion and remain on the matcher.
+- [x] Keep cold patterns in compact matcher bytecode. The specialized program is allocated only
+  after the threshold and only for an eligible straight-line pattern with observed ASCII or
+  one-byte input;
+  literal-only patterns continue to use their existing eager literal search.
 - [ ] Compile hot straight-line ASCII and one-byte paths to native code first.
+  - [x] Add the first bounded one-byte specialized loop for capture-free `Char`, `Any`, and
+    precomputed ASCII/Latin-1 `Class` instructions (2026-09-04). It preserves sticky behavior,
+    line terminator handling, interruption polling, group-0 spans, retained-byte accounting, and
+    falls back for every unsupported instruction.
+  - [x] Emit bounded W^X machine code for the validated straight-line ASCII subset on Unix
+    AArch64 and x86-64 (2026-09-04), with shared live-code accounting, automatic reclamation,
+    cancellation propagation, and a direct-vs-reference execution test. The machine-code bytes
+    are reported by `LUMEN_REGEXP_PROF=1` as `native_code_bytes`. On the primary AArch64 host,
+    the LUT-class machine mapping is currently declined in optimized builds pending a dedicated
+    emitter audit; class patterns retain the checked native Rust matcher and never enter an
+    unverified machine path.
+  - [x] Extend the emitted subset to legacy one-byte non-ASCII subjects (2026-09-04) using a
+    separate 32-bit-element entry, with no temporary conversion allocation; two-byte, astral,
+    Unicode, and unsupported-flag inputs remain on the verified fallback paths.
 - [ ] Add native character classes, anchors, branches, loops, captures, and backtracking stacks
   incrementally.
+  - [x] Native exact ASCII/Latin-1 class LUT operations are covered by the straight-line subset.
+  - [x] Add non-multiline `^`/`$` anchors as zero-width native operations (2026-09-04); multiline
+    anchors remain on the reference matcher.
+  - [x] Add terminal capture-free `Many` loops with bounded polling and greedy/lazy selection
+    (2026-09-04); repeats with continuations, branches, captures, or backtracking remain on the
+    reference matcher.
 - [ ] Add UTF-16 and Unicode/UnicodeSets native paths without weakening code-point/code-unit
   semantics.
 - [ ] Preserve specified alternative ordering, greedy/lazy behavior, backreferences, lookarounds,
@@ -945,8 +1018,27 @@ throughput after 3A is correct; it may proceed alongside Maps, RegExp, and optim
 - [ ] Charge native RegExp code to the same bounded per-Agent/shared executable-code budget as JS
   JIT and generated builtin code; age or evict cold patterns without allowing one tier to hide
   another tier's memory use.
+  - [x] Route ordinary JIT chunks and native RegExp mappings through one process-wide 16 MiB live
+    executable-code reservation with automatic reclamation on chunk/pattern drop (2026-09-04).
+  - [ ] Add Agent ownership and cold-code aging/eviction so the process cap becomes the specified
+    per-Agent/shared policy rather than only a safe process-level bound.
 - [ ] Run the full official RegExp Test262 slice and bytecode/native differential corpus after each
   matcher expansion.
+  - [x] Milestone gate completed 2026-09-04 after restoring the guarded forward-search split
+    specialization and retaining the AArch64 class-machine safety guard: canonical release
+    regexp smoke passed in 8.16 s (score 487), and the complete 128-job matrix passed with no
+    workload failure. Report `benchmark-results/engine-matrix-20260904-terminal-many-final.json`
+    (SHA-256 `3c0fa0371e08ef7d71a5d2881bb3e42a32566897d894a8fc4fc08afced6da9ef`) used artifact
+    SHA-256 `03053b81156c8e13ad976159e1754b94f6211fa036e5f33f5e09754f4f132935`; the locked
+    regression checker passed every component. Lumen's composite median was 1,909.522 versus
+    1,902.745 in the preceding locked run (+0.36%); Navier-Stokes improved 12,256 → 12,686
+    (+3.51%), Earley-Boyer 852 → 866 (+1.64%), and RegExp moved 499 → 487 (-2.40%) while
+    remaining well above its 420.980 policy floor. The detailed native differential and focused
+    Rust/JS regression gates remain green.
+  - [x] Rebuilt the current release Test262 runner and completed `built-ins/RegExp` on 2026-09-04:
+    1,879/1,879 tests passed, with 0 failures and 0 skips.
+  - [x] Revalidated the cleaned source tree with `cargo test --workspace --offline --locked`:
+    872 core Lumen tests and all workspace integration/package/doc-test targets passed (2026-09-04).
 
 ### Phase 7: native ECMAScript string representations
 
@@ -1533,6 +1625,32 @@ because V8 once used it.
 - [ ] Run a one-iteration Speedometer 3.1 slice/full matrix through the actual Start control.
 - [ ] Run at least YouTube consent rejection/search, Twitch search/cards, and Steam
   search/catalog semantic gates.
+- [ ] Verify Archive.org's Wayback banner and top SVG icons at rest and after hover, and
+  Steam's featured-carousel artwork/thumbnails, through the actual desktop renderer. A semantic
+  text dump or successful HTTP response is not a visual pass.
+- [ ] Exercise Neocities' delayed iframe/WASM phase beyond initial render; capture the module's
+  execution, errors, and memory trajectory. A run that never reaches that phase is **not
+  exercised**, even if the initial page looks complete. See
+  [the 2026-09-05 regression diagnosis](REGRESSION_DIAGNOSIS_2026-09-05.md).
+- [ ] Retain large-function exception tests across native branch-range boundaries. ARM64
+  long-branch insertion must relocate the unwinder's bytecode-PC table as well as ordinary
+  branch labels. Include early/late catches of imported JS exceptions and WASM RuntimeErrors;
+  small module fixtures alone did not expose the September 5 follow-on native crash.
+- [ ] Retain runaway-recursion and post-exhaustion recovery gates across interpreter, bytecode,
+  JIT, native callbacks, constructors, and microtasks. Native segmented stacks are outside GC
+  allocation metrics; finite deep-call tests alone cannot validate their resource safety.
+- [ ] Close both fresh-instance WASM retention gates with cross-heap reachability and native
+  reclamation, not weakened identity caches. Keep duplicate-externref allocation, nonconstructible
+  exports, imported callback dispatch, and multi-value iterator-order regressions in all three
+  tiers. The September 5 boundary corrections reduce the fresh fixture's retained JS objects
+  from three per instance to one; the gate remains failing and no native collection is claimed.
+- [ ] Implement compiled proper-tail-call transfer before removing the strict tail-call
+  interpreter fallback. Measure the fallback's performance impact explicitly; memory
+  containment must not turn constant-stack tail recursion into growing native frames.
+- [ ] Contain every leak/site reproducer with verified process-tree memory and time limits and
+  no swap (`bash scripts/run-bounded.sh 1024 90 -- /absolute/command ...` on this Linux host).
+  Limit termination is a failed/unfinished gate, never a successful page result. Record whether
+  the intended phase ran, not just whether the runner exited.
 - [ ] Rotate Instagram and at least two other JS-heavy sites or faithful local replays through the
   matrix; avoid hammering an origin that has rate-limited the harness.
 - [ ] Require responsive page actors, expected semantic milestones, no engine/script errors, no

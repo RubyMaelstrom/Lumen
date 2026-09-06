@@ -329,8 +329,21 @@ not an acceptable cost of conformance.
   their application code runs; do not disguise this as a JavaScript failure or
   add a site-specific exception.
 
+- [ ] Complete joint JS/WASM lifetime handling before browser acceptance. The September 5
+  follow-up fixes duplicate externref allocation, callback dispatch, multi-value iteration,
+  and constructible exported wrappers; all focused tier tests pass. Fresh-instance retention
+  falls from three JS objects per instance to one but both enabled retention gates still fail,
+  and native Store/unique externref reclamation remains open. Do not weaken wrapper identity
+  or failed-start escape handling. See the [verification record](REGRESSION_DIAGNOSIS_2026-09-05.md).
 - [ ] Replace arbitrary execution-depth rejection with an implementation that
   supports ECMAScript execution contexts up to actual resource exhaustion.
+  - **2026-09-05 correction:** unrestricted native segment allocation was not a safe
+    replacement for a depth guard. Neocities exposes recursive calls growing the
+    native stacks until host OOM. Bound live additional segment storage, return a
+    catchable stack-overflow error through owning call boundaries, and reclaim the
+    budget on unwind. Preserve deep finite calls and proper tail-call reuse. See
+    [the investigation and verification record](REGRESSION_DIAGNOSIS_2026-09-05.md).
+    Existing finite-depth tests alone did not test exhaustion or recovery.
   - [x] Remove TRust's embedder-selected depth budget and Lumen's native
     browser-visible depth guard.
   - [x] Cover interpreter, bytecode, JIT, captured/native calls, and construction
