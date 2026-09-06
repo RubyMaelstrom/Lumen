@@ -2072,6 +2072,101 @@ fn regex_literal_can_begin_a_control_statement_body() {
 }
 
 #[test]
+fn regex_literal_after_async_declarations_preserves_lexical_goals() {
+    // ECMA-262 InputElementRegExp versus InputElementDiv, AsyncFunction/AsyncGenerator
+    // definitions, and ASI. VS Code's bootstrap places a regex after adjacent declarations.
+    let cases = [
+        "async function first(){} function second(){} /x/.test('x')",
+        "async function first(){} async function second(){} /x/.test('x')",
+        "async function first(){} class Second{} /x/.test('x')",
+        "async function first(){} /[}]/.test('}')",
+        "async/**/function first(){} /x/.test('x')",
+        "async function* first(){} /x/.test('x')",
+        "async function outer(value=async function inner(){}){} /x/.test('x')",
+        "function outer(){async function first(){} return /x/.test('x')} outer()",
+        "var hit=false; {async function first(){} /x/.test('x') && (hit=true)} hit",
+        "var hit=false; {async function* first(){} /x/.test('x') && (hit=true)} hit",
+        "var async=1; async\nfunction first(){} /x/.test('x')",
+        "var async=1; async/*\n*/function first(){} /x/.test('x')",
+        "var async=1; var value=async\nfunction first(){} /x/.test('x') && value===1",
+        "var quotient=async function(){} / 2; Number.isNaN(quotient)",
+        "var quotient=async function named(){} / 2; Number.isNaN(quotient)",
+        "var quotient=async function*(){} / 2; Number.isNaN(quotient)",
+        "var object={value:async function(){} / 2}; Number.isNaN(object.value)",
+        "function outer(){return async function(){} / 2} Number.isNaN(outer())",
+        "var outer=()=>async function(){} / 2; Number.isNaN(outer())",
+        "Number.isNaN((async function(){}) / 2)",
+    ];
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for source in cases {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(run_in(&mut engine, source), "true", "{tier:?}: {source}");
+        }
+        for separator in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}", "/*\n*/"] {
+            let source = format!(
+                "var async=1; async{separator}function first(){{return 7}} \
+                 /x/.test('x') && first()===7"
+            );
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(run_in(&mut engine, &source), "true", "{tier:?}: {source}");
+        }
+        for source in [
+            "export async function first(){} /x/.test('x') && (globalThis.hit=true)",
+            "export default function(){} /x/.test('x') && (globalThis.hit=true)",
+            "export default function*(){} /x/.test('x') && (globalThis.hit=true)",
+            "export default async function(){} /x/.test('x') && (globalThis.hit=true)",
+            "export default async function*(){} /x/.test('x') && (globalThis.hit=true)",
+            "const async=1; export default async\nfunction first(){return 7} /x/.test('x') && (globalThis.hit=first()===7)",
+        ] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert!(matches!(
+                engine.eval_module(source, "async-regex.js", |_, _| None),
+                Ok(Completion::Value(_))
+            ));
+            assert_eq!(run_in(&mut engine, "hit"), "true", "{tier:?}: {source}");
+        }
+    }
+    for source in [
+        "function(){}",
+        "function*(){}",
+        "async function(){}",
+        "async function*(){}",
+        "if(true) function(){}",
+        "var f=async\nfunction(){} /x/.test('x')",
+        "\\u0061sync function first(){} /x/.test('x')",
+        "var f=\\u0061sync function(){} / 2",
+    ] {
+        assert!(
+            crate::parser::parse_script(source, false).is_err(),
+            "must reject {source}"
+        );
+    }
+    for source in [
+        "export function(){}",
+        "export function*(){}",
+        "export async function(){}",
+        "export async function*(){}",
+        "export default async\nfunction(){}",
+        "export default async\nfunction*(){}",
+    ] {
+        assert!(
+            crate::parser::parse_module(source).is_err(),
+            "must reject {source}"
+        );
+    }
+}
+
+#[test]
 fn bigint() {
     assert_eq!(run("typeof 10n"), "bigint");
     assert_eq!(run("(10n + 20n).toString()"), "30");
@@ -21114,6 +21209,42 @@ fn large_jit_function_catches_after_branch_relaxation() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         assert_eq!(run_in(&mut engine, &source), "43", "tier {tier:?}");
+    }
+}
+
+#[test]
+fn large_compiler_name_pool_preserves_literal_keys_and_references() {
+    // ECMA-262 object initializers and OrdinaryOwnPropertyKeys: repeated keys overwrite values,
+    // retain their original insertion position, and remain distinct from other Unicode spellings.
+    let keys: Vec<_> = (0..64).map(|index| format!("field{index}")).collect();
+    let properties = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| format!("{key}:{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sum = keys
+        .iter()
+        .map(|key| format!("object.{key}"))
+        .collect::<Vec<_>>()
+        .join("+");
+    let source = format!(
+        "function check() {{
+           var object={{{properties}, field3:103, 'é':71, 'e\\u0301':72}};
+           var sum={sum};
+           return Object.keys(object).join(',')+'|'+sum+'|'+object['é']+'|'+object['e\\u0301'];
+         }} check()"
+    );
+    let expected = format!("{},é,e\u{301}|2116|71|72", keys.join(","));
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, &source), expected, "{tier:?}");
     }
 }
 

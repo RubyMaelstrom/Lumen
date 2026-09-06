@@ -207,7 +207,23 @@ impl Lexer {
     /// Whether a `function` keyword (about to be pushed) sits in statement position (a declaration)
     /// rather than expression position.
     fn function_is_declaration(&self) -> bool {
-        match self.out.last().map(|t| &t.kind) {
+        let mut before = self.out.as_slice();
+        if let Some(token) = before.last() {
+            if matches!(&token.kind, Tok::Ident(word) if word == "async") {
+                // ECMA-262 AsyncFunction/AsyncGenerator syntax includes the unescaped `async`
+                // prefix in the declaration or expression. Classify its starting position,
+                // not the prefix as an ordinary value; otherwise `/` after the body is mislexed.
+                // A line terminator instead separates the ordinary identifier expression from
+                // a new FunctionDeclaration (ASI); the parser still validates the full context.
+                if self.nl_pending {
+                    return true;
+                }
+                if !token.escaped {
+                    before = &before[..before.len() - 1];
+                }
+            }
+        }
+        match before.last().map(|t| &t.kind) {
             None => true,
             Some(Tok::Punct(p)) => match *p {
                 ";" | "{" => true,

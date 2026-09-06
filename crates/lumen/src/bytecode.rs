@@ -4967,6 +4967,97 @@ fn plan_inlines_at(
     plan
 }
 
+#[cfg(test)]
+mod compiler_name_tests {
+    use super::Compiler;
+
+    #[test]
+    fn indexed_names_keep_first_occurrence_and_contiguous_literal_keys() {
+        let mut compiler = Compiler::default();
+        for index in 0..32 {
+            assert_eq!(compiler.name_idx(&format!("field{index}")), index);
+        }
+        assert!(compiler.name_indexes.is_none());
+        for index in 32..256 {
+            assert_eq!(compiler.name_idx(&format!("field{index}")), index);
+        }
+        assert!(compiler.name_indexes.is_some());
+        for index in (0..256).rev() {
+            assert_eq!(compiler.name_idx(&format!("field{index}")), index);
+        }
+        // MakeObject deliberately appends duplicate keys in a consecutive operand range.
+        for (offset, key) in ["field99", "new", "field1", "new", "é", "e\u{301}"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(compiler.append_name(key), 256 + offset as u32);
+        }
+        assert_eq!(compiler.name_idx("field99"), 99);
+        assert_eq!(compiler.name_idx("field1"), 1);
+        assert_eq!(compiler.name_idx("new"), 257);
+        assert_eq!(compiler.name_idx("é"), 260);
+        assert_eq!(compiler.name_idx("e\u{301}"), 261);
+        assert_eq!(compiler.names.len(), 262);
+    }
+
+    #[test]
+    fn indexed_names_rollback_discards_only_the_spliced_suffix() {
+        let mut compiler = Compiler::default();
+        for index in 0..64 {
+            compiler.append_name(&format!("field{index}"));
+        }
+        // Build lazily even when the entire initial pool came from literal-key ranges.
+        assert_eq!(compiler.name_idx("field63"), 63);
+        assert!(compiler.name_indexes.is_some());
+        assert_eq!(compiler.append_name("field3"), 64);
+        assert_eq!(compiler.name_idx("discarded"), 65);
+        compiler.append_name("discarded");
+        compiler.truncate_names(64);
+        assert_eq!(compiler.name_idx("field3"), 3);
+        assert_eq!(compiler.name_idx("replacement"), 64);
+        assert_eq!(compiler.name_idx("discarded"), 65);
+        compiler.truncate_names(2);
+        assert_eq!(compiler.name_idx("field1"), 1);
+        assert_eq!(compiler.name_idx("field63"), 2);
+        compiler.truncate_names(0);
+        assert_eq!(compiler.name_idx("discarded"), 0);
+        assert_eq!(compiler.names.len(), 1);
+    }
+
+    #[test]
+    fn indexed_names_match_linear_lookup_through_repeated_rollbacks() {
+        let mut compiler = Compiler::default();
+        let mut reference = Vec::<String>::new();
+        let mut random = 7u64;
+        for step in 0..10_000 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let key = format!("name{}", random >> 32 & 511);
+            match (step < 256, random & 15) {
+                (false, 0) => {
+                    let len = (random >> 16) as usize % (reference.len() + 1);
+                    reference.truncate(len);
+                    compiler.truncate_names(len);
+                }
+                (_, 1 | 2) => {
+                    assert_eq!(compiler.append_name(&key) as usize, reference.len());
+                    reference.push(key);
+                }
+                _ => {
+                    let index = reference
+                        .iter()
+                        .position(|name| name == &key)
+                        .unwrap_or_else(|| {
+                            reference.push(key.clone());
+                            reference.len() - 1
+                        });
+                    assert_eq!(compiler.name_idx(&key) as usize, index, "step {step}");
+                }
+            }
+            assert_eq!(compiler.names.len(), reference.len());
+        }
+    }
+}
+
 #[derive(Default)]
 struct Compiler {
     /// The compiled function's strictness (carried into ops whose runtime behavior forks on it).
@@ -4993,6 +5084,9 @@ struct Compiler {
     ops: Vec<Op>,
     consts: Vec<Value>,
     names: Vec<Rc<str>>,
+    /// Compile-only index for larger name pools. `names` remains the authoritative ordered
+    /// table: object-literal keys can be contiguous duplicates, so this maps to the FIRST entry.
+    name_indexes: Option<crate::fasthash::FastMap<Rc<str>, u32>>,
     /// Lexical scopes for slot resolution: (name, slot, is_const), innermost last.
     scopes: Vec<Vec<(String, u16, bool)>>,
     /// Environment-backed bindings at each compiler scope, parallel to `scopes`. An entry blocks
@@ -5464,7 +5558,7 @@ impl Compiler {
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
             self.ops.truncate(snap.0);
             self.consts.truncate(snap.1);
-            self.names.truncate(snap.2);
+            self.truncate_names(snap.2);
             self.caches.truncate(snap.3);
             self.name_caches.truncate(snap.4);
             self.name_pins.truncate(snap.4);
@@ -6431,11 +6525,46 @@ impl Compiler {
         (self.consts.len() - 1) as u32
     }
     fn name_idx(&mut self, name: &str) -> u32 {
-        if let Some(i) = self.names.iter().position(|n| &**n == name) {
-            return i as u32;
+        // Large bundles repeatedly searched the complete pool for every emitted name. Keep
+        // small functions allocation-free, then use a compile-local index without changing
+        // bytecode IDs, property-key order, feedback layout, or serialized chunk contents.
+        if self.name_indexes.is_none() && self.names.len() >= 32 {
+            let mut indexes = crate::fasthash::FastMap::default();
+            for (index, name) in self.names.iter().enumerate() {
+                indexes.entry(name.clone()).or_insert(index as u32);
+            }
+            self.name_indexes = Some(indexes);
         }
-        self.names.push(Rc::from(name));
-        (self.names.len() - 1) as u32
+        if let Some(indexes) = &self.name_indexes {
+            if let Some(&index) = indexes.get(name) {
+                return index;
+            }
+        } else if let Some(index) = self.names.iter().position(|n| &**n == name) {
+            return index as u32;
+        }
+        self.append_name(name)
+    }
+    /// Append even a duplicate when an opcode requires a contiguous key range.
+    fn append_name(&mut self, name: &str) -> u32 {
+        let index = self.names.len() as u32;
+        let name: Rc<str> = Rc::from(name);
+        if let Some(indexes) = &mut self.name_indexes {
+            indexes.entry(name.clone()).or_insert(index);
+        }
+        self.names.push(name);
+        index
+    }
+    /// Failed speculative inlining must remove only entries first introduced by that splice.
+    /// Work is proportional to the rolled-back suffix, not to the entire retained name table.
+    fn truncate_names(&mut self, len: usize) {
+        if let Some(indexes) = &mut self.name_indexes {
+            for (index, name) in self.names.iter().enumerate().skip(len) {
+                if indexes.get(name.as_ref()) == Some(&(index as u32)) {
+                    indexes.remove(name.as_ref());
+                }
+            }
+        }
+        self.names.truncate(len);
     }
     fn patch(&mut self, at: usize) {
         let target = self.ops.len() as u32;
@@ -9911,7 +10040,7 @@ impl Compiler {
                 // add names of their own, and the key range must stay contiguous.
                 let start = self.names.len() as u32;
                 for k in &keys {
-                    self.names.push(Rc::from(k.as_str()));
+                    self.append_name(k);
                 }
                 // Distinct keys → a pre-shaped template site ({a:1, a:2} keeps the insert path:
                 // the template's slot-indexed value writes assume one slot per key).

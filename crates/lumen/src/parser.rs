@@ -760,12 +760,15 @@ impl Parser {
             }
             Tok::Keyword("function") => {
                 let f = self.parse_function(false, false, self.cur_start())?;
+                // The anonymous declaration production is [+Default] only; export default
+                // takes its own parse_export path. Function expressions remain name-optional.
+                let Some(name) = &f.name else {
+                    return self.err("function declaration requires a name");
+                };
                 // An Annex B substatement-position function (`if (x) function f(){}`) binds in
                 // its own implicit block: its name never conflicts with enclosing declarations.
                 if !single_stmt {
-                    if let Some(n) = &f.name {
-                        self.declare_fn_decl(n, f.is_async, f.is_generator)?;
-                    }
+                    self.declare_fn_decl(name, f.is_async, f.is_generator)?;
                 }
                 Ok(Stmt::FuncDecl(Rc::new(f)))
             }
@@ -783,10 +786,11 @@ impl Parser {
                 let start = self.cur_start();
                 self.advance();
                 let f = self.parse_function(true, false, start)?;
+                let Some(name) = &f.name else {
+                    return self.err("async function declaration requires a name");
+                };
                 if !single_stmt {
-                    if let Some(n) = &f.name {
-                        self.declare_fn_decl(n, f.is_async, f.is_generator)?;
-                    }
+                    self.declare_fn_decl(name, f.is_async, f.is_generator)?;
                 }
                 Ok(Stmt::FuncDecl(Rc::new(f)))
             }
@@ -1798,7 +1802,8 @@ impl Parser {
             let stmt = if self.is_kw("function")
                 || (self.is_ident_word("async")
                     && !self.cur_escaped()
-                    && matches!(self.peek_kind(1), Tok::Keyword("function")))
+                    && matches!(self.peek_kind(1), Tok::Keyword("function"))
+                    && !self.toks[self.pos + 1].nl_before)
             {
                 let start = self.cur_start();
                 let is_async = self.eat_ident_word("async");
