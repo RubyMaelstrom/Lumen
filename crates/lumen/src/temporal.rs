@@ -1592,6 +1592,7 @@ pub fn cal_fields(cal: &str, iso: IsoDate) -> (i64, i64, i64, i64, i64, i64, i64
 }
 
 /// The (display month-number, is-leap-month) of a lunisolar chinese/dangi date.
+#[cfg(feature = "intl")]
 pub fn lunisolar_month_num(cal: &str, iso: IsoDate) -> (i64, bool) {
     let (_, _, num, leap, _) = china_fields(cal, iso);
     (num, leap)
@@ -1599,6 +1600,7 @@ pub fn lunisolar_month_num(cal: &str, iso: IsoDate) -> (i64, bool) {
 
 /// The CLDR month index (1..13) of a Hebrew date: CLDR reserves index 6 for Adar I, so common
 /// years skip it (Adar is always index 7).
+#[cfg(feature = "intl")]
 pub fn hebrew_cldr_month(iso: IsoDate) -> i64 {
     let (y, m, _) = hebrew_from_iso(iso);
     if hebrew_leap(y) || m < 6 {

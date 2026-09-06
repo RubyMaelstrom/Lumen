@@ -56,6 +56,7 @@ pub fn registry_name(name: &str) -> Option<&'static str> {
 }
 
 /// Every canonical IANA zone name in the registry (for `Intl.supportedValuesOf("timeZone")`).
+#[cfg(feature = "intl")]
 pub fn canonical_zone_names() -> Vec<&'static str> {
     ZONES.iter().map(|z| z.name).collect()
 }

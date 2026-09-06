@@ -2386,6 +2386,68 @@ fn high_churn_task_collects_after_temporary_roots_are_released() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn error_diagnostics_do_not_execute_author_code() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        r#"
+        globalThis.diagnosticReads = 0;
+        const hostile = { toString() { ++diagnosticReads; throw 'coerced'; } };
+        globalThis.diagnosticError = new Error('original message');
+        for (const name of ['stack', 'name', 'toString'])
+            Object.defineProperty(diagnosticError, name, { get() {
+                ++diagnosticReads; throw 'getter called';
+            }});
+        globalThis.diagnosticProxy = new Proxy(diagnosticError, {
+            get() { ++diagnosticReads; throw 'proxy called'; },
+            getPrototypeOf() { ++diagnosticReads; throw 'prototype trap called'; }
+        });
+        0;
+    "#,
+    );
+    let global = engine.global_this();
+    let error = engine
+        .ctx()
+        .member_get(&global, "diagnosticError")
+        .unwrap_or_else(|_| panic!("read fixture error"));
+    assert!(engine
+        .ctx()
+        .error_diagnostic(&error)
+        .unwrap()
+        .starts_with("Error: original message"));
+    let proxy = engine
+        .ctx()
+        .member_get(&global, "diagnosticProxy")
+        .unwrap_or_else(|_| panic!("read fixture proxy"));
+    assert!(engine.ctx().error_diagnostic(&proxy).is_none());
+    run_in(&mut engine, "diagnosticError.message = hostile; 0");
+    assert!(engine
+        .ctx()
+        .error_diagnostic(&error)
+        .unwrap()
+        .contains("<non-string message>"));
+    run_in(
+        &mut engine,
+        r#"
+        Object.defineProperty(diagnosticError, 'message', { get() {
+            ++diagnosticReads; throw 'message getter called';
+        }});
+        0;
+    "#,
+    );
+    assert!(engine
+        .ctx()
+        .error_diagnostic(&error)
+        .unwrap()
+        .contains("<accessor message>"));
+    assert_eq!(run_in(&mut engine, "diagnosticReads"), "0");
+    let long = engine.ctx().make_error("Error", "🦀".repeat(10_000));
+    assert!(engine.ctx().error_diagnostic(&long).unwrap().len() < 12_000);
+    assert!(engine.ctx().error_diagnostic(&Value::Undefined).is_none());
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn embedder_can_settle_a_host_promise_after_an_external_task() {
     use crate::value::Value;
 
@@ -2913,6 +2975,86 @@ fn recursive_calls_cross_generator_continuations_without_an_artificial_budget() 
         ),
         "512"
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn execution_stack_resource_exhaustion_unwinds_and_recovers() {
+    // Host stack exhaustion must be catchable, not unlimited native segment growth. Do not
+    // assert an exact JS depth: the resource being bounded is native storage, not [[Call]].
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        for body in [
+            "function recurse(n){return n===0 ? 0 : 1+recurse(n-1)}",
+            "var recurse=(()=>{let step=1;return function f(n){return n===0 ? 0 : step+f(n-1)}})()",
+            "function recurse(n){return n===0 ? 0 : 1+recurse.call(undefined,n-1)}",
+            "function recurse(n){return n===0 ? 0 : 1+recurse.apply(undefined,[n-1])}",
+            "var box={n:0,get value(){return this.n--===0 ? 0 : 1+this.value}}; function recurse(n){box.n=n;return box.value}",
+            "var recurse=new Proxy(function(n){return n===0 ? 0 : 1+recurse(n-1)},{apply(f,t,a){return Reflect.apply(f,t,a)}})",
+            "function C(n){this.n=n===0 ? 0 : 1+new C(n-1).n} function recurse(n){return new C(n).n}",
+        ] {
+            let source = format!(
+                "{body}; recurse(16); var caught=false; \
+                 try{{recurse(Infinity)}}catch(e){{caught=e instanceof RangeError}} \
+                 caught && recurse(16)===16"
+            );
+            match engine.eval(&source, false).expect("stack fixture parses") {
+                Completion::Value(value) => assert_eq!(value, "true", "{tier:?}: {body}"),
+                Completion::Throw { name, message } => {
+                    panic!("{tier:?}: {body}: uncaught {name}: {message}")
+                }
+            }
+            assert_eq!(crate::interpreter::execution_stack_segments(), 0);
+        }
+        // A second exhaustion in the same Agent and try/finally cleanup must both work.
+        let source = r#"
+            var entered=0, exited=0, caught=0;
+            function unwind(){entered++;try{unwind()}finally{exited++}}
+            for(var attempt=0;attempt<2;attempt++){
+                try{unwind()}catch(e){if(e instanceof RangeError)caught++}
+            }
+            caught===2 && entered===exited && entered>0
+        "#;
+        match engine.eval(source, false).expect("unwind fixture parses") {
+            Completion::Value(value) => assert_eq!(value, "true", "{tier:?}: finally cleanup"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+        assert_eq!(crate::interpreter::execution_stack_segments(), 0);
+        // ECMA-262 §15.10.3 reuses tail-call resources; no cumulative call budget is permitted.
+        match engine
+            .eval(
+                "function tail(n,a){'use strict';return n===0 ? a : tail(n-1,a+1)} tail(20000,0)",
+                false,
+            )
+            .expect("tail-call fixture parses")
+        {
+            Completion::Value(value) => assert_eq!(value, "20000", "{tier:?}: tail calls"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn execution_stack_segment_budget_is_returned_on_rust_unwind() {
+    for _ in 0..2 {
+        let result = std::panic::catch_unwind(|| {
+            stacker::grow(512 * 1024, || {
+                crate::interpreter::with_execution_stack(1, || {
+                    assert_eq!(crate::interpreter::execution_stack_segments(), 1);
+                    panic!("exercise native stack cleanup");
+                });
+            });
+        });
+        assert!(result.is_err());
+        assert_eq!(crate::interpreter::execution_stack_segments(), 0);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13223,6 +13365,32 @@ fn regexp_replace_flags_fast_path_shapes() {
 }
 
 #[test]
+fn regexp_anchored_no_match_stays_no_match_after_native_tier_up() {
+    assert_eq!(
+        run(r#"
+                var re = /^-ms-/;
+                var out = [];
+                for (var i = 0; i < 96; i++) {
+                    out.push("background-image".replace(re, "ms-"));
+                }
+                out[0] + "|" + out[63] + "|" + out[95] + "|" +
+                    (re.exec("background-image") === null)
+            "#),
+        "background-image|background-image|background-image|true"
+    );
+}
+
+#[test]
+fn regexp_replace_dead_result_native_loop_terminates() {
+    // Exercise the optimized dynamic-array dead-result replace after the matcher has promoted to
+    // native code. The no-match tail must still advance to the subject end after every poll.
+    assert_eq!(
+        run("var s=['e115']; function f(){for(var i=0;i<96;i++) s[0].replace(/[A-Za-z]/g,'');} f(); 'ok'"),
+        "ok"
+    );
+}
+
+#[test]
 fn regexp_replace_flags_own_override_takes_generic_path() {
     // An own `global` data property (defineProperty) changes the observable flags string to no
     // longer include "g"; replace must follow it, so the guard declines the direct engine-side
@@ -14503,6 +14671,13 @@ fn string_split_delegate() {
     // unsplit remainder (the behavior of splitn, not String.prototype.split).
     assert_eq!(run("'a,b,c'.split(',',1).join('|')"), "a");
     assert_eq!(run("'a1b2c'.split(/[0-9]/).join('|')"), "a|b|c");
+    assert_eq!(run("'aX,b'.split(/,/y).join('|')"), "aX|b");
+    // The dead-result split fast path must remain terminating after a promoted class matcher,
+    // including control characters from the regexp benchmark's input-variant generator.
+    assert_eq!(
+        run("var r=/[+, ]/; var a=[String.fromCharCode(1)+'svz_zlfcnpr_ubzrcntr_abgybttrqva,svz_zlfcnpr_aba_HTP,svz_zlfcnpr_havgrq-fgngrf','tsz_zlfcnpr_ubzrcntr_abgybttrqva,svz_zlfcnpr_aba_HTP,svz_zlfcnpr_havgrq-fgngrf']; for(var i=0;i<30;i++) a[i%2].split(r); 'ok'"),
+        "ok"
+    );
     assert_eq!(run("'x'.split({[Symbol.split](s){return ['S']}})[0]"), "S");
     assert_eq!(run("'abc'.split('').join('-')"), "a-b-c");
     // String separators use UTF-16 units, so a separator can split an astral pair and leave a
@@ -20913,6 +21088,33 @@ fn inline_throw_from_spliced_body() {
         ),
         "450:true"
     );
+}
+
+#[test]
+fn large_jit_function_catches_after_branch_relaxation() {
+    // ECMA-262 14.15.3: a throw in the protected block must enter its catch with the
+    // original value. ARM64 long-branch veneers move the catch's native address.
+    let padding = "value = object.value;\n".repeat(1000);
+    let source = format!(
+        "function largeCatch(flag, object) {{
+           var value = 0;
+           try {{
+             if (flag) {{ {padding} }}
+             throw 42;
+           }} catch (error) {{ return error + 1; }}
+         }}
+         largeCatch(false, {{value: 7}})"
+    );
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, &source), "43", "tier {tier:?}");
+    }
 }
 
 #[test]

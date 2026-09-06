@@ -81,6 +81,7 @@ mod cldr_datetime_patterns;
 #[cfg(feature = "intl")]
 mod cldr_units;
 #[rustfmt::skip]
+#[cfg(feature = "intl")]
 mod units;
 #[cfg(feature = "intl")]
 mod unicode_collation;
@@ -1098,3 +1099,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tail_tests;
+#[cfg(test)]
+mod entry_tests;

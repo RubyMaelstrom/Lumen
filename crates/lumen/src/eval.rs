@@ -2823,6 +2823,7 @@ impl Interp {
                 let idx = self.eval(index, env)?;
                 // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
                 if matches!(base, Value::Undefined | Value::Null) {
+                    trace_nullish_property("eval-index", &idx);
                     return Err(
                         self.throw("TypeError", "cannot read property of null or undefined")
                     );

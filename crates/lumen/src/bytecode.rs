@@ -574,6 +574,13 @@ pub enum Op {
     /// otherwise make the ordinary call. The arguments travel in the same private dense array as
     /// [`Op::CallArgsArrayThis`], so arbitrary suspension and spreads remain explicit bytecode.
     EvalCallArgsArray,
+    /// A call in a proven tail position. Consumes the same operands as the corresponding
+    /// ordinary call, but hands ownership to Interp's trampoline and produces an undefined
+    /// placeholder for the immediately enclosing return. No target code runs before this
+    /// activation is retired. Constructors retain their ordinary result-processing path.
+    TailCall(CallArgsMode, bool),
+    /// Direct eval must execute in this activation; a non-intrinsic eval target transfers.
+    TailEvalCallArgsArray,
     /// Statement-position `obj.name += v` (pops v, the compound-read lval, obj): appends IN
     /// PLACE when the property still holds the exact string the read produced and everything is
     /// plain (see `Interp::append_prop_fast`); otherwise runs the generic Add + IC store —
@@ -869,6 +876,10 @@ struct LexicalBinding {
 }
 
 pub struct Chunk {
+    /// The caller must complete FunctionDeclarationInstantiation before running this body.
+    /// The existing activation, including mapped arguments and parameter-expression scopes,
+    /// is authoritative. Lean/moved call entries must never bypass this prologue.
+    pub(crate) prepared_entry: bool,
     // (fields below; Debug is manual — `consts` holds engine Values)
     ops: Vec<Op>,
     consts: Vec<Value>,
@@ -998,6 +1009,9 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    pub(crate) fn has_tail_calls(&self) -> bool {
+        self.ops.iter().any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray))
+    }
     /// Scan the directly-owned bytecode/feedback payload. Shared AST nodes, Functions, strings,
     /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
     /// allocation-family visitor for identity deduplication.
@@ -1388,7 +1402,7 @@ impl Chunk {
     /// Whether the JIT-to-JIT moved-frame path must stand down. An `arguments` object observes
     /// the call frame even though it does not itself require an activation scope.
     fn needs_env(&self) -> bool {
-        self.makes_env() || self.arguments_slot.is_some()
+        self.prepared_entry || self.makes_env() || self.arguments_slot.is_some()
     }
 
     /// Stable adapter query for call feedback. The optimizing tier must not infer this from the
@@ -1405,6 +1419,9 @@ impl Chunk {
     /// `MakeClosure` environments route through the result. Returns `env` untouched when nothing
     /// needs seeding.
     fn make_run_env(&self, i: &mut Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
+        if self.prepared_entry {
+            return env.clone();
+        }
         if !self.makes_env() {
             return env.clone();
         }
@@ -2672,7 +2689,9 @@ fn feedback_layout_for_ops(
             | Op::CallSpreadThis(..)
             | Op::CallArgsArray
             | Op::CallArgsArrayThis
-            | Op::EvalCallArgsArray => (OperationKind::Call, &[CALL_TARGET, VALUE_RESULT]),
+            | Op::EvalCallArgsArray
+            | Op::TailEvalCallArgsArray => (OperationKind::Call, &[CALL_TARGET, VALUE_RESULT]),
+            Op::TailCall(..) => (OperationKind::Call, &[CALL_TARGET]),
             Op::New(..) | Op::NewArgsArray | Op::SuperCallArgsArray => {
                 (OperationKind::Construct, &[CALL_TARGET, VALUE_RESULT])
             }
@@ -4040,7 +4059,12 @@ mod feedback_layout_tests {
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, &Default::default(), None, None, false);
+    let result = compile_inner(func, &Default::default(), None, None, false, false)
+        .or_else(|| {
+            (!func.is_async && !func.is_generator)
+                .then(|| compile_inner(func, &Default::default(), None, None, false, true))
+                .flatten()
+        });
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4052,7 +4076,7 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
 /// derived class's instance elements through the shared ECMA-262 algorithm.
 pub(crate) fn compile_derived_constructor(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, &Default::default(), None, None, true);
+    let result = compile_inner(func, &Default::default(), None, None, true, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4083,7 +4107,7 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         fn_maps: std::cell::OnceCell::new(),
     };
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(&function, &Default::default(), None, Some(bindings), false);
+    let result = compile_inner(&function, &Default::default(), None, Some(bindings), false, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4099,7 +4123,7 @@ pub(crate) fn compile_with_inlines(
         .is_none()
         .then_some(hot);
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, plan, seed, None, false);
+    let result = compile_inner(func, plan, seed, None, false, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4207,6 +4231,7 @@ fn compile_inner(
     hot: Option<&Chunk>,
     module_bindings: Option<&[(String, bool)]>,
     derived_constructor: bool,
+    prepared_entry: bool,
 ) -> Option<Rc<Chunk>> {
     // Body facts the scanner already knows: `new.target` is an observation channel into the
     // activation that slots do not provide; `this` / `arguments` in an ordinary arrow are free
@@ -4219,7 +4244,7 @@ fn compile_inner(
     // retain it for every resumption, including as the lexical parent of async arrows. A compiled
     // derived constructor likewise runs under its required Function Environment Record. Other
     // lean ordinary frames still omit the activation, so keep their conservative exclusion.
-    if scan & SCAN_NEW_TARGET != 0 && !is_coroutine && !derived_constructor {
+    if scan & SCAN_NEW_TARGET != 0 && !is_coroutine && !derived_constructor && !prepared_entry {
         log_bail("fn", "new.target");
         return None;
     }
@@ -4238,33 +4263,17 @@ fn compile_inner(
             .params
             .iter()
             .any(|param| matches!(&param.pattern, Pattern::Ident(name) if name == "arguments"));
-    if uses_arguments && !is_coroutine && (func.is_arrow || !func.params.is_empty()) {
+    if uses_arguments && !func.is_arrow && !is_coroutine && !prepared_entry && !func.params.is_empty() {
         log_bail("fn", "arguments with arrow/async/parameters");
         return None;
     }
-    // Arrow functions do not bind `this`; they resolve it through their captured lexical
-    // environment (ECMA-262 §15.3.4). Async-arrow setup retains that chain and seeds the VM
-    // frame from its resolved value, including after the defining call has returned. Ordinary
-    // lean arrows still skip the observable activation machinery and remain conservative.
-    if func.is_arrow && scan & SCAN_THIS != 0 && !is_coroutine {
-        log_bail("fn", "arrow reading this");
-        return None;
-    }
-    // `yield`, `yield*`, and `await` lower to explicit VmCoro suspension points. Constructs the
-    // flat bytecode compiler cannot preserve still leave the entire function on the tree-walker.
-    // ECMA-262 Instantiate{Generator,Async}FunctionExpression creates a declarative environment
-    // outside the call activation, initializes its immutable self-name to the closure, and makes
-    // the closure capture it. Coroutine setup retains that exact environment chain, so unresolved
-    // Name operations correctly reach the self-binding (while a body `var` of the same name gets
-    // its own nearer home). Ordinary lean frames still bypass this setup and must stay excluded.
-    if func.is_fn_expr && func.name.is_some() && !is_coroutine {
-        log_bail("fn", "named function expression");
-        return None;
-    }
+    // Arrows resolve `this` / `arguments` from their definition environment. Named function
+    // expressions likewise retain their immutable self-name in [[Environment]] at creation.
+    // Neither needs a general per-call prologue merely to observe those lexical bindings.
     // Capture analysis: which locals inner functions can name (they live in a real activation
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
-    let Some((captured, env_this, block_lets, runtime_lexicals, direct_eval)) =
-        CaptureScan::run(func, is_coroutine)
+    let Some((mut captured, env_this, mut block_lets, mut runtime_lexicals, direct_eval)) =
+        CaptureScan::run(func, is_coroutine || prepared_entry)
     else {
         let head: String = func
             .source
@@ -4283,13 +4292,22 @@ fn compile_inner(
         return None;
     };
 
+    if prepared_entry {
+        // A general entry already instantiated every body-wide binding. Keep those bindings
+        // authoritative, including references from parameter-created closures and direct eval.
+        // Nested block captures get actual block environments instead of extra activation homes.
+        if !hoisted_vars(&func.body, true, func.is_strict, &mut captured) {
+            return None;
+        }
+        for (name, _) in block_lets.drain(..) { runtime_lexicals.insert(name); }
+    }
     let mut c = Compiler {
         // A module already has its own `this` binding, initialized to undefined. Reuse that
         // environment for nested arrows instead of synthesizing a function activation.
         // A derived constructor already runs under its mandatory Function Environment Record;
         // arrows must close over that live, initially-uninitialized `this` binding instead of a
         // child activation seeded with the entry-time placeholder.
-        env_this: env_this && module_bindings.is_none() && !derived_constructor,
+        env_this: env_this && module_bindings.is_none() && !derived_constructor && !prepared_entry,
         lexical_this: func.is_arrow,
         derived_constructor,
         strict: func.is_strict,
@@ -4297,7 +4315,7 @@ fn compile_inner(
         module_body: module_bindings.is_some(),
         direct_eval,
         runtime_lexicals,
-        reuse_activation: has_mapped_parameter_aliases,
+        reuse_activation: has_mapped_parameter_aliases || prepared_entry,
         plan_stack: vec![(plan.clone(), 0)],
         cache_seed_stack: hot
             .map(|chunk| vec![(property_cache_seeds(chunk), 0)])
@@ -4319,7 +4337,7 @@ fn compile_inner(
         // in the parent while `LoadCap`/`StoreCap` intentionally address the fixed home directly.
         c.reuse_activation = true;
     }
-    if uses_arguments {
+    if uses_arguments && !func.is_arrow && !prepared_entry {
         if has_mapped_parameter_aliases {
             c.env_bind("arguments", false);
         } else if !is_coroutine {
@@ -4357,7 +4375,14 @@ fn compile_inner(
     // slots and seed those slots from the live bindings; this admits rest/destructuring/default
     // parameter lists without replaying any binding or initializer operation.
     let mut defaulted: Vec<(u16, &Expr)> = Vec::new();
-    if func.is_generator || func.is_async {
+    if prepared_entry {
+        c.push_compile_scope();
+        for name in crate::interpreter::param_bound_names(&func.params) {
+            // Parameter-expression bindings may be in the body's parent, while a body var
+            // shadows them. Resolve the live reference, never copy it to an independent slot.
+            c.lexical_env_bind(&name, false);
+        }
+    } else if func.is_generator || func.is_async {
         let bound_names = crate::interpreter::param_bound_names(&func.params);
         for (k, name) in bound_names.iter().enumerate() {
             let slot = c.fresh_slot(name);
@@ -4432,7 +4457,9 @@ fn compile_inner(
     for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &annexb_blocked) {
         match op {
             HoistOp::Var(name) => {
-                if c.env_has(&name) {
+                if prepared_entry {
+                    c.env_bind(&name, false);
+                } else if c.env_has(&name) {
                     // A `var` sharing a parameter's Function Environment binding is already
                     // instantiated. In particular, do not split mapped parameters into slots.
                 } else if captured.contains(&name) {
@@ -4446,6 +4473,10 @@ fn compile_inner(
                 }
             }
             HoistOp::Fn(name, f) => {
+                if prepared_entry {
+                    c.env_bind(&name, false);
+                    continue;
+                }
                 if c.module_body && c.env_has(&name) {
                     // ModuleDeclarationInstantiation already created the closure in this exact
                     // environment. Replaying FunctionDeclarationInstantiation would replace the
@@ -4475,7 +4506,10 @@ fn compile_inner(
                 // Annex B.3.2 FunctionDeclarationInstantiation creates/reuses a mutable var home
                 // initialized to undefined. The block's distinct lexical binding is instantiated
                 // later; evaluating its declaration copies that function object into this home.
-                let target = if let Some(home) = c.home(&name) {
+                let target = if prepared_entry {
+                    c.env_bind(&name, false);
+                    Home::Env(false)
+                } else if let Some(home) = c.home(&name) {
                     home
                 } else if captured.contains(&name) {
                     c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
@@ -4497,15 +4531,7 @@ fn compile_inner(
         log_bail("body-lexicals", "unsupported declaration form");
         return None;
     }
-    let compile_body = |compiler: &mut Compiler| -> CResult {
-        for stmt in &func.body {
-            if compiler.stmt(stmt).is_err() {
-                log_bail("stmt-in", &format!("{:.80}", format!("{stmt:?}")));
-                return Err(Bail);
-            }
-        }
-        Ok(())
-    };
+    let compile_body = |compiler: &mut Compiler| compiler.statement_list(&func.body);
     let has_body_using = func.body.iter().any(|statement| {
         matches!(
             statement,
@@ -4600,7 +4626,32 @@ fn compile_inner(
         let (layout, bindings) = feedback_layout_for_ops(&c.ops, &c.names);
         crate::feedback::FeedbackVector::new(layout, bindings)
     };
+    if std::env::var_os("LUMEN_NULLISH_TRACE").is_some()
+        && c.ops.len() == 179
+        && c.ops
+            .get(45)
+            .is_some_and(|op| matches!(op, Op::GetElemLocal(0)))
+    {
+        let source: String = func
+            .source
+            .as_deref()
+            .unwrap_or("<no source>")
+            .chars()
+            .take(4000)
+            .collect();
+        eprintln!(
+            "lumen: nullish target compile params={:?} source={source:?}",
+            func.params
+                .iter()
+                .map(|param| match &param.pattern {
+                    Pattern::Ident(name) => name.as_str(),
+                    _ => "<pattern>",
+                })
+                .collect::<Vec<_>>()
+        );
+    }
     Some(Rc::new(Chunk {
+        prepared_entry,
         ops: c.ops,
         consts: c.consts,
         names: c.names,
@@ -4783,6 +4834,8 @@ fn plan_inlines_at(
                 matches!(
                     op,
                     Op::PushHandler(_)
+                        | Op::TailCall(..)
+                        | Op::TailEvalCallArgsArray
                         | Op::PushFinally(..)
                         | Op::PushIterator(..)
                         | Op::PushDisposeFrame
@@ -4931,6 +4984,13 @@ struct Compiler {
     /// emit a `PopHandler` per region crossed, or the stale handler catches unrelated throws
     /// later in the frame.
     try_depth: u32,
+    /// Source-level contexts that forbid tail transfer (try bodies, catch-before-finally,
+    /// for-of bodies, and statements after a using declaration). Synthetic environment
+    /// cleanup handlers do not forbid tail calls: they only restore the environment cursor.
+    tail_blocked: u32,
+    /// Keep the final call opcode available while lowering a tail expression. Nested calls
+    /// still execute normally; no inline splice may hide the call being converted.
+    lowering_tail: bool,
     /// Active `finally` handler depths. A break/continue may discard ordinary catch/iterator
     /// handlers, but it must never jump across a finalizer without executing it.
     finally_depths: Vec<u32>,
@@ -4970,22 +5030,19 @@ struct Compiler {
     inline_targets: Vec<InlineTarget>,
 }
 
-/// Whether a tagged-template call occurs in a tail position of a return operand.
+/// Whether a call occurs in a tail position of a return operand.
 ///
-/// Strict ordinary functions currently preserve proper tail calls through the tree-walker's
-/// trampoline.  Until bytecode returns can transfer tagged calls to that trampoline too, keep
-/// such functions on the normative path rather than turning an otherwise constant-stack loop
-/// into Rust recursion.  This is the expression part of ECMA-262 HasCallInTailPosition: only the
+/// This is the expression part of ECMA-262 HasCallInTailPosition: only the
 /// selected conditional arm, the final sequence element, and the right logical operand inherit
 /// tail position.
-fn has_tail_tagged_template(expr: &Expr) -> bool {
+fn has_tail_call(expr: &Expr) -> bool {
     match expr {
-        Expr::TaggedTemplate { .. } => true,
-        Expr::Cond { cons, alt, .. } => {
-            has_tail_tagged_template(cons) || has_tail_tagged_template(alt)
+        Expr::Call { .. } | Expr::TaggedTemplate { .. } => true,
+        Expr::Cond { cons, alt, .. } => has_tail_call(cons) || has_tail_call(alt),
+        Expr::Seq(exprs) => exprs.last().is_some_and(has_tail_call),
+        Expr::Logical { right, .. } | Expr::Paren(right) | Expr::OptionalChain(right) => {
+            has_tail_call(right)
         }
-        Expr::Seq(exprs) => exprs.last().is_some_and(has_tail_tagged_template),
-        Expr::Logical { right, .. } | Expr::Paren(right) => has_tail_tagged_template(right),
         _ => false,
     }
 }
@@ -5087,8 +5144,8 @@ fn log_bail(what: &str, detail: &str) {
 struct Bail;
 type CResult = Result<(), Bail>;
 
-#[derive(Clone, Copy)]
-enum CallArgsMode {
+#[derive(Clone, Copy, Debug)]
+pub enum CallArgsMode {
     Fixed(u16),
     FinalSpread(u16),
     Array,
@@ -5886,7 +5943,9 @@ impl Compiler {
     fn finish_call(&mut self, args: &[ArrayElem], with_this: bool, allow_inline: bool) -> CResult {
         match self.call_args(args)? {
             CallArgsMode::Fixed(argc) => {
-                let plan_hit = allow_inline.then(|| self.plan_hit()).flatten();
+                let plan_hit = (allow_inline && !self.lowering_tail)
+                    .then(|| self.plan_hit())
+                    .flatten();
                 let cache = self.new_call_cache();
                 match plan_hit {
                     Some(entry) => self.emit_call_with_inline(entry, argc, cache, with_this),
@@ -6043,7 +6102,7 @@ impl Compiler {
     /// chain's `undefined` result (skipping every later link, key expression, and argument, per
     /// spec). Non-optional links compile as usual. Public Member/Index method calls and plain
     /// optional callees preserve their distinct receiver rules, including private method
-    /// receivers. Optional `delete` and `super` retain their separate paths.
+    /// receivers and super References. Optional `delete` retains its separate path.
     fn opt_chain(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
         match e {
             Expr::Member {
@@ -6091,6 +6150,35 @@ impl Compiler {
                 args,
                 optional: call_opt,
             } => match &**callee {
+                // A SuperCall may be the base of `super()?.x`. Evaluate it through the
+                // constructor continuation, not as an ordinary call to an Expr::Super value.
+                Expr::Super if !call_opt => self.expr(e),
+                Expr::Member {
+                    obj,
+                    prop,
+                    optional: false,
+                } if matches!(**obj, Expr::Super) => {
+                    // ChainEvaluation passes the super Reference to EvaluateCall: its receiver
+                    // is the current this value, not the prototype used for property lookup.
+                    self.super_named_reference(prop);
+                    self.emit(Op::SuperGetMethod);
+                    if *call_opt {
+                        self.opt_link(2, shorts);
+                    }
+                    self.finish_call(args, true, false)
+                }
+                Expr::Index {
+                    obj,
+                    index,
+                    optional: false,
+                } if matches!(**obj, Expr::Super) => {
+                    self.super_computed_reference(index)?;
+                    self.emit(Op::SuperGetMethod);
+                    if *call_opt {
+                        self.opt_link(2, shorts);
+                    }
+                    self.finish_call(args, true, false)
+                }
                 Expr::Member {
                     obj,
                     prop,
@@ -6475,6 +6563,107 @@ impl Compiler {
         Ok(())
     }
 
+    /// ECMA-262 HasCallInTailPosition: a preceding using declaration in this statement list
+    /// blocks transfer, even if its resource is null. Restore the enclosing list on exit.
+    fn statement_list(&mut self, body: &[Stmt]) -> CResult {
+        let saved = self.tail_blocked;
+        let result = (|| {
+            for statement in body {
+                self.stmt(statement)?;
+                if matches!(statement, Stmt::VarDecl { kind: DeclKind::Using | DeclKind::AwaitUsing, .. }) {
+                    self.tail_blocked = saved + 1;
+                }
+            }
+            Ok(())
+        })();
+        self.tail_blocked = saved;
+        result
+    }
+
+    fn without_tail(&mut self, body: impl FnOnce(&mut Self) -> CResult) -> CResult {
+        self.tail_blocked += 1;
+        let result = body(self);
+        self.tail_blocked -= 1;
+        result
+    }
+
+    /// Lower only expression tail positions, leaving callee/key/argument evaluation on the
+    /// ordinary path. The selected final call stages owned values for the existing trampoline.
+    fn tail_expr(&mut self, expression: &Expr) -> CResult {
+        match expression {
+            Expr::Paren(inner) => self.tail_expr(inner),
+            Expr::Cond { test, cons, alt } => {
+                self.expr(test)?;
+                let alternate = self.emit(Op::JumpIfFalse(0));
+                self.tail_expr(cons)?;
+                let done = self.emit(Op::Jump(0));
+                self.patch(alternate);
+                self.tail_expr(alt)?;
+                self.patch(done);
+                Ok(())
+            }
+            Expr::Seq(expressions) if !expressions.is_empty() => {
+                for expression in &expressions[..expressions.len() - 1] {
+                    self.expr(expression)?;
+                    self.emit(Op::Pop);
+                }
+                self.tail_expr(expressions.last().unwrap())
+            }
+            Expr::Logical { op, left, right } => {
+                self.expr(left)?;
+                let done = self.emit(match *op {
+                    "&&" => Op::JumpIfFalsePeek(0),
+                    "||" => Op::JumpIfTruePeek(0),
+                    "??" => Op::JumpIfNotNullishPeek(0),
+                    _ => return Err(Bail),
+                });
+                self.emit(Op::Pop);
+                self.tail_expr(right)?;
+                self.patch(done);
+                Ok(())
+            }
+            Expr::OptionalChain(inner) if has_tail_call(inner) => {
+                let mut shorts = Vec::new();
+                let saved = std::mem::replace(&mut self.lowering_tail, true);
+                let result = self.opt_chain(inner, &mut shorts);
+                self.lowering_tail = saved;
+                result?;
+                self.transfer_last_call()?;
+                if !shorts.is_empty() {
+                    let done = self.emit(Op::Jump(0));
+                    for short in shorts { self.patch(short); }
+                    self.emit(Op::Undef);
+                    self.patch(done);
+                }
+                Ok(())
+            }
+            Expr::Call { callee, .. } if matches!(&**callee, Expr::Super) => self.expr(expression),
+            Expr::Call { .. } | Expr::TaggedTemplate { .. } => {
+                let saved = std::mem::replace(&mut self.lowering_tail, true);
+                let result = self.expr(expression);
+                self.lowering_tail = saved;
+                result?;
+                self.transfer_last_call()
+            }
+            other => self.expr(other),
+        }
+    }
+
+    fn transfer_last_call(&mut self) -> CResult {
+        let operation = self.ops.last_mut().ok_or(Bail)?;
+        *operation = match *operation {
+            Op::Call(argc, _) => Op::TailCall(CallArgsMode::Fixed(argc), false),
+            Op::CallWithThis(argc, _) => Op::TailCall(CallArgsMode::Fixed(argc), true),
+            Op::CallSpread(argc) => Op::TailCall(CallArgsMode::FinalSpread(argc), false),
+            Op::CallSpreadThis(argc) => Op::TailCall(CallArgsMode::FinalSpread(argc), true),
+            Op::CallArgsArray => Op::TailCall(CallArgsMode::Array, false),
+            Op::CallArgsArrayThis => Op::TailCall(CallArgsMode::Array, true),
+            Op::EvalCallArgsArray => Op::TailEvalCallArgsArray,
+            _ => return Err(Bail),
+        };
+        Ok(())
+    }
+
     fn stmt(&mut self, s: &Stmt) -> CResult {
         match s {
             Stmt::Expr(e) => self.expr_stmt(e),
@@ -6585,12 +6774,6 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Return(arg) => {
-                if self.strict
-                    && !self.is_coroutine
-                    && arg.as_ref().is_some_and(has_tail_tagged_template)
-                {
-                    return Err(Bail);
-                }
                 // Inside a spliced callee body, `return v` is "leave v on the stack and jump to
                 // the join point" (the plan guarantees no handlers/for-of regions to unwind:
                 // the callee chunk contains no PushHandler).
@@ -6606,7 +6789,11 @@ impl Compiler {
                     return Ok(());
                 }
                 let explicit = if let Some(e) = arg {
-                    self.expr(e)?;
+                    if self.strict && !self.is_coroutine && self.tail_blocked == 0 {
+                        self.tail_expr(e)?;
+                    } else {
+                        self.expr(e)?;
+                    }
                     true
                 } else {
                     false
@@ -6850,7 +7037,7 @@ impl Compiler {
                         let push_catch = self.emit(Op::PushHandler(0));
                         self.try_depth += 1;
                         self.push_compile_scope();
-                        let try_result = self.block_body(block);
+                        let try_result = self.without_tail(|compiler| compiler.block_body(block));
                         self.pop_compile_scope();
                         try_result?;
                         self.emit(Op::PopHandler);
@@ -6861,11 +7048,11 @@ impl Compiler {
                             Op::PushHandler(target) => *target = catch_pc,
                             _ => unreachable!(),
                         }
-                        self.catch_clause(param.as_ref(), catch_body)?;
+                        self.without_tail(|compiler| compiler.catch_clause(param.as_ref(), catch_body))?;
                         self.patch(after_catch);
                     } else {
                         self.push_compile_scope();
-                        let try_result = self.block_body(block);
+                        let try_result = self.without_tail(|compiler| compiler.block_body(block));
                         self.pop_compile_scope();
                         try_result?;
                     }
@@ -6991,7 +7178,7 @@ impl Compiler {
                 let push = self.emit(Op::PushHandler(0));
                 self.try_depth += 1;
                 self.push_compile_scope();
-                let try_result = self.block_body(block);
+                let try_result = self.without_tail(|compiler| compiler.block_body(block));
                 self.pop_compile_scope();
                 try_result?;
                 self.emit(Op::PopHandler);
@@ -7329,11 +7516,13 @@ impl Compiler {
                         .for_head_member_store(left)
                         .and_then(|()| compiler.stmt(body)),
                 };
-                let r = if let Some(scope) = runtime_scope {
-                    self.environment_scope(compile_iteration, scope)
-                } else {
-                    compile_iteration(self)
-                };
+                let r = self.without_tail(|compiler| {
+                    if let Some(scope) = runtime_scope {
+                        compiler.environment_scope(compile_iteration, scope)
+                    } else {
+                        compile_iteration(compiler)
+                    }
+                });
                 let ctx = self.loops.pop().expect("just pushed");
                 self.pop_compile_scope();
                 r?;
@@ -8077,17 +8266,9 @@ impl Compiler {
                 }
             )
         }) {
-            return self.disposal_scope(|compiler| {
-                for statement in body {
-                    compiler.stmt(statement)?;
-                }
-                Ok(())
-            });
+            return self.disposal_scope(|compiler| compiler.statement_list(body));
         }
-        for statement in body {
-            self.stmt(statement)?;
-        }
-        Ok(())
+        self.statement_list(body)
     }
 
     /// The closure-visible subset of BlockDeclarationInstantiation. Keeping uncaptured names out
@@ -8397,7 +8578,7 @@ impl Compiler {
                         }
                     };
                 }
-                compiler.for_loop_core(labels, None, test, update, body, None)
+                compiler.without_tail(|compiler| compiler.for_loop_core(labels, None, test, update, body, None))
             });
         }
         self.for_loop_core(labels, init, test, update, body, None)
@@ -9037,6 +9218,16 @@ impl Compiler {
                     }
                 }
                 self.uses_this = true;
+                if self.lexical_this && !self.is_coroutine {
+                    // Resolve at the expression, not at entry: a derived constructor's `this`
+                    // may still be in TDZ, and an untaken branch must not eagerly throw. The
+                    // normal guarded name cache reads the captured binding live on every hit.
+                    // Closures under `with` are excluded by the call-entry gates.
+                    let name = self.name_idx("this");
+                    let cache = self.new_name_cache(name);
+                    self.emit(Op::LoadName(name, cache));
+                    return Ok(());
+                }
                 self.emit(if self.lexical_this || self.derived_constructor {
                     Op::LoadLexicalThis
                 } else {
@@ -11379,6 +11570,23 @@ fn run_vm(
             Op::DeleteSuper => {
                 return Err(i.throw("ReferenceError", "cannot delete a super property"));
             }
+            Op::TailCall(mode, with_this) => {
+                let args = match mode {
+                    CallArgsMode::Fixed(argc) => stack.split_off(stack.len() - argc as usize),
+                    CallArgsMode::FinalSpread(argc) => {
+                        let spread = pop!();
+                        let mut args = stack.split_off(stack.len() - (argc as usize - 1));
+                        let (iterator, next) = i.get_iterator(&spread)?;
+                        while let Some(value) = i.iterator_step(&iterator, &next)? { args.push(value); }
+                        args
+                    }
+                    CallArgsMode::Array => argument_array_values(i, pop!()),
+                };
+                let callee = pop!();
+                let receiver = if with_this { pop!() } else { Value::Undefined };
+                stage_tail_call(i, chunk, op_pc, callee, receiver, args)?;
+                stack.push(Value::Undefined);
+            }
             Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
                 let spread = pop!();
                 let at = stack.len() - (argc as usize - 1);
@@ -11415,7 +11623,7 @@ fn run_vm(
                 };
                 stack.push(value);
             }
-            Op::EvalCallArgsArray => {
+            Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => {
                 let args = argument_array_values(i, pop!());
                 let callee = pop!();
                 let receiver = pop!();
@@ -11425,7 +11633,10 @@ fn run_vm(
                         (Value::Obj(function), Some(intrinsic))
                             if Rc::ptr_eq(function, intrinsic)
                     );
-                let value = if direct {
+                let value = if !direct && matches!(op, Op::TailEvalCallArgsArray) {
+                    stage_tail_call(i, chunk, op_pc, callee, receiver, args)?;
+                    Value::Undefined
+                } else if direct {
                     if chunk.feedback.detailed_enabled() {
                         let target = i.call_target_kind(&callee);
                         let environment = i.call_environment_kind(&callee);
@@ -11485,6 +11696,7 @@ fn run_vm(
                     }
                 }
                 if matches!(obj, Value::Undefined | Value::Null) {
+                    crate::value::trace_nullish_property("bytecode-get-elem", &key);
                     return Err(i.throw("TypeError", "cannot read property of null or undefined"));
                 }
                 let k = i.to_property_key(&key)?;
@@ -11557,6 +11769,16 @@ fn run_vm(
                 }
                 let obj = slots[s as usize].clone();
                 if matches!(obj, Value::Undefined | Value::Null) {
+                    crate::value::trace_nullish_property("bytecode-get-elem-local", &key);
+                    if std::env::var_os("LUMEN_NULLISH_TRACE").is_some() {
+                        eprintln!(
+                            "lumen: nullish local tier=bytecode pc={} op={:?} slot={} name={:?}",
+                            op_pc,
+                            chunk.ops.get(op_pc),
+                            s,
+                            chunk.slot_names.get(s as usize).map(|name| name.as_ref())
+                        );
+                    }
                     return Err(i.throw("TypeError", "cannot read property of null or undefined"));
                 }
                 let k = i.to_property_key(&key)?;
@@ -11646,6 +11868,7 @@ fn run_vm(
                 // General path: nullish check, one ToPropertyKey, [[Get]], ToNumeric, [[Set]] —
                 // the oracle's Reference order exactly.
                 if matches!(obj, Value::Undefined | Value::Null) {
+                    crate::value::trace_nullish_property("bytecode-update-elem", &key);
                     return Err(i.throw("TypeError", "cannot read property of null or undefined"));
                 }
                 let k = i.to_property_key(&key)?;
@@ -11724,6 +11947,7 @@ fn run_vm(
                     }
                 } else {
                     if matches!(obj, Value::Undefined | Value::Null) {
+                        crate::value::trace_nullish_property("bytecode-get-method-elem", &key);
                         return Err(
                             i.throw("TypeError", "cannot read property of null or undefined")
                         );
@@ -13901,6 +14125,7 @@ fn get_element_profiled(
     raw_key: &Value,
 ) -> Result<Value, Abrupt> {
     if matches!(base, Value::Undefined | Value::Null) {
+        crate::value::trace_nullish_property("bytecode-profiled-get-elem", raw_key);
         return Err(i.throw("TypeError", "cannot read property of null or undefined"));
     }
     let key = i.to_property_key(raw_key)?;
@@ -14971,6 +15196,7 @@ impl Chunk {
                 | Op::CallArgsArray
                 | Op::CallArgsArrayThis
                 | Op::EvalCallArgsArray
+                | Op::TailEvalCallArgsArray
                 | Op::NewArgsArray
                 | Op::NewObject
                 | Op::ObjectData(_)
@@ -15078,7 +15304,14 @@ impl Chunk {
             Op::CallSpreadThis(argc) => (*argc as usize + 2, 1),
             Op::CallArgsArray => (2, 1),
             Op::CallArgsArrayThis => (3, 1),
-            Op::EvalCallArgsArray => (3, 1),
+            Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => (3, 1),
+            Op::TailCall(mode, with_this) => {
+                let count = match mode {
+                    CallArgsMode::Fixed(count) | CallArgsMode::FinalSpread(count) => *count as usize,
+                    CallArgsMode::Array => 1,
+                };
+                (count + 1 + usize::from(*with_this), 1)
+            }
             Op::ToStr => (1, 1),
             Op::GetIter => (1, 2),
             Op::GetAsyncIter => (1, 3),
@@ -15404,10 +15637,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     let mut push_arg_moved = false;
     let mut call_args_moved = 0usize;
     i.depth += 1;
-    #[cfg(target_arch = "wasm32")]
-    let exhausted = i.depth > crate::interpreter::WASM_EXECUTION_DEPTH_GUARD;
-    #[cfg(not(target_arch = "wasm32"))]
-    let exhausted = false;
+    let exhausted = crate::interpreter::execution_stack_exhausted(i.depth);
     let r: Result<Value, Abrupt> = if exhausted {
         Err(i.throw("RangeError", "Maximum call stack size exceeded"))
     } else {
@@ -17281,6 +17511,33 @@ unsafe fn jit_opstat(ctx: &mut crate::jit::JitCtx, pc: u32) {
     }
 }
 
+/// EvaluateCall checks callability after argument evaluation and before PrepareForTailCall.
+/// The owned tuple is a live interpreter root until the frame-retiring trampoline takes it.
+/// No callee or callback may run between publishing this transfer and leaving the activation.
+fn stage_tail_call(
+    interpreter: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    callee: Value,
+    receiver: Value,
+    args: Vec<Value>,
+) -> Result<(), Abrupt> {
+    if !callee.is_callable() {
+        return Err(interpreter.throw("TypeError", "value is not a function"));
+    }
+    if chunk.feedback.detailed_enabled() {
+        chunk.feedback.observe_call(
+            pc,
+            interpreter.call_target_kind(&callee),
+            call_arity_kind(args.len()),
+            interpreter.call_environment_kind(&callee),
+        );
+    }
+    debug_assert!(interpreter.pending_tail.is_none());
+    interpreter.pending_tail = Some(Box::new((callee, receiver, args)));
+    Ok(())
+}
+
 unsafe fn jit_exec_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
@@ -17610,6 +17867,27 @@ unsafe fn jit_exec_inner(
         Op::DeleteSuper => {
             return Err(i.throw("ReferenceError", "cannot delete a super property"));
         }
+        Op::TailCall(mode, with_this) => {
+            let args = match mode {
+                CallArgsMode::Fixed(argc) => {
+                    *sp = sp.sub(argc as usize);
+                    (0..argc as usize).map(|index| sp.add(index).read()).collect()
+                }
+                CallArgsMode::FinalSpread(argc) => {
+                    let spread = pop!();
+                    *sp = sp.sub(argc as usize - 1);
+                    let mut args: Vec<Value> = (0..argc as usize - 1).map(|index| sp.add(index).read()).collect();
+                    let (iterator, next) = i.get_iterator(&spread)?;
+                    while let Some(value) = i.iterator_step(&iterator, &next)? { args.push(value); }
+                    args
+                }
+                CallArgsMode::Array => argument_array_values(i, pop!()),
+            };
+            let callee = pop!();
+            let receiver = if with_this { pop!() } else { Value::Undefined };
+            stage_tail_call(i, chunk, pc as usize, callee, receiver, args)?;
+            push!(Value::Undefined);
+        }
         Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
             let spread = pop!();
             let mut plain: Vec<Value> = (1..argc).map(|_| pop!()).collect();
@@ -17692,6 +17970,7 @@ unsafe fn jit_exec_inner(
                 }
             }
             if matches!(obj, Value::Undefined | Value::Null) {
+                crate::value::trace_nullish_property("jit-get-elem", &key);
                 return Err(i.throw("TypeError", "cannot read property of null or undefined"));
             }
             let k = i.to_property_key(&key)?;
@@ -17764,6 +18043,16 @@ unsafe fn jit_exec_inner(
             }
             let obj = slots[s as usize].clone();
             if matches!(obj, Value::Undefined | Value::Null) {
+                crate::value::trace_nullish_property("jit-get-elem-local", &key);
+                if std::env::var_os("LUMEN_NULLISH_TRACE").is_some() {
+                    eprintln!(
+                        "lumen: nullish local tier=jit pc={} op={:?} slot={} name={:?}",
+                        pc,
+                        chunk.ops.get(pc as usize),
+                        s,
+                        chunk.slot_names.get(s as usize).map(|name| name.as_ref())
+                    );
+                }
                 return Err(i.throw("TypeError", "cannot read property of null or undefined"));
             }
             let k = i.to_property_key(&key)?;
@@ -17842,6 +18131,7 @@ unsafe fn jit_exec_inner(
                 return Ok(());
             }
             if matches!(obj, Value::Undefined | Value::Null) {
+                crate::value::trace_nullish_property("jit-update-elem", &key);
                 return Err(i.throw("TypeError", "cannot read property of null or undefined"));
             }
             let k = i.to_property_key(&key)?;
@@ -17917,6 +18207,7 @@ unsafe fn jit_exec_inner(
                 }
             } else {
                 if matches!(obj, Value::Undefined | Value::Null) {
+                    crate::value::trace_nullish_property("jit-get-method-elem", &key);
                     return Err(i.throw("TypeError", "cannot read property of null or undefined"));
                 }
                 let k = i.to_property_key(&key)?;
@@ -18297,6 +18588,7 @@ unsafe fn jit_exec_inner(
         | Op::ArrayHole
         | Op::ArraySpread
         | Op::EvalCallArgsArray
+        | Op::TailEvalCallArgsArray
         | Op::NewObject
         | Op::ObjectData(_)
         | Op::ObjectSpread

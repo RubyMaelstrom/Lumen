@@ -937,6 +937,127 @@ mod sys {
     }
 }
 
+/// The process-wide executable-code budget shared by the bytecode JIT and native RegExp tiers.
+///
+/// This is deliberately a conservative cap on live executable mappings, rather than a diagnostic
+/// total of all code ever emitted. A failed reservation makes the caller retain its checked
+/// fallback tier, and dropping the owning mapping returns the bytes for a later hot pattern.
+pub(crate) const EXECUTABLE_CODE_BUDGET: usize = 16 << 20;
+static EXECUTABLE_CODE_REMAINING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(EXECUTABLE_CODE_BUDGET);
+
+pub(crate) struct ExecutableCodeReservation {
+    bytes: usize,
+}
+
+impl ExecutableCodeReservation {
+    fn try_new(bytes: usize) -> Option<Self> {
+        if bytes == 0 {
+            return None;
+        }
+        let mut remaining = EXECUTABLE_CODE_REMAINING.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if remaining < bytes {
+                return None;
+            }
+            match EXECUTABLE_CODE_REMAINING.compare_exchange_weak(
+                remaining,
+                remaining - bytes,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { bytes }),
+                Err(next) => remaining = next,
+            }
+        }
+    }
+}
+
+impl Drop for ExecutableCodeReservation {
+    fn drop(&mut self) {
+        EXECUTABLE_CODE_REMAINING.fetch_add(self.bytes, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A W^X-protected executable allocation shared by the regular JIT and native RegExp tiers. The
+/// allocation owns its live-code reservation, so every mapping has one accounting and reclamation
+/// path regardless of which execution engine requested it.
+pub(crate) struct ExecutableBuffer {
+    mem: *mut u8,
+    len: usize,
+    _reservation: ExecutableCodeReservation,
+}
+
+impl ExecutableBuffer {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let reservation = ExecutableCodeReservation::try_new(bytes.len())?;
+        #[cfg(any(
+            all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ),
+            all(
+                target_arch = "x86_64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            )
+        ))]
+        {
+            let mem = unsafe { sys::alloc_exec(bytes.as_ptr(), bytes.len()) };
+            if mem.is_null() {
+                return None;
+            }
+            Some(Self {
+                mem,
+                len: bytes.len(),
+                _reservation: reservation,
+            })
+        }
+        #[cfg(not(any(
+            all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ),
+            all(
+                target_arch = "x86_64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            )
+        )))]
+        {
+            let _ = (bytes, reservation);
+            None
+        }
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.mem
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl Drop for ExecutableBuffer {
+    fn drop(&mut self) {
+        #[cfg(any(
+            all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ),
+            all(
+                target_arch = "x86_64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            )
+        ))]
+        unsafe {
+            sys::free_exec(self.mem, self.len);
+        }
+    }
+}
+
 /// A finished JIT compilation: executable code plus the pc→code-offset table the unwinder uses
 /// to land on catch handlers.
 #[repr(C)]
@@ -950,6 +1071,11 @@ pub struct JitCode {
     /// Whether any template reads `JitCtx::global_body` (free-name caches): frame setup skips
     /// the realm-global borrow otherwise.
     pub needs_global: bool,
+    /// Owns the W^X mapping and its shared live executable-code reservation. The duplicate `mem`
+    /// and `len` fields above are retained because generated direct-call templates read the
+    /// stable prefix of this struct by offset.
+    #[allow(dead_code)]
+    executable: ExecutableBuffer,
 }
 
 impl JitCode {
@@ -971,24 +1097,6 @@ impl JitCode {
     /// The pc→code-offset table's data pointer (same purpose).
     pub(crate) fn pc_offsets_ptr(&self) -> *const u32 {
         self.pc_offsets.as_ptr()
-    }
-}
-
-impl Drop for JitCode {
-    fn drop(&mut self) {
-        #[cfg(any(
-            all(
-                target_arch = "aarch64",
-                any(target_os = "macos", target_os = "linux", target_os = "windows")
-            ),
-            all(
-                target_arch = "x86_64",
-                any(target_os = "macos", target_os = "linux", target_os = "windows")
-            )
-        ))]
-        unsafe {
-            sys::free_exec(self.mem, self.len);
-        }
     }
 }
 
@@ -1560,9 +1668,6 @@ mod asm {
                 labels: Vec::new(),
             }
         }
-        pub fn here(&self) -> usize {
-            self.buf.len()
-        }
         pub fn new_label(&mut self) -> usize {
             self.labels.push(None);
             self.labels.len() - 1
@@ -1983,8 +2088,16 @@ mod asm {
             self.emit(0x7100_0000 | (imm << 10) | (rn << 5) | rd);
         }
 
-        /// Resolve all label patches. Panics on an unbound label (a compiler bug).
-        pub fn finish(mut self) -> Vec<u32> {
+        #[cfg(test)]
+        pub fn finish(self) -> Vec<u32> {
+            self.finish_with_offsets(&[]).0
+        }
+
+        /// Resolve patches and export byte offsets from the final, relaxed label layout.
+        /// Recording `here()` before relaxation is unsafe for catch destinations: inserted
+        /// veneers move those destinations just as they move ordinary branch labels.
+        /// Panics on an unbound label (a compiler bug).
+        pub fn finish_with_offsets(mut self, exported: &[usize]) -> (Vec<u32>, Vec<u32>) {
             // Relax imm19 branches that cannot reach after final layout. Invert the local
             // condition over an imm26 B and update every later label/patch for the inserted word.
             // Iteration matters: one insertion can push another branch just over its limit.
@@ -2035,7 +2148,14 @@ mod asm {
                     }
                 }
             }
-            self.buf
+            let offsets = exported
+                .iter()
+                .map(|&label| {
+                    let insn = self.labels[label].expect("unbound exported jit label");
+                    u32::try_from(insn * 4).expect("JIT label offset exceeds u32")
+                })
+                .collect();
+            (self.buf, offsets)
         }
     }
 
@@ -2172,6 +2292,36 @@ mod asm {
             assert_eq!((code[0] >> 5) & 0x7ffff, 2); // inverted condition skips the B
             assert_eq!(code[0] & 0xf, super::super::C_NE);
             assert_eq!(code[1] >> 26, 0b000101); // unconditional B (imm26)
+        }
+
+        #[test]
+        fn relaxed_branches_relocate_exported_catch_offsets() {
+            let mut a = super::Asm::new();
+            let start = a.new_label();
+            let middle = a.new_label();
+            let end = a.new_label();
+            a.bind(start);
+            a.b_cond(super::super::C_EQ, end);
+            a.bind(middle);
+            for _ in 0..270_000 {
+                a.mov(0, 0);
+            }
+            a.cbnz(0, true, middle);
+            a.bind(end);
+            a.ret();
+
+            let (code, offsets) = a.finish_with_offsets(&[start, middle, end, middle]);
+            // Both the forward B.cond and backward CBNZ require an inserted instruction.
+            // Exporting a label twice must preserve aliases (fused bytecode PCs use these).
+            assert_eq!(offsets, [0, 8, 270_004 * 4, 8]);
+            assert_eq!(code[offsets[2] as usize / 4], 0xd65f03c0); // RET at catch entry
+            assert_eq!(
+                1 + (code[1] & 0x03ff_ffff) as usize,
+                offsets[2] as usize / 4
+            );
+            let back = code.len() - 2;
+            let delta = ((code[back] << 6) as i32) >> 6;
+            assert_eq!(back as i64 + delta as i64, offsets[1] as i64 / 4);
         }
     }
 }
@@ -2447,11 +2597,9 @@ pub fn compile(
         }
     }
     // ---- op templates ----
-    let mut pc_insn: Vec<u32> = Vec::with_capacity(ops.len());
     let mut skip = 0usize;
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pc_labels[pc]);
-        pc_insn.push(a.here() as u32);
         if interrupt_targets[pc] {
             emit_interrupt_poll(&mut a, ilayout, l_unwind);
         }
@@ -4249,7 +4397,9 @@ pub fn compile(
         emit_direct_finish_stub(&mut a, ilayout, rc_ok && layout.rc_strong_off == 0);
     }
 
-    let words = a.finish();
+    // The unwinder (ECMA-262 14.15.3) needs the same final catch addresses as patched
+    // branches, including every word inserted while relaxing long conditional branches.
+    let (words, pc_offsets) = a.finish_with_offsets(&pc_labels[..ops.len()]);
     // Debug: `LUMEN_JIT_CODEDUMP=<substr>` prints the finished code words (hex, one per line)
     // of chunks whose leading slot names contain the substring — round-trip them through
     // `clang -c` + `objdump -d` for a disassembly of exactly what runs. Any value also prints
@@ -4272,11 +4422,12 @@ pub fn compile(
         }
     }
     let len = words.len() * 4;
-    unsafe {
-        let mem = sys::alloc_exec(words.as_ptr() as *const u8, len);
-        if mem.is_null() {
-            return None;
-        }
+    let executable = ExecutableBuffer::from_bytes(unsafe {
+        std::slice::from_raw_parts(words.as_ptr() as *const u8, len)
+    })?;
+    let mem = executable.as_ptr() as *mut u8;
+    let len = executable.len();
+    {
         if codedump_pat.is_some() {
             let head: Vec<&str> = chunk
                 .jit_slot_names()
@@ -4299,11 +4450,10 @@ pub fn compile(
                 .collect();
             let name = head.join("|");
             eprintln!("[jit-map-range] {:x} {:x} {name}", mem as usize, len);
-            for (pc, (&insn, op)) in pc_insn.iter().zip(ops).enumerate() {
+            for (pc, (&offset, op)) in pc_offsets.iter().zip(ops).enumerate() {
                 eprintln!(
                     "[jit-map-pc] {:x} {:x} {pc} {op:?} {name}",
-                    mem as usize,
-                    insn * 4
+                    mem as usize, offset
                 );
             }
         }
@@ -4313,8 +4463,9 @@ pub fn compile(
                 .any(|o| matches!(o, Op::LoadName(..) | Op::LoadNameForCall(..))),
             mem,
             len,
-            pc_offsets: pc_insn.iter().map(|i| i * 4).collect(),
+            pc_offsets,
             max_stack,
+            executable,
         })
     }
 }

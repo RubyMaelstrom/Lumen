@@ -89,6 +89,29 @@ pub enum Value {
     Obj(Gc) = 8,
 }
 
+/// Emit a compact diagnostic for a computed property read whose base is nullish.
+///
+/// This is intentionally opt-in: the normal error remains the spec-compatible generic
+/// TypeError, while `LUMEN_NULLISH_TRACE=1` makes failures in minified third-party code
+/// actionable without formatting or traversing arbitrary heap objects.
+pub(crate) fn trace_nullish_property(site: &str, key: &Value) {
+    if std::env::var_os("LUMEN_NULLISH_TRACE").is_none() {
+        return;
+    }
+    let key = match key {
+        Value::Str(s) => format!("string:{:?}", s.as_str()),
+        Value::Num(n) => format!("number:{n:?}"),
+        Value::Bool(v) => format!("boolean:{v}"),
+        Value::Null => "null".to_owned(),
+        Value::Undefined => "undefined".to_owned(),
+        Value::Empty => "empty".to_owned(),
+        Value::BigInt(_) => "bigint".to_owned(),
+        Value::Sym(_) => "symbol".to_owned(),
+        Value::Obj(_) => "object".to_owned(),
+    };
+    eprintln!("lumen: nullish computed-property read site={site} key={key}");
+}
+
 // NaN-boxed storage used for long-lived property values. Execution still uses the ergonomic
 // `Value` enum while the migration is staged; packing at the heap boundary cuts each ordinary
 // property by eight bytes without coupling the experiment to every interpreter pattern match.

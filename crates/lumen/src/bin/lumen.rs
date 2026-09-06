@@ -170,7 +170,8 @@ Diagnostics (env, unstable):
   LUMEN_JIT_DUMP=SUBSTR   Dump the op stream of JIT'd chunks whose slot names match
   LUMEN_JIT_CODEDUMP=SUB  Dump the finished machine code of matching chunks (hex)
   LUMEN_JIT_OPSTAT=1      Tally ops that reach the JIT slow path (top at exit; =2 pinpoints sites)
-  LUMEN_REGEXP_PROF=1     Report matcher instruction/scan/attempt/backtrack counts at exit
+  LUMEN_REGEXP_PROF=1     Report matcher instruction/scan/attempt/backtrack/tier counts at exit
+  LUMEN_REGEXP_TIER_UP_AT=N  Promote eligible ASCII matchers after N calls; 0 disables
   LUMEN_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
   LUMEN_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
   LUMEN_PERF_METRICS=1    Print one JSON JIT/collector performance summary at normal exit

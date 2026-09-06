@@ -749,11 +749,11 @@ pub(super) fn compile(
     epilogue(&mut a, false);
 
     let code = a.finish();
-    let len = code.len();
-    let mem = unsafe { sys::alloc_exec(code.as_ptr(), len) };
-    if mem.is_null() {
+    let Some(executable) = crate::jit::ExecutableBuffer::from_bytes(&code) else {
         return None;
-    }
+    };
+    let mem = executable.as_ptr() as *mut u8;
+    let len = executable.len();
     Some(JitCode {
         mem,
         len,
@@ -762,5 +762,6 @@ pub(super) fn compile(
         needs_global: ops
             .iter()
             .any(|o| matches!(o, Op::LoadName(..) | Op::LoadNameForCall(..))),
+        executable,
     })
 }

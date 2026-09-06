@@ -1200,7 +1200,9 @@ pub(super) fn re_sym_split_discard_fast(
 
     // A sticky split loop that advances one unit after every miss is equivalent to one ordinary
     // forward search for its next success. Removing `y` performs that search in the matcher while
-    // preserving the successful captures and their legacy-static side effects.
+    // preserving the successful captures and their legacy-static side effects. The AArch64 class
+    // machine mapping is deliberately declined by the regex tier, so this remains on the checked
+    // matcher for the class-heavy cases that previously exposed the machine-code issue.
     let search_re = if re.sticky {
         let flags: String = re.flags.chars().filter(|&flag| flag != 'y').collect();
         match i.compiled_regexp(&re.source, &flags) {

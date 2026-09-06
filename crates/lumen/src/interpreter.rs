@@ -2025,12 +2025,26 @@ pub(crate) const WASM_EXECUTION_DEPTH_GUARD: u32 = 128;
 
 /// Native execution is allowed to use the current thread stack while it has comfortable
 /// headroom. Once a call chain becomes deep, `stacker` moves the next Rust continuation to a
-/// heap-backed stack segment. This is an implementation detail: unlike the former eval-depth
-/// budget, it does not reject an ECMAScript execution context.
+/// heap-backed stack segment. Execution contexts are not native frames (ECMA-262 §9.4),
+/// but their native storage must still be finite. Bound simultaneous segment storage rather
+/// than JS call count; report exhaustion as a catchable RangeError at an owning call boundary.
+/// Proper tail calls still reuse their storage (ECMA-262 §15.10.3).
+/// https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-execution-contexts
+/// https://tc39.es/ecma262/multipage/ecmascript-language-functions-and-classes.html#sec-preparefortailcall
 #[cfg(not(target_arch = "wasm32"))]
 const EXECUTION_STACK_RED_ZONE: usize = 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const EXECUTION_STACK_SEGMENT: usize = 8 * 1024 * 1024;
+// Host resource policy, not a language recursion-depth limit. The original thread stack is
+// owned by the embedder; Lumen may add at most 512 MiB of simultaneously live native segments.
+// This also accommodates the existing 4096-call stress case with large unoptimized VM frames.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_EXECUTION_STACK_SEGMENTS: usize = 64;
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    // Thread-local so re-entrant Engines/Realms cannot reset the native storage budget.
+    static EXECUTION_STACK_SEGMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 #[cfg(not(target_arch = "wasm32"))]
 // A bytecode execution context can carry substantially more native machinery than a small
 // arithmetic recursion frame (accessors and host-native calls are common examples). Checking at
@@ -2049,6 +2063,29 @@ pub(crate) fn execution_stack_checks() -> u64 {
     EXECUTION_STACK_CHECKS.with(std::cell::Cell::get)
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn execution_stack_segments() -> usize {
+    EXECUTION_STACK_SEGMENTS.with(std::cell::Cell::get)
+}
+
+/// Check before entering a call (and before moving its owned JIT arguments). Leave the red
+/// zone available for error construction and unwinding. The caller must preserve normal
+/// argument/frame cleanup on failure, just as for any other abrupt completion.
+#[inline]
+pub(crate) fn execution_stack_exhausted(depth: u32) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return depth > WASM_EXECUTION_DEPTH_GUARD;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        (depth == 1 || depth & EXECUTION_STACK_CHECK_MASK == 0)
+            && EXECUTION_STACK_SEGMENTS.with(|segments| {
+                segments.get() >= MAX_EXECUTION_STACK_SEGMENTS
+                    && stacker::remaining_stack()
+                        .is_none_or(|remaining| remaining < EXECUTION_STACK_RED_ZONE)
+            })
+    }
+}
+
 #[inline]
 pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
     #[cfg(not(target_arch = "wasm32"))]
@@ -2056,7 +2093,24 @@ pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
         if depth == 1 || depth & EXECUTION_STACK_CHECK_MASK == 0 {
             #[cfg(test)]
             EXECUTION_STACK_CHECKS.with(|checks| checks.set(checks.get().wrapping_add(1)));
-            return stacker::maybe_grow(EXECUTION_STACK_RED_ZONE, EXECUTION_STACK_SEGMENT, f);
+            if stacker::remaining_stack()
+                .is_none_or(|remaining| remaining < EXECUTION_STACK_RED_ZONE)
+            {
+                // Pair native segment allocation with its lifetime, including Rust unwinding.
+                // All execution entry points check exhaustion before moving frame ownership.
+                struct SegmentGuard;
+                impl Drop for SegmentGuard {
+                    fn drop(&mut self) {
+                        EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() - 1));
+                    }
+                }
+                EXECUTION_STACK_SEGMENTS.with(|segments| {
+                    debug_assert!(segments.get() < MAX_EXECUTION_STACK_SEGMENTS);
+                    segments.set(segments.get() + 1);
+                });
+                let _guard = SegmentGuard;
+                return stacker::grow(EXECUTION_STACK_SEGMENT, f);
+            }
         }
     }
     f()
@@ -2761,7 +2815,7 @@ impl Interp {
     /// Snapshot the current call stack as the `\n    at <fn>` lines for an error's `stack`.
     /// Innermost frame first (Node order). We are a tree-walker without per-call source spans, so
     /// frames carry the function name only (`<anonymous>` when unnamed); the `stack` getter adds
-    /// the `name: message` head. Bounded by the engine's own recursion guard (~128 frames).
+    /// the `name: message` head. These are only the currently live frames, not a cumulative log.
     fn capture_stack(&self) -> Rc<str> {
         let mut out = String::new();
         for frame in self.fn_frames.iter().rev() {
@@ -3385,6 +3439,29 @@ impl Interp {
             cur = o.borrow().proto.clone();
         }
         false
+    }
+
+    /// A bounded, side-effect-free diagnostic for an actual Error exotic.
+    ///
+    /// Unlike Error.prototype.toString or the JS `stack` accessor, this never
+    /// performs [[Get]], follows a prototype, invokes a proxy, or coerces a
+    /// value. Only an own string data message and the engine-captured stack are
+    /// inspected. Non-Errors (including proxies around Errors) return None.
+    pub fn error_diagnostic(&self, value: &Value) -> Option<String> {
+        let object = value.as_obj()?.try_borrow().ok()?;
+        let Exotic::Error(stack) = &object.exotic else {
+            return None;
+        };
+        let message = match object.props.get("message") {
+            Some(property) if !property.accessor() => match property.value() {
+                Value::Str(message) => message.chars().take(512).collect::<String>(),
+                _ => "<non-string message>".to_owned(),
+            },
+            Some(_) => "<accessor message>".to_owned(),
+            None => "<no own message>".to_owned(),
+        };
+        let stack: String = stack.chars().take(2048).collect();
+        Some(format!("Error: {message}{stack}"))
     }
 
     /// The `===` (SameValueNonNumeric / strict-equality) predicate, for host addons.
@@ -4174,10 +4251,23 @@ impl Interp {
             };
             (p, pp)
         });
+        // Instantiate{Ordinary,Generator,Async}FunctionExpression creates the immutable
+        // self-name environment ONCE, outside the activation, when the closure is created.
+        // Retain it in [[Environment]] so all execution tiers and recursive calls share the
+        // correct binding without allocating an extra scope on every call.
+        let self_env = if func.is_fn_expr && func.name.is_some() {
+            Some(new_scope(Some(env.clone())))
+        } else {
+            None
+        };
         let obj = Object::new(Some(fn_proto));
         {
             let mut b = obj.borrow_mut();
-            b.call = Callable::user(func.clone(), env, Rc::as_ptr(&self.global) as usize);
+            b.call = Callable::user(
+                func.clone(),
+                self_env.as_ref().cloned().unwrap_or(env),
+                Rc::as_ptr(&self.global) as usize,
+            );
             b.props = fn_map.clone();
         }
         if has_prototype {
@@ -4208,6 +4298,20 @@ impl Interp {
         }
         if !is_arrow && !is_method && !is_async && !is_generator {
             obj.borrow_mut().is_constructor = true;
+        }
+        if let Some(self_env) = self_env {
+            self_env.borrow_mut().vars.insert(
+                func.name.as_ref().expect("named expression").clone(),
+                Binding {
+                    value: Value::Obj(obj.clone()),
+                    mutable: false,
+                    initialized: true,
+                    import_ref: None,
+                    deletable: false,
+                    // CreateImmutableBinding(name, false): sloppy writes are silent no-ops.
+                    strict_immutable: false,
+                },
+            );
         }
         Value::Obj(obj)
     }
@@ -7557,8 +7661,7 @@ impl Interp {
 
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -8235,7 +8338,7 @@ impl Interp {
         this: Value,
         is_construct: bool,
     ) -> Value {
-        if !chunk.uses_this() {
+        if !chunk.needs_frame_this() {
             return Value::Undefined;
         }
         if func.is_strict || is_construct {
@@ -8581,8 +8684,7 @@ impl Interp {
             }
         };
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             drop_args();
             unsafe { std::ptr::drop_in_place(this_slot as *mut Value) };
@@ -8677,8 +8779,7 @@ impl Interp {
             std::ptr::drop_in_place(this_slot as *mut Value);
         };
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             drop_operands();
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
@@ -8754,8 +8855,7 @@ impl Interp {
         }
         // --- committed: identical to call_jit_fast's committed path ---
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             unsafe {
                 for k in 0..argc {
@@ -9138,8 +9238,7 @@ impl Interp {
         // The original body calls the native apply function here. Preserve its depth and GC
         // boundary even though the argument-list object and native dispatch are elided.
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             drop_args();
             return Some(Err(
@@ -9222,8 +9321,7 @@ impl Interp {
         };
         if let Some(call) = native {
             self.depth += 1;
-            #[cfg(target_arch = "wasm32")]
-            if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+            if execution_stack_exhausted(self.depth) {
                 self.depth -= 1;
                 unsafe {
                     for k in 0..argc {
@@ -9322,8 +9420,7 @@ impl Interp {
         let this_val = Value::Obj(this.clone());
         // --- committed: identical shape to call_jit_cached's committed path ---
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             unsafe {
                 for k in 0..argc {
@@ -9578,6 +9675,11 @@ impl Interp {
             _ => return None,
         };
         let arguments_apply_forwarder = chunk.jit_arguments_apply_forwarder().is_some();
+        // The general [[Construct]] continuation still owns return-value/derived-this handling.
+        // Do not enter a call-only tail-transfer body through its lean constructor shortcut.
+        if chunk.has_tail_calls() || chunk.prepared_entry {
+            return None;
+        }
         // Activation-requiring chunks use the same moved-frame entry as cached ordinary calls:
         // it materializes captured bindings / `arguments` before transferring argument ownership.
         let needs_env = !chunk.jit_no_activation();
@@ -9603,7 +9705,7 @@ impl Interp {
             code: Rc::as_ptr(code),
             global_env: genv,
             strict: func.is_strict,
-            uses_this: chunk.uses_this(),
+            uses_this: chunk.needs_frame_this(),
             n_params: n_params as u16,
             n_slots: n_slots as u16,
             direct: if needs_env {
@@ -9706,6 +9808,11 @@ impl Interp {
             Some(Some(c)) => c,
             _ => return None,
         };
+        // A prepared body must first run FunctionDeclarationInstantiation. Its environment is
+        // not the closure environment supplied by this moved-frame shortcut.
+        if chunk.prepared_entry {
+            return None;
+        }
         // A callee that needs an activation env (captured locals / lexical this) is cacheable
         // too: its committed path enters through `jit::run` (which builds the activation)
         // instead of `run_moved`. IC entries carry direct bit 4; bits 0-3 stay clear, so the
@@ -9741,7 +9848,7 @@ impl Interp {
                         code: Rc::as_ptr(code),
                         global_env: Rc::as_ptr(&self.global_env) as usize,
                         strict: func.is_strict,
-                        uses_this: chunk.uses_this(),
+                        uses_this: chunk.needs_frame_this(),
                         n_params: n_params as u16,
                         n_slots: n_slots as u16,
                         direct: if needs_env {
@@ -9766,8 +9873,7 @@ impl Interp {
         }
         // --- committed: from here the arguments and `*this_slot` are ours ---
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             // Ownership contract: consume the arguments and `this` even on the early throw.
             unsafe {
@@ -9874,6 +9980,7 @@ impl Interp {
         // already saved/cleared `new_target`/`constructing`. One divergence: no `lazy` args stash,
         // so legacy `f.arguments` reflection during an active VM frame reads null (the VM's
         // slot-based locals never aliased it faithfully anyway).
+        let allow_compiled_body = !closure.borrow().under_with;
         let derived_class_construct = is_construct
             && self
                 .class_info
@@ -9883,7 +9990,7 @@ impl Interp {
             && !func.is_generator
             && !func.is_async
             // Closures under a `with` scope stay on the tree-walker (see `Scope::under_with`).
-            && !closure.borrow().under_with
+            && allow_compiled_body
         {
             if func.code.get().is_none() {
                 let n = func.calls.get().saturating_add(1);
@@ -9904,7 +10011,10 @@ impl Interp {
                     let _ = func.code.set(compiled);
                 }
             }
-            if let Some(Some(chunk)) = func.code2.get().or_else(|| func.code.get()) {
+            if let Some(chunk) = func.code2.get().or_else(|| func.code.get())
+                .and_then(Option::as_ref)
+                .filter(|chunk| !chunk.prepared_entry && (!is_construct || !chunk.has_tail_calls()))
+            {
                 let chunk = chunk.clone();
                 let this_val = if derived_class_construct {
                     None
@@ -9942,7 +10052,8 @@ impl Interp {
         // Debug: `LUMEN_AST_HOT=1` reports functions whose bodies keep executing on the
         // tree-walker (each time the per-function call count crosses a power of ten).
         static AST_HOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *AST_HOT.get_or_init(|| std::env::var_os("LUMEN_AST_HOT").is_some()) {
+        if !func.code.get().and_then(Option::as_ref).is_some_and(|chunk| chunk.prepared_entry)
+            && *AST_HOT.get_or_init(|| std::env::var_os("LUMEN_AST_HOT").is_some()) {
             let n = func.calls.get().saturating_add(1);
             func.calls.set(n);
             if n >= 1000 && (n == 1000 || n == 10_000 || n == 100_000 || n == 1_000_000) {
@@ -9961,34 +10072,8 @@ impl Interp {
         // a separate parameter Environment Record — not a variable environment — so its body's `var`
         // hoisting sits in a distinct scope below it (and a direct `eval` in a parameter default
         // cannot leak declarations into the body). Otherwise a single variable environment suffices.
-        // A named function *expression*'s name binds immutably inside the function; a
-        // *declaration*'s name already has a (mutable) binding in the enclosing scope, so it must
-        // NOT get the self-reference (that would make `function f(){ f = 1 }` a silent no-op —
-        // and an Annex B block function's binding may have been reassigned between calls).
-        let self_ref_needed = func.is_fn_expr && func.name.is_some();
-        // A named function expression's self-name binds in its own environment *outside* the
-        // variable environment, so a body-level `var` of the same name creates a fresh binding
-        // instead of aliasing the callee.
-        let closure = if self_ref_needed {
-            let selfref_env = new_scope(Some(closure));
-            if let Some(name) = &func.name {
-                selfref_env.borrow_mut().vars.insert(
-                    name.clone(),
-                    Binding {
-                        value: Value::Obj(fn_obj.clone()),
-                        mutable: false,
-                        initialized: true,
-                        import_ref: None,
-                        deletable: false,
-                        // Non-strict immutable: reassignment is a silent no-op in sloppy code.
-                        strict_immutable: false,
-                    },
-                );
-            }
-            selfref_env
-        } else {
-            closure
-        };
+        // A named expression's self-binding is already in its closure environment; body vars
+        // and parameters get nearer bindings here, just as they do for every other function.
         let has_param_exprs = params_have_expr(&func.params);
         let scope = if has_param_exprs {
             // Chain: callee base (variable env) → parameter env → body variable env. A direct `eval`
@@ -10116,8 +10201,7 @@ impl Interp {
                     Binding::data(Value::Bool(true), false, true),
                 );
             }
-            // (A named function expression's self-name binds in its own environment, created
-            // before the variable environment above.)
+            // A named expression's self-name was bound at closure creation, outside this scope.
         }
 
         // Parameter binding may throw (a default initializer, a destructuring mismatch, or an
@@ -10194,6 +10278,30 @@ impl Interp {
         }
         // Pre-declare body-level `let`/`const` in their temporal dead zone.
         self.declare_block_lexicals(&func.body, &body, false);
+
+        // The general compiled entry shares the normative prologue above with the interpreter:
+        // parameters/defaults/destructuring, mapped arguments, self-name and hoisted closures
+        // execute once. Only body evaluation changes tier. Its chunk reuses these live bindings
+        // rather than constructing a second activation or replaying initializers.
+        if !matches!(self.tier, crate::bytecode::Tier::Interp) && !is_construct && allow_compiled_body {
+            if let Some(chunk) = func.code.get().and_then(Option::as_ref)
+                .filter(|chunk| chunk.prepared_entry)
+            {
+                let this_value = if chunk.needs_frame_this() {
+                    self.get_var("this", &body)
+                } else {
+                    Ok(Value::Undefined)
+                };
+                let result = this_value.and_then(|this_value| {
+                    self.run_compiled_chunk(func, chunk, &body, this_value, &[], false)
+                });
+                self.strict = saved_strict;
+                self.new_target = saved_new_target;
+                self.in_field_init_code = saved_field_init;
+                self.in_async_gen_body = saved_agb;
+                return result;
+            }
+        }
 
         // The function body is a disposal boundary for its `using` declarations.
         let has_using = func.body.iter().any(crate::eval::stmt_declares_using);
@@ -10760,8 +10868,7 @@ impl Interp {
         new_target: Value,
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        #[cfg(target_arch = "wasm32")]
-        if self.depth > WASM_EXECUTION_DEPTH_GUARD {
+        if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
