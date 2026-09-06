@@ -201,9 +201,9 @@ impl IcState {
 /// is carried by `global_env`: the fill's env-root walk was relative to the then-active global
 /// scope, whose address is compared raw on every hit (and weak-allocation-pinned in
 /// `Interp::global_env_pins` so it cannot be recycled); a realm switch changes the active
-/// global and makes every cached site miss and revalidate. The blanket proxy/realm gates
-/// `call_jit_fast` re-checks per call are safe to skip on a hit: they exist to keep EXOTIC
-/// callees off the fast path, and identity proves this callee is the same plain user function.
+/// global and makes every cached site miss and revalidate. The callee-local exotic guard is
+/// safe to skip on a hit: identity proves this is the same ordinary function, independently
+/// of proxies created elsewhere in the Agent since the cache was filled.
 #[derive(Clone, Copy)]
 /// `repr(C)` with this field order gives the JIT call template fixed byte offsets for its
 /// inline way-1 probe: callee@0, env@8, chunk@16, code@24, global_env@32, strict@40,
@@ -14486,6 +14486,21 @@ impl Chunk {
     pub(crate) fn jit_call_cache_ptr(&self, idx: u32) -> usize {
         self.call_caches[idx as usize].entries.as_ptr() as usize
     }
+    #[cfg(test)]
+    pub(crate) fn cached_call_for(&self, callee: usize) -> Option<CallIc> {
+        self.call_caches
+            .iter()
+            .flat_map(|site| site.entries.iter())
+            .map(std::cell::Cell::get)
+            .find(|entry| entry.callee == callee)
+    }
+    #[cfg(test)]
+    pub(crate) fn cached_construct_for(&self, callee: usize) -> bool {
+        self.ops.iter().any(|op| match op {
+            Op::New(_, site) => self.construct_cache(*site).call.callee == callee,
+            _ => false,
+        })
+    }
     /// The stable address of name-cache site `idx`'s `Cell<NameIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]).
     pub(crate) fn jit_name_cache_ptr(&self, idx: u32) -> usize {
@@ -15705,13 +15720,15 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         })
                     }
                     INTRINSIC_OBJECT_HAS_OWN => {
-                        let Value::Obj(o) = &*base.add(2) else {
+                        let object @ Value::Obj(_) = &*base.add(2) else {
                             unreachable!("hasOwn intrinsic object guard")
                         };
                         let Value::Str(key) = &*base.add(3) else {
                             unreachable!("hasOwn intrinsic key guard")
                         };
-                        Ok(Value::Bool(o.borrow().props.contains(key.as_str())))
+                        crate::builtins::has_own_property_trapped(i, object, key.as_str())
+                            .map(Value::Bool)
+                            .map_err(Abrupt::Throw)
                     }
                     INTRINSIC_FUNCTION_CALL => {
                         // `target.call(thisArg, arg)`: transfer thisArg + the single forwarded argument
@@ -17142,16 +17159,21 @@ unsafe fn jit_call_inner(
         argc,
     );
     if r.is_none() {
-        // Plain-native fast call: a bare `fn` callee in a proxy-free single-realm engine skips the
+        // Plain-native fast call: an ordinary bare `fn` callee in a single-realm engine skips the
         // call/call_inner/call_dispatch layering. The callee is ALSO recorded as a native IC
         // entry (identity-pinned like a user callee), so subsequent calls take the machine-code
         // probe + `call_native_committed` — no receiver borrow, no `Callable` dispatch.
-        if i.proxies.is_empty() && !i.multi_realm() {
+        if !i.multi_realm() {
             let callee = &*sp.sub(argc + 1);
             if let Value::Obj(o) = callee {
-                let nf = match &o.borrow().call {
-                    crate::value::Callable::Native(nf) => Some(*nf),
-                    _ => None,
+                let nf = {
+                    let object = o.borrow();
+                    match &object.call {
+                        // Callable proxies carry a Native sentinel. Never cache it as the
+                        // implementation of [[Call]] or bypass apply/revocation checks.
+                        crate::value::Callable::Native(nf) if object.ic_plain.get() => Some(*nf),
+                        _ => None,
+                    }
                 };
                 if let Some(nf) = nf {
                     {

@@ -20948,7 +20948,7 @@ fn jit_slice_and_hasown_intrinsics_preserve_slow_paths() {
              var changed = own(o, 'alpha');
              Object.hasOwn = saved;
              var thrown;
-             try { own(1, 'x'); } catch (e) { thrown = e.name; }
+             try { own(null, 'x'); } catch (e) { thrown = e.name; }
              before + ':' + deleted + ':' + restored + ':' + changed + ':' + thrown"
         ),
         "true:false:true:false:true:changed:TypeError"

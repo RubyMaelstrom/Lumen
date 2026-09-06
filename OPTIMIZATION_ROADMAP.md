@@ -42,6 +42,24 @@ release acceptance. The next architectural checkpoint remains a complete product
 family through precise tracing and live VM/native/host roots, exercised by real allocation,
 property and call workloads—not more isolated migration scaffolding.
 
+## 2026-09-06 follow-on: callee-local fast-path guards
+
+The earlier blanket "any Proxy exists" refusal no longer prevents unrelated ordinary functions
+and constructors from filling their fast caches. Callee-local guards preserve actual Proxy
+traps/revocation, realm state, and argument ownership. The intrinsic audit also repaired
+Object.hasOwn coercion and special-object dispatch, sharing that path with hasOwnProperty.
+
+The combined unit run passes 1,001 tests (one ignored); 22,993 Test262 files pass independently
+in all three tiers. Seven-round matched measurements give ordinary calls/construction/native
+calls with an unrelated Proxy present 2.96×/1.98×/2.13× gains, restoring their no-Proxy performance.
+The unchanged Vue kernel improves 1,201→1,145 ms (4.7% shorter); classic components are effectively
+flat, and V8 remains 10.3× faster on this Vue workload. Generated Vue code grows 7.6% as inlining
+becomes active; peak RSS is essentially unchanged. A longer named-function recheck confirms parity.
+
+See [the guarded-call checkpoint](GUARDED_CALLS_2026-09-06.md) for evidence, semantic boundaries,
+and remaining call/activation and object/value work. These commits are not browser promotion or
+completion of the architectural phases below.
+
 ## Non-negotiable engineering rules
 
 - Official standards define observable behavior. ECMA-262, ECMA-402, WebAssembly, WHATWG, W3C,

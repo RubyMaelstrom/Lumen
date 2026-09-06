@@ -9283,9 +9283,6 @@ impl Interp {
         caller_ctx: Option<*mut crate::jit::JitCtx>,
         site: Option<(&crate::bytecode::Chunk, u32)>,
     ) -> Option<Result<Value, Abrupt>> {
-        if !self.proxies.is_empty() {
-            return None;
-        }
         let Value::Obj(o) = callee else { return None };
         let key = Rc::as_ptr(o) as usize;
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
@@ -9308,7 +9305,10 @@ impl Interp {
         // path because the callee's intrinsics must be installed before its native body runs.
         let native = if cached_site.is_none() && !self.multi_realm() {
             let b = o.borrow();
-            if b.is_constructor || b.props.contains("prototype") {
+            // Proxy callability uses a native sentinel, not its target's body. Only the
+            // actual callee's internal methods matter; unrelated proxies must not disable
+            // ordinary native construction throughout the Agent.
+            if b.ic_plain.get() && (b.is_constructor || b.props.contains("prototype")) {
                 match &b.call {
                     Callable::Native(_) | Callable::NativeData(_) => Some(b.call.clone()),
                     _ => None,
@@ -9628,11 +9628,16 @@ impl Interp {
         epoch: u32,
         genv: usize,
     ) -> Option<(crate::bytecode::CallIc, u32, u32, bool)> {
-        let (func, env) = match &o.borrow().call {
-            Callable::User(user) => (user.func.clone(), user.env.clone()),
+        let object = o.borrow();
+        let (func, env) = match &object.call {
+            Callable::User(user) if object.ic_plain.get() => (user.func.clone(), user.env.clone()),
             _ => return None,
         };
+        drop(object);
         if func.is_arrow || func.is_method || func.is_generator || func.is_async {
+            return None;
+        }
+        if env.borrow().under_with {
             return None;
         }
         if self.multi_realm() {
@@ -9753,18 +9758,17 @@ impl Interp {
             &RefCell<crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>>,
         )>,
     ) -> Option<Result<Value, Abrupt>> {
-        // Any exotic engine state (live proxies, multiple realms with possible cross-realm
-        // callees, legacy fn.caller hooks) takes the generic path. Realms: the callee is
-        // same-realm iff its scope chain roots in the active global env — walk a few hops by
-        // raw pointer (no Rc churn; the chain is kept alive by the callee's env handle).
-        if !self.proxies.is_empty() {
-            return None;
-        }
+        // Eligibility belongs to the callee, not to all objects in the Agent. Proxy
+        // [[Call]] must dispatch its traps, but a separate ordinary function still has the
+        // same [[Call]] after any number of unrelated proxies have been created/revoked.
+        // The immutable Callable and identity pin preserve this proof on cached hits.
         let Value::Obj(o) = callee else { return None };
-        let (func, env) = match &o.borrow().call {
-            Callable::User(user) => (user.func.clone(), user.env.clone()),
+        let object = o.borrow();
+        let (func, env) = match &object.call {
+            Callable::User(user) if object.ic_plain.get() => (user.func.clone(), user.env.clone()),
             _ => return None,
         };
+        drop(object);
         // Arrows inherit new.target lexically (the generic path skips the clear for them).
         if func.is_arrow {
             return None;

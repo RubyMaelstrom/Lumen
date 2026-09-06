@@ -704,27 +704,49 @@ pub(crate) fn js_get_prototype_of(i: &mut Interp, obj: &Value) -> Result<Value, 
     })
 }
 
-/// Proxy `[[DefineOwnProperty]]`: call the trap (ToBoolean its result) or forward to the target.
-/// Proxy `[[GetOwnProperty]]`: the trap result as a descriptor object (or undefined), enforcing the
-/// absent-property invariant; a missing trap forwards to the target (recursing for a proxy target).
-/// Trap-aware HasOwnProperty (for CopyNameAndLength across realm boundaries).
+/// HasOwnProperty for an already-coerced object and property key. Share the actual
+/// [[GetOwnProperty]] dispatch between the Object builtins and native intrinsic: proxies,
+/// integer-indexed objects, live namespaces, and host indices cannot use a raw map lookup.
 pub(crate) fn has_own_property_trapped(
     i: &mut Interp,
     v: &Value,
     key: &str,
 ) -> Result<bool, Value> {
+    if Interp::is_private_key(key) {
+        return Ok(false);
+    }
+    let Value::Obj(o) = v else { return Ok(false) };
+    {
+        let object = o.borrow();
+        if object.ic_plain.get() {
+            return Ok(object.props.contains(key));
+        }
+    }
+    ab(i.defer_trigger(o, Some(key)))?;
+    if let Some(info) = ta_info(i, o) {
+        match i.ta_index_kind(&info, key) {
+            TaIndex::Element(_) => return Ok(true),
+            TaIndex::Exotic => return Ok(false),
+            TaIndex::Ordinary => {}
+        }
+    }
     if let Some((t, h)) = proxy_pair(i, v) {
         return Ok(!matches!(
             proxy_gopd_value(i, &t, &h, key)?,
             Value::Undefined
         ));
     }
-    if let Value::Obj(o) = v {
-        if ab(i.host_indexed_own_value(o, key))?.is_some() {
+    if ab(i.host_indexed_own_value(o, key))?.is_some() {
+        return Ok(true);
+    }
+    let ptr = Rc::as_ptr(o) as usize;
+    if i.is_namespace(ptr) {
+        if let Some(result) = i.namespace_own_property(ptr, key) {
+            ab(result)?;
             return Ok(true);
         }
     }
-    Ok(matches!(v, Value::Obj(o) if o.borrow().props.contains(key)))
+    Ok(o.borrow().props.contains(key))
 }
 
 pub(crate) fn proxy_gopd_value(
@@ -3811,38 +3833,8 @@ fn install_object(it: &mut Interp) {
     let op = it.object_proto.clone();
     it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
         let key = ab(i.to_property_key(&arg(args, 0)))?;
-        // A private-name slot (`#x`) is never an observable own property.
-        if Interp::is_private_key(&key) {
-            return Ok(Value::Bool(false));
-        }
         let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
-        // A TypedArray index in range is an own property even though it isn't in the property map;
-        // a canonical-numeric non-index is never an own property.
-        if let Some(info) = ta_info(i, &o) {
-            match i.ta_index_kind(&info, &key) {
-                crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
-                crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
-                crate::value::TaIndex::Ordinary => {}
-            }
-        }
-        if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
-            return Ok(Value::Bool(true));
-        }
-        // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-            return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
-        }
-        // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
-        let ptr = Rc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            if let Some(res) = i.namespace_own_property(ptr, &key) {
-                ab(res)?;
-                return Ok(Value::Bool(true));
-            }
-        }
-        let has = o.borrow().props.contains(&key);
-        Ok(Value::Bool(has))
+        has_own_property_trapped(i, &Value::Obj(o), &key).map(Value::Bool)
     });
     // Annex B __defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__.
     fn define_accessor(
@@ -4567,16 +4559,11 @@ pub(crate) fn nf_object_has_own(
     _this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-    let o = match arg(args, 0) {
-        Value::Obj(o) => o,
-        _ => return Err(i.make_error("TypeError", "Object.hasOwn called on non-object")),
-    };
+    // Object.hasOwn orders ToObject before ToPropertyKey (unlike hasOwnProperty).
+    // https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-object.hasown
+    let o = to_object_arg(i, arg(args, 0), "Object.hasOwn")?;
     let key = ab(i.to_property_key(&arg(args, 1)))?;
-    if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
-        return Ok(Value::Bool(true));
-    }
-    let has = o.borrow().props.contains(&key);
-    Ok(Value::Bool(has))
+    has_own_property_trapped(i, &Value::Obj(o), &key).map(Value::Bool)
 }
 
 /// TestIntegrityLevel: extensibility plus per-key configurability (and, for frozen, data-property

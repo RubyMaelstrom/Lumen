@@ -1103,3 +1103,5 @@ mod tests;
 mod tail_tests;
 #[cfg(test)]
 mod entry_tests;
+#[cfg(test)]
+mod call_guard_tests;
