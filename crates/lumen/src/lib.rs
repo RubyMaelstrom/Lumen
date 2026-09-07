@@ -67,6 +67,10 @@ mod tagged;
 mod temporal;
 mod token;
 #[cfg(test)]
+mod typedarray_allocation_tests;
+#[cfg(all(test, feature = "embed"))]
+mod script_caller_tests;
+#[cfg(test)]
 mod typedarray_search_tests;
 mod tz;
 #[rustfmt::skip]

@@ -1189,7 +1189,7 @@ impl Interp {
         let saved_strict = self.strict;
         self.import_meta = Some(meta);
         self.strict = true;
-        let result = self.run_stmt_list(&body, &env);
+        let result = self.with_script_entry(|this| this.run_stmt_list(&body, &env));
         self.import_meta = saved_meta;
         self.strict = saved_strict;
 
@@ -1530,7 +1530,7 @@ impl Interp {
         self.import_meta = Some(meta);
         self.strict = true;
         self.module_recs.get_mut(key).unwrap().evaluating = true;
-        let result = self.run_stmt_list(&body, &env);
+        let result = self.with_script_entry(|this| this.run_stmt_list(&body, &env));
         self.import_meta = saved_meta;
         self.strict = saved_strict;
         self.module_recs.get_mut(key).unwrap().evaluating = false;

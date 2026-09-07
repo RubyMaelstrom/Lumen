@@ -4261,6 +4261,15 @@ impl Interp {
         caller_env: &Env,
         direct: bool,
     ) -> Result<Value, Abrupt> {
+        self.with_script_entry(|this| this.perform_eval_body(code, caller_env, direct))
+    }
+
+    fn perform_eval_body(
+        &mut self,
+        code: &str,
+        caller_env: &Env,
+        direct: bool,
+    ) -> Result<Value, Abrupt> {
         let base_strict = direct && self.strict;
         // `new.target` is valid at the top level of a direct eval whose caller is in function code.
         let allow_new_target = direct && self.in_function_code(caller_env);

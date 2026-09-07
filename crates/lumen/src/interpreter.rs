@@ -1599,6 +1599,10 @@ pub struct Interp {
     /// that temporarily multiplexes several Window settings objects through one engine Realm can
     /// restore the relevant settings while the job runs. Zero is the embedder's default context.
     pub(crate) host_job_context: u64,
+    /// Script/Eval entry below the currently active function frames. Realm keys are
+    /// non-owning: the realm registry pins every live global. This is not the HTML
+    /// backup incumbent stack; the embedder supplies that for native callbacks.
+    pub(crate) script_entry: Option<(usize, usize)>,
     /// Per-(ECMAScript realm, host settings object) global lexical state.
     /// HTML normally has a 1:1 realm/settings mapping; browser embedders that
     /// multiplex logical Window realms select the corresponding state through
@@ -1827,6 +1831,7 @@ interp_memory_inventory! {
     temporal_cal => "measured",
     microtasks => "measured",
     host_job_context => "non_owning",
+    script_entry => "non_owning",
     host_settings_states => "measured",
     retired_host_job_contexts => "measured",
     host_job_context_enter => "non_owning",
@@ -1885,7 +1890,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 133);
+    assert_eq!(names.len(), 134);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -2713,6 +2718,7 @@ impl Interp {
             temporal_cal: Default::default(),
             microtasks: std::collections::VecDeque::new(),
             host_job_context: 0,
+            script_entry: None,
             host_settings_states: Default::default(),
             retired_host_job_contexts: Default::default(),
             host_job_context_enter: None,
@@ -3312,6 +3318,40 @@ impl Interp {
     /// (N-API's `napi_get_global`).
     pub fn global_this(&self) -> Value {
         Value::Obj(self.global.clone())
+    }
+
+    /// Global of the topmost executing Script/Module/Eval or ECMAScript function,
+    /// ignoring intervening native and bound-function calls. A native operation's
+    /// own Realm is its *receiver* context, not necessarily its script caller.
+    /// ECMA-262 PrepareForOrdinaryCall / BuiltinCallOrConstruct / ScriptEvaluation.
+    ///
+    /// Host-written JavaScript is still JavaScript here. Embedders implementing
+    /// HTML incumbent settings must additionally handle their platform shims and
+    /// the backup incumbent context of Web IDL callbacks.
+    pub fn script_caller_global(&self) -> Value {
+        let floor = self.script_entry.map_or(0, |(_, depth)| depth);
+        let key = self
+            .fn_frames
+            .get(floor..)
+            .and_then(|frames| frames.last())
+            .and_then(|frame| match &frame.callee().borrow().call {
+                Callable::User(user) => Some(user.realm),
+                _ => None,
+            })
+            .or_else(|| self.script_entry.map(|(realm, _)| realm));
+        key.and_then(|key| self.realms.get(&key)).map_or_else(
+            || self.global_this(),
+            |realm| Value::Obj(realm.global.clone()),
+        )
+    }
+
+    pub(crate) fn with_script_entry<R>(&mut self, operation: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self
+            .script_entry
+            .replace((Rc::as_ptr(&self.global) as usize, self.fn_frames.len()));
+        let result = operation(self);
+        self.script_entry = saved;
+        result
     }
 
     /// [[Get]] for embedders: like [`Self::get_member`] but surfaces a thrown value rather than
@@ -11282,6 +11322,10 @@ impl Interp {
     }
 
     pub(crate) fn run_program(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
+        self.with_script_entry(|this| this.run_program_body(body))
+    }
+
+    fn run_program_body(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
         self.activate_gc_heap();
         self.interrupt_poll_force()?;
         // GlobalDeclarationInstantiation early checks, before any binding is created. A probe

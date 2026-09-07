@@ -245,7 +245,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
         v => {
             let n = ab(i.to_number(&v))?;
             let n = if n.is_nan() { 0.0 } else { n.trunc() };
-            if n < 0.0 || !n.is_finite() || n as usize > MAX_ARRAY_OP_LEN {
+            if n < 0.0 || !n.is_finite() || n as usize > MAX_BUFFER_BYTES {
                 return Err(i.make_error("RangeError", "invalid transfer length"));
             }
             Some(n as usize)
@@ -287,11 +287,15 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
 }
 
 fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
+    make_array_buffer_from_bytes(i, vec![0u8; byte_len])
+}
+
+fn make_array_buffer_from_bytes(i: &mut Interp, bytes: Vec<u8>) -> (Value, usize) {
+    let byte_len = bytes.len();
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers
-        .insert(p, Rc::new(RefCell::new(vec![0u8; byte_len])));
+    i.array_buffers.insert(p, Rc::new(RefCell::new(bytes)));
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
     // behind the `__ab*` prefix and surfaced through prototype accessor getters.
     set_internal(&obj, "__abMaxByteLength", Value::Num(byte_len as f64));
@@ -835,11 +839,7 @@ fn rel_index(n: f64, len: usize) -> usize {
         return 0;
     }
     let n = if n.is_infinite() {
-        if n > 0.0 {
-            len as f64
-        } else {
-            0.0
-        }
+        if n > 0.0 { len as f64 } else { 0.0 }
     } else {
         n.trunc()
     };
@@ -1043,11 +1043,7 @@ fn ta_native(
             // coerces to 0); the default when absent is 0 (indexOf) / len-1 (lastIndexOf).
             let from = if args.len() >= 2 {
                 let n = ab(i.to_number(&arg(args, 1)))?;
-                if n.is_nan() {
-                    0.0
-                } else {
-                    n.trunc()
-                }
+                if n.is_nan() { 0.0 } else { n.trunc() }
             } else if last {
                 (len - 1) as f64
             } else {
@@ -1099,11 +1095,7 @@ fn ta_native(
             let from = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undefined) => {
                     let n = ab(i.to_number(v))?;
-                    if n.is_nan() {
-                        0.0
-                    } else {
-                        n.trunc()
-                    }
+                    if n.is_nan() { 0.0 } else { n.trunc() }
                 }
                 _ => 0.0,
             };
@@ -1545,28 +1537,78 @@ ta_methods! {
 }
 
 fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, Value> {
-    // With an Object first argument (buffer / typed array / iterable) — or none —
-    // AllocateTypedArray runs before the argument coercions: newTarget's `prototype` getter
-    // (which may throw or revoke) is observed first. A non-object first argument instead runs
-    // ToIndex first (spec step 6.c). The value is re-read cheaply below.
-    if matches!(
-        args.first(),
-        None | Some(Value::Obj(_)) | Some(Value::Undefined)
-    ) {
-        if let nt @ Value::Obj(_) = &i.new_target.clone() {
-            if !matches!(ab(i.get_member(nt, "prototype"))?, Value::Obj(_)) {
-                ctor_realm_proto(i, nt, kind.name())?;
-            }
-        }
-    }
     if !i.constructing {
         return Err(i.make_error("TypeError", "TypedArray constructor requires 'new'"));
     }
+    // ECMA-262 §23.2.5.1: primitive ToIndex precedes AllocateTypedArray; an
+    // object's coercions follow it. GetPrototypeFromConstructor is observed ONCE.
+    let numeric_length = match args.first() {
+        Some(v) if !matches!(v, Value::Obj(_)) => Some(to_index(i, v)?),
+        _ => None,
+    };
+    let proto = match &i.new_target.clone() {
+        nt @ Value::Obj(_) => match ab(i.get_member(nt, "prototype"))? {
+            Value::Obj(p) => Some(p),
+            _ => ctor_realm_proto(i, nt, kind.name())?
+                .or_else(|| i.extra_protos.get(kind.name()).cloned()),
+        },
+        _ => i.extra_protos.get(kind.name()).cloned(),
+    };
     let es = kind.elsize();
+    // Typed arrays allocate byte buffers, not Vec<Value> array-operation lists.
+    // Share ArrayBuffer's byte ceiling; division bounds multiplication safely.
+    let checked_bytes = |i: &Interp, len: usize| -> Result<usize, Value> {
+        if len > MAX_BUFFER_BYTES / es {
+            Err(i.make_error(
+                "RangeError",
+                "TypedArray backing buffer exceeds allocation limit",
+            ))
+        } else {
+            Ok(len * es)
+        }
+    };
     let (buf_val, buf_ptr, offset, len, track) = match args.first() {
         None => {
             let (bv, bp) = make_array_buffer(i, 0);
             (bv, bp, 0, 0, false)
+        }
+        Some(source) if map_ptr(source).is_some_and(|p| i.typed_arrays.contains_key(&p)) => {
+            // InitializeTypedArrayFromTypedArray bypasses @@iterator, .length,
+            // .constructor and @@species. Same-type copies preserve all raw bits
+            // (including NaN payloads), and do not allocate an iterator result or
+            // Value per pixel. The resulting buffer is independent and fixed-length.
+            let source_info = i.typed_arrays[&map_ptr(source).unwrap()];
+            let len = i
+                .ta_len(&source_info)
+                .ok_or_else(|| i.make_error("TypeError", "TypedArray source is out of bounds"))?;
+            let bytes = checked_bytes(i, len)?;
+            if kind == source_info.kind {
+                let source_bytes = i.ta_read_bytes(&source_info, 0, len).ok_or_else(|| {
+                    i.make_error("TypeError", "TypedArray source is out of bounds")
+                })?;
+                let (bv, bp) = make_array_buffer_from_bytes(i, source_bytes);
+                (bv, bp, 0, len, false)
+            } else {
+                if kind.is_bigint() != source_info.kind.is_bigint() {
+                    return Err(i.make_error(
+                        "TypeError",
+                        "TypedArray content types (BigInt vs Number) differ",
+                    ));
+                }
+                let (bv, bp) = make_array_buffer(i, bytes);
+                let target_info = TaInfo {
+                    buffer: bp,
+                    offset: 0,
+                    len,
+                    kind,
+                    track: false,
+                };
+                for index in 0..len {
+                    let value = i.ta_read(&source_info, index);
+                    ab(i.ta_store(&target_info, index, &value))?;
+                }
+                (bv, bp, 0, len, false)
+            }
         }
         // An ArrayBuffer (or SharedArrayBuffer) backing store: identified by the live side table, or
         // by the [[ArrayBufferData]] marker for a detached buffer (still an ArrayBuffer, so it can't
@@ -1607,7 +1649,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             );
             let len = match len_arg {
                 Some(l) => {
-                    if offset + l * es > buflen {
+                    if offset > buflen || l > (buflen - offset) / es {
                         return Err(i.make_error("RangeError", "invalid typed array length"));
                     }
                     l
@@ -1632,11 +1674,9 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         // A non-object first argument is a length (ToIndex): NaN→0, negative/too-large→RangeError,
         // a Symbol/BigInt → TypeError via ToNumber.
         Some(v) if !matches!(v, Value::Obj(_)) => {
-            let len = to_index(i, v)?;
-            if len > MAX_ARRAY_OP_LEN {
-                return Err(i.make_error("RangeError", "Invalid typed array length"));
-            }
-            let (bv, bp) = make_array_buffer(i, len * es);
+            let len = numeric_length.expect("primitive ToIndex already performed");
+            let bytes = checked_bytes(i, len)?;
+            let (bv, bp) = make_array_buffer(i, bytes);
             (bv, bp, 0, len, false)
         }
         Some(other) => {
@@ -1652,12 +1692,12 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             {
                 return Err(i.make_error("TypeError", "@@iterator is not callable"));
             }
-            let items = if iter_method.is_callable() {
+            if iter_method.is_callable() {
                 // InitializeTypedArrayFromList is observably identical to intrinsic Array
                 // iteration when every indexed value is an own data property. Avoid allocating
                 // one iterator-result object and one decimal property key per element in that
                 // common case; patched iterators, holes, and accessors retain the full algorithm.
-                if is_native_function(&iter_method, nf_array_values)
+                let items = if is_native_function(&iter_method, nf_array_values)
                     && intrinsic_array_iterator_is_unmodified(i)
                 {
                     match dense_array_snapshot(i, other) {
@@ -1666,51 +1706,51 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                     }
                 } else {
                     ab(i.iterate_with(other, iter_method))?
+                };
+                let len = items.len();
+                let bytes = checked_bytes(i, len)?;
+                let (bv, bp) = make_array_buffer(i, bytes);
+                let info = TaInfo {
+                    buffer: bp,
+                    offset: 0,
+                    len,
+                    kind,
+                    track: false,
+                };
+                for (idx, item) in items.iter().enumerate() {
+                    ab(i.ta_store(&info, idx, item))?;
                 }
+                (bv, bp, 0, len, false)
             } else {
-                let lenv = ab(i.get_member(other, "length"))?;
-                let n = ab(i.to_number(&lenv))?.max(0.0) as usize;
-                if n > MAX_ARRAY_OP_LEN {
-                    return Err(i.make_error("RangeError", "Invalid typed array length"));
-                }
-                let mut v = Vec::with_capacity(n.min(1024));
+                let n = ab(i.to_length(other.as_obj().unwrap()))?;
+                let bytes = checked_bytes(i, n)?;
+                let (bv, bp) = make_array_buffer(i, bytes);
+                let info = TaInfo {
+                    buffer: bp,
+                    offset: 0,
+                    len: n,
+                    kind,
+                    track: false,
+                };
+                // Array-like Get/convert/store operations interleave per element;
+                // unlike iterable input, later getters must see earlier conversions.
                 for k in 0..n {
                     let own = other
                         .as_obj()
                         .and_then(|object| i.fast_get_elem(object, k as f64));
-                    v.push(match own {
+                    let value = match own {
                         Some(value) => value,
                         None => ab(i.get_member(other, &k.to_string()))?,
-                    });
+                    };
+                    ab(i.ta_store(&info, k, &value))?;
                 }
-                v
-            };
-            let len = items.len();
-            let (bv, bp) = make_array_buffer(i, len * es);
-            let info = TaInfo {
-                buffer: bp,
-                offset: 0,
-                len,
-                kind,
-                track: false,
-            };
-            for (idx, item) in items.iter().enumerate() {
-                ab(i.ta_store(&info, idx, item))?;
+                (bv, bp, 0, n, false)
             }
-            (bv, bp, 0, len, false)
         }
     };
     // The instance prototype comes from new.target.prototype when it's an object (subclassing /
     // Reflect.construct), else the intrinsic %TypedArray.prototype% for this element type in
     // new.target's realm (GetPrototypeFromConstructor).
-    let proto = match &i.new_target {
-        nt @ Value::Obj(_) => match ab(i.get_member(&nt.clone(), "prototype"))? {
-            Value::Obj(p) => Some(p),
-            _ => ctor_realm_proto(i, &i.new_target.clone(), kind.name())?
-                .or_else(|| i.extra_protos.get(kind.name()).cloned()),
-        },
-        _ => i.extra_protos.get(kind.name()).cloned(),
-    };
     let obj = Object::new(proto);
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
@@ -1748,11 +1788,7 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
         Value::Undefined => 0.0,
         v => {
             let n = ab(i.to_number(&v))?;
-            if n.is_nan() {
-                0.0
-            } else {
-                n.trunc()
-            }
+            if n.is_nan() { 0.0 } else { n.trunc() }
         }
     };
     if offset_n < 0.0 {
