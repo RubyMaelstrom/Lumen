@@ -2044,6 +2044,55 @@ fn regex() {
 }
 
 #[test]
+fn update_operators_preserve_division_and_regexp_lexical_goals() {
+    let cases = [
+        "let n=6; n++/2 === 3 && n === 7",
+        "let n=6; n--/2 === 3 && n === 5",
+        "let n=6; n++ / /xx/.source.length === 3",
+        "let n=6; (n)++/2 === 3",
+        "let o={n:6}; o.n--/2 === 3 && o.n===5",
+        "let a=[6]; a[0]++/2 === 3 && a[0]===7",
+        "let p=0,m=0; let delays=[0,1,0,1].map(y=>y===0?p++/2:m++/4); delays.join(',')==='0,0,0.5,0.25'",
+        "++/x/.lastIndex === 1",
+        "--/x/.lastIndex === -1",
+        "let n=6; `${n++/2}` === '3' && n===7",
+        "let n=6; `${`${n--/2}`}` === '3' && n===5",
+        "`${++/x/.lastIndex}` === '1'",
+        "let n=6; `${(n\n)++/2}` === '3'",
+        "let n=6; `${n/* comment */--/2}` === '3'",
+        "`${(()=>{let n=6; n\n++/x/.lastIndex; return n})()}` === '6'",
+    ];
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for source in cases {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(run_in(&mut engine, source), "true", "{tier:?}: {source}");
+        }
+        for separator in [
+            "\n",
+            "\r",
+            "\r\n",
+            "\u{2028}",
+            "\u{2029}",
+            "/*\n*/",
+            "// comment\n",
+        ] {
+            let source = format!("let n=6; n{separator}++/x/.lastIndex === 1 && n===6");
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            assert_eq!(run_in(&mut engine, &source), "true", "{tier:?}: {source}");
+        }
+    }
+    assert_eq!(run("let n=6; n++\n/2"), "3");
+    assert_eq!(run("let n=6; n/**/++/2"), "3");
+}
+
+#[test]
 fn regex_literal_can_begin_a_control_statement_body() {
     // ECMA-262 uses the InputElementRegExp lexical goal after a control-statement head. This exact
     // brace-free for-of shape is emitted by Archive.org's production bundle.

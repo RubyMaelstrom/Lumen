@@ -101,6 +101,86 @@ fn proxies_do_not_disable_ordinary_call_and_construct_cache_fill() {
 }
 
 #[test]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn fresh_closure_call_cache_uses_the_live_function_identity() {
+    // PrepareForOrdinaryCall sets the execution context's Function to the actual
+    // callee (ECMA-262 e28783d5, spec.html:13873). Sharing code does not share that
+    // identity. Error.stack is an implementation extension that reads this frame.
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval(
+            &mut engine,
+            r#"
+            function factory(label) {
+                var f = function (x) {
+                    var local = x;
+                    function capture() { return local; }
+                    if (x < 0) Reflect.apply(ArrayBuffer, null, [8]);
+                    return capture() + ':' + new Error('frame').stack;
+                };
+                Object.defineProperty(f, 'name', {value: label});
+                return f;
+            }
+            function drive(f, x) { return f(x); }
+            var original = factory('originalClosure');
+            for (var i = 0; i < 80; i++) drive(original, i);
+            var replacement = factory('replacementClosure');
+        "#,
+        );
+        if matches!(tier, Tier::Jit) {
+            let driver = chunk(&mut engine, "drive");
+            let original = object(&mut engine, "original");
+            let entry = driver
+                .cached_call_for(Rc::as_ptr(&original) as usize)
+                .expect("original closure filled the call cache");
+            assert_ne!(entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV, 0);
+        }
+        // Keep the old closure alive for a deterministic wrong-identity failure,
+        // instead of depending on a use-after-free to crash the test process.
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+            var result = drive(replacement, 42);
+            result.startsWith('42:') && result.includes('replacementClosure') &&
+                !result.includes('originalClosure')
+        "#
+            ),
+            "true",
+            "{tier:?}"
+        );
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+            original = null;
+            var correct = true;
+            for (var i = 0; i < 32; i++) {
+                var label = 'freshClosure' + i;
+                var fresh = factory(label);
+                var churn = Array.from({length: 32}, function () {
+                    return {values: new Float64Array([1.5, 2.5, 3.5])};
+                });
+                var stack = drive(fresh, i);
+                correct = correct && stack.startsWith(i + ':') && stack.includes(label);
+                try { drive(fresh, -1); correct = false; }
+                catch (e) {
+                    correct = correct && e.name === 'TypeError' && e.stack.includes(label);
+                }
+            }
+            correct
+        "#
+            ),
+            "true",
+            "{tier:?}: discarded cached closure and native exception"
+        );
+        assert!(engine.interp.fn_frames.is_empty());
+    }
+}
+
+#[test]
 fn cached_calls_still_dispatch_proxy_traps_and_revocation() {
     check(
         r#"

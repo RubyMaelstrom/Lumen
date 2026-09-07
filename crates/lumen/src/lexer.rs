@@ -2,7 +2,7 @@
 //! streaming buys nothing) and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
 
-use crate::token::{Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
+use crate::token::{KEYWORDS, PUNCTUATORS, Tok, Token, TplPart};
 use std::rc::Rc;
 
 pub struct LexError {
@@ -46,6 +46,8 @@ struct Lexer {
     control_paren_stack: Vec<bool>,
     /// Classification of the most recently closed `)`, used until the next significant token.
     last_close_control: bool,
+    /// A postfix update ends an expression; a prefix update still expects an operand.
+    last_update_postfix: bool,
 }
 
 /// Tokenize `src`. A lex error is reported as a SyntaxError by the caller.
@@ -93,6 +95,7 @@ pub(crate) fn tokenize_goal_with_source(
         pending_class: None,
         control_paren_stack: Vec::new(),
         last_close_control: false,
+        last_update_postfix: false,
     };
     let result = lx.run();
     match result {
@@ -160,6 +163,7 @@ impl Lexer {
                 ")" => self.last_close_control,
                 "]" => false,
                 "}" => self.last_close_block,
+                "++" | "--" => !self.last_update_postfix,
                 _ => true,
             },
             Some(Tok::Eof) => false,
@@ -238,6 +242,11 @@ impl Lexer {
     }
 
     fn push(&mut self, kind: Tok) {
+        // ECMA-262 UpdateExpression: only the postfix forms select InputElementDiv,
+        // and they cannot have a LineTerminator before the update operator. In particular,
+        // `counter++/denominator` is division, but `++/x/.lastIndex` starts a regexp.
+        let update_postfix =
+            matches!(&kind, Tok::Punct("++" | "--")) && !self.nl_pending && !self.regex_allowed();
         let closes_control = matches!(&kind, Tok::Punct(")"))
             && self.control_paren_stack.last().copied().unwrap_or(false);
         match &kind {
@@ -288,6 +297,7 @@ impl Lexer {
             _ => {}
         }
         self.last_close_control = closes_control;
+        self.last_update_postfix = update_postfix;
         let nl = self.nl_pending;
         self.nl_pending = false;
         self.out.push(Token {
@@ -512,7 +522,7 @@ impl Lexer {
                 // U+2028/U+2029 may appear literally in a string (json-superset); only CR/LF end it.
                 Some(c @ ('\u{2028}' | '\u{2029}')) => s.push(c),
                 Some(c) if is_line_terminator(c) => {
-                    return Err(self.err("unterminated string literal"))
+                    return Err(self.err("unterminated string literal"));
                 }
                 Some(c) => s.push(c),
             }
@@ -627,6 +637,7 @@ impl Lexer {
         // Last non-whitespace char emitted, to disambiguate `/` (regex vs division) the same way the
         // main lexer does — so quotes/braces inside a regex literal don't confuse the brace scan.
         let mut last_sig: Option<char> = None;
+        let mut newline = false;
         loop {
             // Comments: copy verbatim (their `'"{}` are inert).
             if self.peek() == Some('/') && self.peek2() == Some('/') {
@@ -651,7 +662,10 @@ impl Lexer {
                             self.bump();
                             break;
                         }
-                        Some(c) => src.push(c),
+                        Some(c) => {
+                            newline |= is_line_terminator(c);
+                            src.push(c);
+                        }
                     }
                 }
                 continue;
@@ -660,6 +674,17 @@ impl Lexer {
             if self.peek() == Some('/') && regex_allowed_after(last_sig) {
                 self.copy_regex(&mut src)?;
                 last_sig = Some(')'); // a regex is a value: a following `/` is division
+                newline = false;
+                continue;
+            }
+            if matches!(self.peek(), Some('+' | '-')) && self.peek() == self.peek2() {
+                let op = self.bump().unwrap();
+                self.bump();
+                src.push(op);
+                src.push(op);
+                let postfix = !newline && !regex_allowed_after(last_sig);
+                last_sig = Some(if postfix { ')' } else { op });
+                newline = false;
                 continue;
             }
             match self.bump() {
@@ -669,25 +694,31 @@ impl Lexer {
                     depth -= 1;
                     src.push('}');
                     last_sig = Some('}');
+                    newline = false;
                 }
                 Some('{') => {
                     depth += 1;
                     src.push('{');
                     last_sig = Some('{');
+                    newline = false;
                 }
                 Some(q @ ('"' | '\'')) => {
                     self.copy_quoted(q, &mut src)?;
                     last_sig = Some(')'); // string is a value
+                    newline = false;
                 }
                 Some('`') => {
                     src.push('`');
                     self.copy_template_tail(&mut src)?;
                     last_sig = Some(')');
+                    newline = false;
                 }
                 Some(c) => {
                     src.push(c);
+                    newline |= is_line_terminator(c);
                     if !c.is_whitespace() {
                         last_sig = Some(c);
+                        newline = false;
                     }
                 }
             }
@@ -1147,14 +1178,14 @@ impl Lexer {
             match self.bump() {
                 None => return Err(self.err("unterminated regular expression")),
                 Some(c) if is_line_terminator(c) => {
-                    return Err(self.err("unterminated regular expression"))
+                    return Err(self.err("unterminated regular expression"));
                 }
                 Some('\\') => {
                     body.push('\\');
                     // A backslash sequence can't contain a line terminator either.
                     match self.bump() {
                         Some(c) if is_line_terminator(c) => {
-                            return Err(self.err("unterminated regular expression"))
+                            return Err(self.err("unterminated regular expression"));
                         }
                         Some(c) => body.push(c),
                         None => return Err(self.err("unterminated regular expression")),

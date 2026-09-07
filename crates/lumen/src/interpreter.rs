@@ -8710,7 +8710,14 @@ impl Interp {
                         }
                     }
                 }
-                let ic = found?;
+                let mut ic = found?;
+                // PrepareForOrdinaryCall's Function is the LIVE closure, not the
+                // instance that populated this code-sharing entry. FnFrame borrows
+                // its identity from the caller's callee Value; the old instance may
+                // already be dead (the cache only weakly pins its address). Keeping
+                // ic.callee here caused reflection/error stack capture to read freed
+                // object storage. Change the local copy, not the pinned cache entry.
+                ic.callee = key;
                 return Some(unsafe { self.call_jit_env_committed(ic, ep, this_slot, args, argc) });
             }
         };
