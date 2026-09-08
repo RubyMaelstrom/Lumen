@@ -9832,6 +9832,57 @@ fn async_generators() {
     );
 }
 #[test]
+fn for_await_head_validation_is_local_to_each_loop() {
+    // Nested async iteration must neither poison a plain enclosing loop nor
+    // make an invalid enclosing for-await head valid (ECMA-262 §14.7.5).
+    for source in [
+        "async function f(){for(;;){for await(const x of []){}}}",
+        "async function f(){for(const k in {}){for await(const x of []){}}}",
+        "async function f(){for(const k of []){for await(const x of []){}}}",
+        "async function f(){for await(const x of []){for(;;){break}}}",
+        "for(;;){async function f(){for await(const x of []){}}}",
+        "for(let f=async()=>{for await(const x of []){}};false;){}",
+    ] {
+        assert!(
+            crate::parser::parse_script(source, false).is_ok(),
+            "{source}"
+        );
+        assert!(
+            crate::parser::parse_module(source).is_ok(),
+            "module: {source}"
+        );
+    }
+    for source in [
+        "async function f(){for await(;;){for(const x of []){}}}",
+        "async function f(){for await(const k in {}){for(const x of []){}}}",
+        "async function f(){for await(var k=0 in {}){for(;;){break}}}",
+        "async function f(){for await(let k=()=>{for(;;){}};false;){} }",
+        "function f(){for await(const x of []){}}",
+    ] {
+        assert!(
+            crate::parser::parse_script(source, false).is_err(),
+            "{source}"
+        );
+        assert!(
+            crate::parser::parse_module(source).is_err(),
+            "module: {source}"
+        );
+    }
+    assert!(crate::parser::parse_module("for(;;){for await(const x of []){}}").is_ok());
+    assert!(crate::parser::parse_script("for await(const x of []){}", false).is_err());
+}
+
+#[test]
+fn for_await_nested_in_plain_loop_executes() {
+    let mut engine = Engine::new();
+    engine.eval("globalThis.result=[];async function f(){for(let i=0;i<2;i++){for await(const x of [Promise.resolve(3),4])result.push(i+':'+x)}}f()", false).unwrap();
+    let Completion::Value(result) = engine.eval("result.join(',')", false).unwrap() else {
+        panic!("nested loop did not produce a result");
+    };
+    assert_eq!(result, "0:3,0:4,1:3,1:4");
+}
+
+#[test]
 fn for_await_of() {
     let mut e = Engine::new();
     e.eval("async function* g(){yield 1;yield 2;yield 3} (async()=>{ var s=0; for await (const x of g()) s+=x; globalThis.R=s; })()", false).unwrap();

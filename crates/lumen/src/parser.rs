@@ -55,7 +55,6 @@ pub fn parse_script_eval(
         in_async: false,
         in_params: false,
         no_in: false,
-        last_for_await: false,
         module: false,
         fn_depth: 0,
         nonarrow_fn_depth: 0,
@@ -137,7 +136,6 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         in_async: true,
         in_params: false,
         no_in: false,
-        last_for_await: false,
         module: true,
         fn_depth: 0,
         nonarrow_fn_depth: 0,
@@ -358,8 +356,6 @@ struct Parser {
     /// Suppress `in` as a binary operator (the `[NoIn]` grammar productions in a `for` head, before
     /// `in`/`of` is reached). Reset inside any bracketed/parenthesized sub-expression.
     no_in: bool,
-    /// Whether the innermost `for` head being parsed had `await` (see parse_for's of-form check).
-    last_for_await: bool,
     /// Whether the top-level goal is a Module (so `import`/`export` declarations are allowed).
     module: bool,
     /// Context depths for early-error checks: `return` requires a function, `continue` an iteration,
@@ -1301,9 +1297,17 @@ impl Parser {
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        self.advance();
+        // ECMA-262 #sec-for-in-and-for-of-statements: `await` belongs to
+        // THIS loop head. A nested loop (even in a function expression in
+        // the head) must not overwrite the enclosing loop's grammar choice.
+        let is_await = self.eat_ident_word("await");
+        if is_await && !self.in_async {
+            return self.err("'for await' is only valid in an async context");
+        }
         // A `for (let … )` head shares one lexical scope with the body.
         self.push_decl_scope();
-        let r = self.parse_for_inner();
+        let r = self.parse_for_inner(is_await);
         self.pop_decl_scope();
         // `for await` only exists in the for-of form: a C-style or for-in head is a SyntaxError.
         if let Ok(stmt) = &r {
@@ -1315,20 +1319,14 @@ impl Parser {
                     _ => false,
                 }
             }
-            if self.last_for_await && !body_is_await_of(stmt) {
+            if is_await && !body_is_await_of(stmt) {
                 return self.err("'for await' is only valid with a for-of head");
             }
         }
         r
     }
 
-    fn parse_for_inner(&mut self) -> Result<Stmt, ParseError> {
-        self.advance();
-        let is_await = self.eat_ident_word("await");
-        self.last_for_await = is_await;
-        if is_await && !self.in_async {
-            return self.err("'for await' is only valid in an async context");
-        }
+    fn parse_for_inner(&mut self, is_await: bool) -> Result<Stmt, ParseError> {
         self.expect_punct("(")?;
 
         // Determine the head form. Parse an optional declaration kind or init expression, then look
@@ -2887,7 +2885,6 @@ impl Parser {
                         in_async: self.in_async,
                         in_params: self.in_params,
                         no_in: false,
-                        last_for_await: false,
                         module: self.module,
                         fn_depth: self.fn_depth,
                         nonarrow_fn_depth: self.nonarrow_fn_depth,
@@ -2957,7 +2954,6 @@ impl Parser {
                         in_async: self.in_async,
                         in_params: self.in_params,
                         no_in: false,
-                        last_for_await: false,
                         module: self.module,
                         fn_depth: self.fn_depth,
                         nonarrow_fn_depth: self.nonarrow_fn_depth,
