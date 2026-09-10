@@ -1788,6 +1788,26 @@ pub struct TaInfo {
     pub track: bool,
 }
 
+impl TaInfo {
+    /// ECMA-262 IsTypedArrayOutOfBounds/TypedArrayLength (snapshot e28783d5fc9d).
+    /// Use the length of the currently borrowed Data Block, never a cached buffer pointer or
+    /// size: fixed views become wholly out of bounds when shrunk, tracking views round down.
+    #[inline]
+    pub(crate) fn length_for_buffer(&self, byte_length: usize) -> Option<usize> {
+        if self.track {
+            Some(byte_length.checked_sub(self.offset)? / self.kind.elsize())
+        } else if self
+            .offset
+            .checked_add(self.len.checked_mul(self.kind.elsize())?)?
+            <= byte_length
+        {
+            Some(self.len)
+        } else {
+            None
+        }
+    }
+}
+
 /// How a property key relates to a TypedArray's integer-indexed exotic behavior.
 pub enum TaIndex {
     /// A valid in-range element index.

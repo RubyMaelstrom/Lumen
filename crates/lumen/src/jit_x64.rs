@@ -445,6 +445,7 @@ pub(super) fn compile(
     a.bytes(&strict_offset.to_le_bytes());
     a.code.push(u8::from(chunk.jit_is_strict()));
 
+    let mut boolean_bit_paths = Vec::new();
     let mut pc_offsets = Vec::with_capacity(ops.len());
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pcs[pc]);
@@ -610,12 +611,13 @@ pub(super) fn compile(
             Op::BitAnd | Op::BitOr | Op::BitXor => {
                 let slow = a.label();
                 let done = a.label();
+                let booleans = a.label();
                 a.load_byte_r13(-32);
                 a.bytes(&[0x83, 0xf8, 0x04]);
-                a.jcc(0x85, slow);
+                a.jcc(0x85, booleans);
                 a.load_byte_r13(-16);
                 a.bytes(&[0x83, 0xf8, 0x04]);
-                a.jcc(0x85, slow);
+                a.jcc(0x85, booleans);
                 a.numeric_bitop(
                     match op {
                         Op::BitAnd => 0x21,
@@ -625,6 +627,12 @@ pub(super) fn compile(
                     slow,
                 );
                 a.jmp(done);
+                let opcode = match op {
+                    Op::BitAnd => 0x21,
+                    Op::BitOr => 0x09,
+                    _ => 0x31,
+                };
+                boolean_bit_paths.push((booleans, slow, done, opcode));
                 a.bind(slow);
                 a.helper_spflag(H_EXEC, pc as u32, unwind);
                 a.bind(done);
@@ -745,6 +753,27 @@ pub(super) fn compile(
     a.call_helper_ptr(H_RETURN, 0);
     a.bytes(&[0x49, 0x89, 0xc5]);
     a.jmp(ret_ok);
+
+    for (booleans, slow, done, opcode) in boolean_bit_paths {
+        a.bind(booleans);
+        // Keep the Number/Number hot path unchanged. Primitive boolean pairs avoid
+        // the helper; mixed primitives use jit_bin_i32's checked conversion.
+        a.cmp_byte_r13(-32, 3);
+        a.jcc(0x85, slow);
+        a.cmp_byte_r13(-16, 3);
+        a.jcc(0x85, slow);
+        a.load_byte_r13(-31);
+        a.bytes(&[0x89, 0xc1]); // ecx=lhs
+        a.load_byte_r13(-15); // eax=rhs; all three operations commute
+        a.bytes(&[opcode, 0xc8]);
+        a.bytes(&[0xf2, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0,eax
+        a.bytes(&[0xb8, 4, 0, 0, 0, 0x31, 0xd2]); // Number tag
+        a.store_pair_r13(-32);
+        a.bytes(&[0xf2, 0x41, 0x0f, 0x11, 0x85]);
+        a.bytes(&(-24i32).to_le_bytes());
+        a.add_sp(-16);
+        a.jmp(done);
+    }
 
     a.bind(unwind);
     a.call_helper_pair(H_UNWIND, 0);

@@ -35,6 +35,225 @@ fn arithmetic() {
 }
 
 #[test]
+fn boolean_bitwise_fast_paths_preserve_numbers_and_coercion_in_all_tiers() {
+    // Validate the wide Value layout used by both native boolean templates against live fields.
+    // Do not read padding: Bool's byte is next to its tag, unlike Number's aligned double.
+    for value in [
+        crate::value::Value::Bool(false),
+        crate::value::Value::Bool(true),
+    ] {
+        let base = &value as *const crate::value::Value as usize;
+        let crate::value::Value::Bool(ref boolean) = value else {
+            unreachable!()
+        };
+        assert_eq!(boolean as *const bool as usize - base, 1);
+        assert_eq!(unsafe { *(base as *const u8) }, 3);
+    }
+    // ECMA-262 ToNumeric, ToNumber, ApplyStringOrNumericBinaryOperator, snapshot e28783d5fc9d.
+    // Comparisons feeding a bitwise mask are common in generated asm.js initialization loops.
+    let source = r#"
+        function check(ok, message) { if (!ok) throw new Error(message); }
+        function mask(a, b) { return a & b; }
+        function bits(a, b) { return [a & b, a | b, a ^ b, a << b, a >> b, a >>> b]; }
+        function loop(n) {
+            var sum = 0;
+            for (var k = 0; k < n; ++k) sum = (sum + ((k > 0) & (k < n - 1))) | 0;
+            return sum;
+        }
+        for (var warm = 0; warm < 150; ++warm) {
+            check(mask(true, false) === 0 && mask(true, true) === 1, 'boolean result is Number');
+            check(loop(20) === 18, 'comparison mask');
+            bits(warm, warm + 1);
+        }
+        const values = [false, true, 0, -0, 3.9, -3.9, 2147483647, 2147483648,
+                        4294967295, 4294967296, 2 ** 63, -(2 ** 63), 1e100,
+                        NaN, Infinity, -Infinity, null, undefined, '7'];
+        for (const a of values) for (const b of values) {
+            const actual = bits(a, b), expected = bits(Number(a), Number(b));
+            for (let k = 0; k < actual.length; ++k)
+                check(Object.is(actual[k], expected[k]), 'primitive conversion ' + k);
+        }
+        const trace = [];
+        const left = {valueOf() {trace.push('left'); return true;}};
+        const right = {valueOf() {trace.push('right'); return 7;}};
+        check(mask(left, right) === 1 && trace.join(',') === 'left,right', 'ordered coercion');
+        trace.length = 0;
+        check(mask(true, right) === 1 && trace.join(',') === 'right', 'mixed primitive/object');
+        trace.length = 0;
+        try {mask(Symbol(), right); check(false, 'must throw');}
+        catch (e) {check(e instanceof TypeError && trace.length === 0, 'left throws first');}
+        for (const pair of [[true, 1n], [1n, false]]) {
+            try {bits(pair[0], pair[1]); check(false, 'mixed BigInt must throw');}
+            catch (e) {check(e instanceof TypeError, 'BigInt type error');}
+        }
+        check(mask(3n, 1n) === 1n, 'BigInt preserved');
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "tier {tier:?}");
+    }
+}
+
+#[test]
+fn numeric_typed_array_access_preserves_exotic_semantics_in_all_tiers() {
+    // ECMA-262 ToPropertyKey, TypedArray [[Get]]/[[Set]], TypedArraySetElement and
+    // IsValidIntegerIndex, local snapshot e28783d5fc9d. Exercise the shared numeric-index
+    // fast path as well as the conversion/Proxy/immutable fallbacks it must not consume.
+    let source = r#"
+        function check(ok, message) { if (!ok) throw new Error(message); }
+        function get(a, k) { return a[k]; }
+        function set(a, k, v) { return a[k] = v; }
+        function inc(a, k) { return a[k]++; }
+        for (const C of [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array,
+                         Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array]) {
+            const a = new C(4);
+            for (let warm = 0; warm < 120; ++warm) {
+                check(set(a, 1, 42) === 42 && get(a, 1) === 42, 'read/write');
+                check(inc(a, 1) === 42 && get(a, 1) === 43, 'update');
+            }
+            set(a, -0, 7);
+            check(get(a, 0) === 7 && get(a, -0) === 7, 'numeric negative zero');
+            set(a, '-0', 99);
+            check(get(a, '-0') === undefined && get(a, 0) === 7, 'string negative zero');
+            for (const key of [-1, 1.5, NaN, Infinity, 4, 4294967295]) {
+                check(set(a, key, 123) === 123 && get(a, key) === undefined, 'invalid index');
+                check(!Object.hasOwn(a, String(key)), 'invalid index is not an own property');
+            }
+            let conversions = 0;
+            set(a, 4, { valueOf() { ++conversions; return 9; } });
+            check(conversions === 1, 'out of bounds still coerces value');
+            for (const key of [0, 4]) {
+                let threw = false;
+                try { set(a, key, 1n); } catch (e) { threw = e instanceof TypeError; }
+                check(threw, 'Number content rejects BigInt even out of bounds');
+            }
+        }
+        for (const C of [BigInt64Array, BigUint64Array]) {
+            const a = new C(2);
+            set(a, 0, 12n);
+            check(get(a, 0) === 12n && inc(a, 0) === 12n && get(a, 0) === 13n, 'BigInt access');
+            for (const key of [0, 2]) {
+                let threw = false;
+                try { set(a, key, 1); } catch (e) { threw = e instanceof TypeError; }
+                check(threw, 'BigInt content rejects Number even out of bounds');
+            }
+        }
+        const rab = new ArrayBuffer(8, { maxByteLength: 16 });
+        const tracking = new Uint8Array(rab, 2), fixed = new Uint8Array(rab, 2, 4);
+        set(fixed, 0, 21);
+        rab.resize(4);
+        check(get(fixed, 0) === undefined && get(tracking, 0) === 21, 'shrunken view bounds');
+        set(fixed, 0, 99);
+        check(get(tracking, 0) === 21, 'out of bounds fixed view cannot write');
+        rab.resize(12);
+        set(tracking, 9, 33);
+        check(get(fixed, 0) === 21 && get(tracking, 9) === 33, 'regrown views');
+        set(tracking, 0, { valueOf() { rab.transfer(); return 9; } });
+        check(get(tracking, 0) === undefined, 'detach during conversion');
+        set(tracking, 0, 8);
+        check(get(tracking, 0) === undefined, 'detached write is inert');
+        const target = new Uint8Array(2), trace = [];
+        const proxy = new Proxy(target, {
+            get(t, k) { trace.push('get:' + k); return 17; },
+            set(t, k, v) { trace.push('set:' + k); return true; }
+        });
+        set(proxy, 0, 7);
+        check(get(proxy, 0) === 17 && target[0] === 0, 'Proxy traps preserved');
+        check(trace.join(',') === 'set:0,get:0', 'Proxy key conversions');
+        const receiver = {};
+        Reflect.set(target, '0', 55, receiver);
+        check(receiver[0] === 55 && target[0] === 0, 'different receiver');
+        const immutable = new Uint8Array(new ArrayBuffer(2).transferToImmutable());
+        let threw = false;
+        try { (function () { 'use strict'; immutable[0] = 1; })(); }
+        catch (e) { threw = e instanceof TypeError; }
+        check(threw && get(immutable, 0) === 0, 'immutable writes');
+        const shared = new Int32Array(new SharedArrayBuffer(8));
+        set(shared, 1, 123);
+        check(get(shared, 1) === 123 && Atomics.load(shared, 1) === 123, 'shared storage');
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "tier {tier:?}");
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn fragmented_array_buffer_writes_preserve_host_synchronization() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "var buffer = new ArrayBuffer(4096); var bytes = new Uint8Array(buffer)",
+    );
+    let buffer = engine
+        .eval_value_interruptible("buffer")
+        .expect("buffer expression parses")
+        .unwrap_or_else(|_| panic!("buffer expression threw"));
+    let version = engine.ctx().array_buffer_version(&buffer).unwrap();
+    run_in(
+        &mut engine,
+        "for (var i = 0; i < 1024; ++i) bytes[i * 4] = i & 255",
+    );
+    assert_ne!(engine.ctx().array_buffer_version(&buffer), Some(version));
+    let ranges = engine
+        .ctx()
+        .take_array_buffer_dirty_ranges(&buffer)
+        .unwrap();
+    assert_eq!(ranges, [0..4096]);
+    let mut mirror = vec![0; 4096];
+    for range in ranges {
+        assert!(engine.ctx().array_buffer_copy_range(
+            &buffer,
+            range.start,
+            range.len(),
+            &mut mirror[range]
+        ));
+    }
+    for index in 0..1024 {
+        assert_eq!(mirror[index * 4], (index & 255) as u8);
+    }
+    assert!(engine
+        .ctx()
+        .take_array_buffer_dirty_ranges(&buffer)
+        .unwrap()
+        .is_empty());
+    // Host writes are not echoed as JS mutations; precise tracking resumes after taking.
+    let version = engine.ctx().array_buffer_version(&buffer).unwrap();
+    assert!(engine.ctx().array_buffer_set_range(&buffer, 3, &[17]));
+    assert_eq!(engine.ctx().array_buffer_version(&buffer), Some(version));
+    run_in(
+        &mut engine,
+        "bytes[5] = 42; new DataView(buffer).setUint16(7, 256)",
+    );
+    assert_eq!(
+        engine
+            .ctx()
+            .take_array_buffer_dirty_ranges(&buffer)
+            .unwrap(),
+        [5..6, 7..9]
+    );
+    assert_eq!(
+        run_in(&mut engine, "bytes[3] + ',' + bytes[5] + ',' + bytes[7]"),
+        "17,42,1"
+    );
+}
+
+#[test]
 fn global_declaration_property_order_follows_instantiation_order() {
     // ECMA-262 GlobalDeclarationInstantiation: Annex B-only bindings first,
     // surviving function declarations in source order, then first-seen vars.

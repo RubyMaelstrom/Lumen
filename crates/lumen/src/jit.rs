@@ -3074,6 +3074,8 @@ pub fn compile(
             _ => {}
         }
     }
+    // Emit primitive bitwise exits after the body, preserving numeric loop code layout.
+    let mut primitive_bit_paths = Vec::new();
     // ---- op templates ----
     let mut skip = 0usize;
     for (pc, op) in ops.iter().enumerate() {
@@ -3866,19 +3868,24 @@ pub fn compile(
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
             }
-            // Int32 ops on two numbers: ToInt32 = truncate + wrap to 32 bits. fcvtzs to x
+            // Int32 ops on primitive numbers/booleans: ToInt32 = truncate + wrap to 32 bits.
+            // ECMA-262 ToNumeric/ToNumber maps primitive false/true to 0/1 without user code.
+            // Objects, strings, Symbols and BigInts still take the ordered coercion helper.
+            // fcvtzs to x
             // truncates; taking the low 32 bits is the mod-2^32 wrap. The scvtf/frintz
             // round-trip proves no i64 saturation happened (NaN/±Inf/|x|≥2^63 all fail it and
             // take the helper, which applies the spec's zero/wrap semantics).
             Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr if fast & 1 != 0 => {
                 let slow = a.new_label();
                 let done = a.new_label();
+                let primitives = a.new_label();
+                let calculate = a.new_label();
                 a.ldurb(9, 20, -32);
                 a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
+                a.b_cond(C_NE, primitives);
                 a.ldurb(9, 20, -16);
                 a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
+                a.b_cond(C_NE, primitives);
                 a.ldur_d(0, 20, -24); // lhs
                 a.ldur_d(1, 20, -8); // rhs
                 a.fcvtzs_x_d(9, 0);
@@ -3897,6 +3904,7 @@ pub fn compile(
                 a.b_cond(C_NE, slow);
                 a.cmn_imm_x(10, 1);
                 a.b_cond(6, slow); // VS
+                a.bind(calculate);
                 match op {
                     Op::BitAnd => a.logic_w(0, 11, 9, 10),
                     Op::BitOr => a.logic_w(1, 11, 9, 10),
@@ -3913,6 +3921,7 @@ pub fn compile(
                 a.stur_d(0, 20, -24);
                 a.sub_imm(20, 20, 16);
                 a.b(done);
+                primitive_bit_paths.push((primitives, calculate, slow));
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
@@ -4840,6 +4849,36 @@ pub fn compile(
     // safe about it).
     emit_helper(&mut a, H_RETURN, 0);
     a.b(l_ret_ok);
+
+    for (primitives, calculate, slow) in primitive_bit_paths {
+        a.bind(primitives);
+        for (offset, reg) in [(-32, 9), (-16, 10)] {
+            let number = a.new_label();
+            let converted = a.new_label();
+            a.ldurb(11, 20, offset);
+            a.cmp_imm_w(11, 4);
+            a.b_cond(C_EQ, number);
+            a.cmp_imm_w(11, 3);
+            a.b_cond(C_NE, slow);
+            // repr(u8) Bool's payload is byte 1, not Num's double at byte 8.
+            a.ldurb(reg, 20, offset + 1);
+            a.b(converted);
+            a.bind(number);
+            a.ldur_d(0, 20, offset + 8);
+            a.fcvtzs_x_d(reg, 0);
+            a.scvtf_d_x(2, reg);
+            a.frintz(3, 0);
+            a.fcmp(2, 3);
+            a.b_cond(C_NE, slow);
+            // +2^63 saturates yet passes the round-trip (MAX re-rounds to +2^63).
+            a.cmn_imm_x(reg, 1);
+            a.b_cond(C_VS, slow);
+            a.bind(converted);
+        }
+        a.mov_imm64(11, 4);
+        a.stur(11, 20, -32);
+        a.b(calculate);
+    }
 
     // ---- unwind: route a throw to the innermost try handler, or out ----
     a.bind(l_unwind);

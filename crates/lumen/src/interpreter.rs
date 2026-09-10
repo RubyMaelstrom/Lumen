@@ -13,6 +13,77 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+/// Dirty metadata is a host synchronization aid, not part of the ECMAScript Data Block.
+/// SetValueInBuffer must store the bytes immediately (ECMA-262, local snapshot
+/// e28783d5fc9d, https://tc39.es/ecma262/#sec-setvalueinbuffer); retaining every distinct byte
+/// range is unnecessary. Bound fragmentation so emulator heaps cannot turn every store into
+/// a scan/memmove across hundreds of thousands of ranges. Precision resets on the next take.
+const MAX_BUFFER_DIRTY_RANGES: usize = 64;
+
+fn record_buffer_write(ranges: &mut Vec<Range<usize>>, mut write: Range<usize>, buffer_len: usize) {
+    let first = ranges.partition_point(|range| range.end < write.start);
+    if let Some(range) = ranges.get(first) {
+        if range.start <= write.start && write.end <= range.end {
+            return; // Already covered: do not remove/reinsert and shift the vector twice.
+        }
+    }
+    let mut last = first;
+    while last < ranges.len() && ranges[last].start <= write.end {
+        write.start = write.start.min(ranges[last].start);
+        write.end = write.end.max(ranges[last].end);
+        last += 1;
+    }
+    if first == last {
+        if ranges.len() == MAX_BUFFER_DIRTY_RANGES {
+            ranges.clear();
+            ranges.push(0..buffer_len);
+        } else {
+            ranges.insert(first, write);
+        }
+    } else {
+        ranges[first] = write;
+        ranges.drain(first + 1..last);
+    }
+}
+
+#[cfg(test)]
+mod buffer_dirty_range_tests {
+    use super::{record_buffer_write, MAX_BUFFER_DIRTY_RANGES};
+
+    #[test]
+    fn writes_coalesce_overlap_adjacency_and_bridges() {
+        let mut ranges = vec![4..8, 12..16, 20..24];
+        record_buffer_write(&mut ranges, 5..7, 32);
+        assert_eq!(ranges, [4..8, 12..16, 20..24]);
+        record_buffer_write(&mut ranges, 8..20, 32);
+        assert_eq!(ranges, [4..24]);
+        record_buffer_write(&mut ranges, 0..4, 32);
+        record_buffer_write(&mut ranges, 24..32, 32);
+        assert_eq!(ranges, [0..32]);
+    }
+
+    #[test]
+    fn fragmented_writes_are_bounded_and_never_lost() {
+        let mut ranges = Vec::new();
+        let mut written = [false; 1024];
+        for index in 0..1024 {
+            // An odd multiplier permutes the buffer: scattered insertions and rewrites.
+            let start = (index * 397) % written.len();
+            written[start] = true;
+            record_buffer_write(&mut ranges, start..start + 1, written.len());
+            assert!(ranges.len() <= MAX_BUFFER_DIRTY_RANGES);
+            assert!(ranges.windows(2).all(|pair| pair[0].end < pair[1].start));
+            for (byte, &dirty) in written.iter().enumerate() {
+                assert!(!dirty || ranges.iter().any(|range| range.contains(&byte)));
+            }
+        }
+        assert_eq!(ranges, [0..1024]);
+        ranges.clear(); // Taking the dirty set restores exact tracking for the next batch.
+        record_buffer_write(&mut ranges, 100..104, 1024);
+        assert_eq!(ranges, [100..104]);
+    }
+}
+
 #[derive(Default)]
 struct FunctionProfileEntry {
     description: String,
@@ -2112,7 +2183,7 @@ pub struct Interp {
     /// Monotonic mutation generations for ArrayBuffer byte storage. Host embedders use these
     /// generations to avoid copying an unchanged external mirror across a synchronous boundary.
     pub(crate) array_buffer_versions: crate::fasthash::FastMap<usize, u64>,
-    /// Coalesced byte ranges written by JavaScript since the last embedder synchronization.
+    /// Bounded, conservative byte ranges covering writes since the last host synchronization.
     pub(crate) array_buffer_dirty_ranges: crate::fasthash::FastMap<usize, Vec<Range<usize>>>,
     /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
     /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
@@ -3544,13 +3615,10 @@ impl Interp {
 
     /// Read element `idx` of a TypedArray as a Number (or undefined if out of range / detached).
     pub(crate) fn ta_read(&self, info: &TaInfo, idx: usize) -> Value {
-        if idx >= self.ta_len(info).unwrap_or(0) {
-            return Value::Undefined;
-        }
         let es = info.kind.elsize();
-        let start = info.offset + idx * es;
         let decode = |buf: &[u8]| -> Value {
-            if start + es <= buf.len() {
+            if idx < info.length_for_buffer(buf.len()).unwrap_or(0) {
+                let start = info.offset + idx * es;
                 let bytes = &buf[start..start + es];
                 if info.kind.is_bigint() {
                     Value::BigInt(info.kind.read_bigint(bytes).into())
@@ -3562,6 +3630,11 @@ impl Interp {
             }
         };
         if let Some(&id) = self.shared_buffers.get(&info.buffer) {
+            // Keep the shared length witness and synchronized data read. Ordinary buffers
+            // instead validate and decode under one borrow, with just one backing-store lookup.
+            if idx >= self.ta_len(info).unwrap_or(0) {
+                return Value::Undefined;
+            }
             if let Some(mem) = shared_mem_get(id) {
                 return decode(&mem.lock().unwrap());
             }
@@ -3737,13 +3810,13 @@ impl Interp {
 
     /// Write Number `n` into element `idx` of a TypedArray (out-of-range writes are ignored).
     pub(crate) fn ta_write(&mut self, info: &TaInfo, idx: usize, n: f64) {
-        if idx >= self.ta_len(info).unwrap_or(0) {
-            return;
-        }
         let es = info.kind.elsize();
-        let start = info.offset + idx * es;
-        let bytes = info.kind.write(n);
         if let Some(&id) = self.shared_buffers.get(&info.buffer) {
+            if idx >= self.ta_len(info).unwrap_or(0) {
+                return;
+            }
+            let start = info.offset + idx * es;
+            let bytes = info.kind.write(n);
             if let Some(mem) = shared_mem_get(id) {
                 let mut buf = mem.lock().unwrap();
                 if start + es <= buf.len() {
@@ -3755,13 +3828,14 @@ impl Interp {
         let mut wrote = false;
         if let Some(storage) = self.array_buffers.get(&info.buffer) {
             let mut buf = storage.borrow_mut();
-            if start + es <= buf.len() {
-                buf[start..start + es].copy_from_slice(&bytes);
+            if idx < info.length_for_buffer(buf.len()).unwrap_or(0) {
+                let start = info.offset + idx * es;
+                buf[start..start + es].copy_from_slice(&info.kind.write(n));
                 wrote = true;
             }
         }
         if wrote {
-            self.mark_array_buffer_dirty_range(info.buffer, start, es);
+            self.mark_array_buffer_dirty_range(info.buffer, info.offset + idx * es, es);
         }
     }
 
@@ -4934,8 +5008,10 @@ impl Interp {
         true
     }
 
-    /// Takes byte ranges written by JavaScript since the previous call. The ranges are coalesced
-    /// and are intended for embedders that mirror the buffer into another storage.
+    /// Takes coalesced byte ranges covering JavaScript writes since the previous call. Highly
+    /// fragmented writes collapse to the whole buffer, so ranges may include unchanged bytes.
+    /// As with a full-buffer copy, the embedder must synchronize host writes before allowing JS
+    /// to modify the mirror. Taking the ranges does not change the mutation generation.
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
         let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
         self.array_buffers.contains_key(&ptr).then(|| {
@@ -4982,23 +5058,7 @@ impl Interp {
             return;
         }
         let ranges = self.array_buffer_dirty_ranges.entry(ptr).or_default();
-        let mut start = start;
-        let mut end = end;
-        let mut index = 0;
-        while index < ranges.len() {
-            let range = &ranges[index];
-            if range.end < start {
-                index += 1;
-                continue;
-            }
-            if range.start > end {
-                break;
-            }
-            start = start.min(range.start);
-            end = end.max(range.end);
-            ranges.remove(index);
-        }
-        ranges.insert(index, start..end);
+        record_buffer_write(ranges, start..end, buffer_len);
         let version = self.array_buffer_versions.entry(ptr).or_default();
         *version = version.wrapping_add(1);
     }
@@ -5339,35 +5399,39 @@ impl Interp {
         ok
     }
 
-    fn plain_for_elems(&self, o: &Gc) -> bool {
+    fn plain_non_typed_for_elems(&self, o: &Gc) -> bool {
         // Numeric indexed access is an ordinary [[Get]] shortcut.  Proxies, typed arrays,
         // module/deferred namespaces, and Web IDL indexed objects all have independent internal
         // methods or backing stores; even an own-looking entry must not bypass those semantics
         // (ECMA-262 §10.5.8 and §10.4.5).
-        if !self.ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+        // The caller already looked up TypedArray identity while selecting its direct path.
+        if !self.non_typed_ordinary_get_ptr(Rc::as_ptr(o) as usize) {
             return false;
         }
         if !matches!(o.borrow().exotic, Exotic::Array | Exotic::None) {
             return false;
         }
-        if !self.module_ns.is_empty() || !self.deferred_ns.is_empty() {
-            let ptr = Rc::as_ptr(o) as usize;
-            if self.module_ns.contains_key(&ptr) || self.deferred_ns.contains_key(&ptr) {
-                return false;
-            }
-        }
         true
     }
 
-    /// `o[n]` read fast path: an own dense data element on a plain object/array, fetched without
-    /// stringifying or hashing the index. `None` means "take the generic path" (miss, accessor,
-    /// exotic receiver, non-index number) — never "absent".
+    /// `o[n]` read fast path: a dense data element or a Number-content TypedArray index, without
+    /// stringifying the index. `None` means "take the generic path", never "absent".
     #[inline]
     pub(crate) fn fast_get_elem(&mut self, o: &Gc, n: f64) -> Option<Value> {
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return None;
         }
-        if !self.plain_for_elems(o) {
+        if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)) {
+            // ECMA-262 ToPropertyKey + TypedArrayGetElement (snapshot e28783d5fc9d): a
+            // non-negative integral Number already identifies the element. Numeric -0 becomes
+            // the key "0"; the distinct string "-0" still goes through the generic path.
+            // The identity map cannot match a Proxy wrapping a TypedArray. ta_read retains
+            // detach/resize bounds and shared-memory synchronization. BigInt views stay on
+            // the general path: speculative numeric UpdateElem callers would discard that
+            // result and read again, which must not add a shared-memory read event.
+            return (!info.kind.is_bigint()).then(|| self.ta_read(info, n as usize));
+        }
+        if !self.plain_non_typed_for_elems(o) {
             return None;
         }
         let b = o.borrow();
@@ -5382,7 +5446,7 @@ impl Interp {
         Some(p.value())
     }
 
-    /// `o[n] = v` write fast path: overwrite an existing own writable dense data element.
+    /// `o[n] = v` write fast path: a writable dense data element or numeric TypedArray store.
     /// Correct regardless of the prototype chain — an own writable data property always wins
     /// OrdinarySet. Returns the value back on miss so the caller runs the generic path.
     #[inline]
@@ -5393,13 +5457,19 @@ impl Interp {
         // A Proxy/typed array/module/host object owns a different [[Set]] algorithm.  Do this
         // identity check before probing the ordinary property storage so a future side-table
         // representation cannot accidentally bypass its trap or backing store.
-        if !self.ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+        if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied() {
+            // TypedArraySetElement converts the value before checking current bounds. Only an
+            // already-numeric value on a Number-content view can bypass that observable step;
+            // coercions, BigInt content and immutable-buffer errors retain the general path.
+            if let Value::Num(value) = v {
+                if !info.kind.is_bigint() && !self.immutable_buffers.contains(&info.buffer) {
+                    self.ta_write(&info, n as usize, value);
+                    return Ok(());
+                }
+            }
             return Err(v);
         }
-        if (!self.module_ns.is_empty() || !self.deferred_ns.is_empty()) && {
-            let ptr = Rc::as_ptr(o) as usize;
-            self.module_ns.contains_key(&ptr) || self.deferred_ns.contains_key(&ptr)
-        } {
+        if !self.non_typed_ordinary_get_ptr(Rc::as_ptr(o) as usize) {
             return Err(v);
         }
         let n = n as u32;
@@ -6213,8 +6283,13 @@ impl Interp {
     /// common case in a hot loop.
     #[inline]
     pub(crate) fn ordinary_get_ptr(&self, ptr: usize) -> bool {
+        (self.typed_arrays.is_empty() || !self.typed_arrays.contains_key(&ptr))
+            && self.non_typed_ordinary_get_ptr(ptr)
+    }
+
+    #[inline]
+    fn non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
         (self.proxies.is_empty() || !self.proxies.contains_key(&ptr))
-            && (self.typed_arrays.is_empty() || !self.typed_arrays.contains_key(&ptr))
             && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
             && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
             && (self.host_indexed.is_empty() || !self.host_indexed.contains_key(&ptr))
@@ -7616,18 +7691,7 @@ impl Interp {
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
         let buflen = self.array_buffers.get(&info.buffer)?.borrow().len();
-        let es = info.kind.elsize();
-        if info.track {
-            if info.offset > buflen {
-                None
-            } else {
-                Some((buflen - info.offset) / es)
-            }
-        } else if info.offset + info.len * es > buflen {
-            None
-        } else {
-            Some(info.len)
-        }
+        info.length_for_buffer(buflen)
     }
 
     /// Classify a property key against a TypedArray's integer-index exotic behavior: a valid

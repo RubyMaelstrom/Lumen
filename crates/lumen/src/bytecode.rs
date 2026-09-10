@@ -20053,8 +20053,13 @@ unsafe fn jit_bin_i32(
     *sp = sp.sub(1);
     let a = sp.read();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
-    let v = if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
-        Value::Num(f(crate::eval::to_int32(*x), crate::eval::to_int32(*y)) as f64)
+    let primitive_i32 = |v: &Value| match v {
+        Value::Num(n) => Some(crate::eval::to_int32(*n)),
+        Value::Bool(b) => Some(i32::from(*b)),
+        _ => None,
+    };
+    let v = if let (Some(x), Some(y)) = (primitive_i32(&a), primitive_i32(&b)) {
+        Value::Num(f(x, y) as f64)
     } else {
         i.binary(op, a, b)?
     };
