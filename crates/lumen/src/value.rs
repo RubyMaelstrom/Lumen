@@ -665,6 +665,8 @@ pub struct JitLayout {
     pub obj_ic_plain: usize,
     /// `Rc::as_ptr(env)` → the scope's `VarMap` generation counter (through the `RefCell`).
     pub scope_gen: usize,
+    /// The live fixed-binding-layout identity, zero after structural mutation.
+    pub scope_layout: usize,
     /// `value` within a `Binding` (the LoadName template's 16-byte copy source).
     pub binding_value: usize,
     /// `mutable` within a `Binding` (free-name update/store guard).
@@ -840,6 +842,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let scope_gen = scope_refcell
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::generation_offset();
+    let scope_layout = scope_refcell
+        + offset_of!(crate::interpreter::Scope, vars)
+        + crate::interpreter::VarMap::layout_id_offset();
     let binding_value = offset_of!(crate::interpreter::Binding, value);
     let binding_mutable = offset_of!(crate::interpreter::Binding, mutable);
     let binding_init = offset_of!(crate::interpreter::Binding, initialized);
@@ -895,6 +900,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         exotic_array_tag,
         exotic_strwrap_tag,
         scope_gen,
+        scope_layout,
         binding_value,
         binding_mutable,
         binding_init,
@@ -3346,7 +3352,8 @@ impl Props {
         // in the number of elements. Packed elements have no entry slot and are handled by the
         // caller. With no far insertion, a sidecar miss proves that no named entry can contain
         // this canonical index (the same invariant used by `get`).
-        if let Some(n) = canonical_index(key) {
+        let array_index = canonical_index(key);
+        if let Some(n) = array_index {
             if let Some(&slot) = self.elems.get(n as usize).filter(|&&slot| slot != NO_SLOT) {
                 debug_assert!(
                     matches!(self.entries.get(slot as usize), Some((k, _)) if &**k == key)
@@ -3376,6 +3383,23 @@ impl Props {
                 );
                 return Some(s as usize);
             }
+        }
+        // Array shapes describe named keys only. The intrinsic length-only
+        // shape therefore proves absence of EVERY other non-index key, even
+        // when the classic dense representation has millions of element entries.
+        // Computed method reads (`a[method](...)`) have no static-property IC:
+        // scanning those elements here turned a linear push/XOR loop quadratic.
+        // This proves only OrdinaryGetOwnProperty absence (ECMA-262 §10.1.5);
+        // callers still walk the real prototype chain, preserving getters,
+        // overrides and Proxy traps. Named inserts change the shape, and far
+        // canonical indices must retain their ordinary map lookup.
+        if self.entries.len() > INDEX_THRESHOLD
+            && self.elem_mode.get()
+            && array_index.is_none()
+            && key != "length"
+            && self.shape == array_length_shape(&fn_key(0))
+        {
+            return None;
         }
         let found = if self.elems.index.is_none() {
             self.entries.iter().position(|(k, _)| &**k == key)

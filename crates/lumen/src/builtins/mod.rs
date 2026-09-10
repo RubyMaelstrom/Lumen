@@ -3484,20 +3484,30 @@ fn new_promise_capability(i: &mut Interp, ctor: &Value) -> Result<Value, Value> 
 /// rejecting through `rej` if the call throws.
 pub(crate) fn make_thenable_job(
     i: &mut Interp,
-    then: Value,
+    then: crate::interpreter::JobCallback,
     thenable: Value,
     res: Value,
     rej: Value,
 ) -> Value {
-    make_bound(i, thenable_job_run, vec![then, thenable, res, rej])
+    let mut args = vec![then.callback, thenable, res, rej];
+    if let Some(global) = then.script_caller {
+        args.push(Value::Obj(global));
+    }
+    make_bound(i, thenable_job_run, args)
 }
 
 fn thenable_job_run(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let then = arg(args, 0);
+    let then = crate::interpreter::JobCallback {
+        callback: arg(args, 0),
+        script_caller: match args.get(4) {
+            Some(Value::Obj(global)) => Some(global.clone()),
+            _ => None,
+        },
+    };
     let thenable = arg(args, 1);
     let res = arg(args, 2);
     let rej = arg(args, 3);
-    if let Err(e) = ab(i.call(then, thenable, &[res, rej.clone()])) {
+    if let Err(e) = ab(i.call_job_callback(&then, thenable, &[res, rej.clone()])) {
         let _ = i.call(rej, Value::Undefined, &[e]);
     }
     Ok(Value::Undefined)
@@ -7624,7 +7634,7 @@ enum FromAsyncStage {
 }
 
 impl FromAsyncCoro {
-    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+    fn visit_values(&self, mut visit: impl FnMut(&Value)) {
         let values: &[&Value] = match &self.stage {
             FromAsyncStage::Start {
                 ctor,
@@ -7634,24 +7644,45 @@ impl FromAsyncCoro {
             } => &[ctor, source, mapper, this_arg],
             FromAsyncStage::IteratorNext(state)
             | FromAsyncStage::IteratorResult(state)
-            | FromAsyncStage::IteratorMapped(state) => &[
-                &state.array,
-                &state.iterator,
-                &state.next,
-                &state.mapper,
-                &state.this_arg,
-            ],
+            | FromAsyncStage::IteratorMapped(state) => {
+                let FromAsyncIter {
+                    array,
+                    iterator,
+                    next,
+                    mapper,
+                    this_arg,
+                    index: _,
+                    from_sync: _,
+                } = state;
+                &[array, iterator, next, mapper, this_arg]
+            }
             FromAsyncStage::ArrayLikeNext(state)
             | FromAsyncStage::ArrayLikeValue(state)
             | FromAsyncStage::ArrayLikeMapped(state) => {
-                &[&state.array, &state.source, &state.mapper, &state.this_arg]
+                let FromAsyncArrayLike {
+                    array,
+                    source,
+                    mapper,
+                    this_arg,
+                    index: _,
+                    length: _,
+                } = state;
+                &[array, source, mapper, this_arg]
             }
             FromAsyncStage::Closing { error, iterator } => &[error, iterator],
             FromAsyncStage::Done => &[],
         };
         for value in values {
-            visitor.value(value);
+            visit(value);
         }
+    }
+
+    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
+        self.visit_values(|value| edges.value(value));
+    }
+
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        self.visit_values(|value| visitor.value(value));
         std::mem::size_of::<FromAsyncCoro>()
     }
 
@@ -9572,14 +9603,14 @@ pub(crate) fn async_generator_throw(
     async_gen_drive(i, &this, crate::coroutine::Resume::Throw(arg(a, 0)))
 }
 /// Microtask reactions that re-drive an async generator when an awaited value settles. `args` is
-/// `[keyMarker, resultPromise, settledValue]`.
+/// `[generator, resultPromise, settledValue]`.
 pub(crate) fn async_gen_react_fulfil(
     i: &mut Interp,
     _t: Value,
     a: &[Value],
 ) -> Result<Value, Value> {
     let key = match arg(a, 0) {
-        Value::Num(n) => n as usize,
+        Value::Obj(object) => Rc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     i.drive_async_gen_inner(key, arg(a, 1), crate::coroutine::Resume::Next(arg(a, 2)));
@@ -9591,21 +9622,21 @@ pub(crate) fn async_gen_react_reject(
     a: &[Value],
 ) -> Result<Value, Value> {
     let key = match arg(a, 0) {
-        Value::Num(n) => n as usize,
+        Value::Obj(object) => Rc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     i.drive_async_gen_inner(key, arg(a, 1), crate::coroutine::Resume::Throw(arg(a, 2)));
     Ok(Value::Undefined)
 }
 /// AsyncGeneratorAwaitReturn settled: complete the generator and settle the request promise.
-/// `args` is `[keyMarker, resultPromise, settledValue]`.
+/// `args` is `[generator, resultPromise, settledValue]`.
 pub(crate) fn async_gen_return_fulfil(
     i: &mut Interp,
     _t: Value,
     a: &[Value],
 ) -> Result<Value, Value> {
     let key = match arg(a, 0) {
-        Value::Num(n) => n as usize,
+        Value::Obj(object) => Rc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     let (r, x) = (arg(a, 1), arg(a, 2));
@@ -9626,7 +9657,7 @@ pub(crate) fn async_gen_return_reject(
     a: &[Value],
 ) -> Result<Value, Value> {
     let key = match arg(a, 0) {
-        Value::Num(n) => n as usize,
+        Value::Obj(object) => Rc::as_ptr(&object) as usize,
         _ => return Ok(Value::Undefined),
     };
     let (r, e) = (arg(a, 1), arg(a, 2));
@@ -11229,7 +11260,7 @@ fn install_string(it: &mut Interp) {
     });
     it.def_method(&ctor, "fromCodePoint", 1, |i, _this, args| {
         let mut s = String::new();
-        for a in args {
+        for (index, a) in args.iter().enumerate() {
             // ToNumber identity for Numbers; validation below is identical either way.
             let n = match a {
                 Value::Num(n) => *n,
@@ -11237,6 +11268,20 @@ fn install_string(it: &mut Interp) {
             };
             // Each argument must be an integer code point in [0, 0x10FFFF].
             if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > 0x10FFFF as f64 {
+                // Diagnose the already-converted number without invoking author coercion
+                // hooks a second time or changing the required RangeError completion.
+                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                static TRACED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if *TRACE.get_or_init(|| {
+                    std::env::var_os("LUMEN_TRACE_CODE_POINT_ERRORS").is_some()
+                }) && TRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32
+                {
+                    eprintln!(
+                        "lumen-code-point: argument_index={index} converted={n:?} argument_count={}",
+                        args.len()
+                    );
+                }
                 return Err(i.make_error("RangeError", "Invalid code point"));
             }
             let cp = n as u32;

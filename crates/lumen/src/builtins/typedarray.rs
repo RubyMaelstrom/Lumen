@@ -839,7 +839,11 @@ fn rel_index(n: f64, len: usize) -> usize {
         return 0;
     }
     let n = if n.is_infinite() {
-        if n > 0.0 { len as f64 } else { 0.0 }
+        if n > 0.0 {
+            len as f64
+        } else {
+            0.0
+        }
     } else {
         n.trunc()
     };
@@ -1043,7 +1047,11 @@ fn ta_native(
             // coerces to 0); the default when absent is 0 (indexOf) / len-1 (lastIndexOf).
             let from = if args.len() >= 2 {
                 let n = ab(i.to_number(&arg(args, 1)))?;
-                if n.is_nan() { 0.0 } else { n.trunc() }
+                if n.is_nan() {
+                    0.0
+                } else {
+                    n.trunc()
+                }
             } else if last {
                 (len - 1) as f64
             } else {
@@ -1095,7 +1103,11 @@ fn ta_native(
             let from = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undefined) => {
                     let n = ab(i.to_number(v))?;
-                    if n.is_nan() { 0.0 } else { n.trunc() }
+                    if n.is_nan() {
+                        0.0
+                    } else {
+                        n.trunc()
+                    }
                 }
                 _ => 0.0,
             };
@@ -1788,7 +1800,11 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
         Value::Undefined => 0.0,
         v => {
             let n = ab(i.to_number(&v))?;
-            if n.is_nan() { 0.0 } else { n.trunc() }
+            if n.is_nan() {
+                0.0
+            } else {
+                n.trunc()
+            }
         }
     };
     if offset_n < 0.0 {

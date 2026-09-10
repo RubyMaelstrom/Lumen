@@ -50,6 +50,21 @@ pub enum Coroutine {
 }
 
 impl Coroutine {
+    /// The continuation is an internal slot of its generator/result promise, not
+    /// an independent GC root. Trace only handles physically owned by this payload.
+    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
+        match self {
+            Coroutine::Vm(c) => c.trace_gc(edges),
+            Coroutine::Module(c) => c.trace_gc(edges),
+            Coroutine::FromAsync(c) => c.trace_gc(edges),
+            Coroutine::Unavailable(c) => {
+                if let Some(reason) = &c.reason {
+                    edges.value(reason);
+                }
+            }
+        }
+    }
+
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         match self {
             Coroutine::Vm(coroutine) => std::mem::size_of::<crate::bytecode::VmCoro>()

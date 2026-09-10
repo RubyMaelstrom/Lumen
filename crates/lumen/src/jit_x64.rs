@@ -6,7 +6,8 @@
 
 use super::{
     sys, JitCode, COND_PEEK_NOT_NULLISH, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COND, H_EXEC,
-    H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN, H_SET_PROP, H_UNWIND,
+    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN,
+    H_SET_PROP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 
@@ -378,6 +379,11 @@ pub(super) fn compile(
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
 ) -> Option<JitCode> {
+    if !ilayout.valid || ilayout.strict > i32::MAX as usize {
+        return None;
+    }
+    let strict_offset = ilayout.strict as i32;
+    let interp_offset = std::mem::offset_of!(crate::jit::JitCtx, interp) as i32;
     let ops = chunk.jit_ops();
     if ops.is_empty() || ops.len() > u32::MAX as usize || ops.iter().any(|o| matches!(o, Op::Await))
     {
@@ -427,6 +433,17 @@ pub(super) fn compile(
         0x4d, 0x8b, 0x6c, 0x24, 0x08, // r13 = [r12+8] (sp)
         0x4d, 0x8b, 0x7c, 0x24, 0x18, // r15 = [r12+24] (slots)
     ]);
+    // ECMA-262 Strict Mode Code / PutValue. Preserve the caller's ambient mode on this
+    // native frame and install the body's mode for every semantic helper and nested call.
+    a.bytes(&[0x48, 0x83, 0xec, 0x10]); // sub rsp,16 (keep helper-call alignment)
+    a.bytes(&[0x49, 0x8b, 0x84, 0x24]); // rax = [r12+interp_offset]
+    a.bytes(&interp_offset.to_le_bytes());
+    a.bytes(&[0x0f, 0xb6, 0x88]); // ecx = byte [rax+strict_offset]
+    a.bytes(&strict_offset.to_le_bytes());
+    a.bytes(&[0x88, 0x0c, 0x24]); // [rsp] = cl
+    a.bytes(&[0xc6, 0x80]); // byte [rax+strict_offset] = body's strictness
+    a.bytes(&strict_offset.to_le_bytes());
+    a.code.push(u8::from(chunk.jit_is_strict()));
 
     let mut pc_offsets = Vec::with_capacity(ops.len());
     for (pc, op) in ops.iter().enumerate() {
@@ -717,6 +734,7 @@ pub(super) fn compile(
                 }
             }
             Op::GetProp(..) | Op::GetMethod(..) => a.helper_spflag(H_GET_PROP, pc as u32, unwind),
+            Op::GetMethodElem => a.helper_spflag(H_GET_METHOD_ELEM, pc as u32, unwind),
             Op::SetProp(..)
             | Op::SetPropDrop(..)
             | Op::SetPropThisDrop(..)
@@ -736,6 +754,12 @@ pub(super) fn compile(
 
     let epilogue = |a: &mut Asm, ok: bool| {
         a.bytes(&[0x4d, 0x89, 0x6c, 0x24, 0x10]); // ctx.final_sp = r13
+        a.bytes(&[0x49, 0x8b, 0x84, 0x24]); // rax = [r12+interp_offset]
+        a.bytes(&interp_offset.to_le_bytes());
+        a.bytes(&[0x8a, 0x0c, 0x24]); // cl = [rsp]
+        a.bytes(&[0x88, 0x88]); // byte [rax+strict_offset] = cl
+        a.bytes(&strict_offset.to_le_bytes());
+        a.bytes(&[0x48, 0x83, 0xc4, 0x10]); // add rsp,16
         if ok {
             a.bytes(&[0xb8, 1, 0, 0, 0]);
         } else {

@@ -35,6 +35,709 @@ fn arithmetic() {
 }
 
 #[test]
+fn global_declaration_property_order_follows_instantiation_order() {
+    // ECMA-262 GlobalDeclarationInstantiation: Annex B-only bindings first,
+    // surviving function declarations in source order, then first-seen vars.
+    let source = r#"
+        var order61_z = 1, order61_existing;
+        function order61_fa() { return 0; }
+        var [order61_a, order61_b] = [2, 3];
+        if (false) { function order61_block() {} }
+        function order61_fb() { return 4; }
+        var order61_fa, order61_z;
+        function order61_fa() { return 5; }
+        for (var order61_c = 0; order61_c < 1; order61_c++) {}
+        { var order61_late = 6; }
+        let order61_lexical = 7;
+        Object.keys(globalThis).filter(k => k.startsWith('order61_')).join(',')
+          + '|' + order61_fa() + '|' + order61_existing
+          + '|' + Object.getOwnPropertyDescriptor(globalThis, 'order61_z').configurable
+          + '|' + Object.getOwnPropertyDescriptor(globalThis, 'order61_existing').configurable
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        run_in(&mut engine, "globalThis.order61_existing = 17");
+        assert_eq!(
+            run_in(&mut engine, source),
+            "order61_existing,order61_block,order61_fb,order61_fa,order61_z,order61_a,order61_b,order61_c,order61_late|5|17|false|true",
+            "tier {tier:?}"
+        );
+    }
+}
+
+#[test]
+fn eval_global_declaration_property_order_preserves_last_function_and_first_var() {
+    // EvalDeclarationInstantiation has the same order, but new global
+    // properties are configurable. Both direct and indirect sloppy eval apply.
+    let body = r#"
+        var order61_z = 1;
+        function order61_fa() { return 0; }
+        var order61_a = 2, order61_z;
+        if (false) { function order61_block() {} }
+        function order61_fb() { return 4; }
+        function order61_fa() { return 5; }
+        Object.keys(globalThis).filter(k => k.startsWith('order61_')).join(',')
+          + '|' + order61_fa()
+          + '|' + Object.getOwnPropertyDescriptor(globalThis, 'order61_z').configurable
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for callee in ["eval", "(0, eval)"] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                run_in(&mut engine, &format!("{callee}({body:?})")),
+                "order61_block,order61_fb,order61_fa,order61_z,order61_a|5|true",
+                "tier {tier:?}, callee {callee}"
+            );
+        }
+    }
+}
+
+#[test]
+fn with_proxy_get_binding_value_rechecks_has_property() {
+    // Object Environment Record.HasBinding and GetBindingValue each perform
+    // HasProperty. Do not fuse the calls: the Proxy may change its answer.
+    let source = r#"
+        let log = [], checks = 0, result = 99;
+        const object = new Proxy({p: 42}, {
+            has(target, key) {
+                if (key === 'p') { log.push('has'); return ++checks === 1; }
+                return Reflect.has(target, key);
+            },
+            get(target, key) {
+                if (key === Symbol.unscopables) log.push('unscopables');
+                if (key === 'p') log.push('get');
+                return Reflect.get(target, key);
+            }
+        });
+        with (object) { result = p; }
+        log.join(',') + '|' + String(result)
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "has,unscopables,has|undefined",
+            "tier {tier:?}"
+        );
+    }
+}
+
+#[test]
+fn fresh_closure_code_reuse_preserves_identity_environment_and_abrupt_completion() {
+    // ECMA-262 PrepareForOrdinaryCall/OrdinaryFunctionCreate: sharing executable code
+    // must not reuse the old closure's Function, [[Environment]], or [[Realm]].
+    let source = r#"
+        function invoke(f, x) { return f(x); }
+        function identity() { try { return identity.caller; } catch (error) { throw error; } }
+        function make(value) {
+            return function (x) {
+                try {
+                    if (x < 0) throw value;
+                    return [value + x, identity()];
+                } catch (error) { throw error; }
+            };
+        }
+        let total = 0;
+        for (let i = 0; i < 600; i++) {
+            let f = make(i);
+            let result = invoke(f, 1);
+            if (result[1] !== f || result[0] !== i + 1)
+                throw 'stale closure at ' + i + ': value=' + result[0] + ', identity=' + (result[1] === f);
+            try { invoke(f, -1); throw 'missing throw'; }
+            catch (error) { if (error !== i) throw 'wrong abrupt completion'; }
+            total += result[0];
+        }
+        let proxyCalls = 0;
+        const p = new Proxy(make(1000), {apply(f, t, a) { proxyCalls++; return Reflect.apply(f,t,a); }});
+        if (invoke(p, 2)[0] !== 1002 || proxyCalls !== 1) throw 'proxy bypass';
+        const revoked = Proxy.revocable(make(0), {});
+        revoked.revoke();
+        try { invoke(revoked.proxy, 1); throw 'missing revocation'; }
+        catch (e) { if (!(e instanceof TypeError)) throw e; }
+        const other = $262.createRealm().global;
+        other.eval('globalThis.make = function(v) { return function(x) { return [v+x, new TypeError()]; }; };');
+        for (let i = 0; i < 150; i++) {
+            const f = other.make(i);
+            const r = invoke(f, 3);
+            if (r[0] !== i + 3 || !(r[1] instanceof other.TypeError) || r[1] instanceof TypeError)
+                throw 'wrong realm';
+        }
+        total
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "180300", "{tier:?}");
+    }
+}
+
+#[test]
+fn megamorphic_calls_preserve_receivers_arguments_closures_and_throws() {
+    // ECMA-262 [[Call]], PrepareForOrdinaryCall and OrdinaryCallBindThis: a cached target's
+    // identity never substitutes for the current arguments, receiver or closure environment.
+    let source = r#"
+        var boxes = [];
+        for (var k = 0; k < 16; k++) {
+            var make = Function('captured', 'return function(a,b){' +
+                (k & 1 ? '"use strict";' : '') +
+                'if(a.fail) throw a; var before=arguments[0]; a=b;' +
+                'var inner=function(){return a;};' +
+                'return [this,captured,before,arguments[0],arguments.length,new.target,inner()];};');
+            boxes.push({run: make(k)});
+        }
+        function dispatch(box, a, b) { return box.run(a, b); }
+        function bare(fn, a, b) { return fn(a, b); }
+        var a = {tag:'first'}, b = {tag:'second'};
+        function verify() {
+            for (var k = 0; k < boxes.length; k++) {
+                var r = dispatch(boxes[k], a, b);
+                if(r[0]!==boxes[k] || r[1]!==k || r[2]!==a ||
+                   r[3]!==((k&1)?a:b) || r[4]!==2 || r[5]!==undefined || r[6]!==b)
+                    throw 'method state ' + k;
+                r = bare(boxes[k].run, a, b);
+                if(r[0]!==((k&1)?undefined:globalThis) || r[1]!==k) throw 'bare state ' + k;
+            }
+        }
+        for(var round=0; round<160; round++) verify();
+        function leaf(v){return v+1;} function driver(v){return leaf(v);}
+        function outer(v){return driver(v);} for(var k=0;k<400;k++) outer(k);
+        verify(); // A separate inline recompile invalidated the old call epoch.
+        var thrown = {fail:true};
+        for(var k=0;k<boxes.length;k++) {
+            try {dispatch(boxes[k], thrown, b); throw 'missing throw';}
+            catch(e){if(e!==thrown) throw 'wrong exception';}
+        }
+        var traps = 0;
+        var proxy = new Proxy(boxes[0].run, {apply(f,t,args){traps++;return Reflect.apply(f,t,args);}});
+        boxes[0].run = proxy;
+        if(dispatch(boxes[0],a,b)[0]!==boxes[0] || traps!==1) throw 'proxy bypass';
+        var revoked = Proxy.revocable(boxes[1].run, {}); revoked.revoke();
+        boxes[1].run = revoked.proxy;
+        try {dispatch(boxes[1],a,b);throw 'missing revocation';}
+        catch(e){if(!(e instanceof TypeError))throw e;}
+        boxes[2].run = class NotCallable {};
+        try {dispatch(boxes[2],a,b);throw 'called class';}
+        catch(e){if(!(e instanceof TypeError))throw e;}
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "{tier:?}");
+    }
+}
+
+#[test]
+fn megamorphic_calls_preserve_native_and_user_realms() {
+    let source = r#"
+        var other = $262.createRealm().global;
+        var natives = [Math.abs, Math.floor, Math.ceil, Number, parseFloat, parseInt, String, Boolean];
+        var expected = [3.5,3,4,3.5,3.5,3,'3.5',true];
+        function dispatch(f,x){return f(x);}
+        for(var round=0;round<200;round++) for(var k=0;k<natives.length;k++) {
+            if(dispatch(natives[k],3.5)!==expected[k])throw 'native dispatch';
+        }
+        var local = [], foreign = [];
+        for(var k=0;k<16;k++) {
+            local.push(Function('x','return [x+'+k+',new TypeError(),this];'));
+            foreign.push(other.Function('x','return [x+'+k+',new TypeError(),this];'));
+        }
+        other.sharedDispatch = dispatch;
+        other.runLocal = other.Function('f','return sharedDispatch(f,7);');
+        for(var round=0;round<160;round++) for(var k=0;k<16;k++) {
+            var r = dispatch(local[k],7);
+            if(r[0]!==7+k || !(r[1] instanceof TypeError) || r[2]!==globalThis)throw 'local realm';
+            r = dispatch(foreign[k],7);
+            if(r[0]!==7+k || !(r[1] instanceof other.TypeError) || r[1] instanceof TypeError || r[2]!==other)
+                throw 'foreign realm';
+            r = other.runLocal(local[k]);
+            if(!(r[1] instanceof TypeError) || r[2]!==globalThis)throw 'restored realm';
+        }
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "{tier:?}");
+    }
+}
+
+#[test]
+fn computed_method_reads_preserve_receivers_mutation_and_abrupt_order() {
+    let source = r#"
+        function invoke(o,k,x){return o[k](x);}
+        function first(x){'use strict';return [this, x+1];}
+        function second(x){'use strict';return [this, x+2];}
+        var proto={method:first}, object=Object.create(proto), key='method';
+        for(var n=0;n<450;n++) {
+            var r=invoke(object,key,n);
+            if(r[0]!==object || r[1]!==n+1)throw 'warm receiver';
+        }
+        proto.method=second;
+        if(invoke(object,key,3)[1]!==5)throw 'live value';
+        object.method=first;
+        if(invoke(object,key,3)[1]!==4)throw 'own shadow';
+        delete object.method;
+        Object.setPrototypeOf(object,{method:first});
+        if(invoke(object,key,3)[1]!==4)throw 'same-shape prototype replacement';
+        var deep=object;
+        for(var depth=0;depth<5;depth++) {
+            deep=Object.create(deep);
+            for(var n=0;n<50;n++)if(invoke(deep,key,3)[0]!==deep)throw 'deep receiver';
+        }
+        var getterCalls=0, nested={different:second};
+        Object.defineProperty(object,key,{configurable:true,get:function(){
+            getterCalls++; invoke(nested,'different',1); return second;
+        }});
+        for(var n=0;n<450;n++)if(invoke(object,key,3)[1]!==5)throw 'reentrant getter value';
+        if(getterCalls!==450)throw 'getter replay';
+        Object.defineProperty(object,key,{configurable:true,value:first});
+        if(invoke(object,key,3)[1]!==4)throw 'descriptor restored';
+
+        var primitiveKey='computed_test_method';
+        String.prototype[primitiveKey]=first;
+        Number.prototype[primitiveKey]=first;
+        Boolean.prototype[primitiveKey]=first;
+        for(var n=0;n<450;n++) {
+            for(var v of ['hello',12,true])if(invoke(v,primitiveKey,1)[0]!==v)throw 'boxed receiver';
+        }
+        String.prototype[primitiveKey]=second;
+        if(invoke('hello',primitiveKey,1)[1]!==3)throw 'primitive live value';
+        Object.defineProperty(String.prototype,primitiveKey,{configurable:true,get:function(){
+            'use strict';if(this!=='hello')throw 'getter primitive receiver';return first;
+        }});
+        if(invoke('hello',primitiveKey,1)[0]!=='hello')throw 'primitive getter result';
+        delete String.prototype[primitiveKey]; delete Number.prototype[primitiveKey];
+        delete Boolean.prototype[primitiveKey];
+        var symbol=Symbol('method'); object[symbol]=second;
+        if(invoke(object,symbol,1)[1]!==3)throw 'symbol method';
+        var coercions=0, coercingKey={ [Symbol.toPrimitive]:function(hint){
+            if(hint!=='string')throw 'hint';coercions++;return symbol;
+        }};
+        if(invoke(object,coercingKey,1)[1]!==3 || coercions!==1)throw 'key conversion';
+        try{invoke(null,coercingKey,1);throw 'null accepted';}
+        catch(e){if(!(e instanceof TypeError) || coercions!==1)throw 'null coercion order';}
+        var keyExpressions=0, tagSubstitutions=0;
+        function tagKey(){keyExpressions++;return coercingKey;}
+        function substitute(){tagSubstitutions++;return 1;}
+        function invokeTag(o){return o[tagKey()]`value ${substitute()}`;}
+        for(var n=0;n<450;n++) {
+            try{invokeTag(n&1?null:undefined);throw 'null tag accepted';}
+            catch(e){if(!(e instanceof TypeError))throw e;}
+        }
+        if(keyExpressions!==450 || coercions!==1 || tagSubstitutions!==0)throw 'tagged null ordering';
+        var traps=0, proxy=new Proxy(object,{get:function(target,key,receiver){
+            traps++;return Reflect.get(target,key,receiver);
+        }});
+        if(invoke(proxy,'method',1)[0]!==proxy || traps!==1)throw 'proxy bypass';
+        var revoked=Proxy.revocable(object,{}); revoked.revoke();
+        try{invoke(revoked.proxy,'method',1);throw 'revoked accepted';}
+        catch(e){if(!(e instanceof TypeError))throw e;}
+        var args=0, sentinel={};
+        function arg(){args++;return 1;}
+        function withArg(o,k){return o[k](arg());}
+        try{withArg({},'missing');throw 'missing accepted';}
+        catch(e){if(!(e instanceof TypeError) || args!==1)throw 'callability order';}
+        Object.defineProperty(object,'method',{get:function(){throw sentinel;}});
+        try{withArg(object,'method');throw 'getter accepted';}
+        catch(e){if(e!==sentinel || args!==1)throw 'getter throw ordering';}
+        var table=[first,second];
+        for(var n=0;n<450;n++)if(invoke(table,n&1,2)[0]!==table)throw 'numeric method receiver';
+        var other=$262.createRealm().global, realmKey='computedRealmMethod';
+        String.prototype[realmKey]=function(){return 'local';};
+        other.String.prototype[realmKey]=other.Function("return 'foreign';");
+        var foreignInvoke=other.Function('s','k','return s[k]();');
+        for(var n=0;n<450;n++) {
+            if(invoke('x',realmKey,0)!=='local' || foreignInvoke('x',realmKey)!=='foreign')throw 'active realm';
+        }
+        delete String.prototype[realmKey]; delete other.String.prototype[realmKey];
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
+fn legacy_function_reflection_diagnostics_preserve_lazy_materialization() {
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Interp);
+    assert_eq!(
+        run_in(
+            &mut engine,
+            r#"
+        var conversions=0;
+        var key={ [Symbol.toPrimitive]:function(hint){
+            if(hint!=='string')throw 'bad hint'; conversions++; return 'arguments';
+        }};
+        function lazy(x){
+            var a=lazy[key];
+            if(a[0]!==7 || a.length!==2 || a!==lazy.arguments)throw 'lazy reflection';
+        }
+        function ready(x){
+            if(ready[key]!==arguments)throw 'materialized reflection';
+        }
+        if(lazy.arguments!==null)throw 'inactive reflection';
+        lazy(7,undefined); ready(8);
+        if(conversions!==2)throw 'replayed conversion';
+        if(lazy.arguments!==null)throw 'retained activation';
+        'ok'
+    "#
+        ),
+        "ok"
+    );
+}
+
+#[test]
+fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
+    use std::rc::Rc;
+    for mode in [1, 2] {
+        let mut engine = Engine::new();
+        engine.set_tier(crate::bytecode::Tier::Jit);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                r#"
+            var sentinel = {}, keepContext = 0;
+            var victim = function(x) {
+                try {
+                    if(x) {
+                        victim.prototype = null;
+                        victim = null;
+                        if(x===2) throw sentinel;
+                    }
+                    return 17;
+                } finally {}
+            };
+            function dispatch(f,x) { var keep = keepContext; return f((f=null,x)) + keep; }
+            for(var i=0;i<401;i++) dispatch(victim,0);
+            'ok'
+        "#
+            ),
+            "ok"
+        );
+        let global = crate::value::Value::Obj(engine.interp.global.clone());
+        let value = engine
+            .interp
+            .eval_in_realm(&global, "victim")
+            .unwrap_or_else(|_| panic!("live victim"));
+        let crate::value::Value::Obj(function) = value else {
+            panic!("function object")
+        };
+        let weak = Rc::downgrade(&function);
+        drop(function);
+        let source = format!("try {{ dispatch(victim,{mode}) }} catch(error) {{ error===sentinel ? 'sentinel' : 'wrong error' }}");
+        assert_eq!(
+            run_in(&mut engine, &source),
+            if mode == 1 { "17" } else { "sentinel" }
+        );
+        // The body removed both the global owner and the default prototype's constructor
+        // backlink. Only the caller operand remained; cleanup must drop that owner exactly once.
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "mode {mode}: last callee must be destroyed"
+        );
+    }
+}
+
+#[test]
+fn return_transfers_preserve_values_receiver_context_and_abrupt_completion() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                r#"
+            var token = {}, marker = Symbol('return'), calls = 0, reads = 0;
+            var values = [undefined, null, false, -0, NaN, 2n**90n, 'owned string', marker, token];
+            function leaf(value) { for (var j=0; j<2; j++) calls++; return value; }
+            function bare() { calls++; return; }
+            var receiver = {value: token, pass: function(value) {
+                var nested = leaf(value);
+                if(this.value !== token) throw 'lost receiver';
+                return nested;
+            }};
+            function caught(value) { try { return receiver.pass(value); } catch(e) { throw e; } }
+            for(var k=0; k<900; k++) {
+                var value = values[k % values.length];
+                if(!Object.is(caught(value), value)) throw 'return identity';
+                if(bare() !== undefined) throw 'bare return';
+            }
+            var getter = {get value() { reads++; throw token; }};
+            function failed() { return getter.value; }
+            try { failed(); throw 'missing abrupt'; } catch(e) { if(e !== token) throw e; }
+            function replaced() { try { return token; } finally { return marker; } }
+            function overridden() { try { return token; } finally { throw marker; } }
+            if(replaced() !== marker) throw 'finally return';
+            try { overridden(); throw 'missing finally'; } catch(e) { if(e !== marker) throw e; }
+            if(calls !== 2700 || reads !== 1) throw 'replayed effect';
+            'ok'
+        "#
+            ),
+            "ok",
+            "tier {tier:?}"
+        );
+    }
+}
+
+#[test]
+fn megamorphic_direct_call_can_grow_the_secondary_cache_in_a_nested_call() {
+    assert_eq!(
+        run_jit(
+            r#"
+        var grow = false, churn = [];
+        function nested(f,x){return f(x);}
+        function target(x){
+            if(grow){
+                grow=false;
+                for(var k=0;k<1200;k++) {
+                    var f=Function('x','return x+'+k+';');
+                    churn.push(f); nested(f,1); nested(f,2);
+                }
+            }
+            return x+1;
+        }
+        var handlers=[target];
+        for(var k=1;k<16;k++) handlers.push(Function('x','return x+'+k+';'));
+        function dispatch(f,x){return f(x);}
+        for(var round=0;round<256;round++) for(var k=0;k<16;k++) dispatch(handlers[k],round);
+        grow=true;
+        if(dispatch(target,7)!==8 || churn.length!==1200)throw 'nested growth';
+        if(dispatch(target,9)!==10 || dispatch(handlers[15],2)!==17)throw 'caller restoration';
+        'ok'
+    "#
+        ),
+        "ok"
+    );
+}
+
+#[test]
+fn megamorphic_cache_does_not_keep_discarded_functions_alive() {
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(0);
+    assert_eq!(
+        run_in(
+            &mut engine,
+            r#"
+        var refs = [];
+        function dispatch(f,x){return f(x);}
+        (function(){
+            var functions = [];
+            for(var k=0;k<16;k++) functions.push(Function('x','return x+'+k+';'));
+            for(var r=0;r<200;r++) for(var k=0;k<16;k++) dispatch(functions[k],r);
+            for(var k=0;k<16;k++) refs.push(new WeakRef(functions[k]));
+        })();
+        'ok'
+    "#
+        ),
+        "ok"
+    );
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    assert!(
+        engine.interp.call_overflow.retained_bytes() > 0,
+        "exercise actual secondary fills"
+    );
+    // A separate job permits weak clearing; the still-live dispatch chunk and engine cache
+    // must not root functions or the function/prototype cycles.
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "$262.gc(); refs.every(function(ref){return ref.deref()===undefined;})"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            r#"
+        var sum=0;
+        for(var k=0;k<512;k++) sum+=dispatch(Function('x','return x+'+k+';'),1);
+        sum
+    "#
+        ),
+        "131328"
+    );
+}
+
+#[test]
+fn native_function_realm_survives_prototype_changes_and_call_cache_warmup() {
+    // CreateBuiltinFunction/BuiltinCallOrConstruct use immutable [[Realm]], not [[Prototype]].
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                r#"
+            const foreign = $262.createRealm().global;
+            const localParse = JSON.parse, otherParse = foreign.JSON.parse;
+            function invoke(fn, text) { return fn(text); }
+            function verify(fn, proto, ErrorType) {
+                for (let i=0; i<250; i++) {
+                    if (Object.getPrototypeOf(invoke(fn, '{}')) !== proto) throw 'wrong result realm';
+                }
+                try { invoke(fn, '{'); throw 'missing parse error'; }
+                catch (e) { if (!(e instanceof ErrorType)) throw 'wrong error realm'; }
+            }
+            verify(localParse, Object.prototype, SyntaxError);
+            Object.setPrototypeOf(localParse, foreign.Function.prototype);
+            verify(localParse, Object.prototype, SyntaxError);
+            Object.setPrototypeOf(otherParse, Function.prototype);
+            verify(otherParse, foreign.Object.prototype, foreign.SyntaxError);
+            Object.setPrototypeOf(otherParse, null);
+            verify(otherParse, foreign.Object.prototype, foreign.SyntaxError);
+            let applied=0;
+            const proxy=new Proxy(localParse,{apply(target,receiver,args){applied++;return Reflect.apply(target,receiver,args);}});
+            if (invoke(proxy,'{"n":3}').n !== 3 || applied !== 1) throw 'proxy bypass';
+            const remoteEval=foreign.eval;
+            if (invoke(remoteEval,'Array') !== foreign.Array) throw 'indirect eval realm';
+            'ok'
+        "#
+            ),
+            "ok",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
+fn native_function_realm_is_kept_by_the_function_not_by_the_registry() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        r#"
+        var foreign = $262.createRealm().global;
+        var retainedNative = foreign.JSON.parse;
+        Object.setPrototypeOf(retainedNative, null);
+        foreign = null;
+    "#,
+    );
+    engine.interp.gc_collect();
+    assert_eq!(
+        engine.interp.realms.len(),
+        2,
+        "live built-in retains its original realm"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "Object.getPrototypeOf(retainedNative('{}')) !== Object.prototype"
+        ),
+        "true"
+    );
+    run_in(&mut engine, "retainedNative = null");
+    engine.interp.gc_collect();
+    engine.interp.gc_collect();
+    assert_eq!(
+        engine.interp.realms.len(),
+        1,
+        "weak metadata cannot keep an unused realm alive"
+    );
+}
+
+#[test]
+fn bound_call_diagnostics_preserve_arguments_returns_and_exceptions() {
+    // Also run with LUMEN_TRACE_BOUND_CALLS=1. Diagnostic inspection must not
+    // trigger these traps/getters or alter BoundFunction [[Call]] forwarding.
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                r#"
+                const marker = {};
+                let hooks = 0;
+                const payload = new Proxy({}, {
+                    get() { hooks++; throw marker; },
+                    ownKeys() { hooks++; throw marker; },
+                    getOwnPropertyDescriptor() { hooks++; throw marker; }
+                });
+                function target(first, second) {
+                    'use strict';
+                    if (this !== marker || first !== payload || second !== 7) throw marker;
+                    return payload;
+                }
+                const bound = target.bind(marker, payload);
+                Object.defineProperty(target, 'name', {get() { hooks++; throw marker; }});
+                function outer(value) { return bound(value); }
+                const nested = outer.bind(null);
+                let okay = true;
+                for (let i=0; i<200; i++) okay = okay && nested(7) === payload;
+                const throws = (function () { throw marker; }).bind(null);
+                try { throws(); okay=false; } catch (error) { okay = okay && error === marker; }
+                okay && hooks === 0;
+            "#
+            ),
+            "true",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn variables_and_scope() {
     assert_eq!(run("let x = 5; { let x = 9; } x"), "5");
     assert_eq!(run("var a = 1; function f(){ a = 2; } f(); a"), "2");
@@ -1772,6 +2475,379 @@ fn embedder_realm_snapshot_and_host_context_restore_are_isolated() {
         "7|7"
     );
     assert_eq!(engine.ctx().host_job_context(), 41);
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn job_callbacks_capture_registration_source_without_changing_execution_realm() {
+    fn caller(ctx: &mut crate::embed::Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        Ok(ctx.script_caller_global())
+    }
+    fn then(ctx: &mut crate::embed::Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+        let source = ctx.script_caller_global();
+        ctx.invoke(args[0].clone(), Value::Undefined, &[source])
+    }
+    fn throw_source(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
+        Err(ctx.script_caller_global())
+    }
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for browser in [false, true] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            if browser {
+                engine.set_job_callback_script_caller_capture(true);
+            }
+            engine.define_global("callerGlobal", 0, caller);
+            engine.define_global("nativeThen", 2, then);
+            engine.define_global("throwSource", 0, throw_source);
+            run_in(
+                &mut engine,
+                r#"
+                globalThis.trace = [];
+                globalThis.userCaller = () => callerGlobal();
+                globalThis.pending = new Promise(r => globalThis.release = r);
+                globalThis.rejected = new Promise((r, j) => globalThis.fail = j);
+            "#,
+            );
+            let main = engine.global_this();
+            let child = engine.ctx().create_embed_realm();
+            engine
+                .ctx()
+                .member_set(&child, "main", main.clone())
+                .unwrap_or_else(|_| panic!("parent"));
+            engine
+                .ctx()
+                .member_set(&child, "browserHost", Value::Bool(browser))
+                .unwrap_or_else(|_| panic!("mode"));
+            engine.with_embed_realm(&child, |engine| run_in(engine, r#"
+                const expected = browserHost ? globalThis : main;
+                const check = (label, expected) => value => main.trace.push(label + ':' + (value === expected));
+                Promise.resolve().then(main.callerGlobal.bind(main)).then(check('bound', expected));
+                Promise.reject(1).catch(main.callerGlobal).then(check('reject', expected));
+                main.pending.then(main.callerGlobal).then(check('pending', expected));
+                main.rejected.catch(main.callerGlobal).then(check('pending-reject', expected));
+                Promise.resolve({then: main.nativeThen}).then(check('thenable', expected));
+                Promise.resolve().then(main.throwSource).catch(check('throw', expected));
+                Promise.resolve().then(main.userCaller).then(check('user', main));
+                Promise.resolve().then(new Proxy(main.callerGlobal, {})).then(check('proxy', expected));
+            "#)).unwrap_or_else(|_| panic!("child registration"));
+            // Settlement happens in a different script/Realm after the original registration.
+            run_in(&mut engine, "release(); fail();");
+            assert_eq!(run_in(&mut engine, "trace.sort().join('|')"),
+                "bound:true|pending-reject:true|pending:true|proxy:true|reject:true|thenable:true|throw:true|user:true",
+                "{tier:?}, browser={browser}");
+            assert_eq!(
+                run_in(&mut engine, "callerGlobal() === globalThis"),
+                "true",
+                "source restored"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn job_callback_source_realms_are_traced_and_collectable() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for kind in ["promise", "finalization"] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine.set_job_callback_script_caller_capture(true);
+            engine.define_global("nothing", 0, |_ctx, _, _| Ok(Value::Undefined));
+            let main = engine.global_this();
+            let child = engine.ctx().create_embed_realm();
+            engine
+                .ctx()
+                .member_set(&child, "main", main.clone())
+                .unwrap_or_else(|_| panic!("parent"));
+            // The callback itself belongs to the main Realm. Only its HostDefined source
+            // retains the child, whose global also owns the pending promise / registry.
+            let source = if kind == "promise" {
+                "globalThis.saved = new main.Promise(() => {}); saved.then(main.nothing); main.kept = saved;"
+            } else {
+                "globalThis.saved = new main.FinalizationRegistry(main.nothing); main.kept = saved;"
+            };
+            engine
+                .with_embed_realm(&child, |engine| run_in(engine, source))
+                .unwrap_or_else(|_| panic!("register"));
+            drop(child);
+            engine.interp.gc_collect();
+            assert_eq!(
+                engine.interp.realms.len(),
+                2,
+                "{tier:?}, {kind}: live callback source"
+            );
+            run_in(&mut engine, "kept = null");
+            engine.interp.gc_collect();
+            engine.interp.gc_collect();
+            assert_eq!(
+                engine.interp.realms.len(),
+                1,
+                "{tier:?}, {kind}: unreachable source cycle"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn job_callback_queued_source_is_a_temporary_root() {
+    let mut engine = Engine::new();
+    engine.set_job_callback_script_caller_capture(true);
+    engine.define_global("nothing", 0, |_ctx, _, _| Ok(Value::Undefined));
+    let main = engine.global_this();
+    let child = engine.ctx().create_embed_realm();
+    engine
+        .ctx()
+        .member_set(&child, "main", main)
+        .unwrap_or_else(|_| panic!("parent"));
+    engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            let result =
+                ctx.eval_classic_script_interruptible("main.Promise.resolve().then(main.nothing);");
+            assert!(result.is_ok_and(|completion| completion.is_ok()));
+        })
+        .unwrap_or_else(|_| panic!("queue child callback"));
+    drop(child);
+    engine.interp.gc_collect();
+    assert_eq!(
+        engine.interp.realms.len(),
+        2,
+        "queued source must survive GC"
+    );
+    engine.run_microtasks();
+    engine.interp.gc_collect();
+    engine.interp.gc_collect();
+    assert_eq!(
+        engine.interp.realms.len(),
+        1,
+        "finished callback must release its source"
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn job_callback_context_is_restored_on_host_interruption() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for thenable in [false, true] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine.set_job_callback_script_caller_capture(true);
+            run_in(&mut engine, "var caught = 0, later = 0; function spin() { try { while(true) {} } catch (_) { caught++; } }");
+            let interrupt = engine.interrupt_handle();
+            interrupt.set_deadline(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            ));
+            let source = if thenable {
+                "Promise.resolve({then: spin}).then(() => later++);"
+            } else {
+                "Promise.resolve().then(spin).then(() => later++);"
+            };
+            let result = engine.eval_interruptible(source, false).expect("parse");
+            assert!(
+                matches!(
+                    result,
+                    ExecutionOutcome::Interrupted {
+                        reason: InterruptReason::DeadlineExceeded
+                    }
+                ),
+                "{tier:?}, thenable={thenable}"
+            );
+            assert!(
+                engine.interp.script_entry.is_none(),
+                "callback boundary restored"
+            );
+            interrupt.set_deadline(None);
+            assert_eq!(run_in(&mut engine, "caught + ':' + later"), "0:0");
+        }
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn suspended_context_preserves_script_caller_across_await_and_yield() {
+    fn caller_global(
+        ctx: &mut crate::embed::Ctx,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
+        Ok(ctx.script_caller_global())
+    }
+
+    // RunSuspendedContext restores the suspended function's execution context,
+    // not the Promise reaction / borrowed Generator.prototype.next that resumes it.
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for kind in ["async", "generator", "async-generator"] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine.define_global("callerGlobal", 0, caller_global);
+            run_in(&mut engine, "globalThis.observed = []; globalThis.pending = new Promise(r => globalThis.release = r)");
+            let main = engine.global_this();
+            let child = engine.ctx().create_embed_realm();
+            engine
+                .ctx()
+                .member_set(&child, "main", main.clone())
+                .unwrap_or_else(|_| panic!("publish parent"));
+            engine
+                .ctx()
+                .member_set(&main, "child", child.clone())
+                .unwrap_or_else(|_| panic!("publish child"));
+            let source = match kind {
+                "async" => {
+                    r#"
+                    globalThis.task = async function () {
+                        main.observed.push(main.callerGlobal() === globalThis);
+                        await main.pending;
+                        main.observed.push(main.callerGlobal() === globalThis);
+                        try { await Promise.reject(7); }
+                        catch (_) { main.observed.push(main.callerGlobal() === globalThis); }
+                        await 0;
+                        main.observed.push(main.callerGlobal() === globalThis);
+                    };
+                "#
+                }
+                "generator" => {
+                    r#"
+                    globalThis.task = function* () {
+                        main.observed.push(main.callerGlobal() === globalThis);
+                        yield Object.getPrototypeOf([]) === Array.prototype;
+                        main.observed.push(main.callerGlobal() === globalThis);
+                        try { yield 0; }
+                        finally { main.observed.push(main.callerGlobal() === globalThis); }
+                    };
+                "#
+                }
+                _ => {
+                    r#"
+                    globalThis.task = async function* () {
+                        main.observed.push(main.callerGlobal() === globalThis);
+                        await main.pending;
+                        main.observed.push(main.callerGlobal() === globalThis);
+                        yield Object.getPrototypeOf([]) === Array.prototype;
+                        try { yield 0; }
+                        finally { main.observed.push(main.callerGlobal() === globalThis); }
+                    };
+                "#
+                }
+            };
+            engine
+                .with_embed_realm(&child, |engine| run_in(engine, source))
+                .unwrap_or_else(|_| panic!("initialize child"));
+            let expected = match kind {
+                "async" => {
+                    run_in(&mut engine, "child.task(); release();");
+                    "true,true,true,true"
+                }
+                "generator" => {
+                    run_in(
+                        &mut engine,
+                        r#"
+                        const it=child.task(), proto=Object.getPrototypeOf(function*(){}.prototype);
+                        function next() { return proto.next.call(it); }
+                        observed.push(next().value); next(); proto.return.call(it);
+                    "#,
+                    );
+                    "true,true,true,true"
+                }
+                _ => {
+                    run_in(
+                        &mut engine,
+                        r#"
+                        const it=child.task(), proto=Object.getPrototypeOf(async function*(){}.prototype);
+                        proto.next.call(it).then(r=>observed.push(r.value)); release();
+                    "#,
+                    );
+                    run_in(&mut engine, "proto.next.call(it);");
+                    run_in(&mut engine, "proto.return.call(it);");
+                    "true,true,true,true"
+                }
+            };
+            assert_eq!(
+                run_in(&mut engine, "observed.join(',')"),
+                expected,
+                "{tier:?} {kind}"
+            );
+            assert_eq!(
+                run_in(&mut engine, "callerGlobal() === globalThis"),
+                "true",
+                "caller restored"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn suspended_context_realm_is_traced_but_not_permanently_rooted() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let child = engine.ctx().create_embed_realm();
+        engine.with_embed_realm(&child, |engine| {
+            run_in(engine, "globalThis.saved = (function* () { yield Object.getPrototypeOf([]) === Array.prototype; })()");
+        }).unwrap_or_else(|_| panic!("initialize child continuation"));
+        let continuation = engine
+            .ctx()
+            .member_get(&child, "saved")
+            .unwrap_or_else(|_| panic!("read continuation"));
+        let main = engine.global_this();
+        engine
+            .ctx()
+            .member_set(&main, "kept", continuation)
+            .unwrap_or_else(|_| panic!("retain continuation"));
+        drop(child);
+        engine.interp.gc_collect();
+        assert_eq!(
+            engine.interp.realms.len(),
+            2,
+            "{tier:?}: live context must retain its intrinsics"
+        );
+        assert_eq!(run_in(&mut engine, "kept.next().value"), "true", "{tier:?}");
+        // No completion is necessary: unreachable suspended generators and their
+        // global -> generator -> context -> global cycle must be collectable.
+        run_in(&mut engine, "kept = null");
+        engine.interp.gc_collect();
+        engine.interp.gc_collect();
+        assert_eq!(
+            engine.interp.realms.len(),
+            1,
+            "{tier:?}: dead context must not retain the Realm"
+        );
+        assert!(
+            engine.interp.generators.is_empty(),
+            "{tier:?}: dead coroutine must be reclaimed"
+        );
+    }
 }
 
 #[cfg(feature = "embed")]
@@ -4742,6 +5818,115 @@ fn typeof_tdz() {
     assert_eq!(run("typeof undeclaredXYZ"), "undefined");
     assert_eq!(run("{ let a=1; typeof a }"), "number");
 }
+
+#[test]
+fn typeof_name_preserves_getter_exceptions_and_their_identity() {
+    // ECMA-262 typeof only special-cases an unresolvable Reference. Abrupt
+    // completions from GetValue must propagate, even ReferenceError/undefined.
+    let source = r#"
+        let sentinel, hits = 0, caught = 0;
+        Object.defineProperty(globalThis, '__typeof62', {
+            configurable: true,
+            get() { hits++; throw sentinel; }
+        });
+        function inspect() { return typeof __typeof62; }
+        const values = [undefined, null, 17, 'sentinel', {},
+            new ReferenceError('getter'), new TypeError('getter')];
+        for (let i = 0; i < 210; i++) {
+            sentinel = values[i % values.length];
+            let threw = false;
+            try { inspect(); }
+            catch (error) {
+                if (error !== sentinel) throw 'exception identity changed';
+                threw = true; caught++;
+            }
+            if (!threw) throw 'typeof swallowed a getter exception';
+        }
+        delete globalThis.__typeof62;
+        if (inspect() !== 'undefined') throw 'missing name did not become unresolved';
+        if (typeof (((__typeof62))) !== 'undefined') throw 'parenthesized missing name';
+        let valueError = false;
+        try { typeof (0, __typeof62); } catch (error) { valueError = error instanceof ReferenceError; }
+        if (!valueError) throw 'comma expression must perform GetValue';
+        caught + '|' + hits
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "210|210", "tier {tier:?}");
+    }
+}
+
+#[test]
+fn typeof_name_preserves_with_resolution_exceptions_once() {
+    let source = r#"
+        let sentinel = {}, log = [];
+        for (let stage of ['has', 'unscopables', 'get']) {
+            const object = new Proxy({p: 42}, {
+                has(target, key) {
+                    if (key === 'p') {
+                        log.push('has');
+                        if (stage === 'has') throw sentinel;
+                    }
+                    return Reflect.has(target, key);
+                },
+                get(target, key) {
+                    if (key === Symbol.unscopables) {
+                        log.push('unscopables');
+                        if (stage === 'unscopables') throw sentinel;
+                    }
+                    if (key === 'p') { log.push('get'); throw sentinel; }
+                    return Reflect.get(target, key);
+                }
+            });
+            let caught = false;
+            try { with (object) { typeof p; } }
+            catch (error) { if (error !== sentinel) throw 'wrong exception'; caught = true; }
+            if (!caught) throw 'typeof swallowed a resolution exception';
+        }
+        log.join(',')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "has,has,unscopables,has,unscopables,has,get",
+            "tier {tier:?}"
+        );
+    }
+}
+
+#[test]
+fn typeof_unresolved_name_does_not_allocate_error_objects() {
+    let mut engine = Engine::new();
+    let before = crate::value::heap_allocated_objects(&engine.interp.gc_heap);
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "for (let i = 0; i < 256; i++) {
+                if (typeof __missing_feature62 !== 'undefined') throw 'wrong type';
+             } true"
+        ),
+        "true"
+    );
+    assert_eq!(
+        crate::value::heap_allocated_objects(&engine.interp.gc_heap),
+        before,
+        "an unresolvable typeof must not construct and discard ReferenceErrors"
+    );
+}
+
 #[test]
 fn tdz_fn_toplevel() {
     assert_eq!(throws("typeof w; let w;"), "ReferenceError");
@@ -6054,6 +7239,71 @@ fn compiled_regexp_literal_is_fresh() {
 }
 
 #[test]
+fn compiled_comma_prefixes_discard_values_without_extra_copies() {
+    let source = "function read(a, k, result) { return result = a[k], result; }";
+    let statements = crate::parser::parse_script(source, false)
+        .ok()
+        .expect("parse");
+    let function = statements
+        .iter()
+        .find_map(|statement| match statement {
+            crate::ast::Stmt::FuncDecl(function) => Some(function.clone()),
+            _ => None,
+        })
+        .expect("function declaration");
+    let chunk = crate::bytecode::compile(&function).expect("compile");
+    assert!(
+        !chunk.jit_ops().windows(2).any(|pair| matches!(
+            pair,
+            [crate::bytecode::Op::Dup, crate::bytecode::Op::StoreLocal(_)]
+        )),
+        "discarded comma assignment duplicates its result: {:?}",
+        chunk.jit_ops()
+    );
+}
+
+#[test]
+fn compiled_comma_prefixes_preserve_getters_coercions_and_abrupt_completions() {
+    let source = r#"
+      var log = [], later = 0;
+      function sequence(o, a, k, result) { return o.x, result = a[k], o.x = result, result; }
+      function fail(o) { return o.x, later++, 99; }
+      function tail(o, f) { 'use strict'; return o.x, f(); }
+      function write(o) { 'use strict'; return o.x = 1, later++, 99; }
+      for (var n = 0; n < 500; n++) sequence({x:0}, [n], 0);
+      var o = { get x() { log.push('get'); return 1; },
+                set x(v) { log.push('set:' + v); } };
+      var a = []; Object.defineProperty(a, '0', {get() { log.push('element'); return 'text'; }});
+      var key = {toString() { log.push('key'); return '0'; }};
+      var value = sequence(o, a, key);
+      var tailed = tail(o, function() { log.push('tail'); return 42; });
+      var boom = {get x() { log.push('throw'); throw new Error('stop'); }};
+      try { fail(boom); } catch (e) { log.push(e.message); }
+      try { write(Object.preventExtensions({})); } catch (e) { log.push(e.name); }
+      var method = {f:function() { 'use strict'; return typeof this; }};
+      var detached = (later = 0, method.f)();
+      [value, tailed, later, detached, log.join(',')].join('|');
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        let result = match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        };
+        assert_eq!(
+            result, "text|42|0|undefined|get,key,element,set:text,get,tail,throw,stop,TypeError",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn reconstructible_string_and_regexp_caches_account_retained_bytes() {
     let mut engine = Engine::new();
     let ascii = crate::lstr::LStr::from("repeated ascii subject");
@@ -7317,6 +8567,439 @@ fn async_arrow_super_calls_follow_derived_constructor_order_on_heap_vm() {
 }
 
 #[test]
+fn projected_class_defaults_preserve_the_derived_constructor_this_environment() {
+    let source = r#"
+      var calls = 0;
+      class Base { constructor() { calls++; this.tag = 'receiver'; } }
+      class Derived extends Base {
+        field = 7;
+        constructor() {
+          var [Before = class {}] = [];
+          super();
+          var [After = class { [this.tag]() { return 9; } }] = [];
+          this.before = Before;
+          this.after = After;
+        }
+      }
+      for (var i = 0; i < 10; i++) {
+        var instance = new Derived();
+        if (instance.field !== 7 || instance.tag !== 'receiver' ||
+            typeof instance.before !== 'function' || new instance.after().receiver() !== 9)
+          throw new Error('lost initialized receiver');
+      }
+      class Early extends Base {
+        constructor() { var [Default = class { [this.tag]() {} }] = []; super(); }
+      }
+      var early;
+      try { new Early(); } catch (error) { early = error.name; }
+      if (early !== 'ReferenceError' || calls !== 10) throw new Error('lost this TDZ');
+      'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
+fn for_of_returns_run_inner_finalizers_before_iterator_close() {
+    let source = r#"
+      var effects = [], token = {};
+      function check(fn, mode, expected, value) {
+        effects = [];
+        var iterator = {
+          [Symbol.iterator]() { return this; },
+          next() { return {done: false, value: 1}; },
+          return() {
+            effects.push('close');
+            if (mode === 'throw') throw new Error('close');
+            return mode === 'primitive' ? 7 : {};
+          }
+        };
+        var actual;
+        try { actual = fn(iterator); effects.push('returned'); }
+        catch (error) { effects.push(error.name + ':' + error.message); }
+        if (effects.join(',') !== expected || actual !== value)
+          throw new Error('expected ' + expected + ', got ' + effects.join(','));
+      }
+      function bare(iter) {
+        for (var item of iter) {
+          try { return; }
+          catch (error) { effects.push('inner-catch'); }
+          finally { effects.push('finally'); }
+        }
+      }
+      check(bare, 'throw', 'finally,close,Error:close', undefined);
+      check(bare, 'normal', 'finally,close,returned', undefined);
+      check(function explicit(iter) {
+        var result = token;
+        try {
+          for (var item of iter) {
+            try { effects.push('expression'); return result; }
+            finally { result = {}; effects.push('inner'); }
+          }
+        } finally { effects.push('outer'); }
+      }, 'normal', 'expression,inner,close,outer,returned', token);
+      check(function overrideReturn(iter) {
+        for (var item of iter) {
+          try { return token; }
+          finally { effects.push('override'); return 42; }
+        }
+      }, 'normal', 'override,close,returned', 42);
+      check(function overrideThrow(iter) {
+        for (var item of iter) {
+          try { return token; }
+          finally { effects.push('override'); throw new Error('inner'); }
+        }
+      }, 'throw', 'override,close,Error:inner', undefined);
+      check(function outerCatch(iter) {
+        try {
+          for (var item of iter) {
+            try { return token; }
+            finally { effects.push('finally'); }
+          }
+        } catch (error) { effects.push('outer-catch:' + error.name); return 9; }
+      }, 'primitive', 'finally,close,outer-catch:TypeError,returned', 9);
+      check(function overrideContinue(iter) {
+        var count = 0;
+        for (var item of iter) {
+          try { return ++count; }
+          finally { effects.push('finally'); if (count === 1) continue; }
+        }
+      }, 'normal', 'finally,finally,close,returned', 2);
+      check(function overrideBreak(iter) {
+        for (var item of iter) {
+          try { return token; }
+          finally { effects.push('finally'); break; }
+        }
+        effects.push('after'); return 3;
+      }, 'normal', 'finally,close,after,returned', 3);
+      'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
+fn arrow_super_properties_capture_the_enclosing_receiver_without_explicit_this() {
+    // SuperProperty gets its receiver through GetThisEnvironment. Arrow functions
+    // inherit that environment even when neither body contains a `this` expression.
+    let source = r#"
+      var reads = [], key = Symbol('key');
+      class Base {
+        who() { return this; }
+        get prop() { reads.push(this); return this.value; }
+        set prop(value) { reads.push(this); this.value = value; }
+        get [key]() { return this; }
+        static who() { return this; }
+      }
+      class Derived extends Base {
+        make() { return () => () => [super.who(), super.prop++, super['prop'], super[key]]; }
+        static make() { return () => super.who(); }
+      }
+      var alternate = {value: 900}, instance = new Derived();
+      instance.value = 0;
+      var factory = instance.make(), arrow = factory.call(alternate);
+      for (var i = 0; i < 150; i++) {
+        var result = arrow.call(alternate);
+        if (result[0] !== instance || result[1] !== i || result[2] !== i + 1 ||
+            result[3] !== instance) throw new Error('instance receiver ' + i);
+      }
+      if (reads.length !== 450 || reads.some(value => value !== instance) ||
+          alternate.value !== 900) throw new Error('accessor receiver');
+      var staticArrow = Derived.make();
+      if (staticArrow.call(Base) !== Derived) throw new Error('static receiver');
+      var prototype = {who() { return this; }},
+          object = {__proto__: prototype, make() { return () => super.who(); }};
+      var objectArrow = object.make();
+      if (objectArrow.call(prototype) !== object) throw new Error('object receiver');
+      class Outer extends Base {
+        make() {
+          return {__proto__: prototype, make() { return () => super.who(); }};
+        }
+      }
+      var inner = new Outer().make(), innerArrow = inner.make();
+      if (innerArrow() !== inner) throw new Error('intervening method receiver');
+      'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
+fn loop_fallback_fusions_preserve_mixed_values_and_getter_effects() {
+    let source = r#"
+      function transfer(values, count) {
+        let result = 0;
+        for (let k = 0; k < count; k++) result = values[k];
+        return result;
+      }
+      var object = {}, symbol = Symbol(),
+          mixed = [1, 2, 'three', object, 5n, symbol, undefined, null, NaN, -0, 11];
+      for (var round = 0; round < 40; round++) {
+        if (transfer([1, 2, 3], 3) !== 3 || transfer(mixed, 0) !== 0)
+          throw new Error('numeric/zero-trip');
+        for (var count = 1; count <= mixed.length; count++)
+          if (!Object.is(transfer(mixed, count), mixed[count - 1]))
+            throw new Error('mixed transfer ' + count);
+      }
+      var seen = [], accessor = [1, 2, 3, 4];
+      Object.defineProperty(accessor, '2', {get() { seen.push(2); accessor[3] = object; return 'three'; }});
+      if (transfer(accessor, 4) !== object || seen.join(',') !== '2')
+        throw new Error('getter bailout order');
+      var failure = {};
+      Object.defineProperty(accessor, '1', {get() { seen.push(1); throw failure; }});
+      try { transfer(accessor, 4); throw new Error('missing throw'); }
+      catch (error) { if (error !== failure) throw error; }
+      if (seen.join(',') !== '2,1') throw new Error('repeated getter');
+      if (transfer([1, 2, 3], 3) !== 3) throw new Error('post-throw state');
+      function early(values, count) {
+        for (let k = 0; k < count; k++) result = values[k];
+        let result;
+        return 7;
+      }
+      if (early([], 0) !== 7) throw new Error('zero-trip TDZ');
+      seen = [];
+      var tdzValues = {get 0() { seen.push('rhs'); return 1; }};
+      try { early(tdzValues, 1); throw new Error('missing TDZ'); }
+      catch (error) { if (error.name !== 'ReferenceError') throw error; }
+      if (seen.join(',') !== 'rhs') throw new Error('TDZ before RHS');
+      var throwingValues = {get 0() { seen.push('throw'); throw failure; }};
+      try { early(throwingValues, 1); throw new Error('missing RHS throw'); }
+      catch (error) { if (error !== failure) throw error; }
+      if (seen.join(',') !== 'rhs,throw') throw new Error('replayed RHS');
+      'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
+fn discarded_local_reads_preserve_every_value_kind_and_tdz() {
+    let source = r#"
+      function touch(value) { let local = value; local; return local; }
+      function early() { local; let local; }
+      var observed = 0;
+      var proxy = new Proxy({}, {get() { observed++; throw new Error('unexpected get'); }});
+      var values = [undefined, null, false, true, -0, NaN, Infinity, 3.25,
+                    12345678901234567890n, 'value', Symbol('value'), {}, [], proxy];
+      for (var i = 0; i < 200; i++) {
+        var value = values[i % values.length];
+        if (!Object.is(touch(value), value)) throw new Error('changed value');
+      }
+      var errorName;
+      try { early(); } catch (error) { errorName = error.name; }
+      if (errorName !== 'ReferenceError' || observed !== 0) throw new Error('read effects');
+      'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
+fn compiled_lexical_assignments_check_tdz_after_rhs_and_close_iterators() {
+    let source = r#"
+      var effects = [];
+      function effect() { effects.push('rhs'); return 3; }
+      function check(fn, expected) {
+        effects = [];
+        try { fn(); effects.push('missing'); } catch (error) { effects.push(error.name); }
+        var actual = effects.join(',');
+        if (actual !== expected) throw new Error(actual + ' != ' + expected);
+      }
+      function discarded() { binding = effect(); let binding; }
+      function retained() { return binding = effect(); let binding; }
+      function comma() { (binding = effect(), 1); let binding; }
+      function classBinding() { binding = effect(); class binding {} }
+      function constant() { binding = effect(); const binding = 1; }
+      function rhsThrows() { binding = (() => { effect(); throw new RangeError(); })(); let binding; }
+      function compound() { binding += effect(); let binding; }
+      function optional() { null?.[binding]; binding = effect(); let binding; }
+      function shortCircuit() { const value = false; value &&= binding; binding = effect(); let binding; }
+      for (var fn of [discarded, retained, comma, classBinding, constant, optional, shortCircuit]) {
+        check(fn, 'rhs,ReferenceError');
+      }
+      check(rhsThrows, 'rhs,RangeError');
+      check(compound, 'ReferenceError');
+      function iterable() {
+        return { [Symbol.iterator]() { return this; },
+          next() { effects.push('next'); return {value: 1, done: false}; },
+          return() { effects.push('close'); return {done: true}; }
+        };
+      }
+      function forOf() { for (binding of iterable()) { throw new Error('body'); } let binding; }
+      function forIn() { for (binding in {one: 1}) { throw new Error('body'); } let binding; }
+      check(forOf, 'next,close,ReferenceError');
+      check(forIn, 'ReferenceError');
+      function* pattern() { [binding] = [yield 'value']; let binding; }
+      var generator = pattern();
+      if (generator.next().value !== 'value') throw new Error('yield');
+      check(() => generator.next(7), 'ReferenceError');
+      function* forOfGenerator() { for (binding of iterable()) {} let binding; yield 0; }
+      check(() => forOfGenerator().next(), 'next,close,ReferenceError');
+      function initialized() {
+        let binding;
+        binding = undefined;
+        binding = 1;
+        var sum = binding;
+        for (let item of [2, 3]) sum += item;
+        for (let key in {one: 1}) if (key !== 'one') throw new Error('key');
+        return sum;
+      }
+      if (initialized() !== 6) throw new Error('initialized store');
+      'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
+fn direct_eval_from_with_keeps_lexical_scope_and_argument_order() {
+    let source = r#"
+      function check(actual, expected, label) {
+        if (actual !== expected) throw new Error(label + ': ' + actual);
+      }
+      var local = 9;
+      var intrinsic = eval;
+      function directWith(object) {
+        with (object) {
+          return function () {
+            var local = 1;
+            return eval('local + 1');
+          }();
+        }
+      }
+      check(directWith(globalThis), 2, 'global with binding');
+      check(directWith({eval: intrinsic, local: -1000}), 2, 'own with binding');
+      check(directWith(Object.create({eval: intrinsic})), 2, 'inherited with binding');
+
+      var strictGets = 0;
+      function strictWith(object) {
+        with (object) {
+          return function () {
+            'use strict';
+            var local = 1;
+            return eval('local + 1');
+          }();
+        }
+      }
+      check(strictWith({get eval() { strictGets++; return intrinsic; }}), 2, 'strict direct eval');
+      check(strictGets, 1, 'tail-position getter runs once');
+
+      var effects = [];
+      var scope = {get eval() { effects.push('get'); return intrinsic; }};
+      function* argumentsForEval() {
+        effects.push('args');
+        Object.defineProperty(scope, 'eval', {value: function () { return -1; }});
+        yield 'local + 1';
+        effects.push('done');
+      }
+      function spreadWith() {
+        with (scope) {
+          return function () {
+            var local = 1;
+            var result = eval(...argumentsForEval());
+            return result;
+          }();
+        }
+      }
+      check(spreadWith(), 2, 'retained intrinsic and spread');
+      check(effects.join(','), 'get,args,done', 'reference before arguments');
+
+      var replacement = {eval: function () { 'use strict'; return this; }};
+      check(directWith(replacement), replacement, 'ordinary with receiver');
+      check(strictWith(replacement), replacement, 'ordinary tail with receiver');
+      var unscopable = {eval: function () { return -1; }, [Symbol.unscopables]: {eval: true}};
+      check(directWith(unscopable), 2, 'unscopables');
+
+      function indirect() {
+        var local = 1;
+        var object = {eval: intrinsic};
+        return [object.eval('local + 1'), (0, eval)('local + 1'), eval?.('local + 1')].join(',');
+      }
+      check(indirect(), '10,10,10', 'property, value and optional calls stay indirect');
+      'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        match engine.eval(source, false).unwrap() {
+            Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
 fn direct_eval_uses_the_retained_coroutine_activation() {
     let mut generator = Engine::new();
     generator
@@ -7482,7 +9165,9 @@ fn direct_eval_retains_runtime_lexicals_and_suspending_arguments() {
         .eval("oracleWithEval", false)
         .expect("tree-walker with-property eval result parses")
     {
-        Completion::Value(value) => assert_eq!(value, "undefined"),
+        // ResolveBinding through a with Environment Record is not a property
+        // Reference, so this is direct eval and sees the caller's lexical local.
+        Completion::Value(value) => assert_eq!(value, "number"),
         Completion::Throw { name, message } => {
             panic!("tree-walker with-property eval threw {name}: {message}")
         }
@@ -7527,7 +9212,7 @@ fn direct_eval_retains_runtime_lexicals_and_suspending_arguments() {
     match result {
         Completion::Value(value) => assert_eq!(
             value,
-            "2|3,4|1,4,number|5|6|5,6|1|4|4|undefined|source|spread|8,9,1|shadow-source|shadow:ok|intrinsic-source|10|with-source|undefined"
+            "2|3,4|1,4,number|5|6|5,6|1|4|4|undefined|source|spread|8,9,1|shadow-source|shadow:ok|intrinsic-source|10|with-source|number"
         ),
         Completion::Throw { name, message } => {
             panic!("runtime lexical direct-eval drive threw {name}: {message}")
@@ -13576,6 +15261,45 @@ fn regexp_anchored_no_match_stays_no_match_after_native_tier_up() {
 }
 
 #[test]
+fn native_regexp_exec_and_replace_with_armed_deadline_match_all_tiers() {
+    // RegExpBuiltinExec must report the actual matched substring/end index;
+    // @@replace collects those matches before invoking any replacement callbacks.
+    let source = r#"
+        const re = /./g;
+        const text = 'abc';
+        for (let round = 0; round < 96; round++) {
+            for (let start = 0; start < text.length; start++) {
+                const m = re.exec(text);
+                if (m === null || m[0] !== text[start] || m.index !== start || re.lastIndex !== start + 1)
+                    throw new Error('incorrect native match at ' + round + ':' + start);
+            }
+            if (re.exec(text) !== null || re.lastIndex !== 0)
+                throw new Error('incorrect native no-match tail');
+        }
+        let seen = '';
+        const replaced = text.replace(re, function (match, index, input) {
+            if (input !== text || re.lastIndex !== 0) throw new Error('replacement callback ordering');
+            seen += match + index;
+            return match.toUpperCase();
+        });
+        replaced + '|' + seen + '|' + re.lastIndex
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.interrupt_handle().set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        assert_eq!(run_in(&mut engine, source), "ABC|a0b1c2|0", "{tier:?}");
+    }
+}
+
+#[test]
 fn regexp_replace_dead_result_native_loop_terminates() {
     // Exercise the optimized dynamic-array dead-result replace after the matcher has promoted to
     // native code. The no-match tail must still advance to the subject end after every poll.
@@ -14286,6 +16010,20 @@ fn string_from_code_units_fast_paths_preserve_conversion_edges() {
     assert_eq!(
         run("try{String.fromCodePoint(0x110000)}catch(e){e instanceof RangeError}"),
         "true"
+    );
+    // Convert each argument once, in order, and do not inspect later arguments
+    // after an invalid code point (also run with numeric-error tracing enabled).
+    assert_eq!(
+        run(r#"
+            var trace = '';
+            var first = {valueOf(){trace += 'a';return 65;}};
+            var invalid = {valueOf(){trace += 'b';return 0x110000;}};
+            var later = {valueOf(){trace += 'c';return 66;}};
+            try { String.fromCodePoint(first, invalid, later); }
+            catch (error) { trace += error instanceof RangeError ? 'R' : 'X'; }
+            trace
+        "#),
+        "abR"
     );
 }
 
@@ -19807,6 +21545,120 @@ fn function_to_string_source_text() {
 }
 
 #[test]
+fn function_to_string_diagnostics_do_not_observe_author_properties() {
+    assert_eq!(
+        run("var seen = 0;
+         function f() { return 1; }
+         Object.defineProperty(f, 'name', {get() { seen++; throw new Error('name getter'); }});
+         var proxy = new Proxy(f, {get() { seen++; throw new Error('proxy get'); }});
+         var source = Function.prototype.toString.call(f);
+         var hidden = Function.prototype.toString.call(proxy);
+         [source, hidden, seen].join('|')"),
+        "function f() { return 1; }|function () { [native code] }|0"
+    );
+}
+
+#[test]
+fn host_snapshots_keep_source_policy_without_changing_execution_or_author_code() {
+    let source = r#"
+      function factory(value) {
+        /* opaque-host-comment */
+        return function closure() { return value; };
+      }
+      class Widget { method() { return 11; } }
+      var instance = new Widget();
+    "#;
+    let ordinary = crate::compile_snapshot(source).expect("ordinary snapshot");
+    let host = crate::compile_host_snapshot(source).expect("host snapshot");
+    assert!(host.len() < ordinary.len());
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for (snapshot, opaque) in [(&ordinary, false), (&host, true)] {
+            let mut engine = Engine::new();
+            engine.interp.tier = tier;
+            engine.interp.tier_threshold = 0;
+            assert!(matches!(
+                engine.eval_snapshot(snapshot, false).unwrap(),
+                Completion::Value(_)
+            ));
+            let result = engine
+                .eval(
+                    r#"
+              var closure = factory(7);
+              var platform = [factory, closure, Widget, instance.method];
+              var opaque = platform.every(f => /\{\s*\[native code\]\s*\}$/.test(f.toString()));
+              var author = function author() { /* keep author text */ return 17; };
+              var dynamic = Function('return function dynamic() { return 19; };')();
+              [opaque, factory.toString().includes('opaque-host-comment'),
+               closure(), instance.method(), author.toString().includes('keep author text'),
+               dynamic.toString() === 'function dynamic() { return 19; }', dynamic()].join('|');
+            "#,
+                    false,
+                )
+                .unwrap();
+            match result {
+                Completion::Value(value) => assert_eq!(
+                    value,
+                    if opaque {
+                        "true|false|7|11|true|true|19"
+                    } else {
+                        "false|true|7|11|true|true|19"
+                    },
+                    "{tier:?}"
+                ),
+                Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn host_snapshot_job_leaves_microtasks_with_the_embedder() {
+    let snapshot = crate::compile_host_snapshot(
+        "var order = []; Promise.resolve().then(() => order.push('job')); order.push('sync');",
+    )
+    .unwrap();
+    let mut engine = Engine::new();
+    assert!(engine
+        .eval_snapshot_value_interruptible(&snapshot)
+        .unwrap()
+        .is_ok());
+    let order = engine
+        .eval_value_interruptible("order.join(',')")
+        .unwrap()
+        .ok()
+        .expect("script");
+    assert_eq!(
+        engine
+            .ctx()
+            .coerce_string(&order)
+            .ok()
+            .expect("string")
+            .as_ref(),
+        "sync"
+    );
+    engine.run_microtasks_interruptible().unwrap();
+    let order = engine
+        .eval_value_interruptible("order.join(',')")
+        .unwrap()
+        .ok()
+        .expect("script");
+    assert_eq!(
+        engine
+            .ctx()
+            .coerce_string(&order)
+            .ok()
+            .expect("string")
+            .as_ref(),
+        "sync,job"
+    );
+}
+
+#[test]
 fn cross_realm_construct_semantics() {
     // GetFunctionRealm unwraps bound functions: the fallback prototype comes from the bound
     // target's realm.
@@ -21074,6 +22926,54 @@ fn jit_plain_object_templates_move_values_without_aliasing() {
 }
 
 #[test]
+fn jit_local_store_pairs_preserve_owned_values_and_throw_state() {
+    let source = r#"
+      function kept(a, k, local) {
+        local = {old:k};
+        return local = a[k];
+      }
+      function reloaded(a, k, local) {
+        local = 111111111111111111111111111111n;
+        return local = a[k], local;
+      }
+      function caught(a, k, local) {
+        try { return local = a[k], local; }
+        catch (e) { return local; }
+      }
+      var object = {value:7}, symbol = Symbol('key');
+      var a = [object, 'text', symbol, 123456789012345678901234567890n,
+               undefined, null, true, false, -0, NaN, Infinity, 17];
+      a.push(a);
+      var ok = true;
+      for (var i = 0; i < 1300; i++) {
+        var k = i % a.length;
+        ok = ok && Object.is(kept(a,k),a[k]) && Object.is(reloaded(a,k),a[k]);
+      }
+      var original = kept(a,0);
+      a[0] = {value:9};
+      var bad = {get 0() { throw new Error('stop'); }};
+      for (var i = 0; i < 300; i++) {
+        ok = ok && caught(bad,0,object) === object && caught([symbol],0,object) === symbol;
+      }
+      [ok, original === object, original.value, kept(a,0).value].join('|');
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        let result = match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        };
+        assert_eq!(result, "true|true|7|9", "{tier:?}");
+    }
+}
+
+#[test]
 fn jit_direct_calls_support_wide_argument_lists() {
     // More than eight arguments used to force every hot call through the layered Rust path.
     // Keep refcounted operands, method receivers, nested wide calls and an unwind in the test:
@@ -21155,6 +23055,119 @@ fn jit_slice_and_hasown_intrinsics_preserve_slow_paths() {
 // identity guard (bytecode::plan_inlines). Drivers loop enough times to cross the recompile
 // trigger; every case must behave exactly like the generic call path.
 // ---------------------------------------------------------------------------------------------
+
+#[test]
+fn jit_calls_preserve_lexical_strictness_and_restore_the_caller() {
+    // ECMA-262 Strict Mode Code and PutValue: strictness belongs to the source reference,
+    // not to the function that happened to call it. Exercise ordinary, cached, direct,
+    // activation-requiring and constructor entries, plus normal/throwing returns.
+    let source = r#"
+        var locked = Object.preventExtensions({});
+        function strictWrite(o) { 'use strict'; o.x = 3; }
+        function sloppyWrite(o) { o.x = 4; return 7; }
+        function invoke(f, o) { return f(o); }
+        function strictInvoke(f, o) { 'use strict'; f(o); o.x = 5; }
+        function withActivation(o) {
+            'use strict';
+            function captured() { return o; }
+            o.x = captured();
+        }
+        function StrictConstructor(o) { 'use strict'; o.x = this; }
+        function make(o) { return new StrictConstructor(o); }
+        function strictRestoration(o) {
+            'use strict';
+            try { strictWrite(o); } catch (e) {}
+            sloppyWrite(o);
+            o.x = 6;
+        }
+        var required = 0;
+        function expectTypeError(f) {
+            try { invoke(f, locked); }
+            catch (e) { if (!(e instanceof TypeError)) throw e; required++; return; }
+            throw 'missing strict write error';
+        }
+        for (var n = 0; n < 500; n++) {
+            expectTypeError(strictWrite);
+            expectTypeError(withActivation);
+            expectTypeError(make);
+            expectTypeError(strictRestoration);
+            try { strictInvoke(sloppyWrite, locked); }
+            catch (e) { if (!(e instanceof TypeError)) throw e; required++; }
+            if (invoke(sloppyWrite, locked) !== 7) throw 'sloppy call inherited strictness';
+            locked.x = 9;
+        }
+        required + ':' + Object.hasOwn(locked, 'x')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "2500:false", "{tier:?}");
+    }
+}
+
+#[test]
+fn computed_key_caches_preserve_live_values_getters_proxies_and_key_coercion() {
+    // ECMA-262 GetValue / OrdinaryGet / ToPropertyKey. A computed-key cache identifies
+    // property names by text, validates the live chain, and never replays key conversion.
+    let source = r#"
+        function read(o, key) { return (0, o)[key]; }
+        function invoke(o, key) { return o[key](); }
+        var proto = {alpha: function() { return this.value; }};
+        var object = Object.create(proto);
+        object.value = 7;
+        object.brava = function() { return this.value + 2; };
+        for (var n = 0; n < 700; n++) {
+            var key = ('!' + (n % 2 ? 'brava' : 'alpha')).slice(1);
+            if (invoke(object, key) !== (n % 2 ? 9 : 7)) throw 'transient key mismatch';
+        }
+        object.value = 12;
+        if (invoke(object, 'alpha') !== 12) throw 'stale value';
+        Object.setPrototypeOf(object, {alpha: function() { return this.value * 2; }});
+        if (invoke(object, 'alpha') !== 24) throw 'stale prototype';
+        var gets = 0, coerces = 0;
+        Object.defineProperty(object, 'alpha', {configurable: true, get: function() {
+            gets++;
+            if (read({brava: 19}, 'brava') !== 19) throw 'reentrant read';
+            return function() { return this.value + 3; };
+        }});
+        var keyObject = {toString: function() { coerces++; return 'alpha'; }};
+        for (var n = 0; n < 200; n++) {
+            if (invoke(object, keyObject) !== 15) throw 'getter receiver';
+        }
+        if (gets !== 200 || coerces !== 200) throw 'duplicated or skipped effects';
+        delete object.alpha;
+        if (invoke(object, 'alpha') !== 24) throw 'stale own getter';
+        var traps = 0;
+        var proxy = new Proxy(object, {get: function(o,k,r) {
+            traps++;
+            return k === 'alpha' ? function() { return 31; } : Reflect.get(o,k,r);
+        }});
+        for (var n = 0; n < 200; n++) if (invoke(proxy, 'alpha') !== 31) throw 'proxy skipped';
+        if (traps !== 200) throw 'proxy replayed';
+        var symbol = Symbol('alpha');
+        object[symbol] = function() { return 41; };
+        if (invoke(object, symbol) !== 41) throw 'symbol became a string';
+        var array = [10, 20];
+        if (read(array, '0') !== 10 || read(array, 'length') !== 2) throw 'array lookup';
+        if (read('abc', '1') !== 'b' || read('abc', 'length') !== 3) throw 'string lookup';
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "{tier:?}");
+    }
+}
 
 #[test]
 fn inline_four_way_nested_dispatch_and_deopt() {
@@ -21611,6 +23624,57 @@ fn jit_seeded_numeric_name_cache_reads_live_mutations() {
         ),
         "12:41"
     );
+}
+
+#[test]
+fn binding_layout_fresh_closures_preserve_parent_identity_live_writes_and_eval() {
+    let source = r#"
+        function family(initial) {
+            let outer = {value: initial};
+            return {
+                make(local) {
+                    return function(delta) {
+                        outer = {value: outer.value + delta};
+                        return outer.value + local;
+                    };
+                },
+                replace(value) { outer = {value}; }
+            };
+        }
+        const left = family(7), right = family(100);
+        for (let n = 0; n < 800; n++) {
+            const f = left.make(n), g = right.make(n);
+            if (f(0) !== 7+n || g(0) !== 100+n) throw 'wrong closure family';
+        }
+        left.replace(20);
+        const f = left.make(3), g = right.make(4);
+        if (f(2) !== 25 || g(1) !== 105 || f(0) !== 25) throw 'stale value';
+
+        let outer = 5;
+        function dynamic(local, text) {
+            const read = function() { return outer + local; };
+            const before = read();
+            eval(text);
+            const after = read();
+            eval('delete outer');
+            return before + ':' + after + ':' + read();
+        }
+        for (let n = 0; n < 240; n++) {
+            if (dynamic(2, 'var outer=11') !== '7:13:7') throw 'eval shadow';
+            if (dynamic(2, 'var unrelated=11') !== '7:7:7') throw 'equal-count scope';
+        }
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "tier {tier:?}");
+    }
 }
 
 #[test]

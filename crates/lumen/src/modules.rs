@@ -118,6 +118,11 @@ pub(crate) struct ModuleCoro {
 }
 
 impl ModuleCoro {
+    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
+        let Self { body, key: _ } = self;
+        body.trace_gc(edges);
+    }
+
     fn new(body: crate::bytecode::VmCoro, key: String) -> ModuleCoro {
         ModuleCoro { body, key }
     }

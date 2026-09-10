@@ -132,10 +132,11 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         let obj = new_from_ctor(i, "FinalizationRegistry")?;
         let ptr = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
+        let cleanup_callback = i.make_job_callback(arg(a, 0));
         i.finalization_registries.insert(
             ptr,
             crate::interpreter::FinalizationState {
-                cleanup_callback: arg(a, 0),
+                cleanup_callback,
                 cells: Vec::new(),
                 cleanup_scheduled: false,
             },

@@ -1212,6 +1212,13 @@ fn scan_realm(
             .saturating_add(interp.import_base.capacity())
             .saturating_add(
                 interp
+                    .native_function_realms
+                    .borrow()
+                    .len()
+                    .saturating_mul(size_of::<(usize, (std::rc::Weak<RefCell<Object>>, usize))>()),
+            )
+            .saturating_add(
+                interp
                     .construct_capacity_hints
                     .len()
                     .saturating_mul(size_of::<(
@@ -1238,6 +1245,7 @@ fn scan_realm(
     if !interp.error_protos.is_empty()
         || !interp.extra_protos.is_empty()
         || !interp.eval_realm_fns.is_empty()
+        || !interp.native_function_realms.borrow().is_empty()
         || !interp.construct_capacity_hints.is_empty()
         || !interp.htmldda.is_empty()
     {
@@ -1350,15 +1358,21 @@ fn scan_realm(
         visitor.value(&state.value);
         totals
             .interpreter_side_tables
-            .add(
-                state
-                    .reactions
-                    .capacity()
-                    .saturating_mul(size_of::<(Value, Value, Value, u64)>()),
-            );
+            .add(state.reactions.capacity().saturating_mul(size_of::<(
+                crate::interpreter::JobCallback,
+                crate::interpreter::JobCallback,
+                Value,
+                u64,
+            )>()));
         for (on_fulfilled, on_rejected, result, _) in &state.reactions {
-            visitor.value(on_fulfilled);
-            visitor.value(on_rejected);
+            visitor.value(&on_fulfilled.callback);
+            visitor.value(&on_rejected.callback);
+            if let Some(global) = &on_fulfilled.script_caller {
+                visitor.value(&Value::Obj(global.clone()));
+            }
+            if let Some(global) = &on_rejected.script_caller {
+                visitor.value(&Value::Obj(global.clone()));
+            }
             visitor.value(result);
         }
     }
@@ -1367,7 +1381,10 @@ fn scan_realm(
         visitor.value(reason);
     }
     for job in &interp.microtasks {
-        visitor.value(&job.handler);
+        visitor.value(&job.handler.callback);
+        if let Some(global) = &job.handler.script_caller {
+            visitor.value(&Value::Obj(global.clone()));
+        }
         visitor.value(&job.result);
         visitor.value(&job.value);
     }
@@ -1468,7 +1485,10 @@ fn scan_realm(
             ),
     );
     for registry in interp.finalization_registries.values() {
-        visitor.value(&registry.cleanup_callback);
+        visitor.value(&registry.cleanup_callback.callback);
+        if let Some(global) = &registry.cleanup_callback.script_caller {
+            visitor.value(&Value::Obj(global.clone()));
+        }
         totals.interpreter_side_tables.add(
             registry
                 .cells
@@ -1680,6 +1700,12 @@ fn scan_realm(
     }
     let (construct_ic_bytes, construct_ics_exact) = interp.construct_ic_retained_memory();
     totals.interpreter_side_tables.add(construct_ic_bytes);
+    totals
+        .interpreter_side_tables
+        .add(interp.call_overflow.retained_bytes());
+    totals
+        .interpreter_side_tables
+        .add(interp.computed_reads.scan_retained_memory(visitor));
     if !interp.class_info.is_empty() || !construct_ics_exact {
         totals
             .interpreter_side_tables

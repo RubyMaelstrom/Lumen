@@ -36,9 +36,10 @@ use crate::bytecode::UpdKind;
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
 
-/// Opt-in process counters used by the reproducible benchmark runner. The enabled check occurs
-/// only when a chunk first attempts native compilation, never in generated code or ordinary JIT
-/// execution. Relaxed atomics are sufficient: these are aggregate diagnostics, not engine state.
+/// Opt-in process counters used by the reproducible benchmark runner. Compilation,
+/// native operations, conversions, and selected allocation/lookup helpers check this
+/// flag; disabled paths do no counter updates, timing, or diagnostic traversal.
+/// Relaxed atomics are sufficient: these are aggregate diagnostics, not engine state.
 // 0 = not initialized, 1 = disabled, 2 = enabled. The diagnostics switch is process-scoped and
 // sampled once; a relaxed byte load keeps disabled instrumentation at a predictable branch cost
 // without taking the `OnceLock` fast path on every iterator/conversion helper.
@@ -717,8 +718,13 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let iterate_protocol_nanos = PERF_ITERATE_PROTOCOL_NANOS.load(Relaxed);
     let iterate_protocol_failures = PERF_ITERATE_PROTOCOL_FAILURES.load(Relaxed);
     let gc = crate::value::gc_performance_metrics_json_fields();
+    let (code_used, code_limit, code_denials) = executable_code_stats();
+    let workload_metrics = crate::workload_metrics::json_fields();
+    let code_metrics = format!(
+        "\"executable_code_live_bytes\":{code_used},\"executable_code_limit_bytes\":{code_limit},\"executable_code_budget_denials\":{code_denials},{workload_metrics}"
+    );
     Some(format!(
-        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},\"managed_memory\":{managed_memory},\"native_by_operation\":{native_by_op}}}",
+        "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},{code_metrics},\"managed_memory\":{managed_memory},\"native_by_operation\":{native_by_op}}}",
         attempts.saturating_sub(successes),
         nanos as f64 / 1_000_000_000.0,
         lex_nanos as f64 / 1_000_000_000.0,
@@ -939,43 +945,275 @@ mod sys {
 
 /// The process-wide executable-code budget shared by the bytecode JIT and native RegExp tiers.
 ///
-/// This is deliberately a conservative cap on live executable mappings, rather than a diagnostic
-/// total of all code ever emitted. A failed reservation makes the caller retain its checked
-/// fallback tier, and dropping the owning mapping returns the bytes for a later hot pattern.
-pub(crate) const EXECUTABLE_CODE_BUDGET: usize = 16 << 20;
-static EXECUTABLE_CODE_REMAINING: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(EXECUTABLE_CODE_BUDGET);
+/// This caps requested bytes in live executable mappings, not a cumulative total
+/// of code ever emitted (OS page rounding is separate). Browser bootstrap can
+/// exceed 16 MiB before application hot functions even compile. Keep bounded
+/// headroom; a failed reservation uses the checked fallback, and dropping the
+/// owning mapping returns capacity to later hot code.
+pub(crate) const EXECUTABLE_CODE_BUDGET: usize = 128 << 20;
 
-pub(crate) struct ExecutableCodeReservation {
-    bytes: usize,
+fn configured_executable_code_budget(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|mib| (1..=1024).contains(mib))
+        .and_then(|mib| mib.checked_mul(1 << 20))
+        .unwrap_or(EXECUTABLE_CODE_BUDGET)
 }
 
-impl ExecutableCodeReservation {
-    fn try_new(bytes: usize) -> Option<Self> {
+struct ExecutableCodeBudget {
+    limit: usize,
+    remaining: std::sync::atomic::AtomicUsize,
+    denials: std::sync::atomic::AtomicU64,
+}
+
+impl ExecutableCodeBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            remaining: std::sync::atomic::AtomicUsize::new(limit),
+            denials: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+fn executable_code_budget() -> &'static ExecutableCodeBudget {
+    static BUDGET: std::sync::OnceLock<ExecutableCodeBudget> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        ExecutableCodeBudget::new(configured_executable_code_budget(
+            std::env::var("LUMEN_JIT_CODE_BUDGET_MB").ok().as_deref(),
+        ))
+    })
+}
+
+pub(crate) fn executable_code_can_fit(bytes: usize) -> bool {
+    executable_code_budget()
+        .remaining
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= bytes
+}
+
+thread_local! {
+    // Scoped to compilation, never JS execution. A nested compiler invocation
+    // restores its caller's observation, and other threads have separate slots.
+    static COMPILATION_DENIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CompilationPressureScope(usize);
+
+impl CompilationPressureScope {
+    fn enter() -> Self {
+        Self(COMPILATION_DENIED_BYTES.with(|slot| slot.replace(0)))
+    }
+
+    fn denied_bytes(&self) -> usize {
+        COMPILATION_DENIED_BYTES.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for CompilationPressureScope {
+    fn drop(&mut self) {
+        COMPILATION_DENIED_BYTES.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Live requested executable bytes, hard limit, and rejected reservations. This
+/// intentionally excludes page rounding and ordinary compilation metadata.
+pub(crate) fn executable_code_stats() -> (usize, usize, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let budget = executable_code_budget();
+    (
+        budget.limit - budget.remaining.load(Relaxed),
+        budget.limit,
+        budget.denials.load(Relaxed),
+    )
+}
+
+pub(crate) struct ExecutableCodeReservation<'a> {
+    bytes: usize,
+    budget: &'a ExecutableCodeBudget,
+}
+
+impl<'a> ExecutableCodeReservation<'a> {
+    fn try_new(budget: &'a ExecutableCodeBudget, bytes: usize) -> Option<Self> {
         if bytes == 0 {
             return None;
         }
-        let mut remaining = EXECUTABLE_CODE_REMAINING.load(std::sync::atomic::Ordering::Relaxed);
+        let mut remaining = budget.remaining.load(std::sync::atomic::Ordering::Relaxed);
         loop {
             if remaining < bytes {
+                COMPILATION_DENIED_BYTES.with(|slot| slot.set(bytes));
+                budget
+                    .denials
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
             }
-            match EXECUTABLE_CODE_REMAINING.compare_exchange_weak(
+            match budget.remaining.compare_exchange_weak(
                 remaining,
                 remaining - bytes,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(Self { bytes }),
+                Ok(_) => return Some(Self { bytes, budget }),
                 Err(next) => remaining = next,
             }
         }
     }
 }
 
-impl Drop for ExecutableCodeReservation {
+impl Drop for ExecutableCodeReservation<'_> {
     fn drop(&mut self) {
-        EXECUTABLE_CODE_REMAINING.fetch_add(self.bytes, std::sync::atomic::Ordering::Release);
+        self.budget
+            .remaining
+            .fetch_add(self.bytes, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod executable_code_budget_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn executable_code_budget_is_bounded_and_validated() {
+        for invalid in [
+            None,
+            Some("0"),
+            Some("-1"),
+            Some("1025"),
+            Some("1.5"),
+            Some("bad"),
+        ] {
+            assert_eq!(
+                configured_executable_code_budget(invalid),
+                EXECUTABLE_CODE_BUDGET
+            );
+        }
+        assert_eq!(configured_executable_code_budget(Some("1")), 1 << 20);
+        assert_eq!(configured_executable_code_budget(Some("128")), 128 << 20);
+        assert_eq!(configured_executable_code_budget(Some("1024")), 1024 << 20);
+    }
+
+    #[test]
+    fn executable_code_reservations_release_capacity_and_count_pressure() {
+        let budget = ExecutableCodeBudget::new(100);
+        assert!(ExecutableCodeReservation::try_new(&budget, 0).is_none());
+        let first = ExecutableCodeReservation::try_new(&budget, 60).unwrap();
+        assert!(ExecutableCodeReservation::try_new(&budget, 41).is_none());
+        let second = ExecutableCodeReservation::try_new(&budget, 40).unwrap();
+        assert_eq!(budget.remaining.load(Relaxed), 0);
+        assert_eq!(budget.denials.load(Relaxed), 1);
+        drop(first);
+        assert_eq!(budget.remaining.load(Relaxed), 60);
+        let replacement = ExecutableCodeReservation::try_new(&budget, 60).unwrap();
+        drop((second, replacement));
+        assert_eq!(budget.remaining.load(Relaxed), 100);
+    }
+
+    #[test]
+    fn executable_code_budget_is_shared_safely_between_threads() {
+        let budget = ExecutableCodeBudget::new(128);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        let reservation = ExecutableCodeReservation::try_new(&budget, 64);
+                        assert!(budget.remaining.load(Relaxed) <= 128);
+                        std::thread::yield_now();
+                        drop(reservation);
+                    }
+                });
+            }
+        });
+        assert_eq!(budget.remaining.load(Relaxed), 128);
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    #[test]
+    fn jit_compilation_recovers_after_executable_budget_pressure() {
+        // The budget is process-wide. Isolate this forced-pressure test rather
+        // than stealing executable capacity from concurrently running tests.
+        const CHILD: &str = "LUMEN_TEST_CODE_PRESSURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "jit::executable_code_budget_tests::jit_compilation_recovers_after_executable_budget_pressure",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("LUMEN_JIT_CODE_BUDGET_MB", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use crate::value::{Callable, Value};
+        let mut engine = crate::Engine::new();
+        engine.set_tier(crate::bytecode::Tier::Jit);
+        engine.set_tier_threshold(0);
+        engine
+            .eval("function hot(value) { return value + 1; }", false)
+            .unwrap();
+        let global = Value::Obj(engine.interp.global.clone());
+        let function = engine
+            .interp
+            .get_member(&global, "hot")
+            .unwrap_or_else(|_| panic!("hot function binding exists"));
+        let budget = executable_code_budget();
+        let held =
+            ExecutableCodeReservation::try_new(budget, budget.remaining.load(Relaxed)).unwrap();
+        assert!(
+            matches!(engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)]),
+            Ok(Value::Num(value)) if value == 42.0)
+        );
+        let Value::Obj(object) = &function else {
+            panic!("function object")
+        };
+        let chunk = match &object.borrow().call {
+            Callable::User(user) => user
+                .func
+                .code
+                .get()
+                .and_then(Option::as_ref)
+                .unwrap()
+                .clone(),
+            _ => panic!("ordinary user function"),
+        };
+        assert!(
+            chunk.jit.get().is_none(),
+            "pressure must not cache a permanent JIT failure"
+        );
+        assert!(chunk.jit_budget_wait_bytes.get() > 0);
+        let denials = budget.denials.load(Relaxed);
+        for _ in 0..32 {
+            assert!(
+                matches!(engine.interp.call(function.clone(), Value::Undefined, &[Value::Num(41.0)]),
+                Ok(Value::Num(value)) if value == 42.0)
+            );
+        }
+        assert_eq!(
+            budget.denials.load(Relaxed),
+            denials,
+            "no repeated emission while capacity is unavailable"
+        );
+        drop(held);
+        assert!(
+            matches!(engine.interp.call(function, Value::Undefined, &[Value::Num(41.0)]),
+            Ok(Value::Num(value)) if value == 42.0)
+        );
+        assert!(
+            chunk.jit.get().is_some_and(Option::is_some),
+            "released capacity permits a real JIT entry"
+        );
+        assert_eq!(chunk.jit_budget_wait_bytes.get(), 0);
     }
 }
 
@@ -985,7 +1223,7 @@ impl Drop for ExecutableCodeReservation {
 pub(crate) struct ExecutableBuffer {
     mem: *mut u8,
     len: usize,
-    _reservation: ExecutableCodeReservation,
+    _reservation: ExecutableCodeReservation<'static>,
 }
 
 impl ExecutableBuffer {
@@ -993,7 +1231,8 @@ impl ExecutableBuffer {
         if bytes.is_empty() {
             return None;
         }
-        let reservation = ExecutableCodeReservation::try_new(bytes.len())?;
+        let reservation =
+            ExecutableCodeReservation::try_new(executable_code_budget(), bytes.len())?;
         #[cfg(any(
             all(
                 target_arch = "aarch64",
@@ -1247,6 +1486,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_make_regexp as *const () as usize,
         crate::bytecode::jit_interrupt as *const () as usize,
         crate::bytecode::jit_loop_backedge as *const () as usize,
+        crate::bytecode::jit_get_method_elem as *const () as usize,
     ]
 }
 
@@ -1336,7 +1576,8 @@ unsafe extern "C" fn jit_prepare_numeric_packed_array(
     slots
 }
 
-pub const N_HELPERS: usize = 28;
+pub const H_GET_METHOD_ELEM: usize = 28;
+pub const N_HELPERS: usize = 29;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -1370,6 +1611,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "make_regexp",
     "interrupt",
     "loop_backedge",
+    "get_method_elem",
 ];
 
 #[inline]
@@ -1678,6 +1920,15 @@ mod asm {
         }
         fn emit(&mut self, i: u32) {
             self.buf.push(i);
+        }
+
+        /// Best-effort hot-code alignment before branch relaxation. Padding executes only on
+        /// fallthrough; bind the loop's back-edge label after it. NOP preserves registers/NZCV.
+        pub fn align_hot(&mut self, bytes: usize) {
+            debug_assert!(bytes >= 4 && bytes.is_power_of_two());
+            while !(self.buf.len() * 4).is_multiple_of(bytes) {
+                self.emit(0xD503_201F);
+            }
         }
 
         /// movz xd, #imm16, lsl #(shift*16)
@@ -2005,6 +2256,10 @@ mod asm {
         pub fn lsr_imm(&mut self, rd: u32, rn: u32, shift: u32) {
             debug_assert!(shift < 64);
             self.emit(0xD340_FC00 | (shift << 16) | (rn << 5) | rd);
+        }
+        /// lsrv xd, xn, xm (64-bit logical variable shift).
+        pub fn lsr_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd);
         }
         /// lsl xd, xn, #shift (UBFM alias)
         pub fn lsl_imm(&mut self, rd: u32, rn: u32, shift: u32) {
@@ -2643,6 +2898,9 @@ pub fn compile(
 ) -> Option<JitCode> {
     use crate::bytecode::{Op, UpdKind};
 
+    if !ilayout.valid {
+        return None; // Cannot establish the body's lexical mode without a validated layout.
+    }
     let ops = chunk.jit_ops();
     if ops.len() > 0xFFFF {
         return None; // op index must fit one movz
@@ -2737,9 +2995,10 @@ pub fn compile(
     let l_direct_finish = a.new_label();
 
     // ---- prologue ----
-    // Frame: save fp/lr + x19..x22 (x19=ctx, x20=sp, x21=helpers, x22=slots) + d8..d15.
-    const FRAME_SIZE: i32 = 112;
+    // Frame: fp/lr + x19..x22 + d8..d15 + saved caller strictness (16-byte alignment).
+    const FRAME_SIZE: i32 = 128;
     const DSAVE: i32 = 48;
+    const STRICT_SAVE: u32 = 112;
     a.stp_pre(29, 30, -FRAME_SIZE);
     a.stp_off(19, 20, 16);
     a.stp_off(21, 22, 32);
@@ -2751,6 +3010,16 @@ pub fn compile(
     a.ldr_imm(21, 19, 0); // helpers table
     a.ldr_imm(20, 19, 8); // sp = stack_base
     a.ldr_imm(22, 19, 24); // local slots base
+
+    // ECMA-262 Strict Mode Code / PutValue: semantic helpers must see THIS body's lexical
+    // mode, including cached calls and direct shared-context calls. Save on the native frame,
+    // not JitCtx (which direct callees share), and restore on both normal and throwing exits.
+    a.ldr_imm(13, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
+    a.ldrb_imm(9, strict_base, strict_off);
+    a.strb_imm(9, 31, STRICT_SAVE);
+    a.movz(9, u32::from(chunk.jit_is_strict()), 0);
+    a.strb_imm(9, strict_base, strict_off);
 
     // Branch/catch targets: a fused compare+branch may only swallow a following JumpIfFalse if
     // nothing can land on the branch op itself.
@@ -2936,13 +3205,10 @@ pub fn compile(
             }
             if !emitted_region {
                 if let Some(plan) = plan_loop(chunk, ops, pc, &targeted, layout, fast, &cfg) {
-                    let plain_h = emit_loop_chain(&mut a, layout, &plan, &pc_labels);
+                    let plain_h = emit_loop_chain(&mut a, layout, &plan, &pc_labels, &mut targeted);
                     a.bind(plain_h);
-                    // Bails jump to interior pc labels, so the plain region below must never fuse
-                    // across them: mark every interior pc targeted (all fusions respect that).
-                    for p in pc + 1..=plan.jump_pc {
-                        targeted[p] = true;
-                    }
+                    // The emitter marks its actual interior resume PCs. Preserve those entries
+                    // without turning every ordinary instruction into a fusion boundary.
                     // Fall through: the plain template for this op (and the rest of the region)
                     // emits as usual.
                 }
@@ -3125,6 +3391,34 @@ pub fn compile(
                     ElemLocalKind::Get,
                     key,
                 );
+                skip = 1;
+                continue;
+            }
+        }
+        // Store-and-reload and assignment-result pairs keep one owned copy on the
+        // operand stack. Fuse them without assuming a numeric value or reloading the
+        // slot, while retaining the ordinary fallback for BigInt and unusual layouts.
+        if fast & (8 | 16 | 64) == (8 | 16 | 64) {
+            if let Some(slot) = local_store_pair(ops, pc, &targeted) {
+                emit_store_local(
+                    &mut a,
+                    layout,
+                    slot as u32 * 16,
+                    &[pc as u32, pc as u32 + 1],
+                    l_unwind,
+                    true,
+                    rc_ok,
+                );
+                skip = 1;
+                continue;
+            }
+        }
+        // An unused local read still checks the TDZ, but does not need a cloned
+        // Value or any refcount/BigInt traffic. In particular this is the guard
+        // before a plain lexical assignment. Keep independent Pop entries intact.
+        if fast & (8 | 64) == (8 | 64) {
+            if let Some(slot) = local_read_discard_pair(ops, pc, &targeted) {
+                emit_discard_local_read(&mut a, slot as u32 * 16, pc as u32, l_unwind);
                 skip = 1;
                 continue;
             }
@@ -3817,47 +4111,15 @@ pub fn compile(
                 a.bind(done);
             }
             Op::StoreLocal(slot) if fast & 16 != 0 && (*slot as u32) * 16 + 16 < 4096 => {
-                let off = *slot as u32 * 16;
-                let slow = a.new_label();
-                let done = a.new_label();
-                a.ldrb_imm(9, 22, off);
-                if rc_ok {
-                    let drop_old = a.new_label();
-                    a.cmp_imm_w(9, 5);
-                    a.b_cond(C_EQ, drop_old);
-                    let mv = a.new_label();
-                    a.cmp_imm_w(9, 6);
-                    a.b_cond(C_LO, mv);
-                    a.ldr_imm(10, 22, off + 8);
-                    a.ldur(9, 10, rc_strong);
-                    a.cmp_imm_x(9, 1);
-                    a.b_cond(C_LS, drop_old);
-                    a.sub_imm(9, 9, 1);
-                    a.stur(9, 10, rc_strong);
-                    a.b(mv);
-                    // Last references and BigInts need a real destructor, but StoreLocal itself
-                    // cannot throw. Drop only the old slot through the tiny dedicated helper,
-                    // then keep the actual stack-to-slot move in generated code.
-                    a.bind(drop_old);
-                    a.mov(0, 19);
-                    a.movz(1, 0, 0);
-                    a.add_imm(2, 22, off);
-                    a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
-                    a.blr(16);
-                    a.bind(mv);
-                } else {
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_HI, slow);
-                }
-                a.ldur(9, 20, -16);
-                a.ldur(10, 20, -8);
-                a.str_imm(9, 22, off);
-                a.str_imm(10, 22, off + 8);
-                a.sub_imm(20, 20, 16);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
+                emit_store_local(
+                    &mut a,
+                    layout,
+                    *slot as u32 * 16,
+                    &[pc as u32],
+                    l_unwind,
+                    false,
+                    rc_ok,
+                );
             }
             Op::UpdateLocal(slot, kind) if fast & 32 != 0 && (*slot as u32) * 16 + 8 < 4096 => {
                 let off = *slot as u32 * 16;
@@ -4098,6 +4360,7 @@ pub fn compile(
                         let l_probe = a.new_label();
                         let l_next = a.new_label();
                         let l_hit = a.new_label();
+                        let l_primary_hit = a.new_label();
                         a.bind(l_probe);
                         a.ldur(11, 12, 0); // ic.callee (an Rc::as_ptr identity)
                         a.cmp_reg_x(13, 11);
@@ -4107,7 +4370,7 @@ pub fn compile(
                         a.b_cond(C_NE, l_next);
                         a.ldr_imm(11, 12, 32); // ic.global_env
                         a.cmp_reg_x(11, 17);
-                        a.b_cond(C_EQ, l_hit);
+                        a.b_cond(C_EQ, l_primary_hit);
                         a.bind(l_next);
                         // entry stride (size compile-asserted below the JitCtx asserts)
                         let stride =
@@ -4115,13 +4378,14 @@ pub fn compile(
                         a.add_imm(12, 12, stride as u32);
                         a.sub_imm(14, 14, 1);
                         a.cbnz(14, false, l_probe);
-                        a.b(slow);
+                        emit_call_overflow_probe(&mut a, ilayout, l_hit, slow);
                         // x15 = the hit way (ways-left counter → index), kept live through
                         // the direct sequence's NO-MUTATION gate checks (they never touch
                         // x15; every route into hit_slow happens before any blr).
-                        a.bind(l_hit);
+                        a.bind(l_primary_hit);
                         a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
                         a.sub_reg(15, 15, 14);
+                        a.bind(l_hit);
                         let with_this = matches!(op, Op::CallWithThis(..));
                         let hit_slow = a.new_label();
                         // Inline intrinsics: a native entry the template can finish without
@@ -4504,6 +4768,11 @@ pub fn compile(
                             );
                         }
                         a.bind(hit_slow);
+                        // Secondary ways are not indices into the caller's four primary
+                        // entries. A non-direct/non-intrinsic secondary hit re-probes through
+                        // the checked helper; it must never alias primary way zero.
+                        a.cmp_imm_w(15, crate::bytecode::CALL_IC_WAYS as u32);
+                        a.b_cond(C_HS, slow);
                         a.mov(0, 19);
                         // x1 = pc | way << 16 (pcs are < 65536: every helper call encodes
                         // the pc as one movz)
@@ -4555,6 +4824,13 @@ pub fn compile(
             Op::GetProp(..) | Op::GetPropThis(..) | Op::GetPropLocal(..) | Op::GetMethod(..) => {
                 emit_op_helper(&mut a, H_GET_PROP, pc as u32, l_unwind);
             }
+            Op::GetMethodElem => {
+                if fast & 1024 != 0 && get_method_inlinable(layout) && ilayout.valid {
+                    emit_computed_method_inline(&mut a, layout, ilayout, pc as u32, l_unwind);
+                } else {
+                    emit_op_helper(&mut a, H_GET_METHOD_ELEM, pc as u32, l_unwind);
+                }
+            }
             _ => {
                 emit_exec(&mut a, pc as u32, l_unwind);
             }
@@ -4579,6 +4855,10 @@ pub fn compile(
     // ---- epilogues ----
     a.bind(l_ret_ok);
     a.str_imm(20, 19, 16); // ctx.final_sp = sp
+    a.ldr_imm(13, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
+    a.ldrb_imm(9, 31, STRICT_SAVE);
+    a.strb_imm(9, strict_base, strict_off);
     a.movz(0, 1, 0);
     a.ldp_d_off(8, 9, DSAVE);
     a.ldp_d_off(10, 11, DSAVE + 16);
@@ -4590,6 +4870,10 @@ pub fn compile(
     a.ret();
     a.bind(l_ret_throw);
     a.str_imm(20, 19, 16);
+    a.ldr_imm(13, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
+    a.ldrb_imm(9, 31, STRICT_SAVE);
+    a.strb_imm(9, strict_base, strict_off);
     a.movz(0, 0, 0);
     a.ldp_d_off(8, 9, DSAVE);
     a.ldp_d_off(10, 11, DSAVE + 16);
@@ -4716,6 +5000,16 @@ pub fn compile(
     None
 }
 
+/// Distinguish a temporary capacity shortage from a permanent native-tier bail.
+pub(crate) enum JitCompileOutcome {
+    Compiled(JitCode),
+    /// The body is supported, but its executable reservation did not fit.
+    Deferred {
+        required_bytes: usize,
+    },
+    Unavailable,
+}
+
 /// Compile one chunk and, when explicitly requested, account for compilation latency and emitted
 /// instruction bytes. Keeping this wrapper outside the target-specific emitters ensures AArch64,
 /// x86-64, successful compilations, and defensive fallbacks use one measurement definition.
@@ -4723,23 +5017,33 @@ pub(crate) fn compile_profiled(
     chunk: &Chunk,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
-) -> Option<JitCode> {
-    if !perf_metrics_enabled() {
-        return compile(chunk, layout, ilayout);
-    }
-    let started = std::time::Instant::now();
+) -> JitCompileOutcome {
+    let pressure = CompilationPressureScope::enter();
+    let started = perf_metrics_enabled().then(std::time::Instant::now);
     let result = compile(chunk, layout, ilayout);
-    let elapsed = started.elapsed();
-    use std::sync::atomic::Ordering::Relaxed;
-    PERF_COMPILE_ATTEMPTS.fetch_add(1, Relaxed);
-    PERF_COMPILE_NANOS.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
-    if let Some(code) = &result {
-        let bytes = code.len as u64;
-        PERF_COMPILE_SUCCESSES.fetch_add(1, Relaxed);
-        PERF_GENERATED_CODE_BYTES.fetch_add(bytes, Relaxed);
-        PERF_LARGEST_CODE_BYTES.fetch_max(bytes, Relaxed);
+    if let Some(started) = started {
+        let elapsed = started.elapsed();
+        use std::sync::atomic::Ordering::Relaxed;
+        PERF_COMPILE_ATTEMPTS.fetch_add(1, Relaxed);
+        PERF_COMPILE_NANOS.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
+        if let Some(code) = &result {
+            let bytes = code.len as u64;
+            PERF_COMPILE_SUCCESSES.fetch_add(1, Relaxed);
+            PERF_GENERATED_CODE_BYTES.fetch_add(bytes, Relaxed);
+            PERF_LARGEST_CODE_BYTES.fetch_max(bytes, Relaxed);
+        }
     }
-    result
+    match result {
+        Some(code) => JitCompileOutcome::Compiled(code),
+        None => {
+            let required_bytes = pressure.denied_bytes();
+            if required_bytes > 0 && required_bytes <= executable_code_budget().limit {
+                JitCompileOutcome::Deferred { required_bytes }
+            } else {
+                JitCompileOutcome::Unavailable
+            }
+        }
+    }
 }
 
 /// Whether `layout` is usable for the inline GetProp template: valid (probed std layouts hold)
@@ -5447,7 +5751,236 @@ fn emit_prop_load_inline(
     a.bind(done);
 }
 
-/// The direct (shared-ctx) JIT→JIT call sequence, emitted after the way-1 probe hit when the
+/// Computed method read: a pinned string identity selects a bounded resolution, then every
+/// live shape/descriptor is revalidated. The receiver stays owned on the operand stack; only
+/// the key is replaced with the method. No state changes before all guards have succeeded.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_computed_method_inline(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    il: &crate::interpreter::InterpLayout,
+    pc: u32,
+    l_unwind: usize,
+) {
+    use crate::bytecode::{
+        ComputedReadCache, IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID_OK,
+        IC_OFF_MID_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
+    };
+    let fits = |offset: usize| offset.is_multiple_of(8) && offset / 8 < 4096;
+    if !fits(il.computed_read_sets)
+        || !il.computed_read_mask.is_multiple_of(4)
+        || il.computed_read_mask / 4 >= 4096
+        || !fits(il.string_proto)
+        || !fits(layout.obj_proto)
+        || layout.entry_accessor != layout.entry_value + 8
+    {
+        emit_op_helper(a, H_GET_METHOD_ELEM, pc, l_unwind);
+        return;
+    }
+    let slow = a.new_label();
+    let done = a.new_label();
+    let object = a.new_label();
+    let receiver = a.new_label();
+    let shape = (layout.obj_props + layout.props_shape) as u32;
+    let exotic = layout.obj_exotic as u32;
+    let plain = layout.obj_ic_plain as u32;
+    let object_data = layout.obj_from_rc as u32;
+    a.ldurb(9, 20, -16);
+    a.cmp_imm_w(9, 6); // only an already-string key
+    a.b_cond(C_NE, slow);
+    a.ldur(8, 20, -8); // LStr allocation identity, pinned by a matching cache way
+    a.ldurb(9, 20, -32);
+    a.cmp_imm_w(9, 8);
+    a.b_cond(C_EQ, object);
+    a.cmp_imm_w(9, 6);
+    a.b_cond(C_NE, slow);
+    a.ldr_imm(10, 19, 72);
+    a.ldr_imm(10, 10, il.string_proto as u32); // active realm, never embedded prototype identity
+    a.b(receiver);
+    a.bind(object);
+    a.ldur(10, 20, -24);
+    a.bind(receiver);
+    a.add_imm(11, 10, object_data);
+    a.ldr_w_imm(13, 11, shape);
+    a.ldr_imm(12, 19, 72);
+    a.ldr_w_imm(6, 12, il.computed_read_mask as u32);
+    a.ldr_imm(12, 12, il.computed_read_sets as u32);
+    a.cbz(12, true, slow);
+    a.lsr_imm(7, 8, 3);
+    a.lsr_imm(14, 7, 7);
+    a.logic_x(2, 7, 7, 14);
+    a.logic_x(2, 7, 7, 13);
+    a.logic_w(0, 7, 7, 6);
+    a.mov_imm64(14, ComputedReadCache::SET_STRIDE as u64);
+    a.madd(12, 7, 14, 12);
+    let probe = a.new_label();
+    let next = a.new_label();
+    let hit = a.new_label();
+    a.movz(15, ComputedReadCache::WAYS as u32, 0);
+    a.bind(probe);
+    a.ldr_imm(14, 12, ComputedReadCache::KEY_OFF as u32);
+    a.cmp_reg_x(14, 8);
+    a.b_cond(C_NE, next);
+    a.ldr_w_imm(
+        14,
+        12,
+        ComputedReadCache::STATE_OFF as u32 + IC_OFF_RECV_SHAPE,
+    );
+    a.cmp_reg_w(14, 13);
+    a.b_cond(C_EQ, hit);
+    a.bind(next);
+    a.add_imm(12, 12, ComputedReadCache::WAY_STRIDE as u32);
+    a.sub_imm(15, 15, 1);
+    a.cbnz(15, false, probe);
+    a.b(slow);
+    a.bind(hit);
+    a.add_imm(12, 12, ComputedReadCache::STATE_OFF as u32);
+    a.ldrb_imm(7, 12, IC_OFF_DEPTH);
+    a.cmp_imm_w(7, 3);
+    a.b_cond(C_HI, slow); // array key-checked holders, absence and deep/exotic paths remain checked
+    let ordinary = a.new_label();
+    a.ldrb_imm(14, 11, exotic);
+    a.cmp_imm_w(14, layout.exotic_none_tag as u32);
+    a.b_cond(C_EQ, ordinary);
+    a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
+    a.b_cond(C_EQ, ordinary);
+    a.cmp_imm_w(14, layout.exotic_array_tag as u32);
+    a.b_cond(C_NE, slow);
+    a.cbz(7, false, slow); // an array is allowed only below a named-property holder
+    a.bind(ordinary);
+    a.ldrb_imm(14, 11, plain);
+    a.cbz(14, false, slow);
+    let load = a.new_label();
+    let holder = a.new_label();
+    a.cbz(7, false, load);
+    for hop in 1..=3 {
+        a.ldr_imm(17, 11, layout.obj_proto as u32);
+        a.cbz(17, true, slow);
+        a.add_imm(11, 17, object_data);
+        let hop_ordinary = a.new_label();
+        a.ldrb_imm(14, 11, exotic);
+        a.cmp_imm_w(14, layout.exotic_none_tag as u32);
+        a.b_cond(C_EQ, hop_ordinary);
+        a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
+        a.b_cond(C_NE, slow);
+        a.bind(hop_ordinary);
+        a.ldrb_imm(14, 11, plain);
+        a.cbz(14, false, slow);
+        a.ldr_w_imm(14, 11, shape);
+        a.cmp_imm_w(7, hop);
+        a.b_cond(C_EQ, holder);
+        if hop < 3 {
+            a.ldrb_imm(16, 12, IC_OFF_MID_OK);
+            a.logic_imm_w(0, 16, 16, asm::logical_imm_w(1 << (hop - 1)).unwrap());
+            a.cbz(16, false, slow);
+            a.ldr_w_imm(
+                16,
+                12,
+                if hop == 1 {
+                    IC_OFF_MID_SHAPE
+                } else {
+                    IC_OFF_MID2_SHAPE
+                },
+            );
+            a.cmp_reg_w(14, 16);
+            a.b_cond(C_NE, slow);
+        }
+    }
+    a.bind(holder);
+    a.ldr_w_imm(16, 12, IC_OFF_HOLDER_SHAPE);
+    a.cmp_reg_w(14, 16);
+    a.b_cond(C_NE, slow);
+    a.bind(load);
+    a.ldr_w_imm(13, 12, IC_OFF_SLOT);
+    a.ldr_imm(
+        16,
+        11,
+        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
+    );
+    a.cmp_reg_x(13, 16);
+    a.b_cond(C_HS, slow);
+    a.ldr_imm(
+        15,
+        11,
+        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
+    );
+    a.mov_imm64(16, layout.entry_size as u64);
+    a.madd(15, 13, 16, 15);
+    guard_prop_data(a, 9, 15, layout.entry_accessor as u32, slow);
+    emit_packed_entry_decode(a, layout, 15, slow);
+    // A hit owns a cache pin of this exact LStr, so the operand cannot be its final owner.
+    // Clone the result first (it may alias the key); preserve the original receiver for Call.
+    a.ldur(14, 20, -8);
+    a.ldr_imm(16, 14, 0);
+    a.sub_imm(16, 16, 1);
+    a.str_imm(16, 14, 0);
+    a.stur(12, 20, -16);
+    a.stur(13, 20, -8);
+    a.b(done);
+    a.bind(slow);
+    emit_op_helper(a, H_GET_METHOD_ELEM, pc, l_unwind);
+    a.bind(done);
+}
+
+/// Secondary identity probe. Inputs match the primary probe: x13 = live callee identity,
+/// w15 = epoch, x17 = realm, x10 = stored callee pointer. On hit x12 points at a CallIc and
+/// w15 is the non-primary sentinel. No calls, allocation, GC or observable state changes occur.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_call_overflow_probe(
+    a: &mut asm::Asm,
+    layout: &crate::interpreter::InterpLayout,
+    hit: usize,
+    miss: usize,
+) {
+    if !layout.valid
+        || !layout.call_overflow_sets.is_multiple_of(8)
+        || layout.call_overflow_sets / 8 >= 4096
+        || !layout.call_overflow_shift.is_multiple_of(4)
+        || layout.call_overflow_shift / 4 >= 4096
+    {
+        a.b(miss);
+        return;
+    }
+    a.ldr_imm(9, 19, 72); // live ctx.interp
+    a.ldr_imm(12, 9, layout.call_overflow_sets as u32);
+    a.cbz(12, true, miss);
+    a.ldr_w_imm(9, 9, layout.call_overflow_shift as u32);
+    a.mov_imm64(11, crate::bytecode::CALL_OVERFLOW_HASH);
+    a.madd(11, 13, 11, 31);
+    a.lsr_reg(11, 11, 9);
+    a.mov_imm64(9, crate::bytecode::CallOverflow::SET_STRIDE as u64);
+    a.madd(12, 11, 9, 12);
+    a.movz(14, crate::bytecode::CALL_OVERFLOW_WAYS as u32, 0);
+    let probe = a.new_label();
+    let next = a.new_label();
+    let found = a.new_label();
+    a.bind(probe);
+    a.ldr_imm(11, 12, 0);
+    a.cmp_reg_x(11, 13);
+    a.b_cond(C_NE, next);
+    a.ldr_w_imm(11, 12, 56);
+    a.cmp_reg_w(11, 15);
+    a.b_cond(C_NE, next);
+    a.ldr_imm(11, 12, 32);
+    a.cmp_reg_x(11, 17);
+    a.b_cond(C_EQ, found);
+    a.bind(next);
+    a.add_imm(12, 12, crate::bytecode::CallOverflow::ENTRY_STRIDE as u32);
+    a.sub_imm(14, 14, 1);
+    a.cbnz(14, false, probe);
+    a.b(miss);
+    a.bind(found);
+    a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
+    a.b(hit);
+}
+
+/// The direct (shared-ctx) JIT→JIT call sequence, emitted after a guarded cache hit when the
 /// fill-time gates allow it (see [`crate::bytecode::CallIc::direct`]). Everything the layered
 /// path does survives — recursion depth, the amortized gc tick (a due tick falls to the
 /// generic path BEFORE any mutation), the `FnFrame`, constructing/new.target clearing, the
@@ -5502,7 +6035,6 @@ fn emit_direct_call(
         && fits4(il.gc_tick)
         && fits8(il.gc_next)
         && fits4(il.cur_coro)
-        && il.constructing < 4096
         && fits8(il.new_target)
         && fits8(il.fn_frames + il.fnf_ptr_word)
         && fits8(il.fn_frames + il.fnf_len_word)
@@ -5602,8 +6134,8 @@ fn emit_direct_call(
         a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
     }
     a.bind(this_ok);
-    // callee refcount > 1 (the post-call dec then never frees mid-sequence; a same-call
-    // binding deletion is caught by the post-dec zero check)
+    // Prefer shared callees; same-call binding deletion can still leave the final owner,
+    // which the post-call cleanup passes intact to the full-drop helper.
     a.ldur(9, 10, strong);
     a.cmp_imm_x(9, 1);
     a.b_cond(C_LS, hit_slow);
@@ -5761,14 +6293,16 @@ fn emit_direct_call(
         a.strb_imm(31, 19, cx_this); // Undefined tag (payload stale; tag-only reads)
     }
     // constructing (byte) + new_target (tag byte): cleared for the callee
-    a.ldrb_imm(4, 14, il.constructing as u32);
+    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+    a.ldrb_imm(4, construct_base, construct_offset);
     a.stur(4, 31, 88);
-    a.strb_imm(31, 14, il.constructing as u32);
+    a.strb_imm(31, construct_base, construct_offset);
     a.ldr_imm(4, 14, il.new_target as u32);
     a.ldr_imm(5, 14, (il.new_target + 8) as u32);
     a.stur(4, 31, 96);
     a.stur(5, 31, 104);
-    a.strb_imm(31, 14, il.new_target as u32); // Undefined tag
+    let (target_base, target_offset) = byte_field_address(a, 14, il.new_target, 16);
+    a.strb_imm(31, target_base, target_offset); // Undefined tag
 
     // ---- run the callee on the shared ctx ----
     a.mov(0, 19);
@@ -5804,7 +6338,8 @@ fn emit_direct_call(
     a.str_imm(4, 19, cx_this);
     a.str_imm(5, 19, cx_this + 8);
     a.ldur(4, 31, 88);
-    a.strb_imm(4, 14, il.constructing as u32);
+    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+    a.strb_imm(4, construct_base, construct_offset);
     a.ldur(4, 31, 96);
     a.ldur(5, 31, 104);
     a.str_imm(4, 14, il.new_target as u32);
@@ -5812,21 +6347,7 @@ fn emit_direct_call(
     a.add_imm(31, 31, 128);
 
     // ---- pop the callee (and skip the consumed this slot); dispatch on threw ----
-    a.sub_imm(3, 20, ((argc + 1) * 16) as u32);
-    a.ldr_imm(5, 3, 8);
-    a.ldur(6, 5, strong);
-    a.sub_imm(6, 6, 1);
-    a.stur(6, 5, strong);
-    let no_free = a.new_label();
-    a.cbnz(6, true, no_free);
-    // last reference (binding deleted during the call): real drop via helper
-    a.mov(0, 19);
-    a.movz(1, 0, 0);
-    a.mov_imm64(6, (argc as u64 + 1) * 16);
-    a.sub_reg(2, 20, 6);
-    a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
-    a.blr(16);
-    a.bind(no_free);
+    emit_direct_callee_drop(a, argc);
     let popped = ((argc + 1 + with_this as usize) * 16) as u32;
     a.sub_imm(20, 20, popped);
     a.cbnz(8, true, l_unwind); // threw → caller unwind (fields restored)
@@ -5843,6 +6364,38 @@ fn emit_direct_call(
     a.str_w_imm(13, 14, il.gc_tick as u32);
     a.b(gc_slow);
     true
+}
+
+/// Release the caller's callee operand after restoring its activation. w8 carries the
+/// completion flag from the finish stub and must survive any last-owner destruction.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_direct_callee_drop(a: &mut asm::Asm, argc: usize) {
+    let strong = 0i32;
+    a.sub_imm(3, 20, ((argc + 1) * 16) as u32);
+    a.ldr_imm(5, 3, 8);
+    a.ldur(6, 5, strong);
+    let last_owner = a.new_label();
+    let done = a.new_label();
+    a.sub_imm(6, 6, 1);
+    a.cbz(6, true, last_owner);
+    a.stur(6, 5, strong);
+    a.b(done);
+    a.bind(last_owner);
+    // The real Rc drop owns the final decrement. Decrementing here first would make it
+    // underflow instead of releasing the callable. The helper may clobber any C scratch
+    // register, including the finish stub's w8 normal/throw completion flag.
+    a.stp_pre(8, 31, -16);
+    a.mov(0, 19);
+    a.movz(1, 0, 0);
+    a.mov_imm64(6, (argc as u64 + 1) * 16);
+    a.sub_reg(2, 20, 6);
+    a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
+    a.blr(16);
+    a.ldp_post(8, 31, 16);
+    a.bind(done);
 }
 
 /// Load the executing thread's live-object count into x4 through the current [`JitCtx`]. A JIT
@@ -5863,6 +6416,353 @@ fn emit_live_objects_load(a: &mut asm::Asm, cx_live_objects: u32) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 mod direct_call_tests {
+    #[test]
+    fn computed_method_native_probe_reads_live_values_and_preserves_owners() {
+        use crate::value::{Object, Property, Value};
+        unsafe extern "C" fn miss(
+            ctx: *mut super::JitCtx,
+            _pc: u32,
+            sp: *mut Value,
+        ) -> super::SpFlag {
+            unsafe {
+                *ctx.cast::<usize>() += 1;
+            }
+            super::SpFlag { sp, flag: 0 }
+        }
+        let mut engine = crate::Engine::new();
+        let il = crate::interpreter::interp_layout(&mut engine.interp);
+        let layout = crate::value::jit_layout(&engine.interp.object_proto);
+        assert!(super::get_method_inlinable(&layout));
+        let mut asm = super::asm::Asm::new();
+        asm.stp_pre(29, 30, -16);
+        asm.stp_pre(19, 20, -16);
+        asm.stp_pre(21, 22, -16);
+        asm.mov(19, 0);
+        asm.mov(20, 1);
+        asm.mov(21, 2);
+        let unwind = asm.new_label();
+        super::emit_computed_method_inline(&mut asm, &layout, &il, 0, unwind);
+        asm.bind(unwind);
+        asm.mov(0, 20);
+        asm.ldp_post(21, 22, 16);
+        asm.ldp_post(19, 20, 16);
+        asm.ldp_post(29, 30, 16);
+        asm.ret();
+        let bytes: Vec<u8> = asm
+            .finish()
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let code = super::ExecutableBuffer::from_bytes(&bytes).unwrap();
+        let entry: unsafe extern "C" fn(*mut usize, *mut Value, *const usize) -> *mut Value =
+            unsafe { std::mem::transmute(code.as_ptr()) };
+        let mut helpers = [0usize; super::N_HELPERS];
+        helpers[super::H_GET_METHOD_ELEM] = miss as *const () as usize;
+        // Only the activation-relative Interp pointer is read on this no-call hit path.
+        let mut ctx = [0usize; 16];
+        ctx[std::mem::offset_of!(super::JitCtx, interp) / 8] =
+            &mut *engine.interp as *mut _ as usize;
+        for depth in 0..=3 {
+            let key = crate::lstr::LStr::from(format!("method{depth}"));
+            let holder = Object::new(None);
+            holder
+                .borrow_mut()
+                .props
+                .insert(key.as_str(), Property::plain(Value::Num(17.0)));
+            let mut object = holder.clone();
+            for _ in 0..depth {
+                object = Object::new(Some(object));
+            }
+            let receiver = Value::Obj(object.clone());
+            assert!(matches!(
+                engine.interp.get_computed_property(&receiver, &key),
+                Ok(Value::Num(17.0))
+            ));
+            for value in [Value::Num(29.0), Value::Str(key.clone()), receiver.clone()] {
+                holder
+                    .borrow_mut()
+                    .props
+                    .get_mut(&key)
+                    .unwrap()
+                    .set_value(value.clone());
+                let owners = key.strong_count();
+                let mut operands = [receiver.clone(), Value::Str(key.clone())];
+                let end = unsafe { operands.as_mut_ptr().add(2) };
+                assert_eq!(
+                    unsafe { entry(ctx.as_mut_ptr(), end, helpers.as_ptr()) },
+                    end
+                );
+                assert_eq!(ctx[0], 0, "expected a native cache hit, depth {depth}");
+                match (&operands[1], &value) {
+                    (Value::Num(a), Value::Num(b)) => assert_eq!(a, b),
+                    (Value::Str(a), Value::Str(b)) => assert!(crate::lstr::LStr::ptr_eq(a, b)),
+                    (Value::Obj(a), Value::Obj(b)) => assert!(std::rc::Rc::ptr_eq(a, b)),
+                    _ => panic!("wrong computed value"),
+                }
+                drop(operands);
+                assert_eq!(
+                    key.strong_count(),
+                    owners,
+                    "key operand leaked or was dropped twice"
+                );
+            }
+            holder
+                .borrow_mut()
+                .props
+                .get_mut(&key)
+                .unwrap()
+                .set_value(Value::Num(31.0));
+            // Same string contents at a different allocation must miss the identity probe.
+            let fresh = crate::lstr::LStr::from(key.as_str());
+            let mut operands = [receiver, Value::Str(fresh)];
+            unsafe {
+                entry(
+                    ctx.as_mut_ptr(),
+                    operands.as_mut_ptr().add(2),
+                    helpers.as_ptr(),
+                );
+            }
+            assert_eq!(ctx[0], 1);
+            ctx[0] = 0;
+        }
+
+        // The already-compiled probe must read the current table and mask after growth.
+        // Populate real, stable property resolutions, including enough names to evict ways.
+        let holder = Object::new(None);
+        let keys: Vec<_> = (0..4096)
+            .map(|n| crate::lstr::LStr::from(format!("growth{n}")))
+            .collect();
+        for (n, key) in keys.iter().enumerate() {
+            holder
+                .borrow_mut()
+                .props
+                .insert(key.as_str(), Property::plain(Value::Num(n as f64)));
+        }
+        let receiver = Value::Obj(holder.clone());
+        let initial_mask = engine.interp.computed_reads.mask;
+        for key in &keys {
+            assert!(engine.interp.get_computed_property(&receiver, key).is_ok());
+        }
+        assert!(engine.interp.computed_reads.mask > initial_mask);
+        let shape = holder.borrow().props.shape();
+        for (n, key) in keys.iter().enumerate() {
+            let cached = engine
+                .interp
+                .computed_reads
+                .lookup(key.as_ptr() as usize, shape)
+                .is_some();
+            let mut operands = [receiver.clone(), Value::Str(key.clone())];
+            let end = unsafe { operands.as_mut_ptr().add(2) };
+            assert_eq!(
+                unsafe { entry(ctx.as_mut_ptr(), end, helpers.as_ptr()) },
+                end
+            );
+            assert_eq!(
+                ctx[0],
+                usize::from(!cached),
+                "native/Rust probe disagreement after growth"
+            );
+            if cached {
+                assert!(matches!(operands[1], Value::Num(value) if value == n as f64));
+            }
+            ctx[0] = 0;
+        }
+        for (n, key) in keys.iter().enumerate().take(256) {
+            assert!(engine.interp.get_computed_property(&receiver, key).is_ok());
+            let mut operands = [receiver.clone(), Value::Str(key.clone())];
+            unsafe {
+                entry(
+                    ctx.as_mut_ptr(),
+                    operands.as_mut_ptr().add(2),
+                    helpers.as_ptr(),
+                );
+            }
+            assert_eq!(ctx[0], 0, "a refilled key must hit the grown table");
+            assert!(matches!(operands[1], Value::Num(value) if value == n as f64));
+        }
+    }
+
+    #[test]
+    fn last_callee_drop_owns_the_final_decrement_and_preserves_completion() {
+        fn executable(asm: super::asm::Asm) -> super::ExecutableBuffer {
+            let bytes: Vec<u8> = asm
+                .finish()
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            super::ExecutableBuffer::from_bytes(&bytes).unwrap()
+        }
+        // Model only the helper ABI and ownership contract, without constructing an invalid
+        // Rust Rc if the generated caller erroneously decrements the count to zero first.
+        let mut dropper = super::asm::Asm::new();
+        dropper.ldr_imm(3, 2, 8); // fake Value's stored allocation pointer
+        dropper.ldr_imm(4, 3, 0);
+        dropper.str_imm(4, 3, 8); // record the count seen by the full-drop helper
+        dropper.str_imm(31, 3, 0); // model destroying the last owner
+        dropper.movz(8, 73, 0); // w8 is caller-saved across a C helper
+        dropper.ret();
+        let dropper = executable(dropper);
+        let mut helpers = [0usize; super::H_DROP_AT + 1];
+        helpers[super::H_DROP_AT] = dropper.as_ptr() as usize;
+        for argc in [0usize, 1, 8, 64] {
+            let mut asm = super::asm::Asm::new();
+            asm.stp_pre(29, 30, -16);
+            asm.stp_pre(19, 20, -16);
+            asm.stp_pre(21, 22, -16);
+            asm.mov(20, 0); // operand stack end
+            asm.mov(21, 1); // helper table
+            asm.mov(8, 2); // normal or throw completion
+            super::emit_direct_callee_drop(&mut asm, argc);
+            asm.mov(0, 8);
+            asm.ldp_post(21, 22, 16);
+            asm.ldp_post(19, 20, 16);
+            asm.ldp_post(29, 30, 16);
+            asm.ret();
+            let code = executable(asm);
+            let entry: unsafe extern "C" fn(*const usize, *const usize, usize) -> usize =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            for count in [1usize, 3] {
+                for completion in [0usize, 1] {
+                    let mut allocation = [count, usize::MAX];
+                    let mut operands = vec![0usize; (argc + 1) * 2];
+                    operands[0] = 8; // wide Obj tag
+                    operands[1] = allocation.as_mut_ptr() as usize;
+                    let result = unsafe {
+                        entry(
+                            operands.as_ptr().add(operands.len()),
+                            helpers.as_ptr(),
+                            completion,
+                        )
+                    };
+                    assert_eq!(allocation[0], count - 1);
+                    assert_eq!(
+                        allocation[1],
+                        if count == 1 { 1 } else { usize::MAX },
+                        "the full-drop helper must receive the last live owner"
+                    );
+                    assert_eq!(result, completion, "C helper clobbered the throw flag");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_probe_matches_rust_across_growth_epoch_and_realm_misses() {
+        use crate::bytecode::{CallIc, CallOverflow};
+        use std::rc::Rc;
+        let mut engine = crate::Engine::new();
+        let layout = crate::interpreter::interp_layout(&mut engine.interp);
+        let mut asm = super::asm::Asm::new();
+        asm.stp_pre(19, 30, -16);
+        asm.mov(19, 0); // synthetic JitCtx header
+        asm.mov(13, 1); // key
+        asm.mov_w(15, 2); // epoch
+        asm.mov(17, 3); // realm
+        let hit = asm.new_label();
+        let miss = asm.new_label();
+        let done = asm.new_label();
+        super::emit_call_overflow_probe(&mut asm, &layout, hit, miss);
+        asm.bind(hit);
+        asm.mov(0, 12);
+        asm.b(done);
+        asm.bind(miss);
+        asm.movz(0, 0, 0);
+        asm.bind(done);
+        asm.ldp_post(19, 30, 16);
+        asm.ret();
+        let bytes: Vec<u8> = asm
+            .finish()
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let executable = super::ExecutableBuffer::from_bytes(&bytes).unwrap();
+        let probe: unsafe extern "C" fn(*const usize, usize, u32, usize) -> *const CallIc =
+            unsafe { std::mem::transmute(executable.as_ptr()) };
+        let mut context = [0usize; 10];
+        // Engine owns a Box<Interp>; JitCtx contains the pointee, not the Box handle's address.
+        context[72 / 8] = &mut *engine.interp as *mut _ as usize;
+        assert!(unsafe { probe(context.as_ptr(), 100, 7, 123) }.is_null());
+        let mut objects = Vec::new();
+        for batch in 0..4 {
+            for _ in 0..512 {
+                let object = crate::value::Object::new(None);
+                engine.interp.call_overflow.insert(
+                    CallIc {
+                        callee: Rc::as_ptr(&object) as usize,
+                        epoch: 7,
+                        global_env: 123,
+                        ..CallIc::EMPTY
+                    },
+                    Rc::downgrade(&object),
+                );
+                objects.push(object);
+            }
+            for object in &objects {
+                let key = Rc::as_ptr(object) as usize;
+                let expected = engine.interp.call_overflow.lookup(key, 123, 7);
+                let found = unsafe { probe(context.as_ptr(), key, 7, 123) };
+                assert_eq!(!found.is_null(), expected.is_some(), "batch {batch}");
+                if !found.is_null() {
+                    assert_eq!(unsafe { (*found).callee }, key);
+                }
+                assert!(unsafe { probe(context.as_ptr(), key, 8, 123) }.is_null());
+                assert!(unsafe { probe(context.as_ptr(), key, 7, 124) }.is_null());
+            }
+        }
+        assert!(
+            engine.interp.call_overflow.hash_shift < 57,
+            "exercise growth with already-compiled probes"
+        );
+        assert!(engine.interp.call_overflow.retained_bytes() <= 512 * CallOverflow::SET_STRIDE);
+    }
+
+    #[test]
+    fn direct_call_sequence_is_emitted_for_the_live_interpreter_layout() {
+        let mut engine = crate::Engine::new();
+        let layout = crate::interpreter::interp_layout(&mut engine.interp);
+        let mut asm = super::asm::Asm::new();
+        let hit_slow = asm.new_label();
+        let gc_slow = asm.new_label();
+        let unwind = asm.new_label();
+        let done = asm.new_label();
+        let finish = asm.new_label();
+        let attempted = std::mem::offset_of!(crate::bytecode::Chunk, inline_attempted);
+        assert!(
+            super::emit_direct_call(
+                &mut asm, &layout, 0, attempted, 1, false,
+                hit_slow, gc_slow, unwind, done, finish,
+            ),
+            "direct calls silently disabled: valid={}, depth={}, direct_depth={}, gc_tick={}, gc_next={}, coro={}, constructing={}, new_target={}, frames={}, pool={}, attempted={}",
+            layout.valid, layout.depth, layout.direct_call_depth, layout.gc_tick,
+            layout.gc_next, layout.cur_coro, layout.constructing, layout.new_target,
+            layout.fn_frames, layout.frame_pool, attempted,
+        );
+    }
+
+    #[test]
+    fn byte_field_address_preserves_large_offset_loads_and_stores() {
+        for offset in [0usize, 4095, 4096, 4400, 32768] {
+            let mut asm = super::asm::Asm::new();
+            // extern C fn(base: *mut u8, value: u8) -> u8, x0/w1 -> w0.
+            let (base, imm) = super::byte_field_address(&mut asm, 0, offset, 16);
+            asm.strb_imm(1, base, imm);
+            asm.ldrb_imm(0, base, imm);
+            asm.ret();
+            let code: Vec<u8> = asm
+                .finish()
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let executable = super::ExecutableBuffer::from_bytes(&code).unwrap();
+            let entry: unsafe extern "C" fn(*mut u8, u8) -> u8 =
+                unsafe { std::mem::transmute(executable.as_ptr()) };
+            let mut bytes = vec![0u8; offset + 2];
+            assert_eq!(unsafe { entry(bytes.as_mut_ptr(), 173) }, 173);
+            assert_eq!(bytes[offset], 173);
+            assert_eq!(bytes.iter().filter(|&&byte| byte != 0).count(), 1);
+        }
+    }
+
     #[test]
     fn live_object_count_is_loaded_through_the_execution_context() {
         let offset = std::mem::offset_of!(super::JitCtx, live_objects) as u32;
@@ -5886,6 +6786,155 @@ mod direct_call_tests {
         let load_floor = 0xF940_0000 | ((floor / 8) << 10) | (19 << 5) | 9;
         let store_len = 0xF900_0000 | ((handlers_len / 8) << 10) | (19 << 5) | 9;
         assert_eq!(words, [load_floor, store_len]);
+    }
+}
+
+/// Recognize value-preserving local stores without crossing an independently entered PC.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn local_store_pair(ops: &[crate::bytecode::Op], pc: usize, targeted: &[bool]) -> Option<u16> {
+    use crate::bytecode::Op;
+    if targeted.get(pc + 1).copied().unwrap_or(true) {
+        return None;
+    }
+    let slot = match (ops.get(pc)?, ops.get(pc + 1)?) {
+        (Op::Dup, Op::StoreLocal(slot)) => *slot,
+        (Op::StoreLocal(stored), Op::LoadLocal(loaded)) if stored == loaded => *stored,
+        _ => return None,
+    };
+    ((slot as u32) * 16 + 16 < 4096).then_some(slot)
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn local_read_discard_pair(
+    ops: &[crate::bytecode::Op],
+    pc: usize,
+    targeted: &[bool],
+) -> Option<u16> {
+    use crate::bytecode::Op;
+    if targeted.get(pc + 1).copied().unwrap_or(true) {
+        return None;
+    }
+    match (ops.get(pc)?, ops.get(pc + 1)?) {
+        (Op::LoadLocal(slot), Op::Pop) if (*slot as u32) * 16 + 16 < 4096 => Some(*slot),
+        _ => None,
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_discard_local_read(a: &mut asm::Asm, off: u32, pc: u32, l_unwind: usize) {
+    let done = a.new_label();
+    a.ldrb_imm(9, 22, off);
+    a.cmp_imm_w(9, 1);
+    a.b_cond(C_NE, done);
+    emit_exec(a, pc, l_unwind);
+    emit_exec(a, pc + 1, l_unwind);
+    a.bind(done);
+}
+
+/// Move the stack's top value into a local, optionally retaining the expression result.
+/// `pcs` is the exact unfused sequence for a guard miss. No guard follows an ownership
+/// mutation; dropping a last reference uses the existing non-JavaScript destructor helper.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_store_local(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    off: u32,
+    pcs: &[u32],
+    l_unwind: usize,
+    keep: bool,
+    rc_ok: bool,
+) {
+    let strong = layout.rc_strong_off as i32;
+    let slow = a.new_label();
+    let done = a.new_label();
+    if keep {
+        // A second owned copy needs BigInt's checked clone path. Empty must also
+        // replay the original sequence so StoreLocal/LoadLocal retains its TDZ error.
+        a.ldurb(9, 20, -16);
+        a.cmp_imm_w(9, 1);
+        a.b_cond(C_EQ, slow);
+        a.cmp_imm_w(9, if rc_ok { 5 } else { 4 });
+        a.b_cond(if rc_ok { C_EQ } else { C_HI }, slow);
+    }
+    a.ldrb_imm(9, 22, off);
+    if rc_ok {
+        let drop_old = a.new_label();
+        let mv = a.new_label();
+        a.cmp_imm_w(9, 5);
+        a.b_cond(C_EQ, drop_old);
+        a.cmp_imm_w(9, 6);
+        a.b_cond(C_LO, mv);
+        a.ldr_imm(10, 22, off + 8);
+        a.ldur(9, 10, strong);
+        a.cmp_imm_x(9, 1);
+        a.b_cond(C_LS, drop_old);
+        a.sub_imm(9, 9, 1);
+        a.stur(9, 10, strong);
+        a.b(mv);
+        a.bind(drop_old);
+        a.mov(0, 19);
+        a.movz(1, 0, 0);
+        a.add_imm(2, 22, off);
+        a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
+        a.blr(16);
+        a.bind(mv);
+    } else {
+        a.cmp_imm_w(9, 4);
+        a.b_cond(C_HI, slow);
+    }
+    a.ldur(9, 20, -16);
+    a.ldur(10, 20, -8);
+    if keep && rc_ok {
+        let no_clone = a.new_label();
+        a.ldurb(11, 20, -16);
+        a.cmp_imm_w(11, 6);
+        a.b_cond(C_LO, no_clone);
+        a.ldur(11, 10, strong);
+        a.add_imm(11, 11, 1);
+        a.stur(11, 10, strong);
+        a.bind(no_clone);
+    }
+    a.str_imm(9, 22, off);
+    a.str_imm(10, 22, off + 8);
+    if !keep {
+        a.sub_imm(20, 20, 16);
+    }
+    a.b(done);
+    a.bind(slow);
+    for &pc in pcs {
+        emit_exec(a, pc, l_unwind);
+    }
+    a.bind(done);
+}
+
+/// Byte loads/stores have an unscaled 12-bit offset, unlike the wider range of
+/// word/pointer accesses. Interp's Rust layout can put a byte field beyond 4 KiB;
+/// form its address in an explicitly reserved scratch register instead of
+/// silently disabling every direct call. ADD does not alter condition flags.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn byte_field_address(a: &mut asm::Asm, base: u32, offset: usize, scratch: u32) -> (u32, u32) {
+    if offset < 4096 {
+        (base, offset as u32)
+    } else {
+        debug_assert_ne!(base, scratch);
+        a.mov_imm64(scratch, offset as u64);
+        a.add_shifted(scratch, base, scratch, 0);
+        (scratch, 0)
     }
 }
 
@@ -7525,6 +8574,8 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.rc_strong_off < 256
         && layout.scope_gen.is_multiple_of(4)
         && layout.scope_gen / 4 < 4096
+        && layout.scope_layout.is_multiple_of(4)
+        && layout.scope_layout / 4 < 4096
         && layout.binding_value + 16 < 256
         && layout.binding_value < 4096
         && layout.binding_init < 4096
@@ -8049,10 +9100,24 @@ fn emit_name_ic_value_ptr(
     // --- depth-1 mode: `act_gen` belongs to current env; `gen` belongs to parent ---
     a.bind(depth_one);
     a.ldr_w_imm(15, 12, NAME_IC_OFF_ACT_GEN);
+    let activation_guard = a.new_label();
+    let parent_tagged = a.new_label();
+    a.movz(16, 4, 0);
+    a.logic_x(0, 16, 10, 16);
+    a.cbz(16, false, activation_guard);
+    // Layout mode (parent|6): invalidation is represented by layout ID zero.
+    // Read the creator's published key-set identity, not a coincidental count
+    // of mutations in an unrelated activation.
+    a.cbz(15, false, slow);
+    a.ldr_w_imm(11, 9, layout.scope_layout as u32);
+    a.bind(activation_guard);
     a.cmp_reg_w(11, 15);
     a.b_cond(C_NE, slow);
     a.ldr_imm(14, 19, std::mem::offset_of!(JitCtx, env_parent_raw) as u32);
     a.cbz(14, true, slow);
+    a.cbz(16, false, parent_tagged);
+    a.sub_imm(10, 10, 4); // strip the optional layout tag
+    a.bind(parent_tagged);
     a.sub_imm(16, 10, 2); // strip the depth-1 tag
     a.cmp_reg_x(14, 16);
     a.b_cond(C_NE, slow);
@@ -9131,7 +10196,7 @@ enum ChainOp {
     Pop,
     /// Duplicate the virtual top (compound element assignment's key copy).
     Dup,
-    /// `ToPropKeyLocal` on an in-chain key: a proven Num needs no coercion — pure nop.
+    /// A proven no-op: numeric ToPropKeyLocal, or an unused read guarded by the loop preamble.
     KeyNop,
     /// Cached free-name read that must currently hold a Num (the `NameIc` cell address).
     LoadName(usize),
@@ -9424,6 +10489,12 @@ fn build_chain(
         if pc > start && targeted[pc] {
             break; // a jump lands here: the canonical (memory) stack state must hold
         }
+        if local_read_discard_pair(ops, pc, targeted).is_some() {
+            // The observable effect of this pair is only its TDZ check. Its value
+            // is not a numeric input: leave it to the tag-only ordinary template,
+            // and keep any following stores out of a speculative helper suffix.
+            break;
+        }
         let (op, push, pop): (ChainOp, usize, usize) = match &ops[pc] {
             Op::Const(k) => match chunk.jit_const_num(*k) {
                 Some(bits) => (ChainOp::ConstNum(bits), 1, 0),
@@ -9638,6 +10709,27 @@ fn build_chain(
     if chain.len() < 3 {
         return None;
     }
+    // Element transfers do not benefit from assuming the value is numeric. A common
+    // table decoder does `result = values[index]`: GetElem/Dup/Store/Pop then fail
+    // on every string result and replay through generic helpers, despite the ordinary
+    // element/local templates already handling every value type in machine code.
+    // Keep numerical speculation for computations, not just moving array values.
+    let has_elem = chain
+        .iter()
+        .any(|(op, _)| matches!(op, ChainOp::GetElem(_) | ChainOp::SetElem(..)));
+    let has_computation = chain.iter().any(|(op, _)| {
+        matches!(
+            op,
+            ChainOp::Arith(_)
+                | ChainOp::Bit(_)
+                | ChainOp::Neg
+                | ChainOp::Update(..)
+                | ChainOp::CmpBranch(..)
+        )
+    });
+    if has_elem && !has_computation {
+        return None;
+    }
     // A speculative property producer is worthwhile when the chain actually computes with it.
     // Property-to-local transfer runs are common in generated code (EarleyBoyer in particular),
     // but they merely replace one compact property template with a larger guarded chain and can
@@ -9691,6 +10783,252 @@ fn build_chain(
             }
     });
     Some((chain, consumed))
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod numeric_chain_tests {
+    use super::{build_chain, ChainOp, Chunk};
+
+    fn compile_function(source: &str) -> std::rc::Rc<Chunk> {
+        let statements = crate::parser::parse_script(source, false)
+            .ok()
+            .expect("parse");
+        let function = statements
+            .iter()
+            .find_map(|statement| match statement {
+                crate::ast::Stmt::FuncDecl(function) => Some(function.clone()),
+                _ => None,
+            })
+            .expect("function declaration");
+        crate::bytecode::compile(&function).expect("compile")
+    }
+
+    #[test]
+    fn local_store_pairs_keep_jump_entries_and_distinct_slots() {
+        use crate::bytecode::Op;
+        for pair in [
+            [Op::Dup, Op::StoreLocal(3)],
+            [Op::StoreLocal(3), Op::LoadLocal(3)],
+        ] {
+            assert_eq!(super::local_store_pair(&pair, 0, &[false; 3]), Some(3));
+            assert_eq!(
+                super::local_store_pair(&pair, 0, &[false, true, false]),
+                None
+            );
+            assert_eq!(super::local_store_pair(&pair, 1, &[false; 3]), None);
+        }
+        assert_eq!(
+            super::local_store_pair(&[Op::StoreLocal(3), Op::LoadLocal(4)], 0, &[false; 3]),
+            None
+        );
+        assert_eq!(
+            super::local_store_pair(&[Op::Dup, Op::StoreLocal(255)], 0, &[false; 3]),
+            None
+        );
+    }
+
+    #[test]
+    fn unused_local_reads_keep_tdz_checks_and_independent_pop_entries() {
+        use crate::bytecode::Op;
+        let pair = [Op::LoadLocal(3), Op::Pop];
+        assert_eq!(
+            super::local_read_discard_pair(&pair, 0, &[false; 3]),
+            Some(3)
+        );
+        assert_eq!(
+            super::local_read_discard_pair(&pair, 0, &[false, true, false]),
+            None
+        );
+        assert_eq!(super::local_read_discard_pair(&pair, 1, &[false; 3]), None);
+        assert_eq!(
+            super::local_read_discard_pair(&[Op::LoadLocal(255), Op::Pop], 0, &[false; 3]),
+            None
+        );
+        assert_eq!(
+            super::local_read_discard_pair(&[Op::LoadLocal(3), Op::Dup], 0, &[false; 3]),
+            None
+        );
+    }
+
+    #[test]
+    fn hot_loop_padding_preserves_instruction_words_and_branch_labels() {
+        for alignment in [16, 32, 64, 128] {
+            for prefix in 0..32 {
+                let mut assembler = super::asm::Asm::new();
+                for _ in 0..prefix {
+                    assembler.movz(0, 7, 0);
+                }
+                let body = assembler.new_label();
+                assembler.b(body);
+                let before_padding = assembler.buf.len();
+                assembler.align_hot(alignment);
+                assembler.bind(body);
+                assembler.ret();
+                let (words, offsets) = assembler.finish_with_offsets(&[body]);
+                let body_word = offsets[0] as usize / 4;
+                assert!((offsets[0] as usize).is_multiple_of(alignment));
+                assert!(words[before_padding..body_word]
+                    .iter()
+                    .all(|word| *word == 0xD503_201F));
+                assert_eq!(words[prefix] & 0x03ff_ffff, (body_word - prefix) as u32);
+                assert_eq!(words[body_word], 0xD65F_03C0);
+            }
+        }
+    }
+
+    #[test]
+    fn loop_fallback_entries_leave_non_entry_discard_pairs_fusible() {
+        use crate::bytecode::Op;
+        let engine = crate::Engine::new();
+        let layout = crate::value::jit_layout(&engine.interp.object_proto);
+        let chunk = compile_function(
+            "function read(a, count) { let result = ''; for (let k = 0; k < count; k++) result = a[k & 127]; return result; }",
+        );
+        let ops = chunk.jit_ops();
+        let mut targeted = vec![false; ops.len() + 1];
+        let mut head = None;
+        for (pc, op) in ops.iter().enumerate() {
+            match op {
+                Op::Jump(to) | Op::JumpIfFalse(to) => {
+                    targeted[*to as usize] = true;
+                    if (*to as usize) < pc {
+                        head = Some(*to as usize);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let cfg = crate::jit_ir::Cfg::build(&chunk).expect("CFG");
+        let plan = super::plan_loop(
+            &chunk,
+            ops,
+            head.expect("loop head"),
+            &targeted,
+            &layout,
+            u32::MAX,
+            &cfg,
+        )
+        .expect("numeric loop plan");
+        let mut assembler = super::asm::Asm::new();
+        let labels: Vec<_> = (0..=ops.len()).map(|_| assembler.new_label()).collect();
+        super::emit_loop_chain(&mut assembler, &layout, &plan, &labels, &mut targeted);
+        let guard_pc = ops
+            .windows(2)
+            .position(|pair| matches!(pair, [Op::LoadLocal(_), Op::Pop]))
+            .expect("lexical assignment guard");
+        let Op::LoadLocal(guard_slot) = ops[guard_pc] else {
+            unreachable!()
+        };
+        assert!(plan
+            .initialization_guards
+            .contains(&(guard_slot as u32 * 16)));
+        assert!(plan
+            .chain
+            .iter()
+            .any(|(op, pc)| *pc == guard_pc && matches!(op, ChainOp::KeyNop)));
+        assert!(plan
+            .slots
+            .iter()
+            .any(|slot| slot.off == guard_slot as u32 * 16 && slot.virgin && !slot.preload));
+        assert!(!targeted[guard_pc + 1], "Pop has no bailout edge");
+        assert!(super::local_read_discard_pair(ops, guard_pc, &targeted).is_some());
+        let element_pc = ops
+            .iter()
+            .enumerate()
+            .find_map(|(pc, op)| {
+                (pc > plan.head && matches!(op, Op::GetElemLocal(_))).then_some(pc)
+            })
+            .expect("element access");
+        assert!(
+            targeted[element_pc],
+            "element guard must retain its exact entry"
+        );
+    }
+
+    #[test]
+    fn discarded_local_reads_do_not_introduce_numeric_speculation() {
+        let engine = crate::Engine::new();
+        let layout = crate::value::jit_layout(&engine.interp.object_proto);
+        let chunk = compile_function(
+            "function read(a, k) { let result = ''; result = a[k & 127]; return result; }",
+        );
+        let ops = chunk.jit_ops();
+        let targeted = vec![false; ops.len() + 1];
+        let guard_pc = ops
+            .windows(2)
+            .position(|pair| {
+                matches!(
+                    pair,
+                    [crate::bytecode::Op::LoadLocal(_), crate::bytecode::Op::Pop]
+                )
+            })
+            .expect("lexical assignment guard");
+        for start in 0..=guard_pc {
+            if let Some((chain, _)) = build_chain(&chunk, ops, start, &targeted, &layout, u32::MAX)
+            {
+                assert!(
+                    chain.iter().all(|(_, pc)| *pc != guard_pc),
+                    "unused read at {guard_pc} became a numeric guard from {start}: {ops:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn element_value_transfers_do_not_speculate_on_the_value_type() {
+        let engine = crate::Engine::new();
+        let layout = crate::value::jit_layout(&engine.interp.object_proto);
+        let chunk =
+            compile_function("function read(a, k, result) { return result = a[k], result; }");
+        let ops = chunk.jit_ops();
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, crate::bytecode::Op::GetElemLocal(_))));
+        let targeted = vec![false; ops.len() + 1];
+        for start in 0..ops.len() {
+            if let Some((chain, _)) = build_chain(&chunk, ops, start, &targeted, &layout, u32::MAX)
+            {
+                assert!(
+                    !chain
+                        .iter()
+                        .any(|(op, _)| matches!(op, ChainOp::GetElem(_))),
+                    "pure element transfer became a numeric chain at {start}: {ops:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn element_arithmetic_still_uses_numeric_chains() {
+        let engine = crate::Engine::new();
+        let layout = crate::value::jit_layout(&engine.interp.object_proto);
+        for source in [
+            "function sum(a, k) { return a[k] + 7; }",
+            "function bits(a, k) { return a[k] ^ 255; }",
+            "function negative(a, k) { return -a[k]; }",
+            "function less(a, k) { if (a[k] < 7) return 1; return 0; }",
+        ] {
+            let chunk = compile_function(source);
+            let ops = chunk.jit_ops();
+            let targeted = vec![false; ops.len() + 1];
+            assert!(
+                (0..ops.len()).any(|start| {
+                    build_chain(&chunk, ops, start, &targeted, &layout, u32::MAX).is_some_and(
+                        |(chain, _)| {
+                            chain
+                                .iter()
+                                .any(|(op, _)| matches!(op, ChainOp::GetElem(_)))
+                        },
+                    )
+                }),
+                "element computation lost its numeric chain: {source}: {ops:?}"
+            );
+        }
+    }
 }
 
 /// Emit a numeric register chain (see [`build_chain`]): the virtual operand stack lives in
@@ -10511,9 +11849,11 @@ struct SlotPlan {
 ))]
 struct LoopPlan {
     head: usize,
-    jump_pc: usize,
     exit_pc: usize,
-    /// Translated ops for `[head, jump_pc)`; the single CmpBranch ends the condition prefix.
+    /// Discarded local reads checked once at entry. This helper-free region has no Tdz op;
+    /// failure resumes the original loop so zero-trip and RHS exception order stay unchanged.
+    initialization_guards: Vec<u32>,
+    /// Translated ops from the head to the latch; CmpBranch ends the condition prefix.
     chain: Vec<(ChainOp, usize)>,
     /// Chain entries `[0, cond_len)` are the condition (emitted twice: entry + bottom).
     cond_len: usize,
@@ -10659,8 +11999,22 @@ fn plan_loop(
     let mut vdepth = 0usize;
     let mut exit_pc = None;
     let mut cond_len = None;
+    let mut initialization_guards = Vec::new();
     let mut pc = head;
     while pc < jump_pc {
+        if let Some(slot) = local_read_discard_pair(ops, pc, targeted) {
+            let off = slot as u32 * 16;
+            if !initialization_guards.contains(&off) {
+                initialization_guards.push(off);
+            }
+            // This read's value is discarded, not used numerically. The preamble only
+            // checks initialization; a miss replays the ordinary instructions. Keep both
+            // PCs in the plan for exact original-bytecode mapping without a numeric home.
+            chain.push((ChainOp::KeyNop, pc));
+            chain.push((ChainOp::KeyNop, pc + 1));
+            pc += 2;
+            continue;
+        }
         let (cop, push, pop): (ChainOp, usize, usize) = match &ops[pc] {
             Op::Const(k) => (ChainOp::ConstNum(chunk.jit_const_num(*k)?), 1, 0),
             Op::LoadLocal(s) if in_range(*s) => (ChainOp::Load(*s as u32 * 16), 1, 0),
@@ -11776,8 +13130,8 @@ fn plan_loop(
         || conv_retain.iter().any(|&(_, p)| p >= 23);
     Some(LoopPlan {
         head,
-        jump_pc,
         exit_pc,
+        initialization_guards,
         chain,
         cond_len,
         kinds: plan_kinds,
@@ -12232,7 +13586,8 @@ fn emit_numeric_diamond_region(
 }
 
 /// Emit the loop chain for `plan`. Returns the label for the plain fallback of the head op —
-/// the caller binds it immediately after and continues emitting the plain region.
+/// the caller binds it immediately after and continues emitting the plain region. Every emitted
+/// interior fallback destination is marked in `targeted` before plain-template fusion begins.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -12242,6 +13597,7 @@ fn emit_loop_chain(
     layout: &crate::value::JitLayout,
     plan: &LoopPlan,
     pc_labels: &[usize],
+    targeted: &mut [bool],
 ) -> usize {
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
@@ -12308,6 +13664,14 @@ fn emit_loop_chain(
         .collect();
 
     // ---- preamble --------------------------------------------------------------------------
+    // Hoist only the non-throwing guard, never the observable TDZ error. On Empty, return to
+    // the original loop before its condition/RHS: it may be zero-trip or throw from the RHS
+    // first. Once admitted, no operation in the helper-free loop can uninitialize a local.
+    for off in &plan.initialization_guards {
+        a.ldrb_imm(9, 22, *off);
+        a.cmp_imm_w(9, 1);
+        a.b_cond(C_EQ, pre_fail);
+    }
     // Validate names before populating integer local homes: the shared IC probe uses x7 as its
     // packed/wide result marker in addition to x9-x17. Large regions can legitimately assign
     // a resident local to x7, so reversing this order would silently overwrite that local.
@@ -13276,6 +14640,17 @@ fn emit_loop_chain(
 
     // ---- rotated loop ----------------------------------------------------------------------
     emit_pass!(0..plan.cond_len, exit_a, Vec::new());
+    // Keep hot-loop placement stable when cold preamble checks grow. The override is for
+    // release A/B diagnostics, not a semantic switch; 0 disables padding. Large-branch
+    // relaxation can still move this boundary, so correctness never depends on alignment.
+    let alignment = std::env::var("LUMEN_JIT_LOOP_ALIGNMENT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value == 0 || (16..=128).contains(value) && value.is_power_of_two())
+        .unwrap_or(64);
+    if alignment != 0 {
+        a.align_hot(alignment);
+    }
     a.bind(body_l);
     emit_pass!(
         plan.cond_len..plan.chain.len(),
@@ -13361,6 +14736,7 @@ fn emit_loop_chain(
         if pc == plan.head {
             a.b(plain_h);
         } else {
+            targeted[pc] = true;
             a.b(pc_labels[pc]);
         }
     }

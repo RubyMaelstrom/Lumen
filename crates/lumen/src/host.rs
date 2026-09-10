@@ -44,6 +44,33 @@ pub trait RetainedMemory {
     fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor);
 }
 
+/// Native caches can own JavaScript references without making them permanent roots.
+/// Implementations must enumerate each owned strong handle exactly once with `internal`,
+/// then describe the logical edges that keep it alive. Omitted handles remain ordinary
+/// conservative roots, which is the safe fallback when a native store is currently borrowed.
+/// These callbacks must not execute JavaScript, allocate JS objects, or re-enter collection.
+pub trait HostGc {
+    fn trace_gc(&self, visitor: &mut dyn HostGcVisitor);
+    /// Remove every cache handle that `is_live` rejects before the JS heap is swept.
+    /// Do not retain new handles or change the graph during this phase.
+    fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool);
+}
+
+pub trait HostGcVisitor {
+    /// Discount exactly one native-owned strong handle during root classification.
+    fn internal(&mut self, value: &Value);
+    /// A logical (non-Rc-owning) edge from a live owner to a retained value.
+    fn edge(&mut self, owner: &Value, value: &Value);
+    /// A value reachable from a native root not represented by a JS owner.
+    fn root(&mut self, value: &Value);
+}
+
+#[derive(Clone, Copy)]
+struct GcReporter {
+    trace: fn(&dyn Any, &mut dyn HostGcVisitor),
+    sweep: fn(&mut dyn Any, &dyn Fn(&Value) -> bool),
+}
+
 #[derive(Clone, Copy)]
 struct ManagedReporter {
     scan: fn(&dyn Any, &mut dyn HostRetainedMemoryVisitor),
@@ -176,6 +203,7 @@ pub struct OpState {
     retained_reporters: HashMap<TypeId, RetainedReporter>,
     managed_reporters: HashMap<TypeId, ManagedReporter>,
     external_reporters: HashMap<TypeId, ExternalReporter>,
+    gc_reporters: HashMap<TypeId, GcReporter>,
     pub resources: ResourceTable,
 }
 
@@ -264,6 +292,34 @@ impl OpState {
         self.map.contains_key(&TypeId::of::<T>())
     }
 
+    /// Opt an installed host type into cycle collection. Replacing a slot of the same
+    /// Rust type preserves this registration; an absent slot is simply not visited.
+    pub fn register_gc<T: Any + HostGc>(&mut self) {
+        self.gc_reporters.insert(
+            TypeId::of::<T>(),
+            GcReporter {
+                trace: |value, visitor| value.downcast_ref::<T>().unwrap().trace_gc(visitor),
+                sweep: |value, is_live| value.downcast_mut::<T>().unwrap().sweep_gc(is_live),
+            },
+        );
+    }
+
+    pub(crate) fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+        for (key, reporter) in &self.gc_reporters {
+            if let Some(value) = self.map.get(key) {
+                (reporter.trace)(value.as_ref(), visitor);
+            }
+        }
+    }
+
+    pub(crate) fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
+        for (key, reporter) in &self.gc_reporters {
+            if let Some(value) = self.map.get_mut(key) {
+                (reporter.sweep)(value.as_mut(), is_live);
+            }
+        }
+    }
+
     pub(crate) fn retained_memory(&self) -> HostRetainedMemory {
         let mut memory = HostRetainedMemory {
             reported_bytes: self
@@ -284,6 +340,11 @@ impl OpState {
                     self.external_reporters
                         .len()
                         .saturating_mul(std::mem::size_of::<(TypeId, ExternalReporter)>()),
+                )
+                .saturating_add(
+                    self.gc_reporters
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(TypeId, GcReporter)>()),
                 ),
             unavailable_entries: self
                 .map
@@ -302,7 +363,8 @@ impl OpState {
             opaque_storage: !self.map.is_empty()
                 || !self.retained_reporters.is_empty()
                 || !self.managed_reporters.is_empty()
-                || !self.external_reporters.is_empty(),
+                || !self.external_reporters.is_empty()
+                || !self.gc_reporters.is_empty(),
             external_allocations: Vec::new(),
         };
         for (type_id, reporter) in &self.retained_reporters {
@@ -499,6 +561,215 @@ impl ResourceTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct NativeCache {
+        values: Vec<Value>,
+        edges: Vec<(usize, usize)>,
+        roots: Vec<usize>,
+        busy: bool,
+    }
+
+    impl HostGc for NativeCache {
+        fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+            if self.busy {
+                return;
+            }
+            for value in &self.values {
+                visitor.internal(value);
+            }
+            for &(owner, target) in &self.edges {
+                visitor.edge(&self.values[owner], &self.values[target]);
+            }
+            for &root in &self.roots {
+                visitor.root(&self.values[root]);
+            }
+        }
+        fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
+            // Keep indices stable in this synthetic cache.
+            for value in &mut self.values {
+                if !is_live(value) {
+                    *value = Value::Undefined;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_gc_edges_preserve_ephemerons_and_release_unrooted_cycles() {
+        let mut engine = crate::Engine::new();
+        engine
+            .eval(
+                r#"
+            globalThis.owner = {};
+            globalThis.target = {};
+            globalThis.payload = {marker: 42};
+            const map = new WeakMap([[target, payload]]);
+            payload.back = target;
+        "#,
+                false,
+            )
+            .unwrap();
+        let global = Value::Obj(engine.interp.global.clone());
+        let owner = engine
+            .interp
+            .member_get(&global, "owner")
+            .unwrap_or_else(|_| panic!("owner"));
+        let target = engine
+            .interp
+            .member_get(&global, "target")
+            .unwrap_or_else(|_| panic!("target"));
+        let payload = engine
+            .interp
+            .member_get(&global, "payload")
+            .unwrap_or_else(|_| panic!("payload"));
+        let target_weak = engine.interp.downgrade_object_value(&target).unwrap();
+        let payload_weak = engine.interp.downgrade_object_value(&payload).unwrap();
+        drop(payload);
+        engine.interp.op_state().put(NativeCache {
+            // Two cache handles to one target must both be discounted, but logical edges
+            // must not be counted as additional strong owners.
+            values: vec![owner, target.clone(), target],
+            edges: vec![(0, 1), (1, 0)],
+            ..Default::default()
+        });
+        engine.interp.op_state().register_gc::<NativeCache>();
+        engine.eval("target = payload = null", false).unwrap();
+        engine.interp.gc_collect();
+        assert!(target_weak.upgrade().is_some());
+        assert!(
+            payload_weak.upgrade().is_some(),
+            "native edge activates WeakMap value"
+        );
+
+        engine.eval("owner = null", false).unwrap();
+        engine
+            .interp
+            .op_state()
+            .get_mut::<NativeCache>()
+            .unwrap()
+            .roots
+            .push(1);
+        engine.interp.gc_collect();
+        assert!(
+            payload_weak.upgrade().is_some(),
+            "native root activates entire component"
+        );
+        engine
+            .interp
+            .op_state()
+            .get_mut::<NativeCache>()
+            .unwrap()
+            .roots
+            .clear();
+        engine.interp.gc_collect();
+        assert!(target_weak.upgrade().is_none());
+        assert!(payload_weak.upgrade().is_none());
+        assert!(engine
+            .interp
+            .op_state()
+            .get::<NativeCache>()
+            .unwrap()
+            .values
+            .iter()
+            .all(|value| matches!(value, Value::Undefined)));
+    }
+
+    #[test]
+    fn host_gc_busy_fallback_and_replaced_slots_remain_safe() {
+        let mut engine = crate::Engine::new();
+        engine.interp.op_state().register_gc::<NativeCache>();
+        // A registration is attached to a Rust type, not to the old slot's address.
+        engine.interp.op_state().put(NativeCache::default());
+        engine.interp.op_state().take::<NativeCache>();
+        engine.interp.gc_collect();
+        let value = Value::Obj(engine.interp.new_object());
+        let weak = engine.interp.downgrade_object_value(&value).unwrap();
+        engine.interp.op_state().put(NativeCache {
+            values: vec![value],
+            busy: true,
+            ..Default::default()
+        });
+        engine.interp.gc_collect();
+        assert!(
+            weak.upgrade().is_some(),
+            "undiscounted handle remains a root"
+        );
+        engine
+            .interp
+            .op_state()
+            .get_mut::<NativeCache>()
+            .unwrap()
+            .busy = false;
+        engine.interp.gc_collect();
+        assert!(
+            weak.upgrade().is_none(),
+            "idle, unrooted cache entry is released"
+        );
+    }
+
+    #[test]
+    fn host_gc_and_continuations_share_an_owner_without_losing_either_edge() {
+        let mut engine = crate::Engine::new();
+        engine
+            .eval(
+                r#"
+            var mixedOwner = (function*() {
+                const payload = {n:41};
+                yield 0; yield payload.n;
+            })();
+            mixedOwner.next();
+        "#,
+                false,
+            )
+            .unwrap();
+        let global = Value::Obj(engine.interp.global.clone());
+        let owner = engine
+            .interp
+            .member_get(&global, "mixedOwner")
+            .unwrap_or_else(|_| panic!("generator owner"));
+        let owner_weak = engine.interp.downgrade_object_value(&owner).unwrap();
+        let native_target = Value::Obj(engine.interp.new_object());
+        let native_weak = engine
+            .interp
+            .downgrade_object_value(&native_target)
+            .unwrap();
+        engine.interp.op_state().put(NativeCache {
+            values: vec![owner, native_target],
+            edges: vec![(0, 1)],
+            ..Default::default()
+        });
+        engine.interp.op_state().register_gc::<NativeCache>();
+        engine.interp.gc_collect();
+        assert!(
+            native_weak.upgrade().is_some(),
+            "the native edge shares the coroutine owner"
+        );
+        match engine.eval("mixedOwner.next().value", false).unwrap() {
+            crate::Completion::Value(value) => assert_eq!(value, "41"),
+            crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+        engine.eval("mixedOwner = null", false).unwrap();
+        engine
+            .interp
+            .op_state()
+            .get_mut::<NativeCache>()
+            .unwrap()
+            .busy = true;
+        engine.interp.gc_collect();
+        assert!(owner_weak.upgrade().is_some());
+        assert!(native_weak.upgrade().is_some());
+        engine
+            .interp
+            .op_state()
+            .get_mut::<NativeCache>()
+            .unwrap()
+            .busy = false;
+        engine.interp.gc_collect();
+        assert!(owner_weak.upgrade().is_none());
+        assert!(native_weak.upgrade().is_none());
+        assert!(engine.interp.generators.is_empty());
+    }
 
     struct Reported(Vec<u8>);
 

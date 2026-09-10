@@ -7,7 +7,8 @@
 //!   at worst it costs a parse. A `MAGIC`+`VERSION` header makes skew a clean decode error.
 //! - **Only parser output is encoded.** `Function`'s `scan`/`hoist`/`calls`/`code` are lazy
 //!   runtime caches (`Cell`/`OnceCell`); decode initializes them empty, exactly as the parser
-//!   leaves them, so a decoded tree is indistinguishable from a freshly parsed one.
+//!   leaves them. Ordinary snapshots preserve reflection source; the explicit host-bootstrap
+//!   variant omits only function/class source text, leaving executable AST nodes intact.
 //! - Interned `&'static str` operators are re-interned from [`KEYWORDS`]/[`PUNCTUATORS`] on
 //!   decode (every op the parser emits comes from those tables).
 //!
@@ -37,6 +38,7 @@ const ACCOUNTED_NODE_BYTES: usize = 64;
 
 struct Writer {
     buf: Vec<u8>,
+    include_source: bool,
 }
 
 impl Writer {
@@ -210,9 +212,20 @@ fn intern_op(s: &str) -> R<&'static str> {
 
 /// Encode a parsed script body to a snapshot blob.
 pub fn encode(body: &[Stmt]) -> Vec<u8> {
+    encode_with_source(body, true)
+}
+
+/// Host implementation code has no author-visible source. Keep the executable
+/// AST intact, including nested functions/classes created after bootstrap.
+pub(crate) fn encode_host(body: &[Stmt]) -> Vec<u8> {
+    encode_with_source(body, false)
+}
+
+fn encode_with_source(body: &[Stmt], include_source: bool) -> Vec<u8> {
     let perf_started = crate::jit::perf_stage_start();
     let mut w = Writer {
         buf: Vec::with_capacity(body.len() * 32),
+        include_source,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -1234,7 +1247,11 @@ fn enc_function(w: &mut Writer, f: &Function) {
         | (f.is_fn_expr as u8) << 6
         | (f.default_ctor as u8) << 7;
     w.u8(flags);
-    enc_opt_rcstr(w, &f.source);
+    if w.include_source {
+        enc_opt_rcstr(w, &f.source);
+    } else {
+        w.u8(0);
+    }
 }
 fn dec_function(r: &mut Reader) -> R<Function> {
     r.enter_node()?;
@@ -1312,7 +1329,11 @@ fn enc_class(w: &mut Writer, c: &Class) {
         enc_exprs(w, &m.decorators);
     }
     enc_exprs(w, &c.decorators);
-    enc_opt_rcstr(w, &c.source);
+    if w.include_source {
+        enc_opt_rcstr(w, &c.source);
+    } else {
+        w.u8(0);
+    }
 }
 fn dec_class(r: &mut Reader) -> R<Class> {
     r.enter_node()?;
@@ -1461,7 +1482,10 @@ mod tests {
     use super::{decode, encode, Writer, MAGIC, VERSION};
 
     fn snapshot_writer() -> Writer {
-        let mut writer = Writer { buf: Vec::new() };
+        let mut writer = Writer {
+            buf: Vec::new(),
+            include_source: true,
+        };
         writer.uv(MAGIC as u64);
         writer.uv(VERSION as u64);
         writer

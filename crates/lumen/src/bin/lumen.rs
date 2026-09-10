@@ -173,6 +173,7 @@ Diagnostics (env, unstable):
   LUMEN_REGEXP_PROF=1     Report matcher instruction/scan/attempt/backtrack/tier counts at exit
   LUMEN_REGEXP_TIER_UP_AT=N  Promote eligible ASCII matchers after N calls; 0 disables
   LUMEN_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
+  LUMEN_JIT_CODE_BUDGET_MB=N  Process-wide live executable-code cap, 1..1024 MiB
   LUMEN_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
   LUMEN_PERF_METRICS=1    Print one JSON JIT/collector performance summary at normal exit
 "

@@ -2,6 +2,37 @@
 
 use super::*;
 
+/// Opt-in reflection metadata only: no source bodies, argument values, getters or
+/// Proxy traps. Useful for identifying the actual platform functions a page inspects.
+fn trace_function_to_string(value: &Value) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if !*ENABLED.get_or_init(|| std::env::var_os("LUMEN_TRACE_FUNCTION_TOSTRING").is_some())
+        || COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 512
+    {
+        return;
+    }
+    let Value::Obj(object) = value else {
+        return;
+    };
+    let object = object.borrow();
+    let name = match object.props.get("name").map(|property| property.value()) {
+        Some(Value::Str(name)) => name.chars().take(80).collect::<String>(),
+        _ => String::new(),
+    };
+    let source = match &object.call {
+        Callable::User(user) => user.func.source.as_deref(),
+        _ => None,
+    };
+    let source_bytes = source.map_or(0, str::len);
+    let host_ops = source.is_some_and(|source| {
+        source.contains("__dom_") || source.contains("__host_") || source.contains("__trust")
+    });
+    eprintln!(
+        "lumen-function-source: name={name:?} source_bytes={source_bytes} host_ops={host_ops}"
+    );
+}
+
 pub(super) fn install_function_proto(it: &mut Interp) {
     let fp = it.function_proto.clone();
     // %Function.prototype% is itself a callable function object that accepts any arguments and
@@ -16,6 +47,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         b.props
             .insert("name", Property::data(Value::str(""), false, false, true));
     }
+    it.register_native_realm(&fp);
     it.def_method(&fp, "call", 1, nf_function_call);
     it.def_method(&fp, "apply", 2, nf_function_apply);
     it.def_method(&fp, "bind", 1, |i, this, args| {
@@ -76,6 +108,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
                 "Function.prototype.toString requires that 'this' be a function",
             ));
         }
+        trace_function_to_string(&this);
         // A user function returns the source text it was parsed from; everything else
         // (natives, bound functions, proxies) renders as a native function carrying its name.
         if let Value::Obj(o) = &this {

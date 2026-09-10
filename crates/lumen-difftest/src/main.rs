@@ -102,6 +102,31 @@ struct Outcome {
     threw: Option<(String, String)>,
 }
 
+/// A dependency-free wire record for an independent engine oracle. Hex preserves
+/// UTF-8, newlines and empty strings without depending on the engine's serializer.
+/// Native error messages are implementation-defined; compare the error name,
+/// printed observable trace and normal completion instead.
+fn observation_record(outcome: &Outcome) -> String {
+    fn hex(text: &str) -> String {
+        let mut result = String::with_capacity(text.len().saturating_mul(2));
+        for byte in text.bytes() {
+            write!(result, "{byte:02x}").unwrap();
+        }
+        result
+    }
+    let mut result = String::new();
+    for line in &outcome.console {
+        writeln!(result, "L {}", hex(line)).unwrap();
+    }
+    if let Some((name, _)) = &outcome.threw {
+        writeln!(result, "E {}", hex(name)).unwrap();
+    } else {
+        writeln!(result, "V {}", hex(&outcome.completion)).unwrap();
+    }
+    result.push_str("END\n");
+    result
+}
+
 fn run_tier(src: &str, tier: Tier) -> Outcome {
     let mut e = Engine::new();
     e.set_tier(tier);
@@ -401,6 +426,21 @@ fn dispatch() {
             let s: u64 = args[1].parse().unwrap();
             print!("{}", generate(s));
         }
+        // Read-only observation of an owned fixture. The parent must enforce a
+        // wall-clock cap too, as it does for --check. Never emit source here.
+        Some("--observe") => {
+            ALLOC
+                .cap
+                .store(CAP_MB as usize * 1024 * 1024, Ordering::Relaxed);
+            let source = std::fs::read_to_string(&args[1]).unwrap();
+            let tier = match args.get(2).map(String::as_str) {
+                Some("interp") => Tier::Interp,
+                Some("bytecode") => Tier::Bytecode,
+                Some("jit") => Tier::Jit,
+                _ => panic!("--observe FILE interp|bytecode|jit"),
+            };
+            print!("{}", observation_record(&run_tier(&source, tier)));
+        }
         // Child: run the JS in `args[1]` in both tiers. Exit 3 = diverged, 0 = agreed. The parent
         // caps this child's memory and wall-clock, so a pathological program (non-terminating or
         // huge — both tiers agree, but forever) is killed and reported as inconclusive, never a
@@ -422,6 +462,32 @@ fn dispatch() {
 /// or allocate without bound — see the seed-159 exponential-catch case in the fuzzer notes).
 const CAP_MB: u64 = 512;
 const TIMEOUT_MS: u64 = 4000;
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn wire_record_preserves_empty_and_unicode_lines_without_error_messages() {
+        let result = Outcome {
+            console: vec![String::new(), "a\nλ".into()],
+            completion: "undefined".into(),
+            threw: None,
+        };
+        assert_eq!(
+            observation_record(&result),
+            "L \nL 610acebb\nV 756e646566696e6564\nEND\n"
+        );
+        let error = Outcome {
+            threw: Some(("TypeError".into(), "implementation-specific message".into())),
+            ..result
+        };
+        assert_eq!(
+            observation_record(&error),
+            "L \nL 610acebb\nE 547970654572726f72\nEND\n"
+        );
+    }
+}
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Verdict {

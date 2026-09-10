@@ -374,9 +374,10 @@ type OneByteNativeEntry = unsafe extern "C" fn(
 ) -> u8;
 
 #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
-extern "C" fn regexp_native_poll(control: *const crate::RuntimeInterrupt) -> u8 {
+extern "C" fn regexp_native_poll(control: *const crate::RuntimeInterrupt) -> u32 {
     // The generated code returns 0 for no interruption and 1..=3 in the same priority order as
     // RuntimeInterrupt. The helper keeps deadline/mutex semantics out of the generated loop.
+    // Return a full word so all of w0 is defined for the AArch64 caller's comparison.
     match unsafe { control.as_ref() }.and_then(crate::RuntimeInterrupt::current_reason) {
         None => 0,
         Some(crate::InterruptReason::Cancelled) => 1,
@@ -973,7 +974,11 @@ fn compile_one_byte_native_aarch64(
     a.bind(loop_start);
     arm64_mov_reg(&mut a, 0, 23);
     arm64_mov_imm64(&mut a, 16, regexp_native_poll as *const () as usize as u64);
+    // AAPCS64 6.1.1: NZCV is undefined across a public call. Test the returned
+    // status, not flags left by Rust; a false interrupt with w0 == 0 would be
+    // encoded below as a successful empty match and could stall global replace.
     a.insn(0xd63f_0200); // blr x16
+    arm64_cmp_imm_w(&mut a, 0, 0);
     a.branch_cond(1, interrupted); // NE: poll returned a reason
     if word_elements {
         arm64_add_shifted_reg(&mut a, 10, 19, 21, 2); // add x10, x19, x21, lsl #2
@@ -6006,6 +6011,91 @@ mod internal_engine_diagnostics {
             multiline.exec_text_shared(&ascii, 0, &control).unwrap();
         }
         assert!(!multiline.tier_feedback().3);
+    }
+
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
+    #[test]
+    fn native_regexp_machine_poll_with_armed_deadline_preserves_match_offsets() {
+        let control = crate::RuntimeInterrupt::default();
+        control.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        // Exercise the executable mappings directly: the checked native Rust matcher
+        // cannot reveal an ABI error at the generated code's host-interrupt call.
+        let code = super::OneByteNativeCode::compile(&[super::OneByteNativeOp::Any])
+            .expect("the fixed-width dot pattern must have executable code");
+        for sticky in [false, true] {
+            for start in 0..=4 {
+                let expected = (start < 3).then_some((start, start + 1));
+                assert_eq!(
+                    code.find_ascii(b"abc", start, sticky, &control).unwrap(),
+                    expected,
+                    "byte mapping at {start}, sticky={sticky}"
+                );
+                assert_eq!(
+                    code.find_one_byte(&[0xe9, 0x78, 0xff], start, sticky, &control)
+                        .unwrap(),
+                    expected,
+                    "word mapping at {start}, sticky={sticky}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn native_regexp_aarch64_poll_explicitly_tests_return_value() {
+        // Debug Rust can coincidentally leave useful flags; keep an emitter-level
+        // gate as well as the release executable-mapping and JS regressions.
+        for word_elements in [false, true] {
+            let bytes = super::compile_one_byte_native_aarch64(
+                &[super::OneByteNativeOp::Any],
+                word_elements,
+            )
+            .unwrap();
+            let instructions: Vec<u32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
+                .collect();
+            let poll = instructions
+                .iter()
+                .position(|&word| word == 0xd63f_0200)
+                .expect("poll call must be emitted");
+            assert_eq!(instructions[poll + 1], 0x7100_001f, "cmp w0, #0");
+        }
+    }
+
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]
+    #[test]
+    fn native_regexp_machine_poll_preserves_host_interrupt_reasons() {
+        let code = super::OneByteNativeCode::compile(&[super::OneByteNativeOp::Any])
+            .expect("the fixed-width dot pattern must have executable code");
+        for expected in [
+            crate::InterruptReason::Cancelled,
+            crate::InterruptReason::UserNavigation,
+            crate::InterruptReason::DeadlineExceeded,
+        ] {
+            let control = crate::RuntimeInterrupt::default();
+            match expected {
+                crate::InterruptReason::Cancelled => control.cancel(),
+                crate::InterruptReason::UserNavigation => control.request_user_navigation(),
+                crate::InterruptReason::DeadlineExceeded => control.set_deadline(Some(
+                    std::time::Instant::now() - std::time::Duration::from_secs(1),
+                )),
+            }
+            for result in [
+                code.find_ascii(b"abc", 1, false, &control),
+                code.find_one_byte(&[0xe9, 0x78, 0xff], 1, false, &control),
+            ] {
+                assert!(
+                    matches!(result, Err(super::MatchError::Interrupted(reason)) if reason == expected),
+                    "incorrect poll completion: {result:?}, expected {expected:?}"
+                );
+            }
+        }
     }
 
     #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), unix))]

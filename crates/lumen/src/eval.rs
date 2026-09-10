@@ -32,6 +32,41 @@ struct PreparedDecoratorValue {
 }
 
 impl PreparedClassEvaluation {
+    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
+        // Exhaustive inventory: adding retained state must update this ownership walk.
+        let Self {
+            outer_class_env,
+            class_env,
+            proto_parent,
+            ctor_parent,
+            derived: _,
+            keys: _,
+            decorator_values,
+        } = self;
+        edges.scope(outer_class_env);
+        edges.scope(class_env);
+        if let Some(parent) = proto_parent {
+            edges.object(parent);
+        }
+        if let Some(parent) = ctor_parent {
+            edges.value(parent);
+        }
+        if let Some(decorators) = decorator_values {
+            for decorator in decorators
+                .class
+                .iter()
+                .chain(decorators.members.iter().flatten())
+            {
+                let PreparedDecoratorValue {
+                    callback,
+                    this_value,
+                } = decorator;
+                edges.value(callback);
+                edges.value(this_value);
+            }
+        }
+    }
+
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         let mut bytes = self
             .keys
@@ -2028,30 +2063,6 @@ impl Interp {
         );
     }
 
-    /// Whether `name` resolves to a declared-but-uninitialized (TDZ) lexical binding — following a
-    /// live module import through to the exporter's binding (so `typeof importedName` throws when the
-    /// exporter has not yet initialized it).
-    fn binding_in_tdz(&self, name: &str, env: &Env) -> bool {
-        let mut cur = Some(env.clone());
-        while let Some(s) = cur {
-            let (import_ref, uninit, found) = {
-                let b = s.borrow();
-                match b.vars.get(name) {
-                    Some(binding) => (binding.import_ref.clone(), !binding.initialized, true),
-                    None => (None, false, false),
-                }
-            };
-            if found {
-                if let Some((src_env, local)) = import_ref {
-                    return self.binding_in_tdz(&local, &src_env);
-                }
-                return uninit;
-            }
-            cur = s.borrow().parent.clone();
-        }
-        false
-    }
-
     /// Object-environment HasBinding for a `with (obj)` scope: HasProperty, then an object-valued
     /// `obj[@@unscopables]` whose `name` property is truthy blocks the binding.
     fn with_has_binding(&mut self, obj: &Value, name: &str) -> Result<bool, Abrupt> {
@@ -2074,20 +2085,30 @@ impl Interp {
         self.get_var_with(name, env).map(|(v, _)| v)
     }
 
-    /// Compiled `typeof freeName`: unlike an ordinary name load, an unresolved name produces the
-    /// string "undefined". A declared lexical still in its TDZ continues to throw.
+    /// ECMA-262 typeof: only an unresolvable Reference produces "undefined"
+    /// without GetValue. Resolution/getter/TDZ exceptions propagate unchanged.
+    /// Decide at the lookup's missing-name branch, not by throwing an Error and
+    /// then guessing whether to swallow it (which also allocates on feature checks).
     pub(crate) fn typeof_name_vm(&mut self, name: &str, env: &Env) -> Result<Value, Abrupt> {
-        match self.get_var(name, env) {
-            Ok(v) if self.is_htmldda(&v) => Ok(Value::str("undefined")),
-            Ok(v) => Ok(Value::from_string(v.type_of().to_string())),
-            Err(e) if self.binding_in_tdz(name, env) => Err(e),
-            Err(_) => Ok(Value::str("undefined")),
+        let (value, _) = self.get_var_with_mode::<true>(name, env)?;
+        if self.is_htmldda(&value) {
+            Ok(Value::str("undefined"))
+        } else {
+            Ok(Value::str(value.type_of()))
         }
     }
 
     /// Resolve like [`Interp::get_var`], also yielding the `with` object the binding came from —
     /// the implicit call receiver for `f()` resolved through a with scope.
     pub(crate) fn get_var_with(
+        &mut self,
+        name: &str,
+        env: &Env,
+    ) -> Result<(Value, Option<Value>), Abrupt> {
+        self.get_var_with_mode::<false>(name, env)
+    }
+
+    fn get_var_with_mode<const ALLOW_UNRESOLVED: bool>(
         &mut self,
         name: &str,
         env: &Env,
@@ -2166,7 +2187,11 @@ impl Interp {
         if self.js_has_property(&g, name)? {
             return Ok((self.get_member(&g, name)?, None));
         }
-        Err(self.throw("ReferenceError", format!("{name} is not defined")))
+        if ALLOW_UNRESOLVED {
+            Ok((Value::Undefined, None))
+        } else {
+            Err(self.throw("ReferenceError", format!("{name} is not defined")))
+        }
     }
 
     /// Walk the scope chain for an initialized binding without the `with`/global fallback or the
@@ -2461,7 +2486,16 @@ impl Interp {
             let (with_obj, parent) = {
                 let mut b = s.borrow_mut();
                 if let Some(binding) = b.vars.get_mut(name) {
-                    if !binding.mutable && binding.initialized {
+                    // Var initializers and assignment-pattern/loop-head writes perform
+                    // PutValue, not InitializeBinding. Hoisted var bindings are already
+                    // initialized; a lexical binding found here must retain its TDZ.
+                    if !binding.initialized {
+                        return Err(self.throw(
+                            "ReferenceError",
+                            format!("cannot access '{name}' before initialization"),
+                        ));
+                    }
+                    if !binding.mutable {
                         // A const always throws; a non-strict immutable binding (a named function
                         // expression's own name) is a silent no-op in sloppy code.
                         if binding.strict_immutable || self.strict {
@@ -3224,7 +3258,7 @@ impl Interp {
             Expr::Index { obj, index, .. } => {
                 let base = self.eval(obj, env)?;
                 let idx = self.eval(index, env)?;
-                let key = self.to_property_key(&idx)?;
+                let key = self.ref_prop_key(&base, &mut RefKey::Raw(idx))?;
                 let f = self.get_member(&base, &key)?;
                 (f, base)
             }
@@ -3291,6 +3325,15 @@ impl Interp {
     /// calls. Anything else evaluates normally to a value.
     fn eval_return_expr(&mut self, e: &Expr, env: &Env) -> Result<TailEval, Abrupt> {
         match e {
+            Expr::Call {
+                callee,
+                args,
+                optional: false,
+            } if matches!(&**callee, Expr::Ident(name) if name == "eval") => {
+                // Resolve once: even testing whether this is direct eval can invoke a
+                // with-object getter. A shadowing ordinary function still gets a tail call.
+                self.eval_named_eval_call(args, env, true)
+            }
             Expr::Call { .. } => {
                 if let Some((f, t, a)) = self.eval_tail_call(e, env)? {
                     return Ok(TailEval::Tail(f, t, a));
@@ -3354,17 +3397,11 @@ impl Interp {
             // A direct `eval`, `super(...)`, private-name or super-property callee stays on the
             // normal path.
             Expr::Ident(name) => {
+                if name == "eval" {
+                    return Ok(None); // handled without a second lookup by eval_return_expr
+                }
                 // A callee resolved through a `with (obj)` environment gets `obj` as `this`.
                 let (f, recv) = self.get_var_with(name, env)?;
-                // A callee *named* eval only disqualifies when it is the real eval function
-                // (a direct eval isn't a call at all).
-                if name == "eval" && recv.is_none() {
-                    if let (Value::Obj(fo), Some(ef)) = (&f, &self.eval_fn) {
-                        if Rc::ptr_eq(fo, ef) {
-                            return Ok(None);
-                        }
-                    }
-                }
                 (f, recv.unwrap_or(Value::Undefined))
             }
             Expr::Member { obj, prop, .. }
@@ -3517,6 +3554,35 @@ impl Interp {
         Ok(result)
     }
 
+    fn eval_named_eval_call(
+        &mut self,
+        args: &[ArrayElem],
+        env: &Env,
+        tail: bool,
+    ) -> Result<TailEval, Abrupt> {
+        // ECMA-262 §13.3.6: an identifier resolved through a with Environment Record
+        // is still a non-property Reference. Its WithBaseObject is the receiver for
+        // an ordinary call, not a condition for recognizing this Realm's %eval%.
+        let (func, receiver) = self.get_var_with("eval", env)?;
+        let direct = matches!(
+            (&func, &self.eval_fn),
+            (Value::Obj(function), Some(intrinsic)) if Rc::ptr_eq(function, intrinsic)
+        );
+        let argv = self.eval_args(args, env)?;
+        if direct {
+            return self.direct_eval(argv.first(), env).map(TailEval::Val);
+        }
+        if !func.is_callable() {
+            return Err(self.throw("TypeError", "eval is not a function"));
+        }
+        let receiver = receiver.unwrap_or(Value::Undefined);
+        if tail {
+            Ok(TailEval::Tail(func, receiver, argv))
+        } else {
+            self.call(func, receiver, &argv).map(TailEval::Val)
+        }
+    }
+
     fn eval_call(
         &mut self,
         callee: &Expr,
@@ -3524,25 +3590,11 @@ impl Interp {
         optional: bool,
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        // ECMA-262 §13.3.6 recognizes direct eval only from a non-property Reference whose
-        // [[ReferencedName]] is "eval" and whose value is this Realm's %eval%. Resolve that
-        // Reference exactly once before arguments: a `with` hit supplies a base object and is
-        // therefore indirect even when the property value happens to be %eval%.
         if !optional && matches!(callee, Expr::Ident(name) if name == "eval") {
-            let (func, receiver) = self.get_var_with("eval", env)?;
-            let direct = receiver.is_none()
-                && matches!(
-                    (&func, &self.eval_fn),
-                    (Value::Obj(function), Some(intrinsic)) if Rc::ptr_eq(function, intrinsic)
-                );
-            let argv = self.eval_args(args, env)?;
-            if direct {
-                return self.direct_eval(argv.first(), env);
+            match self.eval_named_eval_call(args, env, false)? {
+                TailEval::Val(value) => return Ok(value),
+                TailEval::Tail(..) => unreachable!("non-tail eval call"),
             }
-            if !func.is_callable() {
-                return Err(self.throw("TypeError", "eval is not a function"));
-            }
-            return self.call(func, receiver.unwrap_or(Value::Undefined), &argv);
         }
         // SuperCall deliberately stages GetNewTarget/GetSuperConstructor before arguments; the
         // bytecode VM uses the same two helpers with suspension between those phases.
@@ -3635,7 +3687,10 @@ impl Interp {
                     return Ok(Value::Undefined);
                 }
                 let idx = self.eval(index, env)?;
-                let key = self.to_property_key(&idx)?;
+                // GetValue checks ToObject(base) before coercing a computed method key,
+                // just as it does for a non-call property read. Optional access already
+                // short-circuited above; the key expression still evaluates for ordinary null.
+                let key = self.ref_prop_key(&base, &mut RefKey::Raw(idx))?;
                 let f = self.get_member(&base, &key)?;
                 (f, base)
             }
@@ -3779,10 +3834,11 @@ impl Interp {
                     let (realm, host_context) =
                         self.promise_job_target(&then, self.host_job_context);
                     let (res, rej) = self.make_resolver_pair(promise);
+                    let then = self.make_job_callback(then);
                     let runner =
                         crate::builtins::make_thenable_job(self, then, value.clone(), res, rej);
                     self.microtasks.push_back(crate::interpreter::Job {
-                        handler: runner,
+                        handler: crate::interpreter::JobCallback::plain(runner),
                         result: Value::Undefined,
                         value: Value::Undefined,
                         fulfilled: true,
@@ -3833,7 +3889,7 @@ impl Interp {
         }
         for (on_f, on_r, result, host_context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
-            let (realm, host_context) = self.promise_job_target(&handler, host_context);
+            let (realm, host_context) = self.promise_job_target(&handler.callback, host_context);
             self.microtasks.push_back(Job {
                 handler,
                 result,
@@ -3867,6 +3923,9 @@ impl Interp {
         };
         let status = self.promises.get(&ptr).map(|s| s.status).unwrap_or(0);
         let host_context = self.host_job_context;
+        // HostMakeJobCallback runs at registration, not settlement or job execution.
+        let on_f = self.make_job_callback(on_f);
+        let on_r = self.make_job_callback(on_r);
         // Attaching a handler marks the rejection handled (HostPromiseRejectionTracker "handle").
         self.unhandled_rejections.remove(&ptr);
         match status {
@@ -3877,7 +3936,7 @@ impl Interp {
             }
             1 => {
                 let v = self.promises[&ptr].value.clone();
-                let (realm, host_context) = self.promise_job_target(&on_f, host_context);
+                let (realm, host_context) = self.promise_job_target(&on_f.callback, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_f,
                     result: result.clone(),
@@ -3889,7 +3948,7 @@ impl Interp {
             }
             _ => {
                 let v = self.promises[&ptr].value.clone();
-                let (realm, host_context) = self.promise_job_target(&on_r, host_context);
+                let (realm, host_context) = self.promise_job_target(&on_r.callback, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_r,
                     result: result.clone(),
@@ -4057,7 +4116,7 @@ impl Interp {
             let Some((callback, held_value)) = next else {
                 return Ok(());
             };
-            match self.call(callback, Value::Undefined, &[held_value]) {
+            match self.call_job_callback(&callback, Value::Undefined, &[held_value]) {
                 Ok(_) => {}
                 // CleanupFinalizationRegistry uses `?`: the first callback throw ends this job.
                 // The bare engine has no host error reporter; browser/Node embedders can add one
@@ -4116,9 +4175,9 @@ impl Interp {
             }
             self.switch_host_job_context(job.host_context);
         }
-        if job.handler.is_callable() {
-            match self.call(
-                job.handler.clone(),
+        if job.handler.callback.is_callable() {
+            match self.call_job_callback(
+                &job.handler,
                 Value::Undefined,
                 std::slice::from_ref(&job.value),
             ) {
@@ -4417,26 +4476,17 @@ impl Interp {
         let probe = new_scope(Some(lex_env.clone()));
         let saved_strict = self.strict;
         self.strict = strict;
-        self.hoist(body, &probe, &[]);
+        let hoist_ops = collect_hoist_ops(body, strict, &[]);
+        self.apply_hoist_ops(&hoist_ops, &probe);
         self.strict = saved_strict;
-        let var_names: Vec<String> = probe.borrow().vars.keys().map(|k| k.to_string()).collect();
-        // A callable hoisted value is a function declaration (which becomes a global *function*
-        // binding); everything else is a plain `var`.
-        let is_func = |name: &str| {
-            probe
-                .borrow()
-                .vars
-                .get(name)
-                .map(|b| b.value.is_callable())
-                .unwrap_or(false)
-        };
+        let var_bindings = ordered_global_hoist_bindings(&hoist_ops);
         let is_global = Rc::ptr_eq(var_env, &self.global_env);
 
         if !strict {
             // A sloppy eval must not hoist a `var` over a same-named global lexical declaration...
             if is_global {
-                for name in &var_names {
-                    if name != "this" && self.global_env.borrow().vars.contains_key(name.as_str()) {
+                for &(name, _) in &var_bindings {
+                    if name != "this" && self.global_env.borrow().vars.contains_key(name) {
                         return Err(self.throw(
                             "SyntaxError",
                             format!("Identifier '{name}' has already been declared"),
@@ -4458,8 +4508,8 @@ impl Interp {
                     (b.with_obj.is_some() || b.catch_param, b.parent.clone())
                 };
                 if !skip {
-                    for name in &var_names {
-                        if s.borrow().vars.contains_key(name.as_str()) {
+                    for &(name, _) in &var_bindings {
+                        if s.borrow().vars.contains_key(name) {
                             return Err(self.throw(
                                 "SyntaxError",
                                 format!("Identifier '{name}' has already been declared"),
@@ -4471,7 +4521,7 @@ impl Interp {
             }
             // The variable environment itself may hold body-level lexicals (our function body
             // scope carries both); a var may not hoist over one of those either.
-            for name in &var_names {
+            for &(name, _) in &var_bindings {
                 if var_env.borrow().lexical_names.iter().any(|n| n == name) {
                     return Err(self.throw(
                         "SyntaxError",
@@ -4484,8 +4534,8 @@ impl Interp {
         // A global variable environment can refuse a declaration (non-extensible global, or a
         // non-configurable same-named property) with a TypeError.
         if is_global {
-            for name in &var_names {
-                let ok = if is_func(name) {
+            for &(name, is_func) in &var_bindings {
+                let ok = if is_func {
                     self.can_declare_global_function(name)
                 } else {
                     self.can_declare_global_var(name)
@@ -4502,27 +4552,27 @@ impl Interp {
         // Instantiate each declared name from the value the probe hoist computed (a function object —
         // top-level or Annex B.3.3 block-scoped, later hoists winning — or `undefined` for a plain
         // `var`). A pre-existing `var` binding keeps its value; a function binding always overwrites.
-        for name in &var_names {
+        for &(name, is_func) in &var_bindings {
             let value = probe
                 .borrow()
                 .vars
-                .get(name.as_str())
+                .get(name)
                 .map(|b| b.value.clone())
                 .unwrap_or(Value::Undefined);
             if is_global {
-                if is_func(name) {
+                if is_func {
                     self.create_global_function_binding(name, value);
                 } else {
                     self.create_global_var_binding(name);
                 }
-            } else if is_func(name) {
-                var_env.borrow_mut().vars.insert(name.clone(), {
+            } else if is_func {
+                var_env.borrow_mut().vars.insert(name.to_owned(), {
                     let mut b = Binding::data(value, true, true);
                     b.deletable = true;
                     b
                 });
-            } else if !var_env.borrow().vars.contains_key(name.as_str()) {
-                var_env.borrow_mut().vars.insert(name.clone(), {
+            } else if !var_env.borrow().vars.contains_key(name) {
+                var_env.borrow_mut().vars.insert(name.to_owned(), {
                     let mut b = Binding::data(Value::Undefined, true, true);
                     b.deletable = true;
                     b
@@ -5942,7 +5992,7 @@ impl Interp {
             if self.is_htmldda(&v) {
                 return Ok(Value::str("undefined"));
             }
-            return Ok(Value::from_string(v.type_of().to_string()));
+            return Ok(Value::str(v.type_of()));
         }
         let v = if matches!(op, "-" | "~") && matches!(v, Value::Obj(_)) {
             self.to_primitive(&v, Hint::Number)?
@@ -6053,20 +6103,13 @@ impl Interp {
         if op == "typeof" {
             // typeof on an unresolved identifier yields "undefined" rather than throwing.
             if let Expr::Ident(name) = arg {
-                match self.get_var(name, env) {
-                    Ok(v) if self.is_htmldda(&v) => return Ok(Value::str("undefined")),
-                    Ok(v) => return Ok(Value::from_string(v.type_of().to_string())),
-                    // A binding in its temporal dead zone still throws; only a truly-unresolved
-                    // name yields "undefined".
-                    Err(e) if self.binding_in_tdz(name, env) => return Err(e),
-                    Err(_) => return Ok(Value::str("undefined")),
-                }
+                return self.typeof_name_vm(name, env);
             }
             let v = self.eval(arg, env)?;
             if self.is_htmldda(&v) {
                 return Ok(Value::str("undefined"));
             }
-            return Ok(Value::from_string(v.type_of().to_string()));
+            return Ok(Value::str(v.type_of()));
         }
         if op == "delete" {
             return self.eval_delete(arg, env);
@@ -8390,6 +8433,34 @@ enum Reference {
 pub(crate) struct PreparedReference(Reference);
 
 impl PreparedReference {
+    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
+        fn key(key: &RefKey, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
+            if let RefKey::Raw(value) = key {
+                edges.value(value);
+            }
+        }
+        match &self.0 {
+            Reference::Var(base, _) => match base {
+                RefBase::Scope(scope) => edges.scope(scope),
+                RefBase::With(value) => edges.value(value),
+                RefBase::Global | RefBase::Unresolvable => {}
+            },
+            Reference::Prop(object, property) => {
+                edges.value(object);
+                key(property, edges);
+            }
+            Reference::Super {
+                proto,
+                receiver,
+                key: property,
+            } => {
+                edges.value(proto);
+                edges.value(receiver);
+                key(property, edges);
+            }
+        }
+    }
+
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         fn base(base: &RefBase, visitor: &mut crate::memory::Visitor) {
             if let RefBase::With(value) = base {

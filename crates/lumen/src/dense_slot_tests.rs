@@ -136,3 +136,43 @@ fn dense_slot_descriptors_prototypes_and_failed_truncation() {
         "get,set:8|42|false|false|71|false|true|false|false|proto:88|1|9|3|8",
     );
 }
+
+#[test]
+fn dense_named_lookup_preserves_own_keys_prototypes_and_index_namespaces() {
+    // ECMA-262 OrdinaryGetOwnProperty/OrdinaryGet: fast absence is not a
+    // prototype result, and any named insertion must invalidate its proof.
+    check(
+        r#"
+        function run() {
+            var a = Array.from({length: 1024}, (_, i) => i), out = [];
+            var key = ['push'][0];
+            a[key](1024);
+            out.push(a.length, a[1024], Object.hasOwn(a, key));
+            var count = 0, receiver = false, proto = Object.create(Array.prototype);
+            Object.defineProperty(proto, key, {configurable:true, get() {
+                count++; receiver = this === a; return Array.prototype.push;
+            }});
+            Object.setPrototypeOf(a, proto);
+            a[key](1025);
+            out.push(count, receiver, a.length);
+            Object.defineProperty(a, key, {value: 73, writable: true, configurable: true});
+            out.push(a[key], Object.hasOwn(a, key));
+            delete a[key];
+            out.push(a[key] === Array.prototype.push, count);
+            var sym = Symbol('named'); a[sym] = 81;
+            a['01'] = 82; a['4294967295'] = 83; a[1000000] = 84;
+            out.push(a[sym], a['01'], a['4294967295'], a[1000000]);
+            a.length = 2;
+            out.push(a[1000000], a[sym], a['01'], a['4294967295']);
+            var b = Array.from({length: 1024}, (_, i) => i), traps = 0;
+            Object.setPrototypeOf(b, new Proxy(Array.prototype, {get(t,k,r) {
+                if (k === key) traps++; return Reflect.get(t,k,r);
+            }}));
+            b[key](1024); out.push(traps, b.length);
+            return out.join('|');
+        }
+        run()
+        "#,
+        "1025|1024|false|1|true|1026|73|true|true|2|81|82|83|84||81|82|83|1|1025",
+    );
+}

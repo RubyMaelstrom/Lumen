@@ -39,6 +39,7 @@ pub mod fastalloc;
 mod fasthash;
 mod feedback;
 mod gc_edges;
+mod gc_sweep;
 mod heap;
 mod host;
 mod interpreter;
@@ -54,10 +55,14 @@ mod memory;
 mod modules;
 #[cfg(feature = "intl")]
 mod numbering;
+#[cfg(test)]
+mod object_literal_jit_tests;
 mod parser;
 mod regex;
 mod regex_emoji;
 mod regex_fold;
+#[cfg(all(test, feature = "embed"))]
+mod script_caller_tests;
 #[cfg(test)]
 mod shared_layout_tests;
 mod snapshot;
@@ -68,8 +73,6 @@ mod temporal;
 mod token;
 #[cfg(test)]
 mod typedarray_allocation_tests;
-#[cfg(all(test, feature = "embed"))]
-mod script_caller_tests;
 #[cfg(test)]
 mod typedarray_search_tests;
 mod tz;
@@ -120,6 +123,7 @@ mod cldr_display_names;
 #[rustfmt::skip]
 mod cldr_numbers;
 mod value;
+mod workload_metrics;
 
 use interpreter::Interp;
 use std::time::{Duration, Instant};
@@ -313,6 +317,19 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
     let body =
         parser::parse_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
     Ok(snapshot::encode(&body))
+}
+
+/// Compile implementation-owned bootstrap code without author-visible function
+/// source, including nested functions and class constructors. This supplies the
+/// source-unavailable behavior permitted by ECMA-262 HostHasSourceTextAvailable:
+/// Function.prototype.toString uses NativeFunction syntax for these callables.
+/// Ordinary snapshots and subsequently parsed author/eval/Function code retain
+/// their source. This does not alter execution, constructibility, or descriptors,
+/// and does not by itself implement the rest of Web IDL's function-object rules.
+pub fn compile_host_snapshot(src: &str) -> Result<Vec<u8>, String> {
+    let body =
+        parser::parse_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
+    Ok(snapshot::encode_host(&body))
 }
 
 /// A parse-phase failure. test262 reports these as a `SyntaxError` thrown during parsing.
@@ -727,8 +744,8 @@ impl Engine {
 #[cfg(feature = "embed")]
 pub mod embed {
     pub use crate::host::{
-        HostRetainedMemoryVisitor, OpState, ResourceId, ResourceTable, RetainedBytes,
-        RetainedExternalAllocation, RetainedExternalMemory, RetainedMemory,
+        HostGc, HostGcVisitor, HostRetainedMemoryVisitor, OpState, ResourceId, ResourceTable,
+        RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory, RetainedMemory,
     };
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
@@ -890,6 +907,15 @@ impl Engine {
         self.interp.host_job_context_leave = Some(leave);
     }
 
+    /// Opt in to saving the incumbent script-caller global at JobCallback registration and
+    /// restoring it while invoking the callback (HTML HostMakeJobCallback/HostCallJobCallback).
+    /// This preserves source identity independently of the callback's execution Realm. It does
+    /// not yet capture an active ScriptOrModule record for later dynamic-import base resolution.
+    /// Non-browser hosts must leave this disabled, as required by ECMA-262 §9.5.2–9.5.3.
+    pub fn set_job_callback_script_caller_capture(&mut self, enabled: bool) {
+        self.interp.capture_job_script_caller = enabled;
+    }
+
     /// The realm's global object — the root from which an embedder reaches user-defined JS
     /// (e.g. `ctx().get_member(&engine.global_this(), "myCallback")`).
     pub fn global_this(&self) -> embed::Value {
@@ -956,6 +982,21 @@ impl Engine {
         Ok(result)
     }
 
+    /// Snapshot counterpart of [`Self::eval_value_interruptible`]. Executes one
+    /// synchronous script job in the active Realm; the embedder still owns the
+    /// following microtask checkpoint. No agent event loop is drained here.
+    pub fn eval_snapshot_value_interruptible(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        let result = self.interp.eval_classic_snapshot_interruptible(bytes)?;
+        if matches!(&result, Err(embed::EvalError::Interrupted(_))) {
+            self.interp.gc_task_boundary();
+        }
+        self.interp.kept_alive.clear();
+        Ok(result)
+    }
+
     /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
     pub fn define_global(&mut self, name: &str, len: usize, f: embed::NativeFn) {
         self.interp.activate_gc_heap();
@@ -1006,6 +1047,19 @@ impl Engine {
         this: embed::Value,
         args: &[embed::Value],
     ) -> Result<embed::Value, embed::EvalError> {
+        self.call_callback_interruptible(func, this, args, &Value::Undefined)
+    }
+
+    /// Call with a captured host callback source context. Unlike an ordinary call, self-hosted
+    /// platform frames below the callback cannot replace its incumbent source. The original
+    /// function still executes in its own Realm, and interruptions remain host control flow.
+    pub fn call_callback_interruptible(
+        &mut self,
+        func: &embed::Value,
+        this: embed::Value,
+        args: &[embed::Value],
+        script_caller: &embed::Value,
+    ) -> Result<embed::Value, embed::EvalError> {
         self.interp.activate_gc_heap();
         if let Err(abrupt) = self.interp.interrupt_poll_force() {
             let error = match abrupt {
@@ -1018,7 +1072,7 @@ impl Engine {
         }
         let result = self
             .interp
-            .call(func.clone(), this, args)
+            .with_callback_script_caller(script_caller, |ctx| ctx.call(func.clone(), this, args))
             .map_err(|abrupt| match abrupt {
                 interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
                 interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),

@@ -16,6 +16,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 #[derive(Default)]
 struct FunctionProfileEntry {
     description: String,
+    execution_state: String,
+    source: Option<Rc<str>>,
     calls: u64,
     inclusive_ns: u128,
     self_ns: u128,
@@ -26,6 +28,51 @@ struct FunctionProfileFrame {
     key: (usize, usize),
     started: std::time::Instant,
     child_ns: u128,
+}
+
+fn function_profile_description(
+    key: (usize, usize),
+    name: Option<&str>,
+    source: Option<&str>,
+    include_source: bool,
+) -> String {
+    let name = name.unwrap_or("<anon>");
+    let mut description = format!("[realm={:#x} function={:#x}] {name}", key.1, key.0);
+    // Profiling is metadata-only unless source output is explicitly requested. In
+    // particular, the ordinary one-line description must not leak a source prefix
+    // while the separately gated full-source record is disabled.
+    if include_source {
+        description.push_str(": ");
+        description.extend(source.unwrap_or("").chars().take(100).map(|c| {
+            if c == '\n' || c == '\r' {
+                ' '
+            } else {
+                c
+            }
+        }));
+    }
+    description
+}
+
+#[cfg(test)]
+mod function_profile_tests {
+    use super::function_profile_description;
+
+    #[test]
+    fn source_output_is_opt_in_including_description_prefixes() {
+        let source = "function measured() { return 'private-payload'; }";
+        let metadata = function_profile_description((1, 2), Some("measured"), Some(source), false);
+        assert_eq!(metadata, "[realm=0x2 function=0x1] measured");
+        assert!(!metadata.contains("private-payload"));
+        let detailed = function_profile_description((1, 2), Some("measured"), Some(source), true);
+        assert!(detailed.ends_with(source));
+        let source = "é\r\n".repeat(1000);
+        let detailed = function_profile_description((3, 2), None, Some(&source), true);
+        let prefix = "[realm=0x2 function=0x3] <anon>: ";
+        assert!(detailed.starts_with(prefix));
+        assert_eq!(detailed[prefix.len()..].chars().count(), 100);
+        assert!(!detailed.contains(['\r', '\n']));
+    }
 }
 
 #[derive(Default)]
@@ -62,6 +109,17 @@ impl FunctionProfileState {
                 caller_calls,
                 caller,
             );
+            eprintln!(
+                "[fn-profile-state] description={:?} {}",
+                entry.description, entry.execution_state,
+            );
+            if let Some(source) = &entry.source {
+                eprintln!(
+                    "[fn-profile-source] description={:?} source={:?}",
+                    entry.description,
+                    source.chars().take(16_384).collect::<String>()
+                );
+            }
         }
         self.entries.clear();
     }
@@ -75,6 +133,284 @@ impl Drop for FunctionProfileState {
 
 thread_local! {
     static FUNCTION_PROFILE: RefCell<FunctionProfileState> = RefCell::new(Default::default());
+    static MISSING_PROPERTY_TRACE: RefCell<std::collections::VecDeque<String>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+    static BOUND_CALL_TRACE: RefCell<BoundCallTrace> = RefCell::new(BoundCallTrace::default());
+}
+
+#[derive(Default)]
+struct BoundCallTrace {
+    next_id: u64,
+    stack: Vec<u64>,
+    history: std::collections::VecDeque<String>,
+    arrays: std::collections::VecDeque<(usize, Vec<String>)>,
+}
+
+impl BoundCallTrace {
+    fn record(&mut self, entry: String) {
+        if self.history.len() == 256 {
+            self.history.pop_front();
+        }
+        self.history.push_back(entry);
+    }
+}
+
+// Native descriptors only: diagnostics must not call an author's getter, Proxy
+// trap or conversion method, or keep a returned object alive after its call.
+fn bound_trace_preview(value: &Value, depth: usize) -> String {
+    match value {
+        Value::Str(text) => format!(
+            "string(bytes={},prefix={:?})",
+            text.len(),
+            text.chars().take(48).collect::<String>()
+        ),
+        Value::Num(number) => format!("{number}"),
+        Value::Bool(boolean) => format!("{boolean}"),
+        Value::Obj(object) => {
+            let id = Rc::as_ptr(object) as usize;
+            let Ok(object) = object.try_borrow() else {
+                return format!("object@{id:x}(borrowed)");
+            };
+            let name = match object.props.get("name") {
+                Some(property) if !property.accessor() => match property.value() {
+                    Value::Str(name) => name.chars().take(48).collect::<String>(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            if let Callable::Bound(bound) = &object.call {
+                let metadata = if depth < 2 {
+                    bound
+                        .args
+                        .iter()
+                        .take(2)
+                        .map(|arg| bound_trace_preview(arg, depth + 1))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                return format!("bound@{id:x}({name:?},metadata={metadata:?})");
+            }
+            if !matches!(object.call, Callable::None) {
+                return format!("function@{id:x}({name:?})");
+            }
+            if matches!(object.exotic, Exotic::Array) && depth < 2 {
+                let items = (0..8)
+                    .map(|index| match object.props.get(&index.to_string()) {
+                        Some(property) if !property.accessor() => {
+                            bound_trace_preview(&property.value(), depth + 1)
+                        }
+                        Some(_) => "<accessor>".to_string(),
+                        None => "<hole>".to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                return format!("array@{id:x}{items:?}");
+            }
+            format!("object@{id:x}")
+        }
+        _ => type_name(value).to_string(),
+    }
+}
+
+fn trace_bound_call_enter(bound: &BoundCallable, args: &[Value]) -> Option<u64> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("LUMEN_TRACE_BOUND_CALLS").is_some()) {
+        return None;
+    }
+    let target = bound_trace_preview(&Value::Obj(bound.target.clone()), 0);
+    let saved = bound
+        .args
+        .iter()
+        .take(4)
+        .map(|arg| bound_trace_preview(arg, 0))
+        .collect::<Vec<_>>();
+    let args = args
+        .iter()
+        .take(8)
+        .map(|arg| bound_trace_preview(arg, 0))
+        .collect::<Vec<_>>();
+    Some(BOUND_CALL_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        trace.next_id = trace.next_id.wrapping_add(1);
+        let id = trace.next_id;
+        let parent = trace.stack.last().copied();
+        trace.stack.push(id);
+        trace.record(format!(
+            "enter id={id} parent={parent:?} target={target} saved={saved:?} args={args:?}"
+        ));
+        id
+    }))
+}
+
+fn trace_bound_call_exit(id: u64, result: &Result<Value, Abrupt>) {
+    let result = match result {
+        Ok(value) => format!("return {}", bound_trace_preview(value, 0)),
+        Err(Abrupt::Throw(value)) => format!("throw {}", bound_trace_preview(value, 0)),
+        Err(_) => "abrupt completion".to_string(),
+    };
+    BOUND_CALL_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        trace.stack.pop();
+        trace.record(format!("exit id={id} {result}"));
+    });
+}
+
+fn bound_trace_arrays(value: &Value) -> Vec<(usize, String, Vec<String>)> {
+    let Value::Obj(owner) = value else {
+        return Vec::new();
+    };
+    let Ok(owner) = owner.try_borrow() else {
+        return Vec::new();
+    };
+    let mut arrays = Vec::new();
+    for (key, property) in owner.props.iter().take(16) {
+        if property.accessor() {
+            continue;
+        }
+        let Value::Obj(array) = property.value() else {
+            continue;
+        };
+        let id = Rc::as_ptr(&array) as usize;
+        let Ok(array) = array.try_borrow() else {
+            continue;
+        };
+        if !matches!(array.exotic, Exotic::Array) {
+            continue;
+        }
+        let Some(length) = array.props.get("length").filter(|p| !p.accessor()) else {
+            continue;
+        };
+        let Value::Num(length) = length.value() else {
+            continue;
+        };
+        if !(16.0..=512.0).contains(&length) {
+            continue;
+        }
+        let values = (0..length as usize)
+            .map(|index| match array.props.get(&index.to_string()) {
+                Some(property) if !property.accessor() => bound_trace_preview(&property.value(), 0),
+                Some(_) => "<accessor>".to_string(),
+                None => "<hole>".to_string(),
+            })
+            .collect();
+        arrays.push((id, key.chars().take(48).collect(), values));
+        if arrays.len() == 4 {
+            break;
+        }
+    }
+    arrays
+}
+
+fn trace_bound_array_state(call_id: u64, phase: &str, value: Option<&Value>) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("LUMEN_TRACE_BOUND_ARRAYS").is_some()) {
+        return;
+    }
+    let Some(value) = value else {
+        return;
+    };
+    let arrays = bound_trace_arrays(value);
+    BOUND_CALL_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        for (array_id, key, values) in arrays {
+            let old = trace
+                .arrays
+                .iter()
+                .position(|(id, _)| *id == array_id)
+                .and_then(|index| trace.arrays.remove(index));
+            let changes = values
+                .iter()
+                .enumerate()
+                .filter(|(index, value)| {
+                    old.as_ref().and_then(|(_, old)| old.get(*index)) != Some(*value)
+                })
+                .map(|(index, value)| (index, value.as_str()))
+                .collect::<Vec<_>>();
+            if !changes.is_empty() {
+                trace.record(format!(
+                    "array id={call_id} phase={phase} object={array_id:x} field={key:?} changes={changes:?}"
+                ));
+            }
+            if trace.arrays.len() == 16 {
+                trace.arrays.pop_front();
+            }
+            trace.arrays.push_back((array_id, values));
+        }
+    });
+}
+
+#[cfg(test)]
+mod bound_trace_tests {
+    use super::*;
+
+    #[test]
+    fn native_previews_are_bounded_and_do_not_retain_objects() {
+        let object = Object::new(None);
+        object.borrow_mut().exotic = Exotic::Array;
+        object
+            .borrow_mut()
+            .props
+            .insert("0", Property::accessor_prop(None, None, true, true));
+        let value = Value::Obj(object.clone());
+        let count = Rc::strong_count(&object);
+        let preview = bound_trace_preview(&value, 0);
+        assert!(preview.contains("<accessor>"));
+        assert_eq!(Rc::strong_count(&object), count);
+        let borrowed = object.borrow_mut();
+        assert!(bound_trace_preview(&value, 0).contains("(borrowed)"));
+        drop(borrowed);
+        let text = Value::from_string("é".repeat(100_000));
+        assert!(bound_trace_preview(&text, 0).len() < 200);
+    }
+
+    #[test]
+    fn history_keeps_only_the_last_256_events() {
+        let mut trace = BoundCallTrace::default();
+        for n in 0..400 {
+            trace.record(n.to_string());
+        }
+        assert_eq!(trace.history.len(), 256);
+        assert_eq!(trace.history.front().map(String::as_str), Some("144"));
+        assert_eq!(trace.history.back().map(String::as_str), Some("399"));
+    }
+
+    #[test]
+    fn array_state_previews_skip_accessors_and_do_not_retain_values() {
+        let owner = Object::new(None);
+        let array = Object::new(None);
+        array.borrow_mut().exotic = Exotic::Array;
+        array
+            .borrow_mut()
+            .props
+            .insert("length", Property::builtin(Value::Num(256.0)));
+        array
+            .borrow_mut()
+            .props
+            .insert("0", Property::accessor_prop(None, None, true, true));
+        array
+            .borrow_mut()
+            .props
+            .insert("255", Property::builtin(Value::Bool(false)));
+        owner
+            .borrow_mut()
+            .props
+            .insert("bank", Property::builtin(Value::Obj(array.clone())));
+        let count = Rc::strong_count(&array);
+        let values = bound_trace_arrays(&Value::Obj(owner.clone()));
+        assert_eq!(Rc::strong_count(&array), count);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].2[0], "<accessor>");
+        assert_eq!(values[0].2[1], "<hole>");
+        assert_eq!(values[0].2[255], "false");
+        let borrowed = array.borrow_mut();
+        assert!(bound_trace_arrays(&Value::Obj(owner.clone())).is_empty());
+        drop(borrowed);
+        array
+            .borrow_mut()
+            .props
+            .insert("length", Property::builtin(Value::Num(513.0)));
+        assert!(bound_trace_arrays(&Value::Obj(owner)).is_empty());
+    }
 }
 
 struct FunctionProfileGuard {
@@ -117,8 +453,14 @@ impl Drop for FunctionProfileGuard {
     }
 }
 
-fn function_profile_enter(func: &Rc<Function>, realm_key: usize) -> Option<FunctionProfileGuard> {
+fn function_profile_enter(
+    func: &Rc<Function>,
+    closure: &Env,
+    fn_obj: &Gc,
+    realm_key: usize,
+) -> Option<FunctionProfileGuard> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
+    static SOURCE: OnceLock<bool> = OnceLock::new();
     static FLUSH_NAME: OnceLock<Option<String>> = OnceLock::new();
     static FLUSH_AFTER_NS: OnceLock<Option<u128>> = OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var_os("LUMEN_FN_PROFILE").is_some()) {
@@ -140,17 +482,57 @@ fn function_profile_enter(func: &Rc<Function>, realm_key: usize) -> Option<Funct
         let mut profile = profile.borrow_mut();
         let caller = profile.stack.last().map(|frame| frame.key);
         profile.entries.entry(key).or_insert_with(|| {
-            let name = func.name.as_deref().unwrap_or("<anon>");
-            let source = func
-                .source
-                .as_deref()
-                .unwrap_or("")
-                .chars()
-                .take(100)
-                .collect::<String>()
-                .replace('\n', " ");
+            let include_source = *SOURCE
+                .get_or_init(|| std::env::var_os("LUMEN_FN_PROFILE_SOURCE").is_some());
+            // Only inspect internal state, once per function per profile batch.
+            // In particular, do not call an author's getters or keep extra JS
+            // roots alive. This distinguishes a slow caller from a callee whose
+            // compiled entry is unavailable or ineligible for cached dispatch.
+            let compiled = func.code2.get().or_else(|| func.code.get());
+            let chunk = compiled.and_then(Option::as_ref);
+            let code = chunk.and_then(|chunk| chunk.jit.get());
+            let tier = match (compiled, chunk, code) {
+                (None, _, _) => "cold",
+                (Some(None), _, _) => "bytecode-bail",
+                (_, _, Some(Some(_))) => "jit",
+                (_, _, Some(None)) => "jit-bail",
+                (_, Some(chunk), None) if chunk.jit_budget_wait_bytes.get() > 0 => "jit-budget-wait",
+                _ => "bytecode",
+            };
+            let mut depth = 0;
+            let mut scope = Some(closure.clone());
+            while let Some(env) = scope {
+                depth += 1;
+                if depth >= 64 {
+                    break;
+                }
+                scope = env.borrow().parent.clone();
+            }
+            let same_realm = match &fn_obj.borrow().call {
+                Callable::User(user) => user.realm == realm_key,
+                _ => false,
+            };
+            let (code_used, code_limit, code_denials) = crate::jit::executable_code_stats();
             FunctionProfileEntry {
-                description: format!("[realm={realm_key:#x}] {name}: {source}"),
+                description: function_profile_description(
+                    key,
+                    func.name.as_deref(),
+                    func.source.as_deref(),
+                    include_source,
+                ),
+                execution_state: format!(
+                    "tier={tier} strict={} arrow={} with={} env_depth={depth} same_realm={same_realm} prepared={} activation={} code_used={code_used} code_limit={code_limit} code_denials={code_denials}",
+                    func.is_strict,
+                    func.is_arrow,
+                    closure.borrow().under_with,
+                    chunk.is_some_and(|chunk| chunk.prepared_entry),
+                    chunk.is_some_and(|chunk| !chunk.jit_no_activation()),
+                ),
+                source: if include_source {
+                    func.source.clone()
+                } else {
+                    None
+                },
                 ..Default::default()
             }
         });
@@ -296,7 +678,7 @@ pub(crate) struct FinalizationCell {
 
 /// Internal slots of a FinalizationRegistry instance (ECMA-262 §26.2).
 pub(crate) struct FinalizationState {
-    pub(crate) cleanup_callback: Value,
+    pub(crate) cleanup_callback: JobCallback,
     pub(crate) cells: Vec<FinalizationCell>,
     pub(crate) cleanup_scheduled: bool,
 }
@@ -473,6 +855,43 @@ impl FnFrame {
     }
 }
 
+/// Diagnose whether the existing legacy reflection extension is actually used. This does not
+/// expose source, function identities, property payloads or arguments, and changes no result.
+/// Each of six fixed states is printed at most once per thread. Ordinary execution is unchanged.
+fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("LUMEN_TRACE_LEGACY_REFLECTION").is_some()) {
+        return;
+    }
+    let state = match (key, frame) {
+        ("arguments", None) => 0,
+        ("arguments", Some(frame)) => match frame.extra.as_deref() {
+            Some(extra) if !matches!(extra.args_obj, Value::Null) => 1,
+            Some(extra) if extra.lazy.is_some() => 2,
+            _ => 3,
+        },
+        ("caller", None) => 4,
+        ("caller", Some(_)) => 5,
+        _ => return,
+    };
+    thread_local! { static SEEN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
+    SEEN.with(|seen| {
+        let bit = 1 << state;
+        if seen.get() & bit == 0 {
+            seen.set(seen.get() | bit);
+            let label = [
+                "arguments: inactive",
+                "arguments: active, materialized",
+                "arguments: active, lazily available",
+                "arguments: active, unavailable",
+                "caller: inactive",
+                "caller: active",
+            ][state];
+            eprintln!("[legacy-reflection] {label}");
+        }
+    });
+}
+
 /// The JIT fast call's frame-buffer freelist (see `Interp::frame_pool`). A newtype so teardown
 /// frees the raw buffers (their contents are already dropped whenever a buffer is pooled).
 pub(crate) struct FramePool(pub(crate) Vec<std::ptr::NonNull<Value>>);
@@ -566,6 +985,24 @@ impl Default for RegexpDependencyCache {
 pub struct VarMap {
     map: VarStorage,
     generation: std::cell::Cell<u32>,
+    /// Nonzero only after a fresh compiled activation publishes its fixed key
+    /// layout. Every structural mutation clears it, even replacement of a key.
+    /// Binding values/TDZ flags remain live and are never part of this identity.
+    layout_id: u32,
+}
+
+static NEXT_BINDING_LAYOUT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Process-unique, never-recycled binding-layout identity. Exhaustion disables
+/// new layout proofs rather than wrapping into an old cache's identity.
+pub(crate) fn new_binding_layout_id() -> u32 {
+    allocate_binding_layout_id(&NEXT_BINDING_LAYOUT)
+}
+
+fn allocate_binding_layout_id(next: &std::sync::atomic::AtomicU32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    next.fetch_update(Relaxed, Relaxed, |id| id.checked_add(1))
+        .unwrap_or(0)
 }
 
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
@@ -580,6 +1017,7 @@ impl Default for VarMap {
         Self {
             map: VarStorage::Small(Vec::new()),
             generation: std::cell::Cell::new(0),
+            layout_id: 0,
         }
     }
 }
@@ -661,6 +1099,7 @@ impl VarMap {
                 ))
             },
             generation: std::cell::Cell::new(0),
+            layout_id: 0,
         }
     }
 
@@ -670,8 +1109,20 @@ impl VarMap {
         self.generation.get()
     }
     #[inline]
-    fn bump(&self) {
+    fn bump(&mut self) {
         self.generation.set(self.generation.get().wrapping_add(1));
+        self.layout_id = 0;
+    }
+
+    #[inline]
+    pub(crate) fn layout_id(&self) -> u32 {
+        self.layout_id
+    }
+
+    /// Only the creator of a fresh, fully initialized fixed-key activation may
+    /// publish its plan's identity. Never publish on a reused/dynamic environment.
+    pub(crate) fn publish_layout(&mut self, layout_id: u32) {
+        self.layout_id = layout_id;
     }
     pub fn insert(&mut self, k: impl Into<std::rc::Rc<str>>, v: Binding) -> Option<Binding> {
         self.bump();
@@ -759,6 +1210,70 @@ impl VarMap {
     /// Byte offset of the generation counter within a `VarMap` (for the JIT's inline template).
     pub(crate) fn generation_offset() -> usize {
         std::mem::offset_of!(VarMap, generation)
+    }
+
+    pub(crate) fn layout_id_offset() -> usize {
+        std::mem::offset_of!(VarMap, layout_id)
+    }
+}
+
+#[cfg(test)]
+mod binding_layout_tests {
+    use super::*;
+
+    #[test]
+    fn binding_layout_invalidates_every_structural_mutation_but_not_live_writes() {
+        let mut vars = VarMap::default();
+        let id = new_binding_layout_id();
+        assert_ne!(id, 0);
+        vars.insert("value", Binding::data(Value::Num(1.0), true, true));
+        vars.publish_layout(id);
+        vars.get_mut("value").unwrap().value = Value::Num(2.0);
+        assert_eq!(vars.layout_id(), id);
+        vars.get_mut("value").unwrap().initialized = false;
+        assert_eq!(vars.layout_id(), id, "TDZ is checked live");
+        vars.insert("value", Binding::data(Value::Num(3.0), true, true));
+        assert_eq!(vars.layout_id(), 0, "even same-key replacement invalidates");
+        vars.publish_layout(id);
+        vars.remove("missing");
+        assert_eq!(vars.layout_id(), 0);
+        vars.publish_layout(id);
+        vars.clear();
+        assert_eq!(vars.layout_id(), 0);
+        vars.publish_layout(id);
+        for n in 0..20 {
+            vars.insert(
+                n.to_string(),
+                Binding::data(Value::Num(n as f64), true, true),
+            );
+        }
+        assert_eq!(
+            vars.layout_id(),
+            0,
+            "small-to-large growth also invalidates"
+        );
+    }
+
+    #[test]
+    fn binding_layout_id_exhaustion_never_reuses_old_id() {
+        let next = std::sync::atomic::AtomicU32::new(u32::MAX - 1);
+        assert_eq!(allocate_binding_layout_id(&next), u32::MAX - 1);
+        assert_eq!(allocate_binding_layout_id(&next), 0);
+        assert_eq!(allocate_binding_layout_id(&next), 0);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn binding_layout_identity_fits_existing_var_map_padding() {
+        #[allow(dead_code)]
+        struct PreviousVarMap {
+            map: VarStorage,
+            generation: std::cell::Cell<u32>,
+        }
+        assert_eq!(
+            std::mem::size_of::<VarMap>(),
+            std::mem::size_of::<PreviousVarMap>()
+        );
     }
 }
 
@@ -1127,6 +1642,7 @@ impl Default for StubEntry {
 
 /// Stub-cache capacity (power of two). 4096 × 24-byte entries = 96 KiB.
 const STUB_CACHE_SIZE: usize = 4096;
+const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
 
 /// The table index for a (receiver shape, name pointer) pair. The name pointer's low bits are
 /// alignment zeros; shift them off before mixing so they contribute entropy.
@@ -1161,6 +1677,78 @@ impl Interp {
     }
 }
 
+#[cfg(test)]
+mod computed_key_cache_tests {
+    use super::*;
+
+    #[test]
+    fn computed_key_stub_cache_owns_text_and_rejects_reused_addresses() {
+        let mut engine = crate::Engine::new();
+        let i = &mut engine.interp;
+        let object = Object::new(None);
+        object
+            .borrow_mut()
+            .props
+            .insert("alpha", Property::plain(Value::Num(7.0)));
+        object
+            .borrow_mut()
+            .props
+            .insert("brava", Property::plain(Value::Num(9.0)));
+        let shape = object.borrow().props.shape();
+        let base = Value::Obj(object.clone());
+        let cells = [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
+            crate::bytecode::PROP_IC_WAYS];
+        let mut key = String::from("alpha");
+        let address = key.as_ptr();
+        let read = i.get_prop_keyed(&base, &key, &cells[0]);
+        assert!(matches!(read, Ok(Value::Num(7.0))));
+        assert!(
+            i.stub_cache_get(shape, &key).is_some(),
+            "computed reads must populate the owned-text stub cache"
+        );
+
+        // Reuse exactly the same key allocation for a different property. Pointer identity
+        // alone must not reuse alpha's resolution, even though the receiver shape is unchanged.
+        key.replace_range(.., "brava");
+        assert_eq!(address, key.as_ptr());
+        assert!(i.stub_cache_get(shape, &key).is_none());
+        for cell in &cells {
+            cell.set(crate::bytecode::IcState::EMPTY);
+        }
+        let read = i.get_prop_keyed(&base, &key, &cells[0]);
+        assert!(matches!(read, Ok(Value::Num(9.0))));
+        assert!(i.stub_cache_get(shape, &key).is_some());
+        // Only name text and validated layout metadata are retained, never the receiver.
+        assert_eq!(Rc::strong_count(&object), 2);
+        let computed_key = crate::lstr::LStr::from("alpha");
+        assert!(matches!(
+            i.get_computed_property(&base, &computed_key),
+            Ok(Value::Num(7.0))
+        ));
+        assert_eq!(
+            Rc::strong_count(&object),
+            2,
+            "computed resolutions cannot root their receiver"
+        );
+
+        let long_key = "k".repeat(COMPUTED_STUB_KEY_MAX_BYTES + 1);
+        object
+            .borrow_mut()
+            .props
+            .insert(long_key.as_str(), Property::plain(Value::Num(11.0)));
+        for cell in &cells {
+            cell.set(crate::bytecode::IcState::EMPTY);
+        }
+        let read = i.get_prop_keyed(&base, &long_key, &cells[0]);
+        assert!(matches!(read, Ok(Value::Num(11.0))));
+        assert!(
+            i.stub_cache_get(object.borrow().props.shape(), &long_key)
+                .is_none(),
+            "large transient keys must not accumulate in the stub table"
+        );
+    }
+}
+
 /// Runtime-probed byte offsets from an `Interp`'s base address to the fields the asm call
 /// thunk touches (see the asm-call-frames arc). `Interp` is not `repr(C)`, so nothing here is
 /// compile-time stable — every offset is measured against a live instance, and `valid` fails
@@ -1176,6 +1764,8 @@ pub(crate) struct InterpLayout {
     pub interrupt_poll_tick: usize,
     pub cur_coro: usize,
     pub constructing: usize,
+    /// Ambient mode used by semantic helpers; every native function body saves/restores it.
+    pub strict: usize,
     pub new_target: usize,
     pub pending_tail: usize,
     /// `fn_frames` Vec base, plus its ptr/len/cap word offsets within the Vec header.
@@ -1193,6 +1783,10 @@ pub(crate) struct InterpLayout {
     pub string_proto: usize,
     /// Canonical Function.prototype, used to validate the ordinary `instanceof` fast path.
     pub function_proto: usize,
+    pub call_overflow_sets: usize,
+    pub call_overflow_shift: usize,
+    pub computed_read_sets: usize,
+    pub computed_read_mask: usize,
     pub valid: bool,
 }
 
@@ -1252,6 +1846,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         interrupt_poll_tick: off(&i.interrupt_poll_tick as *const _ as usize),
         cur_coro: off(&i.cur_coro as *const _ as usize),
         constructing: off(&i.constructing as *const _ as usize),
+        strict: off(&i.strict as *const _ as usize),
         new_target: off(&i.new_target as *const _ as usize),
         pending_tail: off(&i.pending_tail as *const _ as usize),
         fn_frames: off(&i.fn_frames as *const _ as usize),
@@ -1264,6 +1859,10 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         fp_cap_word: fp.2,
         string_proto: off(&i.string_proto as *const _ as usize),
         function_proto: off(&i.function_proto as *const _ as usize),
+        call_overflow_sets: off(&i.call_overflow.raw_sets as *const _ as usize),
+        call_overflow_shift: off(&i.call_overflow.hash_shift as *const _ as usize),
+        computed_read_sets: off(&i.computed_reads.raw_sets as *const _ as usize),
+        computed_read_mask: off(&i.computed_reads.mask as *const _ as usize),
         valid: true,
     }
 }
@@ -1346,6 +1945,7 @@ pub struct Interp {
     /// later chunk whose allocator reused that address.
     pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
     pub(crate) stub_cache_names: std::cell::RefCell<Vec<Option<Rc<str>>>>,
+    pub(crate) computed_reads: crate::bytecode::ComputedReadCache,
     /// Freelist of fixed-size raw frame buffers ([`crate::jit::FRAME_BUF`] `Value`s each) for the
     /// JIT fast call's slots + operand stack — a pop and pointer math per call instead of `Vec`
     /// bookkeeping. Buffers hold no live values while pooled.
@@ -1414,6 +2014,11 @@ pub struct Interp {
     /// Object pointers of every function tagged `__eval_realm` (each realm's `eval`): the
     /// pre-filter `call_dispatch` checks before the property lookup, so ordinary calls skip it.
     pub(crate) eval_realm_fns: crate::fasthash::FastSet<usize>,
+    /// Builtin functions' immutable [[Realm]] slots (ECMA-262 CreateBuiltinFunction).
+    /// Weak identity pins prevent address reuse without rooting either functions or realms.
+    /// The collector activates the owning realm when a registered function is reachable.
+    pub(crate) native_function_realms:
+        RefCell<crate::fasthash::FastMap<usize, (std::rc::Weak<RefCell<Object>>, usize)>>,
     /// The "no-elements-on-array-protos" protector: `(epoch, clean)` — while `epoch` matches the
     /// live [`crate::value::proto_epoch`], `clean` says the canonical `Array.prototype` →
     /// `Object.prototype` chain has no canonical-index own keys, no exotic hops, and terminates
@@ -1427,6 +2032,8 @@ pub struct Interp {
     /// caches, validated by the same epoch. The `Weak` pins the callee's address against
     /// recycling (ABA), exactly like `Chunk::call_pins`.
     construct_ics: crate::fasthash::FastMap<usize, ConstructIc>,
+    /// Shared, lazily allocated secondary cache for evictions from four-way call sites.
+    pub(crate) call_overflow: crate::bytecode::CallOverflow,
     /// Small ordered key layouts learned from successful ordinary construction, keyed and
     /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
@@ -1603,6 +2210,9 @@ pub struct Interp {
     /// non-owning: the realm registry pins every live global. This is not the HTML
     /// backup incumbent stack; the embedder supplies that for native callbacks.
     pub(crate) script_entry: Option<(usize, usize)>,
+    /// Opt-in browser incumbent-source propagation for JobCallback records. Non-browser hosts
+    /// retain ECMA-262's default HostMakeJobCallback/HostCallJobCallback behavior.
+    pub(crate) capture_job_script_caller: bool,
     /// Per-(ECMAScript realm, host settings object) global lexical state.
     /// HTML normally has a 1:1 realm/settings mapping; browser embedders that
     /// multiplex logical Window realms select the corresponding state through
@@ -1761,6 +2371,7 @@ interp_memory_inventory! {
     native_arg_pool => "measured",
     stub_cache => "measured",
     stub_cache_names => "measured",
+    computed_reads => "measured",
     frame_pool => "measured",
     creation_pins => "measured",
     global_env_pins => "measured",
@@ -1779,8 +2390,10 @@ interp_memory_inventory! {
     class_info => "measured",
     eval_fn => "measured",
     eval_realm_fns => "measured",
+    native_function_realms => "measured",
     elems_protector => "non_owning",
     construct_ics => "measured",
+    call_overflow => "measured",
     construct_capacity_hints => "measured",
     iterator_sym => "measured",
     wk_syms => "measured",
@@ -1832,6 +2445,7 @@ interp_memory_inventory! {
     microtasks => "measured",
     host_job_context => "non_owning",
     script_entry => "non_owning",
+    capture_job_script_caller => "non_owning",
     host_settings_states => "measured",
     retired_host_job_contexts => "measured",
     host_job_context_enter => "non_owning",
@@ -1890,7 +2504,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 134);
+    assert_eq!(names.len(), 138);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -1932,9 +2546,27 @@ pub struct Disposable {
     pub method_is_async: bool,
 }
 
+/// ECMA-262 JobCallback plus the optional browser host's incumbent global. Keep the global as
+/// an owned GC edge, not a permanently rooted host registry or an untraced Realm pointer.
+/// This source context is independent of the callable's execution Realm / job settings.
+#[derive(Clone)]
+pub(crate) struct JobCallback {
+    pub(crate) callback: Value,
+    pub(crate) script_caller: Option<Gc>,
+}
+
+impl JobCallback {
+    pub(crate) fn plain(callback: Value) -> Self {
+        Self {
+            callback,
+            script_caller: None,
+        }
+    }
+}
+
 /// A queued microtask: running one promise reaction.
 pub struct Job {
-    pub handler: Value,
+    pub(crate) handler: JobCallback,
     pub result: Value,
     pub value: Value,
     pub fulfilled: bool,
@@ -1951,7 +2583,7 @@ pub struct PromiseState {
 
     pub value: Value,
     /// Pending reactions: `(onFulfilled, onRejected, resultPromise, hostContext)`.
-    pub reactions: Vec<(Value, Value, Value, u64)>,
+    pub(crate) reactions: Vec<(JobCallback, JobCallback, Value, u64)>,
 }
 
 /// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
@@ -2638,8 +3270,10 @@ impl Interp {
             class_info: Default::default(),
             eval_fn: None,
             eval_realm_fns: Default::default(),
+            native_function_realms: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
             construct_ics: Default::default(),
+            call_overflow: Default::default(),
             construct_capacity_hints: Default::default(),
             iterator_sym: None,
             wk_syms: Vec::new(),
@@ -2668,6 +3302,7 @@ impl Interp {
             native_arg_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
+            computed_reads: Default::default(),
             frame_pool: FramePool(Vec::new()),
             creation_pins: Default::default(),
             global_env_pins: Vec::new(),
@@ -2719,6 +3354,7 @@ impl Interp {
             microtasks: std::collections::VecDeque::new(),
             host_job_context: 0,
             script_entry: None,
+            capture_job_script_caller: false,
             host_settings_states: Default::default(),
             retired_host_job_contexts: Default::default(),
             host_job_context_enter: None,
@@ -2821,7 +3457,58 @@ impl Interp {
                 .props
                 .insert("message", Property::builtin(Value::from_string(msg)));
         }
-        Value::Obj(obj)
+        let value = Value::Obj(obj);
+        // Opt-in, bounded diagnostics include caught native errors without
+        // invoking author accessors or changing exception propagation.
+        static TRACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        static TRACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if let Some(filter) = TRACE.get_or_init(|| std::env::var("LUMEN_TRACE_ERRORS").ok()) {
+            if let Some(diagnostic) = self.error_diagnostic(&value) {
+                if (filter == "1" || diagnostic.contains(filter))
+                    && TRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1024
+                {
+                    eprintln!("lumen-error: {kind}: {diagnostic}");
+                    MISSING_PROPERTY_TRACE.with(|trace| {
+                        for entry in trace.borrow().iter() {
+                            eprintln!("lumen-error-undefined-property: {entry}");
+                        }
+                    });
+                    BOUND_CALL_TRACE.with(|trace| {
+                        for entry in &trace.borrow().history {
+                            eprintln!("lumen-error-bound-call: {entry}");
+                        }
+                    });
+                    static SOURCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *SOURCE
+                        .get_or_init(|| std::env::var_os("LUMEN_TRACE_ERROR_SOURCE").is_some())
+                    {
+                        static SOURCE_LIMIT: std::sync::OnceLock<usize> =
+                            std::sync::OnceLock::new();
+                        let limit = *SOURCE_LIMIT.get_or_init(|| {
+                            std::env::var("LUMEN_TRACE_ERROR_SOURCE")
+                                .ok()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .filter(|limit| *limit > 1)
+                                .unwrap_or(800)
+                                .min(16_384)
+                        });
+                        for frame in self.fn_frames.iter().rev().take(4) {
+                            let callee = frame.callee();
+                            let object = callee.borrow();
+                            if let Callable::User(user) = &object.call {
+                                if let Some(source) = &user.func.source {
+                                    eprintln!(
+                                        "lumen-error-source: {:?}",
+                                        source.chars().take(limit).collect::<String>()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        value
     }
     /// Snapshot the current call stack as the `\n    at <fn>` lines for an error's `stack`.
     /// Innermost frame first (Node order). We are a tree-walker without per-call source spans, so
@@ -3354,6 +4041,106 @@ impl Interp {
         result
     }
 
+    /// Invoke a host callback with a previously captured incumbent global as its fallback
+    /// script caller. Frames belonging to self-hosted platform plumbing below this boundary
+    /// are ignored; new author function frames above it still take precedence. This does NOT
+    /// switch the callable's Realm or settings, nor change its Call/throw/interrupt behavior.
+    /// The host must capture the global before entering its JavaScript API implementation.
+    /// HTML prepare/clean up after running a callback; Web IDL invoke a callback function.
+    pub fn with_callback_script_caller<R>(
+        &mut self,
+        global: &Value,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Value::Obj(global) = global else {
+            return operation(self);
+        };
+        let key = Rc::as_ptr(global) as usize;
+        if !self.realms.contains_key(&key) {
+            return operation(self);
+        }
+        let saved = self.script_entry.replace((key, self.fn_frames.len()));
+        let result = operation(self);
+        self.script_entry = saved;
+        result
+    }
+
+    pub(crate) fn make_job_callback(&self, callback: Value) -> JobCallback {
+        let script_caller = if self.capture_job_script_caller && callback.is_callable() {
+            match self.script_caller_global() {
+                Value::Obj(global) => Some(global),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        JobCallback {
+            callback,
+            script_caller,
+        }
+    }
+
+    pub(crate) fn call_job_callback(
+        &mut self,
+        callback: &JobCallback,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
+        if let Some(global) = &callback.script_caller {
+            self.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
+                ctx.call(callback.callback.clone(), this, args)
+            })
+        } else {
+            self.call(callback.callback.clone(), this, args)
+        }
+    }
+
+    /// ECMA-262 RunSuspendedContext: the source continuation becomes the topmost
+    /// script context until it parks/completes, even when a foreign native
+    /// Promise reaction or borrowed generator method resumes it. Ordinary calls
+    /// made by the body still take precedence above this entry's frame floor.
+    pub(crate) fn with_suspended_context<R>(
+        &mut self,
+        global: &Gc,
+        context: u64,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let key = Rc::as_ptr(global) as usize;
+        let saved = if !Rc::ptr_eq(global, &self.global) {
+            let target = self
+                .realms
+                .get(&key)
+                .expect("a live source continuation retains its owning Realm")
+                .snapshot_clone();
+            let saved = self.snapshot_realm();
+            self.restore_realm(&target);
+            Some(saved)
+        } else {
+            None
+        };
+        let previous_context = self.host_job_context;
+        let switch_context = context != previous_context;
+        if switch_context {
+            if let Some(enter) = self.host_job_context_enter {
+                enter(self, context);
+            }
+            self.switch_host_job_context(context);
+        }
+        let result = self.with_script_entry(operation);
+        if switch_context {
+            if let Some(leave) = self.host_job_context_leave {
+                leave(self);
+            }
+            self.switch_host_job_context(previous_context);
+        }
+        if let Some(saved) = saved {
+            let updated = self.snapshot_realm();
+            self.realms.insert(key, updated);
+            self.restore_realm(&saved);
+        }
+        result
+    }
+
     /// [[Get]] for embedders: like [`Self::get_member`] but surfaces a thrown value rather than
     /// the crate-internal `Abrupt` completion, so op crates can propagate it as `Err(Value)`.
     pub fn member_get(&mut self, base: &Value, key: &str) -> Result<Value, Value> {
@@ -3816,6 +4603,7 @@ impl Interp {
                 Property::data(Value::from_string(name.to_string()), false, false, true),
             );
         }
+        self.register_native_realm(&obj);
         obj
     }
 
@@ -3834,7 +4622,31 @@ impl Interp {
                 Property::data(Value::from_string(name.to_string()), false, false, true),
             );
         }
+        self.register_native_realm(&obj);
         obj
+    }
+
+    pub(crate) fn register_native_realm(&self, function: &Gc) {
+        self.native_function_realms.borrow_mut().insert(
+            Rc::as_ptr(function) as usize,
+            (Rc::downgrade(function), Rc::as_ptr(&self.global) as usize),
+        );
+    }
+
+    /// Same-realm native calls need no context switch, even in a multi-Window Agent.
+    /// Never infer [[Realm]] from the mutable prototype chain. Indirect eval retains
+    /// its special dispatch, and unregistered native sentinels take the generic path.
+    pub(crate) fn native_call_in_current_realm(&self, function: &Gc) -> bool {
+        let key = Rc::as_ptr(function) as usize;
+        if self.eval_realm_fns.contains(&key) {
+            return false;
+        }
+        !self.multi_realm()
+            || self
+                .native_function_realms
+                .borrow()
+                .get(&key)
+                .is_some_and(|(_, realm)| *realm == Rc::as_ptr(&self.global) as usize)
     }
 
     /// Create the callable `[[IsHTMLDDA]]` exotic used by the web platform's legacy
@@ -4254,6 +5066,7 @@ impl Interp {
         // none. A generator's `.prototype` chains to %GeneratorPrototype% / %AsyncGeneratorPrototype%
         // (an ordinary function's is a plain object). Only ordinary functions are constructors.
         let has_prototype = !is_arrow && (is_generator || (!is_async && !is_method));
+        crate::workload_metrics::function_created(&func, has_prototype);
         // Per-FUNCTION map templates (see `ast::Function::fn_maps`): the shape transitions, key
         // hashing, and the name string are paid once; every closure instance clones the finished
         // maps (entry-vector copy, refcount bumps) and patches the two identity-dependent values
@@ -4367,7 +5180,92 @@ impl Interp {
     /// handled by routing to their wrapper prototype (and string index/length specially). The
     /// receiver defaults to `base`.
     pub fn get_member(&mut self, base: &Value, key: &str) -> Result<Value, Abrupt> {
-        self.get_member_recv(base, key, base.clone())
+        let result = self.get_member_recv(base, key, base.clone());
+        if matches!(result, Ok(Value::Undefined)) {
+            self.trace_undefined_property(base, key);
+        }
+        result
+    }
+
+    // Diagnostic history of completed slow-path reads, not an absence proof:
+    // an accessor/Proxy can also deliberately return undefined. OrdinaryGet
+    // has already executed exactly once; never replay author code to inspect it.
+    fn trace_undefined_property(&self, base: &Value, key: &str) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("LUMEN_TRACE_UNDEFINED_PROPERTIES").is_some())
+        {
+            return;
+        }
+        let function = self
+            .fn_frames
+            .last()
+            .and_then(|frame| {
+                let callee = frame.callee();
+                let object = callee.borrow();
+                match object.props.get("name").map(|property| property.value()) {
+                    Some(Value::Str(name)) => Some(name.chars().take(80).collect::<String>()),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default();
+        let key = key.chars().take(120).collect::<String>();
+        let mut entry = format!("function={function:?} base={} key={key:?}", type_name(base));
+        if canonical_index(&key).is_none() {
+            if let Value::Obj(object) = base {
+                let id = Rc::as_ptr(object) as usize;
+                let object = object.borrow();
+                let kind = if self.array_buffers.contains_key(&id) {
+                    "ArrayBuffer"
+                } else if self.typed_arrays.contains_key(&id) {
+                    "TypedArray"
+                } else {
+                    match &object.exotic {
+                        Exotic::Array => "Array",
+                        Exotic::StrWrap(_) => "String object",
+                        Exotic::Arguments => "Arguments",
+                        Exotic::None => "ordinary/host object",
+                        _ => "other exotic",
+                    }
+                };
+                // Read only native descriptors. Do not enumerate a Proxy,
+                // call a constructor/tag getter, or retain the receiver.
+                let names = object
+                    .props
+                    .iter()
+                    .take(8)
+                    .map(|(name, _)| name.chars().take(60).collect::<String>())
+                    .collect::<Vec<_>>();
+                let constructor = object.proto.as_ref().and_then(|prototype| {
+                    let prototype = prototype.borrow();
+                    match prototype
+                        .props
+                        .get("constructor")
+                        .map(|property| property.value())
+                    {
+                        Some(Value::Obj(function)) => {
+                            let function = function.borrow();
+                            match function.props.get("name").map(|property| property.value()) {
+                                Some(Value::Str(name)) => {
+                                    Some(name.chars().take(80).collect::<String>())
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                });
+                entry.push_str(&format!(
+                    " kind={kind:?} constructor={constructor:?} own={names:?}"
+                ));
+            }
+        }
+        MISSING_PROPERTY_TRACE.with(|trace| {
+            let mut trace = trace.borrow_mut();
+            if trace.len() == 32 {
+                trace.pop_front();
+            }
+            trace.push_back(entry);
+        });
     }
 
     /// Profile-enabled `[[Get]]` entry used by computed element operations. It executes the
@@ -4587,20 +5485,70 @@ impl Interp {
         self.get_prop_ic_impl(base, name, cache, true, Some(trace))
     }
 
-    /// [`Interp::get_prop_ic`] for a RUNTIME string key (computed reads — `o[k]`): the global
-    /// stub cache is keyed by name data pointer under the invariant that those pointers are
-    /// site-interned `Rc<str>`s alive for the chunk's lifetime. A transient key must neither
-    /// probe it (a freed key's recycled address false-hits another key's entry — with the
-    /// size-class allocator this happens on the very next iteration of an
-    /// `Object.entries` loop) nor fill it (the dangling pointer would later false-match a
-    /// fresh site name allocated at the same address).
+    /// Computed string-key property read. The caller clears its scratch ways for each key:
+    /// unlike a named site, those cells alone do not establish the property's name. The
+    /// bounded stub cache DOES own and compare its name text (`stub_cache_get`), so it is
+    /// safe to reuse for transient keys, including a different key at a recycled address.
+    /// Long transient keys stay uncached: at most 4096 * 256 bytes of text can be retained
+    /// by computed reads, regardless of the sizes of author-generated property names.
     pub(crate) fn get_prop_keyed(
         &mut self,
         base: &Value,
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
-        self.get_prop_ic_impl(base, name, cache, false, None)
+        self.get_prop_ic_impl(
+            base,
+            name,
+            cache,
+            name.len() <= COMPUTED_STUB_KEY_MAX_BYTES,
+            None,
+        )
+    }
+
+    /// GetValue / OrdinaryGet for an already-string computed key. Pointer-keyed resolutions
+    /// are only hints: live shapes, prototype links, exotic gates and descriptors are checked
+    /// on every hit. Accessors retain the original primitive/object receiver and run once.
+    pub(crate) fn get_computed_property(
+        &mut self,
+        base: &Value,
+        key: &crate::lstr::LStr,
+    ) -> Result<Value, Abrupt> {
+        let cacheable = key.len() <= 256
+            && key.as_str() != "length"
+            && key.as_str() != "description"
+            && !key.as_bytes().first().is_some_and(u8::is_ascii_digit);
+        if cacheable {
+            let object = match base {
+                Value::Obj(object) => Some(object),
+                Value::Str(_) => Some(&self.string_proto),
+                Value::Num(_) => Some(&self.number_proto),
+                Value::Bool(_) => Some(&self.boolean_proto),
+                _ => None,
+            };
+            if let Some(object) = object {
+                let head = Rc::as_ptr(object);
+                let shape = object.borrow().props.shape();
+                if let Some(state) = self.computed_reads.lookup(key.as_ptr() as usize, shape) {
+                    if let Some(value) = self.ic_shape_probe(head, key, state) {
+                        return Ok(value);
+                    }
+                }
+                // This probe/derivation never executes author code. Do not harvest scratch
+                // IC state after a getter or Proxy callback: reentrancy can change its meaning.
+                let scratch = [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
+                    crate::bytecode::PROP_IC_WAYS];
+                // A computed-cache miss already rejected the identity/shape resolution. The
+                // scratch ways are empty; probing them and copying the key into a second
+                // pointer-indexed stub table adds work on high-cardinality/transient inputs.
+                // Derive once and retain the key only in the bounded computed cache.
+                if let Some(value) = self.ic_get_rederive(object, key, &scratch[0], false) {
+                    self.computed_reads.insert(key, scratch[0].get());
+                    return Ok(value);
+                }
+            }
+        }
+        self.get_member(base, key)
     }
 
     fn get_prop_ic_impl(
@@ -4936,9 +5884,8 @@ impl Interp {
                         mid2_shape: mid2_shape.unwrap_or(0),
                     };
                     self.ic_insert(cache, st);
-                    // Mirror into the stub cache so OTHER shapes rotating through this
-                    // site don't evict this resolution for good — stable site names only
-                    // (see `get_prop_keyed`).
+                    // Mirror into the owned-text stub cache so OTHER shapes rotating through
+                    // this site don't evict this resolution for good.
                     if stable_name {
                         self.stub_cache_set(recv_shape, name, st);
                     }
@@ -5796,6 +6743,7 @@ impl Interp {
                                 // frames are naturally skipped.
                                 let rptr = Rc::as_ptr(r) as usize;
                                 let top = self.fn_frames.iter().rposition(|fr| fr.fn_ptr == rptr);
+                                trace_legacy_reflection(key, top.map(|k| &self.fn_frames[k]));
                                 return Ok(match (key, top) {
                                     (_, None) => Value::Null,
                                     ("arguments", Some(k)) => {
@@ -6884,11 +7832,12 @@ impl Interp {
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!(
-                "[gc] live={live} realms={} templates={} pins={} host_settings={}",
+                "[gc] live={live} realms={} templates={} pins={} host_settings={} coroutines={}",
                 self.realms.len(),
                 self.template_cache.len(),
                 self.gc_pins.len(),
-                self.host_settings_states.len()
+                self.host_settings_states.len(),
+                self.generators.len()
             );
         }
         if live > MAX_LIVE {
@@ -6920,12 +7869,13 @@ impl Interp {
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
             eprintln!(
-                "[gc-task] live={live} reclaimed={} realms={} templates={} pins={} host_settings={}",
+                "[gc-task] live={live} reclaimed={} realms={} templates={} pins={} host_settings={} coroutines={}",
                 before.saturating_sub(live),
                 self.realms.len(),
                 self.template_cache.len(),
                 self.gc_pins.len(),
-                self.host_settings_states.len()
+                self.host_settings_states.len(),
+                self.generators.len()
             );
         }
         self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
@@ -7002,6 +7952,84 @@ impl Interp {
         if let Some(setter) = property.setter() {
             Self::push_value_object(setter, refs);
         }
+    }
+
+    /// All strong side-table families used by the two object edge walkers.
+    /// Keep this inventory paired with those walkers when adding a new family.
+    /// The existing snapshot index is reused; no second owner hash map or
+    /// duplicated payload graph is constructed. Weak collections remain in
+    /// the separate ephemeron walk, not in this strong-edge absence proof.
+    /// Test-only inventory for the withdrawn sparse-mask runtime experiment.
+    #[cfg(test)]
+    pub(crate) fn gc_slot_owner_mask(
+        &self,
+        live_index: &crate::fasthash::FastMap<usize, usize>,
+    ) -> crate::gc_edges::GcSlotOwnerMask {
+        macro_rules! owners {
+            ($($table:ident),+ $(,)?) => {{
+                let entries = 0usize$(.saturating_add(self.$table.len()))+;
+                let mut mask = crate::gc_edges::GcSlotOwnerMask::new(live_index.len(), entries);
+                if mask.enabled() {
+                    $(for owner in self.$table.keys() {
+                        if let Some(&index) = live_index.get(owner) {
+                            mask.note_owner(index);
+                        }
+                    })+
+                }
+                mask
+            }};
+        }
+        owners!(
+            class_info,
+            module_ns,
+            map_data,
+            ta_buffer,
+            proxies,
+            host_indexed,
+            promises,
+            promise_forward,
+            async_gen_queue,
+            finalization_registries,
+            mapped_arguments,
+        )
+    }
+
+    /// A collection-local proof that an unpinned object cannot own any of the
+    /// strong side slots below. Use the existing ownership registry rather
+    /// than allocating an owner index or adding metadata to every object.
+    ///
+    /// Pins alone are NOT an absence proof: embed/test paths can attach slots
+    /// to an unpinned owner. Check every actual table's keys first, and retain
+    /// the complete walk whenever that precondition or the sparsity gate fails.
+    /// ECMA-262 #sec-liveness: this only avoids empty lookups; no graph edge,
+    /// root, ephemeron condition or weak-target clearing may be omitted.
+    /// Test-only: runtime use was withdrawn after startup/RSS regression gates
+    /// failed. Preserve the ownership proof for future collector experiments.
+    #[cfg(test)]
+    pub(crate) fn gc_can_skip_unpinned_slots(&self, object_count: usize) -> bool {
+        if object_count < 4096 || self.gc_pins.len() > object_count / 4 {
+            return false;
+        }
+        macro_rules! pinned {
+            ($($table:ident),+ $(,)?) => {
+                $(self.$table.keys().all(|owner| self.gc_pins.contains_key(owner)))&&+
+            };
+        }
+        // Keep this complete alongside BOTH edge walkers and the test-only
+        // slot inventory above. Any unrecognized owner keeps the full trace.
+        pinned!(
+            class_info,
+            module_ns,
+            map_data,
+            ta_buffer,
+            proxies,
+            host_indexed,
+            promises,
+            promise_forward,
+            async_gen_queue,
+            finalization_registries,
+            mapped_arguments,
+        )
     }
 
     fn obj_refs_into(&self, o: &Gc, refs: &mut Vec<Gc>) {
@@ -7090,8 +8118,14 @@ impl Interp {
         if let Some(promise) = self.promises.get(&ptr) {
             Self::push_value_object(&promise.value, refs);
             for (fulfilled, rejected, result, _) in &promise.reactions {
-                Self::push_value_object(fulfilled, refs);
-                Self::push_value_object(rejected, refs);
+                Self::push_value_object(&fulfilled.callback, refs);
+                Self::push_value_object(&rejected.callback, refs);
+                if let Some(global) = &fulfilled.script_caller {
+                    refs.push(global.clone());
+                }
+                if let Some(global) = &rejected.script_caller {
+                    refs.push(global.clone());
+                }
                 Self::push_value_object(result, refs);
             }
         }
@@ -7112,7 +8146,10 @@ impl Interp {
             }
         }
         if let Some(registry) = self.finalization_registries.get(&ptr) {
-            Self::push_value_object(&registry.cleanup_callback, refs);
+            Self::push_value_object(&registry.cleanup_callback.callback, refs);
+            if let Some(global) = &registry.cleanup_callback.script_caller {
+                refs.push(global.clone());
+            }
             for cell in &registry.cells {
                 Self::push_value_object(&cell.held_value, refs);
             }
@@ -7226,6 +8263,12 @@ impl Interp {
             }
         }
 
+        let live_index: crate::fasthash::FastMap<usize, usize> = live
+            .iter()
+            .enumerate()
+            .map(|(index, object)| (Rc::as_ptr(object) as usize, index))
+            .collect();
+
         // ECMAScript's GetTemplateObject cache is a per-Realm internal slot.  The cache is
         // stored on the interpreter for fast lookup, so account for its values as internal
         // edges and index them by their owning Realm global.  This keeps a retired browsing
@@ -7233,11 +8276,6 @@ impl Interp {
         // live for as long as that Realm is live (ECMA-262 GetTemplateObject, [[TemplateMap]]).
         let mut template_cache_members: crate::fasthash::FastMap<usize, Vec<usize>> =
             Default::default();
-        let live_index: crate::fasthash::FastMap<usize, usize> = live
-            .iter()
-            .enumerate()
-            .map(|(index, object)| (Rc::as_ptr(object) as usize, index))
-            .collect();
         for ((realm_key, _site), value) in &self.template_cache {
             if let Value::Obj(object) = value {
                 let ptr = Rc::as_ptr(object) as usize;
@@ -7290,6 +8328,12 @@ impl Interp {
             }
         }
 
+        // [[Realm]] is a logical edge, not a strong Rust reference in this weak table.
+        // In particular, detaching a built-in's prototype cannot detach its realm.
+        for (&function, (_, realm)) in self.native_function_realms.get_mut().iter() {
+            realm_members.insert(function, *realm);
+        }
+
         // A pin is bookkeeping, not a real holder: count it like an internal reference so a
         // pinned-but-unreachable object is still collectable (the sweep evicts its entries).
         for o in self.gc_pins.values() {
@@ -7303,6 +8347,58 @@ impl Interp {
                 if let Value::Obj(object) = value {
                     let b = object.borrow();
                     b.gc_internal.set(b.gc_internal.get() + 1);
+                }
+            }
+        }
+        // Host caches are internal owners too. Keep their graph as identities into `live`,
+        // not extra Rc handles that could distort the root count. Native roots and edges
+        // participate in this same mark, including WeakMap ephemerons and realm ownership.
+        #[derive(Default)]
+        struct AuxiliaryEdges {
+            edges: crate::fasthash::FastMap<usize, Vec<usize>>,
+            roots: Vec<usize>,
+        }
+        impl crate::host::HostGcVisitor for AuxiliaryEdges {
+            fn internal(&mut self, value: &Value) {
+                if let Value::Obj(object) = value {
+                    let b = object.borrow();
+                    b.gc_internal.set(b.gc_internal.get().saturating_add(1));
+                }
+            }
+            fn edge(&mut self, owner: &Value, value: &Value) {
+                if let (Value::Obj(owner), Value::Obj(value)) = (owner, value) {
+                    self.edges
+                        .entry(Rc::as_ptr(owner) as usize)
+                        .or_default()
+                        .push(Rc::as_ptr(value) as usize);
+                }
+            }
+            fn root(&mut self, value: &Value) {
+                if let Value::Obj(object) = value {
+                    self.roots.push(Rc::as_ptr(object) as usize);
+                }
+            }
+        }
+        let mut auxiliary_edges = AuxiliaryEdges::default();
+        self.host_state.trace_gc(&mut auxiliary_edges);
+        // A continuation owns its stored values/environments on behalf of its generator
+        // or result promise. Count the actual payloads once, instead of probing this table
+        // for every ordinary object. The existing auxiliary-owner lookup also dispatches
+        // their marking below. Only an empty owner entry is stored here, not a second edge
+        // cache; large suspended stacks keep the scratch-only tracing fallback.
+        for (&owner, coroutine) in &self.generators {
+            auxiliary_edges.edges.entry(owner).or_default();
+            coroutine.trace_gc(&mut crate::gc_edges::DirectGcEdges {
+                objects: &mut object_refs,
+                scopes: &mut scope_refs,
+            });
+            for object in object_refs.drain(..) {
+                let b = object.borrow();
+                b.gc_internal.set(b.gc_internal.get().saturating_add(1));
+            }
+            for scope in scope_refs.drain(..) {
+                if let Some(&index) = sidx.get(&(Rc::as_ptr(&scope) as usize)) {
+                    s_internal[index] = s_internal[index].saturating_add(1);
                 }
             }
         }
@@ -7324,9 +8420,107 @@ impl Interp {
                 sstack.push(e.clone());
             }
         }
+        for ptr in &auxiliary_edges.roots {
+            if let Some(&index) = live_index.get(ptr) {
+                let object = &live[index];
+                if !object.borrow().gc_mark.get() {
+                    object.borrow().gc_mark.set(true);
+                    stack.push(object.clone());
+                }
+            }
+        }
         // Debug: `LUMEN_GC_DUMP=1` prints each external-rooted object's shape (its first prop
         // names) with strong/internal counts — the fastest way to see WHAT pins a leaked graph.
-        if std::env::var_os("LUMEN_GC_DUMP").is_some() {
+        if std::env::var_os("LUMEN_GC_DUMP").is_some()
+            && live.len()
+                >= std::env::var("LUMEN_GC_DUMP_MIN_OBJECTS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0)
+        {
+            // Internal tags and captured metadata only: no author getters,
+            // value serialization, or extra heap roots. Counts describe the
+            // pre-sweep snapshot and its initially classified roots, not the
+            // final reachable graph. The optional floor keeps pressure runs
+            // from dumping every ordinary small collection.
+            let mut kinds = std::collections::BTreeMap::<&str, (usize, usize)>::new();
+            let mut functions =
+                crate::fasthash::FastMap::<usize, (String, usize, usize)>::default();
+            let mut omitted_function_instances = 0;
+            let mut root_array_sizes = std::collections::BTreeMap::<&str, usize>::new();
+            let mut max_array_length = 0.0_f64;
+            for object in &live {
+                let b = object.borrow();
+                let kind = match &b.call {
+                    Callable::User(user) => {
+                        let key = Rc::as_ptr(&user.func) as usize;
+                        if functions.len() < 1024 || functions.contains_key(&key) {
+                            let entry = functions.entry(key).or_insert_with(|| {
+                                (
+                                    user.func
+                                        .name
+                                        .as_deref()
+                                        .unwrap_or("<anonymous>")
+                                        .chars()
+                                        .take(80)
+                                        .collect(),
+                                    user.func.source.as_ref().map_or(0, |source| source.len()),
+                                    0,
+                                )
+                            });
+                            entry.2 += 1;
+                        } else {
+                            omitted_function_instances += 1;
+                        }
+                        "user_function"
+                    }
+                    Callable::Native(_) | Callable::NativeData(_) => "native_function",
+                    Callable::Bound(_) => "bound_function",
+                    Callable::None => match &b.exotic {
+                        Exotic::Array => {
+                            if let Some(Value::Num(length)) =
+                                b.props.length_property().map(Property::value)
+                            {
+                                max_array_length = max_array_length.max(length);
+                                if b.gc_mark.get() {
+                                    let bucket = match length as u64 {
+                                        0 => "0",
+                                        1 => "1",
+                                        2 => "2",
+                                        3 => "3",
+                                        4..=8 => "4-8",
+                                        9..=64 => "9-64",
+                                        65..=1024 => "65-1024",
+                                        _ => "1025+",
+                                    };
+                                    *root_array_sizes.entry(bucket).or_default() += 1;
+                                }
+                            }
+                            "array"
+                        }
+                        Exotic::StrWrap(_) => "string_wrapper",
+                        Exotic::Error(_) => "error",
+                        Exotic::Arguments => "arguments",
+                        Exotic::None => "object",
+                        _ => "primitive_wrapper",
+                    },
+                    _ => "other_callable",
+                };
+                let entry = kinds.entry(kind).or_default();
+                entry.0 += 1;
+                entry.1 += usize::from(b.gc_mark.get());
+            }
+            let mut functions: Vec<_> = functions.into_values().collect();
+            functions.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
+            functions.truncate(6);
+            eprintln!(
+                "[gc-dump-summary] objects={} scopes={} root_scopes={} kept_objects={} pooled_values={} max_array_length={max_array_length} kinds_total_roots={kinds:?} root_array_sizes={root_array_sizes:?} function_instances={functions:?} omitted_function_instances={omitted_function_instances}",
+                live.len(), scopes.len(), s_mark.iter().filter(|marked| **marked).count(),
+                self.kept_alive.len(),
+                self.vm_pool.iter().map(|(slots, stack)| slots.len() + stack.len()).sum::<usize>()
+                    + self.native_arg_pool.iter().map(Vec::len).sum::<usize>(),
+            );
+            eprintln!("[gc-dump-stack] {}", self.capture_stack());
             let mut shown = 0;
             for o in &live {
                 let b = o.borrow();
@@ -7465,6 +8659,37 @@ impl Interp {
                 }
 
                 let ptr = Rc::as_ptr(&o) as usize;
+                if let Some(targets) = auxiliary_edges.edges.get(&ptr) {
+                    for target in targets {
+                        if let Some(&index) = live_index.get(target) {
+                            let object = &live[index];
+                            if !object.borrow().gc_mark.get() {
+                                object.borrow().gc_mark.set(true);
+                                stack.push(object.clone());
+                            }
+                        }
+                    }
+                    if let Some(coroutine) = self.generators.get(&ptr) {
+                        coroutine.trace_gc(&mut crate::gc_edges::DirectGcEdges {
+                            objects: &mut object_refs,
+                            scopes: &mut scope_refs,
+                        });
+                        for object in object_refs.drain(..) {
+                            if !object.borrow().gc_mark.get() {
+                                object.borrow().gc_mark.set(true);
+                                stack.push(object);
+                            }
+                        }
+                        for scope in scope_refs.drain(..) {
+                            if let Some(&index) = sidx.get(&(Rc::as_ptr(&scope) as usize)) {
+                                if !s_mark[index] {
+                                    s_mark[index] = true;
+                                    sstack.push(scope);
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(&realm_key) = realm_members.get(&ptr) {
                     if activated_realms.insert(realm_key) {
                         if let Some((objects, env)) = realm_groups.get(&realm_key) {
@@ -7583,6 +8808,11 @@ impl Interp {
             .map(|object| Rc::as_ptr(object) as usize)
             .collect();
 
+        self.host_state.sweep_gc(&|value| match value {
+            Value::Obj(object) => !garbage_objects.contains(&(Rc::as_ptr(object) as usize)),
+            _ => true,
+        });
+
         // Drop template entries owned by a dead Realm before the sweep releases its global.
         // Checking the Realm table as well as the garbage set handles stale pointer-keyed entries
         // without allowing an address-reused global to inherit an old template object.
@@ -7654,6 +8884,48 @@ impl Interp {
         // Sweep: clear unmarked (garbage) objects to break their cycles; once `live` drops, their
         // refcounts hit zero and they are freed. Also evict them from pointer-keyed side tables so a
         // future object reusing the address can't inherit stale metadata.
+        self.native_function_realms.get_mut().retain(|_, (pin, _)| {
+            pin.upgrade()
+                .is_some_and(|function| function.borrow().gc_mark.get())
+        });
+        // Evict the chosen dead set in batches. Probing all internal-slot tables for each
+        // ordinary function/prototype makes closure churn pay for unrelated platform state.
+        // Small dead sets keep directed removal; dense churn scans each table only once.
+        // The heap/scope snapshots keep identities alive, and weak targets were cleared above.
+        crate::gc_sweep::map(&mut self.class_info, &garbage_objects);
+        crate::gc_sweep::set(&mut self.eval_realm_fns, &garbage_objects);
+        crate::gc_sweep::map(&mut self.module_ns, &garbage_objects);
+        crate::gc_sweep::map(&mut self.realms, &garbage_objects);
+        crate::gc_sweep::map(&mut self.map_data, &garbage_objects);
+        crate::gc_sweep::map(&mut self.collection_index, &garbage_objects);
+        crate::gc_sweep::map(&mut self.weak_collection_data, &garbage_objects);
+        crate::gc_sweep::map(&mut self.weak_collection_index, &garbage_objects);
+        crate::gc_sweep::map(&mut self.typed_arrays, &garbage_objects);
+        crate::gc_sweep::map(&mut self.data_views, &garbage_objects);
+        crate::gc_sweep::map(&mut self.regexps, &garbage_objects);
+        crate::gc_sweep::map(&mut self.proxies, &garbage_objects);
+        crate::gc_sweep::map(&mut self.host_indexed, &garbage_objects);
+        crate::gc_sweep::map(&mut self.promises, &garbage_objects);
+        crate::gc_sweep::map(&mut self.temporal, &garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffers, &garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffer_versions, &garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, &garbage_objects);
+        crate::gc_sweep::map(&mut self.ta_buffer, &garbage_objects);
+        crate::gc_sweep::map(&mut self.shadow_realms, &garbage_objects);
+        crate::gc_sweep::map(&mut self.shared_buffers, &garbage_objects);
+        crate::gc_sweep::set(&mut self.immutable_buffers, &garbage_objects);
+        crate::gc_sweep::set(&mut self.host_keyed_buffers, &garbage_objects);
+        crate::gc_sweep::map(&mut self.generators, &garbage_objects);
+        crate::gc_sweep::set(&mut self.async_gens, &garbage_objects);
+        crate::gc_sweep::set(&mut self.async_gen_busy, &garbage_objects);
+        crate::gc_sweep::map(&mut self.async_gen_queue, &garbage_objects);
+        crate::gc_sweep::map(&mut self.mapped_arguments, &garbage_objects);
+        crate::gc_sweep::map(&mut self.deferred_ns, &garbage_objects);
+        crate::gc_sweep::map(&mut self.promise_forward, &garbage_objects);
+        crate::gc_sweep::map(&mut self.temporal_cal, &garbage_objects);
+        crate::gc_sweep::map(&mut self.weak_refs, &garbage_objects);
+        crate::gc_sweep::map(&mut self.finalization_registries, &garbage_objects);
+        crate::gc_sweep::map(&mut self.gc_pins, &garbage_objects);
         #[cfg(not(target_arch = "wasm32"))]
         let mut garbage = 0usize;
         for o in &live {
@@ -7662,41 +8934,6 @@ impl Interp {
                 {
                     garbage += 1;
                 }
-                let ptr = Rc::as_ptr(o) as usize;
-                self.class_info.remove(&ptr);
-                self.eval_realm_fns.remove(&ptr);
-                self.module_ns.remove(&ptr);
-                self.realms.remove(&ptr);
-                self.map_data.remove(&ptr);
-                self.collection_index.remove(&ptr);
-                self.weak_collection_data.remove(&ptr);
-                self.weak_collection_index.remove(&ptr);
-                self.typed_arrays.remove(&ptr);
-                self.data_views.remove(&ptr);
-                self.regexps.remove(&ptr);
-                self.proxies.remove(&ptr);
-                self.host_indexed.remove(&ptr);
-                self.promises.remove(&ptr);
-                self.temporal.remove(&ptr);
-                self.array_buffers.remove(&ptr);
-                self.array_buffer_versions.remove(&ptr);
-                self.array_buffer_dirty_ranges.remove(&ptr);
-                self.ta_buffer.remove(&ptr);
-                self.shadow_realms.remove(&ptr);
-                self.shared_buffers.remove(&ptr);
-                self.immutable_buffers.remove(&ptr);
-                self.host_keyed_buffers.remove(&ptr);
-                self.generators.remove(&ptr);
-                self.async_gens.remove(&ptr);
-                self.async_gen_busy.remove(&ptr);
-                self.async_gen_queue.remove(&ptr);
-                self.mapped_arguments.remove(&ptr);
-                self.deferred_ns.remove(&ptr);
-                self.promise_forward.remove(&ptr);
-                self.temporal_cal.remove(&ptr);
-                self.weak_refs.remove(&ptr);
-                self.finalization_registries.remove(&ptr);
-                self.gc_pins.remove(&ptr);
                 let mut b = o.borrow_mut();
                 b.props.clear();
                 b.proto = None;
@@ -7719,6 +8956,7 @@ impl Interp {
         self.creation_pins.retain(|_, pin| pin.strong_count() != 0);
         self.construct_ics
             .retain(|_, entry| entry.pin.strong_count() != 0);
+        self.call_overflow.prune_dead();
         self.construct_capacity_hints
             .retain(|_, (pin, _)| pin.strong_count() != 0);
         self.global_env_pins.retain(|pin| pin.strong_count() != 0);
@@ -7860,6 +9098,15 @@ impl Interp {
     /// rooted in; anything else is resolved by finding which realm's %Function.prototype% sits on
     /// its prototype chain.
     pub(crate) fn callee_realm_global(&self, obj: &Gc) -> Option<usize> {
+        if let Some((_, realm)) = self
+            .native_function_realms
+            .borrow()
+            .get(&(Rc::as_ptr(obj) as usize))
+        {
+            return (*realm != Rc::as_ptr(&self.global) as usize
+                && self.realms.contains_key(realm))
+            .then_some(*realm);
+        }
         if let Callable::User(user) = &obj.borrow().call {
             // Walk to the scope root by raw pointer — every hop is kept alive transitively by
             // `env` (which the callee's `call` field owns) and nothing mutates the parent links,
@@ -7920,10 +9167,32 @@ impl Interp {
         let obj = match &callee {
             Value::Obj(o) => o.clone(),
             _ => {
+                // Optional call-boundary context complements the error stack
+                // when an obfuscated interpreter attempts to call a primitive.
+                // Inspect only native primitive data: no author coercion/hooks.
+                static TRACE_CALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                static TRACE_COUNT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if *TRACE_CALL.get_or_init(|| {
+                    std::env::var_os("LUMEN_TRACE_ERROR_SOURCE").is_some()
+                        && std::env::var("LUMEN_TRACE_ERRORS")
+                            .is_ok_and(|filter| filter == "1" || filter.contains("not a function"))
+                }) && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32
+                {
+                    let preview = match &callee {
+                        Value::Str(text) => text.chars().take(160).collect::<String>(),
+                        _ => type_name(&callee).to_string(),
+                    };
+                    eprintln!(
+                        "lumen-call-error: callee={preview:?} this-type={} argument-types={:?}",
+                        type_name(&this),
+                        args.iter().take(8).map(type_name).collect::<Vec<_>>()
+                    );
+                }
                 return Err(self.throw(
                     "TypeError",
                     format!("{} is not a function", type_name(&callee)),
-                ))
+                ));
             }
         };
         // Proxy with an `apply` trap (or forward to the target).
@@ -7992,7 +9261,19 @@ impl Interp {
             Callable::Bound(bound) => {
                 let mut all = bound.args.clone();
                 all.extend_from_slice(args);
-                self.call(Value::Obj(bound.target), bound.this, &all)
+                // ECMA-262 BoundFunction [[Call]] still forwards the original
+                // concatenated argument list once. The optional history records
+                // only bounded native previews, without changing author APIs.
+                let trace = trace_bound_call_enter(&bound, args);
+                if let Some(id) = trace {
+                    trace_bound_array_state(id, "enter", bound.args.first());
+                }
+                let result = self.call(Value::Obj(bound.target), bound.this, &all);
+                if let Some(id) = trace {
+                    trace_bound_array_state(id, "exit", bound.args.first());
+                    trace_bound_call_exit(id, &result);
+                }
+                result
             }
             Callable::WrappedShadow(shadow) => {
                 self.call_wrapped_shadow(shadow.realm, (*shadow.target).clone(), args)
@@ -8481,11 +9762,14 @@ impl Interp {
             self.in_field_init_code = false;
             self.in_async_gen_body = false;
         }
-        // Machine-code tier: compile once (None = unsupported — async or platform), then run the
-        // JIT body; otherwise the bytecode VM.
+        // Supported code can wait for executable capacity without being marked
+        // permanently unsupported. No eviction or mutation of live machine code:
+        // cached pointers remain stable, and a deferred body uses the checked VM.
         let mut jit_code = None;
         if matches!(self.tier, crate::bytecode::Tier::Jit) {
-            if chunk.jit.get().is_none() {
+            if chunk.jit.get().is_none()
+                && crate::jit::executable_code_can_fit(chunk.jit_budget_wait_bytes.get())
+            {
                 let layout = *self
                     .jit_layout
                     .get_or_init(|| crate::value::jit_layout(&self.object_proto));
@@ -8493,10 +9777,18 @@ impl Interp {
                     let l = interp_layout(self);
                     self.interp_layout.set(l);
                 }
-                let _ = chunk.jit.set(
-                    crate::jit::compile_profiled(chunk, &layout, &self.interp_layout.get())
-                        .map(std::rc::Rc::new),
-                );
+                match crate::jit::compile_profiled(chunk, &layout, &self.interp_layout.get()) {
+                    crate::jit::JitCompileOutcome::Compiled(code) => {
+                        chunk.jit_budget_wait_bytes.set(0);
+                        let _ = chunk.jit.set(Some(std::rc::Rc::new(code)));
+                    }
+                    crate::jit::JitCompileOutcome::Deferred { required_bytes } => {
+                        chunk.jit_budget_wait_bytes.set(required_bytes);
+                    }
+                    crate::jit::JitCompileOutcome::Unavailable => {
+                        let _ = chunk.jit.set(None);
+                    }
+                }
             }
             if let Some(Some(code)) = chunk.jit.get() {
                 jit_code = Some(code.clone());
@@ -8711,40 +10003,51 @@ impl Interp {
                 }
             }
         }
+        if hit.is_none() {
+            hit = self.call_overflow.lookup(key, genv, epoch);
+        }
         let ic = match hit {
             Some(ic) => ic,
             None => {
-                // Fresh-closure retry: a needs-env entry whose AST FUNCTION matches the callee
-                // still applies — closures created per call share the function and chunk; only
-                // the environment differs, and that comes from the live callee object. One
-                // borrow + pointer compare instead of a full call_jit_fast re-walk + refill
-                // per instance.
-                let has_env_entry = site.entries.iter().any(|e| {
+                // OrdinaryFunctionCreate gives each closure its own identity, [[Environment]]
+                // and [[Realm]], but closures from the same expression share immutable code.
+                // Reuse that code for BOTH activation-homed and slot-only functions. Restricting
+                // this retry to needs-env entries made tiny freshly allocated callbacks refill
+                // the cache on every invocation, eventually saturating the weak-pin budget.
+                let has_user_entry = site.entries.iter().any(|e| {
                     let p = e.as_ptr();
-                    unsafe { (*p).direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 }
+                    unsafe {
+                        !(*p).func.is_null() && (*p).global_env == genv && (*p).epoch == epoch
+                    }
                 });
-                if !has_env_entry {
+                if !has_user_entry {
                     return None;
                 }
-                let (fp, ep) = match &o.borrow().call {
+                let object = o.borrow();
+                let (fp, ep) = match &object.call {
                     // `under_with`: see the refusal in `call_jit_fast` — this retry runs a
-                    // FRESH closure instance whose env was never vetted there.
+                    // FRESH closure instance whose environment/realm was never vetted there.
+                    // The immutable [[Realm]] slot proves same-realm execution independently
+                    // of user mutations to the function object's prototype chain.
                     Callable::User(user)
-                        if !user.func.is_arrow && !user.env.borrow().under_with =>
+                        if object.ic_plain.get()
+                            && !user.func.is_arrow
+                            && user.realm == Rc::as_ptr(&self.global) as usize
+                            && !user.env.borrow().under_with =>
                     {
                         (Rc::as_ptr(&user.func), Rc::as_ptr(&user.env))
                     }
                     _ => return None,
                 };
+                drop(object);
+                if !self.class_info.is_empty() && self.class_info.contains_key(&key) {
+                    return None;
+                }
                 let mut found = None;
                 for e in &site.entries {
                     let p = e.as_ptr();
                     unsafe {
-                        if (*p).direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0
-                            && (*p).func == fp
-                            && (*p).global_env == genv
-                            && (*p).epoch == epoch
-                        {
+                        if (*p).func == fp && (*p).global_env == genv && (*p).epoch == epoch {
                             found = Some(*p);
                             break;
                         }
@@ -8758,7 +10061,8 @@ impl Interp {
                 // ic.callee here caused reflection/error stack capture to read freed
                 // object storage. Change the local copy, not the pinned cache entry.
                 ic.callee = key;
-                return Some(unsafe { self.call_jit_env_committed(ic, ep, this_slot, args, argc) });
+                ic.env = ep;
+                ic
             }
         };
         if ic.native != 0 {
@@ -10008,33 +11312,40 @@ impl Interp {
                 }
                 let (n_params, n_slots) = chunk.jit_frame();
                 if n_params <= u16::MAX as usize && n_slots <= u16::MAX as usize {
-                    cs.fill(crate::bytecode::CallIc {
-                        callee: key,
-                        env: Rc::as_ptr(&env),
-                        chunk: chunk as *const Rc<crate::bytecode::Chunk>,
-                        code: Rc::as_ptr(code),
-                        global_env: Rc::as_ptr(&self.global_env) as usize,
-                        strict: func.is_strict,
-                        uses_this: chunk.needs_frame_this(),
-                        n_params: n_params as u16,
-                        n_slots: n_slots as u16,
-                        direct: if needs_env {
-                            crate::bytecode::CALL_IC_NEEDS_ENV
-                        } else {
-                            chunk.jit_direct_flags(code)
-                                | (((chunk.inline_attempted.get() || func.code2.get().is_some())
-                                    as u8)
-                                    << 2)
+                    let evicted = cs.fill(
+                        crate::bytecode::CallIc {
+                            callee: key,
+                            env: Rc::as_ptr(&env),
+                            chunk: chunk as *const Rc<crate::bytecode::Chunk>,
+                            code: Rc::as_ptr(code),
+                            global_env: Rc::as_ptr(&self.global_env) as usize,
+                            strict: func.is_strict,
+                            uses_this: chunk.needs_frame_this(),
+                            n_params: n_params as u16,
+                            n_slots: n_slots as u16,
+                            direct: if needs_env {
+                                crate::bytecode::CALL_IC_NEEDS_ENV
+                            } else {
+                                chunk.jit_direct_flags(code)
+                                    | (((chunk.inline_attempted.get() || func.code2.get().is_some())
+                                        as u8)
+                                        << 2)
+                            },
+                            func: Rc::as_ptr(&func),
+                            epoch: crate::bytecode::CALL_IC_EPOCH
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            chunk_raw: Rc::as_ptr(chunk),
+                            code_mem: code.mem_ptr(),
+                            pc_offs_ptr: code.pc_offsets_ptr(),
+                            native: 0,
+                            intrinsic: 0,
                         },
-                        func: Rc::as_ptr(&func),
-                        epoch: crate::bytecode::CALL_IC_EPOCH
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        chunk_raw: Rc::as_ptr(chunk),
-                        code_mem: code.mem_ptr(),
-                        pc_offs_ptr: code.pc_offsets_ptr(),
-                        native: 0,
-                        intrinsic: 0,
-                    });
+                        Some(&func),
+                    );
+                    if let Some(evicted) = evicted {
+                        let pin = p.get(&evicted.callee).expect("call entry has an ABA pin");
+                        self.call_overflow.insert(evicted, pin.clone());
+                    }
                 }
             }
         }
@@ -10132,7 +11443,7 @@ impl Interp {
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
         let realm_key = Rc::as_ptr(&self.global) as usize;
-        let _profile = function_profile_enter(func, realm_key);
+        let _profile = function_profile_enter(func, &closure, fn_obj, realm_key);
         // Bytecode fast call: an eligible sync callee runs on the VM. Ordinary and base-class
         // bodies use the lean activation chosen by the compiler; a derived constructor uses the
         // dedicated Function Environment Record path below so `super()` can initialize `this`.
@@ -10881,6 +12192,14 @@ impl Interp {
     }
 
     fn make_async_gen_return_reaction(&mut self, key: usize, r: &Value, fulfil: bool) -> Value {
+        // AsyncGeneratorAwaitReturn's abstract closures capture the generator itself.
+        // A numeric address is not an owning edge and can become stale across collection.
+        let generator = Value::Obj(
+            self.gc_pins
+                .get(&key)
+                .expect("a pending async-generator return has a pinned owner")
+                .clone(),
+        );
         let target = self.make_native(
             "",
             1,
@@ -10891,8 +12210,7 @@ impl Interp {
             },
         );
         let bound = Object::new(Some(self.function_proto.clone()));
-        bound.borrow_mut().call =
-            Callable::bound(target, r.clone(), vec![Value::Num(key as f64), r.clone()]);
+        bound.borrow_mut().call = Callable::bound(target, r.clone(), vec![generator, r.clone()]);
         Value::Obj(bound)
     }
 
@@ -10910,6 +12228,12 @@ impl Interp {
     }
 
     fn make_async_gen_reaction(&mut self, key: usize, r: &Value, fulfil: bool) -> Value {
+        let generator = Value::Obj(
+            self.gc_pins
+                .get(&key)
+                .expect("a pending async-generator reaction has a pinned owner")
+                .clone(),
+        );
         let target = self.make_native(
             "",
             1,
@@ -10920,9 +12244,8 @@ impl Interp {
             },
         );
         let bound = Object::new(Some(self.function_proto.clone()));
-        // `args` carries the generator key (as a number marker) and the result promise.
-        bound.borrow_mut().call =
-            Callable::bound(target, r.clone(), vec![Value::Num(key as f64), r.clone()]);
+        // Await's continuation owns the generator, not just its recyclable address.
+        bound.borrow_mut().call = Callable::bound(target, r.clone(), vec![generator, r.clone()]);
         Value::Obj(bound)
     }
 
@@ -11328,10 +12651,11 @@ impl Interp {
     fn run_program_body(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
         self.activate_gc_heap();
         self.interrupt_poll_force()?;
-        // GlobalDeclarationInstantiation early checks, before any binding is created. A probe
-        // hoist into a throwaway scope yields this script's VarDeclaredNames.
-        let probe = new_scope(None);
-        self.hoist(body, &probe, &[]);
+        // GlobalDeclarationInstantiation validates declarations before creating
+        // bindings or function objects. The hoist plan supplies names and kinds;
+        // no throwaway scope or duplicate function/prototype objects are needed.
+        let hoist_ops = collect_hoist_ops(body, self.strict, &[]);
+        let new_vars = ordered_global_hoist_bindings(&hoist_ops);
         let mut lex_names: Vec<String> = Vec::new();
         for s in body {
             match unwrap_export(s) {
@@ -11370,7 +12694,7 @@ impl Interp {
             }
         }
         let extensible = self.global.borrow().extensible;
-        for (name, binding) in probe.borrow().vars.iter() {
+        for &(name, is_func) in &new_vars {
             if self.global_env.borrow().vars.contains_key(name) {
                 return Err(Abrupt::Throw(self.make_error(
                     "SyntaxError",
@@ -11383,7 +12707,7 @@ impl Interp {
                 .props
                 .get(name)
                 .map(|p| (p.configurable(), p.accessor(), p.writable(), p.enumerable()));
-            if !matches!(binding.value, Value::Undefined) {
+            if is_func {
                 // CanDeclareGlobalFunction.
                 let ok = match existing {
                     Some((true, ..)) => true,
@@ -11406,49 +12730,48 @@ impl Interp {
                 )));
             }
         }
-        let new_vars: Vec<String> = probe.borrow().vars.keys().map(|k| k.to_string()).collect();
         self.global_var_names
             .borrow_mut()
-            .extend(new_vars.iter().cloned());
-        self.hoist(body, &self.global_env.clone(), &[]);
+            .extend(new_vars.iter().map(|(name, _)| (*name).to_owned()));
+        self.apply_hoist_ops(&hoist_ops, &self.global_env.clone());
         // The global Environment Record is object-backed: this script's `var`/`function` bindings
         // (which `hoist` just placed in `global_env`) become properties of the global object, so
-        // they are visible as `globalThis.<name>` and writes stay in sync. Only the probe-computed
+        // they are visible as `globalThis.<name>` and writes stay in sync. Only the plan-computed
         // names move — lexical bindings from earlier scripts stay in the environment.
-        for name in new_vars {
-            let Some(binding) = self.global_env.borrow_mut().vars.remove(&name) else {
+        for (name, is_func) in new_vars {
+            let Some(binding) = self.global_env.borrow_mut().vars.remove(name) else {
                 continue;
             };
             let existing = self
                 .global
                 .borrow()
                 .props
-                .get(name.as_str())
+                .get(name)
                 .map(|p| (p.writable(), p.configurable()));
-            let is_func = !matches!(binding.value, Value::Undefined);
             match existing {
                 None => {
-                    self.global.borrow_mut().props.insert(
-                        name.as_str(),
-                        Property::data(binding.value, true, true, false),
-                    );
+                    self.global
+                        .borrow_mut()
+                        .props
+                        .insert(name, Property::data(binding.value, true, true, false));
                 }
                 // CreateGlobalFunctionBinding: a configurable property is fully redefined; a
                 // non-configurable one (already validated writable) just takes the new value.
                 Some((_, true)) if is_func => {
-                    self.global.borrow_mut().props.insert(
-                        name.as_str(),
-                        Property::data(binding.value, true, true, false),
-                    );
+                    self.global
+                        .borrow_mut()
+                        .props
+                        .insert(name, Property::data(binding.value, true, true, false));
                 }
                 Some((true, _)) if is_func => {
-                    if let Some(p) = self.global.borrow_mut().props.get_mut(&name) {
+                    if let Some(p) = self.global.borrow_mut().props.get_mut(name) {
                         p.set_value(binding.value);
                     }
                 }
                 _ => {}
             }
         }
+        drop(hoist_ops);
         // Top-level `let`/`const` are pre-declared in their temporal dead zone.
         self.declare_block_lexicals(body, &self.global_env.clone(), false);
         let env = self.global_env.clone();
@@ -11504,7 +12827,7 @@ impl Interp {
     }
 
     /// Replay a hoisting plan against `scope` (see [`HoistOp`] for the op semantics).
-    fn apply_hoist_ops(&mut self, ops: &[HoistOp], scope: &Env) {
+    pub(crate) fn apply_hoist_ops(&mut self, ops: &[HoistOp], scope: &Env) {
         for op in ops {
             match op {
                 HoistOp::Var(name) => {
@@ -11609,6 +12932,43 @@ pub(crate) fn collect_hoist_ops(
         }
     }
     out
+}
+
+/// Property creation order for GlobalDeclarationInstantiation and global
+/// EvalDeclarationInstantiation. Scope bindings are hashed; iterating that table
+/// would make the observable global object's own-key order depend on its buckets.
+/// Annex B-only vars precede surviving function declarations (last declaration
+/// wins), which precede ordinary vars in their first-occurrence order.
+pub(crate) fn ordered_global_hoist_bindings(ops: &[HoistOp]) -> Vec<(&str, bool)> {
+    // Borrow plan-owned names. The flag identifies a function binding without
+    // allocating a function merely to infer its declaration kind from a value.
+    let mut seen: crate::fasthash::FastSet<&str> = Default::default();
+    let mut functions_and_vars = Vec::new();
+    for op in ops.iter().rev() {
+        if let HoistOp::Fn(name, _) = op {
+            if seen.insert(name.as_str()) {
+                functions_and_vars.push((name.as_str(), true));
+            }
+        }
+    }
+    functions_and_vars.reverse();
+    for op in ops {
+        if let HoistOp::Var(name) = op {
+            if seen.insert(name.as_str()) {
+                functions_and_vars.push((name.as_str(), false));
+            }
+        }
+    }
+    let mut ordered = Vec::with_capacity(seen.len());
+    for op in ops {
+        if let HoistOp::AnnexB(name, _) = op {
+            if seen.insert(name.as_str()) {
+                ordered.push((name.as_str(), false));
+            }
+        }
+    }
+    ordered.extend(functions_and_vars);
+    ordered
 }
 
 /// Hoist `var` declarations from one statement (function declarations and Annex B promotions are

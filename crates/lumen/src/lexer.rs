@@ -2,7 +2,7 @@
 //! streaming buys nothing) and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
 
-use crate::token::{KEYWORDS, PUNCTUATORS, Tok, Token, TplPart};
+use crate::token::{Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
 use std::rc::Rc;
 
 pub struct LexError {
