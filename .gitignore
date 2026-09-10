@@ -17,6 +17,15 @@ __pycache__/
 /browser-replay-fixtures/
 # Machine-readable local performance reports.
 /benchmark-results/
+# Local documentation and investigation notes; keep READMEs and agent guidance available.
+*.md
+!README.md
+!/AGENTS.md
+
+# Local generated focus lists.
+/wasm-spec-focus.txt
+/wpt-focus.txt
+
 # Playground wasm bundle + build stamp (built by wasm-pack in .github/workflows/pages.yml).
 /site/pkg/
 /site/version.json

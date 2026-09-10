@@ -1,242 +1,69 @@
-# lumen
+# Lumen
 
-A from-scratch JavaScript **engine** in Rust — std only, zero dependencies — and a
-**runtime** being built on top of it, the way Node/Deno/Bun wrap a JS engine with an event
-loop and host APIs. Every crate in the workspace is std-only: no `tokio`, `mio`, `libc`,
-`rustyline`, `serde`, or any other third-party dependency, anywhere.
+Lumen is a JavaScript engine written from scratch in Rust, with a runtime growing
+around it. It powers the JavaScript in TRust, and you can also take it out for a
+spin on its own: run a script, open a REPL, or give it a little web server to look
+after.
 
-## The engine (`crates/lumen`)
+Building a JavaScript engine means getting acquainted with every strange corner
+of JavaScript. Closures, promises, proxies, regular expressions, the surprising
+things you can do to an array… Lumen takes on the whole messy language. That's
+part of the fun.
 
-A lexer, parser, and **three execution tiers**:
+## What's special about it?
 
-- a **tree-walking interpreter** — the reference oracle: the spec semantics live here, and
-  every other tier must match it observably (a differential fuzzer, `lumen-difftest`, holds
-  them to that);
-- an opt-in **bytecode VM** — functions compile whole (or not at all — no deoptimization) to
-  a stack machine with slot-homed locals, per-site inline caches for property and free-name
-  access backed by object shapes (hidden classes), and dense-array element fast paths;
-- a **native template JIT** — bytecode lowers to real ARM64 machine code on macOS, Linux,
-  and Windows, with a correctness-first x86-64 backend on Intel macOS, Linux, and Windows:
-  per-op templates with the interpreter as the shared slow path, inline-cache reads baked
-  into the instruction stream, fused compare-and-branch, exact-`ToInt32` bitops, and numeric
-  *register chains* that keep runs of arithmetic entirely in FP registers. The full set of
-  inline fast paths currently lives in the ARM64 backend; x86-64 starts with native control
-  flow and checked per-op helpers. Other architectures degrade to the bytecode VM.
+The engine is ours all the way down, from reading your source code to generating
+native machine code. It has three ways to run JavaScript: an interpreter, a
+bytecode VM, and a JIT compiler for ARM64 and x86-64. We can run the same program
+through all three and check that they agree. Making it faster should still leave
+you with the same JavaScript.
 
-Tier selection: `--tier=interp|bytecode|jit` (**jit is the default**; where the JIT is
-unavailable it degrades to the bytecode VM). Functions tier up after a call-count threshold —
-immediately if the body contains a loop. Force the reference tree-walker with `--tier=interp`
-(or `LUMEN_TIER=interp`).
+It also has a real day job. Being TRust's engine means dealing with the code
+websites actually ship, alongside the smaller programs that help us pin down
+bugs. There's plenty to explore outside the browser too: modules, async/await,
+`Intl`, `Temporal`, and a runtime with filesystem access, timers, web APIs, and
+growing Node.js compatibility.
 
-The base JIT and its second-stage speculative whole-function inliner are enabled by default. A hot
-chunk is considered for a one-shot inline recompile after 100 machine-code runs. ARM64 direct
-shared-context calls and speculative inlining compose by default. Direct activations bind
-thread-local GC state at execution time and discard callee-owned exception handlers before
-restoring the caller; these boundaries keep reusable generated code and early returns from leaking
-activation state across calls. `LUMEN_INLINE_AT=N` changes the inlining trigger, and
-`LUMEN_INLINE_AT=0` disables inlining. `LUMEN_JIT_NO_DIRECT_CALLS=1` retains ordinary layered JIT
-calls while disabling only the shared-context fast path for diagnostics.
+Much of Lumen is built with Rust's standard library. We use a few dependencies
+where they earn their keep, and some runtime features use system libraries.
+Keeping the pieces understandable matters to us.
 
-The language surface: generators and `async`/`await` running on stackful coroutines (async
-bodies suspend on the bytecode VM itself), full `RegExp` (including `\p{…}` and inline
-modifiers), typed arrays, `Proxy`/`Reflect`, ES modules (top-level await, `import defer`,
-source phase), `Intl`, and `Temporal`.
+Lumen is still an ambitious work in progress. Compatibility and performance keep
+improving, and there's a lot left to do. If you like poking around language
+runtimes—or finding the tiny JavaScript program that makes one fall over—you'll
+probably feel at home here.
 
-`Intl` (ECMA-402) and its CLDR data tables are behind the default-on `intl` cargo feature —
-the largest single contributor to binary size (~3 MB of the release binary). Build with
-`--no-default-features` for a small engine: the `Intl` global is absent and the `toLocale*`
-methods degrade to their locale-independent forms, the way engines built without i18n do.
+## Give it a try
 
-On dependencies and `unsafe`: the workspace stays std-only — the JIT maps executable memory
-through raw platform declarations (`mmap`/`mprotect`, macOS `MAP_JIT`, or Windows
-`VirtualAlloc`/`VirtualProtect`) rather than libc. Pages are writable only while code is copied,
-then executable/read-only, and instruction caches are synchronized where required. The
-interpreter and bytecode VM are safe Rust; `unsafe` is concentrated where machine
-code meets the object graph (the JIT's executable pages and its templates' raw reads — every
-baked offset is *measured at runtime* against the live types and fails closed to the checked
-helper if anything doesn't hold) and in the N-API addon loader's `dlopen` bridge.
-
-Measured on 2026-08-26 against [tc39/test262](https://github.com/tc39/test262) commit
-`d86b2294eb0a17eaa281ff12c73c473ec864c72f`: **53,574 passed, 0 failed, and 4 were skipped**
-(100% of executed tests, including annexB, intl402, and staging) on the default JIT tier.
-This is a reproducible baseline, not a permanent conformance claim; Test262 and the engine both
-change. See the commands under [Conformance](#conformance) and the generated
-`test262-report/summary.json` for current results.
-
-Extracted from — and used by — the [lucid-softworks/browser](https://github.com/lucid-softworks/browser)
-engine as its JS backend (`backend-lumen`), with full git history.
-
-## The runtime
-
-A curated `embed` API on the engine exposes just enough — native-function registration, a
-typed host-state slot, and event-loop hooks — for a runtime layer to be assembled from
-independent op crates, without leaking the interpreter's internals into the published API.
-On top of that:
-
-- **Event loop** (`lumen-runtime`) — a single loop thread owns the (`!Send`) engine; blocking
-  work runs on a std thread pool and completes back over `mpsc`. No epoll/kqueue reactor
-  (that would need raw syscalls); the thread-pool-plus-completion model is libuv's own fs
-  strategy. Each turn drains microtasks, queued callbacks, due timers, and I/O completions,
-  then blocks until the next event.
-- **Timers** (`lumen-timers`) — `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`/
-  `setImmediate`, plus `queueMicrotask`.
-- **`console` and `process`** — streaming `console.*`; `process.argv`/`env`/`platform`/
-  `cwd()`/`exit()`/`nextTick()`.
-- **Filesystem** (`lumen-fs`) — synchronous ops (`readFileSync`, `writeFileSync`,
-  `existsSync`, `mkdirSync`, `readdirSync`, …), file handles via a resource table
-  (`openSync`/`readSync`/`writeSync`/`closeSync`), and async `fs.promises.readFile`/
-  `writeFile` on the thread pool.
-- **Web platform** (`lumen-web`) — a growing slice of the WinterTC Minimum Common API:
-  `Event`/`EventTarget`/`CustomEvent`/`AbortController`/`AbortSignal`/`DOMException`,
-  `TextEncoder`/`TextDecoder`, `atob`/`btoa`, `structuredClone`, `URL`/`URLSearchParams`,
-  `performance.now()`, `crypto.getRandomValues`/`randomUUID`/`subtle.digest` (SHA-256), and
-  `fetch`/`Headers`/`Request`/`Response`. See the checklist at the top of
-  `crates/lumen-web/src/lib.rs` for what's implemented vs. deferred (streams, `Blob`/
-  `FormData`, `URLPattern`, …).
-
-  `fetch` speaks HTTP/1.1 over `std::net`. **`https:` is not supported**: TLS cannot be
-  implemented on std alone and no third-party crate is permitted, so `https` URLs reject with
-  a clear error; plain `http` works.
-
-  `Lumen.serve((request) => Response)` is the matching HTTP/1.1 **server** — not a WinterTC API,
-  but the cross-runtime `serve(handler)` convention (Deno/Bun/Workers), so a Hono app runs with
-  `Lumen.serve(app.fetch)`. v1 is single-accept, `Connection: close`, buffered bodies, http only
-  (see `crates/lumen-web/src/server.rs`). Cold-start and usage: `examples/hono-app`.
-
-- **Modules — both CommonJS and ESM.** `lumen-cli` picks the module kind the way Node does:
-  `.mjs` is ESM, `.cjs` is CommonJS, `.js` follows the nearest `package.json` `"type"`. ES
-  modules run through the engine's real module graph (linking, top-level `await`); `import`
-  specifiers resolve against disk and `node_modules`, `node:` builtins are importable
-  (named imports included), and CommonJS packages interop by default export. CommonJS files
-  run as the program entry with `require.main === module`.
-
-- **`node:` compatibility** (`lumen-node`) — a CommonJS `require` with `node_modules`
-  resolution and the module wrapper, `package.json` `main`/`exports`, the `node:path`/
-  `node:os`/`node:fs` builtins, and `Buffer`, so packages written against the `node:` surface
-  run. See the checklist at the top of `crates/lumen-node/src/lib.rs` for the deferred pieces
-  (subpath-pattern exports, the full N-API surface).
-
-  **Native addons** load too: `require('./addon.node')` dlopens the compiled library and runs its
-  N-API registration, resolving the addon's `napi_*` symbols against the lumen executable — the
-  same mechanism the `node` binary uses. The N-API surface is implemented from scratch (values,
-  properties, functions, callbacks, errors, references, object wrap, classes, promises, buffers,
-  typed arrays, async work); the loader reaches `dlopen`/`dlsym` through raw `extern "C"`
-  declarations, so no third-party crate is added. See `examples/native-addon`.
-
-  **`vite build` runs on lumen** (`examples/vite-app`): a full Vite production build, bundling
-  through Rollup's native N-API addon, transforming with esbuild's service subprocess, over
-  ESM↔CommonJS interop and the `node:` surface — building `dist/` and exiting cleanly.
-
-- **REPL + CLI** (`lumen-repl`, `lumen-cli`) — an interactive shell with a persistent realm,
-  parser-driven incomplete-input detection (multi-line continuation), top-level `await`, and
-  loop-to-quiescence so timers and awaited promises settle before the next prompt. Line
-  editing is line-buffered (raw-mode/history would need `termios`); use `rlwrap` for arrows
-  and history.
-
-### Workspace crates
-
-```
-lumen          engine (std-only, zero-dep; `embed` feature gates the runtime API)
-lumen-host     substrate: OpState, ResourceTable, Extension, the thread-pool/callback primitives
-lumen-timers   setTimeout/setInterval/queueMicrotask/setImmediate
-lumen-fs       filesystem (sync + async)
-lumen-web      WinterTC Minimum Common API (Event, URL, crypto, fetch, …)
-lumen-node     node: compatibility (require, node:path/os/fs, Buffer)
-lumen-runtime  the event loop; assembles the op crates; console + process
-lumen-repl     interactive shell
-lumen-cli      node/deno-style entrypoint
-
-test262-runner   conformance harness (parallel workers over ./test262)
-lumen-difftest   differential fuzzer across the three execution tiers
-lumen-wasm       wasm build of the engine
-```
-
-The dependency graph is a strict DAG — `lumen ← lumen-host ← {op crates} ← lumen-runtime ←
-lumen-repl ← lumen-cli` — so each op crate can be worked on in isolation.
-
-## Install
-
-Grab a nightly prebuilt runtime on macOS arm64/x86_64 or Linux x86_64/arm64 (tagged releases
-also publish Windows x86_64 binaries):
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/lucid-softworks/lumen/main/scripts/install.sh | bash
-```
-
-It installs the `lumen` CLI to `~/.lumen/bin` from the rolling `nightly` release
-(`LUMEN_INSTALL` and `LUMEN_RELEASE` override the location and tag). Other platforms build from
-source — see below.
-
-## Usage
-
-Run scripts / open a REPL through the runtime:
+With Rust and Cargo installed, build the runtime from the repository root:
 
 ```sh
 cargo build --release -p lumen-cli
-./target/release/lumen-cli                 # REPL (or: lumen-cli repl)
-./target/release/lumen-cli file.js [args]  # run a script to loop quiescence
-./target/release/lumen-cli -e 'code'       # evaluate a string
+./target/release/lumen-cli -e 'console.log("Hello from Lumen!")'
+./target/release/lumen-cli repl
 ```
 
-The engine also ships a minimal standalone shell (the test262 host, no runtime/host APIs):
+Or run your own script:
 
 ```sh
-cargo build --release -p lumen --bin lumen
-./target/release/lumen file.js [more.js ...]
+./target/release/lumen-cli hello.js
 ```
 
-## Conformance
+On Windows, the executable is `target\release\lumen-cli.exe`.
 
-```sh
-scripts/test262-clone.sh    # one-time: clone the suite into ./test262
-scripts/run-test262.sh      # run it (see crates/test262-runner for env knobs)
-LUMEN_TIER=jit scripts/run-test262.sh    # same suite against the compiled tiers
-```
+For something bigger, the [examples](examples/) include a
+[Hono web app](examples/hono-app/README.md),
+[React server rendering](examples/react-ssr/README.md), and a
+[Vite build](examples/vite-app/README.md). Each has its own setup instructions;
+they're useful places to start exploring what works.
 
-The execution tiers are also held together by a differential fuzzer: every generated program
-runs in all three tiers, which must agree on the completion value, thrown errors, the
-observable side-effect trace, and final global state. Divergences are delta-minimized into a
-regression corpus that replays on every run.
+## Come poke around
 
-```sh
-cargo run --release -p lumen-difftest -- --count 2000
-```
+The [engine](crates/lumen/) and [runtime](crates/lumen-runtime/) are separate, so
+you can explore either one or embed the engine in your own project. Build notes,
+testing commands, and guidance for working on the code live in [AGENTS.md](AGENTS.md).
 
-## Benchmarks
+Bug reports with small reproducers are especially welcome. JavaScript has an
+excellent supply of weird little edge cases.
 
-```sh
-git clone https://github.com/chromium/octane.git ../octane   # one-time: Octane checkout
-scripts/run-octane.sh                    # full Octane suite
-scripts/run-octane.sh richards crypto    # selected benchmarks
-
-git clone https://github.com/v8/web-tooling-benchmark ../web-tooling-benchmark   # one-time: checkout
-(cd ../web-tooling-benchmark && npm install)                                     # one-time: build dist/cli.js
-scripts/run-web-tooling.sh                    # full suite (babel, terser, acorn, etc.)
-scripts/run-web-tooling.sh --only babel       # rebuild dist/cli.js for one selected benchmark
-WEB_TOOLING_BENCHMARK_DIR=/path/to/web-tooling-benchmark scripts/run-web-tooling.sh --only terser
-```
-
-Octane is expected at `../octane` by default; set `OCTANE=/path/to/octane` to override.
-
-Web Tooling Benchmark is expected at `../web-tooling-benchmark` by default;
-set `WEB_TOOLING_BENCHMARK_DIR=/path/to/web-tooling-benchmark` to override. The
-upstream CLI bundle does not support runtime benchmark selection; `--only <name>`
-rebuilds `dist/cli.js` in that checkout with webpack's build-time selector
-(`npx webpack --env.only=<name>`) before running lumen. The full suite is a
-many-hours run on current lumen builds; prefer `--only <name>` while iterating.
-
-### ARES-6
-
-```sh
-# one-time: provide an ARES-6 checkout outside this repo
-# the default lookup is the sibling ../ARES-6; ARES6=... overrides it
-scripts/run-ares6.sh                    # full ARES-6 suite
-scripts/run-ares6.sh air basic          # selected workloads: air, basic, babylon, ml
-ARES6=/path/to/ARES-6 scripts/run-ares6.sh babylon ml
-```
-
-ARES-6 sources are not vendored here. The runner expects a checkout at `../ARES-6` by default; set `ARES6=/path/to/ARES-6` to point at another checkout.
-
-The reported `summary:` is the ARES-6 geomean in milliseconds, so lower is better. A selected run reports a partial geomean over only the selected workloads, which is useful for local iteration but is not the official full-suite ARES-6 score. If a workload fails, or if the expected metric and completion lines are missing, `scripts/run-ares6.sh` exits nonzero instead of hiding the failure.
-
-Expect the full suite to take a long time on the current tree-walking engine; use selected workloads for quicker local checks.
+Lumen is [MIT licensed](LICENSE).
