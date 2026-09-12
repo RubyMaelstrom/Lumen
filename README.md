@@ -3,7 +3,8 @@
 Lumen is a JavaScript engine written from scratch in Rust, with a runtime growing
 around it. It powers the JavaScript in TRust, and you can also take it out for a
 spin on its own: run a script, open a REPL, or give it a little web server to look
-after.
+after. This is a heavy fork of 
+[Lucid-Softworks' Lumen](https://github.com/lucid-softworks/lumen).
 
 Building a JavaScript engine means getting acquainted with every strange corner
 of JavaScript. Closures, promises, proxies, regular expressions, the surprising
