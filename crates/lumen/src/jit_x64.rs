@@ -5,7 +5,7 @@
 //! can then be ported without duplicating runtime semantics or compromising deoptimization.
 
 use super::{
-    sys, JitCode, COND_PEEK_NOT_NULLISH, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COND, H_EXEC,
+    JitCode, COND_PEEK_NOT_NULLISH, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COND, H_EXEC,
     H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN,
     H_SET_PROP, H_UNWIND,
 };
@@ -385,8 +385,30 @@ pub(super) fn compile(
     let strict_offset = ilayout.strict as i32;
     let interp_offset = std::mem::offset_of!(crate::jit::JitCtx, interp) as i32;
     let ops = chunk.jit_ops();
-    if ops.is_empty() || ops.len() > u32::MAX as usize || ops.iter().any(|o| matches!(o, Op::Await))
-    {
+    if ops.is_empty() || ops.len() > u32::MAX as usize {
+        return None;
+    }
+    // ECMA-262 TryStatement Evaluation / IteratorClose: abrupt completions must retain
+    // their cleanup state until finally blocks and abandoned iterators have run. Like the
+    // ARM64 entry, leave these bodies in the heap-owned VM until this backend models that
+    // state. They cannot use H_EXEC: its ordinary-operation helper has no control-flow state.
+    // Await/yield and async iteration likewise require a resumable VM continuation.
+    if ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::Await
+                | Op::Yield
+                | Op::YieldStar
+                | Op::AsyncIterStepL(..)
+                | Op::AsyncIterResumeL(..)
+                | Op::AsyncIterCloseL(..)
+                | Op::AbruptJump(..)
+                | Op::PushFinally(..)
+                | Op::PushIterator(..)
+                | Op::ResumeReturn
+                | Op::ResumeJump
+        )
+    }) {
         return None;
     }
     let max_stack = crate::jit_ir::Cfg::build(chunk).ok()?.jit_stack_capacity();
@@ -688,7 +710,7 @@ pub(super) fn compile(
                 a.bytes(&[0x49, 0x89, 0xc5]);
                 a.jmp(ret_ok);
             }
-            Op::ReturnUndef => {
+            Op::ReturnBare | Op::ReturnUndef => {
                 a.call_helper_ptr(H_RETURN, 0);
                 a.bytes(&[0x49, 0x89, 0xc5]);
                 a.jmp(ret_ok);
@@ -817,4 +839,110 @@ pub(super) fn compile(
             .any(|o| matches!(o, Op::LoadName(..) | Op::LoadNameForCall(..))),
         executable,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{bytecode::Tier, value::Callable, value::Value, Completion, Engine};
+
+    fn engine() -> Engine {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        engine
+    }
+
+    fn evaluate(engine: &mut Engine, source: &str) -> String {
+        match engine.eval(source, false).expect("fixture parses") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+
+    fn assert_native_code(engine: &mut Engine, name: &str, expected: bool) {
+        let env = engine.interp.global_env.clone();
+        let Value::Obj(object) = engine
+            .interp
+            .get_var(name, &env)
+            .unwrap_or_else(|_| panic!("missing {name}"))
+        else {
+            panic!("{name} is not an object");
+        };
+        let object = object.borrow();
+        let Callable::User(user) = &object.call else {
+            panic!("{name} is not a user function");
+        };
+        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        assert_eq!(
+            chunk.jit.get().map(Option::is_some),
+            Some(expected),
+            "unexpected native compilation state for {name}"
+        );
+    }
+
+    #[test]
+    fn finally_completions_use_vm_without_disabling_ordinary_native_calls() {
+        // ECMA-262 e28783d5, sec-try-statement-runtime-semantics-evaluation:
+        // normal finally completion preserves the body completion; abrupt finally replaces it.
+        let mut engine = engine();
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                "var events = [];
+                 function plain(x) { return x + 1; }
+                 function bare() { return; }
+                 function cleanup(mode) {
+                     try {
+                         if (mode === 0) return plain(6);
+                         if (mode === 1) throw 'body';
+                         return 1;
+                     } finally {
+                         events.push(mode);
+                         if (mode === 2) return 9;
+                         if (mode === 3) throw 'finally';
+                     }
+                 }
+                 var results = [cleanup(0)];
+                 try { cleanup(1); } catch (e) { results.push(e); }
+                 results.push(cleanup(2));
+                 try { cleanup(3); } catch (e) { results.push(e); }
+                 results.push(bare() === undefined);
+                 results.join(',') + '|' + events.join(',')"
+            ),
+            "7,body,9,finally,true|0,1,2,3"
+        );
+        assert_native_code(&mut engine, "cleanup", false);
+        assert_native_code(&mut engine, "plain", true);
+        assert_native_code(&mut engine, "bare", true);
+    }
+
+    #[test]
+    fn labelled_break_runs_finally_then_closes_iterators_inside_out() {
+        // ECMA-262 e28783d5, sec-iteratorclose and TryStatement Evaluation: preserve
+        // the pending break while running every intervening cleanup in nesting order.
+        let mut engine = engine();
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                "var events = [];
+                 function iterable(name) {
+                     return { [Symbol.iterator]() { return {
+                         next() { return {value: 1, done: false}; },
+                         return() { events.push(name); return {}; }
+                     }; } };
+                 }
+                 function leave() {
+                     outer: for (var x of iterable('outer')) {
+                         for (var y of iterable('inner')) {
+                             try { break outer; } finally { events.push('finally'); }
+                         }
+                     }
+                     return events.join(',');
+                 }
+                 leave()"
+            ),
+            "finally,inner,outer"
+        );
+        assert_native_code(&mut engine, "leave", false);
+    }
 }
