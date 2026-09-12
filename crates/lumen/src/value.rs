@@ -1583,12 +1583,53 @@ pub(crate) fn heap_allocated_objects(heap: &GcHeap) -> u64 {
 
 /// Stable address of this Agent's live-object counter. JIT activations capture it when execution
 /// starts; reusable compiled chunks must not embed it because a chunk can be shared across Agents.
+/// Both native backends capture this pointer in the shared JIT entry paths.
 #[cfg(all(
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
     heap.live.as_ptr()
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod jit_heap_tests {
+    use super::*;
+
+    #[test]
+    fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
+        // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may
+        // share a native thread. A captured JIT counter must keep tracking its owning heap.
+        let first = new_gc_heap();
+        let second = new_gc_heap();
+        let first_symbols = new_symbol_agent();
+        let second_symbols = new_symbol_agent();
+        let _first_active = enter_agent(&first, &first_symbols);
+        let first_counter = live_objects_ptr(&first);
+        // Explicit heap selection must also work while a different Agent is surrounding.
+        let second_counter = live_objects_ptr(&second);
+        assert_ne!(first_counter, second_counter);
+
+        let first_object = Object::new(None);
+        {
+            let _second_active = enter_agent(&second, &second_symbols);
+            let second_object = Object::new(None);
+            // SAFETY: both heap owners remain alive throughout these counter reads.
+            assert_eq!(unsafe { (*first_counter, *second_counter) }, (1, 1));
+            drop(first_object);
+            assert_eq!(unsafe { (*first_counter, *second_counter) }, (0, 1));
+            drop(second_object);
+        }
+
+        let first_object = Object::new(None);
+        assert_eq!(unsafe { (*first_counter, *second_counter) }, (1, 0));
+        drop(first_object);
+        assert_eq!(unsafe { (*first_counter, *second_counter) }, (0, 0));
+    }
 }
 
 /// Strong handles to every currently-live heap object. Registry slots are non-owning weak
