@@ -1,5 +1,10 @@
 /target/
 __pycache__/
+# Local environment settings and JavaScript dependencies.
+.env
+.env.*
+!.env.example
+node_modules/
 # tc39/test262 conformance suite (cloned on demand by scripts/test262-clone.sh) + its score report.
 /test262/
 /test262-report/
@@ -17,10 +22,13 @@ __pycache__/
 /browser-replay-fixtures/
 # Machine-readable local performance reports.
 /benchmark-results/
+# Machine-specific installed production artifact record.
+/benchmarks/accepted-production.json
 # Local documentation and investigation notes; keep READMEs and agent guidance available.
 *.md
 !README.md
 !/AGENTS.md
+!/crates/lumen-web/src/js/STREAMS_UPSTREAM.md
 
 # Local generated focus lists.
 /wasm-spec-focus.txt

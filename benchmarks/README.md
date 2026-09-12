@@ -17,5 +17,6 @@ policy. The local investigation runners and provisioning helpers have been remov
   memory, startup, or completion regression.
 - A meaningful regression requires a written explanation and explicit user acceptance. Otherwise
   rework or revert the responsible optimization.
-- Update `accepted-production.json` only after the user approves and promotes exact release
-  artifacts. Preserve the preceding report rather than overwriting history.
+- If keeping a local, gitignored `accepted-production.json`, update it only after the user
+  approves and promotes exact release artifacts. Preserve the preceding report rather than
+  overwriting history.
