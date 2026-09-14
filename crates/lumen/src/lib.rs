@@ -364,6 +364,9 @@ pub enum ExecutionOutcome {
 
 /// A JavaScript engine instance: one realm (global object + intrinsics) that persists across
 /// [`eval`](Engine::eval) calls.
+/// Destroying the engine dismantles its Agent's object and environment graph, including all
+/// child realms. Opaque object handles belong to this engine; retaining one does not keep the
+/// realm executable after the engine has been destroyed.
 pub struct Engine {
     // Thread-backed generator bodies hold a pointer to the interpreter while suspended. Boxing
     // makes that address stable even when ordinary Rust code moves the public `Engine` value.

@@ -2600,6 +2600,10 @@ impl Drop for Interp {
         for coroutine in coroutines.values_mut() {
             coroutine.terminate(self);
         }
+        // The whole Agent is ending, not merely reaching a GC safepoint. Its global,
+        // intrinsics and environment roots are still live during Drop, so an ordinary
+        // collection here would preserve their cycles and then orphan the heap forever.
+        crate::value::destroy_gc_heap(&self.gc_heap);
         // Do not let a driver thread retain this Agent's weak object/scope registries after its
         // interpreter dies. Objects already carry their own owner through the ensuing field drops.
         crate::value::deactivate_agent_if(&self.gc_heap, &self.symbol_agent);

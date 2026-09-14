@@ -1650,6 +1650,47 @@ pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
     live
 }
 
+/// Dismantle the object/environment graph when its owning interpreter is destroyed.
+/// ECMA-262 #sec-agents and #sec-weakref-execution (snapshot e28783d5fc9d): there
+/// are no remaining execution contexts, and shutdown need not run finalizers.
+/// This is Agent teardown, never the destruction of one still-accessible child Realm.
+pub(crate) fn destroy_gc_heap(heap: &GcHeap) {
+    // Pin both sets before removing any edge. This bounds native stack use even for
+    // deep prototype/environment chains, and keeps all RefCells alive while their
+    // peer edges are removed. Side-table/host owners drop with the interpreter next.
+    let objects = heap_gc_snapshot(heap);
+    let scopes = gc_scope_snapshot(heap);
+    // Also handle unwinding from an interrupted collector's scratch-count phase.
+    gc_restore_registry_slots(heap);
+    for object in &objects {
+        let detached = {
+            let mut object = object.borrow_mut();
+            (
+                std::mem::take(&mut object.props),
+                object.proto.take(),
+                std::mem::replace(&mut object.call, Callable::None),
+                std::mem::replace(&mut object.exotic, Exotic::None),
+            )
+        };
+        // Native captures may have Rust destructors. Release them outside the borrow.
+        // Replacing Props also frees its buffers without touching the surrounding
+        // Agent's shape/prototype caches, unlike an ordinary property mutation.
+        drop(detached);
+    }
+    for scope in &scopes {
+        let detached = {
+            let mut scope = scope.borrow_mut();
+            (
+                std::mem::take(&mut scope.vars),
+                scope.parent.take(),
+                scope.with_obj.take(),
+                std::mem::take(&mut scope.lexical_names),
+            )
+        };
+        drop(detached);
+    }
+}
+
 /// Restore `gc_internal` from scratch reference counts to registry-slot ids. Collection calls
 /// this after marking and before sweeping side tables/properties can release the final owner of
 /// any object, so `Object::drop` always sees its stable slot.

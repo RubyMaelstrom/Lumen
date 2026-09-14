@@ -4407,6 +4407,189 @@ fn moving_and_dropping_an_engine_safely_stops_suspended_generators() {
 }
 
 #[test]
+fn engine_teardown_reclaims_the_entire_object_and_environment_graph() {
+    use std::rc::Rc;
+
+    // ECMA-262 #sec-agents / #sec-weakref-execution: destroying the owning Agent
+    // leaves no script roots or required finalization jobs. In particular, collecting
+    // before Drop while the global remains rooted cannot reclaim this fixture.
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for _ in 0..3 {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                run_in(
+                    &mut engine,
+                    r#"
+                    const graph = [];
+                    function retain(n) {
+                        const object = { n, data: new Uint8Array(1024) };
+                        object.self = object;
+                        object.closure = () => object;
+                        object.map = new Map([[object, object.closure]]);
+                        object.promise = Promise.resolve(object);
+                        return object;
+                    }
+                    for (let n = 0; n < 128; n++) graph.push(retain(n));
+                    const foreign = $262.createRealm().evalScript(
+                        'var object = {}; object.self = object; () => object');
+                    graph.push(foreign);
+                    const shadow = new ShadowRealm();
+                    shadow.evaluate('var object = {}; object.self = object; 0');
+                    function* suspended() { const local = retain(999); yield local; }
+                    const iterator = suspended(); iterator.next();
+                    'ready'
+                    "#,
+                ),
+                "ready"
+            );
+            // A full ordinary collection must preserve these live roots, and must not
+            // leave scratch reference counts where Object::drop expects registry slots.
+            engine.interp.gc_collect();
+            let heap = Rc::downgrade(&engine.interp.gc_heap);
+            let objects: Vec<_> = crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
+                .iter()
+                .map(Rc::downgrade)
+                .collect();
+            let scopes: Vec<_> = crate::value::gc_scope_snapshot(&engine.interp.gc_heap)
+                .iter()
+                .map(Rc::downgrade)
+                .collect();
+            let child_heaps: Vec<_> = engine
+                .interp
+                .shadow_realms
+                .values()
+                .map(|child| Rc::downgrade(&child.gc_heap))
+                .collect();
+            assert!(!child_heaps.is_empty());
+            drop(engine);
+            assert!(
+                objects.iter().all(|object| object.upgrade().is_none()),
+                "{tier:?}: dead objects"
+            );
+            assert!(
+                scopes.iter().all(|scope| scope.upgrade().is_none()),
+                "{tier:?}: dead environments"
+            );
+            assert!(
+                child_heaps.iter().all(|heap| heap.upgrade().is_none()),
+                "{tier:?}: child heaps"
+            );
+            assert!(heap.upgrade().is_none(), "{tier:?}: dead heap registry");
+        }
+    }
+}
+
+#[test]
+fn engine_teardown_preserves_another_live_agent_on_the_same_thread() {
+    let mut retired = Engine::new();
+    run_in(&mut retired, "globalThis.cycle = {}; cycle.self = cycle;");
+    let retired_heap = std::rc::Rc::downgrade(&retired.interp.gc_heap);
+    let mut active = Engine::new();
+    run_in(
+        &mut active,
+        "globalThis.kept = { n: 41 }; kept.self = kept;",
+    );
+    drop(retired);
+    assert!(retired_heap.upgrade().is_none());
+    let object = crate::value::Object::new(None);
+    assert!(std::rc::Rc::ptr_eq(
+        &object.borrow().gc_heap,
+        &active.interp.gc_heap
+    ));
+    assert_eq!(run_in(&mut active, "kept.self.n + 1"), "42");
+    active.interp.gc_collect();
+    assert_eq!(run_in(&mut active, "kept.self === kept"), "true");
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn engine_teardown_releases_native_capture_cycles_without_running_author_cleanup() {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    let mut engine = Engine::new();
+    let calls = Rc::new(Cell::new(0));
+    let captured = Rc::new(RefCell::new(Value::Undefined));
+    let weak_capture = Rc::downgrade(&captured);
+    let callback = engine.ctx().new_native_fn(
+        "recordCleanup",
+        0,
+        Rc::new({
+            let calls = calls.clone();
+            let captured = captured.clone();
+            move |_, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(captured.borrow().clone())
+            }
+        }),
+    );
+    *captured.borrow_mut() = callback.clone();
+    engine
+        .interp
+        .global
+        .borrow_mut()
+        .props
+        .insert("recordCleanup", crate::value::Property::plain(callback));
+    drop(captured);
+    let result = engine
+        .eval_value(
+            r#"
+        const registry = new FinalizationRegistry(recordCleanup);
+        let target = {}; target.self = target; registry.register(target, 1); target = null;
+        function* suspended() { try { yield 1; } finally { recordCleanup(); } }
+        const iterator = suspended(); iterator.next();
+        Promise.resolve().then(recordCleanup);
+        'ready'
+    "#,
+        )
+        .expect("cleanup fixture parses");
+    assert!(result.is_ok());
+    drop(result);
+    let heap = Rc::downgrade(&engine.interp.gc_heap);
+    engine.interrupt_handle().cancel();
+    drop(engine);
+    assert_eq!(
+        calls.get(),
+        0,
+        "shutdown must not run author jobs or finally blocks"
+    );
+    assert!(
+        weak_capture.upgrade().is_none(),
+        "opaque native closure cycle released"
+    );
+    assert!(heap.upgrade().is_none());
+}
+
+#[test]
+fn engine_teardown_dismantles_deep_chains_without_recursive_drops() {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let mut engine = Engine::new();
+            for _ in 0..16_384 {
+                engine.interp.global =
+                    crate::value::Object::new(Some(engine.interp.global.clone()));
+                engine.interp.global_env =
+                    crate::interpreter::new_scope(Some(engine.interp.global_env.clone()));
+            }
+            let heap = std::rc::Rc::downgrade(&engine.interp.gc_heap);
+            drop(engine);
+            assert!(heap.upgrade().is_none());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn recursive_calls_cross_generator_continuations_without_an_artificial_budget() {
     assert_eq!(
         run(
