@@ -51,8 +51,8 @@ fn range_endpoints(
 
 fn format_range(i: &mut Interp, this: &Value, x: &Value, y: &Value) -> Result<Value, Value> {
     let (o, a, b) = range_endpoints(i, this, x, y)?;
-    let sa = assemble_number_exact(i, &o, a, exact_of(x));
-    let sb = assemble_number_exact(i, &o, b, exact_of(y));
+    let sa = assemble_number_exact(i, &o, a, exact_of(x)).text;
+    let sb = assemble_number_exact(i, &o, b, exact_of(y)).text;
     let nu = get_str(&o, "__nf_nu");
     // Endpoints that FORMAT identically collapse to a single approximate value.
     if sa == sb {
@@ -129,8 +129,8 @@ fn format_range_to_parts(
             out.push(Value::Obj(ob));
         }
     };
-    let sa = assemble_number_exact(i, &o, a, exact_of(x));
-    let sb = assemble_number_exact(i, &o, b, exact_of(y));
+    let sa = assemble_number_exact(i, &o, a, exact_of(x)).text;
+    let sb = assemble_number_exact(i, &o, b, exact_of(y)).text;
     if sa == sb {
         let approx = i.new_object();
         set_data(&approx, "type", Value::str("approximatelySign"));
@@ -1284,8 +1284,20 @@ pub(super) fn exact_magnitude_options(
     })
 }
 
+struct FormattedNumber {
+    text: String,
+    // Retain the selected pattern so formatToParts uses the same rounded
+    // quantity as format, including placeholder-free unit forms.
+    unit_pattern: Option<String>,
+}
+
 /// `exact` carries a BigInt or decimal-string input whose digits must not round through f64.
-fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>) -> String {
+fn assemble_number_exact(
+    i: &mut Interp,
+    o: &Gc,
+    x: f64,
+    exact: Option<ExactDec>,
+) -> FormattedNumber {
     let style = get_str(o, "__nf_style");
     let cldr_locale = cldr_number_locale(o);
     let number_system = get_str(o, "__nf_nu");
@@ -1575,6 +1587,8 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
     let compact_exponent = compact
         .map(|(_, pattern)| pattern.exponent.max(0) as u32)
         .unwrap_or(0);
+    let quantity_exponent = exponent.unwrap_or(compact_exponent as i32);
+    let mut unit_pattern = None;
 
     // GetNumberFormatPattern selects the localized sign/style affixes around the notation
     // subpattern. Currency names use CLDR's plural currency unit pattern instead of a symbol slot.
@@ -1592,7 +1606,7 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
             let code = get_str(o, "__nf_currency");
             let display = get_str(o, "__nf_currencydisplay");
             let category =
-                crate::cldr_plurals::select_cardinal(o_lang(o), &rounded, compact_exponent);
+                quantity_plural_category(o_lang(o), &rounded, quantity_exponent, compact_exponent);
             let currency = crate::cldr_numbers::currency(cldr_locale, &code, category);
             if display == "name" {
                 let signed = apply_number_pattern(
@@ -1650,13 +1664,15 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
                 &symbols,
                 "",
             );
-            num = match unit_pattern_of(o, value) {
+            let category =
+                quantity_plural_category(o_lang(o), &rounded, quantity_exponent, compact_exponent);
+            unit_pattern = unit_pattern_for_category(o, category);
+            num = match unit_pattern.as_deref() {
                 Some(p) => p.replace("{0}", &signed),
                 None => {
                     let unit = get_str(o, "__nf_unit");
                     let disp = get_str(o, "__nf_unitdisplay");
-                    let cat = crate::intl::data::plural_cardinal(o_lang(o), value, 0);
-                    unit_wrap(&signed, &unit, &disp, cat != "one")
+                    unit_wrap(&signed, &unit, &disp, category != "one")
                 }
             };
         }
@@ -1671,7 +1687,35 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, x: f64, exact: Option<ExactDec>
         }
     }
     let _ = i;
-    num
+    FormattedNumber {
+        text: num,
+        unit_pattern,
+    }
+}
+
+/// ECMA-402 #sec-partitionnumberpattern (snapshot b1c961988b9a) uses the
+/// rounded result for locale-dependent affixes. UTS #35 Part 3 #Operands
+/// (snapshot 1c6bc010ee9a) counts digits of the represented quantity, so
+/// 1E4 has i=10000 and 1.20050c3 has i=1200, v=2, f=50. Move the radix
+/// point exactly, retaining visible zeros and BigInt/decimal-string digits.
+/// This is distinct from choosing the compact power word itself, which
+/// follows UTS #35 #Compact_Number_Formats using the scaled mantissa.
+fn quantity_plural_category(
+    lang: &str,
+    rounded: &str,
+    exponent: i32,
+    compact_exponent: u32,
+) -> &'static str {
+    let Some(decimal) = ExactDec::parse(rounded) else {
+        return "other"; // NaN and infinities do not have plural operands.
+    };
+    let quantity = shift_exact(&decimal, exponent);
+    let digits = if quantity.frac.is_empty() {
+        quantity.int
+    } else {
+        format!("{}.{}", quantity.int, quantity.frac)
+    };
+    crate::cldr_plurals::select_cardinal(lang, &digits, compact_exponent)
 }
 
 fn apply_number_pattern(
@@ -1782,7 +1826,7 @@ pub(crate) fn xlate_digits(s: &str, nu: &str) -> String {
 fn format_number(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value> {
     let o = instance(i, this)?;
     let n = to_intl_number(i, x)?;
-    let s = assemble_number_exact(i, &o, n, exact_of(x));
+    let s = assemble_number_exact(i, &o, n, exact_of(x)).text;
     Ok(Value::from_string(xlate_digits(
         &s,
         &get_str(&o, "__nf_nu"),
@@ -1813,13 +1857,16 @@ pub(super) fn to_intl_number(i: &mut Interp, x: &Value) -> Result<f64, Value> {
 fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value> {
     let o = instance(i, this)?;
     let n = to_intl_number(i, x)?;
-    let whole = assemble_number_exact(i, &o, n, exact_of(x));
+    let FormattedNumber {
+        text: whole,
+        unit_pattern,
+    } = assemble_number_exact(i, &o, n, exact_of(x));
     let nu = get_str(&o, "__nf_nu");
     let symbols = cldr_number_symbols(&o);
     // Unit style: rebuild from the CLDR pattern so a unit prefix/suffix (e.g. ko "시속 {0}킬로미터")
     // is tagged as unit/literal around the number's own parts.
-    let parts = if get_str(&o, "__nf_style") == "unit" && n.is_finite() {
-        if let Some(pat) = unit_pattern_of(&o, n) {
+    let parts = if get_str(&o, "__nf_style") == "unit" {
+        if let Some(pat) = unit_pattern {
             if !pat.contains("{0}") {
                 vec![("unit", whole)]
             } else {
@@ -1865,9 +1912,9 @@ fn o_lang(o: &Gc) -> &'static str {
     cldr_number_locale(o).split('-').next().unwrap_or("en")
 }
 
-/// The CLDR unit-display pattern ("{0} km/h") for a formatter and value (plural category from the
-/// value; zh split by script, en-IN region-specific).
-fn unit_pattern_of(o: &Gc, value: f64) -> Option<String> {
+/// The CLDR unit-display pattern ("{0} km/h") for the already-selected plural
+/// category; zh is split by script and en-IN has region-specific patterns.
+fn unit_pattern_for_category(o: &Gc, category: &str) -> Option<String> {
     let unit = get_str(o, "__nf_unit");
     let disp = get_str(o, "__nf_unitdisplay");
     let style = if disp.is_empty() {
@@ -1878,8 +1925,7 @@ fn unit_pattern_of(o: &Gc, value: f64) -> Option<String> {
     let locale = cldr_number_locale(o);
     let cldr_loc = if locale == "zh" { "zh-Hans" } else { locale };
     let lang = o_lang(o);
-    let cat = crate::intl::data::plural_cardinal(o_lang(o), value, 0);
-    crate::cldr_units::unit_pattern(cldr_loc, &unit, style, cat)
+    crate::cldr_units::unit_pattern(cldr_loc, &unit, style, category)
         .or_else(|| crate::cldr_units::unit_pattern(cldr_loc, &unit, style, "other"))
         .or_else(|| crate::cldr_units::unit_pattern(lang, &unit, style, "other"))
         .map(|s| s.to_string())
@@ -2177,4 +2223,104 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     put(i, &res, "roundingPriority", "__nf_roundingpriority");
     put(i, &res, "trailingZeroDisplay", "__nf_trailingzero");
     Ok(Value::Obj(res))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{bytecode::Tier, Completion, Engine};
+
+    fn check_all_tiers(source: &str) {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            match engine.eval(source, false).expect("valid test script") {
+                Completion::Value(value) => assert_eq!(value, "ok"),
+                Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+            }
+        }
+    }
+
+    #[test]
+    fn numberformat_plural_quantities_preserve_notation_exponents() {
+        // ECMA-402 PartitionNumberPattern and UTS #35 Part 3, Operands:
+        // the quantity 1E4 has i=10000, not i=1. Currency/unit names use
+        // this quantity; the separate compact power word uses its mantissa.
+        check_all_tiers(
+            r#"
+            function check(actual, expected) {
+                if (actual !== expected) throw Error(JSON.stringify({actual, expected}));
+            }
+            for (const [notation, value, expected] of [
+                ['scientific', 10000, '1E4 bits'],
+                ['scientific', -10000, '-1E4 bits'],
+                ['scientific', .1, '1E-1 bits'],
+                ['scientific', 1, '1E0 bit'],
+                ['engineering', 1000, '1E3 bits'],
+                ['engineering', .1, '100E-3 bits'],
+                ['compact', 1000, '1K bits'],
+                ['compact', 1000000, '1M bits']
+            ]) {
+                const format = new Intl.NumberFormat('en', {
+                    notation, style: 'unit', unit: 'bit', unitDisplay: 'long'
+                });
+                check(format.format(value), expected);
+                check(format.formatToParts(value).map(p => p.value).join(''), expected);
+                check(format.formatToParts(value).filter(p => p.type === 'unit').length, 1);
+            }
+            for (const notation of ['scientific', 'engineering', 'compact']) {
+                const format = new Intl.NumberFormat('en', {
+                    notation, style: 'currency', currency: 'USD', currencyDisplay: 'name',
+                    minimumFractionDigits: 0, maximumFractionDigits: 0
+                });
+                const prefix = notation === 'compact' ? '1K' : '1E3';
+                check(format.format(1000), prefix + ' US dollars');
+            }
+            check(new Intl.NumberFormat('ru', {notation: 'compact', compactDisplay: 'long'}).format(2000), '2 тысячи');
+            'ok';
+        "#,
+        );
+    }
+
+    #[test]
+    fn numberformat_unit_plurals_share_rounded_digits_with_parts() {
+        // ECMA-402 #sec-partitionnumberpattern; UTS #35 #Unit_Elements
+        // and #Plural_Operand_Meanings: visible zeros and exact integer
+        // digits participate in plural selection after rounding.
+        check_all_tiers(
+            r#"
+            function check(actual, expected) {
+                if (actual !== expected) throw Error(JSON.stringify({actual, expected}));
+            }
+            for (const [value, options, expected] of [
+                [1.2, {maximumFractionDigits: 0}, '1 bit'],
+                [.99, {maximumFractionDigits: 0}, '1 bit'],
+                [1.99, {maximumFractionDigits: 0}, '2 bits'],
+                [1, {minimumFractionDigits: 1}, '1.0 bits'],
+                [-1, {}, '-1 bit'],
+                [NaN, {}, 'NaN bits'],
+                [Infinity, {}, '∞ bits']
+            ]) {
+                const format = new Intl.NumberFormat('en', {
+                    style: 'unit', unit: 'bit', unitDisplay: 'long', ...options
+                });
+                check(format.format(value), expected);
+                const parts = format.formatToParts(value);
+                check(parts.map(p => p.value).join(''), expected);
+                check(parts.filter(p => p.type === 'unit').length, 1);
+            }
+            const ru = new Intl.NumberFormat('ru', {style: 'unit', unit: 'meter', unitDisplay: 'long', useGrouping: false});
+            const large = 100000000000000000000000000000000000000000000000000000000000000021n;
+            check(ru.format(large), large.toString() + ' метр');
+            check(ru.formatToParts(large).map(p => p.value).join(''), ru.format(large));
+            const ar = new Intl.NumberFormat('ar', {style: 'unit', unit: 'meter', unitDisplay: 'long', maximumFractionDigits: 0});
+            check(ar.format(.99), 'متر');
+            check(JSON.stringify(ar.formatToParts(.99)), '[{"type":"unit","value":"متر"}]');
+            const sl = new Intl.NumberFormat('sl', {style: 'unit', unit: 'meter', unitDisplay: 'long', minimumFractionDigits: 2});
+            check(sl.format(1), '1,00 metri');
+            check(sl.formatToParts(1).map(p => p.value).join(''), '1,00 metri');
+            'ok';
+        "#,
+        );
+    }
 }
