@@ -14213,6 +14213,52 @@ fn date_setter_order_and_invalid() {
 }
 
 #[test]
+fn math_random_distinct_realms_and_borrowed_functions() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let child = engine.interp.create_realm();
+        engine
+            .interp
+            .global
+            .borrow_mut()
+            .props
+            .insert("otherRealm", crate::value::Property::plain(child));
+        assert_eq!(
+            run_in(
+                &mut engine,
+                r#"
+                const borrowed = otherRealm.Math.random;
+                const root = [], child = [];
+                for (let n = 0; n < 256; ++n) {
+                    root.push(Math.random());
+                    child.push(borrowed.call(null));
+                }
+                const valid = n => n >= 0 && n < 1 && !Object.is(n, -0);
+                const descriptor = Object.getOwnPropertyDescriptor(otherRealm.Math, 'random');
+                const native = Function.prototype.toString.call(borrowed);
+                let nonConstructor = false;
+                try { new borrowed(); } catch (e) { nonConstructor = e.name === 'TypeError'; }
+                root.every(valid) && child.every(valid) &&
+                    root.join() !== child.join() &&
+                    new Set(root).size === root.length && new Set(child).size === child.length &&
+                    borrowed.name === 'random' && borrowed.length === 0 &&
+                    descriptor.writable && !descriptor.enumerable && descriptor.configurable &&
+                    native.includes('[native code]') && nonConstructor
+            "#
+            ),
+            "true",
+            "Math.random realm and native-function contract in {tier:?}"
+        );
+    }
+}
+
+#[test]
 fn math_constants_and_hypot() {
     // All Math constants exist and are non-writable/enumerable/configurable.
     assert_eq!(

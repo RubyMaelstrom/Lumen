@@ -2,6 +2,40 @@
 
 use super::*;
 
+/// ECMA-262 #sec-math.random (snapshot e28783d5fc9d) gives each realm's
+/// Math.random a distinct stream. Keep the state on that function, so borrowed
+/// calls advance the originating stream and independent agents cannot race.
+/// RandomState supplies a fresh randomized seed without adding a host API or
+/// coupling Math.random to an embedder's clock. This is not Web Crypto.
+struct RandomStream(std::cell::Cell<u64>);
+
+impl RandomStream {
+    fn new() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        // Xorshift's all-zero state would never advance.
+        Self(std::cell::Cell::new(seed.max(1)))
+    }
+
+    fn next(&self) -> f64 {
+        let mut x = self.0.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+impl crate::value::NativeCallableRetained for RandomStream {
+    fn scan_retained_memory(&self, _visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor) {
+        // The reporter's inline Cell is counted by the native-callable walker;
+        // there are no further allocations or captured JavaScript values.
+    }
+}
+
 pub(crate) fn nf_math_sqrt(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
     if let [Value::Num(x)] = args {
         return Ok(Value::Num(x.sqrt()));
@@ -197,9 +231,17 @@ pub(super) fn install_math(it: &mut Interp) {
         let y = to_uint32(ab(i.to_number(&arg(a, 1)))?) as i32;
         Ok(Value::Num(x.wrapping_mul(y) as f64))
     });
-    it.def_method(&math, "random", 0, |_i, _t, _a| {
-        Ok(Value::Num(next_random()))
-    });
+    let random_stream = Rc::new(RandomStream::new());
+    let captured = random_stream.clone();
+    let random = it.new_native_fn_with_retained_memory(
+        "random",
+        0,
+        Rc::new(move |_i, _t, _a| Ok(Value::Num(captured.next()))),
+        random_stream,
+    );
+    math.borrow_mut()
+        .props
+        .insert("random", Property::builtin(random));
     unary!("log", f64::ln);
     unary!("log2", f64::log2);
     unary!("log10", f64::log10);

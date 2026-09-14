@@ -11617,19 +11617,6 @@ fn to_uint32(n: f64) -> u32 {
     n.trunc().rem_euclid(4294967296.0) as u32
 }
 
-/// A small deterministic PRNG for `Math.random` (lumen has no entropy source; tests only check the
-/// `[0, 1)` range, not distribution).
-fn next_random() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x >> 11) as f64 / (1u64 << 53) as f64
-}
-
 fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisNumberValue: only a Number primitive or Number wrapper is acceptable.
     match this {
