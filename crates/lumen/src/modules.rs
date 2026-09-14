@@ -1707,7 +1707,7 @@ impl Interp {
         if let Some(loader) = self.dynamic_module_loader.clone() {
             let request_id = self.next_dynamic_import_id;
             self.next_dynamic_import_id = self.next_dynamic_import_id.wrapping_add(1).max(1);
-            if loader(request_id, specifier, &referrer, attr_type) {
+            if loader(request_id, host_context, specifier, &referrer, attr_type) {
                 self.pending_dynamic_imports.insert(
                     request_id,
                     PendingDynamicImport {

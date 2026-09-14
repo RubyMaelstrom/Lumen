@@ -585,6 +585,21 @@ impl Engine {
         &mut self,
         loader: impl Fn(u64, &str, &str, Option<&str>) -> bool + 'static,
     ) {
+        self.set_async_dynamic_module_loader_with_context(
+            move |id, _, specifier, referrer, attributes| {
+                loader(id, specifier, referrer, attributes)
+            },
+        );
+    }
+
+    /// HostLoadImportedModule retains the referrer's host-defined environment
+    /// (ECMA-262 #sec-HostLoadImportedModule). Browser embedders use the second
+    /// argument, the initiating host job context, to authorize resource access.
+    /// A URL alone cannot distinguish the same module in different Window realms.
+    pub fn set_async_dynamic_module_loader_with_context(
+        &mut self,
+        loader: impl Fn(u64, u64, &str, &str, Option<&str>) -> bool + 'static,
+    ) {
         self.interp.dynamic_module_loader = Some(std::rc::Rc::new(loader));
     }
 
@@ -1172,3 +1187,42 @@ mod entry_tests;
 mod tail_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "embed"))]
+mod module_host_context_tests {
+    use super::*;
+    use crate::bytecode::Tier;
+    #[test]
+    fn asynchronous_module_hook_receives_initiating_host_context() {
+        use std::{cell::RefCell, rc::Rc};
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let captured = seen.clone();
+            engine.set_async_dynamic_module_loader_with_context(
+                move |id, context, specifier, _, _| {
+                    captured
+                        .borrow_mut()
+                        .push((id, context, specifier.to_string()));
+                    true
+                },
+            );
+            engine.ctx().set_host_job_context(17);
+            engine
+                .eval("import('first').catch(() => {});", false)
+                .unwrap();
+            engine.ctx().set_host_job_context(23);
+            engine
+                .eval("import('second').catch(() => {});", false)
+                .unwrap();
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 2);
+            assert_eq!((seen[0].1, seen[0].2.as_str()), (17, "first"));
+            assert_eq!((seen[1].1, seen[1].2.as_str()), (23, "second"));
+            assert_ne!(seen[0].0, seen[1].0);
+            assert!(engine.finish_dynamic_module_load(seen[0].0, None));
+            assert!(engine.finish_dynamic_module_load(seen[1].0, None));
+        }
+    }
+}

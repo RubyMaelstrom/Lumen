@@ -2147,7 +2147,8 @@ pub struct Interp {
     /// id and starts HostLoadImportedModule; the embedder later calls
     /// `Engine::finish_dynamic_module_load` with the fetched source or failure.
     #[allow(clippy::type_complexity)]
-    pub(crate) dynamic_module_loader: Option<Rc<dyn Fn(u64, &str, &str, Option<&str>) -> bool>>,
+    pub(crate) dynamic_module_loader:
+        Option<Rc<dyn Fn(u64, u64, &str, &str, Option<&str>) -> bool>>,
     pub(crate) pending_dynamic_imports:
         std::collections::HashMap<u64, crate::modules::PendingDynamicImport>,
     pub(crate) next_dynamic_import_id: u64,
