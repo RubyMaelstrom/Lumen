@@ -1883,6 +1883,11 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
         return Err(i.make_error("RangeError", "source is too large for the target at offset"));
     }
     let offset = offset_n as usize;
+    // ECMA-262 SetTypedArrayFromArrayLike (snapshot e28783d5fc9d): preserve length and
+    // bounds/error ordering above; only an effect-free numeric source may batch the copy.
+    if i.ta_set_numeric_array(&info, offset, &src, src_len) {
+        return Ok(Value::Undefined);
+    }
     let src = Value::Obj(src);
     for k in 0..src_len {
         let item = ab(i.get_member(&src, &k.to_string()))?;

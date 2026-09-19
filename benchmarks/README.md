@@ -20,3 +20,24 @@ policy. The local investigation runners and provisioning helpers have been remov
 - If keeping a local, gitignored `accepted-production.json`, update it only after the user
   approves and promotes exact release artifacts. Preserve the preceding report rather than
   overwriting history.
+
+## Renderer-shaped JavaScript
+
+`webgl-engine-kernels.js` isolates ordinary arrays, typed-array copying, computed property reads,
+prototype misses, enumeration, and function calls without browser or graphics APIs. Arithmetic,
+an indexed numerical stencil, and recursive calls provide controls against unrelated regressions.
+Run it with the release engine shell:
+
+```sh
+cargo build --release -p lumen --features embed --bin lumen
+target/release/lumen --tier=jit benchmarks/webgl-engine-kernels.js
+```
+
+Each kernel warms up and prints all five timings plus checksums. Compare fresh baseline and
+candidate processes in interleaved order, using the same CPU affinity, build settings, and input;
+verify every checksum. Kernel speedups do not predict a scene's frame rate.
+
+`webgl-engine-2026-09-19.json` records the ARM64 comparison, release artifact hashes, raw kernel
+samples, real-WebGL browser measurements, validation scope, and remaining limitations. Its
+baseline already includes the preceding browser-call and WebGL optimizations. It is an
+investigation record, not an installed-artifact promotion record.

@@ -1706,6 +1706,8 @@ impl Default for StubEntry {
                 mid_ok: 0,
                 mid_shape: 0,
                 mid2_shape: 0,
+                mid3_shape: 0,
+                mid4_shape: 0,
             },
         }
     }
@@ -1714,6 +1716,64 @@ impl Default for StubEntry {
 /// Stub-cache capacity (power of two). 4096 × 24-byte entries = 96 KiB.
 const STUB_CACHE_SIZE: usize = 4096;
 const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
+
+#[cfg(test)]
+mod deep_property_ic_tests {
+    use super::*;
+    use crate::bytecode::{IcState, IC_ABSENT, PROP_IC_WAYS};
+    use std::cell::Cell;
+
+    #[test]
+    fn deep_property_cache_validates_every_live_prototype() {
+        let mut interp = Interp::new();
+        let base = Object::new(None);
+        let mut receiver = base.clone();
+        let mut levels = vec![base.clone()];
+        for _ in 0..5 {
+            receiver = Object::new(Some(receiver));
+            levels.push(receiver.clone());
+        }
+        let object = Value::Obj(receiver.clone());
+        let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+        let read = |interp: &mut Interp| {
+            interp
+                .get_prop_ic(&object, "optional", &cache[0])
+                .unwrap_or_else(|_| panic!("ordinary read threw"))
+        };
+        assert!(matches!(read(&mut interp), Value::Undefined));
+        assert_eq!(cache[0].get().depth, IC_ABSENT);
+        assert_eq!(cache[0].get().slot, 6);
+        assert!(matches!(read(&mut interp), Value::Undefined));
+        base.borrow_mut()
+            .props
+            .insert("optional", Property::plain(Value::Num(7.0)));
+        assert!(matches!(read(&mut interp), Value::Num(7.0)));
+        assert_eq!(cache[0].get().depth, 5);
+        assert!(matches!(read(&mut interp), Value::Num(7.0)));
+        levels[2]
+            .borrow_mut()
+            .props
+            .insert("optional", Property::plain(Value::Num(11.0)));
+        assert!(matches!(read(&mut interp), Value::Num(11.0)));
+        // Identical layout, different prototype identity/value: the IC must follow it live.
+        let replacement = Object::new(None);
+        replacement
+            .borrow_mut()
+            .props
+            .insert("optional", Property::plain(Value::Num(19.0)));
+        levels[3].borrow_mut().proto = Some(replacement);
+        assert!(matches!(read(&mut interp), Value::Num(19.0)));
+        assert_eq!(std::mem::size_of::<IcState>(), 32);
+        assert_eq!(
+            std::mem::offset_of!(IcState, mid3_shape),
+            crate::bytecode::IC_OFF_MID3_SHAPE as usize
+        );
+        assert_eq!(
+            std::mem::offset_of!(IcState, mid4_shape),
+            crate::bytecode::IC_OFF_MID4_SHAPE as usize
+        );
+    }
+}
 
 /// The table index for a (receiver shape, name pointer) pair. The name pointer's low bits are
 /// alignment zeros; shift them off before mixing so they contribute entropy.
@@ -2017,6 +2077,8 @@ pub struct Interp {
     pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
     pub(crate) stub_cache_names: std::cell::RefCell<Vec<Option<Rc<str>>>>,
     pub(crate) computed_reads: crate::bytecode::ComputedReadCache,
+    pub(crate) enumeration_keys:
+        crate::cache::ByteLru<crate::eval::EnumerationShape, Vec<crate::lstr::LStr>>,
     /// Freelist of fixed-size raw frame buffers ([`crate::jit::FRAME_BUF`] `Value`s each) for the
     /// JIT fast call's slots + operand stack — a pop and pointer math per call instead of `Vec`
     /// bookkeeping. Buffers hold no live values while pooled.
@@ -2446,6 +2508,7 @@ interp_memory_inventory! {
     stub_cache => "measured",
     stub_cache_names => "measured",
     computed_reads => "measured",
+    enumeration_keys => "measured",
     frame_pool => "measured",
     creation_pins => "measured",
     global_env_pins => "measured",
@@ -2579,7 +2642,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 139);
+    assert_eq!(names.len(), 140);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3381,6 +3444,7 @@ impl Interp {
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
             computed_reads: Default::default(),
+            enumeration_keys: crate::cache::ByteLru::new(1 << 20, 256),
             frame_pool: FramePool(Vec::new()),
             creation_pins: Default::default(),
             global_env_pins: Vec::new(),
@@ -3838,13 +3902,71 @@ impl Interp {
             let mut buf = storage.borrow_mut();
             if idx < info.length_for_buffer(buf.len()).unwrap_or(0) {
                 let start = info.offset + idx * es;
-                buf[start..start + es].copy_from_slice(&info.kind.write(n));
+                info.kind.write_into(n, &mut buf[start..start + es]);
                 wrote = true;
             }
         }
         if wrote {
             self.mark_array_buffer_dirty_range(info.buffer, info.offset + idx * es, es);
         }
+    }
+
+    /// SetTypedArrayFromArrayLike, specialized only after every source element is proven to be
+    /// an own Number data property of an ordinary Array. No getters, coercions, prototype reads,
+    /// or shared-memory events can occur, so copying directly is observationally equivalent to
+    /// the specification's ordered Get/TypedArraySetElement loop. A failed proof writes nothing.
+    pub(crate) fn ta_set_numeric_array(
+        &mut self,
+        info: &TaInfo,
+        offset: usize,
+        source: &Gc,
+        len: usize,
+    ) -> bool {
+        if info.kind.is_bigint()
+            || self.shared_buffers.contains_key(&info.buffer)
+            || self.immutable_buffers.contains(&info.buffer)
+            || !self.ordinary_get_ptr(Rc::as_ptr(source) as usize)
+        {
+            return false;
+        }
+        let source = source.borrow();
+        if !matches!(source.exotic, Exotic::Array)
+            || !(0..len).all(|index| {
+                source
+                    .props
+                    .get_index(index as u32)
+                    .is_some_and(|property| {
+                        !property.accessor() && matches!(property.value(), Value::Num(_))
+                    })
+            })
+        {
+            return false;
+        }
+        let Some(storage) = self.array_buffers.get(&info.buffer) else {
+            return false;
+        };
+        let mut buffer = storage.borrow_mut();
+        let Some(length) = info.length_for_buffer(buffer.len()) else {
+            return false;
+        };
+        if offset > length || len > length - offset {
+            return false;
+        }
+        let size = info.kind.elsize();
+        let start = info.offset + offset * size;
+        for (index, bytes) in buffer[start..start + len * size]
+            .chunks_exact_mut(size)
+            .enumerate()
+        {
+            let Value::Num(number) = source.props.get_index(index as u32).unwrap().value() else {
+                unreachable!("numeric array validated without running author code");
+            };
+            info.kind.write_into(number, bytes);
+        }
+        drop(buffer);
+        drop(source);
+        self.mark_array_buffer_dirty_range(info.buffer, start, len * size);
+        true
     }
 
     // ----- symbols ----------------------------------------------------------------------------
@@ -5646,7 +5768,8 @@ impl Interp {
     /// safe to reuse for transient keys, including a different key at a recycled address.
     /// Long transient keys stay uncached: at most 4096 * 256 bytes of text can be retained
     /// by computed reads, regardless of the sizes of author-generated property names.
-    pub(crate) fn get_prop_keyed(
+    #[cfg(test)]
+    fn get_prop_keyed(
         &mut self,
         base: &Value,
         name: &str,
@@ -5669,7 +5792,7 @@ impl Interp {
         base: &Value,
         key: &crate::lstr::LStr,
     ) -> Result<Value, Abrupt> {
-        let cacheable = key.len() <= 256
+        let cacheable = key.len() <= COMPUTED_STUB_KEY_MAX_BYTES
             && key.as_str() != "length"
             && key.as_str() != "description"
             && !key.as_bytes().first().is_some_and(u8::is_ascii_digit);
@@ -5856,9 +5979,16 @@ impl Interp {
         // plainness/exotic gates a rederive would demand). All shapes matching proves the key
         // is still absent everywhere — the read is `undefined` with no entry scan at all.
         if st.depth == IC_ABSENT {
-            let shapes = [st.recv_shape, st.mid_shape, st.mid2_shape, st.holder_shape];
+            let shapes = [
+                st.recv_shape,
+                st.mid_shape,
+                st.mid2_shape,
+                st.mid3_shape,
+                st.mid4_shape,
+                st.holder_shape,
+            ];
             let levels = st.slot as usize;
-            if levels == 0 || levels > 4 {
+            if levels == 0 || levels > shapes.len() {
                 return None;
             }
             let mut cur = head;
@@ -5891,8 +6021,8 @@ impl Interp {
         }
         let keychk = st.depth & IC_ARR_KEYCHK != 0;
         let depth = st.depth & !IC_ARR_KEYCHK;
-        if !(depth <= 1 || (depth == 2 && st.mid_ok & 1 != 0) || (depth == 3 && st.mid_ok & 3 == 3))
-        {
+        let required_mids = (1u8 << depth.saturating_sub(1).min(7)) - 1;
+        if depth > crate::bytecode::IC_MAX_DEPTH || st.mid_ok & required_mids != required_mids {
             return None;
         }
         unsafe {
@@ -5927,7 +6057,7 @@ impl Interp {
                     drop(rb); // the next hop is a different object; release the borrow
                               // Validate each intermediate hop's shape (a match proves it still lacks
                               // the name), following live protos.
-                    for mid_shape in [st.mid_shape, st.mid2_shape]
+                    for mid_shape in [st.mid_shape, st.mid2_shape, st.mid3_shape, st.mid4_shape]
                         .into_iter()
                         .take(depth.saturating_sub(1) as usize)
                     {
@@ -5986,12 +6116,11 @@ impl Interp {
         // a depth-2 fill stores it as `mid_shape` so later hits can shape-validate the whole
         // two-hop chain. An Array mid hop stays ineligible (its shape doesn't track elements, so
         // a shape match couldn't prove an index-like name is still absent).
-        let mut mid = None;
-        let mut mid2 = None;
+        let mut mids = [None; 4];
         // Level shapes for an absent-property fill (see `IC_ABSENT`): valid only while every
         // level so far is a plain `Exotic::None` object (exotics answer some names outside
         // their entries — a wrapper's `length` — so absence-of-entry proves nothing there).
-        let mut absent_shapes: [u32; 4] = [0; 4];
+        let mut absent_shapes = [0; 6];
         let mut absent_ok = true;
         unsafe {
             for depth in 0..=IC_MAX_DEPTH {
@@ -5999,9 +6128,7 @@ impl Interp {
                 if !self.ic_plain_ptr(cur as usize, &b) {
                     return None;
                 }
-                if (depth as usize) < 4 {
-                    absent_shapes[depth as usize] = b.props.shape();
-                }
+                absent_shapes[depth as usize] = b.props.shape();
                 absent_ok = absent_ok && matches!(b.exotic, Exotic::None);
                 if let Some(slot) = b.props.slot_of(name) {
                     let p = b.props.property_at(slot).unwrap();
@@ -6019,8 +6146,13 @@ impl Interp {
                     if keychk && name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
                         return Some(v);
                     }
-                    let mid_shape = if depth >= 2 { mid } else { None };
-                    let mid2_shape = if depth == 3 { mid2 } else { None };
+                    let mid_ok = mids
+                        .iter()
+                        .take(depth.saturating_sub(1) as usize)
+                        .enumerate()
+                        .fold(0, |mask, (index, shape)| {
+                            mask | ((shape.is_some() as u8) << index)
+                        });
                     // Demote the previous ways before refilling: a site rotating through up
                     // to PROP_IC_WAYS shapes stabilizes with one shape per way instead of
                     // thrashing a single cell.
@@ -6034,9 +6166,11 @@ impl Interp {
                         slot: slot as u32,
                         recv_shape,
                         holder_shape: b.props.shape(),
-                        mid_ok: mid_shape.is_some() as u8 | ((mid2_shape.is_some() as u8) << 1),
-                        mid_shape: mid_shape.unwrap_or(0),
-                        mid2_shape: mid2_shape.unwrap_or(0),
+                        mid_ok,
+                        mid_shape: mids[0].unwrap_or(0),
+                        mid2_shape: mids[1].unwrap_or(0),
+                        mid3_shape: mids[2].unwrap_or(0),
+                        mid4_shape: mids[3].unwrap_or(0),
                     };
                     self.ic_insert(cache, st);
                     // Mirror into the owned-text stub cache so OTHER shapes rotating through
@@ -6046,28 +6180,29 @@ impl Interp {
                     }
                     return Some(v);
                 }
-                if depth == 1 && matches!(b.exotic, Exotic::None | Exotic::StrWrap(_)) {
-                    mid = Some(b.props.shape());
-                }
-                if depth == 2 && matches!(b.exotic, Exotic::None | Exotic::StrWrap(_)) {
-                    mid2 = Some(b.props.shape());
+                if (1..=4).contains(&depth) && matches!(b.exotic, Exotic::None | Exotic::StrWrap(_))
+                {
+                    mids[depth as usize - 1] = Some(b.props.shape());
                 }
                 match b.proto.as_ref() {
                     Some(p) => cur = Rc::as_ptr(p),
                     None => {
                         // Chain ended: the property is absent. Cache that (the cheapest read
                         // there is) when every level was a plain ordinary object and the
-                        // chain fits the four shape fields.
+                        // chain fits the recorded shape fields. OrdinaryGet must observe
+                        // additions and prototype swaps at every level, including deep bases.
                         let levels = depth as usize + 1;
-                        if absent_ok && levels <= 4 {
+                        if absent_ok && levels <= absent_shapes.len() {
                             let st = IcState {
                                 depth: crate::bytecode::IC_ABSENT,
                                 slot: levels as u32,
                                 recv_shape: absent_shapes[0],
-                                holder_shape: absent_shapes[3],
+                                holder_shape: absent_shapes[5],
                                 mid_ok: 0,
                                 mid_shape: absent_shapes[1],
                                 mid2_shape: absent_shapes[2],
+                                mid3_shape: absent_shapes[3],
+                                mid4_shape: absent_shapes[4],
                             };
                             self.ic_insert(cache, st);
                             if stable_name {
@@ -6268,6 +6403,8 @@ impl Interp {
                     mid_ok: 0,
                     mid_shape: 0,
                     mid2_shape: 0,
+                    mid3_shape: 0,
+                    mid4_shape: 0,
                 };
                 self.ic_insert(cache, st);
                 // Mirror into the stub cache (see the probe above).
@@ -6355,6 +6492,8 @@ impl Interp {
                 mid_ok: 0,
                 mid_shape: crate::value::proto_epoch(),
                 mid2_shape: ((proto_ptr as u64) >> 32) as u32,
+                mid3_shape: 0,
+                mid4_shape: 0,
             },
         );
         let pin = cur.take().map(|p| Rc::downgrade(&p)).unwrap_or_default();

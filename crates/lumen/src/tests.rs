@@ -6785,6 +6785,241 @@ fn jit_writes_packed_dense_values_without_losing_ownership() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
+fn jit_numeric_packed_overwrites_stay_in_native_code() {
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(0);
+    run_in(
+        &mut engine,
+        r#"
+        var a=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
+        function localDrop(a,k,v){a[k]=v;}
+        function localKeep(a,k,v){return a[k]=v;}
+        function stackDrop(a,k,v){(k<99?a:[])[k]=v;}
+        function stackKeep(a,k,v){return (k<99?a:[])[k]=v;}
+        function stores(n){for(var k=0;k<n;k++){
+            localDrop(a,k&15,k); localKeep(a,k&15,k+1);
+            stackDrop(a,k&15,k+2); stackKeep(a,k&15,k+3);
+        }}
+        stores(500);
+    "#,
+    );
+    crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(0));
+    assert_eq!(run_in(&mut engine, "stores(500);a[3]"), "502");
+    assert_eq!(
+        crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.get()),
+        0
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn jit_small_packed_array_reads_and_writes_stay_native() {
+    let mut engine = Engine::new();
+    engine.interp.tier = crate::bytecode::Tier::Jit;
+    engine.interp.tier_threshold = 0;
+    assert_eq!(
+        run_in(
+            &mut engine,
+            r#"
+        function make(){return [1,2,3];}
+        function read(a){return a[0]+a[1]+a[2];}
+        function write(a,v){a[1]=v;return a[0]*a[1]+a[2];}
+        var small; for(var n=0;n<200;n++){small=make();read(small);write(small,2);}
+        small=make(); 'ok'
+    "#
+        ),
+        "ok"
+    );
+    crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(0));
+    crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(0));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "read(small)+':'+write(small,0.5)+':'+read(small)"
+        ),
+        "6:3.5:4.5"
+    );
+    assert_eq!(
+        crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.get()),
+        0
+    );
+    assert_eq!(
+        crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.get()),
+        0
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn jit_packed_numeric_chains_do_not_replay_element_helpers() {
+    let mut engine = Engine::new();
+    engine.interp.tier = crate::bytecode::Tier::Jit;
+    engine.interp.tier_threshold = 0;
+    assert_eq!(
+        run_in(
+            &mut engine,
+            r#"
+        function make(){ return [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]; }
+        var a,b; for(var n=0;n<150;n++){a=make();b=make();}
+        function compute(a,b,x) {
+            a[0]=b[1]*x+b[2];
+            a[1]=b[3]*x+b[4];
+            a[2]=b[5]*x+b[6];
+            return a[0]+a[1]+a[2];
+        }
+        for(var n=0;n<150;n++) compute(a,b,0.25);
+        'ok'
+    "#
+        ),
+        "ok"
+    );
+    crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(0));
+    assert_eq!(run_in(&mut engine, "compute(a,b,0.5)"), "21");
+    assert_eq!(
+        crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.get()),
+        0,
+        "packed numeric chains must not replay their suffix through generic helpers"
+    );
+    assert_eq!(
+        run_in(
+            &mut engine,
+            r#"
+        var indexed=Array.from({length:16},(_,i)=>i+1);
+        Object.defineProperty(indexed,'1',{value:2,writable:true,enumerable:true,configurable:true});
+        'ok'
+    "#
+        ),
+        "ok"
+    );
+    crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(0));
+    assert_eq!(run_in(&mut engine, "compute(a,indexed,0.5)"), "21");
+    assert_eq!(
+        crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.get()),
+        0,
+        "an invalidated optional mirror must not force numeric properties through helpers"
+    );
+    // Aliasing, NaN, and a mid-sequence accessor bail retain values and side-effect order.
+    assert_eq!(
+        run_in(
+            &mut engine,
+            r#"
+        var first=compute(a,a,0.5), log='';
+        Object.defineProperty(b,'3',{get(){log+='get;';return 4}, configurable:true});
+        var second=compute(a,b,0.5);
+        var nan=compute(a,b,NaN);
+        [first,second,log,Number.isNaN(nan)].join('|')
+    "#
+        ),
+        "30.5|21|get;get;|true"
+    );
+}
+
+#[test]
+fn jit_numeric_mirrors_preserve_arbitrary_nan_payloads_as_numbers() {
+    assert_eq!(
+        run_jit(
+            r#"
+        const bits=new BigUint64Array([0x7ff9000000000001n]);
+        const value=new Float64Array(bits.buffer)[0];
+        const a=[],b=[],c=[];
+        for(let k=0;k<32;k++){a[k]=k;b[k]=k;c[k]=k;}
+        function overwrite(a,b,c,value){
+            a[0]=value;b[0]=value;c[0]=value;
+            return a[0]+b[0]+c[0];
+        }
+        for(let k=0;k<300;k++)overwrite(a,b,c,.25);
+        const result=overwrite(a,b,c,value);
+        [result,a[0],b[0],c[0]].every(value=>typeof value==='number'&&Number.isNaN(value))
+    "#
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn packed_overwrites_preserve_holes_descriptors_and_special_numbers() {
+    let source = r#"
+        var checks=0; function check(ok){checks++;if(!ok)throw new Error('packed overwrite '+checks);}
+        function put(a,k,v){'use strict';return a[k]=v;}
+        var a=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
+        for(var k=0;k<450;k++)put(a,k&15,k);
+        check(Object.is(put(a,-0,-0),-0) && Object.is(a[0],-0));
+        check(Number.isNaN(put(a,0,NaN)) && Number.isNaN(a[0]));
+        put(a,0,Infinity);check(a[0]===Infinity);
+        Object.defineProperty(a,'length',{writable:false});
+        put(a,1,31);check(a[1]===31 && a.length===16);
+        try{put(a,16,2);throw 0;}catch(e){check(e instanceof TypeError);}
+        var seen=0;delete a[3];
+        Object.defineProperty(Array.prototype,'3',{set(v){seen=v;},configurable:true});
+        put(a,3,17);check(seen===17 && !Object.hasOwn(a,3));
+        delete Array.prototype[3];
+        Object.defineProperty(a,'5',{value:55,writable:false});
+        try{put(a,5,2);throw 0;}catch(e){check(e instanceof TypeError);}
+        check(a[5]===55);
+        Object.freeze(a);
+        try{put(a,1,2);throw 0;}catch(e){check(e instanceof TypeError);}
+        'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "{tier:?}");
+    }
+}
+
+#[test]
+fn typed_array_numeric_copies_preserve_order_bounds_and_conversions() {
+    // ECMA-262 SetTypedArrayFromArrayLike/NumericToRawBytes, snapshot e28783d5fc9d.
+    let source = r#"
+        function check(ok,message){if(!ok)throw new Error(message);}
+        var values=[-0,0.5,1.5,2.5,-3.9,256,65536,4294967295,2**63,-(2**63),1e100,NaN,Infinity];
+        for(var C of [Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array,Float16Array,Float32Array,Float64Array]){
+            var a=new C(values.length+2), b=new C(values.length+2);
+            a.fill(7);b.fill(7);a.set(values,1);
+            for(var k=0;k<values.length;k++)b[k+1]=values[k];
+            for(var k=0;k<a.length;k++)check(Object.is(a[k],b[k]),C.name+' conversion '+k);
+            if(C===Int32Array || C===Uint32Array)check(a[9]===0 && a[10]===0,'modulo large integer');
+        }
+        var trace=[], a=new Float32Array(4), src=[1,2,3];
+        Object.defineProperty(src,'1',{get(){trace.push(a[0]);return {valueOf(){trace.push('convert');return 5;}}}});
+        Object.defineProperty(src,'2',{get(){trace.push(a[1]);throw 'sentinel';}});
+        try{a.set(src);}catch(e){check(e==='sentinel','throw propagated');}
+        check(trace.join(',')==='1,convert,5' && a[0]===1 && a[1]===5 && a[2]===0,'ordered partial copy');
+        var inherited=[4,,6], proto=Object.create(Array.prototype);
+        Object.defineProperty(proto,'1',{get(){return 8;}});Object.setPrototypeOf(inherited,proto);
+        a.set(inherited,1);check(a.join(',')==='1,4,8,6','inherited hole');
+        var gets=[];var proxy=new Proxy([11,12],{get(t,k,r){gets.push(k);return Reflect.get(t,k,r);}});
+        a.set(proxy);check(gets.join(',')==='length,0,1' && a[0]===11 && a[1]===12,'proxy reads');
+        var small=new Uint8Array(1), reads=0, tooLong=[1,2];
+        Object.defineProperty(tooLong,'0',{get(){reads++;return 1;}});
+        try{small.set(tooLong);}catch(e){check(e instanceof RangeError,'bounds error');}
+        check(reads===0,'bounds before elements');
+        var rab=new ArrayBuffer(16,{maxByteLength:32}), target=new Float32Array(rab,0,4);
+        try{target.set([1,2],{valueOf(){rab.resize(8);return 0;}});throw 0;}
+        catch(e){check(e instanceof TypeError,'resized bounds');}
+        check(target.length===0,'fixed view out of bounds rejected');
+        'ok';
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "{tier:?}");
+    }
+}
+
+#[test]
 fn jit_compact_warmed_property_probes_deopt_cleanly() {
     assert_eq!(
         run_jit(
@@ -17345,6 +17580,64 @@ fn proxy_get_receiver() {
 }
 
 #[test]
+fn for_in_cached_shapes_preserve_live_enumeration() {
+    // EnumerateObjectProperties / CreateForInIterator: live descriptors, shadowing,
+    // prototype changes and deletion must remain observable after a candidate-cache hit.
+    let source = r#"
+        function check(ok) { if (!ok) throw Error('enumeration cache'); }
+        function keys(o) { var out=''; for (var k in o) out+=k+','; return out; }
+        var proto={shadow:1,inherited:2};
+        var a=Object.create(proto), b=Object.create(proto);
+        Object.defineProperty(a,'shadow',{value:3,enumerable:false,configurable:true});
+        Object.defineProperty(b,'shadow',{value:4,enumerable:true,configurable:true});
+        a.own=1; b.own=2;
+        for(var n=0;n<120;n++) check(keys(a)==='own,inherited,');
+        check(keys(b)==='shadow,own,inherited,');
+        Object.defineProperty(a,'shadow',{enumerable:true});
+        check(keys(a)==='shadow,own,inherited,');
+        Object.defineProperty(a,'shadow',{enumerable:false});
+        delete proto.inherited;
+        proto.later=3;
+        check(keys(a)==='own,later,');
+        Object.setPrototypeOf(a,{different:1});
+        check(keys(a)==='own,different,');
+        delete a.own; a.own=4;
+        check(keys(a)==='own,different,');
+        var order={z:1,12:1,2:1,a:1}; order[Symbol('skip')]=1;
+        for(var n=0;n<120;n++) check(keys(order)==='2,12,z,a,');
+        delete order.z; order.z=2;
+        check(keys(order)==='2,12,a,z,');
+        var reads=0, accessor={get x(){reads++;return 1}};
+        for(var n=0;n<120;n++) check(keys(accessor)==='x,');
+        check(reads===0);
+        var deleting={a:1,b:2,c:3};
+        keys(deleting); var seen='';
+        for(var k in deleting) { seen+=k; if(k==='a') delete deleting.b; }
+        check(seen==='ac');
+        var traps=0, proxy=new Proxy({proxied:1},{ownKeys(t){traps++;return Reflect.ownKeys(t)}});
+        var child=Object.create(proxy); child.own=1;
+        check(keys(child)==='own,proxied,'); var before=traps;
+        check(keys(child)==='own,proxied,' && traps===before+1);
+        var deep={base:1}; for(var n=0;n<10;n++) deep=Object.create(deep);
+        check(keys(deep)==='base,');
+        check(keys('xy')==='0,1,' && keys(new Uint8Array(2))==='0,1,');
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        assert_eq!(run_in(&mut engine, source), "ok");
+        let (entries, bytes) = engine.interp.enumeration_keys.stats();
+        assert!(entries > 0 && entries <= 256 && bytes <= 1 << 20);
+    }
+}
+
+#[test]
 fn proxy_for_in_and_has_own() {
     // for-in over a proxy enumerates via [[OwnPropertyKeys]] + enumerable, through a proxy target.
     assert_eq!(
@@ -23674,6 +23967,41 @@ fn jit_local_store_pairs_preserve_owned_values_and_throw_state() {
 }
 
 #[test]
+fn deep_property_caches_preserve_absence_accessors_and_prototype_swaps() {
+    let source = r#"
+        function flag(o){return o.optional;}
+        function check(ok){if(!ok)throw Error('deep property cache');}
+        var base=Object.create(null), levels=[base], leaf=base;
+        for(var n=0;n<5;n++){leaf=Object.create(leaf);levels.push(leaf);}
+        leaf.marker=37;
+        for(var n=0;n<200;n++)check(flag(leaf)===undefined);
+        base.optional=7; check(flag(leaf)===7);
+        for(var n=0;n<200;n++)check(flag(leaf)===7);
+        Object.defineProperty(base,'optional',{get(){return this.marker},configurable:true});
+        check(flag(leaf)===37);
+        Object.defineProperty(levels[2],'optional',{value:13,configurable:true});
+        check(flag(leaf)===13);
+        delete levels[2].optional; check(flag(leaf)===37);
+        Object.setPrototypeOf(levels[2],{optional:19});check(flag(leaf)===19);
+        Object.setPrototypeOf(levels[2],null);check(flag(leaf)===undefined);
+        var traps=0, proxy=new Proxy({optional:23},{get(t,k,r){traps++;return Reflect.get(t,k,r)}});
+        Object.setPrototypeOf(levels[2],proxy);
+        check(flag(leaf)===23 && flag(leaf)===23 && traps===2);
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.interp.tier = tier;
+        engine.interp.tier_threshold = 0;
+        assert_eq!(run_in(&mut engine, source), "ok");
+    }
+}
+
+#[test]
 fn jit_direct_calls_support_wide_argument_lists() {
     // More than eight arguments used to force every hot call through the layered Rust path.
     // Keep refcounted operands, method receivers, nested wide calls and an unwind in the test:
@@ -24283,6 +24611,23 @@ fn jit_local_equality_branch_preserves_coercion_and_htmldda() {
               seq(a,a),seq(a,b),seq(null,undefined)].join(':')"
         ),
         "0:1:1:0:1:0:0:1:1:0:1:0:1:1:1:0:0"
+    );
+    assert_eq!(
+        run_jit(
+            r#"
+        function eq(a,b){if(a==b)return 1;return 0;}
+        function ne(a,b){if(a!=b)return 1;return 0;}
+        function seq(a,b){if(a===b)return 1;return 0;}
+        function sne(a,b){if(a!==b)return 1;return 0;}
+        function loop(n){var sum=0;for(var k=0;k!==n;k++)sum+=k;return sum;}
+        for(var k=0;k<300;k++){eq(k,k);ne(k,k+1);seq(k,k);sne(k,k+1);loop(10);}
+        var symbol=Symbol();
+        [eq(-0,0),seq(-0,0),eq(NaN,NaN),sne(NaN,NaN),seq(Infinity,Infinity),
+         ne(Infinity,-Infinity),eq(true,true),sne(true,false),eq(false,0),seq(false,0),
+         eq(symbol,symbol),sne(symbol,Symbol()),loop(100)].join(':')
+    "#
+        ),
+        "1:1:0:1:1:1:1:1:1:0:1:1:4950"
     );
 }
 

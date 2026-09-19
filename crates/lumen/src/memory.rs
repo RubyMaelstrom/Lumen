@@ -1044,6 +1044,19 @@ fn scan_realm(
         }
     }
 
+    let mut key_vectors = 0usize;
+    let (bytes, exact) = interp.enumeration_keys.scan_retained_memory(|keys| {
+        key_vectors = key_vectors.saturating_add(keys.capacity() * size_of::<crate::lstr::LStr>());
+        for key in keys {
+            visitor.lstr(key);
+        }
+    });
+    totals.engine_caches.add(bytes.saturating_add(key_vectors));
+    if !exact {
+        totals
+            .engine_caches
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
     let (bytes, exact) = interp.str_units.scan_retained_memory(|(string, units)| {
         visitor.lstr(string);
         visitor.str_units(units);

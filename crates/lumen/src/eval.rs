@@ -6,6 +6,14 @@ use crate::interpreter::*;
 use crate::value::*;
 use std::rc::Rc;
 
+/// A complete small ordinary prototype chain, including each level's live enumerable flags.
+/// Contains no object identities or roots; following current prototypes also detects swaps.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub(crate) struct EnumerationShape {
+    levels: [(u32, u64); 6],
+    depth: u8,
+}
+
 /// Partially evaluated ClassDefinitionEvaluation retained by a heap VM continuation while a
 /// heritage or computed-name expression is suspended. ECMA-262 §15.7.14 creates both class
 /// environments before heritage evaluation, then retains them through every class element.
@@ -1321,7 +1329,7 @@ impl Interp {
         let items: Vec<Value> = self
             .for_in_keys(&rhs)?
             .into_iter()
-            .map(Value::from_string)
+            .map(Value::Str)
             .collect();
         let mut idx = 0;
         self.run_loop(labels, env, |me, env| {
@@ -1813,7 +1821,18 @@ impl Interp {
 
     /// Snapshot the candidate keys for EnumerateObjectProperties. Each prototype level's
     /// [[OwnPropertyKeys]] is consulted once; the loop rechecks deletion before yielding a key.
-    pub(crate) fn for_in_keys(&mut self, v: &Value) -> Result<Vec<String>, Abrupt> {
+    pub(crate) fn for_in_keys(&mut self, v: &Value) -> Result<Vec<crate::lstr::LStr>, Abrupt> {
+        // EnumerateObjectProperties / CreateForInIterator, ECMA-262 snapshot e28783d5fc9d.
+        // Reuse candidate strings only when the complete live ordinary chain proves the same
+        // ordered keys, shadowing and enumerable flags. Exotics use their internal methods;
+        // the loop still checks deletion immediately before yielding each candidate.
+        let shape = self.enumeration_shape(v);
+        if let Some(keys) = shape
+            .as_ref()
+            .and_then(|shape| self.enumeration_keys.get_cloned(shape))
+        {
+            return Ok(keys);
+        }
         let keys = self.enum_keys(v)?;
         // A module namespace's [[GetOwnProperty]] runs during enumeration, so an uninitialized
         // export makes the loop throw before any iteration.
@@ -1827,7 +1846,37 @@ impl Interp {
                 }
             }
         }
+        let keys: Vec<crate::lstr::LStr> = keys.into_iter().map(Into::into).collect();
+        if let Some(shape) = shape {
+            let bytes = keys.iter().map(|key| key.len() + 32).sum::<usize>()
+                + keys.capacity() * std::mem::size_of::<crate::lstr::LStr>();
+            self.enumeration_keys.insert(shape, keys.clone(), bytes);
+        }
         Ok(keys)
+    }
+
+    fn enumeration_shape(&self, value: &Value) -> Option<EnumerationShape> {
+        let mut current = Rc::as_ptr(value.as_obj()?);
+        let mut shape = EnumerationShape {
+            levels: [(0, 0); 6],
+            depth: 0,
+        };
+        loop {
+            if shape.depth as usize == shape.levels.len() {
+                return None;
+            }
+            // The receiver transitively owns every prototype. This walk runs no author code.
+            let object = unsafe { (*current).borrow() };
+            if !object.ic_plain.get() || !matches!(object.exotic, Exotic::None) {
+                return None;
+            }
+            shape.levels[shape.depth as usize] = object.props.enumeration_shape()?;
+            shape.depth += 1;
+            match object.proto.as_ref() {
+                Some(parent) => current = Rc::as_ptr(parent),
+                None => return Some(shape),
+            }
+        }
     }
 
     fn enum_keys(&mut self, v: &Value) -> Result<Vec<String>, Abrupt> {
@@ -7404,6 +7453,8 @@ impl Interp {
                 mid_ok: 0,
                 mid_shape: 0,
                 mid2_shape: 0,
+                mid3_shape: 0,
+                mid4_shape: 0,
             });
         }
         Ok(out)

@@ -60,7 +60,7 @@ pub struct IcState {
     pub slot: u32,
     pub depth: u8,
     /// Bit 0: `mid_shape` was recorded (a `depth ≥ 2` fill whose depth-1 hop was a plain
-    /// ordinary object); bit 1: `mid2_shape` too (depth 3). Flags are needed because shape id 0
+    /// ordinary object); bits 1..3 cover `mid2_shape` through `mid4_shape`. Shape id 0
     /// is a real shape (the empty object).
     pub mid_ok: u8,
     /// The intermediate (depth-1) hop's shape for a `depth == 2` hit: a match proves that hop
@@ -68,8 +68,12 @@ pub struct IcState {
     pub mid_shape: u32,
     /// The depth-2 hop's shape for a `depth == 3` hit (three-level class hierarchies put base
     /// methods three hops from an instance; without this they'd re-walk every access). Recorded
-    /// iff `mid_ok & 2`. The JIT templates handle depth ≤ 2 and route deeper hits to the helper.
+    /// iff `mid_ok & 2`. The JIT templates handle depth ≤ 3 and route deeper hits to the helper.
     pub mid2_shape: u32,
+    /// Deeper ordinary class hierarchies retain every intermediate shape, including empty
+    /// prototypes. These fields also extend negative lookups to six complete chain levels.
+    pub mid3_shape: u32,
+    pub mid4_shape: u32,
 }
 
 /// Byte offsets into an [`IcState`] `Cell`, for the JIT inline templates.
@@ -80,12 +84,14 @@ pub const IC_OFF_DEPTH: u32 = 12;
 pub const IC_OFF_MID_OK: u32 = 13;
 pub const IC_OFF_MID_SHAPE: u32 = 16;
 pub const IC_OFF_MID2_SHAPE: u32 = 20;
+pub const IC_OFF_MID3_SHAPE: u32 = 24;
+pub const IC_OFF_MID4_SHAPE: u32 = 28;
 
 pub const IC_EMPTY: u8 = u8::MAX;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
 /// is missing along the entire (all `Exotic::None`, all ic-plain) prototype chain. The chain's
-/// shapes sit in recv_shape/mid_shape/mid2_shape/holder_shape in walk order with the level
-/// count in `slot` (1-4); a hit re-walks the live chain validating each shape and yields
+/// shapes sit in recv_shape/mid_shape/mid2_shape/mid3_shape/mid4_shape/holder_shape in walk
+/// order with the level count in `slot` (1-6); a hit re-walks the live chain and yields
 /// `undefined`. Shape-only proof is sound for absence: a shape pins the exact key set of a
 /// non-elem-mode map, and every level's exotic/side-table gates are re-checked live.
 pub const IC_ABSENT: u8 = 0xFC;
@@ -102,7 +108,7 @@ pub const PROP_IC_WAYS: usize = 4;
 /// `depth < 0x80` (`IC_CREATE`/`IC_EMPTY` have the bit set but are filtered by range first).
 pub const IC_ARR_KEYCHK: u8 = 0x40;
 /// Deepest prototype hop the IC will record; hotter sites deeper than this stay on the slow path.
-pub const IC_MAX_DEPTH: u8 = 4;
+pub const IC_MAX_DEPTH: u8 = 5;
 /// `IcState::depth` marker for a property-*creation* cache (constructor `this.x = v` on a fresh
 /// shape): `recv_shape` is the shape BEFORE the insert and `mid_shape` holds the
 /// [`crate::value::proto_epoch`] at fill. A hit requires the same shape, the same receiver
@@ -329,6 +335,8 @@ impl IcState {
         mid_ok: 0,
         mid_shape: 0,
         mid2_shape: 0,
+        mid3_shape: 0,
+        mid4_shape: 0,
     };
 }
 
@@ -4425,6 +4433,8 @@ mod feedback_layout_tests {
             mid_ok: 0,
             mid_shape: 0,
             mid2_shape: 0,
+            mid3_shape: 0,
+            mid4_shape: 0,
         });
 
         refresh_current_layout_feedback(&feedback, &shapes, &caches);
@@ -4459,6 +4469,8 @@ mod feedback_layout_tests {
             mid_ok: 0,
             mid_shape: 0,
             mid2_shape: 0,
+            mid3_shape: 0,
+            mid4_shape: 0,
         });
         refresh_current_layout_feedback(&feedback, &shapes, &caches);
         let receiver = feedback.read(
@@ -4493,6 +4505,8 @@ mod feedback_layout_tests {
             mid_ok: 0,
             mid_shape: 0,
             mid2_shape: 0,
+            mid3_shape: 0,
+            mid4_shape: 0,
         });
 
         refresh_current_layout_feedback(&feedback, &shapes, &caches);
@@ -4533,6 +4547,8 @@ mod feedback_layout_tests {
             mid_ok: 0,
             mid_shape: 0,
             mid2_shape: 0,
+            mid3_shape: 0,
+            mid4_shape: 0,
         });
 
         refresh_current_layout_feedback(&feedback, &shapes, &caches);
@@ -11658,12 +11674,23 @@ fn for_in_step(
     index_slot: u16,
     source_slot: u16,
 ) -> Result<Option<Value>, Abrupt> {
+    let keys = slots[keys_slot as usize].clone();
+    let source = slots[source_slot as usize].clone();
+    for_in_next(i, &keys, &mut slots[index_slot as usize], &source)
+}
+
+fn for_in_next(
+    i: &mut Interp,
+    keys: &Value,
+    cursor: &mut Value,
+    source: &Value,
+) -> Result<Option<Value>, Abrupt> {
     loop {
-        let index = match slots[index_slot as usize] {
+        let index = match *cursor {
             Value::Num(index) => index as u32,
             _ => unreachable!("for-in cursor is an internal integer"),
         };
-        let key = match &slots[keys_slot as usize] {
+        let key = match keys {
             Value::Obj(keys) => keys
                 .borrow()
                 .props
@@ -11674,13 +11701,12 @@ fn for_in_step(
         let Some(key) = key else {
             return Ok(None);
         };
-        slots[index_slot as usize] = Value::Num(index as f64 + 1.0);
-        if matches!(slots[source_slot as usize], Value::Obj(_)) {
+        *cursor = Value::Num(index as f64 + 1.0);
+        if matches!(source, Value::Obj(_)) {
             let Value::Str(name) = &key else {
                 unreachable!("for-in candidates are strings")
             };
-            let source = slots[source_slot as usize].clone();
-            if !i.js_has_property(&source, name)? {
+            if !i.js_has_property(source, name)? {
                 continue;
             }
         }
@@ -12695,24 +12721,8 @@ fn run_vm(
             Op::GetElem => {
                 let key = pop!();
                 let obj = pop!();
-                if chunk.feedback.detailed_enabled() {
-                    let v = get_element_profiled(i, chunk, op_pc, &obj, &key)?;
-                    stack.push(v);
-                    continue;
-                }
-                if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
-                    if let Some(v) = i.fast_get_elem(o, *n) {
-                        stack.push(v);
-                        continue;
-                    }
-                }
-                if matches!(obj, Value::Undefined | Value::Null) {
-                    crate::value::trace_nullish_property("bytecode-get-elem", &key);
-                    return Err(i.throw("TypeError", "cannot read property of null or undefined"));
-                }
-                let k = i.to_property_key(&key)?;
-                let v = i.get_member(&obj, &k)?;
-                stack.push(v);
+                let value = get_computed_element(i, chunk, op_pc, &obj, &key)?;
+                stack.push(value);
             }
             Op::SetElem => {
                 let v = pop!();
@@ -12766,35 +12776,9 @@ fn run_vm(
             }
             Op::GetElemLocal(s) => {
                 let key = pop!();
-                if chunk.feedback.detailed_enabled() {
-                    let obj = slots[s as usize].clone();
-                    let v = get_element_profiled(i, chunk, op_pc, &obj, &key)?;
-                    stack.push(v);
-                    continue;
-                }
-                if let (Value::Obj(o), Value::Num(n)) = (&slots[s as usize], &key) {
-                    if let Some(v) = i.fast_get_elem(o, *n) {
-                        stack.push(v);
-                        continue;
-                    }
-                }
                 let obj = slots[s as usize].clone();
-                if matches!(obj, Value::Undefined | Value::Null) {
-                    crate::value::trace_nullish_property("bytecode-get-elem-local", &key);
-                    if std::env::var_os("LUMEN_NULLISH_TRACE").is_some() {
-                        eprintln!(
-                            "lumen: nullish local tier=bytecode pc={} op={:?} slot={} name={:?}",
-                            op_pc,
-                            chunk.ops.get(op_pc),
-                            s,
-                            chunk.slot_names.get(s as usize).map(|name| name.as_ref())
-                        );
-                    }
-                    return Err(i.throw("TypeError", "cannot read property of null or undefined"));
-                }
-                let k = i.to_property_key(&key)?;
-                let v = i.get_member(&obj, &k)?;
-                stack.push(v);
+                let value = get_computed_element(i, chunk, op_pc, &obj, &key)?;
+                stack.push(value);
             }
             Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => {
                 let keep = matches!(op, Op::SetElemLocal(_));
@@ -12942,7 +12926,7 @@ fn run_vm(
             Op::GetMethodElem => {
                 let key = pop!();
                 let obj = pop!();
-                let m = get_computed_method(i, chunk, op_pc, &obj, &key)?;
+                let m = get_computed_element(i, chunk, op_pc, &obj, &key)?;
                 stack.push(obj);
                 stack.push(m);
             }
@@ -13574,7 +13558,7 @@ fn run_vm(
                 let keys = i
                     .for_in_keys(&source)?
                     .into_iter()
-                    .map(Value::from_string)
+                    .map(Value::Str)
                     .collect();
                 stack.push(i.make_array(keys));
             }
@@ -16586,6 +16570,18 @@ pub(crate) unsafe extern "C" fn jit_exec(
     pc: u32,
     mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    #[cfg(test)]
+    if matches!(
+        unsafe { &(&(*(*ctx).chunk).ops)[pc as usize] },
+        Op::GetElem
+            | Op::GetElemLocal(_)
+            | Op::SetElem
+            | Op::SetElemDrop
+            | Op::SetElemLocal(_)
+            | Op::SetElemLocalDrop(_)
+    ) {
+        TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(count.get() + 1));
+    }
     // Packed local misses must remain O(1): widening every slot for a single object overwrite
     // dominates object-heavy kernels. These two ownership operations need no interpreter state;
     // TDZ loads retain the generic path so it can construct the precise ReferenceError.
@@ -16593,6 +16589,62 @@ pub(crate) unsafe extern "C" fn jit_exec(
         let chunk = unsafe { &*(*ctx).chunk };
         let op = &chunk.ops[pc as usize];
         match *op {
+            Op::ForInStepL(keys, index, source) => {
+                let ctx = unsafe { &mut *ctx };
+                jit_opstat(ctx, pc);
+                let keys = unsafe { ctx.clone_slot(keys as usize) };
+                let source = unsafe { ctx.clone_slot(source as usize) };
+                let mut cursor = unsafe { ctx.clone_slot(index as usize) };
+                let result = for_in_next(unsafe { &mut *ctx.interp }, &keys, &mut cursor, &source);
+                // The cursor advances before the observable property check, including throws.
+                let word = unsafe { ctx.slots.cast::<u64>().add(index as usize) };
+                unsafe { crate::value::PackedValue::replace_raw(word, cursor) };
+                match result {
+                    Ok(key) => {
+                        let found = key.is_some();
+                        unsafe {
+                            sp.write(key.unwrap_or(Value::Undefined));
+                            sp.add(1).write(Value::Bool(found));
+                        }
+                        return crate::jit::SpFlag {
+                            sp: unsafe { sp.add(2) },
+                            flag: 0,
+                        };
+                    }
+                    Err(error) => {
+                        ctx.error = Some(error);
+                        return crate::jit::SpFlag { sp, flag: 1 };
+                    }
+                }
+            }
+            Op::GetElemLocal(slot) => {
+                // A computed read can call getters, but it only needs this one local. Keep
+                // unrelated packed locals untouched instead of widening the entire frame.
+                let ctx = unsafe { &mut *ctx };
+                jit_opstat(ctx, pc);
+                let object = unsafe { ctx.clone_slot(slot as usize) };
+                sp = unsafe { sp.sub(1) };
+                let key = unsafe { sp.read() };
+                match get_computed_element(
+                    unsafe { &mut *ctx.interp },
+                    chunk,
+                    pc as usize,
+                    &object,
+                    &key,
+                ) {
+                    Ok(value) => {
+                        unsafe { sp.write(value) };
+                        return crate::jit::SpFlag {
+                            sp: unsafe { sp.add(1) },
+                            flag: 0,
+                        };
+                    }
+                    Err(error) => {
+                        ctx.error = Some(error);
+                        return crate::jit::SpFlag { sp, flag: 1 };
+                    }
+                }
+            }
             Op::LoadLocal(slot) => {
                 let word = unsafe { (*ctx).slots.cast::<u64>().add(slot as usize) };
                 let value = unsafe { crate::value::PackedValue::clone_raw(word) };
@@ -17832,6 +17884,16 @@ pub(crate) unsafe extern "C" fn jit_make_array(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_JIT_SET_ELEM_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static TEST_JIT_EXEC_ELEMENT_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// Dedicated element-store entry (same contract as [`jit_exec`]): handles the four element
 /// assignment stack shapes without entering the full opcode dispatcher. Inline dense overwrites
 /// never reach this helper; it primarily serves semantically checked array growth and sparse
@@ -17841,7 +17903,8 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
     pc: u32,
     mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
-    let _wide_slots = unsafe { JitWideSlots::enter(ctx) };
+    #[cfg(test)]
+    TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(count.get() + 1));
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
     let i = unsafe { &mut *ctx.interp };
@@ -17886,11 +17949,10 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
                 unsafe { sp.write(value.clone()) };
                 sp = unsafe { sp.add(1) };
             }
-            let local = unsafe { &*ctx.slots.add(slot as usize) };
+            let local = unsafe { ctx.clone_slot(slot as usize) };
             if chunk.feedback.detailed_enabled() {
-                let object = local.clone();
-                set_element_profiled(i, chunk, pc as usize, &object, &key, value)?;
-            } else if let (Value::Obj(o), Value::Num(n)) = (local, &key) {
+                set_element_profiled(i, chunk, pc as usize, &local, &key, value)?;
+            } else if let (Value::Obj(o), Value::Num(n)) = (&local, &key) {
                 match i.fast_set_elem(o, *n, value) {
                     Ok(()) => {}
                     Err(back) => {
@@ -18064,7 +18126,6 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
 ) -> crate::jit::SpFlag {
     #[cfg(test)]
     TEST_JIT_SET_PROP_HELPERS.with(|count| count.set(count.get() + 1));
-    let _wide_slots = unsafe { JitWideSlots::enter(ctx) };
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
@@ -18120,7 +18181,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
         Op::SetPropLocalDrop(s, n, c) => {
             sp = sp.sub(1);
             let v = sp.read();
-            let obj = (*ctx.slots.add(s as usize)).clone();
+            let obj = ctx.clone_slot(s as usize);
             if matches!(obj, Value::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
@@ -18151,43 +18212,11 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     }
 }
 
-thread_local! {
-    /// Scratch site cells for COMPUTED string-key property reads (`o[k]` where `k` is a
-    /// string): `get_prop_ic` needs a site, and probes address all `PROP_IC_WAYS` CONSECUTIVE
-    /// cells relative to the one passed (`Interp::ic_way`), so the scratch must be a full
-    /// way-array. Computed sites have no cells of their own — the global stub cache (keyed by
-    /// receiver shape + key data pointer, both stable for the shared LStr instances that flow
-    /// through dispatch tables like astring's `this[node.type]`) carries the real caching;
-    /// these cells just absorb the fills.
-    static ELEM_IC: [std::cell::Cell<IcState>; PROP_IC_WAYS] =
-        const { [const { std::cell::Cell::new(IcState::EMPTY) }; PROP_IC_WAYS] };
-}
-
-/// Computed string-key read fast path: route through the property-IC machinery instead of the
-/// raw `get_member` chain walk. The way cells are CLEARED first — an `IcState` carries no
-/// name (a real site cell binds one implicitly), so a stale way entry filled for one key
-/// would answer a different key on the same shape. Resolution therefore comes from the
-/// name-keyed STUB cache (hit: shape-validated, no scan) or a rederive; the scratch ways
-/// only absorb the fills. Digit-leading keys keep the element paths.
-#[inline]
-fn get_elem_str_ic(
-    i: &mut crate::interpreter::Interp,
-    obj: &Value,
-    key: &crate::lstr::LStr,
-) -> Result<Value, Abrupt> {
-    ELEM_IC.with(|cells| {
-        for c in cells {
-            c.set(IcState::EMPTY);
-        }
-        i.get_prop_keyed(obj, key, &cells[0])
-    })
-}
-
-/// The computed method reference retains the original receiver. GetValue checks a nullish
+/// Computed reads (including method references) retain the original receiver. GetValue checks a nullish
 /// base before key coercion; an existing string is already a property key and needs no copy.
 /// See ECMA-262 GetValue, ToPropertyKey, OrdinaryGet and EvaluateCall.
 #[inline]
-fn get_computed_method(
+fn get_computed_element(
     i: &mut Interp,
     chunk: &Chunk,
     pc: usize,
@@ -18228,7 +18257,7 @@ pub(crate) unsafe extern "C" fn jit_get_method_elem(
     if ctx.opstat_enabled {
         jit_method_operand_stat(&obj, &key);
     }
-    let result = get_computed_method(
+    let result = get_computed_element(
         unsafe { &mut *ctx.interp },
         unsafe { &*ctx.chunk },
         pc as usize,
@@ -18294,11 +18323,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                 Ok(())
             }
             Op::GetPropLocal(s, n, c) => {
-                let obj = if ctx.slots_packed {
-                    crate::value::PackedValue::clone_raw(ctx.slots.cast::<u64>().add(s as usize))
-                } else {
-                    (*ctx.slots.add(s as usize)).clone()
-                };
+                let obj = ctx.clone_slot(s as usize);
                 if matches!(obj, Value::Empty) {
                     return Err(i.throw(
                         "ReferenceError",
@@ -18634,6 +18659,28 @@ pub(crate) fn jit_callstat_enabled() -> bool {
     })
 }
 
+/// Exclude startup from opt-in helper counts without adding a clock read to normal execution.
+/// The window starts at the first profiled helper; values are milliseconds, default zero.
+fn jit_profile_window_open() -> bool {
+    static WINDOW: std::sync::OnceLock<Option<(std::time::Instant, std::time::Duration)>> =
+        std::sync::OnceLock::new();
+    match WINDOW.get_or_init(|| {
+        let delay = std::env::var("LUMEN_JIT_PROFILE_AFTER_MS")
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        (delay != 0).then(|| {
+            (
+                std::time::Instant::now(),
+                std::time::Duration::from_millis(delay),
+            )
+        })
+    }) {
+        Some((start, delay)) => start.elapsed() >= *delay,
+        None => true,
+    }
+}
+
 #[inline(always)]
 unsafe fn jit_callstat(
     i: &crate::interpreter::Interp,
@@ -18643,7 +18690,7 @@ unsafe fn jit_callstat(
     with_this: bool,
     sp: *mut Value,
 ) {
-    if !ctx.callstat_enabled {
+    if !ctx.callstat_enabled || !jit_profile_window_open() {
         return;
     }
     struct Dump(crate::fasthash::FastMap<&'static str, u64>);
@@ -18779,7 +18826,7 @@ pub(crate) fn jit_opstat_enabled() -> bool {
 #[inline(always)]
 unsafe fn jit_opstat(ctx: &mut crate::jit::JitCtx, pc: u32) {
     {
-        if ctx.opstat_enabled {
+        if ctx.opstat_enabled && jit_profile_window_open() {
             struct OpstatDump(crate::fasthash::FastMap<String, u64>);
             impl Drop for OpstatDump {
                 fn drop(&mut self) {
@@ -18901,7 +18948,13 @@ unsafe fn jit_exec_inner(
         Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
     });
     let env: &Env = &env_h;
-    let slots = std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots);
+    // Stack-only helpers leave locals packed. Do not form a Value slice over NaN-boxed
+    // words: those words neither have Value's stride nor its valid enum discriminants.
+    let slots = if ctx.slots_packed {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots)
+    };
     macro_rules! pop {
         () => {{
             *sp = sp.sub(1);
@@ -19303,31 +19356,8 @@ unsafe fn jit_exec_inner(
         Op::GetElem => {
             let key = pop!();
             let obj = pop!();
-            if chunk.feedback.detailed_enabled() {
-                let v = get_element_profiled(i, chunk, pc as usize, &obj, &key)?;
-                push!(v);
-                return Ok(());
-            }
-            if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
-                if let Some(v) = i.fast_get_elem(o, *n) {
-                    push!(v);
-                    return Ok(());
-                }
-            }
-            if let (Value::Obj(_), Value::Str(s)) = (&obj, &key) {
-                if !s.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
-                    let v = get_elem_str_ic(i, &obj, s)?;
-                    push!(v);
-                    return Ok(());
-                }
-            }
-            if matches!(obj, Value::Undefined | Value::Null) {
-                crate::value::trace_nullish_property("jit-get-elem", &key);
-                return Err(i.throw("TypeError", "cannot read property of null or undefined"));
-            }
-            let k = i.to_property_key(&key)?;
-            let v = i.get_member(&obj, &k)?;
-            push!(v);
+            let value = get_computed_element(i, chunk, pc as usize, &obj, &key)?;
+            push!(value);
         }
         Op::SetElem => {
             let v = pop!();
@@ -19381,35 +19411,9 @@ unsafe fn jit_exec_inner(
         }
         Op::GetElemLocal(s) => {
             let key = pop!();
-            if chunk.feedback.detailed_enabled() {
-                let obj = slots[s as usize].clone();
-                let v = get_element_profiled(i, chunk, pc as usize, &obj, &key)?;
-                push!(v);
-                return Ok(());
-            }
-            if let (Value::Obj(o), Value::Num(n)) = (&slots[s as usize], &key) {
-                if let Some(v) = i.fast_get_elem(o, *n) {
-                    push!(v);
-                    return Ok(());
-                }
-            }
             let obj = slots[s as usize].clone();
-            if matches!(obj, Value::Undefined | Value::Null) {
-                crate::value::trace_nullish_property("jit-get-elem-local", &key);
-                if std::env::var_os("LUMEN_NULLISH_TRACE").is_some() {
-                    eprintln!(
-                        "lumen: nullish local tier=jit pc={} op={:?} slot={} name={:?}",
-                        pc,
-                        chunk.ops.get(pc as usize),
-                        s,
-                        chunk.slot_names.get(s as usize).map(|name| name.as_ref())
-                    );
-                }
-                return Err(i.throw("TypeError", "cannot read property of null or undefined"));
-            }
-            let k = i.to_property_key(&key)?;
-            let v = i.get_member(&obj, &k)?;
-            push!(v);
+            let value = get_computed_element(i, chunk, pc as usize, &obj, &key)?;
+            push!(value);
         }
         Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElemLocal(_));
@@ -19539,7 +19543,7 @@ unsafe fn jit_exec_inner(
             if ctx.opstat_enabled {
                 jit_method_operand_stat(&obj, &key);
             }
-            let m = get_computed_method(i, chunk, pc as usize, &obj, &key)?;
+            let m = get_computed_element(i, chunk, pc as usize, &obj, &key)?;
             push!(obj);
             push!(m);
         }
@@ -19878,7 +19882,7 @@ unsafe fn jit_exec_inner(
             let keys = i
                 .for_in_keys(&source)?
                 .into_iter()
-                .map(Value::from_string)
+                .map(Value::Str)
                 .collect();
             push!(i.make_array(keys));
         }

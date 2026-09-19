@@ -638,6 +638,10 @@ pub struct JitLayout {
     /// Nullable `Box<Vec<Property>>` within the dense sidecar. When non-null the box points at
     /// the Vec header; packed element slots use [`Value::Empty`] for holes and have no key Rc.
     pub dense_packed: usize,
+    /// Inline small-array storage within DenseBuffers (used before an indexed mutation
+    /// needs to grow it into the optional Vec). Offsets are measured from the live types.
+    pub dense_inline_len: usize,
+    pub dense_inline_data: usize,
     /// The `mirror_flags` byte within `Props`.
     pub props_mirror_flags: usize,
     /// `size_of::<Property>()` — the keyless instance-field stride.
@@ -883,6 +887,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         dense_elems: offset_of!(DenseBuffers, elems),
         dense_mirror: offset_of!(DenseBuffers, mirror),
         dense_packed: offset_of!(DenseBuffers, packed),
+        dense_inline_len: offset_of!(DenseBuffers, inline_packed) + offset_of!(InlinePacked, len),
+        dense_inline_data: offset_of!(DenseBuffers, inline_packed)
+            + offset_of!(InlinePacked, slots),
         props_mirror_flags: offset_of!(Props, mirror_flags),
         entry_size: std::mem::size_of::<Property>(),
         str_len_word,
@@ -1820,10 +1827,25 @@ impl TaKind {
     }
     /// Convert a Number to this element type's little-endian bytes (JS integer-conversion rules).
     pub(crate) fn write(self, n: f64) -> Vec<u8> {
-        let int = |n: f64| if n.is_finite() { n.trunc() as i64 } else { 0 };
+        let mut bytes = vec![0; self.elsize()];
+        self.write_into(n, &mut bytes);
+        bytes
+    }
+
+    /// NumericToRawBytes into existing storage. A numeric TypedArray store must not allocate a
+    /// temporary byte vector for every element. Integer conversions wrap modulo 2^N, including
+    /// finite Numbers outside Rust's integer range (ECMA-262 NumericToRawBytes and ToInt32/ToUint32).
+    pub(crate) fn write_into(self, n: f64, bytes: &mut [u8]) {
+        debug_assert_eq!(bytes.len(), self.elsize());
+        let int = || {
+            if (-2147483648.0..2147483648.0).contains(&n) {
+                n as i32
+            } else {
+                crate::eval::to_int32(n)
+            }
+        };
         match self {
-            TaKind::I8 => vec![int(n) as i8 as u8],
-            TaKind::U8 => vec![int(n) as u8],
+            TaKind::I8 | TaKind::U8 => bytes[0] = int() as u8,
             TaKind::U8Clamped => {
                 // ToUint8Clamp: round-half-to-even (0.5 → 0, 1.5 → 2, 2.5 → 2), clamped to [0,255].
                 let c = if n.is_nan() || n <= 0.0 {
@@ -1842,16 +1864,17 @@ impl TaKind {
                         f
                     }
                 };
-                vec![c as u8]
+                bytes[0] = c as u8;
             }
-            TaKind::I16 => (int(n) as i16).to_le_bytes().to_vec(),
-            TaKind::U16 => (int(n) as u16).to_le_bytes().to_vec(),
-            TaKind::I32 => (int(n) as i32).to_le_bytes().to_vec(),
-            TaKind::U32 => (int(n) as u32).to_le_bytes().to_vec(),
-            TaKind::F16 => f64_to_f16(n).to_le_bytes().to_vec(),
-            TaKind::F32 => (n as f32).to_le_bytes().to_vec(),
-            TaKind::F64 => n.to_le_bytes().to_vec(),
-            TaKind::I64 | TaKind::U64 => self.write_bigint(int(n) as i128),
+            TaKind::I16 | TaKind::U16 => bytes.copy_from_slice(&(int() as u16).to_le_bytes()),
+            TaKind::I32 | TaKind::U32 => bytes.copy_from_slice(&int().to_le_bytes()),
+            TaKind::F16 => bytes.copy_from_slice(&f64_to_f16(n).to_le_bytes()),
+            TaKind::F32 => bytes.copy_from_slice(&(n as f32).to_le_bytes()),
+            TaKind::F64 => bytes.copy_from_slice(&n.to_le_bytes()),
+            TaKind::I64 | TaKind::U64 => {
+                let n = if n.is_finite() { n.trunc() as i64 } else { 0 };
+                bytes.copy_from_slice(&n.to_le_bytes());
+            }
         }
     }
 }
@@ -3101,6 +3124,20 @@ impl Props {
     #[inline]
     pub(crate) fn shape(&self) -> u32 {
         self.shape
+    }
+
+    /// Keys plus live enumerable bits identify a small ordinary map's enumeration. Shapes do
+    /// not encode attributes: two objects can share all keys but enumerate different subsets.
+    /// Element-mode maps use a separate index layout and cannot use this shape-only proof.
+    pub(crate) fn enumeration_shape(&self) -> Option<(u32, u64)> {
+        if self.elem_mode.get() || self.elems.packed_ref().is_some() || self.entries.len() > 64 {
+            return None;
+        }
+        let mut enumerable = 0;
+        for (index, property) in self.entries.fields.iter().enumerate() {
+            enumerable |= u64::from(property.enumerable()) << index;
+        }
+        Some((self.shape, enumerable))
     }
     /// Final named-property count of a small ordinary instance. The construct JIT records this
     /// after a successful call so forwarding constructors whose own bytecode has no direct

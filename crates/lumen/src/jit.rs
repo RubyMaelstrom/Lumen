@@ -749,8 +749,8 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     ))
 }
 
-/// ARM64's generated templates use owned 8-byte NaN-boxed local slots. The x64 backend keeps
-/// the established wide `Value` ABI until its load/store templates are migrated as a unit.
+/// Both native backends currently use the wide `Value` local-slot ABI. ARM64's packed-slot
+/// templates remain gated while the full load/store and helper surface is migrated.
 const PACKED_LOCAL_SLOTS: bool = false;
 
 // ---------------------------------------------------------------------------------------------
@@ -1407,6 +1407,17 @@ pub struct JitCtx {
 }
 
 impl JitCtx {
+    /// Clone one local without changing the representation of the rest of the frame.
+    /// A runtime miss for one operation must not copy every local in a large function.
+    pub(crate) unsafe fn clone_slot(&self, slot: usize) -> Value {
+        debug_assert!(slot < self.n_slots);
+        if self.slots_packed {
+            unsafe { crate::value::PackedValue::clone_raw(self.slots.cast::<u64>().add(slot)) }
+        } else {
+            unsafe { (*self.slots.add(slot)).clone() }
+        }
+    }
+
     /// Enter a Rust helper that expects ordinary 16-byte `Value` slots. Packed slots expand
     /// backward inside their already-reserved wide slot region, transferring ownership.
     pub(crate) unsafe fn unpack_slots(&mut self) {
@@ -4983,8 +4994,21 @@ pub fn compile(
             let name = head.join("|");
             eprintln!("[jit-map-range] {:x} {:x} {name}", mem as usize, len);
             for (pc, (&offset, op)) in pc_offsets.iter().zip(ops).enumerate() {
+                let property = match *op {
+                    Op::GetProp(name, _)
+                    | Op::GetMethod(name, _)
+                    | Op::GetPropThis(name, _)
+                    | Op::GetPropLocal(_, name, _)
+                    | Op::SetProp(name, _)
+                    | Op::SetPropDrop(name, _)
+                    | Op::SetPropThisDrop(name, _)
+                    | Op::SetPropLocalDrop(_, name, _) => {
+                        format!(" key={:?}", chunk.jit_name(name))
+                    }
+                    _ => String::new(),
+                };
                 eprintln!(
-                    "[jit-map-pc] {:x} {:x} {pc} {op:?} {name}",
+                    "[jit-map-pc] {:x} {:x} {pc} {op:?} {name}{property}",
                     mem as usize, offset
                 );
             }
@@ -5205,8 +5229,8 @@ fn emit_prop_load_inline(
     recv: PropRecv,
 ) {
     use crate::bytecode::{
-        IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID_OK, IC_OFF_MID_SHAPE,
-        IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
+        IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID3_SHAPE, IC_OFF_MID4_SHAPE,
+        IC_OFF_MID_OK, IC_OFF_MID_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
     };
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
@@ -5523,7 +5547,9 @@ fn emit_prop_load_inline(
             for (lvl, shape_off) in [
                 (2u32, IC_OFF_MID_SHAPE),
                 (3u32, IC_OFF_MID2_SHAPE),
-                (4u32, IC_OFF_HOLDER_SHAPE),
+                (4u32, IC_OFF_MID3_SHAPE),
+                (5u32, IC_OFF_MID4_SHAPE),
+                (6u32, IC_OFF_HOLDER_SHAPE),
             ] {
                 a.cmp_imm_w(13, lvl);
                 a.b_cond(C_LO, chain_end);
@@ -7374,7 +7400,7 @@ fn eq_inlinable(layout: &crate::value::JitLayout) -> bool {
 }
 
 /// Fused `LoadLocal(a); LoadLocal(b); equality; JumpIfFalse`: compare borrowed frame values
-/// directly for object identity and nullish cases. These cases require neither coercion nor
+/// directly for same-type primitives, object identity and nullish cases. These need no coercion or
 /// ownership changes. Any TDZ value, coercing mixed pair, or HTMLDDA/nullish pair replays the
 /// original operations through their checked helpers before the frame is touched.
 #[cfg(all(
@@ -7401,6 +7427,7 @@ fn emit_local_eq_branch(
     let rhs_nullish = a.new_label();
     let equal = a.new_label();
     let unequal = a.new_label();
+    let same_primitive = a.new_label();
 
     // w9/w10 are the borrowed Value tags. Empty is a TDZ sentinel, so it must retain the
     // checked LoadLocal path and its precise ReferenceError.
@@ -7414,6 +7441,8 @@ fn emit_local_eq_branch(
     a.b_cond(C_EQ, lhs_obj);
     a.cmp_imm_w(10, 8);
     a.b_cond(C_EQ, rhs_obj);
+    a.cmp_reg_w(9, 10);
+    a.b_cond(C_EQ, same_primitive);
 
     // Neither side is an object. Null/undefined compare loosely equal only to each other;
     // strictly they must have the same tag. Other strict different-tag pairs are definitively
@@ -7431,6 +7460,33 @@ fn emit_local_eq_branch(
         a.b_cond(C_NE, unequal);
     }
     a.b(slow);
+
+    a.bind(same_primitive);
+    // IsStrictlyEqual / IsLooselyEqual delegate same-type Numbers to Number::equal.
+    // FP equality handles both signed zeroes and makes every NaN compare unequal.
+    let not_number = a.new_label();
+    a.cmp_imm_w(9, 4);
+    a.b_cond(C_NE, not_number);
+    a.ldr_d_imm(0, 22, lhs_off + 8);
+    a.ldr_d_imm(1, 22, rhs_off + 8);
+    a.fcmp(0, 1);
+    a.b_cond(C_EQ, equal);
+    a.b(unequal);
+    a.bind(not_number);
+    a.cmp_imm_w(9, 2);
+    a.b_cond(C_LS, equal); // both Undefined or both Null (Empty was rejected)
+    let not_bool = a.new_label();
+    a.cmp_imm_w(9, 3);
+    a.b_cond(C_NE, not_bool);
+    a.ldrb_imm(12, 22, lhs_off + 1);
+    a.ldrb_imm(13, 22, rhs_off + 1);
+    a.cmp_reg_w(12, 13);
+    a.b_cond(C_EQ, equal);
+    a.b(unequal);
+    a.bind(not_bool);
+    a.cmp_imm_w(9, 7);
+    a.b_cond(C_EQ, both_obj); // Symbols also compare by identity
+    a.b(slow); // String content and BigInt use their established helpers
 
     a.bind(lhs_nullish);
     if strict {
@@ -9208,6 +9264,30 @@ fn packed_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.property_meta < 4096
         && layout.dense_packed.is_multiple_of(8)
         && layout.dense_packed / 8 < 4096
+        && layout.dense_inline_len < 4096
+        && layout.dense_inline_data < 4096
+        && layout.dense_inline_data.is_multiple_of(8)
+}
+
+/// Resolve either current packed-element representation. x12 owns the live DenseBuffers;
+/// output x15 = Property pointer, x14 = length. A zero inline length means no packed storage.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_packed_elements_base(a: &mut asm::Asm, layout: &crate::value::JitLayout, legacy: usize) {
+    let heap = a.new_label();
+    let ready = a.new_label();
+    a.ldr_imm(15, 12, layout.dense_packed as u32);
+    a.cbnz(15, true, heap);
+    a.ldrb_imm(14, 12, layout.dense_inline_len as u32);
+    a.cbz(14, false, legacy);
+    a.add_imm(15, 12, layout.dense_inline_data as u32);
+    a.b(ready);
+    a.bind(heap);
+    a.ldr_imm(14, 15, layout.vec_len_off as u32);
+    a.ldr_imm(15, 15, layout.vec_ptr_off as u32);
+    a.bind(ready);
 }
 
 /// Packed entries can still use the numeric mirror read; the classic entry chase falls back.
@@ -9324,14 +9404,11 @@ fn emit_get_elem_inline(
     a.cbz(12, true, slow);
     if packed_elem_inlinable(layout) {
         let classic_dense = a.new_label();
-        a.ldr_imm(15, 12, layout.dense_packed as u32);
-        a.cbz(15, true, classic_dense);
+        emit_packed_elements_base(a, layout, classic_dense);
         // Packed elements are a keyless Vec<Property>: Empty remains a semantic hole, while a
         // live data slot can be decoded directly without an index string or entry-table chase.
-        a.ldr_imm(14, 15, layout.vec_len_off as u32);
         a.cmp_reg_x(9, 14);
         a.b_cond(C_HS, slow);
-        a.ldr_imm(15, 15, layout.vec_ptr_off as u32);
         a.add_shifted(15, 15, 9, 4); // property_size == 16 (gate above)
         guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
         a.ldur(13, 15, layout.property_value as i32);
@@ -9433,7 +9510,7 @@ enum MirrorVal {
 /// entry (see `value::Props::mirror`): keep `mirror[n]` coherent, drop `MIRROR_ALL_I32` for
 /// unproven values, and invalidate outright on a non-Num or the hole sentinel. Bounds are
 /// re-checked against the mirror's own length as corruption insurance (the lockstep invariant
-/// should make it redundant). Clobbers x9, x12, x13 and d1 only.
+/// should make it redundant). Clobbers x9, x12, x13 and d1/d2 only.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -9477,8 +9554,11 @@ fn emit_mirror_store(
         a.logic_imm_w(0, 9, 13, i32_bit);
         a.cbz(9, false, i32_done);
         a.fcvtzs_w_d(9, dv);
-        a.scvtf_d_w(1, 9);
-        a.fmov_x_d(9, 1);
+        // MirrorVal::Stack owns d1 and a local-element key may still own d0. Test the
+        // integer round-trip in d2: clobbering d1 used to truncate the stored mirror value
+        // (and lose -0) even though the authoritative property retained the exact Number.
+        a.scvtf_d_w(2, 9);
+        a.fmov_x_d(9, 2);
         a.fmov_x_d(12, dv);
         a.cmp_reg_x(9, 12);
         a.b_cond(C_EQ, i32_done);
@@ -9582,6 +9662,7 @@ fn emit_set_elem_inline(
     // 5. dense bounds
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
+    emit_packed_element_store(a, layout, slow, done, true, keep);
     a.ldr_imm(14, 12, evl);
     a.cmp_reg_x(9, 14);
     a.b_cond(C_HS, slow);
@@ -9675,6 +9756,66 @@ fn emit_set_elem_inline(
     a.bind(slow);
     emit_op_helper(a, H_SET_ELEM, pc, l_unwind);
     a.bind(done);
+}
+
+/// Numeric overwrites of the current keyless dense storage. ECMA-262 OrdinarySetWithOwnDescriptor
+/// and Array.[[DefineOwnProperty]] permit an existing writable data element to be overwritten
+/// without consulting prototypes or changing length. Holes, accessors, non-writable properties
+/// and reference-bearing old values retain the checked path. No guard follows the first write.
+/// Entry: x12 = DenseElems, x9 = index, x10 = receiver Rc, x11 = Object.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_packed_element_store(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    slow: usize,
+    done: usize,
+    stack_receiver: bool,
+    keep: bool,
+) {
+    if !packed_elem_inlinable(layout)
+        || layout.entry_value != layout.property_value
+        || layout.entry_accessor != layout.property_meta
+    {
+        return;
+    }
+    let classic = a.new_label();
+    emit_packed_elements_base(a, layout, classic);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, slow);
+    a.add_shifted(15, 15, 9, 4);
+    guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
+    guard_prop_writable(a, 14, 15, layout.property_meta as u32, slow);
+    emit_packed_number_drop_guard(a, layout, 15, slow);
+    emit_packed_stack_encode(a, -16, slow);
+    a.stur(16, 15, layout.property_value as i32);
+    // Packed storage is authoritative and normally has no numeric mirror. Invalidate the
+    // optional mirror conservatively, matching representation changes in Props.
+    a.strb_imm(
+        31,
+        11,
+        (layout.obj_props + layout.props_mirror_flags) as u32,
+    );
+    if stack_receiver {
+        a.ldur(13, 10, layout.rc_strong_off as i32);
+        a.sub_imm(13, 13, 1);
+        a.stur(13, 10, layout.rc_strong_off as i32);
+    }
+    let consumed = if stack_receiver { 48 } else { 32 };
+    if keep {
+        // The expression result retains the original Number, including signed zero and NaN.
+        a.ldur(14, 20, -16);
+        a.ldur(17, 20, -8);
+        a.stur(14, 20, -consumed);
+        a.stur(17, 20, -consumed + 8);
+        a.sub_imm(20, 20, (consumed - 16) as u32);
+    } else {
+        a.sub_imm(20, 20, consumed as u32);
+    }
+    a.b(done);
+    a.bind(classic);
 }
 
 /// Which fused parameter-slot element op to emit.
@@ -10057,14 +10198,14 @@ fn emit_elem_local_keyed(
     // 5b. dense bounds
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
+    if !get {
+        emit_packed_element_store(a, layout, slow, done, false, kind == ElemLocalKind::SetKeep);
+    }
     if get && packed_elem_inlinable(layout) {
         let classic_dense = a.new_label();
-        a.ldr_imm(15, 12, layout.dense_packed as u32);
-        a.cbz(15, true, classic_dense);
-        a.ldr_imm(14, 15, layout.vec_len_off as u32);
+        emit_packed_elements_base(a, layout, classic_dense);
         a.cmp_reg_x(9, 14);
         a.b_cond(C_HS, slow);
-        a.ldr_imm(15, 15, layout.vec_ptr_off as u32);
         a.add_shifted(15, 15, 9, 4);
         guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
         a.ldur(13, 15, layout.property_value as i32);
@@ -11128,10 +11269,10 @@ fn emit_chain(
     // the mirror data pointer and length, validated MIRROR_OK|NO_HOLES once — so later reads
     // are a bounds check + one indexed load, the shape one dispatch loop hits 5-6 times per
     // iteration on the same one or two arrays (NavierStokes' lin_solve). Classic mode caches
-    // only the base (register pressure, or the flags check failed at fill and the per-op
-    // mirror/classic dance answers each access).
-    // Cache registers live in x2-x8: `emit_name_ic_value_ptr` (in-chain LoadName) clobbers
-    // x9-x17, so the caches survive it. Invalidation: an in-chain Store/Update to the receiver
+    // only the base under register pressure. A null cached mirror pointer selects the native
+    // packed/classic path: an unavailable mirror must not replay a whole chain in helpers.
+    // Cache registers live in x2-x8 except x7: `emit_name_ic_value_ptr` (in-chain LoadName)
+    // clobbers x7 (the packed-value flag) and x9-x17. An in-chain Store/Update to the receiver
     // slot drops its entry.
     enum RcMode {
         Classic,
@@ -11143,7 +11284,7 @@ fn emit_chain(
         mode: RcMode,
     }
     let mut rcache: Vec<RcEnt> = Vec::new();
-    let mut rfree: Vec<u32> = vec![8, 7, 6, 5, 4, 3, 2];
+    let mut rfree: Vec<u32> = vec![8, 6, 5, 4, 3, 2];
     // (chain index, bail label, virtual stack *before* the op) — slow paths follow the fast body.
     let mut bails: Vec<(usize, usize, Vec<(u32, bool)>)> = Vec::new();
 
@@ -11387,6 +11528,7 @@ fn emit_chain(
                 a.ucvtf_d_w(0, 9);
                 a.fcmp(dk, 0);
                 a.b_cond(C_NE, guard!());
+                let packed_done = a.new_label();
                 let cached = rcache.iter().position(|c| c.off == xoff);
                 let mode: Option<(u32, u32)> = match cached {
                     Some(k) => {
@@ -11414,13 +11556,16 @@ fn emit_chain(
                         a.ldrb_imm(12, 11, plain); // no side-table behavior
                         a.cbz(12, false, guard!());
                         if rfree.len() >= 3 {
-                            // Mirror mode: prove coherent + hole-free once, pin data ptr and
-                            // length. A flags miss bails the chain (the plain templates run
-                            // the rest) — only mirror-incoherent or holey arrays pay that.
+                            // Retain the existing numeric-kernel optimization when a mirror
+                            // is coherent. Its absence selects native element access below,
+                            // rather than forcing either representation through slow helpers.
                             let base = rfree.pop().unwrap();
                             let mpreg = rfree.pop().unwrap();
                             let mlreg = rfree.pop().unwrap();
+                            let no_mirror = a.new_label();
                             a.mov(base, 11);
+                            a.movz(mpreg, 0, 0);
+                            a.movz(mlreg, 0, 0);
                             a.ldrb_imm(12, 11, mf);
                             let mask = asm::logical_imm_w(
                                 (crate::value::MIRROR_OK | crate::value::MIRROR_NO_HOLES) as u32,
@@ -11431,11 +11576,21 @@ fn emit_chain(
                                 12,
                                 (crate::value::MIRROR_OK | crate::value::MIRROR_NO_HOLES) as u32,
                             );
-                            a.b_cond(C_NE, guard!());
+                            a.b_cond(C_NE, no_mirror);
                             a.ldr_imm(12, 11, mirror);
-                            a.cbz(12, true, guard!());
+                            a.cbz(12, true, no_mirror);
+                            if packed_elem_inlinable(layout) {
+                                // Only indexed entry storage is updated alongside this pinned
+                                // mirror. A keyless packed store invalidates its optional mirror;
+                                // never retain such a pointer across a store through an alias.
+                                a.ldr_imm(13, 12, layout.dense_packed as u32);
+                                a.cbnz(13, true, no_mirror);
+                                a.ldrb_imm(13, 12, layout.dense_inline_len as u32);
+                                a.cbnz(13, false, no_mirror);
+                            }
                             a.ldr_imm(mpreg, 12, mvp);
                             a.ldr_imm(mlreg, 12, mvl);
+                            a.bind(no_mirror);
                             rcache.push(RcEnt {
                                 off: xoff,
                                 base,
@@ -11459,11 +11614,12 @@ fn emit_chain(
                     // Mirror-pinned receiver: bounds against the register copy, then one
                     // indexed access. Stores also sync the canonical entry payload (readers
                     // outside the chain trust entries) and keep the ALL_I32 flag honest.
+                    let native_elements = a.new_label();
+                    a.cbz(mpreg, true, native_elements);
                     a.cmp_reg_x(9, mlreg);
                     a.b_cond(C_HS, guard!());
                     if !is_set {
                         a.ldr_d_lsl3(dk, mpreg, 9);
-                        vregs.push((dk, false));
                     } else {
                         a.ldr_imm(12, 11, el);
                         a.cbz(12, true, guard!());
@@ -11475,7 +11631,17 @@ fn emit_chain(
                         a.ldr_imm(15, 11, en);
                         a.movz(14, es as u32, 0);
                         a.madd(15, 13, 14, 15);
-                        a.stur_d(dv, 15, num_ev); // MIRROR_OK ⇒ plain writable data Num
+                        if layout.entry_accessor == layout.entry_value + 8 {
+                            a.fmov_x_d(14, dv);
+                            a.fcmp(dv, dv);
+                            let encoded = a.new_label();
+                            a.b_cond(C_VS ^ 1, encoded);
+                            a.mov_imm64(14, f64::NAN.to_bits());
+                            a.bind(encoded);
+                            a.stur(14, 15, num_ev);
+                        } else {
+                            a.stur_d(dv, 15, num_ev);
+                        }
                         a.str_d_lsl3(dv, mpreg, 9);
                         // Flag-first ALL_I32 upkeep (dv int-ness is unknown in this tier).
                         let i32_done = a.new_label();
@@ -11495,17 +11661,42 @@ fn emit_chain(
                         a.logic_imm_w(0, 13, 13, clear);
                         a.strb_imm(13, 11, mf);
                         a.bind(i32_done);
-                        free.push(dk);
-                        if keep {
-                            vregs.push((dv, viv));
-                        } else {
-                            free.push(dv);
-                        }
                     }
-                    if used > 0 {
-                        bails.push((idx, bail, pre_op));
+                    a.b(packed_done);
+                    a.bind(native_elements);
+                }
+                if packed_elem_inlinable(layout)
+                    && layout.entry_value == layout.property_value
+                    && layout.entry_accessor == layout.property_meta
+                {
+                    // The receiver is already validated (and cached across this helper-free
+                    // chain). Packed array literals have no legacy numeric mirror.
+                    let indexed = a.new_label();
+                    a.ldr_imm(12, 11, el);
+                    a.cbz(12, true, guard!());
+                    emit_packed_elements_base(a, layout, indexed);
+                    a.cmp_reg_x(9, 14);
+                    a.b_cond(C_HS, guard!());
+                    a.add_shifted(15, 15, 9, 4);
+                    guard_prop_data(a, 14, 15, layout.property_meta as u32, guard!());
+                    if is_set {
+                        guard_prop_writable(a, 14, 15, layout.property_meta as u32, guard!());
                     }
-                    continue;
+                    emit_packed_number_drop_guard(a, layout, 15, guard!());
+                    if is_set {
+                        a.fmov_x_d(16, dv);
+                        a.fcmp(dv, dv);
+                        let encoded = a.new_label();
+                        a.b_cond(C_VS ^ 1, encoded);
+                        a.mov_imm64(16, f64::NAN.to_bits());
+                        a.bind(encoded);
+                        a.stur(16, 15, layout.property_value as i32);
+                        a.strb_imm(31, 11, mf);
+                    } else {
+                        a.fmov_d_x(dk, 12);
+                    }
+                    a.b(packed_done);
+                    a.bind(indexed);
                 }
                 let mirror_done = a.new_label();
                 let classic = a.new_label();
@@ -11555,7 +11746,17 @@ fn emit_chain(
                     a.ldr_imm(15, 11, en);
                     a.movz(14, es as u32, 0);
                     a.madd(15, 13, 14, 15);
-                    a.stur_d(dv, 15, num_ev);
+                    if layout.entry_accessor == layout.entry_value + 8 {
+                        a.fmov_x_d(14, dv);
+                        a.fcmp(dv, dv);
+                        let encoded = a.new_label();
+                        a.b_cond(C_VS ^ 1, encoded);
+                        a.mov_imm64(14, f64::NAN.to_bits());
+                        a.bind(encoded);
+                        a.stur(14, 15, num_ev);
+                    } else {
+                        a.stur_d(dv, 15, num_ev);
+                    }
                     a.ldr_imm(12, 11, mirror);
                     a.ldr_imm(12, 12, mvp);
                     a.str_d_lsl3(dv, 12, 9);
@@ -11578,9 +11779,6 @@ fn emit_chain(
                     a.b(mirror_done);
                 }
                 a.bind(classic);
-                if layout.entry_accessor == layout.entry_value + 8 {
-                    a.b(guard!());
-                }
                 a.ldr_imm(12, 11, el);
                 a.cbz(12, true, guard!());
                 a.ldr_imm(14, 12, evl);
@@ -11595,6 +11793,28 @@ fn emit_chain(
                 a.movz(9, es as u32, 0); // entry stride (< 65536; the key index in x9 is dead)
                 a.madd(15, 13, 9, 15);
                 guard_prop_data(a, 9, 15, ea, guard!());
+                if layout.entry_accessor == layout.entry_value + 8 {
+                    // A length update or descriptor operation can invalidate the optional
+                    // mirror without changing ordinary numeric elements. Read authoritative
+                    // packed properties directly instead of replaying the entire chain.
+                    if is_set {
+                        guard_prop_writable(a, 14, 15, ew, guard!());
+                    }
+                    emit_packed_number_drop_guard(a, layout, 15, guard!());
+                    if is_set {
+                        a.fmov_x_d(16, dv);
+                        a.fcmp(dv, dv);
+                        let encoded = a.new_label();
+                        a.b_cond(C_VS ^ 1, encoded);
+                        a.mov_imm64(16, f64::NAN.to_bits());
+                        a.bind(encoded);
+                        a.stur(16, 15, ev);
+                        a.strb_imm(31, 11, mf);
+                    } else {
+                        a.fmov_d_x(dk, 12);
+                    }
+                    a.b(mirror_done);
+                }
                 if is_set {
                     guard_prop_writable(a, 9, 15, ew, guard!());
                     // old value: droppable inline, or bail (w14/x12 stay live to the dec)
@@ -11644,6 +11864,7 @@ fn emit_chain(
                     a.bind(mirror_done);
                     vregs.push((dk, false));
                 }
+                a.bind(packed_done);
             }
             ChainOp::Arith(f) => {
                 let (rm, _) = vregs.pop().expect("chain vstack");
