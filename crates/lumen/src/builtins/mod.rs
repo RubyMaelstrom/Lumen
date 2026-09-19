@@ -6577,6 +6577,16 @@ fn array_get_present_index(
     index: usize,
 ) -> Result<Option<Value>, Value> {
     if let Some(value) = i.fast_get_elem(object, index as f64) {
+        // A successful numeric TypedArray Get can return undefined for a detached or
+        // out-of-bounds index. That is not a present element. Array callback/search methods
+        // require HasProperty first (ECMA-262 §23.1.3; TypedArray.[[HasProperty]] and
+        // IsValidIntegerIndex, snapshot e28783d5fc9d). Valid numeric elements cannot contain
+        // undefined; ordinary own properties containing undefined must still be visited.
+        if matches!(value, Value::Undefined)
+            && i.typed_arrays.contains_key(&(Rc::as_ptr(object) as usize))
+        {
+            return Ok(None);
+        }
         return Ok(Some(value));
     }
     let key = index.to_string();

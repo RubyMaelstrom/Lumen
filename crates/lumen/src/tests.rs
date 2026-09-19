@@ -6590,6 +6590,57 @@ fn array_length_index() {
 }
 
 #[test]
+fn array_callbacks_distinguish_missing_typed_elements_from_undefined() {
+    let source = r#"
+        const check=(value,message)=>{if(!value)throw Error(message);};
+        const ordinary=[];
+        [undefined,,1].forEach((value,index)=>ordinary.push(index));
+        check(ordinary.join(',')==='0,2','own undefined is present');
+        check([undefined].indexOf(undefined)===0,'search own undefined');
+        const buffer=new ArrayBuffer(4,{maxByteLength:8});
+        const fixed=new Uint8Array(buffer,0,4);fixed.set([1,2,3,4]);
+        const visited=[];
+        const mapped=Array.prototype.map.call(fixed,(value,index)=>{
+            visited.push(index);if(index===1)buffer.resize(2);return value;
+        });
+        check(visited.join(',')==='0,1'&&mapped.length===4&&!(2 in mapped),
+            'fixed view becomes entirely out of bounds');
+        buffer.resize(4);fixed.set([1,2,3,4]);
+        const tracking=new Uint8Array(buffer),reverse=[];
+        Array.prototype.reduceRight.call(tracking,(acc,value,index)=>{
+            reverse.push(index);if(index===3)buffer.resize(2);return acc+value;
+        },0);
+        check(reverse.join(',')==='3,1,0','tracking view keeps remaining valid indices');
+        buffer.resize(4);
+        check(Array.prototype.indexOf.call(fixed,undefined,{valueOf(){buffer.resize(0);return 0;}})===-1,
+            'absent indices cannot match undefined after argument coercion');
+        buffer.resize(4);
+        check(Array.prototype.lastIndexOf.call(fixed,undefined,{valueOf(){buffer.resize(2);return 3;}})===-1,
+            'reverse search rechecks current bounds');
+        buffer.resize(4);
+        const detached=[];
+        Array.prototype.forEach.call(fixed,(value,index)=>{detached.push(index);buffer.transfer();});
+        check(detached.join(',')==='0','detachment skips later absent indices');
+        const other=new ArrayBuffer(4,{maxByteLength:8}),view=new Uint8Array(other),found=[];
+        Array.prototype.find.call(view,(value,index)=>{
+            found.push(value);if(index===0)other.resize(0);return false;
+        });
+        check(found.length===4&&found[1]===undefined,'Get-based find still visits absent indices');
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "{tier:?}");
+    }
+}
+
+#[test]
 fn packed_dense_numeric_array_semantics() {
     let literal = "[0,1,2,3,4,5,6,7,8,9]";
     assert_eq!(
