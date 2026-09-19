@@ -712,6 +712,18 @@ fn canonicalize_map_key(k: Value) -> Value {
     }
 }
 
+pub(crate) fn map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<Value, Value> {
+    let ptr = coll_ptr_kind(i, map, Some("Map"))?;
+    let key = canonicalize_map_key(key.clone());
+    Ok(collection_get(i, ptr, &key).unwrap_or(Value::Undefined))
+}
+
+pub(crate) fn map_set(i: &mut Interp, map: &Value, key: Value, value: Value) -> Result<(), Value> {
+    let ptr = coll_ptr_kind(i, map, Some("Map"))?;
+    collection_set(i, ptr, canonicalize_map_key(key), value);
+    Ok(())
+}
+
 /// Map and Set share almost everything; `is_set` flips key/value handling and method names.
 pub(super) fn install_map_like(
     it: &mut Interp,
@@ -731,9 +743,7 @@ pub(super) fn install_map_like(
         }
     } else {
         |i, this, a| {
-            let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            let (key, val) = (canonicalize_map_key(arg(a, 0)), arg(a, 1));
-            collection_set(i, ptr, key, val);
+            map_set(i, &this, arg(a, 0), arg(a, 1))?;
             Ok(this)
         }
     };
@@ -744,11 +754,7 @@ pub(super) fn install_map_like(
         adder,
     );
     if !is_set {
-        it.def_method(&proto, "get", 1, |i, this, a| {
-            let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            let key = canonicalize_map_key(arg(a, 0));
-            Ok(collection_get(i, ptr, &key).unwrap_or(Value::Undefined))
-        });
+        it.def_method(&proto, "get", 1, |i, this, a| map_get(i, &this, &arg(a, 0)));
     }
     // has/delete are shared but brand-check the exact kind via kind-specific fn pointers.
     let has_fn: NativeFn = if is_set {
@@ -941,6 +947,14 @@ fn weak_entry_index(i: &Interp, ptr: usize, key: &Value) -> Option<usize> {
     i.weak_collection_index.get(&ptr)?.get(&identity).copied()
 }
 
+pub(crate) fn weak_map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<Value, Value> {
+    let ptr = weak_brand_ptr(i, map, "WeakMap")?;
+    Ok(weak_entry_index(i, ptr, key)
+        .and_then(|index| i.weak_collection_data.get(&ptr)?.get(index))
+        .map(|(_, value)| value.clone())
+        .unwrap_or(Value::Undefined))
+}
+
 fn weak_insert(i: &mut Interp, ptr: usize, key: Value, value: Value) {
     let target = crate::interpreter::WeakTarget::of(&key)
         .expect("WeakMap and WeakSet entries have weakly holdable keys");
@@ -1031,12 +1045,7 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
     );
     if !is_set {
         it.def_method(&proto, "get", 1, |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, "WeakMap")?;
-            let key = arg(a, 0);
-            Ok(weak_entry_index(i, ptr, &key)
-                .and_then(|index| i.weak_collection_data.get(&ptr)?.get(index))
-                .map(|(_, value)| value.clone())
-                .unwrap_or(Value::Undefined))
+            weak_map_get(i, &this, &arg(a, 0))
         });
         // Upsert proposal: getOrInsert(key, value) / getOrInsertComputed(key, callbackfn).
         it.def_method(&proto, "getOrInsert", 2, |i, this, a| {

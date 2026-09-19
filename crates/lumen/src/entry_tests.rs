@@ -116,14 +116,7 @@ fn compiled_entry_arguments_mapping_and_parameter_body_cells() {
         [mapped(1,2),duplicate(1,2),unmapped(1),complex(),separate(),captured(1)].join('|')
     "#,
         "4:4:7|9:8|4:9|4:9|1:9|14",
-        &[
-            "mapped",
-            "duplicate",
-            "unmapped",
-            "complex",
-            "separate",
-            "captured",
-        ],
+        &["mapped", "duplicate", "complex", "separate", "captured"],
         true,
     );
 }

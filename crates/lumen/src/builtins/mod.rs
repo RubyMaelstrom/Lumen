@@ -14,6 +14,7 @@ use std::rc::Rc;
 // are reachable from each submodule via `use super::*`.
 mod atomics;
 mod collections;
+pub(crate) use collections::{map_get, map_set, weak_map_get};
 mod dataview;
 mod date;
 mod disposable;

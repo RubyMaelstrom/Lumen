@@ -5008,8 +5008,8 @@ fn compile_inner(
 ) -> Option<Rc<Chunk>> {
     // Body facts the scanner already knows: `new.target` is an observation channel into the
     // activation that slots do not provide; `this` / `arguments` in an ordinary arrow are free
-    // variables we do not model. Parameterless synchronous ordinary functions can materialize an
-    // unmapped arguments object into a dedicated slot (the common variadic-helper shape).
+    // variables we do not model. Ordinary functions with unmapped arguments can materialize
+    // the object into a dedicated slot, independently of their positional parameters.
     let scan = func.scan_flags();
     let is_coroutine = func.is_generator || func.is_async;
     // ECMA-262 §9.4.5 GetNewTarget reads the nearest this-binding Function Environment Record.
@@ -5022,6 +5022,13 @@ fn compile_inner(
         return None;
     }
     let uses_arguments = scan & SCAN_ARGUMENTS != 0;
+    // ECMA-262 §10.2.11: strict functions never map arguments indices to parameter
+    // bindings. Simple parameters can therefore use the ordinary compiled entry;
+    // defaults/destructuring retain their existing general instantiation path.
+    let strict_simple_arguments = func.is_strict
+        && func.params.iter().all(|param| {
+            !param.rest && param.default.is_none() && matches!(param.pattern, Pattern::Ident(_))
+        });
     // ECMA-262 §10.2.11 creates a mapped arguments object only for a non-strict, non-arrow
     // function with a simple parameter list. A nonempty mapped list must alias parameter writes;
     // the current coroutine slot projection cannot yet preserve that relationship.
@@ -5041,6 +5048,7 @@ fn compile_inner(
         && !is_coroutine
         && !prepared_entry
         && !func.params.is_empty()
+        && !strict_simple_arguments
     {
         log_bail("fn", "arguments with arrow/async/parameters");
         return None;
@@ -5116,26 +5124,6 @@ fn compile_inner(
         // More importantly, a fresh function activation would put pre-instantiated module cells
         // in the parent while `LoadCap`/`StoreCap` intentionally address the fixed home directly.
         c.reuse_activation = true;
-    }
-    if uses_arguments && !func.is_arrow && !prepared_entry {
-        if has_mapped_parameter_aliases {
-            c.env_bind("arguments", false);
-        } else if !is_coroutine {
-            if captured.contains("arguments") {
-                // ECMA-262 §15.3.4: an arrow has no own arguments binding. Materialize the
-                // enclosing function's one arguments object in its activation so both the outer
-                // body and every captured arrow resolve the same identity.
-                c.env_bind("arguments", false);
-                c.env_arguments = true;
-            } else {
-                let slot = c.fresh_slot("arguments");
-                c.scope_bind("arguments", slot, false);
-                c.arguments_slot = Some(slot);
-            }
-        }
-        // Other coroutines deliberately leave `arguments` unresolved in the chunk. The normal
-        // name operation walks the retained activation installed by FunctionDeclarationInstantiation,
-        // or its parents for an arrow, so direct reads and nested arrows observe one object.
     }
     // Captured once-per-call block `let`s home in the activation (TDZ from entry, initialized
     // by the declaring block's own StoreCapInit); CaptureScan proved no enclosing same-name
@@ -5228,6 +5216,28 @@ fn compile_inner(
             c.emit(Op::StoreLocal(slot));
             c.patch(jf);
         }
+    }
+    if uses_arguments && !func.is_arrow && !prepared_entry {
+        if has_mapped_parameter_aliases {
+            c.env_bind("arguments", false);
+        } else if !is_coroutine {
+            if captured.contains("arguments") {
+                // ECMA-262 §15.3.4: an arrow has no own arguments binding. Materialize the
+                // enclosing function's one arguments object in its activation so both the outer
+                // body and every captured arrow resolve the same identity.
+                c.env_bind("arguments", false);
+                c.env_arguments = true;
+            } else {
+                // Positional parameters must occupy the first n_params slots in every
+                // VM/JIT entry. Allocate the independent arguments slot only after them.
+                let slot = c.fresh_slot("arguments");
+                c.scope_bind("arguments", slot, false);
+                c.arguments_slot = Some(slot);
+            }
+        }
+        // Other coroutines deliberately leave `arguments` unresolved in the chunk. The normal
+        // name operation walks the retained activation installed by FunctionDeclarationInstantiation,
+        // or its parents for an arrow, so direct reads and nested arrows observe one object.
     }
     // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
     let mut annexb_blocked = crate::interpreter::param_bound_names(&func.params);

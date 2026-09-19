@@ -3825,6 +3825,148 @@ fn high_churn_task_collects_after_temporary_roots_are_released() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn host_numeric_array_copy_guards_observable_property_reads() {
+    let mut engine = Engine::new();
+    let mut evaluate = |source: &str| {
+        engine
+            .eval_value_interruptible(source)
+            .unwrap()
+            .unwrap_or_else(|_| panic!("array fixture threw"))
+    };
+    let dense = evaluate("Object.freeze([1,-0,NaN,Infinity])");
+    let accessor =
+        evaluate("var reads=0;Object.defineProperty([1,2],'1',{get(){reads++;return 2;}})");
+    let proxy = evaluate("new Proxy([1,2],{get(t,k){reads++;return t[k];}})");
+    let holes = evaluate("Array(2)");
+    let mixed = evaluate("[1,{valueOf(){reads++;return 2;}}]");
+    let values = engine.ctx().copy_numeric_array(&dense, 4).unwrap();
+    assert_eq!(values[0], 1.);
+    assert!(values[1].is_sign_negative());
+    assert!(values[2].is_nan());
+    assert!(values[3].is_infinite());
+    assert!(engine.ctx().copy_numeric_array(&dense, 3).is_none());
+    for value in [accessor, proxy, holes, mixed] {
+        assert!(engine.ctx().copy_numeric_array(&value, 8).is_none());
+    }
+    assert!(matches!(
+        engine.eval_value_interruptible("reads").unwrap().ok(),
+        Some(crate::value::Value::Num(0.))
+    ));
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn host_weak_map_lookup_uses_intrinsic_brand_and_storage() {
+    let mut engine = Engine::new();
+    let value = engine.eval_value_interruptible(
+        "var key={};var slots=new WeakMap([[key,42]]);slots.get=()=>{throw Error('override')};slots"
+    ).unwrap().unwrap_or_else(|_| panic!("weak map fixture threw"));
+    let key = engine
+        .eval_value_interruptible("key")
+        .unwrap()
+        .unwrap_or_else(|_| panic!("key fixture threw"));
+    assert!(matches!(
+        engine.ctx().weak_map_get(&value, &key).ok(),
+        Some(crate::value::Value::Num(42.))
+    ));
+    assert!(matches!(
+        engine
+            .ctx()
+            .weak_map_get(&value, &crate::value::Value::Null)
+            .ok(),
+        Some(crate::value::Value::Undefined)
+    ));
+    let set = engine
+        .eval_value_interruptible("new WeakSet([key])")
+        .unwrap()
+        .unwrap_or_else(|_| panic!("set fixture threw"));
+    assert!(engine.ctx().weak_map_get(&set, &key).is_err());
+    let map = engine
+        .eval_value_interruptible("new Map()")
+        .unwrap()
+        .unwrap_or_else(|_| panic!("map fixture threw"));
+    engine
+        .ctx()
+        .map_set(&map, crate::value::Value::Num(-0.), key.clone())
+        .unwrap_or_else(|_| panic!("map intrinsic failed"));
+    let found = engine
+        .ctx()
+        .map_get(&map, &crate::value::Value::Num(0.))
+        .unwrap_or_else(|_| panic!("map intrinsic failed"));
+    assert!(engine.ctx().values_strict_equal(&found, &key));
+    engine
+        .ctx()
+        .map_set(
+            &map,
+            crate::value::Value::Num(f64::NAN),
+            crate::value::Value::Num(7.),
+        )
+        .unwrap_or_else(|_| panic!("map intrinsic failed"));
+    assert!(matches!(
+        engine
+            .ctx()
+            .map_get(&map, &crate::value::Value::Num(f64::NAN))
+            .unwrap_or_else(|_| panic!("map lookup failed")),
+        crate::value::Value::Num(7.)
+    ));
+    assert!(engine.ctx().map_get(&set, &key).is_err());
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn transient_tasks_avoid_full_heap_scans_and_small_cycles_stay_bounded() {
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(0);
+    engine
+        .eval_value_interruptible("var anchors=[];for(var i=0;i<60000;i++)anchors.push({i});")
+        .unwrap()
+        .unwrap_or_else(|_| panic!("GC fixture threw"));
+    engine.ctx().collect_garbage_for_host();
+    let baseline = engine.ctx().live_object_count();
+    engine
+        .eval_value_interruptible(
+            "var dead={};dead.self=dead;var weak=new WeakRef(dead);dead=null;\n\
+         for(var i=0;i<20000;i++){var temporary={i};}temporary=null;",
+        )
+        .unwrap()
+        .unwrap_or_else(|_| panic!("GC fixture threw"));
+    engine.run_microtasks_interruptible().unwrap();
+    assert_eq!(
+        engine.interp.gc_task_live, baseline,
+        "transient churn scanned the retained heap"
+    );
+    let value = engine
+        .eval_value_interruptible("weak.deref()!==undefined")
+        .unwrap()
+        .unwrap_or_else(|_| panic!("GC fixture threw"));
+    assert!(matches!(value, crate::value::Value::Bool(true)));
+    // ClearKeptObjects after deref.
+    engine.run_microtasks_interruptible().unwrap();
+    // Each task allocates less than the old per-task trigger. Cumulative retained
+    // growth must still collect, without approaching the ordinary doubling limit.
+    for _ in 0..20 {
+        engine
+            .eval_value_interruptible(
+                "for(var i=0;i<1500;i++){var cycle={};cycle.self=cycle;}cycle=null;",
+            )
+            .unwrap()
+            .unwrap_or_else(|_| panic!("GC fixture threw"));
+        engine.run_microtasks_interruptible().unwrap();
+        assert!(engine.ctx().live_object_count() < baseline + 12_000);
+    }
+    let value = engine
+        .eval_value_interruptible("weak.deref()===undefined")
+        .unwrap()
+        .unwrap_or_else(|_| panic!("GC fixture threw"));
+    assert!(
+        matches!(value, crate::value::Value::Bool(true)),
+        "cycles were not collected"
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn error_diagnostics_do_not_execute_author_code() {
     let mut engine = Engine::new();
     run_in(
@@ -7417,6 +7559,65 @@ fn compiled_parameterless_arguments_object() {
             Completion::Throw { name, message } => panic!("threw {name}: {message}"),
         };
         assert_eq!(got, "3:a:c:true:a,b,c|true|TypeError");
+    }
+}
+
+#[test]
+fn compiled_strict_arguments_preserve_parameters_and_escaping_identity() {
+    // ECMA-262 §10.2.11 / §10.4.4.6: strict arguments are independent of formal
+    // bindings, including after escape and when captured by a lexical arrow.
+    let source = r#"
+      function inspect(a,b,c) {
+        "use strict";
+        a = 20;
+        arguments[1] = 30;
+        return [a,b,c,arguments.length,arguments[0],arguments[1],arguments[3],arguments];
+      }
+      function capture(a,b) {
+        "use strict";
+        const original = arguments;
+        a = 90;
+        return () => [a,b,arguments === original,arguments[0],arguments.length];
+      }
+      let x;
+      for(let n=0;n<300;n++) x=inspect(1,2,3,4);
+      const y=inspect(5), escaped=x.pop();
+      escaped[0]=11;
+      let poisoned=false;
+      try { escaped.callee; } catch(e) { poisoned=e instanceof TypeError; }
+      x.join(',')+'|'+y.slice(0,7).join(',')+'|'+capture(7,8,9)().join(',')+
+        '|'+poisoned+'|'+(escaped!==y[7])+'|'+Object.keys(escaped).join(',');
+    "#;
+    let statements = crate::parser::parse_script(source, false)
+        .ok()
+        .expect("parse");
+    let function = statements
+        .iter()
+        .find_map(|statement| match statement {
+            crate::ast::Stmt::FuncDecl(function) => Some(function.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let chunk = crate::bytecode::compile(&function).expect("ordinary compiled strict arguments");
+    assert!(!chunk.prepared_entry);
+    assert_eq!(chunk.jit_frame().0, 3);
+    assert_eq!(chunk.jit_arguments_slot(), Some(3));
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut e = Engine::new();
+        e.interp.tier = tier;
+        e.interp.tier_threshold = 0;
+        let got = match e.eval(source, false).expect("parse") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{tier:?}: threw {name}: {message}"),
+        };
+        assert_eq!(
+            got, "20,2,3,4,1,30,4|20,,,1,5,30,|90,8,true,7,3|true|true|0,1,2,3",
+            "{tier:?}"
+        );
     }
 }
 

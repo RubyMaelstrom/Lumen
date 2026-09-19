@@ -2318,6 +2318,8 @@ pub struct Interp {
     pub(crate) gc_tick: u32,
     /// Allocation counter at the preceding host task boundary.
     pub(crate) gc_task_allocated: u64,
+    /// Objects remaining after the most recent collection, for task-boundary pressure.
+    pub(crate) gc_task_live: i64,
     /// Prune the scope registry once its entry count passes this floating threshold.
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
@@ -2529,6 +2531,7 @@ interp_memory_inventory! {
     gc_suppressed => "non_owning",
     gc_tick => "non_owning",
     gc_task_allocated => "non_owning",
+    gc_task_live => "non_owning",
     scope_gc_next => "non_owning",
     constructing => "non_owning",
     super_call_ok => "non_owning",
@@ -2576,7 +2579,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 138);
+    assert_eq!(names.len(), 139);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -2850,9 +2853,8 @@ pub(crate) const GC_DIRECT_MAINT_MASK: u32 = 4095;
 /// Scope-registry entry count that arms a registry prune.
 const SCOPE_GC_TRIGGER: usize = 65_536;
 
-/// Per-task allocation volume which triggers an end-of-task cycle collection. This catches a
-/// large graph which remained reachable at allocation safepoints but became garbage when its task
-/// returned, without collecting after every low-churn browser task.
+/// Minimum pressure that triggers an end-of-task cycle collection. Larger retained heaps scale
+/// this floor, so short-lived allocation churn alone does not force a full scan every frame.
 const GC_TASK_ALLOCATION_TRIGGER: u64 = 10_000;
 
 /// Memory safety valves. Several built-ins iterate/allocate in proportion to a user-controlled
@@ -3442,6 +3444,7 @@ impl Interp {
             gc_suppressed: 0,
             gc_tick: 0,
             gc_task_allocated: crate::value::heap_allocated_objects(&gc_heap),
+            gc_task_live: crate::value::heap_live_objects(&gc_heap),
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
             super_call_ok: false,
@@ -4533,6 +4536,55 @@ impl Interp {
         Value::Obj(obj)
     }
 
+    /// Copy a bounded ordinary Array containing only own numeric data properties.
+    /// Returns None without executing author code for proxies, holes, accessors, or
+    /// non-numbers; callers must then use normal property reads and conversions.
+    /// ECMA-262 OrdinaryGet returns these own data values before consulting prototypes.
+    pub fn copy_numeric_array(&self, value: &Value, limit: usize) -> Option<Vec<f64>> {
+        let object = value.as_obj()?;
+        if !self.ordinary_get_ptr(Rc::as_ptr(object) as usize) {
+            return None;
+        }
+        let object = object.borrow();
+        if !matches!(object.exotic, Exotic::Array) {
+            return None;
+        }
+        let length = object.props.get("length")?;
+        if length.accessor() {
+            return None;
+        }
+        let length = length.value().as_num_opt()?;
+        if length > limit as f64 {
+            return None;
+        }
+        let mut values = Vec::with_capacity(length as usize);
+        for index in 0..length as u32 {
+            let property = object.props.get_index(index)?;
+            if property.accessor() {
+                return None;
+            }
+            values.push(property.value().as_num_opt()?);
+        }
+        Some(values)
+    }
+
+    /// Intrinsic WeakMap.prototype.get for host-owned private-slot tables. Uses
+    /// the same brand check and ephemeron storage as JS, without an overridable
+    /// property lookup or a temporary Reflect.apply argument array.
+    pub fn weak_map_get(&mut self, map: &Value, key: &Value) -> Result<Value, Value> {
+        crate::builtins::weak_map_get(self, map, key)
+    }
+
+    /// Intrinsic Map lookup for private host state; does not invoke overridden methods.
+    pub fn map_get(&mut self, map: &Value, key: &Value) -> Result<Value, Value> {
+        crate::builtins::map_get(self, map, key)
+    }
+
+    /// Intrinsic Map assignment for private host state, with normal SameValueZero key semantics.
+    pub fn map_set(&mut self, map: &Value, key: Value, value: Value) -> Result<(), Value> {
+        crate::builtins::map_set(self, map, key, value)
+    }
+
     /// Build an array by moving `len` initialized values directly from a JIT operand stack.
     ///
     /// # Safety
@@ -4839,6 +4891,34 @@ impl Interp {
             .copied()?;
         let len = self.ta_len(&info)?;
         self.ta_read_bytes(&info, 0, len)
+    }
+
+    /// Snapshot a matching TypedArray over fixed backing storage for Web IDL unions.
+    /// Brand, view bounds, detached state and resizability come from intrinsic slots;
+    /// user properties and @@iterator are never read. None requires normal conversion
+    /// or rejection by the host, never treating an unmatched value as an empty list.
+    pub fn fixed_typed_array_bytes(
+        &self,
+        value: &Value,
+        name: &str,
+        allow_shared: bool,
+    ) -> Option<Vec<u8>> {
+        let ptr = self.object_addr(value)?;
+        let info = self.typed_arrays.get(&ptr)?;
+        if info.kind.name() != name
+            || (!allow_shared && self.shared_buffers.contains_key(&info.buffer))
+        {
+            return None;
+        }
+        let buffer = self.ta_buffer.get(&ptr)?.as_obj()?.borrow();
+        if !matches!(
+            buffer.props.get("__abResizable").map(|p| p.value()),
+            Some(Value::Bool(false))
+        ) {
+            return None;
+        }
+        let len = self.ta_len(info)?;
+        self.ta_read_bytes(info, 0, len)
     }
 
     /// Copy the bytes held by a Web IDL `BufferSource` (`ArrayBuffer`, `DataView`, or any
@@ -7917,7 +7997,7 @@ impl Interp {
         Ok(())
     }
 
-    /// Collect after a high-churn host task, when temporary roots from that task have gone away.
+    /// Collect after a high-pressure host task, when temporary roots from that task have gone away.
     /// Allocation safepoints alone cannot see this transition: a graph may be reachable during
     /// every in-task collection and become cyclic garbage only as the callback returns.
     pub(crate) fn gc_task_boundary(&mut self) -> i64 {
@@ -7930,10 +8010,23 @@ impl Interp {
         let allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         let churn = allocated.wrapping_sub(self.gc_task_allocated);
         self.gc_task_allocated = allocated;
-        if churn < GC_TASK_ALLOCATION_TRIGGER {
+        let before = crate::value::heap_live_objects(&self.gc_heap);
+        let floor = GC_TASK_ALLOCATION_TRIGGER as i64;
+        // Most short-lived objects are already reclaimed by reference counting.
+        // Scanning an entire retained scene after every 10k transient allocations
+        // makes animation pauses proportional to the scene even with no garbage.
+        // Collect once retained growth reaches 1/8 of the last live set, or one
+        // task allocates half that set (covering graphs released after an in-task
+        // collection). The 10k floor preserves prompt collection on small heaps;
+        // growth also catches cycles accumulated across many smaller tasks.
+        // ECMA-262 #sec-liveness permits this scheduling choice. ClearKeptObjects
+        // above still runs at every job boundary, independently of collection.
+        let growth = before.saturating_sub(self.gc_task_live);
+        if growth < (self.gc_task_live / 8).max(floor)
+            && churn < (self.gc_task_live / 2).max(floor) as u64
+        {
             return 0;
         }
-        let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect_with_cause(crate::value::GcCause::TaskBoundary);
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
@@ -9042,6 +9135,7 @@ impl Interp {
         drop(realm_groups);
         drop(live);
         drop(scopes);
+        self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
         #[cfg(not(target_arch = "wasm32"))]
         if garbage >= 50_000 {
             crate::fastalloc::trim();
@@ -9694,12 +9788,17 @@ impl Interp {
         fn_obj: &Gc,
     ) -> Gc {
         let ao = Object::new(Some(self.object_proto.clone()));
-        ao.borrow_mut().exotic = crate::value::Exotic::Arguments;
-        for (idx, v) in args.iter().enumerate() {
-            ao.borrow_mut().props.insert(
-                idx.to_string().as_str(),
-                Property::data(v.clone(), true, true, true),
-            );
+        {
+            let mut object = ao.borrow_mut();
+            object.exotic = crate::value::Exotic::Arguments;
+            // Create{Unmapped,Mapped}ArgumentsObject defines a contiguous run of
+            // ordinary indexed data properties. Use the same packed storage as
+            // fresh arrays without changing the arguments object's exotic kind,
+            // length descriptor, or (for sloppy calls) ParameterMap semantics.
+            object.props.reserve_dense_exact(args.len(), false);
+            for value in args {
+                object.props.push_dense(Property::plain(value.clone()));
+            }
         }
         ao.borrow_mut().props.insert(
             "length",
@@ -9770,7 +9869,7 @@ impl Interp {
         ao
     }
 
-    /// Materialize the dedicated arguments slot of a compiled parameterless function. The active
+    /// Materialize the dedicated unmapped arguments slot of a compiled function. The active
     /// [`FnFrame`] supplies the observable `callee` identity for both ordinary and activation-aware
     /// moved-frame entries.
     pub(crate) fn make_compiled_arguments_object(&mut self, args: &[Value], scope: &Env) -> Gc {
