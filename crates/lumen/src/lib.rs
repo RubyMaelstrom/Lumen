@@ -1130,6 +1130,31 @@ impl Engine {
         self.interp.collect_garbage_for_host()
     }
 
+    /// Defer optional task-boundary cycle scans during a short latency-sensitive
+    /// host interval. This does not suppress allocation-triggered collection,
+    /// memory limits, microtasks, or ClearKeptObjects. The host must end the
+    /// interval and service pending collection when its input queue quiets down.
+    pub fn defer_task_garbage_collection(&mut self, deferred: bool) {
+        self.interp.gc_task_deferred = deferred;
+    }
+
+    /// Whether a checkpoint requested an optional cycle scan that is pending.
+    pub fn has_pending_task_garbage_collection(&self) -> bool {
+        self.interp.gc_task_pending
+    }
+
+    /// Service a deferred request between host tasks, after their microtask
+    /// checkpoints. Returns zero while deferral remains enabled or no request
+    /// is pending. Unlike an explicit idle collection, this never forces a scan
+    /// of an otherwise quiet heap.
+    pub fn collect_pending_task_garbage(&mut self) -> i64 {
+        if !self.interp.gc_task_pending || self.interp.gc_task_deferred {
+            return 0;
+        }
+        self.interp.activate_gc_heap();
+        self.interp.gc_task_boundary()
+    }
+
     /// Drain and return the reasons of promises rejected without a handler (after a microtask
     /// checkpoint, these are genuine unhandled rejections). The runtime reports them; the bare
     /// engine ignores them, so test262 semantics are unaffected.

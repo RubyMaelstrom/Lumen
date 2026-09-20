@@ -2386,6 +2386,10 @@ pub struct Interp {
     pub(crate) gc_task_allocated: u64,
     /// Objects remaining after the most recent collection, for task-boundary pressure.
     pub(crate) gc_task_live: i64,
+    /// Host scheduling hint for optional task-boundary collection only.
+    /// Allocation safepoints and their existing limits remain enabled.
+    pub(crate) gc_task_deferred: bool,
+    pub(crate) gc_task_pending: bool,
     /// Prune the scope registry once its entry count passes this floating threshold.
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
@@ -2600,6 +2604,8 @@ interp_memory_inventory! {
     gc_tick => "non_owning",
     gc_task_allocated => "non_owning",
     gc_task_live => "non_owning",
+    gc_task_deferred => "non_owning",
+    gc_task_pending => "non_owning",
     scope_gc_next => "non_owning",
     constructing => "non_owning",
     super_call_ok => "non_owning",
@@ -2647,7 +2653,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 141);
+    assert_eq!(names.len(), 143);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3515,6 +3521,8 @@ impl Interp {
             gc_tick: 0,
             gc_task_allocated: crate::value::heap_allocated_objects(&gc_heap),
             gc_task_live: crate::value::heap_live_objects(&gc_heap),
+            gc_task_deferred: false,
+            gc_task_pending: false,
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
             super_call_ok: false,
@@ -8219,9 +8227,13 @@ impl Interp {
         // ECMA-262 #sec-liveness permits this scheduling choice. ClearKeptObjects
         // above still runs at every job boundary, independently of collection.
         let growth = before.saturating_sub(self.gc_task_live);
-        if growth < (self.gc_task_live / 8).max(floor)
-            && churn < (self.gc_task_live / 2).max(floor) as u64
-        {
+        self.gc_task_pending |= growth >= (self.gc_task_live / 8).max(floor)
+            || churn >= (self.gc_task_live / 2).max(floor) as u64;
+        // ECMA-262 #sec-liveness leaves collection scheduling to the host.
+        // Preserve the pressure request across deferred checkpoints, including
+        // a high-churn task whose temporary graph has just become unreachable.
+        // ClearKeptObjects above is NEVER deferred with the optional scan.
+        if !self.gc_task_pending || self.gc_task_deferred {
             return 0;
         }
         self.gc_collect_with_cause(crate::value::GcCause::TaskBoundary);
@@ -9333,6 +9345,7 @@ impl Interp {
         drop(live);
         drop(scopes);
         self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
+        self.gc_task_pending = false;
         #[cfg(not(target_arch = "wasm32"))]
         if garbage >= 50_000 {
             crate::fastalloc::trim();

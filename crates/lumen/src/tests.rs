@@ -3801,6 +3801,99 @@ fn gc_reclaims_cycles() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
+    // ECMA-262 #sec-liveness / #sec-clear-kept-objects and HTML
+    // #perform-a-microtask-checkpoint: collection is optional; completing
+    // jobs and ending WeakRef read consistency at their boundary are not.
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.defer_task_garbage_collection(true);
+        engine
+            .eval_value_interruptible(
+                "var done=false;Promise.resolve().then(()=>done=true);\n\
+             var keep=[];for(var i=0;i<12000;i++){var o={};o.self=o;keep.push(o);}\n\
+             var weak=new WeakRef(keep[0]);keep=null;o=null;",
+            )
+            .unwrap()
+            .unwrap_or_else(|_| panic!("allocation fixture threw"));
+        let before = engine.ctx().live_object_count();
+        engine.run_microtasks_interruptible().unwrap();
+        assert!(engine.has_pending_task_garbage_collection(), "{tier:?}");
+        assert!(
+            engine.interp.kept_alive.is_empty(),
+            "ClearKeptObjects was deferred"
+        );
+        assert_eq!(engine.collect_pending_task_garbage(), 0);
+        assert!(matches!(
+            engine
+                .eval_value_interruptible("done")
+                .unwrap()
+                .unwrap_or_else(|_| panic!("job result threw")),
+            crate::value::Value::Bool(true)
+        ));
+        // A quiet checkpoint must not forget pressure from the previous task.
+        engine.run_microtasks_interruptible().unwrap();
+        assert!(engine.has_pending_task_garbage_collection());
+        engine.defer_task_garbage_collection(false);
+        assert!(engine.collect_pending_task_garbage() > 10_000, "{tier:?}");
+        assert!(engine.ctx().live_object_count() + 10_000 < before);
+        assert!(!engine.has_pending_task_garbage_collection());
+        assert_eq!(engine.collect_pending_task_garbage(), 0);
+        assert!(matches!(
+            engine
+                .eval_value_interruptible("weak.deref()===undefined")
+                .unwrap()
+                .unwrap_or_else(|_| panic!("weak result threw")),
+            crate::value::Value::Bool(true)
+        ));
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn deferred_task_gc_keeps_allocation_safepoints_enabled() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.defer_task_garbage_collection(true);
+        engine
+            .eval_value_interruptible("var o={};o.self=o;var weak=new WeakRef(o);o=null;")
+            .unwrap()
+            .unwrap_or_else(|_| panic!("weak fixture threw"));
+        engine.run_microtasks_interruptible().unwrap();
+        engine.interp.gc_next = engine.ctx().live_object_count() + 128;
+        engine
+            .eval_value_interruptible(
+                "for(var i=0;i<2000;i++){var cycle={};cycle.self=cycle;}cycle=null;",
+            )
+            .unwrap()
+            .unwrap_or_else(|_| panic!("allocation fixture threw"));
+        assert!(
+            matches!(
+                engine
+                    .eval_value_interruptible("weak.deref()===undefined")
+                    .unwrap()
+                    .unwrap_or_else(|_| panic!("weak result threw")),
+                crate::value::Value::Bool(true)
+            ),
+            "allocation GC was deferred in {tier:?}"
+        );
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn high_churn_task_collects_after_temporary_roots_are_released() {
     let mut engine = Engine::new();
     let before = engine.ctx().live_object_count();
