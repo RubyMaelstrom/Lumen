@@ -2344,6 +2344,10 @@ pub struct Interp {
     /// non-owning: the realm registry pins every live global. This is not the HTML
     /// backup incumbent stack; the embedder supplies that for native callbacks.
     pub(crate) script_entry: Option<(usize, usize)>,
+    /// Embedder entry context, distinct from the innermost Script/Eval caller.
+    /// HTML's entry Realm survives ordinary cross-Realm calls and indirect eval.
+    /// Realm keys are pinned by the realm registry.
+    pub(crate) host_entry_realm: Option<usize>,
     /// Opt-in browser incumbent-source propagation for JobCallback records. Non-browser hosts
     /// retain ECMA-262's default HostMakeJobCallback/HostCallJobCallback behavior.
     pub(crate) capture_job_script_caller: bool,
@@ -2582,6 +2586,7 @@ interp_memory_inventory! {
     microtasks => "measured",
     host_job_context => "non_owning",
     script_entry => "non_owning",
+    host_entry_realm => "non_owning",
     capture_job_script_caller => "non_owning",
     host_settings_states => "measured",
     retired_host_job_contexts => "measured",
@@ -2642,7 +2647,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 140);
+    assert_eq!(names.len(), 141);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3496,6 +3501,7 @@ impl Interp {
             microtasks: std::collections::VecDeque::new(),
             host_job_context: 0,
             script_entry: None,
+            host_entry_realm: None,
             capture_job_script_caller: false,
             host_settings_states: Default::default(),
             retired_host_job_contexts: Default::default(),
@@ -4236,12 +4242,52 @@ impl Interp {
         )
     }
 
+    /// Global of the embedder's most recent script/callback entry. HTML
+    /// #entry-settings-object / #prepare-to-run-script distinguishes this from
+    /// the incumbent (innermost author function) and the native receiver Realm.
+    pub fn script_entry_global(&self) -> Value {
+        self.host_entry_realm
+            .and_then(|key| self.realms.get(&key))
+            .map_or_else(
+                || self.global_this(),
+                |realm| Value::Obj(realm.global.clone()),
+            )
+    }
+
+    /// Enter an author callback through a host boundary, using GetFunctionRealm
+    /// (including bound functions and proxies), then restore the prior entry on
+    /// every completion. Ordinary `invoke` deliberately does not enter anew.
+    pub fn invoke_callback_entry(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Value> {
+        let key = if let Value::Obj(ref object) = callee {
+            self.get_function_realm_global(object)
+                .map_err(abrupt_value)?
+        } else {
+            None
+        }
+        .unwrap_or(Rc::as_ptr(&self.global) as usize);
+        let saved = self.host_entry_realm.replace(key);
+        let result = self.invoke(callee, this, args);
+        self.host_entry_realm = saved;
+        result
+    }
+
     pub(crate) fn with_script_entry<R>(&mut self, operation: impl FnOnce(&mut Self) -> R) -> R {
+        let saved_host_entry = self.host_entry_realm;
+        // Eval does not itself prepare a new host script entry. At the outer
+        // engine boundary there is no entry yet, so the current Realm supplies it.
+        self.host_entry_realm
+            .get_or_insert(Rc::as_ptr(&self.global) as usize);
         let saved = self
             .script_entry
             .replace((Rc::as_ptr(&self.global) as usize, self.fn_frames.len()));
         let result = operation(self);
         self.script_entry = saved;
+        self.host_entry_realm = saved_host_entry;
         result
     }
 
@@ -4290,13 +4336,25 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        if let Some(global) = &callback.script_caller {
+        let previous_entry = self.host_entry_realm;
+        if self.capture_job_script_caller {
+            let key = if let Value::Obj(ref object) = callback.callback {
+                self.get_function_realm_global(object)?
+            } else {
+                None
+            }
+            .unwrap_or(Rc::as_ptr(&self.global) as usize);
+            self.host_entry_realm = Some(key);
+        }
+        let result = if let Some(global) = &callback.script_caller {
             self.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
                 ctx.call(callback.callback.clone(), this, args)
             })
         } else {
             self.call(callback.callback.clone(), this, args)
-        }
+        };
+        self.host_entry_realm = previous_entry;
+        result
     }
 
     /// ECMA-262 RunSuspendedContext: the source continuation becomes the topmost
