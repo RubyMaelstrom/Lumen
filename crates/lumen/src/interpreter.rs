@@ -9399,7 +9399,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_inner(f, t, &a);
+                    r = self.call_tail(f, t, &a);
                 }
                 None => break,
             }
@@ -9435,6 +9435,23 @@ impl Interp {
             }
         }
         Ok(None)
+    }
+
+    /// Resume a proper tail call at the existing logical depth, but re-enter
+    /// the native storage guard. The previous callee's stack segment has
+    /// already been released; its continuation may make ordinary nested calls.
+    /// ECMA-262 #sec-preparefortailcall reuses execution-context resources, not
+    /// permission to execute the next callee on an exhausted native stack.
+    pub(crate) fn call_tail(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
+        if execution_stack_exhausted(self.depth) {
+            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+        }
+        with_execution_stack(self.depth, || self.call_inner(callee, this, args))
     }
 
     pub(crate) fn call_inner(
@@ -10544,7 +10561,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_inner(f, t, &a);
+                    r = self.call_tail(f, t, &a);
                 }
                 None => break,
             }
@@ -10622,7 +10639,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_inner(f, t, &a);
+                    r = self.call_tail(f, t, &a);
                 }
                 None => break,
             }
@@ -10726,7 +10743,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_inner(f, t, &a);
+                    r = self.call_tail(f, t, &a);
                 }
                 None => break,
             }
@@ -11447,7 +11464,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_inner(f, t, &a);
+                    r = self.call_tail(f, t, &a);
                 }
                 None => break,
             }
@@ -11802,7 +11819,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_inner(f, t, &a);
+                    r = self.call_tail(f, t, &a);
                 }
                 None => break,
             }

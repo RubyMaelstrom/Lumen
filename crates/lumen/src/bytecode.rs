@@ -17711,7 +17711,7 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     if !threw {
         while let Some(bx) = i.pending_tail.take() {
             let (f, t, a) = *bx;
-            let r = i.gc_check_amortized().and_then(|()| i.call_inner(f, t, &a));
+            let r = i.gc_check_amortized().and_then(|()| i.call_tail(f, t, &a));
             match r {
                 Ok(v) => ctx.ret = v,
                 Err(e) => {

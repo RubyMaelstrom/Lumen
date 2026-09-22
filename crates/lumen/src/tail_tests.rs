@@ -91,6 +91,49 @@ fn compiled_tail_mutual_recursion_retires_vm_and_native_frames() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn tail_dispatch_keeps_stack_growth_for_nested_non_tail_calls() {
+    // PrepareForTailCall retires only the caller's context. The resumed callee
+    // can still create ordinary nested contexts, including through accessors.
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        std::thread::Builder::new()
+            .name(format!("tail-stack-{tier:?}"))
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let mut engine = engine(tier);
+                assert_eq!(
+                    evaluate(
+                        &mut engine,
+                        r#"
+                    function tail(n) { 'use strict'; return body(n); }
+                    function body(n) { return n === 0 ? 0 : 1 + tail(n - 1); }
+                    tail(2048)
+                "#
+                    ),
+                    "2048"
+                );
+                assert_eq!(crate::interpreter::execution_stack_segments(), 0);
+                assert_eq!(
+                    evaluate(
+                        &mut engine,
+                        r#"
+                        var remaining = 512;
+                        var object = { get value() { 'use strict'; return read(); } };
+                        function read() { return remaining-- === 0 ? 0 : 1 + object.value; }
+                        object.value
+                    "#
+                    ),
+                    "512"
+                );
+                assert_eq!(crate::interpreter::execution_stack_segments(), 0);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
 #[test]
 fn compiled_tail_expression_forms_and_optional_receivers() {
     for tier in [Tier::Bytecode, Tier::Jit] {
