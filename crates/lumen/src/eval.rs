@@ -5327,6 +5327,23 @@ impl Interp {
             }
         }
 
+        // ECMA-262 ClassDefinitionEvaluation installs [[Fields]] and [[PrivateMethods]]
+        // before running static elements. A static initializer can construct this class,
+        // including a derived class, and must see its complete instance initialization.
+        // Keep this metadata even if a static element throws: the constructor may escape.
+        // https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation
+        self.gc_pin(&ctor_obj);
+        self.class_info.insert(
+            Rc::as_ptr(&ctor_obj) as usize,
+            ClassInfo {
+                fields: inst_fields,
+                field_env: inst_env,
+                derived,
+                instance_initializers: instance_inits,
+                private_members: priv_members,
+            },
+        );
+
         for (block, key, init, transforms) in static_els {
             let scope = new_scope(Some(static_env.clone()));
             bind(&scope, "this", ctor_val.clone());
@@ -5394,18 +5411,6 @@ impl Interp {
                 .props
                 .insert(key.as_str(), Property::plain(v));
         }
-
-        self.gc_pin(&ctor_obj);
-        self.class_info.insert(
-            Rc::as_ptr(&ctor_obj) as usize,
-            ClassInfo {
-                fields: inst_fields,
-                field_env: inst_env,
-                derived,
-                instance_initializers: instance_inits,
-                private_members: priv_members,
-            },
-        );
 
         // Class decorators apply after the body is built; a callable return replaces the class.
         let mut class_value = ctor_val;

@@ -1559,6 +1559,80 @@ fn classes_basic() {
 }
 
 #[test]
+fn class_static_initializers_can_construct_complete_instances() {
+    // ECMA-262 ClassDefinitionEvaluation installs [[Fields]] and [[PrivateMethods]]
+    // before evaluating static elements (local snapshot e28783d5fc9d).
+    let source = r#"
+        function check(ok, message) { if (!ok) throw new Error(message); }
+        function exercise() {
+            const trace = [];
+            const key = Symbol('field');
+            class Codec {
+                static singleton = new Codec;
+                absent;
+                values = (trace.push('field'), []);
+                [key] = 7;
+                #value = this.#method();
+                #method() { return 11; }
+                get #accessor() { return this.#value; }
+                constructor() {
+                    trace.push('constructor');
+                    this.values.push(this.#accessor);
+                }
+                static { this.second = new this; trace.push('block'); }
+            }
+            check(Codec.singleton.values.join() === '11', 'self construction');
+            check(Codec.second.values.join() === '11', 'static block construction');
+            check(Codec.singleton.values !== Codec.second.values, 'fresh fields');
+            check(Codec.singleton[key] === 7, 'computed field');
+            check(Object.hasOwn(Codec.singleton, 'absent'), 'uninitialized field');
+            check(trace.join() === 'field,constructor,field,constructor,block', 'element order');
+            class Base { base = 3; }
+            class Derived extends Base {
+                static singleton = new this;
+                own = this.base + 4;
+                #method() { return this.own; }
+                read() { return this.#method(); }
+            }
+            check(Derived.singleton.read() === 7, 'default derived constructor');
+            class Explicit extends Base {
+                static singleton = new this;
+                own = 9;
+                constructor() { super(); check(this.own === 9, 'derived super fields'); }
+            }
+            check(Explicit.singleton.base === 3, 'base fields');
+            class Default { static singleton = new this; value = 5; }
+            check(Default.singleton.value === 5, 'default base constructor');
+            let escaped, later = false;
+            const sentinel = {};
+            try {
+                class Throwing {
+                    static { escaped = this; new this; }
+                    value = (() => { throw sentinel; })();
+                    static later = (later = true);
+                }
+                check(false, 'initializer must throw');
+            } catch (error) { check(error === sentinel, 'original abrupt completion'); }
+            check(!later, 'later static elements skipped');
+            try { new escaped; check(false, 'escaped constructor retains fields'); }
+            catch (error) { check(error === sentinel, 'escaped fields'); }
+        }
+        for (let warm = 0; warm < 5; ++warm) exercise();
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "{tier:?}");
+    }
+}
+
+#[test]
 fn classes_inheritance() {
     let src = "class A { constructor(x){ this.x = x; } hello(){ return 'a' + this.x; } } \
                class B extends A { constructor(x){ super(x); this.y = x*2; } hello(){ return super.hello() + this.y; } } \
