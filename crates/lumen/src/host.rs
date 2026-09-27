@@ -51,24 +51,76 @@ pub trait RetainedMemory {
 /// These callbacks must not execute JavaScript, allocate JS objects, or re-enter collection.
 pub trait HostGc {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor);
+    /// Release temporary native roots at the same synchronous-job boundary as ClearKeptObjects.
+    /// This may update native bookkeeping only: no JavaScript, JS allocation or collection.
+    /// Persistent async work must own explicit roots rather than relying on a job lease.
+    fn end_job(&mut self) {}
     /// Remove every cache handle that `is_live` rejects before the JS heap is swept.
     /// Do not retain new handles or change the graph during this phase.
     fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool);
+    /// Joint native/JavaScript sweep. Native identities were traced in this collection, so only
+    /// identities rejected by this callback may be reclaimed. Existing JS-only hosts need no
+    /// changes; native graph users override this and leave the legacy sweep conservative.
+    fn sweep_gc_with_native(
+        &mut self,
+        is_live: &dyn Fn(&Value) -> bool,
+        _native_is_live: &dyn Fn(NativeGcId) -> bool,
+    ) {
+        self.sweep_gc(is_live);
+    }
+}
+
+/// A native graph node, independent of JavaScript object allocation. The host owns the identity
+/// domain and stable owner token; id must distinguish live resources and must not alias a retired
+/// resource while references to its old identity remain possible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeGcId {
+    pub domain: &'static str,
+    pub owner: usize,
+    pub id: usize,
 }
 
 pub trait HostGcVisitor {
+    /// Nursery collections conservatively retain old JavaScript and native owners. A host
+    /// may enumerate only its young and remembered state when it can prove all omitted
+    /// handles/edges are old. The default keeps existing embedders on the full graph path.
+    fn is_minor(&self) -> bool {
+        false
+    }
+    /// Declare the old prefix of a host's monotonic native identity domain. During a minor
+    /// collection every ID below `first_young_id` is conservatively live, including sources
+    /// later reported by another host. Returning false requires the ordinary full graph.
+    /// Do not clear journals or promote young state until the corresponding sweep succeeds.
+    fn native_old_generation(
+        &mut self,
+        _domain: &'static str,
+        _owner: usize,
+        _first_young_id: usize,
+    ) -> bool {
+        false
+    }
     /// Discount exactly one native-owned strong handle during root classification.
     fn internal(&mut self, value: &Value);
     /// A logical (non-Rc-owning) edge from a live owner to a retained value.
     fn edge(&mut self, owner: &Value, value: &Value);
     /// A value reachable from a native root not represented by a JS owner.
     fn root(&mut self, value: &Value);
+    /// Old/third-party visitors can conservatively retain their native graph. A host must not
+    /// discount the handles owned by that graph unless this visitor supports tracing it.
+    fn supports_native(&self) -> bool {
+        false
+    }
+    fn native_edge(&mut self, _from: NativeGcId, _to: NativeGcId) {}
+    fn js_to_native(&mut self, _owner: &Value, _to: NativeGcId) {}
+    fn native_to_js(&mut self, _from: NativeGcId, _value: &Value) {}
+    fn native_root(&mut self, _id: NativeGcId) {}
 }
 
 #[derive(Clone, Copy)]
 struct GcReporter {
     trace: fn(&dyn Any, &mut dyn HostGcVisitor),
-    sweep: fn(&mut dyn Any, &dyn Fn(&Value) -> bool),
+    end_job: fn(&mut dyn Any),
+    sweep_native: fn(&mut dyn Any, &dyn Fn(&Value) -> bool, &dyn Fn(NativeGcId) -> bool),
 }
 
 #[derive(Clone, Copy)]
@@ -299,7 +351,13 @@ impl OpState {
             TypeId::of::<T>(),
             GcReporter {
                 trace: |value, visitor| value.downcast_ref::<T>().unwrap().trace_gc(visitor),
-                sweep: |value, is_live| value.downcast_mut::<T>().unwrap().sweep_gc(is_live),
+                end_job: |value| value.downcast_mut::<T>().unwrap().end_job(),
+                sweep_native: |value, is_live, native_is_live| {
+                    value
+                        .downcast_mut::<T>()
+                        .unwrap()
+                        .sweep_gc_with_native(is_live, native_is_live)
+                },
             },
         );
     }
@@ -312,10 +370,22 @@ impl OpState {
         }
     }
 
-    pub(crate) fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
+    pub(crate) fn end_job(&mut self) {
         for (key, reporter) in &self.gc_reporters {
             if let Some(value) = self.map.get_mut(key) {
-                (reporter.sweep)(value.as_mut(), is_live);
+                (reporter.end_job)(value.as_mut());
+            }
+        }
+    }
+
+    pub(crate) fn sweep_gc_with_native(
+        &mut self,
+        is_live: &dyn Fn(&Value) -> bool,
+        native_is_live: &dyn Fn(NativeGcId) -> bool,
+    ) {
+        for (key, reporter) in &self.gc_reporters {
+            if let Some(value) = self.map.get_mut(key) {
+                (reporter.sweep_native)(value.as_mut(), is_live, native_is_live);
             }
         }
     }

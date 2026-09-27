@@ -33,6 +33,14 @@ mod shadowrealm;
 mod typedarray;
 mod weakrefs;
 
+#[cfg(test)]
+#[path = "../array_length_tests.rs"]
+mod array_length_tests;
+
+#[cfg(test)]
+#[path = "../array_shift_tests.rs"]
+mod array_shift_tests;
+
 pub(crate) use function_proto::nf_function_call;
 pub(crate) use math::nf_math_sqrt;
 
@@ -315,13 +323,6 @@ pub(crate) fn intl_delegate(
     let inst = ab(i.construct(ctor, &[locales, options]))?;
     let f = ab(i.get_member(&inst, method))?;
     ab(i.call(f, inst, call_args))
-}
-
-fn is_tombstone(i: &Interp, k: &Value) -> bool {
-    match (k.as_obj(), i.extra_protos.get("%MapTombstone%")) {
-        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-        _ => false,
-    }
 }
 
 /// Proxy `[[OwnPropertyKeys]]`: the trap result (must be a list of strings/symbols) or the target's
@@ -1407,7 +1408,7 @@ fn reflect_ordinary_set(
             Some(p) if p.accessor() => {
                 return match p.setter().cloned() {
                     Some(setter) if setter.is_callable() => {
-                        ab(i.call(setter, receiver.clone(), &[value]))?;
+                        ab(i.call_callback(setter, receiver.clone(), &[value]))?;
                         Ok(true)
                     }
                     _ => Ok(false),
@@ -1494,16 +1495,26 @@ pub(crate) fn reflect_define_on_receiver(
     if i.host_indexed_array_key(&ro, key) {
         return Ok(false);
     }
-    // An Array receiver's `length` (and index writes) go through the exotic [[Set]] semantics
-    // (double coercion, RangeError, truncation) rather than a raw property write.
-    if matches!(ro.borrow().exotic, Exotic::Array) {
-        let saved = i.strict;
-        i.strict = false;
-        let r = i.set_member_recv(&Value::Obj(ro.clone()), key, value, Value::Obj(ro.clone()));
-        i.strict = saved;
-        return ab(r);
-    }
     let existing = ro.borrow().props.get(key).cloned();
+    // OrdinarySetWithOwnDescriptor calls the receiver's [[DefineOwnProperty]], not [[Set]].
+    // Re-running [[Set]] here would invoke its own/inherited setter instead of defining a
+    // data property, and would repeat the prototype search on the wrong object.
+    if matches!(ro.borrow().exotic, Exotic::Array) {
+        let mut descriptor = PartialDesc {
+            value: Some(value),
+            ..PartialDesc::default()
+        };
+        match existing {
+            Some(property) if property.accessor() || !property.writable() => return Ok(false),
+            Some(_) => {}
+            None => {
+                descriptor.writable = Some(true);
+                descriptor.enumerable = Some(true);
+                descriptor.configurable = Some(true);
+            }
+        }
+        return ab(define_own_property_ordinary(i, &ro, key, &descriptor));
+    }
     match existing {
         Some(ep) if ep.accessor() || !ep.writable() => Ok(false),
         Some(_) => {
@@ -1566,7 +1577,7 @@ pub(crate) fn reflect_ordinary_get(
         match own {
             Some(p) if p.accessor() => {
                 return match p.getter().cloned() {
-                    Some(g) if g.is_callable() => ab(i.call(g, receiver.clone(), &[])),
+                    Some(g) if g.is_callable() => ab(i.call_callback(g, receiver.clone(), &[])),
                     _ => Ok(Value::Undefined),
                 };
             }
@@ -3229,22 +3240,14 @@ fn coll_ptr_kind(i: &Interp, this: &Value, want: Option<&str>) -> Result<usize, 
     let err = || i.make_error("TypeError", "method called on an incompatible receiver");
     let o = this.as_obj().ok_or_else(err)?;
     let ptr = Rc::as_ptr(o) as usize;
-    if !i.map_data.contains_key(&ptr) {
-        return Err(err());
-    }
-    let kind = o.borrow().props.get("__ck").map(|p| p.value());
-    let ok = match (&kind, want) {
-        (Some(Value::Str(s)), Some(w)) => &**s == w,
-        (Some(Value::Str(s)), None) => &**s == "Map" || &**s == "Set",
-        _ => false,
-    };
-    if !ok {
+    let data = i.map_data.get(&ptr).ok_or_else(err)?;
+    if want.is_some_and(|want| data.kind().name() != want) {
         return Err(err());
     }
     Ok(ptr)
 }
 
-/// Build an iterator over a Map/Set's snapshot. `kind`: 0 = values, 1 = keys, 2 = [key,value].
+/// Build a live Map/Set iterator. `kind`: 0 = values, 1 = keys, 2 = [key,value].
 /// Like [`collection_iter`] but brand-checks the exact collection kind ("Set" / "Map").
 fn collection_iter_kind(
     i: &mut Interp,
@@ -3268,33 +3271,23 @@ fn collection_for_each(
     if !cb.is_callable() {
         return Err(i.make_error("TypeError", "forEach callback is not callable"));
     }
+    let cb = crate::callback::Callback::new(cb);
     let cb_this = arg(a, 1);
-    // Iterate the LIVE backing list by index (positions are stable — deletes leave tombstones), so
-    // entries appended during the callback are visited and deleted entries are skipped.
-    let mut idx = 0usize;
-    loop {
-        let entry = i.map_data.get(&ptr).and_then(|e| e.get(idx).cloned());
-        idx += 1;
-        let (k, v) = match entry {
-            Some(kv) => kv,
-            None => break,
-        };
-        if is_tombstone(i, &k) {
-            continue;
-        }
-        ab(i.call(cb.clone(), cb_this.clone(), &[v, k, this.clone()]))?;
+    // Cursors survive clear/compaction, including recursively nested forEach calls. Never hold a
+    // collection borrow across JavaScript: callbacks may mutate this collection arbitrarily.
+    let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
+    while let Some((k, v)) = i.map_data[&ptr].next(&cursor) {
+        ab(cb.call(i, cb_this.clone(), [v, k, this.clone()]))?;
     }
     Ok(Value::Undefined)
 }
 
 fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Value> {
-    coll_ptr(i, this)?; // brand check (a real Map/Set)
-    let is_set = this
-        .as_obj()
-        .and_then(|o| o.borrow().props.get("__ck").map(|p| p.value()))
-        .map(|v| matches!(v, Value::Str(ref s) if &**s == "Set"))
-        .unwrap_or(false);
-    let key = if is_set {
+    let ptr = coll_ptr(i, this)?;
+    let data = i.map_data.get_mut(&ptr).unwrap();
+    let brand = data.kind();
+    let cursor = data.cursor();
+    let key = if brand == crate::ordered_collection::CollectionKind::Set {
         "%SetIteratorPrototype%"
     } else {
         "%MapIteratorPrototype%"
@@ -3305,64 +3298,51 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
         .cloned()
         .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned());
     let obj = Object::new(proto);
-    set_builtin(&obj, "__ci_coll", this.clone());
-    set_builtin(&obj, "__ci_index", Value::Num(0.0));
-    set_builtin(&obj, "__ci_kind", Value::Num(kind as f64));
+    i.gc_pin(&obj);
+    i.collection_iterators.insert(
+        Rc::as_ptr(&obj) as usize,
+        crate::ordered_collection::CollectionIterator {
+            target: Some(this.as_obj().unwrap().clone()),
+            cursor: Some(cursor),
+            kind,
+            brand,
+        },
+    );
     Ok(Value::Obj(obj))
 }
 
-/// `next()` for a Map/Set iterator: reads the live backing entries at the current index (so entries
-/// appended during iteration are observed). The `__ci_coll` slot is the brand.
-fn map_set_iter_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let coll = this
-        .as_obj()
-        .and_then(|o| o.borrow().props.get("__ci_coll").map(|p| p.value()));
-    let coll = match coll {
-        Some(c) => c,
-        None => return Err(i.make_error("TypeError", "not a Map/Set Iterator")),
+/// ECMA-262 GeneratorValidate checks the exact native iterator brand, even after exhaustion.
+fn map_set_iter_next(
+    i: &mut Interp,
+    this: Value,
+    brand: crate::ordered_collection::CollectionKind,
+) -> Result<Value, Value> {
+    let ptr = map_ptr(&this).ok_or_else(|| i.make_error("TypeError", "not a Map/Set Iterator"))?;
+    let state = i
+        .collection_iterators
+        .get(&ptr)
+        .filter(|state| state.brand == brand)
+        .ok_or_else(|| i.make_error("TypeError", "incompatible collection iterator"))?;
+    let kind = state.kind;
+    let entry = match (&state.target, &state.cursor) {
+        (Some(target), Some(cursor)) => i
+            .map_data
+            .get(&(Rc::as_ptr(target) as usize))
+            .and_then(|data| data.next(cursor)),
+        _ => None,
     };
-    let obj = this.as_obj().unwrap();
-    let num = |o: &Gc, k: &str| -> f64 {
-        match o.borrow().props.get(k).map(|p| p.value()) {
-            Some(Value::Num(n)) => n,
-            _ => 0.0,
-        }
-    };
-    // A once-exhausted iterator stays done, even if the collection later grows.
-    if matches!(
-        obj.borrow().props.get("__ci_done").map(|p| p.value()),
-        Some(Value::Bool(true))
-    ) {
-        return Ok(iter_result(i, Value::Undefined, true));
-    }
-    let mut idx = num(obj, "__ci_index") as usize;
-    let kind = num(obj, "__ci_kind") as u8;
-    let coll_ptr = map_ptr(&coll);
-    // Skip tombstoned (deleted) slots so the iterator observes a live view.
-    loop {
-        let entry = coll_ptr
-            .and_then(|p| i.map_data.get(&p))
-            .and_then(|e| e.get(idx).cloned());
-        match entry {
-            Some((k, v)) => {
-                idx += 1;
-                if is_tombstone(i, &k) {
-                    continue;
-                }
-                set_internal(obj, "__ci_index", Value::Num(idx as f64));
-                let val = match kind {
-                    1 => k,
-                    2 => i.make_array(vec![k, v]),
-                    _ => v,
-                };
-                return Ok(iter_result(i, val, false));
-            }
-            None => {
-                set_internal(obj, "__ci_index", Value::Num(idx as f64));
-                set_internal(obj, "__ci_done", Value::Bool(true));
-                return Ok(iter_result(i, Value::Undefined, true));
-            }
-        }
+    if let Some((key, value)) = entry {
+        let value = match kind {
+            1 => key,
+            2 => i.make_array(vec![key, value]),
+            _ => value,
+        };
+        Ok(iter_result(i, value, false))
+    } else {
+        let state = i.collection_iterators.get_mut(&ptr).unwrap();
+        state.target = None;
+        state.cursor = None;
+        Ok(iter_result(i, Value::Undefined, true))
     }
 }
 
@@ -4887,11 +4867,7 @@ fn define_own_property_ordinary(
     if is_array && key == "length" {
         return array_set_length(i, o, &d);
     }
-    let array_index = if is_array {
-        key.parse::<u32>().ok().filter(|&n| n < 4294967295)
-    } else {
-        None
-    };
+    let array_index = if is_array { canonical_index(key) } else { None };
     if let Some(idx) = array_index {
         // Adding an index at or past a non-writable `length` is rejected.
         let len = i.array_length(o);
@@ -5023,8 +4999,23 @@ fn grow_array_length(i: &mut Interp, o: &Gc, array_index: Option<u32>) {
     }
 }
 
-/// Array exotic `length` define: validate the new length is a valid uint32, honor a non-writable
-/// `length`, and drop the now-out-of-range index properties.
+/// The value-only [[DefineOwnProperty]] used after OrdinarySet has checked the receiver's
+/// writable own descriptor. Share ArraySetLength with Object/Reflect.defineProperty: coercion
+/// can change the array's length and attributes, so neither caller can retain an earlier proof.
+pub(crate) fn array_set_length_value(i: &mut Interp, o: &Gc, value: Value) -> Result<bool, Abrupt> {
+    array_set_length(
+        i,
+        o,
+        &PartialDesc {
+            value: Some(value),
+            ..PartialDesc::default()
+        },
+    )
+}
+
+/// ECMA-262 ArraySetLength (#sec-arraysetlength), local snapshot e28783d5fc9d.
+/// Read the current descriptor only after both observable conversions. Only canonical array
+/// indices participate in truncation; other numeric-looking names are ordinary properties.
 fn array_set_length(i: &mut Interp, o: &Gc, d: &PartialDesc) -> Result<bool, Abrupt> {
     let new_len = match &d.value {
         None => {
@@ -5053,16 +5044,26 @@ fn array_set_length(i: &mut Interp, o: &Gc, d: &PartialDesc) -> Result<bool, Abr
             }
             return Ok(true);
         }
+        Some(Value::Num(number)) => {
+            // ToNumber(Number) is the identity and cannot run author code. The two-conversion
+            // SameValueZero test succeeds exactly for integral Numbers in [0, 2^32 - 1],
+            // including -0 (normalized to +0). Saturating conversion plus an exact round trip
+            // proves this range/integrality; unlike the object case below, no modulo result
+            // outside that range could compare equal to the unchanged original Number.
+            let new_len = *number as u32;
+            if *number != new_len as f64 {
+                return Err(i.throw("RangeError", "Invalid array length"));
+            }
+            new_len as usize
+        }
         Some(v) => {
             // ArraySetLength coerces first — ToUint32(value) then ToNumber(value), both
             // observable — and a mismatch (fraction, negative, ≥ 2^32) is a RangeError before
             // any attribute validation.
-            let n1 = i.to_number(v)?;
-            let new_len: u32 = if n1.is_nan() || n1.is_infinite() || n1 == 0.0 {
-                0
-            } else {
-                (n1.trunc() as i64 as u64 & 0xFFFF_FFFF) as u32
-            };
+            // ToUint32 is modulo 2^32 over the full Number range, not a saturating integer
+            // cast. An object can return a huge Number here and a valid length on its second
+            // conversion, so comparing only the original input range is not equivalent.
+            let new_len = i.to_uint32(v)?;
             let number_len = i.to_number(v)?;
             let same = if number_len == 0.0 {
                 new_len == 0
@@ -5090,37 +5091,40 @@ fn array_set_length(i: &mut Interp, o: &Gc, d: &PartialDesc) -> Result<bool, Abr
     if !len_writable && (new_len != old_len || matches!(d.writable, Some(true))) {
         return Ok(false);
     }
+    if !len_writable {
+        // OrdinaryDefineOwnProperty accepts the same normalized value on a non-writable
+        // property. This includes a length frozen by one of the conversions above.
+        return Ok(true);
+    }
     let writable = d.writable.unwrap_or(len_writable);
+    if new_len == old_len && writable == len_writable {
+        // Validation and every observable conversion have already completed. Length is an
+        // ordinary non-configurable, non-enumerable data property: reapplying this exact
+        // value/attributes changes nothing (ValidateAndApplyPropertyDescriptor). In particular,
+        // do not return here when the descriptor freezes a currently writable length.
+        return Ok(true);
+    }
     if new_len < old_len {
-        // ArraySetLength deletes elements from the top down; a non-configurable element blocks the
-        // shrink, so length only drops to just past it and the operation reports failure.
-        let mut indices: Vec<usize> = o
-            .borrow()
-            .props
-            .keys()
-            .iter()
-            .filter_map(|k| k.parse::<usize>().ok())
-            .filter(|&idx| idx >= new_len)
-            .collect();
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in indices {
-            let configurable = o
-                .borrow()
-                .props
-                .get(&idx.to_string())
-                .map(|p| p.configurable())
-                .unwrap_or(true);
-            if configurable {
-                o.borrow_mut().props.remove(&idx.to_string());
-            } else {
-                // Stop here: length settles at idx+1; length stays writable unless explicitly frozen.
-                o.borrow_mut().props.insert(
-                    "length",
-                    Property::data(Value::Num((idx + 1) as f64), writable, false, false),
-                );
-                return Ok(false);
-            }
+        // Publish the tentative length first, with writable still true. A requested freeze
+        // is deferred until the deletion phase (including a possible failed deletion).
+        let mut array = o.borrow_mut();
+        array.props.insert(
+            "length",
+            Property::data(Value::Num(new_len as f64), true, false, false),
+        );
+        // Array own [[Delete]] cannot invoke an accessor or proxy trap. Finding the highest
+        // non-configurable index and removing all indices above it is therefore equivalent
+        // to descending deletion, without sorting/key allocation or O(n)-per-key compaction.
+        let blocker = array.props.highest_nonconfig_index_from(new_len);
+        let final_len = blocker.map_or(new_len, |index| index + 1);
+        array.props.remove_indices_from(final_len);
+        if blocker.is_some() || !writable {
+            array.props.insert(
+                "length",
+                Property::data(Value::Num(final_len as f64), writable, false, false),
+            );
         }
+        return Ok(blocker.is_none());
     }
     o.borrow_mut().props.insert(
         "length",
@@ -5202,6 +5206,58 @@ pub(crate) fn intrinsic_array_iterator_is_unmodified(i: &Interp) -> bool {
         .get("%ArrayIteratorPrototype%")
         .and_then(|prototype| prototype.borrow().props.get("next").map(|p| p.value()))
         .is_some_and(|next| is_native_function(&next, array_iter_next))
+}
+
+/// Cardinality of an already-open Array iterator only when its captured next method and every
+/// indexed Get/state transition are inert. Used solely to reject impossible bounded rest drains;
+/// custom next methods, state accessors and length-changing element getters must run normally.
+pub(crate) fn inert_array_iterator_remaining(
+    i: &Interp,
+    iterator: &Value,
+    next: &Value,
+) -> Option<usize> {
+    if !is_native_function(next, array_iter_next) {
+        return None;
+    }
+    let object = iterator.as_obj()?;
+    if !i.ordinary_get_ptr(Rc::as_ptr(object) as usize) {
+        return None;
+    }
+    let state = object.borrow();
+    let plain = |name| {
+        state
+            .props
+            .get(name)
+            .filter(|p| !p.accessor() && p.writable())
+            .map(|p| p.value())
+    };
+    let target = plain("__ai_target")?;
+    let Value::Num(index) = plain("__ai_index")? else {
+        return None;
+    };
+    let Value::Num(kind) = plain("__ai_kind")? else {
+        return None;
+    };
+    if !index.is_finite()
+        || index < 0.0
+        || index.fract() != 0.0
+        || (kind != 0.0 && kind != 1.0 && kind != 2.0)
+    {
+        return None;
+    }
+    let target = target.as_obj()?;
+    if !matches!(target.borrow().exotic, Exotic::Array)
+        || !i.ordinary_get_ptr(Rc::as_ptr(target) as usize)
+        || !i.array_append_unshadowed(target)
+        || target
+            .borrow()
+            .props
+            .iter()
+            .any(|(key, p)| crate::value::canonical_index(key).is_some() && p.accessor())
+    {
+        return None;
+    }
+    Some(i.array_length(target).saturating_sub(index as usize))
 }
 
 /// Whether an array can use the allocation-free iterator snapshot in `Interp::iterate`.
@@ -5498,6 +5554,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             set_throw(i, &ov, "length", Value::Num(0.0))?;
             return Ok(Value::Undefined);
         }
+        // ECMA-262 #sec-array.prototype.shift: own data reads/writes cannot
+        // observe the prototype, even on non-extensible Arrays. The storage
+        // proof rejects holes/accessors/failing descriptors before any mutation.
+        if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+        {
+            if let Some(first) = o.borrow_mut().props.shift_dense_array(len) {
+                return Ok(first);
+            }
+        }
         let first = ab(i.get_member(&ov, "0"))?;
         for k in 1..len {
             let to = (k - 1).to_string();
@@ -5717,16 +5782,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             ));
         }
         let cb_this = arg(args, 1);
+        let cb = crate::callback::Callback::new(cb);
         let ov = Value::Obj(o.clone());
         for k in 0..len {
             let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue; // skip array holes
             };
-            ab(i.call(
-                cb.clone(),
-                cb_this.clone(),
-                &[v, Value::Num(k as f64), ov.clone()],
-            ))?;
+            ab(cb.call(i, cb_this.clone(), [v, Value::Num(k as f64), ov.clone()]))?;
         }
         Ok(Value::Undefined)
     });
@@ -5738,17 +5800,14 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             return Err(i.make_error("TypeError", "Array.prototype.map callback is not callable"));
         }
         let cb_this = arg(args, 1);
+        let cb = crate::callback::Callback::new(cb);
         let ov = Value::Obj(o.clone());
         let result = array_species_create(i, &this, len)?;
         for k in 0..len {
             let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue; // holes stay holes in the result
             };
-            let mapped = ab(i.call(
-                cb.clone(),
-                cb_this.clone(),
-                &[v, Value::Num(k as f64), ov.clone()],
-            ))?;
+            let mapped = ab(cb.call(i, cb_this.clone(), [v, Value::Num(k as f64), ov.clone()]))?;
             let key = k.to_string();
             // ECMA-262 §23.1.3.21 step 6.3: CreateDataPropertyOrThrow.  The
             // trap-aware helper keeps the ordinary fresh-array fast path while
@@ -5768,6 +5827,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             ));
         }
         let cb_this = arg(args, 1);
+        let cb = crate::callback::Callback::new(cb);
         let ov = Value::Obj(o.clone());
         let result = array_species_create(i, &this, 0)?;
         let mut to = 0usize;
@@ -5775,10 +5835,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
                 continue;
             };
-            let keep = ab(i.call(
-                cb.clone(),
+            let keep = ab(cb.call(
+                i,
                 cb_this.clone(),
-                &[v.clone(), Value::Num(k as f64), ov.clone()],
+                [v.clone(), Value::Num(k as f64), ov.clone()],
             ))?;
             if i.to_boolean(&keep) {
                 // ECMA-262 §23.1.3.8 step 6.3.1: CreateDataPropertyOrThrow.
@@ -5798,6 +5858,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 "Array.prototype.reduce callback is not callable",
             ));
         }
+        let cb = crate::callback::Callback::new(cb);
         let ov = Value::Obj(o.clone());
         let mut k = 0;
         let mut acc;
@@ -5821,10 +5882,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         while k < len {
             if let Some(v) = array_get_present_index(i, &o, &ov, k)? {
-                acc = ab(i.call(
-                    cb.clone(),
+                acc = ab(cb.call(
+                    i,
                     Value::Undefined,
-                    &[acc, v, Value::Num(k as f64), ov.clone()],
+                    [acc, v, Value::Num(k as f64), ov.clone()],
                 ))?;
             }
             k += 1;
@@ -6066,6 +6127,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let cb_this = arg(args, 1);
         let a = array_species_create(i, &this, 0)?;
         let ov = Value::Obj(o.clone());
+        let cb = crate::callback::Callback::new(cb);
         flatten_into(i, &a, &ov, len, 0, 1, Some(&cb), &cb_this)?;
         Ok(a)
     });
@@ -6239,6 +6301,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 "Array.prototype.reduceRight callback is not callable",
             ));
         }
+        let cb = crate::callback::Callback::new(cb);
         let ov = Value::Obj(o.clone());
         let mut acc;
         let mut k = len as i64 - 1;
@@ -6262,10 +6325,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         }
         while k >= 0 {
             if let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? {
-                acc = ab(i.call(
-                    cb.clone(),
+                acc = ab(cb.call(
+                    i,
                     Value::Undefined,
-                    &[acc, v, Value::Num(k as f64), ov.clone()],
+                    [acc, v, Value::Num(k as f64), ov.clone()],
                 ))?;
             }
             k -= 1;
@@ -6387,6 +6450,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         if !matches!(mapfn, Value::Undefined) && !mapfn.is_callable() {
             return Err(i.make_error("TypeError", "Array.from: mapFn is not callable"));
         }
+        let mapfn = mapfn
+            .is_callable()
+            .then(|| crate::callback::Callback::new(mapfn));
         // GetMethod(items, @@iterator): a throwing getter propagates; non-callable non-nullish
         // is a TypeError.
         let iter_method = match well_known_key(i, "iterator") {
@@ -6403,7 +6469,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             // With the intrinsic Array constructor and iterator, a fully dense own-data source
             // has no per-element observable calls. Build the identical result in one pass rather
             // than allocating an iterator result and a property descriptor for every element.
-            if matches!(mapfn, Value::Undefined)
+            if mapfn.is_none()
                 && is_intrinsic_array_constructor(i, &this)
                 && is_native_function(&iter_method, nf_array_values)
                 && intrinsic_array_iterator_is_unmodified(i)
@@ -6421,10 +6487,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 i.make_array(Vec::new())
             };
             let iter = ab(i.call(iter_method, source.clone(), &[]))?;
-            let next = ab(i.get_member(&iter, "next"))?;
+            let next = crate::callback::Callback::new(ab(i.get_member(&iter, "next"))?);
             let mut k = 0u64;
             loop {
-                let res = ab(i.call(next.clone(), iter.clone(), &[]))?;
+                let res = ab(next.call(i, iter.clone(), []))?;
                 if !matches!(res, Value::Obj(_)) {
                     return Err(i.make_error("TypeError", "iterator result is not an object"));
                 }
@@ -6434,12 +6500,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 }
                 let raw = ab(i.get_member(&res, "value"))?;
                 let step = (|i: &mut Interp| -> Result<(), Value> {
-                    let v = if mapfn.is_callable() {
-                        ab(i.call(
-                            mapfn.clone(),
-                            this_arg.clone(),
-                            &[raw, Value::Num(k as f64)],
-                        ))?
+                    let v = if let Some(mapfn) = &mapfn {
+                        ab(mapfn.call(i, this_arg.clone(), [raw, Value::Num(k as f64)]))?
                     } else {
                         raw
                     };
@@ -6469,12 +6531,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         };
         for k in 0..len {
             let raw = array_get_index(i, &o, &ov, k)?;
-            let v = if mapfn.is_callable() {
-                ab(i.call(
-                    mapfn.clone(),
-                    this_arg.clone(),
-                    &[raw, Value::Num(k as f64)],
-                ))?
+            let v = if let Some(mapfn) = &mapfn {
+                ab(mapfn.call(i, this_arg.clone(), [raw, Value::Num(k as f64)]))?
             } else {
                 raw
             };
@@ -6613,13 +6671,14 @@ fn array_find(
         return Err(i.make_error("TypeError", "predicate is not callable"));
     }
     let cb_this = arg(args, 1);
+    let cb = crate::callback::Callback::new(cb);
     for step in 0..len {
         let k = if from_last { len - 1 - step } else { step };
         let v = array_get_index(i, &o, &ov, k)?;
-        let r = ab(i.call(
-            cb.clone(),
+        let r = ab(cb.call(
+            i,
             cb_this.clone(),
-            &[v.clone(), Value::Num(k as f64), ov.clone()],
+            [v.clone(), Value::Num(k as f64), ov.clone()],
         ))?;
         if i.to_boolean(&r) {
             return Ok(if want_value { v } else { Value::Num(k as f64) });
@@ -6645,16 +6704,13 @@ fn array_some_every(
         return Err(i.make_error("TypeError", "predicate is not callable"));
     }
     let cb_this = arg(args, 1);
+    let cb = crate::callback::Callback::new(cb);
     let ov = Value::Obj(o.clone());
     for k in 0..len {
         let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
             continue; // skip holes
         };
-        let r = ab(i.call(
-            cb.clone(),
-            cb_this.clone(),
-            &[v, Value::Num(k as f64), ov.clone()],
-        ))?;
+        let r = ab(cb.call(i, cb_this.clone(), [v, Value::Num(k as f64), ov.clone()]))?;
         let b = i.to_boolean(&r);
         if every && !b {
             return Ok(Value::Bool(false));
@@ -6676,7 +6732,7 @@ fn flatten_into(
     source_len: usize,
     start: usize,
     depth: i64,
-    mapper: Option<&Value>,
+    mapper: Option<&crate::callback::Callback>,
     mapper_this: &Value,
 ) -> Result<usize, Value> {
     // FlattenIntoArray uses HasProperty/Get for every source index. If no mapper is present and
@@ -6728,10 +6784,10 @@ fn flatten_into(
             _ => ab(i.get_member(source, &key))?,
         };
         if let Some(m) = mapper {
-            element = ab(i.call(
-                m.clone(),
+            element = ab(m.call(
+                i,
                 mapper_this.clone(),
-                &[element, Value::Num(k as f64), source.clone()],
+                [element, Value::Num(k as f64), source.clone()],
             ))?;
         }
         if depth > 0 && json_is_array(i, &element)? {
@@ -6857,6 +6913,9 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
             return merge_sort_with_keys(items, keys);
         }
     }
+    let cmp = cmp
+        .is_callable()
+        .then(|| crate::callback::Callback::new(cmp.clone()));
 
     // SortIndexedProperties permits any stable implementation-defined comparison sequence
     // (ECMA-262 §23.1.3.30.1). Keep one source and one destination buffer for all merge passes;
@@ -6874,8 +6933,8 @@ fn merge_sort(i: &mut Interp, items: &mut [Value], cmp: &Value) -> Result<(), Va
             let end = mid.saturating_add(width).min(n);
             let (mut left, mut right, mut out) = (start, mid, start);
             while left < mid && right < end {
-                let take_left =
-                    compare_values(i, cmp, &source[left], &source[right])? != Ordering::Greater;
+                let take_left = compare_values(i, cmp.as_ref(), &source[left], &source[right])?
+                    != Ordering::Greater;
                 let selected = if take_left {
                     let value = std::mem::replace(&mut source[left], Value::Undefined);
                     left += 1;
@@ -6992,7 +7051,12 @@ fn compare_sort_keys(a: &Option<LStr>, b: &Option<LStr>) -> Ordering {
     }
 }
 
-fn compare_values(i: &mut Interp, cmp: &Value, a: &Value, b: &Value) -> Result<Ordering, Value> {
+fn compare_values(
+    i: &mut Interp,
+    cmp: Option<&crate::callback::Callback>,
+    a: &Value,
+    b: &Value,
+) -> Result<Ordering, Value> {
     // `undefined` always sorts to the end.
     match (matches!(a, Value::Undefined), matches!(b, Value::Undefined)) {
         (true, true) => return Ok(Ordering::Equal),
@@ -7000,8 +7064,8 @@ fn compare_values(i: &mut Interp, cmp: &Value, a: &Value, b: &Value) -> Result<O
         (false, true) => return Ok(Ordering::Less),
         _ => {}
     }
-    if cmp.is_callable() {
-        let r = ab(i.call(cmp.clone(), Value::Undefined, &[a.clone(), b.clone()]))?;
+    if let Some(cmp) = cmp {
+        let r = ab(cmp.call(i, Value::Undefined, [a.clone(), b.clone()]))?;
         let n = ab(i.to_number(&r))?;
         Ok(if n < 0.0 {
             Ordering::Less
@@ -7080,8 +7144,9 @@ fn install_iterator(it: &mut Interp) {
         }
         let next = ab(i.get_member(&this, "next"))?;
         let mut k = 0.0;
+        let f = crate::callback::Callback::new(f);
         while let Some(v) = step_iter_with(i, &this, &next)? {
-            if let Err(e) = i.call(f.clone(), Value::Undefined, &[v, Value::Num(k)]) {
+            if let Err(e) = f.call(i, Value::Undefined, [v, Value::Num(k)]) {
                 i.iterator_close(&this);
                 return Err(crate::interpreter::abrupt_value(e));
             }
@@ -7114,8 +7179,9 @@ fn install_iterator(it: &mut Interp) {
             };
             k = 1.0;
         }
+        let f = crate::callback::Callback::new(f);
         while let Some(v) = step_iter_with(i, &this, &next)? {
-            acc = match i.call(f.clone(), Value::Undefined, &[acc, v, Value::Num(k)]) {
+            acc = match f.call(i, Value::Undefined, [acc, v, Value::Num(k)]) {
                 Ok(r) => r,
                 Err(e) => {
                     i.iterator_close(&this);
@@ -7140,8 +7206,9 @@ fn install_iterator(it: &mut Interp) {
         }
         let next = ab(i.get_member(&this, "next"))?;
         let mut k = 0.0;
+        let f = crate::callback::Callback::new(f);
         while let Some(v) = step_iter_with(i, &this, &next)? {
-            let r = match i.call(f.clone(), Value::Undefined, &[v.clone(), Value::Num(k)]) {
+            let r = match f.call(i, Value::Undefined, [v.clone(), Value::Num(k)]) {
                 Ok(r) => r,
                 Err(e) => {
                     i.iterator_close(&this);
@@ -8258,8 +8325,9 @@ fn iter_some_every(i: &mut Interp, this: Value, a: &[Value], want: bool) -> Resu
     }
     let next = ab(i.get_member(&this, "next"))?;
     let mut k = 0.0;
+    let f = crate::callback::Callback::new(f);
     while let Some(v) = step_iter_with(i, &this, &next)? {
-        let r = match i.call(f.clone(), Value::Undefined, &[v, Value::Num(k)]) {
+        let r = match f.call(i, Value::Undefined, [v, Value::Num(k)]) {
             Ok(r) => r,
             Err(e) => {
                 i.iterator_close(&this);

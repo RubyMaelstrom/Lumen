@@ -172,12 +172,14 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
             };
             slots[index] = slot as u32;
         }
-        i.regexp_dependency_cache
-            .set(crate::interpreter::RegexpDependencyCache {
-                proto: proto_ptr,
-                shape,
-                slots,
-            });
+        if crate::value::is_cacheable_shape(shape) {
+            i.regexp_dependency_cache
+                .set(crate::interpreter::RegexpDependencyCache {
+                    proto: proto_ptr,
+                    shape,
+                    slots,
+                });
+        }
         slots
     };
     let property_at = |index: usize| {

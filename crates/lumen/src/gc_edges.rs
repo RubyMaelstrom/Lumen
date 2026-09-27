@@ -379,7 +379,7 @@ mod tests {
             },
         );
         engine.interp.module_ns.insert(key(1), Default::default());
-        engine.interp.map_data.insert(key(2), Vec::new());
+        engine.interp.map_data.insert(key(2), Vec::new().into());
         engine.interp.ta_buffer.insert(key(3), Value::Undefined);
         engine
             .interp
@@ -408,7 +408,7 @@ mod tests {
             key(9),
             FinalizationState {
                 cleanup_callback: crate::interpreter::JobCallback::plain(Value::Undefined),
-                cells: Vec::new(),
+                cells: Default::default(),
                 cleanup_scheduled: false,
             },
         );
@@ -451,7 +451,7 @@ mod tests {
             engine.interp.gc_pin(&owner);
             assert!(engine.interp.gc_can_skip_unpinned_slots(count));
         }
-        engine.interp.map_data.insert(key(2), Vec::new());
+        engine.interp.map_data.insert(key(2), Vec::new().into());
         let owner = engine.interp.gc_pins.remove(&key(2)).unwrap();
         assert!(!engine.interp.gc_can_skip_unpinned_slots(count));
         engine.interp.gc_pin(&owner);
@@ -495,7 +495,7 @@ mod tests {
             engine
                 .interp
                 .map_data
-                .insert(ptr, vec![(left.clone(), left.clone())]);
+                .insert(ptr, vec![(left.clone(), left.clone())].into());
             engine.interp.ta_buffer.insert(ptr, left);
             engine.interp.promise_forward.insert(ptr, right);
             assert_sparse_mask(&engine);
@@ -543,7 +543,7 @@ mod tests {
             engine
                 .interp
                 .map_data
-                .insert(outside, vec![(Value::Undefined, target)]);
+                .insert(outside, vec![(Value::Undefined, target)].into());
             value(&mut engine, "foreignSlotTarget = null; 'released global'");
             assert_sparse_mask(&engine);
             engine

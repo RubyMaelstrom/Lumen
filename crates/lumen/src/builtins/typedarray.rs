@@ -764,11 +764,11 @@ fn ta_sort_compare(
     i: &mut Interp,
     a: &Value,
     b: &Value,
-    cmp: &Value,
+    cmp: Option<&crate::callback::Callback>,
     is_bigint: bool,
 ) -> Result<i32, Value> {
-    if cmp.is_callable() {
-        let r = ab(i.call(cmp.clone(), Value::Undefined, &[a.clone(), b.clone()]))?;
+    if let Some(cmp) = cmp {
+        let r = ab(cmp.call(i, Value::Undefined, [a.clone(), b.clone()]))?;
         let n = ab(i.to_number(&r))?;
         return Ok(if n.is_nan() {
             0
@@ -797,7 +797,7 @@ fn ta_sort_compare(
 fn ta_merge_sort(
     i: &mut Interp,
     vals: &mut [Value],
-    cmp: &Value,
+    cmp: Option<&crate::callback::Callback>,
     is_bigint: bool,
 ) -> Result<(), Value> {
     let n = vals.len();
@@ -871,7 +871,9 @@ fn ta_native(
     // A predicate/callback method requires its first argument to be callable.
     let require_cb = |i: &mut Interp| {
         if cb.is_callable() {
-            Ok(())
+            // Keep one guarded entry across the algorithm, without changing any live element
+            // read or species/Call order (ECMA-262 %TypedArray%.prototype callback methods).
+            Ok(crate::callback::Callback::new(cb.clone()))
         } else {
             Err(i.make_error("TypeError", "callback is not a function"))
         }
@@ -888,26 +890,18 @@ fn ta_native(
             Ok(i.ta_read(&info, k as usize))
         })()),
         "forEach" => Some((|| {
-            require_cb(i)?;
+            let cb = require_cb(i)?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
             }
             Ok(Value::Undefined)
         })()),
         "every" => Some((|| {
-            require_cb(i)?;
+            let cb = require_cb(i)?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
                 if !i.to_boolean(&r) {
                     return Ok(Value::Bool(false));
                 }
@@ -915,14 +909,10 @@ fn ta_native(
             Ok(Value::Bool(true))
         })()),
         "some" => Some((|| {
-            require_cb(i)?;
+            let cb = require_cb(i)?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                let r = ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
                 if i.to_boolean(&r) {
                     return Ok(Value::Bool(true));
                 }
@@ -930,7 +920,7 @@ fn ta_native(
             Ok(Value::Bool(false))
         })()),
         "find" | "findIndex" | "findLast" | "findLastIndex" => Some((|| {
-            require_cb(i)?;
+            let cb = require_cb(i)?;
             let want_value = method == "find" || method == "findLast";
             let reverse = method == "findLast" || method == "findLastIndex";
             // The spec captures [[ArrayLength]] once, then visits indices in direction order.
@@ -944,10 +934,10 @@ fn ta_native(
                 };
                 remaining -= 1;
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
+                let r = ab(cb.call(
+                    i,
                     this_arg.clone(),
-                    &[v.clone(), Value::Num(k as f64), this.clone()],
+                    [v.clone(), Value::Num(k as f64), this.clone()],
                 ))?;
                 if i.to_boolean(&r) {
                     return Ok(if want_value { v } else { Value::Num(k as f64) });
@@ -960,7 +950,7 @@ fn ta_native(
             })
         })()),
         "map" => Some((|| {
-            require_cb(i)?;
+            let cb = require_cb(i)?;
             let new_ta = ta_species_create(i, this, info.kind, &[Value::Num(len as f64)], true)?;
             let new_info = map_ptr(&new_ta)
                 .and_then(|p| i.typed_arrays.get(&p).copied())
@@ -969,24 +959,21 @@ fn ta_native(
                 })?;
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let mapped = ab(i.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Num(k as f64), this.clone()],
-                ))?;
+                let mapped =
+                    ab(cb.call(i, this_arg.clone(), [v, Value::Num(k as f64), this.clone()]))?;
                 ab(i.ta_store(&new_info, k, &mapped))?;
             }
             Ok(new_ta)
         })()),
         "filter" => Some((|| {
-            require_cb(i)?;
+            let cb = require_cb(i)?;
             let mut kept: Vec<Value> = Vec::new();
             for k in 0..len {
                 let v = i.ta_read(&info, k);
-                let r = ab(i.call(
-                    cb.clone(),
+                let r = ab(cb.call(
+                    i,
                     this_arg.clone(),
-                    &[v.clone(), Value::Num(k as f64), this.clone()],
+                    [v.clone(), Value::Num(k as f64), this.clone()],
                 ))?;
                 if i.to_boolean(&r) {
                     kept.push(v);
@@ -1005,7 +992,7 @@ fn ta_native(
             Ok(new_ta)
         })()),
         "reduce" | "reduceRight" => Some((|| {
-            require_cb(i)?;
+            let cb = require_cb(i)?;
             let right = method == "reduceRight";
             let mut acc: Value;
             let mut remaining = len;
@@ -1029,10 +1016,10 @@ fn ta_native(
                 };
                 remaining -= 1;
                 let v = i.ta_read(&info, k);
-                acc = ab(i.call(
-                    cb.clone(),
+                acc = ab(cb.call(
+                    i,
                     Value::Undefined,
-                    &[acc, v, Value::Num(k as f64), this.clone()],
+                    [acc, v, Value::Num(k as f64), this.clone()],
                 ))?;
             }
             Ok(acc)
@@ -1303,7 +1290,10 @@ fn ta_native(
                 return Ok(new_ta);
             }
             let mut vals: Vec<Value> = (0..len).map(|k| i.ta_read(&info, k)).collect();
-            ta_merge_sort(i, &mut vals, &cmp, info.kind.is_bigint())?;
+            let cmp = cmp
+                .is_callable()
+                .then(|| crate::callback::Callback::new(cmp));
+            ta_merge_sort(i, &mut vals, cmp.as_ref(), info.kind.is_bigint())?;
             if in_place {
                 for (k, v) in vals.iter().enumerate() {
                     ab(i.ta_store(&info, k, v))?;
@@ -2566,6 +2556,9 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
     if !matches!(mapfn, Value::Undefined) && !mapfn.is_callable() {
         return Err(i.make_error("TypeError", "mapfn is not callable"));
     }
+    let mapfn = mapfn
+        .is_callable()
+        .then(|| crate::callback::Callback::new(mapfn));
     let this_arg = arg(args, 2);
     let source = arg(args, 0);
     // GetMethod(source, @@iterator): reading @@iterator off undefined/null throws, and a throwing
@@ -2586,8 +2579,8 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
         let ta = ab(i.construct(this, &len_args))?;
         let ta = ta_validate_created(i, ta, &len_args, true)?;
         for (k, v) in items.into_iter().enumerate() {
-            let val = if mapfn.is_callable() {
-                ab(i.call(mapfn.clone(), this_arg.clone(), &[v, Value::Num(k as f64)]))?
+            let val = if let Some(mapfn) = &mapfn {
+                ab(mapfn.call(i, this_arg.clone(), [v, Value::Num(k as f64)]))?
             } else {
                 v
             };
@@ -2604,8 +2597,8 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
     let ta = ta_validate_created(i, ta, &len_args, true)?;
     for k in 0..len {
         let v = ab(i.get_member(&src, &k.to_string()))?;
-        let val = if mapfn.is_callable() {
-            ab(i.call(mapfn.clone(), this_arg.clone(), &[v, Value::Num(k as f64)]))?
+        let val = if let Some(mapfn) = &mapfn {
+            ab(mapfn.call(i, this_arg.clone(), [v, Value::Num(k as f64)]))?
         } else {
             v
         };

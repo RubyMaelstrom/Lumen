@@ -403,6 +403,11 @@ impl Snapshot {
 
 #[derive(Default)]
 pub(crate) struct Visitor {
+    /// Cache admission accounts one plan, never traverses independent source/callee graphs.
+    fragment_plan_root: Option<usize>,
+    /// One-time immutable source charge: skip mutable Function code/hoist/object-map sidecars.
+    fragment_source_only: bool,
+    loop_site_tokens: HashSet<usize>,
     gc_heaps: HashSet<usize>,
     lstrs: HashSet<usize>,
     rc_strs: HashSet<usize>,
@@ -449,7 +454,42 @@ pub(crate) struct Visitor {
     detached_property_storage_opaque: bool,
 }
 
+/// Known requested payload directly reachable from this plan's own metadata. Independent
+/// Rc<Function>/Class/callee-Chunk graphs are deliberately not traversed. This is an eviction
+/// charge, not an exact total-retained-heap claim (Rc headers/opaque table buckets excluded).
+pub(crate) fn fragment_plan_charge(chunk: &Rc<crate::bytecode::Chunk>) -> usize {
+    let mut visitor = Visitor {
+        fragment_plan_root: Some(Rc::as_ptr(chunk) as usize),
+        ..Visitor::default()
+    };
+    visitor.chunk(chunk);
+    visitor.fragment_charge()
+}
+
+pub(crate) fn fragment_plan_source_charge(chunk: &Rc<crate::bytecode::Chunk>) -> usize {
+    let direct = fragment_plan_charge(chunk);
+    let mut visitor = Visitor {
+        fragment_source_only: true,
+        ..Visitor::default()
+    };
+    visitor.chunk(chunk);
+    visitor.fragment_charge().saturating_sub(direct)
+}
+
 impl Visitor {
+    fn fragment_charge(&self) -> usize {
+        self.function_bytecode_metadata
+            .saturating_add(self.strings_symbols_bigints)
+            .saturating_add(self.jit_heap_metadata)
+            .saturating_add(self.regexp_metadata)
+            .saturating_add(self.detached_property_storage)
+    }
+    pub(crate) fn loop_site_token(&mut self, token: &Rc<crate::ast::LoopSiteToken>) {
+        if self.loop_site_tokens.insert(Rc::as_ptr(token) as usize) {
+            self.add_function_bytecode_bytes(size_of::<crate::ast::LoopSiteToken>());
+        }
+    }
+
     fn gc_heap(&mut self, heap: &crate::value::GcHeap) -> (usize, bool) {
         let identity = Rc::as_ptr(heap) as usize;
         if !self.gc_heaps.insert(identity) {
@@ -492,6 +532,12 @@ impl Visitor {
             if let Some(description) = &value.description {
                 self.rc_str(description);
             }
+            if let Some(observers) = value.weak_observers.borrow().as_ref() {
+                self.strings_symbols_bigints = self
+                    .strings_symbols_bigints
+                    .saturating_add(size_of::<crate::weak_metadata::DeathObservers>())
+                    .saturating_add(observers.allocated_bytes());
+            }
         }
     }
 
@@ -518,20 +564,34 @@ impl Visitor {
             Callable::None | Callable::Native(_) => {}
             Callable::NativeData(value) => {
                 let identity = Rc::as_ptr(value) as usize;
-                if self.callable_allocations.insert(identity) {
+                let first = self.callable_allocations.insert(identity);
+                if first {
                     self.callable_metadata = self
                         .callable_metadata
                         .saturating_add(size_of_val(value.as_ref()));
                 }
-                let closure_identity = Rc::as_ptr(&value.func) as *const () as usize;
+                // Keep the immutable registration label in the canonical string family.
+                self.rc_str(&value.identity);
+                let crate::value::NativeCallableBody::Opaque(function) = &value.body else {
+                    if let crate::value::NativeCallableBody::Captured { captures, .. } = &value.body
+                    {
+                        if first {
+                            self.callable_metadata = self
+                                .callable_metadata
+                                .saturating_add(size_of_val(captures.as_ref()));
+                        }
+                        for capture in captures {
+                            self.value(capture);
+                        }
+                    }
+                    return;
+                };
+                let closure_identity = Rc::as_ptr(function) as *const () as usize;
                 if self.native_closure_allocations.insert(closure_identity) {
                     self.callable_metadata = self
                         .callable_metadata
-                        .saturating_add(size_of_val(value.func.as_ref()));
+                        .saturating_add(size_of_val(function.as_ref()));
                 }
-                // Keep the immutable registration label in the same canonical string family as
-                // every other engine string. It is distinct from the mutable JS `name` property.
-                self.rc_str(&value.identity);
                 if let Some(reporter) = &value.retained {
                     self.reported_native_closures.insert(closure_identity);
                     let reporter_identity = Rc::as_ptr(reporter) as *const () as usize;
@@ -716,11 +776,18 @@ impl Visitor {
     }
 
     pub(crate) fn function(&mut self, function: &Rc<crate::ast::Function>) {
+        if self.fragment_plan_root.is_some() {
+            return;
+        }
         let identity = Rc::as_ptr(function) as usize;
         if !self.functions.insert(identity) {
             return;
         }
         let mut bytes = crate::ast::scan_function_retained_memory(function, self);
+        if self.fragment_source_only {
+            self.add_function_bytecode_bytes(bytes);
+            return;
+        }
         if let Some((_, hoist)) = function.hoist.get() {
             let identity = Rc::as_ptr(hoist) as usize;
             if self.hoist_plans.insert(identity) {
@@ -761,6 +828,9 @@ impl Visitor {
     }
 
     pub(crate) fn class(&mut self, class: &Rc<crate::ast::Class>) {
+        if self.fragment_plan_root.is_some() {
+            return;
+        }
         let identity = Rc::as_ptr(class) as usize;
         if self.classes.insert(identity) {
             let bytes = crate::ast::scan_class_retained_memory(class, self);
@@ -769,6 +839,9 @@ impl Visitor {
     }
 
     pub(crate) fn stmt_body(&mut self, body: &Rc<Vec<crate::ast::Stmt>>) {
+        if self.fragment_plan_root.is_some() {
+            return;
+        }
         let identity = Rc::as_ptr(body) as usize;
         if self.stmt_bodies.insert(identity) {
             let bytes = crate::ast::scan_stmt_body_retained_memory(body, self);
@@ -798,6 +871,9 @@ impl Visitor {
 
     pub(crate) fn chunk(&mut self, chunk: &Rc<crate::bytecode::Chunk>) {
         let identity = Rc::as_ptr(chunk) as usize;
+        if self.fragment_plan_root.is_some_and(|root| root != identity) {
+            return;
+        }
         if self.chunks.insert(identity) {
             chunk.scan_retained_memory(self);
         }
@@ -831,7 +907,7 @@ impl Visitor {
         self.detached_property_storage = self.detached_property_storage.saturating_add(bytes);
         self.detached_property_storage_opaque |= !exact;
         for (_, property) in props.iter() {
-            self.value(&property.value());
+            property.visit_retained_value(self);
             if let Some(getter) = property.getter() {
                 self.value(getter);
             }
@@ -840,7 +916,7 @@ impl Visitor {
             }
         }
         for property in props.packed_values() {
-            self.value(&property.value());
+            property.visit_retained_value(self);
         }
     }
 
@@ -849,8 +925,7 @@ impl Visitor {
             self.property_layout(layout);
         }
         for (_, property) in object.props.iter() {
-            let value = property.value();
-            self.value(&value);
+            property.visit_retained_value(self);
             if let Some(getter) = property.getter() {
                 self.value(getter);
             }
@@ -860,8 +935,7 @@ impl Visitor {
         }
         // Packed array elements have no key entry and must be visited separately.
         for property in object.props.packed_values() {
-            let value = property.value();
-            self.value(&value);
+            property.visit_retained_value(self);
             if let Some(getter) = property.getter() {
                 self.value(getter);
             }
@@ -1044,14 +1118,15 @@ fn scan_realm(
         }
     }
 
-    let mut key_vectors = 0usize;
-    let (bytes, exact) = interp.enumeration_keys.scan_retained_memory(|keys| {
-        key_vectors = key_vectors.saturating_add(keys.capacity() * size_of::<crate::lstr::LStr>());
-        for key in keys {
-            visitor.lstr(key);
-        }
+    // Candidate backings are registered GC objects. The heap census above counts their
+    // property storage and strings once, including backings pinned by active iterators after
+    // cache eviction. Cache entries additionally pin key-only layouts; these can outlive their
+    // originating foreign heap. Visit them through the same layout/string identity census as
+    // ordinary properties and constructor hints. Stale recency keys own no allocations.
+    let (bytes, exact) = interp.enumeration_keys.scan_retained_memory(|entry| {
+        entry.scan_retained_layouts(visitor);
     });
-    totals.engine_caches.add(bytes.saturating_add(key_vectors));
+    totals.engine_caches.add(bytes);
     if !exact {
         totals
             .engine_caches
@@ -1092,7 +1167,7 @@ fn scan_realm(
         interp
             .vm_pool
             .capacity()
-            .saturating_mul(size_of::<(Vec<Value>, Vec<Value>)>())
+            .saturating_mul(size_of::<crate::execution_storage::CompactFrame>())
             .saturating_add(
                 interp
                     .stub_cache
@@ -1110,11 +1185,15 @@ fn scan_realm(
                 interp
                     .frame_pool
                     .capacity()
-                    .saturating_mul(size_of::<std::ptr::NonNull<Value>>()),
+                    .saturating_mul(size_of::<std::ptr::NonNull<crate::value::PackedValue>>()),
             )
-            .saturating_add(interp.frame_pool.len().saturating_mul(
-                crate::jit::FRAME_BUF.saturating_mul(size_of::<std::mem::MaybeUninit<Value>>()),
-            ))
+            .saturating_add(
+                interp.frame_pool.len().saturating_mul(
+                    crate::jit::FRAME_BUF.saturating_mul(size_of::<
+                        std::mem::MaybeUninit<crate::value::PackedValue>,
+                    >()),
+                ),
+            )
             .saturating_add(
                 interp
                     .creation_pins
@@ -1132,8 +1211,8 @@ fn scan_realm(
         totals.engine_caches.add(
             slots
                 .capacity()
-                .saturating_mul(size_of::<Value>())
-                .saturating_add(stack.capacity().saturating_mul(size_of::<Value>())),
+                .saturating_add(stack.capacity())
+                .saturating_mul(size_of::<crate::value::PackedValue>()),
         );
         debug_assert!(slots.is_empty() && stack.is_empty());
     }
@@ -1497,18 +1576,18 @@ fn scan_realm(
                     .saturating_mul(size_of::<Value>()),
             ),
     );
+    totals
+        .interpreter_side_tables
+        .add(interp.weak_metadata.allocated_bytes());
     for registry in interp.finalization_registries.values() {
         visitor.value(&registry.cleanup_callback.callback);
         if let Some(global) = &registry.cleanup_callback.script_caller {
             visitor.value(&Value::Obj(global.clone()));
         }
-        totals.interpreter_side_tables.add(
-            registry
-                .cells
-                .capacity()
-                .saturating_mul(size_of::<crate::interpreter::FinalizationCell>()),
-        );
-        for cell in &registry.cells {
+        totals
+            .interpreter_side_tables
+            .add(registry.cells.allocated_bytes());
+        for cell in registry.cells.iter() {
             // `target` and `unregister_token` are deliberately not upgraded: diagnostics must
             // never turn an ECMA-262 weak edge into a strong root. The cell buffer already
             // includes their inline Weak handles; only [[HeldValue]] is strongly retained.
@@ -1716,6 +1795,15 @@ fn scan_realm(
     totals
         .interpreter_side_tables
         .add(interp.call_overflow.retained_bytes());
+    if let Some(cache) = &interp.native_callback_cache {
+        totals.engine_caches.add(cache.retained_bytes());
+        totals
+            .engine_caches
+            .make_lower_bound("opaque callback HashMap bucket and Weak allocation storage");
+    }
+    totals
+        .engine_caches
+        .add(interp.fragment_cache.scan_retained_memory(visitor));
     totals
         .interpreter_side_tables
         .add(interp.computed_reads.scan_retained_memory(visitor));
@@ -1813,41 +1901,30 @@ fn scan_realm(
         );
     }
 
-    totals.interpreter_side_tables.add(
-        interp
-            .map_data
-            .len()
-            .saturating_mul(size_of::<(usize, Vec<(Value, Value)>)>()),
-    );
+    totals
+        .interpreter_side_tables
+        .add(interp.map_data.len().saturating_mul(size_of::<(
+            usize,
+            crate::ordered_collection::OrderedCollection,
+        )>()));
     for entries in interp.map_data.values() {
-        totals.interpreter_side_tables.add(
-            entries
-                .capacity()
-                .saturating_mul(size_of::<(Value, Value)>()),
-        );
-        for (key, value) in entries {
+        totals
+            .interpreter_side_tables
+            .add(entries.storage_bytes_lower_bound());
+        for (key, value) in entries.iter() {
             visitor.value(key);
             visitor.value(value);
         }
     }
     totals
         .interpreter_side_tables
-        .add(interp.collection_index.len().saturating_mul(size_of::<(
+        .add(interp.collection_iterators.len().saturating_mul(size_of::<(
             usize,
-            crate::fasthash::FastMap<u64, crate::interpreter::CollectionBucket>,
+            crate::ordered_collection::CollectionIterator,
         )>()));
-    for index in interp.collection_index.values() {
-        totals.interpreter_side_tables.add(
-            index
-                .len()
-                .saturating_mul(size_of::<(u64, crate::interpreter::CollectionBucket)>()),
-        );
-        for bucket in index.values() {
-            if let crate::interpreter::CollectionBucket::Many(offsets) = bucket {
-                totals
-                    .interpreter_side_tables
-                    .add(offsets.capacity().saturating_mul(size_of::<usize>()));
-            }
+    for state in interp.collection_iterators.values() {
+        if let Some(target) = &state.target {
+            visitor.value(&Value::Obj(target.clone()));
         }
     }
     totals
@@ -1868,26 +1945,22 @@ fn scan_realm(
             visitor.value(value);
         }
     }
-    totals
-        .interpreter_side_tables
-        .add(
-            interp
-                .weak_collection_index
-                .len()
-                .saturating_mul(size_of::<(
-                    usize,
-                    crate::fasthash::FastMap<crate::interpreter::WeakKey, usize>,
-                )>()),
-        );
+    totals.interpreter_side_tables.add(
+        interp
+            .weak_collection_index
+            .capacity()
+            .saturating_mul(size_of::<(usize, crate::weak_metadata::WeakCollectionIndex)>()),
+    );
     for index in interp.weak_collection_index.values() {
         totals.interpreter_side_tables.add(
             index
-                .len()
+                .entries
+                .capacity()
                 .saturating_mul(size_of::<(crate::interpreter::WeakKey, usize)>()),
         );
     }
     if !interp.map_data.is_empty()
-        || !interp.collection_index.is_empty()
+        || !interp.collection_iterators.is_empty()
         || !interp.weak_collection_data.is_empty()
         || !interp.weak_collection_index.is_empty()
     {
@@ -2243,6 +2316,53 @@ mod tests {
     }
 
     #[test]
+    fn for_in_cache_layout_pins_are_censused_once_after_source_dies() {
+        let mut engine = crate::Engine::new();
+        engine.interp.activate_gc_heap();
+        let layout = Rc::new(vec![Rc::from("live"), Rc::from("unused prediction")]);
+        let weak_layout = Rc::downgrade(&layout);
+        let expected_layout_bytes =
+            size_of::<Vec<Rc<str>>>() + layout.capacity() * size_of::<Rc<str>>();
+        let mut props = Props::with_layout(1, Some(layout.clone()));
+        props.append_initialized_field(&layout[0], crate::value::Property::plain(Value::Undefined));
+        let source = Value::Obj(crate::value::Object::new_with_parts(
+            None,
+            props,
+            Exotic::None,
+        ));
+        let weak_source = Rc::downgrade(source.as_obj().unwrap());
+        let _keys = engine
+            .interp
+            .for_in_keys(&source)
+            .ok()
+            .expect("ordinary keys");
+        drop(source);
+        drop(layout);
+        assert!(weak_source.upgrade().is_none());
+        assert_eq!(
+            weak_layout.strong_count(),
+            1,
+            "cache is the only layout owner"
+        );
+        let mut visitor = Visitor::default();
+        for _ in 0..2 {
+            engine
+                .interp
+                .enumeration_keys
+                .scan_retained_memory(|entry| {
+                    entry.scan_retained_layouts(&mut visitor);
+                });
+        }
+        assert_eq!(visitor.property_layouts.len(), 1);
+        assert_eq!(
+            visitor.rc_strs.len(),
+            2,
+            "unused predictions are retained too"
+        );
+        assert_eq!(visitor.detached_property_storage, expected_layout_bytes);
+    }
+
+    #[test]
     fn unavailable_snapshot_is_not_reported_as_zero() {
         let json = Snapshot {
             object_bodies: Category::exact(1),
@@ -2495,6 +2615,43 @@ mod tests {
     }
 
     #[test]
+    fn explicit_native_captures_are_complete_and_shared_storage_is_counted_once() {
+        let string = LStr::from("explicit native capture");
+        let callable = Callable::NativeData(Rc::new(crate::value::NativeCallable {
+            body: crate::value::NativeCallableBody::Captured {
+                function: |_, _, _, captures| Ok(captures[0].clone()),
+                captures: vec![Value::Str(string.clone()), Value::Str(string.clone())]
+                    .into_boxed_slice(),
+            },
+            retained: None,
+            identity: Rc::from("captured"),
+        }));
+        let mut visitor = Visitor::default();
+        visitor.callable(&callable);
+        visitor.callable(&callable.clone());
+        assert_eq!(
+            visitor.callable_metadata,
+            size_of::<crate::value::NativeCallable>() + 2 * size_of::<Value>()
+        );
+        assert_eq!(
+            visitor.strings_symbols_bigints,
+            string.retained_requested_bytes() + "captured".len()
+        );
+        assert!(visitor.native_closure_allocations.is_empty());
+        assert!(visitor.unreported_native_closures.is_empty());
+
+        let interp = Interp::new();
+        let first = Object::new(None);
+        let second = Object::new(None);
+        first.borrow_mut().call = callable.clone();
+        second.borrow_mut().call = callable;
+        let snapshot = measure(&interp, &[first, second], &[]);
+        assert!(matches!(snapshot.callable_metadata.quality, Quality::Exact));
+        assert!(snapshot.callable_metadata.coverage_complete);
+        assert!(snapshot.complete());
+    }
+
+    #[test]
     fn reported_native_closure_allocations_and_values_are_deduplicated() {
         let interp = Interp::new();
         let allocation = Rc::new(RefCell::new(Vec::<u8>::with_capacity(137)));
@@ -2540,14 +2697,14 @@ mod tests {
         let (first_func, first_retained) = make_closure();
         let first_callable =
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
-                func: first_func,
+                body: crate::value::NativeCallableBody::Opaque(first_func),
                 retained: Some(first_retained),
                 identity: Rc::from("first"),
             }));
         let (second_func, second_retained) = make_closure();
         let second_callable =
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
-                func: second_func,
+                body: crate::value::NativeCallableBody::Opaque(second_func),
                 retained: Some(second_retained),
                 identity: Rc::from("second"),
             }));
@@ -2682,6 +2839,7 @@ mod tests {
             .eval(
                 r#"
                     globalThis.strong = new Map([["a", 1], ["b", 2], ["c", 3]]);
+                    globalThis.strongIterator = strong.entries();
                     globalThis.weakKey = {};
                     globalThis.weak = new WeakMap([[weakKey, { held: "value" }]]);
                 "#,
@@ -2693,7 +2851,7 @@ mod tests {
         let after = measure(&engine.interp, &objects, &scopes);
 
         assert!(!engine.interp.map_data.is_empty());
-        assert!(!engine.interp.collection_index.is_empty());
+        assert!(!engine.interp.collection_iterators.is_empty());
         assert!(!engine.interp.weak_collection_data.is_empty());
         assert!(!engine.interp.weak_collection_index.is_empty());
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
@@ -3323,5 +3481,46 @@ mod tests {
         assert!(visitor.functions.len() >= 3, "outer, method, and inner");
         assert_eq!(visitor.classes.len(), 1);
         assert_eq!(visitor.bigints.len(), 1);
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    #[test]
+    fn borrowed_osr_cache_metadata_is_counted_once_and_released_with_chunk() {
+        let mut engine = crate::Engine::new();
+        let body = crate::parser::parse_script("for(let n=0;n<1000;n++){}", false)
+            .ok()
+            .expect("OSR memory fixture parses");
+        let chunk = crate::bytecode::compile_script(&body, false).expect("Script compiles");
+        let mut before = Visitor::default();
+        before.chunk(&chunk);
+        let state = chunk
+            .osr
+            .get_or_init(|| Box::new(crate::tiering::OsrCodeState::default()));
+        let code = state
+            .code(&mut engine.interp, &chunk)
+            .expect("borrowed code compiles");
+        let weak = Rc::downgrade(&code);
+        let mut after = Visitor::default();
+        after.chunk(&chunk);
+        // The reclaimable native slot now owns a lazy state allocation in
+        // addition to the OSR sidecar itself. It is not executable/JitCode data.
+        assert!(state.retained_metadata_bytes() > size_of::<crate::tiering::OsrCodeState>());
+        assert_eq!(
+            after.function_bytecode_metadata,
+            before.function_bytecode_metadata + state.retained_metadata_bytes()
+        );
+        assert_eq!(after.jit_codes.len(), 1);
+        let retained = after.jit_heap_metadata;
+        assert!(retained > 0);
+        after.chunk(&chunk);
+        after.jit_code(&code);
+        assert_eq!(after.jit_heap_metadata, retained);
+        drop(code);
+        assert!(weak.upgrade().is_some());
+        drop(chunk);
+        assert!(weak.upgrade().is_none());
     }
 }

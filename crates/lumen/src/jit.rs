@@ -33,8 +33,97 @@ use crate::bytecode::Chunk;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 use crate::bytecode::UpdKind;
+use crate::execution_storage::SlotAccess;
 use crate::interpreter::{Abrupt, Env, Interp};
-use crate::value::Value;
+use crate::value::{PackedValue, Value};
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "jit_names.rs"]
+mod names;
+
+#[path = "jit_profiler.rs"]
+mod profiler;
+
+#[path = "jit_cache.rs"]
+pub(crate) mod cache;
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "jit_cache_tests.rs"]
+mod cache_tests;
+
+#[cfg(test)]
+#[path = "jit_coverage_tests.rs"]
+mod coverage_tests;
+
+#[cfg(test)]
+#[path = "jit_assignment_tests.rs"]
+mod assignment_tests;
+
+#[cfg(test)]
+#[path = "jit_call_reference_tests.rs"]
+mod call_reference_tests;
+
+#[cfg(test)]
+#[path = "jit_osr_entry_tests.rs"]
+mod osr_entry_tests;
+
+#[cfg(test)]
+#[path = "jit_continuation_tests.rs"]
+mod continuation_tests;
+
+#[cfg(test)]
+#[path = "jit_inline_context_tests.rs"]
+mod inline_context_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_constant_tests.rs"]
+mod constant_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_name_dispatch_tests.rs"]
+mod name_dispatch_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_loop_latch_tests.rs"]
+mod loop_latch_tests;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_regions.rs"]
+mod regions;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_exec_values.rs"]
+mod exec_values;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+use exec_values::*;
 
 /// Opt-in process counters used by the reproducible benchmark runner. Compilation,
 /// native operations, conversions, and selected allocation/lookup helpers check this
@@ -720,8 +809,9 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let gc = crate::value::gc_performance_metrics_json_fields();
     let (code_used, code_limit, code_denials) = executable_code_stats();
     let workload_metrics = crate::workload_metrics::json_fields();
+    let cache_metadata = cache::shared_metadata_json();
     let code_metrics = format!(
-        "\"executable_code_live_bytes\":{code_used},\"executable_code_limit_bytes\":{code_limit},\"executable_code_budget_denials\":{code_denials},{workload_metrics}"
+        "\"executable_code_live_bytes\":{code_used},\"executable_code_limit_bytes\":{code_limit},\"executable_code_budget_denials\":{code_denials},\"native_cache_thread_metadata\":{cache_metadata},{workload_metrics}"
     );
     Some(format!(
         "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},{code_metrics},\"managed_memory\":{managed_memory},\"native_by_operation\":{native_by_op}}}",
@@ -748,10 +838,6 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
         iterate_protocol_nanos as f64 / 1_000_000_000.0,
     ))
 }
-
-/// Both native backends currently use the wide `Value` local-slot ABI. ARM64's packed-slot
-/// templates remain gated while the full load/store and helper surface is migrated.
-const PACKED_LOCAL_SLOTS: bool = false;
 
 // ---------------------------------------------------------------------------------------------
 // Executable memory (platform W^X policy)
@@ -948,8 +1034,9 @@ mod sys {
 /// This caps requested bytes in live executable mappings, not a cumulative total
 /// of code ever emitted (OS page rounding is separate). Browser bootstrap can
 /// exceed 16 MiB before application hot functions even compile. Keep bounded
-/// headroom; a failed reservation uses the checked fallback, and dropping the
-/// owning mapping returns capacity to later hot code.
+/// headroom; pressure first reclaims inactive, unleased native code. A failed
+/// reservation uses the checked fallback, and dropping each owning mapping
+/// returns capacity to later hot code.
 pub(crate) const EXECUTABLE_CODE_BUDGET: usize = 128 << 20;
 
 fn configured_executable_code_budget(value: Option<&str>) -> usize {
@@ -990,6 +1077,20 @@ pub(crate) fn executable_code_can_fit(bytes: usize) -> bool {
         .remaining
         .load(std::sync::atomic::Ordering::Relaxed)
         >= bytes
+}
+
+/// Reclaim only inactive, unleased code owned by this thread. Another thread's
+/// live mappings or a fully active working set may still require VM fallback.
+pub(crate) fn ensure_executable_capacity(bytes: usize) -> bool {
+    let budget = executable_code_budget();
+    if bytes > budget.limit {
+        return false;
+    }
+    let remaining = budget.remaining.load(std::sync::atomic::Ordering::Relaxed);
+    if remaining < bytes {
+        cache::reclaim_for_capacity(bytes, remaining);
+    }
+    executable_code_can_fit(bytes)
 }
 
 thread_local! {
@@ -1204,16 +1305,45 @@ mod executable_code_budget_tests {
             denials,
             "no repeated emission while capacity is unavailable"
         );
+        // OSR is equally recoverable: a denied compilation must preserve the settled
+        // Script frame and finish in bytecode, without replaying its side effects.
+        engine.set_tier_threshold(32);
+        const SCRIPT: &str = "var pressureCount=0;for(var pressureIndex=0;pressureIndex<1000;pressureIndex++){pressureCount++;}pressureCount;";
+        TEST_OSR_ENTRIES.with(|count| count.set(0));
+        crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.set(0));
+        assert!(matches!(engine.eval(SCRIPT,false).unwrap(),
+            crate::Completion::Value(value) if value=="1000"));
+        assert_eq!(
+            TEST_OSR_ENTRIES.with(|count| count.get()),
+            0,
+            "a full executable budget must leave the exact Script in the VM"
+        );
+        assert!(
+            crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get()) > 0,
+            "cold Script must reach the VM fragment despite native-code pressure"
+        );
         drop(held);
         assert!(
             matches!(engine.interp.call(function, Value::Undefined, &[Value::Num(41.0)]),
             Ok(Value::Num(value)) if value == 42.0)
         );
         assert!(
-            chunk.jit.get().is_some_and(Option::is_some),
+            chunk.jit.get().is_some_and(|code| code.is_some()),
             "released capacity permits a real JIT entry"
         );
         assert_eq!(chunk.jit_budget_wait_bytes.get(), 0);
+        TEST_OSR_ENTRIES.with(|count| count.set(0));
+        crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.set(0));
+        assert!(matches!(engine.eval(SCRIPT,false).unwrap(),
+            crate::Completion::Value(value) if value=="1000"));
+        assert!(
+            TEST_OSR_ENTRIES.with(|count| count.get()) > 0,
+            "released capacity permits real same-activation native execution"
+        );
+        assert!(
+            crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get()) > 0,
+            "recovered Script must retain its real fragment handoff"
+        );
     }
 }
 
@@ -1231,6 +1361,7 @@ impl ExecutableBuffer {
         if bytes.is_empty() {
             return None;
         }
+        ensure_executable_capacity(bytes.len());
         let reservation =
             ExecutableCodeReservation::try_new(executable_code_budget(), bytes.len())?;
         #[cfg(any(
@@ -1297,8 +1428,14 @@ impl Drop for ExecutableBuffer {
     }
 }
 
-/// A finished JIT compilation: executable code plus the pc→code-offset table the unwinder uses
-/// to land on catch handlers.
+/// The native frame contract, independent of the body's language suspension eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeEntryKind {
+    FreshFrame,
+    BorrowedFrame,
+}
+
+/// A finished JIT compilation and validated bytecode-to-machine landing maps.
 #[repr(C)]
 pub struct JitCode {
     mem: *mut u8,
@@ -1310,32 +1447,69 @@ pub struct JitCode {
     /// Whether any template reads `JitCtx::global_body` (free-name caches): frame setup skips
     /// the realm-global borrow otherwise.
     pub needs_global: bool,
+    /// Checked bytecode resumption depths; empty for ordinary-call code. Suspended state
+    /// retains PCs, never executable addresses that could outlive a recompilation.
+    resume_depths: Vec<Option<usize>>,
+    /// Calling convention is independent of language Await/Yield eligibility. OSR code and
+    /// coroutine slices borrow canonical VM storage; ordinary CallIc entries create a frame.
+    entry_kind: NativeEntryKind,
+    /// Only taken backward-edge headers admit a first VM-to-native transfer, at exactly this
+    /// depth. Later completion resumptions use resume_depths' separate upper-bound contract.
+    osr_entry_depths: Vec<Option<usize>>,
     /// Owns the W^X mapping and its shared live executable-code reservation. The duplicate `mem`
     /// and `len` fields above are retained because generated direct-call templates read the
     /// stable prefix of this struct by offset.
     #[allow(dead_code)]
     executable: ExecutableBuffer,
+    /// Stable native-entry counter and CLOCK reference bit. The code embeds its
+    /// address; keep the allocation alive until after the mapping is unmapped.
+    residency: Box<cache::CodeResidency>,
+}
+
+impl Drop for JitCode {
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.residency.active.get(),
+            0,
+            "active native mapping dropped"
+        );
+        // Unload profiler symbols before the executable mapping is released.
+        profiler::unregister(self.mem);
+    }
 }
 
 impl JitCode {
     /// Heap-requested metadata only. The executable mapping is intentionally excluded and remains
     /// visible through the independent generated-code byte metric.
     pub(crate) fn retained_heap_metadata_bytes(&self) -> usize {
-        std::mem::size_of::<JitCode>().saturating_add(
-            self.pc_offsets
-                .capacity()
-                .saturating_mul(std::mem::size_of::<u32>()),
-        )
+        std::mem::size_of::<JitCode>()
+            .saturating_add(std::mem::size_of::<cache::CodeResidency>())
+            .saturating_add(
+                self.pc_offsets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.resume_depths.capacity() * std::mem::size_of::<Option<usize>>())
+            .saturating_add(self.osr_entry_depths.capacity() * std::mem::size_of::<Option<usize>>())
     }
 
     /// The machine-code entry address (for CallIc fills — the direct-call sequence branches
     /// to it through the swapped ctx).
     pub(crate) fn mem_ptr(&self) -> *const u8 {
+        assert_eq!(
+            self.entry_kind,
+            NativeEntryKind::FreshFrame,
+            "borrowed-frame code cannot enter an ordinary CallIc"
+        );
         self.mem
     }
     /// The pc→code-offset table's data pointer (same purpose).
     pub(crate) fn pc_offsets_ptr(&self) -> *const u32 {
         self.pc_offsets.as_ptr()
+    }
+
+    pub(crate) fn osr_entry_depth(&self, pc: usize) -> Option<usize> {
+        self.osr_entry_depths.get(pc).copied().flatten()
     }
 }
 
@@ -1344,19 +1518,19 @@ impl JitCode {
 // ---------------------------------------------------------------------------------------------
 
 /// Passed to the JIT entry in x0. The leading fields are read from assembly by fixed offset —
-/// keep their order in sync with the prologue/epilogue emitters below. Everything after is only
-/// touched from Rust helpers.
+/// keep their order in sync with the prologue/epilogue emitters below. Emitters access fields
+/// after that prefix through `offset_of!`, never assumed Rust enum or struct sizes.
 #[repr(C)]
 pub struct JitCtx {
     /// [0] Helper function table (see `HELPER_*` indices).
     pub helpers: *const usize,
     /// [8] Operand-stack base; the JIT keeps the live top in a register and stores it back here
     /// on every exit path.
-    pub stack_base: *mut Value,
+    pub stack_base: *mut PackedValue,
     /// [16] Final stack top, written by the epilogues (for leftover-value cleanup on throw).
-    pub final_sp: *mut Value,
+    pub final_sp: *mut PackedValue,
     /// [24] Local slots base (the inline LoadLocal/StoreLocal templates index off this).
-    pub slots: *mut Value,
+    pub slots: *mut PackedValue,
     /// [32] Points at `Interp::inline_ic_safe` (a `Cell<bool>` byte): raw prototype-walk
     /// templates read it live and fall to the helper after a Proxy is created.
     pub inline_ic_safe: *const u8,
@@ -1377,12 +1551,8 @@ pub struct JitCtx {
     pub chunk: *const Chunk,
     pub this_val: Value,
     pub n_slots: usize,
-    /// ARM64 generated code keeps local slots as owned NaN-boxed words. Rust helpers expand them
-    /// in place and restore them before returning to generated code. x64 remains wide until its
-    /// templates migrate.
-    pub slots_packed: bool,
-    /// Active `try` regions: (catch pc, operand-stack depth to unwind to).
-    pub handlers: Vec<(u32, usize)>,
+    /// Active catch/finally/iterator regions, shared with bytecode completion routing.
+    pub(crate) handlers: Vec<crate::bytecode::Handler>,
     /// The handler-stack watermark of THIS activation: `jit_unwind` propagates out (instead of
     /// popping) once `handlers.len()` reaches it. Always 0 for a `run`/`run_moved` activation
     /// (each owns a fresh Vec); the direct-call sequence shares the caller's ctx — and its
@@ -1391,7 +1561,9 @@ pub struct JitCtx {
     pub code_base: *const u8,
     pub pc_offsets: *const u32,
     pub error: Option<Abrupt>,
-    pub ret: Value,
+    /// Owned native return slot. Vacant is the complete PACK_UNDEFINED word, never a
+    /// zero tag byte; direct calls move it back to the packed operand stack unchanged.
+    pub ret: PackedValue,
     /// Parent of `env_raw` as an `Rc::as_ptr`, or null. Depth-1 free-name caches use this to
     /// validate a fresh activation without baking that per-call allocation's identity.
     pub env_parent_raw: *const u8,
@@ -1404,35 +1576,27 @@ pub struct JitCtx {
     /// boundaries with generator/async interpreter handoff, so this TLS address must be captured
     /// when an activation starts rather than embedded while machine code is compiled.
     pub live_objects: *const i64,
+    pub(crate) activation: Option<Box<crate::bytecode::NativeActivation>>,
+    /// Native slices borrow VmCoro's authoritative heap state only while running. Ordinary
+    /// entries leave this null; chunk identity prevents a nested direct call from aliasing it.
+    pub(crate) resume_activation: *mut crate::bytecode::NativeContinuation,
+    pub(crate) resume_pc: usize,
+    pub(crate) resume_step: Option<crate::bytecode::VmStep>,
+    /// Canonical Reference owners for this frame; null until a fresh activation needs them.
+    pub(crate) references_raw: *mut crate::eval::PreparedReferenceSlot,
 }
 
 impl JitCtx {
+    #[inline]
+    pub(crate) fn take_ret(&mut self) -> PackedValue {
+        std::mem::replace(&mut self.ret, PackedValue::pack(Value::Undefined))
+    }
+
     /// Clone one local without changing the representation of the rest of the frame.
     /// A runtime miss for one operation must not copy every local in a large function.
     pub(crate) unsafe fn clone_slot(&self, slot: usize) -> Value {
         debug_assert!(slot < self.n_slots);
-        if self.slots_packed {
-            unsafe { crate::value::PackedValue::clone_raw(self.slots.cast::<u64>().add(slot)) }
-        } else {
-            unsafe { (*self.slots.add(slot)).clone() }
-        }
-    }
-
-    /// Enter a Rust helper that expects ordinary 16-byte `Value` slots. Packed slots expand
-    /// backward inside their already-reserved wide slot region, transferring ownership.
-    pub(crate) unsafe fn unpack_slots(&mut self) {
-        if self.slots_packed {
-            unsafe { crate::value::PackedValue::unpack_in_place(self.slots, self.n_slots) };
-            self.slots_packed = false;
-        }
-    }
-
-    /// Return from a Rust helper to generated code. Wide slots compact forward in place.
-    pub(crate) unsafe fn pack_slots(&mut self) {
-        if !self.slots_packed {
-            unsafe { crate::value::PackedValue::pack_in_place(self.slots, self.n_slots) };
-            self.slots_packed = true;
-        }
+        unsafe { (*self.slots.add(slot)).unpack() }
     }
 }
 
@@ -1456,8 +1620,11 @@ fn jit_env_parent_raw(env: &Env) -> *const u8 {
 fn jit_handlers_len_offset() -> Option<usize> {
     use std::mem::offset_of;
 
-    let mut handlers: Vec<(u32, usize)> = Vec::with_capacity(5);
-    handlers.extend([(1, 1), (2, 2), (3, 3)]);
+    let mut handlers: Vec<crate::bytecode::Handler> = Vec::with_capacity(5);
+    handlers.extend((1..=3).map(|pc| crate::bytecode::Handler {
+        target: crate::bytecode::HandlerTarget::Catch { throw_pc: pc },
+        stack_depth: pc,
+    }));
     let words: [usize; 3] = unsafe { std::mem::transmute_copy(&handlers) };
     words
         .iter()
@@ -1497,7 +1664,10 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_make_regexp as *const () as usize,
         crate::bytecode::jit_interrupt as *const () as usize,
         crate::bytecode::jit_loop_backedge as *const () as usize,
-        crate::bytecode::jit_get_method_elem as *const () as usize,
+        crate::bytecode::jit_get_element as *const () as usize,
+        crate::bytecode::jit_complete as *const () as usize,
+        crate::bytecode::jit_slice_op as *const () as usize,
+        crate::bytecode::jit_reference_op as *const () as usize,
     ]
 }
 
@@ -1587,8 +1757,32 @@ unsafe extern "C" fn jit_prepare_numeric_packed_array(
     slots
 }
 
+/// Pure representation preparation: no author code or engine allocation/safepoint. The
+/// activation owns `raw`; the optional f64 mirror leaves canonical Property addresses intact.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+unsafe extern "C" fn jit_prepare_packed_numeric_mirror(
+    raw: *const std::cell::RefCell<crate::value::Object>,
+) {
+    let object = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
+    let Ok(mut body) = object.try_borrow_mut() else {
+        return;
+    };
+    if matches!(body.exotic, crate::value::Exotic::Array) && body.ic_plain.get() {
+        body.props.prepare_packed_numeric_mirror();
+    }
+}
+
 pub const H_GET_METHOD_ELEM: usize = 28;
-pub const N_HELPERS: usize = 29;
+/// The historical method-read slot now serves every compact computed-read shape.
+/// Keep its diagnostic identity and ABI index stable.
+pub const H_GET_ELEM: usize = H_GET_METHOD_ELEM;
+pub const H_COMPLETE: usize = 29;
+pub const H_SLICE_OP: usize = 30;
+pub const H_REFERENCE_OP: usize = 31;
+pub const N_HELPERS: usize = 32;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -1623,6 +1817,9 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "interrupt",
     "loop_backedge",
     "get_method_elem",
+    "complete",
+    "slice_op",
+    "reference_op",
 ];
 
 #[inline]
@@ -1698,7 +1895,7 @@ mod native_op_tests {
         let func: Rc<crate::value::NativeClosure> =
             Rc::new(|_, _, _| Err(crate::value::Value::Undefined));
         let data = Rc::new(crate::value::NativeCallable {
-            func,
+            body: crate::value::NativeCallableBody::Opaque(func),
             retained: None,
             identity: Rc::from("test.extension.op"),
         });
@@ -1826,9 +2023,13 @@ const C_VS: u32 = 6;
 /// Condition-helper modes (the `w1` immediate for `H_COND`).
 pub const COND_POP_TRUTHY: u32 = 0;
 pub const COND_PEEK_TRUTHY: u32 = 1;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
+#[cfg_attr(all(test, not(target_arch = "x86_64")), allow(dead_code))]
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
 ))]
 pub const COND_PEEK_NOT_NULLISH: u32 = 2;
 
@@ -1883,7 +2084,7 @@ mod layout_asserts {
 /// Two-register return for helpers that produce (new sp, flag) — x0/x1 under the C ABI.
 #[repr(C)]
 pub struct SpFlag {
-    pub sp: *mut Value,
+    pub sp: *mut PackedValue,
     pub flag: u64,
 }
 
@@ -1921,6 +2122,27 @@ mod asm {
                 patches: Vec::new(),
                 labels: Vec::new(),
             }
+        }
+        /// Transaction for an optional region. The region may allocate/bind only NEW labels;
+        /// branches to existing baseline labels are fine. This caps added native bytes before
+        /// executable allocation without cloning the function's growing instruction buffer.
+        pub fn checkpoint(&self) -> (usize, usize, usize) {
+            (self.buf.len(), self.patches.len(), self.labels.len())
+        }
+        pub fn rewind(&mut self, checkpoint: (usize, usize, usize)) {
+            self.buf.truncate(checkpoint.0);
+            self.patches.truncate(checkpoint.1);
+            self.labels.truncate(checkpoint.2);
+        }
+        /// Labels actually referenced by an optional emission, before relaxation. A region
+        /// uses this to omit unreachable deoptimization stubs and unnecessary baseline entries.
+        pub fn referenced_since(
+            &self,
+            checkpoint: (usize, usize, usize),
+        ) -> impl Iterator<Item = usize> + '_ {
+            self.patches[checkpoint.1..]
+                .iter()
+                .map(|&(_, label, _)| label)
         }
         pub fn new_label(&mut self) -> usize {
             self.labels.push(None);
@@ -1973,18 +2195,31 @@ mod asm {
         pub fn mov(&mut self, rd: u32, rn: u32) {
             self.emit(0xAA00_03E0 | (rn << 16) | rd);
         }
-        /// Load a 64-bit constant via movz/movk chain.
+        /// Exact 64-bit materialization using the shortest MOVZ/MOVN + MOVK chain.
+        /// MOVZ zero-fills other lanes; MOVN one-fills them (Arm 100076, D2.106–108).
+        /// Never reinterpret the bits: callers also pass pointers, packed tags and binary64
+        /// signed zero/NaN encodings (ECMA-262 e28783d5, sec-ecmascript-language-types-number-type).
         #[allow(dead_code)]
         pub fn mov_imm64(&mut self, rd: u32, v: u64) {
-            self.movz(rd, (v & 0xffff) as u32, 0);
-            if (v >> 16) & 0xffff != 0 || v >> 16 != 0 {
-                self.movk(rd, ((v >> 16) & 0xffff) as u32, 1);
+            debug_assert!(rd < 32);
+            let lanes = std::array::from_fn::<_, 4, _>(|lane| ((v >> (lane * 16)) & 0xffff) as u32);
+            let zero_cost = lanes.iter().filter(|&&lane| lane != 0).count();
+            let ones_cost = lanes.iter().filter(|&&lane| lane != 0xffff).count();
+            let inverted = ones_cost < zero_cost;
+            let fill = if inverted { 0xffff } else { 0 };
+            let first = lanes.iter().position(|&lane| lane != fill).unwrap_or(0);
+            if inverted {
+                // MOVN Xd, #imm16, LSL #(first*16); unlike MOVK it initializes every bit.
+                self.emit(
+                    0x9280_0000 | ((first as u32) << 21) | ((!lanes[first] & 0xffff) << 5) | rd,
+                );
+            } else {
+                self.movz(rd, lanes[first], first as u32);
             }
-            if v >> 32 != 0 {
-                self.movk(rd, ((v >> 32) & 0xffff) as u32, 2);
-            }
-            if v >> 48 != 0 {
-                self.movk(rd, ((v >> 48) & 0xffff) as u32, 3);
+            for (lane, &bits) in lanes.iter().enumerate() {
+                if lane != first && bits != fill {
+                    self.movk(rd, bits, lane as u32);
+                }
             }
         }
         /// ldr xd, [xn, #imm] (imm = byte offset, multiple of 8, unsigned)
@@ -2268,6 +2503,14 @@ mod asm {
             debug_assert!(shift < 64);
             self.emit(0xD340_FC00 | (shift << 16) | (rn << 5) | rd);
         }
+        /// UBFX Xd, Xn, #lsb, #width: zero-extend the selected field, without changing NZCV.
+        /// Arm Instruction Set Reference Guide 100076_0100, D2.180–181: UBFM with
+        /// sf=N=1, immr=lsb, imms=lsb+width-1. Register 31 denotes XZR, not SP.
+        pub fn ubfx(&mut self, rd: u32, rn: u32, lsb: u32, width: u32) {
+            assert!(rd < 32 && rn < 32);
+            assert!(lsb < 64 && width > 0 && width <= 64 - lsb);
+            self.emit(0xD340_0000 | (lsb << 16) | ((lsb + width - 1) << 10) | (rn << 5) | rd);
+        }
         /// lsrv xd, xn, xm (64-bit logical variable shift).
         pub fn lsr_reg(&mut self, rd: u32, rn: u32, rm: u32) {
             self.emit(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd);
@@ -2546,6 +2789,62 @@ mod asm {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn optional_region_reference_inventory_ignores_unused_bailouts() {
+            let mut a = super::Asm::new();
+            let entry = a.new_label();
+            a.bind(entry);
+            a.b(entry);
+            let checkpoint = a.checkpoint();
+            let unused = a.new_label();
+            let needed = a.new_label();
+            a.b_cond(super::super::C_NE, needed);
+            a.b(entry);
+            assert_eq!(
+                a.referenced_since(checkpoint).collect::<Vec<_>>(),
+                [needed, entry]
+            );
+            assert!(!a.referenced_since(checkpoint).any(|label| label == unused));
+            a.bind(needed);
+            a.ret();
+            // An unreferenced, unbound label must not require a fake stub or exported PC.
+            assert_eq!(a.finish().len(), 4);
+        }
+
+        #[test]
+        fn optional_region_rollback_preserves_baseline_labels_patches_and_bytes() {
+            fn baseline(with_discarded_region: bool) -> (Vec<u32>, Vec<u32>) {
+                let mut a = super::Asm::new();
+                let start = a.new_label();
+                let finish = a.new_label();
+                a.bind(start);
+                a.b(finish); // a preexisting fixup to a still-unbound baseline label
+                if with_discarded_region {
+                    let before = a.checkpoint();
+                    let internal = a.new_label();
+                    let unused = a.new_label();
+                    a.b_cond(super::super::C_EQ, internal);
+                    a.b(start);
+                    a.bind(internal);
+                    a.b(finish);
+                    a.bind(unused);
+                    a.mov(7, 8);
+                    a.rewind(before);
+                    assert_eq!(a.checkpoint(), before);
+                }
+                a.mov(0, 1);
+                a.bind(finish);
+                a.b(start);
+                a.finish_with_offsets(&[start, finish])
+            }
+            let expected = baseline(false);
+            assert_eq!(
+                expected,
+                (vec![0x1400_0002, 0xaa01_03e0, 0x17ff_fffe], vec![0, 8])
+            );
+            assert_eq!(baseline(true), expected);
+        }
+
         /// Brute-force decoder for the 32-bit logical-immediate field (N=0).
         fn decode(field: u32) -> Option<u32> {
             let immr = (field >> 6) & 0x3F;
@@ -2907,6 +3206,28 @@ pub fn compile(
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
 ) -> Option<JitCode> {
+    compile_entry(
+        chunk,
+        layout,
+        ilayout,
+        if chunk.jit_is_resumable() {
+            NativeEntryKind::BorrowedFrame
+        } else {
+            NativeEntryKind::FreshFrame
+        },
+    )
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn compile_entry(
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    entry_kind: NativeEntryKind,
+) -> Option<JitCode> {
     use crate::bytecode::{Op, UpdKind};
 
     if !ilayout.valid {
@@ -2916,27 +3237,19 @@ pub fn compile(
     if ops.len() > 0xFFFF {
         return None; // op index must fit one movz
     }
-    // Await and generator yield points must retain their heap-owned VM continuation.
-    // Completion-aware loop exits must also stay in the VM: ECMA-262 break/continue
-    // completions can cross finally regions and can run one or more IteratorClose
-    // operations before reaching the target. The native tier does not yet model that
-    // handler-unwind state, so compiling AbruptJump would lose the completion (and the
-    // emitter quite correctly has no machine-code case for it).
-    if ops.iter().any(|o| {
-        matches!(
-            o,
-            Op::Await
-                | Op::Yield
-                | Op::YieldStar
-                | Op::AbruptJump(..)
-                | Op::PushFinally(..)
-                | Op::ResumeReturn
-                | Op::ResumeJump
-        )
-    }) {
-        return None;
+    let borrowed_entry = entry_kind == NativeEntryKind::BorrowedFrame;
+    if !borrowed_entry && ops.iter().any(|op| matches!(op, Op::FragmentExit(_))) {
+        return None; // exact outer completion belongs to the borrowed AST/VM driver
     }
-    let cfg = crate::jit_ir::Cfg::build(chunk).ok()?;
+    let return_needs_unwind = ops
+        .iter()
+        .any(|op| matches!(op, Op::PushFinally(..) | Op::PushIterator(..)));
+    let cfg = if borrowed_entry && !chunk.jit_is_resumable() {
+        crate::jit_ir::Cfg::build_osr(chunk)
+    } else {
+        crate::jit_ir::Cfg::build(chunk)
+    }
+    .ok()?;
     let max_stack = cfg.jit_stack_capacity();
     // Debug: `LUMEN_JIT_DUMP=<substr>` prints the op stream of chunks whose leading slot names
     // contain the substring (empty value = all chunks) as they compile.
@@ -2959,6 +3272,11 @@ pub fn compile(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(u32::MAX);
+    // A slice borrows a continuation-owned activation. Calls remain native through their
+    // ordinary entry, but cannot swap this context out from under the borrowed state view.
+    if borrowed_entry {
+        fast &= !(1 << 20);
+    }
     if chunk.jit_detailed_feedback_enabled() {
         // Detailed arithmetic observation runs in the exact-PC helper. Keep ordinary builds on
         // their inline and register-region paths; profile-enabled chunks route numeric/update
@@ -2995,8 +3313,9 @@ pub fn compile(
     // Whether the probed layout supports inline refcount bumps/decs (clone/drop of Str/Sym/Obj
     // without a helper call). All strong-count templates gate on this.
     let rc_ok = layout.valid && layout.rc_strong_off < 256;
-    let rc_strong = layout.rc_strong_off as i32;
     let mut a = asm::Asm::new();
+    let residency = Box::<cache::CodeResidency>::default();
+    let residency_ptr = &*residency as *const cache::CodeResidency as u64;
     // One label per bytecode pc (branch/catch targets bind as we emit).
     let pc_labels: Vec<usize> = (0..ops.len()).map(|_| a.new_label()).collect();
     let l_unwind = a.new_label();
@@ -3019,8 +3338,12 @@ pub fn compile(
     a.stp_d_off(14, 15, DSAVE + 48);
     a.mov(19, 0); // ctx
     a.ldr_imm(21, 19, 0); // helpers table
-    a.ldr_imm(20, 19, 8); // sp = stack_base
+    a.ldr_imm(20, 19, if borrowed_entry { 16 } else { 8 }); // live top or empty stack
     a.ldr_imm(22, 19, 24); // local slots base
+
+    // Protect this mapping even when a direct callee re-enters compilation.
+    // No helper can run before this mark or after its matching epilogue release.
+    emit_residency_mark(&mut a, residency_ptr, true);
 
     // ECMA-262 Strict Mode Code / PutValue: semantic helpers must see THIS body's lexical
     // mode, including cached calls and direct shared-context calls. Save on the native frame,
@@ -3029,14 +3352,30 @@ pub fn compile(
     let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
     a.ldrb_imm(9, strict_base, strict_off);
     a.strb_imm(9, 31, STRICT_SAVE);
-    a.movz(9, u32::from(chunk.jit_is_strict()), 0);
-    a.strb_imm(9, strict_base, strict_off);
+    if !borrowed_entry {
+        a.movz(9, u32::from(chunk.jit_is_strict()), 0);
+        a.strb_imm(9, strict_base, strict_off);
+    }
+    if borrowed_entry {
+        // The Rust entry validates the bytecode PC and its settled stack before dispatch.
+        a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, resume_pc) as u32);
+        a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, pc_offsets) as u32);
+        a.lsl_imm(9, 9, 2);
+        a.add_shifted(9, 10, 9, 0);
+        a.ldr_w_imm(9, 9, 0);
+        a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, code_base) as u32);
+        a.add_shifted(9, 10, 9, 0);
+        a.br(9);
+    }
 
     // Branch/catch targets: a fused compare+branch may only swallow a following JumpIfFalse if
     // nothing can land on the branch op itself.
     let mut targeted = vec![false; ops.len() + 1];
     let mut interrupt_targets = vec![false; ops.len() + 1];
     for (pc, op) in ops.iter().enumerate() {
+        if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) && pc + 1 < ops.len() {
+            targeted[pc + 1] = true;
+        }
         match op {
             Op::Jump(t)
             | Op::AbruptJump(t, _)
@@ -3074,6 +3413,7 @@ pub fn compile(
         }
         match op {
             Op::Jump(target)
+            | Op::AbruptJump(target, _)
             | Op::JumpIfFalse(target)
             | Op::JumpIfFalsePeek(target)
             | Op::JumpIfTruePeek(target)
@@ -3087,8 +3427,20 @@ pub fn compile(
     }
     // Emit primitive bitwise exits after the body, preserving numeric loop code layout.
     let mut primitive_bit_paths = Vec::new();
+    // Whole-loop plans start only at their guarded header. Extra exact bailout labels added
+    // by an enclosing region must inhibit baseline fusions, not destroy a stronger nested
+    // loop's planning vocabulary (for example a checked, discarded local read).
+    let source_targets = targeted.clone();
     // ---- op templates ----
     let mut skip = 0usize;
+    // Baseline labels remain independently enterable; don't emit another optimized
+    // forward copy at each interior block of an already selected region.
+    let mut region_covered = vec![false; ops.len()];
+    let mut acyclic_budget = crate::jit_ir::AcyclicBudget::new(&cfg, ops.len());
+    // All optional general-region copies share one budget, including loop regions.
+    // The preserved baseline and established whole-loop lowerings remain independent.
+    let mut region_copy_bytes = 0usize;
+    let mut stronger_header_cache = vec![None; ops.len()];
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pc_labels[pc]);
         if interrupt_targets[pc] {
@@ -3098,6 +3450,11 @@ pub fn compile(
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
             // pc-offset still bind here (harmless: nothing jumps into a fused region — checked).
             skip -= 1;
+            continue;
+        }
+        if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) {
+            emit_op_helper(&mut a, H_SLICE_OP, pc as u32, l_ret_throw);
+            a.b(l_ret_ok);
             continue;
         }
         // A web-trace regexp workload is dominated by tiny loops whose body is exactly
@@ -3196,7 +3553,7 @@ pub fn compile(
             }
             let mut emitted_region = false;
             if let Some(plan) = plan_linked_scan(chunk, ops, pc, &cfg, layout, fast) {
-                let plain_h = emit_linked_scan_region(&mut a, layout, &plan, &pc_labels);
+                let plain_h = emit_linked_scan_region(&mut a, layout, ilayout, &plan, &pc_labels);
                 a.bind(plain_h);
                 for p in pc + 1..pc + 9 {
                     targeted[p] = true;
@@ -3206,7 +3563,8 @@ pub fn compile(
                     eprintln!("[jit-region] head {pc}: EMITTED linked scan");
                 }
             } else if let Some(plan) = plan_numeric_diamond(chunk, ops, pc, &cfg, layout, fast) {
-                let plain_h = emit_numeric_diamond_region(&mut a, layout, &plan, &pc_labels);
+                let plain_h =
+                    emit_numeric_diamond_region(&mut a, layout, ilayout, &plan, &pc_labels);
                 a.bind(plain_h);
                 for p in pc + 1..pc + 18 {
                     targeted[p] = true;
@@ -3217,13 +3575,88 @@ pub fn compile(
                 }
             }
             if !emitted_region {
-                if let Some(plan) = plan_loop(chunk, ops, pc, &targeted, layout, fast, &cfg) {
-                    let plain_h = emit_loop_chain(&mut a, layout, &plan, &pc_labels, &mut targeted);
+                // Prefer the fully helper-free lowering when it covers the entire loop.
+                // General CFG lowering adds effect/call coverage, not a reason to spill
+                // already-proven numeric and element loops at every operation.
+                if let Some(plan) = plan_loop(chunk, ops, pc, &source_targets, layout, fast, &cfg) {
+                    let plain_h =
+                        emit_loop_chain(&mut a, layout, ilayout, &plan, &pc_labels, &mut targeted);
                     a.bind(plain_h);
-                    // The emitter marks its actual interior resume PCs. Preserve those entries
-                    // without turning every ordinary instruction into a fusion boundary.
-                    // Fall through: the plain template for this op (and the rest of the region)
-                    // emits as usual.
+                } else if let Some(plan) = regions::Plan::build(chunk, &cfg, pc) {
+                    for &(start, end) in plan.ranges() {
+                        region_covered[start..end].fill(true);
+                    }
+                    let checkpoint = a.checkpoint();
+                    let emission = regions::emit(
+                        &mut a,
+                        chunk,
+                        &cfg,
+                        layout,
+                        ilayout,
+                        &plan,
+                        &pc_labels,
+                        &source_targets,
+                        &mut stronger_header_cache,
+                        fast,
+                        array_intrinsics_on,
+                        function_call_intrinsic_on,
+                        l_unwind,
+                        l_direct_finish,
+                    );
+                    if emission.profitable() && emission.bytes <= 128 * 1024 - region_copy_bytes {
+                        region_copy_bytes += emission.bytes;
+                        emission.publish(&mut targeted);
+                        a.bind(emission.plain);
+                        if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                            eprintln!("[jit-region] head {pc}: EMITTED general CFG ({} bytes, {} saved-work units)", emission.bytes, emission.saved_work);
+                        }
+                    } else {
+                        a.rewind(checkpoint);
+                        if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                            eprintln!("[jit-region] head {pc}: retained baseline ({} optional bytes, {} saved-work units)", emission.bytes, emission.saved_work);
+                        }
+                    }
+                }
+            }
+        }
+        if fast & 32768 != 0 && rc_ok && !region_covered[pc] && region_copy_bytes < 128 * 1024 {
+            if let Some(plan) = regions::Plan::build_acyclic(chunk, &cfg, pc, &mut acyclic_budget) {
+                for &(start, end) in plan.ranges() {
+                    region_covered[start..end].fill(true);
+                }
+                let checkpoint = a.checkpoint();
+                let emission = regions::emit(
+                    &mut a,
+                    chunk,
+                    &cfg,
+                    layout,
+                    ilayout,
+                    &plan,
+                    &pc_labels,
+                    &source_targets,
+                    &mut stronger_header_cache,
+                    fast,
+                    array_intrinsics_on,
+                    function_call_intrinsic_on,
+                    l_unwind,
+                    l_direct_finish,
+                );
+                let added = emission.bytes;
+                if !emission.profitable() || added > 128 * 1024 - region_copy_bytes {
+                    // Code, fixups and private labels roll back together. Crucially, no
+                    // speculative bailout destinations have been published: the mature
+                    // baseline retains every independently legal span fusion.
+                    a.rewind(checkpoint);
+                    if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                        eprintln!("[jit-region] head {pc}: retained baseline ({added} optional bytes, {} saved-work units)", emission.saved_work);
+                    }
+                } else {
+                    region_copy_bytes += added;
+                    emission.publish(&mut targeted);
+                    a.bind(emission.plain);
+                    if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                        eprintln!("[jit-region] head {pc}: EMITTED acyclic CFG ({added} bytes, total {region_copy_bytes})");
+                    }
                 }
             }
         }
@@ -3239,13 +3672,13 @@ pub fn compile(
                 Some(Op::JumpIfFalse(target)),
             ) = (op, ops.get(pc + 1), ops.get(pc + 2), ops.get(pc + 3))
             {
-                let lhs_off = *lhs as u32 * 16;
-                let rhs_off = *rhs as u32 * 16;
+                let lhs_off = *lhs as u32 * 8;
+                let rhs_off = *rhs as u32 * 8;
                 if !targeted[pc + 1]
                     && !targeted[pc + 2]
                     && !targeted[pc + 3]
-                    && lhs_off + 16 < 4096
-                    && rhs_off + 16 < 4096
+                    && lhs_off + 8 < 4096
+                    && rhs_off + 8 < 4096
                 {
                     emit_local_eq_branch(
                         &mut a,
@@ -3352,15 +3785,11 @@ pub fn compile(
                     };
                     let slow = a.new_label();
                     let done = a.new_label();
-                    a.ldurb(9, 20, -32);
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_NE, slow);
-                    a.ldurb(9, 20, -16);
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_NE, slow);
-                    a.ldur_d(0, 20, -24);
-                    a.ldur_d(1, 20, -8);
-                    a.sub_imm(20, 20, 32); // pop both operands (no bool pushed)
+                    emit_exec_word_load(&mut a, 9, 20, -16);
+                    emit_exec_word_load(&mut a, 10, 20, -8);
+                    emit_exec_number_guard(&mut a, 9, 0, 11, slow);
+                    emit_exec_number_guard(&mut a, 10, 1, 11, slow);
+                    a.sub_imm(20, 20, 16); // pop both compact operands
                     a.fcmp(0, 1);
                     a.b_cond(neg, pc_labels[*t as usize]);
                     a.b(done);
@@ -3380,17 +3809,17 @@ pub fn compile(
         // before any state is written (the pre-increment commits with the element copy), so the
         // slow path can re-run both ops through the helper cleanly.
         if fast & 1024 != 0 && get_elem_inlinable(layout) && !targeted[pc + 1] {
-            let in_range = |s: u16| (s as u32) * 16 + 16 < 4096;
+            let in_range = |s: u16| (s as u32) * 8 + 8 < 4096;
             let pair = match (op, ops.get(pc + 1)) {
                 (Op::LoadLocal(k), Some(Op::GetElemLocal(x))) if in_range(*k) && in_range(*x) => {
-                    Some((*x as u32 * 16, KeySrc::Slot(*k as u32 * 16)))
+                    Some((*x as u32 * 8, KeySrc::Slot(*k as u32 * 8)))
                 }
                 (
                     Op::UpdateLocal(k, kind @ (UpdKind::PreInc | UpdKind::PreDec)),
                     Some(Op::GetElemLocal(x)),
                 ) if in_range(*k) && in_range(*x) => Some((
-                    *x as u32 * 16,
-                    KeySrc::SlotPre(*k as u32 * 16, matches!(kind, UpdKind::PreDec)),
+                    *x as u32 * 8,
+                    KeySrc::SlotPre(*k as u32 * 8, matches!(kind, UpdKind::PreDec)),
                 )),
                 _ => None,
             };
@@ -3416,7 +3845,7 @@ pub fn compile(
                 emit_store_local(
                     &mut a,
                     layout,
-                    slot as u32 * 16,
+                    slot as u32 * 8,
                     &[pc as u32, pc as u32 + 1],
                     l_unwind,
                     true,
@@ -3431,7 +3860,7 @@ pub fn compile(
         // before a plain lexical assignment. Keep independent Pop entries intact.
         if fast & (8 | 64) == (8 | 64) {
             if let Some(slot) = local_read_discard_pair(ops, pc, &targeted) {
-                emit_discard_local_read(&mut a, slot as u32 * 16, pc as u32, l_unwind);
+                emit_discard_local_read(&mut a, slot as u32 * 8, pc as u32, l_unwind);
                 skip = 1;
                 continue;
             }
@@ -3443,22 +3872,22 @@ pub fn compile(
                 }
                 a.b(pc_labels[*t as usize]);
             }
-            Op::AbruptJump(..) => {
-                unreachable!("abrupt loop jumps are emitted only for suspending chunks")
+            Op::AbruptJump(..) | Op::ResumeReturn | Op::ResumeJump => {
+                emit_completion(&mut a, pc as u32, l_ret_ok);
             }
             Op::JumpIfFalse(t) if chunk.jit_detailed_feedback_enabled() => {
                 emit_cond_profiled(&mut a, COND_POP_TRUTHY, pc as u32, false, l_unwind);
                 a.cbz(1, false, pc_labels[*t as usize]);
             }
             Op::JumpIfFalse(t) if fast & 4 != 0 => {
-                // Bool on top (the compare fast paths produce one): branch on its payload byte.
+                // Packed Bool on top (the compare fast paths produce one).
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 3);
-                a.b_cond(C_NE, slow);
-                a.ldurb(9, 20, -15); // bool payload at offset 1
-                a.sub_imm(20, 20, 16);
+                emit_exec_word_load(&mut a, 9, 20, -8);
+                emit_exec_tag_guard(&mut a, 9, crate::value::PACK_BOOL, 10, slow);
+                a.movz(10, 1, 0);
+                a.logic_x(0, 9, 9, 10);
+                a.sub_imm(20, 20, 8);
                 a.cbz(9, false, pc_labels[*t as usize]);
                 a.b(done);
                 a.bind(slow);
@@ -3495,28 +3924,29 @@ pub fn compile(
                 a.cbnz(1, false, pc_labels[*t as usize]);
             }
             Op::Return => {
-                emit_helper(&mut a, H_RETURN, 1);
-                a.b(l_ret_ok);
+                if return_needs_unwind {
+                    emit_completion(&mut a, pc as u32, l_ret_ok);
+                } else {
+                    emit_return(&mut a, 1, l_ret_ok);
+                }
             }
-            Op::ResumeReturn => {
-                unreachable!("resumed returns are emitted only for suspending chunks")
+            Op::ReturnBare => {
+                if return_needs_unwind {
+                    emit_completion(&mut a, pc as u32, l_ret_ok);
+                } else {
+                    emit_return(&mut a, 0, l_ret_ok);
+                }
             }
-            Op::ResumeJump => {
-                unreachable!("resumed loop jumps are emitted only for suspending chunks")
+            Op::ReturnUndef => {
+                emit_return(&mut a, 0, l_ret_ok);
             }
-            Op::ReturnBare | Op::ReturnUndef => {
-                emit_helper(&mut a, H_RETURN, 0);
-                a.b(l_ret_ok);
+            Op::PushHandler(..) | Op::PushFinally(..) | Op::PushIterator(..) => {
+                emit_helper(&mut a, H_PUSH_HANDLER, pc as u32);
             }
-            Op::PushHandler(t) => {
-                emit_helper(&mut a, H_PUSH_HANDLER, *t);
+            Op::PushDisposeFrame | Op::AddDisposable(_) => {
+                emit_exec(&mut a, pc as u32, l_unwind);
             }
-            Op::PushFinally(..) => {
-                unreachable!("try/finally is currently emitted only for suspending chunks")
-            }
-            Op::PushDisposeFrame
-            | Op::AddDisposable(_)
-            | Op::DisposeNormal
+            Op::DisposeNormal
             | Op::DisposeThrow
             | Op::DisposeReturn
             | Op::DisposeBareReturn
@@ -3524,14 +3954,17 @@ pub fn compile(
             | Op::DisposeJump => {
                 unreachable!("resource-disposal ops are rejected before JIT emission")
             }
-            Op::PushWith | Op::PopEnv => {
-                unreachable!("dynamic-environment ops are rejected before JIT emission")
-            }
             Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_) => {
-                unreachable!("prepared-reference ops are rejected before JIT emission")
+                if fast & 8192 == 0
+                    || !names::emit_reference_op(
+                        &mut a, layout, ilayout, chunk, op, pc as u32, l_unwind,
+                    )
+                {
+                    emit_op_helper(&mut a, H_REFERENCE_OP, pc as u32, l_unwind);
+                }
             }
-            Op::PushIterator(..) => {
-                unreachable!("completion-aware iterator handlers require a suspending chunk")
+            Op::PushWith | Op::PopEnv => {
+                emit_exec(&mut a, pc as u32, l_unwind);
             }
             Op::PopHandler => {
                 emit_helper(&mut a, H_POP_HANDLER, 0);
@@ -3589,7 +4022,7 @@ pub fn compile(
             Op::GetPropLocal(s, n, cache)
                 if fast & 256 != 0
                     && get_method_inlinable(layout)
-                    && (*s as u32) * 16 + 16 < 4096 =>
+                    && (*s as u32) * 8 + 8 < 4096 =>
             {
                 let arr_ok = !chunk
                     .jit_name(*n)
@@ -3607,7 +4040,7 @@ pub fn compile(
                     l_unwind,
                     false,
                     arr_ok,
-                    PropRecv::Slot(*s as u32 * 16),
+                    PropRecv::Slot(*s as u32 * 8),
                 );
             }
             Op::ToPropKey | Op::ToPropKeyLocal(_) if fast & 64 != 0 => {
@@ -3615,12 +4048,13 @@ pub fn compile(
                 // anything else — real coercion plus the nullish-base check — takes the helper.
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_EQ, done);
-                a.cmp_imm_w(9, 6);
-                a.b_cond(C_EQ, done);
-                a.b(slow);
+                let not_number = a.new_label();
+                emit_exec_word_load(&mut a, 9, 20, -8);
+                emit_exec_number_guard(&mut a, 9, 0, 10, not_number);
+                a.b(done);
+                a.bind(not_number);
+                emit_exec_tag_guard(&mut a, 9, crate::value::PACK_STR, 10, slow);
+                a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
@@ -3629,47 +4063,27 @@ pub fn compile(
                 // Copy the top value; refcounted payloads bump inline, BigInt takes the helper.
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 5);
-                a.b_cond(C_EQ, slow);
-                a.ldur(10, 20, -16);
-                a.ldur(11, 20, -8);
-                a.stur(10, 20, 0);
-                a.stur(11, 20, 8);
-                let nobump = a.new_label();
-                a.cmp_imm_w(9, 6);
-                a.b_cond(C_LO, nobump);
-                a.ldur(13, 11, rc_strong);
-                a.add_imm(13, 13, 1);
-                a.stur(13, 11, rc_strong);
-                a.bind(nobump);
-                a.add_imm(20, 20, 16);
+                emit_exec_word_load(&mut a, 9, 20, -8);
+                emit_exec_clone(&mut a, layout, 9, 10, 11, slow);
+                emit_exec_word_store(&mut a, 9, 20, 0);
+                a.add_imm(20, 20, 8);
                 a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
             }
             Op::LoadThis if fast & 32768 != 0 && rc_ok => {
-                // Copy ctx.this_val (16 bytes) and bump its refcount inline; only a BigInt
-                // `this` (impossible in practice, but be safe) takes the helper.
+                // `this_raw` is deliberately a wide host-boundary Value; encode before
+                // acquiring the compact operand owner. BigInt uses the checked helper.
                 let slow = a.new_label();
                 let done = a.new_label();
                 a.ldr_imm(9, 19, 48); // ctx.this_raw
-                a.ldrb_imm(10, 9, 0);
-                a.cmp_imm_w(10, 5);
-                a.b_cond(C_EQ, slow);
-                a.ldr_imm(11, 9, 0);
-                a.ldr_imm(12, 9, 8);
-                a.stur(11, 20, 0);
-                a.stur(12, 20, 8);
-                let nobump = a.new_label();
-                a.cmp_imm_w(10, 6);
-                a.b_cond(C_LO, nobump);
-                a.ldur(14, 12, rc_strong);
-                a.add_imm(14, 14, 1);
-                a.stur(14, 12, rc_strong);
-                a.bind(nobump);
-                a.add_imm(20, 20, 16);
+                a.ldr_imm(10, 9, 0);
+                a.ldr_imm(11, 9, 8);
+                emit_exec_encode_wide(&mut a, 10, 11, 12, 13, 14, 0, slow);
+                emit_exec_clone(&mut a, layout, 12, 13, 14, slow);
+                emit_exec_word_store(&mut a, 12, 20, 0);
+                a.add_imm(20, 20, 8);
                 a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
@@ -3722,7 +4136,11 @@ pub fn compile(
             // Captured bindings use the same guarded scope-entry cache as free names, but are
             // keyed by interned name because resolution is always in the current activation.
             // Fresh/recursive activations miss the raw env comparison once and refill safely.
-            Op::LoadCap(name) if fast & 8192 != 0 && load_name_inlinable(layout) => {
+            Op::LoadCap(name)
+                if fast & 8192 != 0
+                    && load_name_inlinable(layout)
+                    && !chunk.jit_needs_activation_state() =>
+            {
                 emit_load_name_inline(
                     &mut a,
                     layout,
@@ -3733,7 +4151,11 @@ pub fn compile(
                     false,
                 );
             }
-            Op::StoreCap(name) if fast & 8192 != 0 && update_name_inlinable(layout) => {
+            Op::StoreCap(name)
+                if fast & 8192 != 0
+                    && update_name_inlinable(layout)
+                    && !chunk.jit_needs_activation_state() =>
+            {
                 emit_store_name_inline(
                     &mut a,
                     layout,
@@ -3759,12 +4181,12 @@ pub fn compile(
             Op::GetElemLocal(slot)
                 if fast & 1024 != 0
                     && get_elem_inlinable(layout)
-                    && (*slot as u32) * 16 + 16 < 4096 =>
+                    && (*slot as u32) * 8 + 8 < 4096 =>
             {
                 emit_elem_local_inline(
                     &mut a,
                     layout,
-                    *slot as u32 * 16,
+                    *slot as u32 * 8,
                     pc as u32,
                     l_unwind,
                     ElemLocalKind::Get,
@@ -3780,26 +4202,24 @@ pub fn compile(
                     && (layout.entry_accessor != layout.entry_value + 8
                         || fast & (1024 | 8192 | 32768 | 262144)
                             == (1024 | 8192 | 32768 | 262144))
-                    && (*slot as u32) * 16 + 16 < 4096 =>
+                    && (*slot as u32) * 8 + 8 < 4096 =>
             {
                 emit_elem_local_inline(
                     &mut a,
                     layout,
-                    *slot as u32 * 16,
+                    *slot as u32 * 8,
                     pc as u32,
                     l_unwind,
                     ElemLocalKind::SetDrop,
                 );
             }
             Op::SetElemLocal(slot)
-                if fast & 4096 != 0
-                    && elem_inlinable(layout)
-                    && (*slot as u32) * 16 + 16 < 4096 =>
+                if fast & 4096 != 0 && elem_inlinable(layout) && (*slot as u32) * 8 + 8 < 4096 =>
             {
                 emit_elem_local_inline(
                     &mut a,
                     layout,
-                    *slot as u32 * 16,
+                    *slot as u32 * 8,
                     pc as u32,
                     l_unwind,
                     ElemLocalKind::SetKeep,
@@ -3826,29 +4246,22 @@ pub fn compile(
                     PropRecv::Stack,
                 );
             }
-            // ---- inline fast paths (tags: 3 = Bool, 4 = Num; payload at +8; Value = 16) ----
+            // ---- inline compact execution-word fast paths ----
             Op::Add if fast & 1 != 0 => {
                 let strings = a.new_label();
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -32);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, strings);
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
-                a.ldur_d(0, 20, -24);
-                a.ldur_d(1, 20, -8);
+                emit_exec_word_load(&mut a, 9, 20, -16);
+                emit_exec_word_load(&mut a, 10, 20, -8);
+                emit_exec_number_guard(&mut a, 9, 0, 11, strings);
+                emit_exec_number_guard(&mut a, 10, 1, 11, slow);
                 a.f_arith(0, 0, 0, 1);
-                a.stur_d(0, 20, -24);
-                a.sub_imm(20, 20, 16);
+                emit_exec_number_store(&mut a, 0, 20, -16, 11);
+                a.sub_imm(20, 20, 8);
                 a.b(done);
                 a.bind(strings);
-                a.cmp_imm_w(9, 6);
-                a.b_cond(C_NE, slow);
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 6);
-                a.b_cond(C_NE, slow);
+                emit_exec_tag_guard(&mut a, 9, crate::value::PACK_STR, 11, slow);
+                emit_exec_tag_guard(&mut a, 10, crate::value::PACK_STR, 11, slow);
                 emit_op_helper(&mut a, H_ADD_STRINGS, pc as u32, l_unwind);
                 a.b(done);
                 a.bind(slow);
@@ -3863,17 +4276,13 @@ pub fn compile(
                 };
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -32);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
-                a.ldur_d(0, 20, -24);
-                a.ldur_d(1, 20, -8);
+                emit_exec_word_load(&mut a, 9, 20, -16);
+                emit_exec_word_load(&mut a, 10, 20, -8);
+                emit_exec_number_guard(&mut a, 9, 0, 11, slow);
+                emit_exec_number_guard(&mut a, 10, 1, 11, slow);
                 a.f_arith(f_op, 0, 0, 1);
-                a.stur_d(0, 20, -24);
-                a.sub_imm(20, 20, 16);
+                emit_exec_number_store(&mut a, 0, 20, -16, 11);
+                a.sub_imm(20, 20, 8);
                 a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
@@ -3891,14 +4300,10 @@ pub fn compile(
                 let done = a.new_label();
                 let primitives = a.new_label();
                 let calculate = a.new_label();
-                a.ldurb(9, 20, -32);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, primitives);
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, primitives);
-                a.ldur_d(0, 20, -24); // lhs
-                a.ldur_d(1, 20, -8); // rhs
+                emit_exec_word_load(&mut a, 9, 20, -16);
+                emit_exec_word_load(&mut a, 10, 20, -8);
+                emit_exec_number_guard(&mut a, 9, 0, 11, primitives);
+                emit_exec_number_guard(&mut a, 10, 1, 11, primitives);
                 a.fcvtzs_x_d(9, 0);
                 a.scvtf_d_x(2, 9);
                 a.frintz(3, 0);
@@ -3929,8 +4334,8 @@ pub fn compile(
                 } else {
                     a.scvtf_d_w(0, 11);
                 }
-                a.stur_d(0, 20, -24);
-                a.sub_imm(20, 20, 16);
+                a.stur_d(0, 20, -16); // finite Int32/Uint32: already canonical
+                a.sub_imm(20, 20, 8);
                 a.b(done);
                 primitive_bit_paths.push((primitives, calculate, slow));
                 a.bind(slow);
@@ -3944,10 +4349,8 @@ pub fn compile(
             Op::BitNot if fast & 1 != 0 => {
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
-                a.ldur_d(0, 20, -8);
+                emit_exec_word_load(&mut a, 9, 20, -8);
+                emit_exec_number_guard(&mut a, 9, 0, 10, slow);
                 a.fcvtzs_x_d(9, 0);
                 a.scvtf_d_x(1, 9);
                 a.frintz(2, 0);
@@ -4027,7 +4430,7 @@ pub fn compile(
                 if fast & 65536 != 0
                     && rc_ok
                     && set_prop_inlinable(layout)
-                    && (*s as u32) * 16 + 16 < 4096 =>
+                    && (*s as u32) * 8 + 8 < 4096 =>
             {
                 emit_set_prop_inline(
                     &mut a,
@@ -4039,7 +4442,7 @@ pub fn compile(
                     }),
                     pc as u32,
                     l_unwind,
-                    PropRecv::Slot(*s as u32 * 16),
+                    PropRecv::Slot(*s as u32 * 8),
                 );
             }
             Op::UpdateProp(_, cache, kind)
@@ -4076,147 +4479,71 @@ pub fn compile(
                 };
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -32);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
-                a.ldurb(9, 20, -16);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
-                a.ldur_d(0, 20, -24);
-                a.ldur_d(1, 20, -8);
+                emit_exec_word_load(&mut a, 9, 20, -16);
+                emit_exec_word_load(&mut a, 10, 20, -8);
+                emit_exec_number_guard(&mut a, 9, 0, 11, slow);
+                emit_exec_number_guard(&mut a, 10, 1, 11, slow);
                 a.fcmp(0, 1);
                 a.cset_w(9, cond);
-                a.movz(10, 3, 0); // Bool tag word (payload byte 1 zeroed by the 64-bit store)
-                a.sub_imm(20, 20, 16);
-                a.stur(10, 20, -16);
-                a.sturb(9, 20, -15); // bool payload at offset 1
+                a.mov_imm64(10, crate::value::PACK_BOOL);
+                a.logic_x(1, 9, 9, 10);
+                emit_exec_word_store(&mut a, 9, 20, -16);
+                a.sub_imm(20, 20, 8);
                 a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
             }
-            Op::LoadLocal(slot) if fast & 8 != 0 && (*slot as u32) * 16 + 16 < 4096 => {
-                let off = *slot as u32 * 16;
+            Op::LoadLocal(slot) if fast & 8 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
+                let off = *slot as i32 * 8;
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldrb_imm(9, 22, off);
-                a.cmp_imm_w(9, 1); // Empty = TDZ throw → slow
+                emit_exec_word_load(&mut a, 9, 22, off);
+                a.mov_imm64(10, crate::value::PACK_EMPTY);
+                a.cmp_reg_x(9, 10); // Empty = TDZ throw → slow
                 a.b_cond(C_EQ, slow);
-                if rc_ok {
-                    a.cmp_imm_w(9, 5);
-                    a.b_cond(C_EQ, slow);
-                    a.ldr_imm(10, 22, off);
-                    a.ldr_imm(11, 22, off + 8);
-                    a.stur(10, 20, 0);
-                    a.stur(11, 20, 8);
-                    let nobump = a.new_label();
-                    a.cmp_imm_w(9, 6);
-                    a.b_cond(C_LO, nobump);
-                    a.ldur(13, 11, rc_strong);
-                    a.add_imm(13, 13, 1);
-                    a.stur(13, 11, rc_strong);
-                    a.bind(nobump);
-                } else {
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_HI, slow);
-                    a.ldr_imm(10, 22, off);
-                    a.ldr_imm(11, 22, off + 8);
-                    a.stur(10, 20, 0);
-                    a.stur(11, 20, 8);
-                }
-                a.add_imm(20, 20, 16);
+                emit_exec_clone(&mut a, layout, 9, 10, 11, slow);
+                emit_exec_word_store(&mut a, 9, 20, 0);
+                a.add_imm(20, 20, 8);
                 a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
             }
-            Op::StoreLocal(slot) if fast & 16 != 0 && (*slot as u32) * 16 + 16 < 4096 => {
+            Op::StoreLocal(slot) if fast & 16 != 0 && (*slot as u32) * 8 + 8 < 4096 => {
                 emit_store_local(
                     &mut a,
                     layout,
-                    *slot as u32 * 16,
+                    *slot as u32 * 8,
                     &[pc as u32],
                     l_unwind,
                     false,
                     rc_ok,
                 );
             }
-            Op::UpdateLocal(slot, kind) if fast & 32 != 0 && (*slot as u32) * 16 + 8 < 4096 => {
-                let off = *slot as u32 * 16;
-                let slow = a.new_label();
-                let done = a.new_label();
-                a.ldrb_imm(9, 22, off);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, slow);
-                a.ldr_d_imm(0, 22, off + 8); // old
-                a.fmov_one(1);
-                let dec = matches!(
-                    kind,
-                    UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
-                );
-                a.f_arith(if dec { 1 } else { 0 }, 2, 0, 1); // new = old ± 1
-                a.str_d_imm(2, 22, off + 8);
-                match kind {
-                    UpdKind::PreInc | UpdKind::PreDec => {
-                        a.movz(10, 4, 0);
-                        a.stur(10, 20, 0);
-                        a.stur_d(2, 20, 8);
-                        a.add_imm(20, 20, 16);
-                    }
-                    UpdKind::PostInc | UpdKind::PostDec => {
-                        a.movz(10, 4, 0);
-                        a.stur(10, 20, 0);
-                        a.stur_d(0, 20, 8);
-                        a.add_imm(20, 20, 16);
-                    }
-                    UpdKind::IncDiscard | UpdKind::DecDiscard => {}
-                }
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
+            Op::UpdateLocal(slot, kind) if fast & 32 != 0 && (*slot as u32) * 8 + 8 < 4096 => {
+                emit_update_local(&mut a, *slot, *kind, pc as u32, l_unwind);
             }
-            Op::Pop if fast & 64 != 0 => {
+            Op::Pop if fast & 64 != 0 && rc_ok => {
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -16);
-                if rc_ok {
-                    // A refcounted top drops inline (strong--) unless it is the last reference
-                    // (real destructor) or a BigInt (compound payload) — those take the helper.
-                    a.cmp_imm_w(9, 5);
-                    a.b_cond(C_EQ, slow);
-                    let plain = a.new_label();
-                    a.cmp_imm_w(9, 6);
-                    a.b_cond(C_LO, plain);
-                    a.ldur(10, 20, -8);
-                    a.ldur(9, 10, rc_strong);
-                    a.cmp_imm_x(9, 1);
-                    a.b_cond(C_LS, slow);
-                    a.sub_imm(9, 9, 1);
-                    a.stur(9, 10, rc_strong);
-                    a.bind(plain);
-                } else {
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_HI, slow); // refcounted → slow (must drop)
-                }
-                a.sub_imm(20, 20, 16);
+                emit_exec_word_load(&mut a, 9, 20, -8);
+                emit_exec_drop_shared(&mut a, layout, 9, 10, 11, slow);
+                a.sub_imm(20, 20, 8);
                 a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
             }
             Op::Undef if fast & 128 != 0 => {
-                a.stur(31, 20, 0);
-                a.stur(31, 20, 8);
-                a.add_imm(20, 20, 16);
+                a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+                emit_exec_word_store(&mut a, 9, 20, 0);
+                a.add_imm(20, 20, 8);
             }
             Op::Const(k) if fast & 128 != 0 && chunk.jit_const_copyable(*k) => {
-                let (word0, word1) = chunk.jit_const_bits(*k);
-                a.mov_imm64(9, word0);
-                a.stur(9, 20, 0);
-                a.mov_imm64(9, word1);
-                a.stur(9, 20, 8);
-                a.add_imm(20, 20, 16);
+                a.mov_imm64(9, chunk.jit_const_packed_bits(*k)?);
+                emit_exec_word_store(&mut a, 9, 20, 0);
+                a.add_imm(20, 20, 8);
             }
             // String consts: copy the 16-byte Value from its stable chunk slot and bump the
             // LStr strong count — parser-shaped code pushes literal strings millions of times
@@ -4228,14 +4555,14 @@ pub fn compile(
                     && chunk.jit_const_is_str(*k) =>
             {
                 a.mov_imm64(9, chunk.jit_const_ptr(*k) as u64);
-                a.ldr_imm(10, 9, 0);
                 a.ldr_imm(11, 9, 8);
-                a.stur(10, 20, 0);
-                a.stur(11, 20, 8);
+                a.mov_imm64(10, crate::value::PACK_STR);
+                a.logic_x(1, 10, 10, 11);
+                emit_exec_word_store(&mut a, 10, 20, 0);
                 a.ldur(13, 11, 0); // strong (payload+0)
                 a.add_imm(13, 13, 1);
                 a.stur(13, 11, 0);
-                a.add_imm(20, 20, 16);
+                a.add_imm(20, 20, 8);
             }
             // TDZ entry: the slot becomes `Empty` (tag 1). The old value drops in place —
             // trivially for tags < 5, by a bare shared-reference decrement for refcounted
@@ -4247,32 +4574,25 @@ pub fn compile(
             Op::DestructureGuard => {
                 let slow = a.new_label();
                 let done = a.new_label();
-                a.ldurb(9, 20, -16);
-                a.cbz(9, false, slow); // Undefined
-                a.cmp_imm_w(9, 2);
+                emit_exec_word_load(&mut a, 9, 20, -8);
+                a.mov_imm64(10, crate::value::PACK_UNDEFINED);
+                a.cmp_reg_x(9, 10);
+                a.b_cond(C_EQ, slow);
+                a.mov_imm64(10, crate::value::PACK_NULL);
+                a.cmp_reg_x(9, 10);
                 a.b_cond(C_NE, done); // anything but Null
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
             }
-            Op::Tdz(slot) if fast & 16 != 0 && rc_ok && (*slot as u32) * 16 + 16 < 4096 => {
-                let off = *slot as u32 * 16;
+            Op::Tdz(slot) if fast & 16 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
+                let off = *slot as i32 * 8;
                 let slow = a.new_label();
                 let done = a.new_label();
-                let plain = a.new_label();
-                a.ldrb_imm(9, 22, off);
-                a.cmp_imm_w(9, 5);
-                a.b_cond(C_LO, plain);
-                a.b_cond(C_EQ, slow);
-                a.ldr_imm(10, 22, off + 8);
-                a.ldur(11, 10, rc_strong);
-                a.cmp_imm_x(11, 1);
-                a.b_cond(C_LS, slow);
-                a.sub_imm(11, 11, 1);
-                a.stur(11, 10, rc_strong);
-                a.bind(plain);
-                a.movz(9, 1, 0);
-                a.strb_imm(9, 22, off);
+                emit_exec_word_load(&mut a, 9, 22, off);
+                emit_exec_drop_shared(&mut a, layout, 9, 10, 11, slow);
+                a.mov_imm64(9, crate::value::PACK_EMPTY);
+                emit_exec_word_store(&mut a, 9, 22, off);
                 a.b(done);
                 a.bind(slow);
                 emit_exec(&mut a, pc as u32, l_unwind);
@@ -4282,26 +4602,15 @@ pub fn compile(
             // with a single byte store; refcounted values (the receiver-array vars of a spliced
             // bignum kernel, typically) decrement inline while shared. Only a last-reference
             // drop (or a string-ish tag 5) re-runs the whole (idempotent) op via the helper.
-            Op::ResetSlots(start, count)
-                if rc_ok && (*start as u32 + *count as u32) * 16 < 4096 =>
-            {
+            Op::ResetSlots(start, count) if rc_ok && (*start as u32 + *count as u32) * 8 < 4096 => {
                 let slow = a.new_label();
                 let done = a.new_label();
                 for k in *start..*start + *count {
-                    let off = k as u32 * 16;
-                    let plain = a.new_label();
-                    a.ldrb_imm(9, 22, off);
-                    a.cmp_imm_w(9, 5);
-                    a.b_cond(C_LO, plain);
-                    a.b_cond(C_EQ, slow);
-                    a.ldr_imm(10, 22, off + 8);
-                    a.ldur(11, 10, rc_strong);
-                    a.cmp_imm_x(11, 1);
-                    a.b_cond(C_LS, slow);
-                    a.sub_imm(11, 11, 1);
-                    a.stur(11, 10, rc_strong);
-                    a.bind(plain);
-                    a.strb_imm(31, 22, off);
+                    let off = k as i32 * 8;
+                    emit_exec_word_load(&mut a, 9, 22, off);
+                    emit_exec_drop_shared(&mut a, layout, 9, 10, 11, slow);
+                    a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+                    emit_exec_word_store(&mut a, 9, 22, off);
                 }
                 a.b(done);
                 a.bind(slow);
@@ -4329,18 +4638,24 @@ pub fn compile(
                             a.cmp_reg_x(11, 12);
                             a.b_cond(C_NE, pc_labels[*target as usize]);
                         }
-                        let dm = (it.argc as i32 + 1) * 16;
-                        a.ldurb(9, 20, -dm);
-                        a.cmp_imm_w(9, 8);
-                        a.b_cond(C_NE, pc_labels[*target as usize]);
-                        a.ldur(9, 20, -dm + 8);
-                        a.mov_imm64(10, s as u64);
+                        let dm = (it.argc as i32 + 1) * 8;
+                        // Inline plans bound arity; a far-negative address is materialized
+                        // once rather than truncating an unscaled load displacement.
+                        a.mov_imm64(11, dm as u64);
+                        a.sub_reg(11, 20, 11);
+                        emit_exec_word_load(&mut a, 9, 11, 0);
+                        a.mov_imm64(10, crate::value::PACK_OBJ | s as u64);
                         a.cmp_reg_x(9, 10);
                         a.b_cond(C_NE, pc_labels[*target as usize]);
                         if it.check_this {
-                            a.ldurb(9, 20, -dm - 16);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, pc_labels[*target as usize]);
+                            emit_exec_word_load(&mut a, 9, 11, -8);
+                            emit_exec_tag_guard(
+                                &mut a,
+                                9,
+                                crate::value::PACK_OBJ,
+                                10,
+                                pc_labels[*target as usize],
+                            );
                         }
                     }
                 }
@@ -4352,469 +4667,19 @@ pub fn compile(
             // global root — and a hit takes the H_CALL_HIT helper, which skips the probe loop
             // and op decode. Any mismatch (incl. an empty way: callee 0 matches no payload)
             // falls to the full helper.
-            Op::Call(argc, c) | Op::CallWithThis(argc, c) => {
-                let inline_probe = fast & 524288 != 0;
-                let slow = a.new_label();
-                let done = a.new_label();
-                if inline_probe {
-                    let depth = *argc as u32 + 1; // callee sits under the args
-                    let off = depth as i32 * -16;
-                    if (-256..0).contains(&off) {
-                        let ic0 = chunk.jit_call_cache_ptr(*c);
-                        a.ldurb(9, 20, off);
-                        a.cmp_imm_w(9, 8); // callee must be an Obj
-                        a.b_cond(C_NE, slow);
-                        a.ldur(10, 20, off + 8); // callee payload (stored Rc ptr)
-                                                 // the payload is the STORED RcBox pointer; as_ptr sits one probed
-                                                 // header further (comparing them raw was a silent 100% miss)
-                        a.add_imm(13, 10, layout.gc_data_off as u32);
-                        // Probe ALL 4 ways (a stable polymorphic site — e.g. one dispatch
-                        // loop over a handful of receiver classes — otherwise pays the full
-                        // helper on every call that isn't way 1): x12 = entry cursor,
-                        // w14 = ways left, w15 = live epoch, x17 = ctx.genv.
-                        a.mov_imm64(12, ic0 as u64);
-                        a.mov_imm64(11, &crate::bytecode::CALL_IC_EPOCH as *const _ as u64);
-                        a.ldr_w_imm(15, 11, 0);
-                        a.ldr_imm(17, 19, 64); // ctx.genv
-                        a.movz(14, crate::bytecode::CALL_IC_WAYS as u32, 0);
-                        let l_probe = a.new_label();
-                        let l_next = a.new_label();
-                        let l_hit = a.new_label();
-                        let l_primary_hit = a.new_label();
-                        a.bind(l_probe);
-                        a.ldur(11, 12, 0); // ic.callee (an Rc::as_ptr identity)
-                        a.cmp_reg_x(13, 11);
-                        a.b_cond(C_NE, l_next);
-                        a.ldr_w_imm(11, 12, 56); // ic.epoch
-                        a.cmp_reg_w(11, 15);
-                        a.b_cond(C_NE, l_next);
-                        a.ldr_imm(11, 12, 32); // ic.global_env
-                        a.cmp_reg_x(11, 17);
-                        a.b_cond(C_EQ, l_primary_hit);
-                        a.bind(l_next);
-                        // entry stride (size compile-asserted below the JitCtx asserts)
-                        let stride =
-                            std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
-                        a.add_imm(12, 12, stride as u32);
-                        a.sub_imm(14, 14, 1);
-                        a.cbnz(14, false, l_probe);
-                        emit_call_overflow_probe(&mut a, ilayout, l_hit, slow);
-                        // x15 = the hit way (ways-left counter → index), kept live through
-                        // the direct sequence's NO-MUTATION gate checks (they never touch
-                        // x15; every route into hit_slow happens before any blr).
-                        a.bind(l_primary_hit);
-                        a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
-                        a.sub_reg(15, 15, 14);
-                        a.bind(l_hit);
-                        let with_this = matches!(op, Op::CallWithThis(..));
-                        let hit_slow = a.new_label();
-                        // Inline intrinsics: a native entry the template can finish without
-                        // leaving machine code. charCodeAt on a known-ASCII receiver with an
-                        // exact in-bounds u32 index is a byte load — meriyah-style scanners
-                        // make millions of these per parse. Any miss (intrinsic id, receiver
-                        // tag/hint, index shape, bounds, last-reference operands) takes the
-                        // H_CALL_HIT form, whose Rust side handles native entries generally.
-                        if with_this && *argc == 1 && rc_ok && layout.rc_strong_off == 0 {
-                            let char_at = a.new_label();
-                            let char_code = a.new_label();
-                            let sqrt = a.new_label();
-                            let regexp_exec =
-                                matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
-                            let string_split =
-                                matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
-                            let array_push = array_intrinsics_on.then(|| a.new_label());
-                            let no_intr = a.new_label();
-                            a.ldrb_imm(9, 12, 96); // ic.intrinsic (offset compile-asserted)
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_AT as u32);
-                            a.b_cond(C_EQ, char_at);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32);
-                            a.b_cond(C_EQ, char_code);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
-                            a.b_cond(C_EQ, sqrt);
-                            if let Some(array_push) = array_push {
-                                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32);
-                                a.b_cond(C_EQ, array_push);
-                            }
-                            if let Some(regexp_exec) = regexp_exec {
-                                a.cmp_imm_w(
-                                    9,
-                                    crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32,
-                                );
-                                a.b_cond(C_EQ, regexp_exec);
-                            }
-                            if let Some(string_split) = string_split {
-                                a.cmp_imm_w(
-                                    9,
-                                    crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32,
-                                );
-                                a.b_cond(C_EQ, string_split);
-                            }
-                            a.b(no_intr);
-
-                            // String#charAt(number): exact builtin identity is already proven.
-                            // The dedicated helper handles truncation, UTF-16 units, and the
-                            // interned ASCII result while consuming the three operands directly.
-                            a.bind(char_at);
-                            a.ldurb(9, 20, -48);
-                            a.cmp_imm_w(9, 6);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldurb(9, 20, -16);
-                            a.cmp_imm_w(9, 4);
-                            a.b_cond(C_NE, hit_slow);
-                            a.mov(0, 19);
-                            a.movz(1, pc as u32, 0);
-                            a.movk(1, crate::bytecode::INTRINSIC_CHAR_AT as u32, 1);
-                            a.mov(2, 20);
-                            a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                            a.blr(16);
-                            a.mov(20, 0);
-                            a.cbnz(1, false, l_unwind);
-                            a.b(done);
-
-                            a.bind(char_code);
-                            // receiver: Str with the ASCII hint
-                            a.ldurb(9, 20, -48);
-                            a.cmp_imm_w(9, 6);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldur(11, 20, -40);
-                            a.ldr_w_imm(14, 11, crate::lstr::CAP_OFF as u32);
-                            a.lsr_imm(14, 14, 31);
-                            a.cbz(14, false, hit_slow);
-                            // index: exact u32 Num
-                            a.ldurb(9, 20, -16);
-                            a.cmp_imm_w(9, 4);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldur_d(0, 20, -8);
-                            a.fcvtzu_w_d(9, 0);
-                            a.ucvtf_d_w(1, 9);
-                            a.fcmp(0, 1);
-                            a.b_cond(C_NE, hit_slow);
-                            // bounds (ASCII: byte index == unit index); OOB answers NaN in the
-                            // helper
-                            a.ldr_w_imm(14, 11, crate::lstr::LEN_OFF as u32);
-                            a.cmp_reg_x(9, 14);
-                            a.b_cond(C_HS, hit_slow);
-                            // both refcounted operands must survive a bare dec
-                            a.ldur(14, 11, 0);
-                            a.cmp_imm_x(14, 1);
-                            a.b_cond(C_LS, hit_slow);
-                            a.ldur(13, 10, 0);
-                            a.cmp_imm_x(13, 1);
-                            a.b_cond(C_LS, hit_slow);
-                            // ---- commit: byte load, decs, Num over the receiver slot ----
-                            a.add_imm(16, 11, crate::lstr::DATA_OFF as u32);
-                            a.ldrb_reg(16, 16, 9);
-                            a.ucvtf_d_w(0, 16);
-                            a.sub_imm(14, 14, 1);
-                            a.stur(14, 11, 0);
-                            a.sub_imm(13, 13, 1);
-                            a.stur(13, 10, 0);
-                            a.movz(9, 4, 0);
-                            a.stur(9, 20, -48);
-                            a.stur_d(0, 20, -40);
-                            a.sub_imm(20, 20, 32);
-                            a.b(done);
-
-                            // Math.sqrt(number): the call IC already proved builtin identity.
-                            // The receiver is ignored semantically; require an object so it and
-                            // the distinct function handle can be released by guarded decrements.
-                            a.bind(sqrt);
-                            a.ldurb(9, 20, -48);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldurb(9, 20, -16);
-                            a.cmp_imm_w(9, 4);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldur(11, 20, -40);
-                            a.ldur(14, 11, 0);
-                            a.cmp_imm_x(14, 1);
-                            a.b_cond(C_LS, hit_slow);
-                            a.ldur(13, 10, 0);
-                            a.cmp_imm_x(13, 1);
-                            a.b_cond(C_LS, hit_slow);
-                            a.ldur_d(0, 20, -8);
-                            a.fsqrt(0, 0);
-                            a.sub_imm(14, 14, 1);
-                            a.stur(14, 11, 0);
-                            a.sub_imm(13, 13, 1);
-                            a.stur(13, 10, 0);
-                            a.movz(9, 4, 0);
-                            a.stur(9, 20, -48);
-                            a.stur_d(0, 20, -40);
-                            a.sub_imm(20, 20, 32);
-                            a.b(done);
-
-                            // Array#push(value): builtin identity is proven by the call IC. The
-                            // helper moves `value` into dense storage after live array/prototype/
-                            // length guards, and restores the operand before the exact builtin on
-                            // any miss.
-                            if let Some(array_push) = array_push {
-                                a.bind(array_push);
-                                a.ldurb(9, 20, -48);
-                                a.cmp_imm_w(9, 8);
-                                a.b_cond(C_NE, hit_slow);
-                                a.mov(0, 19);
-                                a.movz(1, pc as u32, 0);
-                                a.movk(1, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32, 1);
-                                a.mov(2, 20);
-                                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                                a.blr(16);
-                                a.mov(20, 0);
-                                a.cbnz(1, false, l_unwind);
-                                a.b(done);
-                            }
-
-                            if let Some(regexp_exec) = regexp_exec {
-                                a.bind(regexp_exec);
-                                // Exact built-in identity is already proven by the call IC.
-                                // The helper additionally validates the ordinary RegExp object
-                                // and lastIndex shape before taking its allocation-free path.
-                                a.ldurb(9, 20, -48);
-                                a.cmp_imm_w(9, 8);
-                                a.b_cond(C_NE, hit_slow);
-                                a.ldurb(9, 20, -16);
-                                a.cmp_imm_w(9, 6);
-                                a.b_cond(C_NE, hit_slow);
-                                a.mov(0, 19);
-                                a.movz(1, pc as u32, 0);
-                                a.movk(1, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32, 1);
-                                a.mov(2, 20);
-                                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                                a.blr(16);
-                                a.mov(20, 0);
-                                a.cbnz(1, false, l_unwind);
-                                a.b(done);
-                            }
-
-                            if let Some(string_split) = string_split {
-                                a.bind(string_split);
-                                // The call IC proves String#split identity. The helper validates
-                                // the separator's complete RegExp protocol/species dependency
-                                // chain before eliding only the dead result allocations.
-                                a.ldurb(9, 20, -48);
-                                a.cmp_imm_w(9, 6);
-                                a.b_cond(C_NE, hit_slow);
-                                a.ldurb(9, 20, -16);
-                                a.cmp_imm_w(9, 8);
-                                a.b_cond(C_NE, hit_slow);
-                                a.mov(0, 19);
-                                a.movz(1, pc as u32, 0);
-                                a.movk(
-                                    1,
-                                    crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32,
-                                    1,
-                                );
-                                a.mov(2, 20);
-                                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                                a.blr(16);
-                                a.mov(20, 0);
-                                a.cbnz(1, false, l_unwind);
-                                a.b(done);
-                            }
-
-                            a.bind(no_intr);
-                        }
-                        if with_this && *argc == 0 && array_intrinsics_on {
-                            let no_intr = a.new_label();
-                            a.ldrb_imm(9, 12, 96);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_POP as u32);
-                            a.b_cond(C_NE, no_intr);
-                            a.ldurb(9, 20, -32);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, hit_slow);
-                            a.mov(0, 19);
-                            a.movz(1, pc as u32, 0);
-                            a.movk(1, crate::bytecode::INTRINSIC_ARRAY_POP as u32, 1);
-                            a.mov(2, 20);
-                            a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                            a.blr(16);
-                            a.mov(20, 0);
-                            a.cbnz(1, false, l_unwind);
-                            a.b(done);
-                            a.bind(no_intr);
-                        }
-                        if with_this && (1..=8).contains(argc) && function_call_intrinsic_on {
-                            let no_intr = a.new_label();
-                            a.ldrb_imm(9, 12, 96);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_CALL as u32);
-                            a.b_cond(C_NE, no_intr);
-                            let receiver_off = -((*argc as i32 + 2) * 16);
-                            a.ldurb(9, 20, receiver_off);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, hit_slow);
-                            a.mov(0, 19);
-                            a.movz(1, pc as u32, 0);
-                            a.movk(
-                                1,
-                                crate::bytecode::INTRINSIC_FUNCTION_CALL as u32
-                                    | ((*argc as u32) << 8),
-                                1,
-                            );
-                            a.mov(2, 20);
-                            a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                            a.blr(16);
-                            a.mov(20, 0);
-                            a.cbnz(1, false, l_unwind);
-                            a.b(done);
-                            a.bind(no_intr);
-                        }
-                        if with_this && *argc == 2 {
-                            let slice = a.new_label();
-                            let has_own = a.new_label();
-                            let apply = a.new_label();
-                            let replace =
-                                matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
-                            let no_intr = a.new_label();
-                            a.ldrb_imm(9, 12, 96);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
-                            a.b_cond(C_EQ, slice);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32);
-                            a.b_cond(C_EQ, has_own);
-                            a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32);
-                            a.b_cond(C_EQ, apply);
-                            if let Some(replace) = replace {
-                                a.cmp_imm_w(
-                                    9,
-                                    crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32,
-                                );
-                                a.b_cond(C_EQ, replace);
-                            }
-                            a.b(no_intr);
-
-                            // ASCII String#slice(start, end), both bounds already Numbers: no
-                            // user code or exotic conversion can run in the dedicated helper.
-                            a.bind(slice);
-                            a.ldurb(9, 20, -64);
-                            a.cmp_imm_w(9, 6);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldur(11, 20, -56);
-                            a.ldr_w_imm(9, 11, crate::lstr::CAP_OFF as u32);
-                            a.lsr_imm(9, 9, 31);
-                            a.cbz(9, false, hit_slow);
-                            for off in [-32i32, -16] {
-                                a.ldurb(9, 20, off);
-                                a.cmp_imm_w(9, 4);
-                                a.b_cond(C_NE, hit_slow);
-                            }
-                            a.mov(0, 19);
-                            a.movz(1, pc as u32, 0);
-                            a.movk(1, crate::bytecode::INTRINSIC_STRING_SLICE as u32, 1);
-                            a.mov(2, 20);
-                            a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                            a.blr(16);
-                            a.mov(20, 0);
-                            a.cbnz(1, false, l_unwind);
-                            a.b(done);
-
-                            // Object.hasOwn(obj, string): the named intrinsic's implementation
-                            // is exactly an own-map lookup for this non-coercing argument shape.
-                            a.bind(has_own);
-                            a.ldurb(9, 20, -32);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldurb(9, 20, -16);
-                            a.cmp_imm_w(9, 6);
-                            a.b_cond(C_NE, hit_slow);
-                            a.mov(0, 19);
-                            a.movz(1, pc as u32, 0);
-                            a.movk(1, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32, 1);
-                            a.mov(2, 20);
-                            a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                            a.blr(16);
-                            a.mov(20, 0);
-                            a.cbnz(1, false, l_unwind);
-                            a.b(done);
-
-                            // Function#apply(targetThis, arguments): builtin identity is already
-                            // proven. Restrict the intrinsic helper to an object target and
-                            // object list; it performs the ordinary/unmapped/dense guards before
-                            // moving entries directly into a compiled target frame.
-                            a.bind(apply);
-                            a.ldurb(9, 20, -64);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, hit_slow);
-                            a.ldurb(9, 20, -16);
-                            a.cmp_imm_w(9, 8);
-                            a.b_cond(C_NE, hit_slow);
-                            a.mov(0, 19);
-                            a.movz(1, pc as u32, 0);
-                            a.movk(1, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32, 1);
-                            a.mov(2, 20);
-                            a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                            a.blr(16);
-                            a.mov(20, 0);
-                            a.cbnz(1, false, l_unwind);
-                            a.b(done);
-
-                            if let Some(replace) = replace {
-                                a.bind(replace);
-                                for (off, tag) in [(-64i32, 6u32), (-32, 8), (-16, 6)] {
-                                    a.ldurb(9, 20, off);
-                                    a.cmp_imm_w(9, tag);
-                                    a.b_cond(C_NE, hit_slow);
-                                }
-                                a.mov(0, 19);
-                                a.movz(1, pc as u32, 0);
-                                a.movk(
-                                    1,
-                                    crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32,
-                                    1,
-                                );
-                                a.mov(2, 20);
-                                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                                a.blr(16);
-                                a.mov(20, 0);
-                                a.cbnz(1, false, l_unwind);
-                                a.b(done);
-                            }
-                            a.bind(no_intr);
-                        }
-                        // Direct shared-ctx call: its own gate misses land on `hit_slow` =
-                        // the H_CALL_HIT form below.
-                        if direct_on {
-                            let attempted_off = chunk.jit_inline_attempted_off();
-                            emit_direct_call(
-                                &mut a,
-                                ilayout,
-                                layout.gc_data_off,
-                                attempted_off,
-                                *argc as usize,
-                                with_this,
-                                hit_slow,
-                                slow,
-                                l_unwind,
-                                done,
-                                l_direct_finish,
-                            );
-                        }
-                        a.bind(hit_slow);
-                        // Secondary ways are not indices into the caller's four primary
-                        // entries. A non-direct/non-intrinsic secondary hit re-probes through
-                        // the checked helper; it must never alias primary way zero.
-                        a.cmp_imm_w(15, crate::bytecode::CALL_IC_WAYS as u32);
-                        a.b_cond(C_HS, slow);
-                        a.mov(0, 19);
-                        // x1 = pc | way << 16 (pcs are < 65536: every helper call encodes
-                        // the pc as one movz)
-                        a.movz(1, pc as u32, 0);
-                        a.add_shifted(1, 1, 15, 16);
-                        a.mov(2, 20);
-                        a.ldr_imm(16, 21, (H_CALL_HIT * 8) as u32);
-                        a.blr(16);
-                        a.mov(20, 0);
-                        a.cbnz(1, false, l_unwind);
-                        a.b(done);
-                    }
-                }
-                a.bind(slow);
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_CALL * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.bind(done);
+            Op::Call(..) | Op::CallWithThis(..) => {
+                emit_call_inline(
+                    &mut a,
+                    chunk,
+                    layout,
+                    ilayout,
+                    pc,
+                    fast,
+                    array_intrinsics_on,
+                    function_call_intrinsic_on,
+                    l_unwind,
+                    l_direct_finish,
+                );
             }
             Op::MakeObject(..) => {
                 emit_op_helper(&mut a, H_MAKE_OBJECT, pc as u32, l_unwind);
@@ -4851,6 +4716,9 @@ pub fn compile(
                     emit_op_helper(&mut a, H_GET_METHOD_ELEM, pc as u32, l_unwind);
                 }
             }
+            Op::GetElem | Op::GetElemLocal(_) => {
+                emit_op_helper(&mut a, H_GET_ELEM, pc as u32, l_unwind);
+            }
             _ => {
                 emit_exec(&mut a, pc as u32, l_unwind);
             }
@@ -4858,24 +4726,20 @@ pub fn compile(
     }
     // Fall off the end: return undefined (compile() always terminates with ReturnUndef, but be
     // safe about it).
-    emit_helper(&mut a, H_RETURN, 0);
-    a.b(l_ret_ok);
+    if borrowed_entry {
+        emit_helper(&mut a, H_SLICE_OP, ops.len() as u32);
+        a.b(l_ret_ok);
+    } else {
+        emit_return(&mut a, 0, l_ret_ok);
+    }
 
     for (primitives, calculate, slow) in primitive_bit_paths {
         a.bind(primitives);
-        for (offset, reg) in [(-32, 9), (-16, 10)] {
-            let number = a.new_label();
+        for (offset, reg) in [(-16, 9), (-8, 10)] {
+            let boolean = a.new_label();
             let converted = a.new_label();
-            a.ldurb(11, 20, offset);
-            a.cmp_imm_w(11, 4);
-            a.b_cond(C_EQ, number);
-            a.cmp_imm_w(11, 3);
-            a.b_cond(C_NE, slow);
-            // repr(u8) Bool's payload is byte 1, not Num's double at byte 8.
-            a.ldurb(reg, 20, offset + 1);
-            a.b(converted);
-            a.bind(number);
-            a.ldur_d(0, 20, offset + 8);
+            emit_exec_word_load(&mut a, 11, 20, offset);
+            emit_exec_number_guard(&mut a, 11, 0, 12, boolean);
             a.fcvtzs_x_d(reg, 0);
             a.scvtf_d_x(2, reg);
             a.frintz(3, 0);
@@ -4884,15 +4748,21 @@ pub fn compile(
             // +2^63 saturates yet passes the round-trip (MAX re-rounds to +2^63).
             a.cmn_imm_x(reg, 1);
             a.b_cond(C_VS, slow);
+            a.b(converted);
+            a.bind(boolean);
+            emit_exec_tag_guard(&mut a, 11, crate::value::PACK_BOOL, 12, slow);
+            a.movz(12, 1, 0);
+            a.logic_x(0, reg, 11, 12);
             a.bind(converted);
         }
-        a.mov_imm64(11, 4);
-        a.stur(11, 20, -32);
         a.b(calculate);
     }
 
     // ---- unwind: route a throw to the innermost try handler, or out ----
     a.bind(l_unwind);
+    if borrowed_entry {
+        a.b(l_ret_throw);
+    }
     a.mov(0, 19);
     a.movz(1, 0, 0);
     a.mov(2, 20);
@@ -4909,6 +4779,7 @@ pub fn compile(
     let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
     a.ldrb_imm(9, 31, STRICT_SAVE);
     a.strb_imm(9, strict_base, strict_off);
+    emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 1, 0);
     a.ldp_d_off(8, 9, DSAVE);
     a.ldp_d_off(10, 11, DSAVE + 16);
@@ -4924,6 +4795,7 @@ pub fn compile(
     let (strict_base, strict_off) = byte_field_address(&mut a, 13, ilayout.strict, 16);
     a.ldrb_imm(9, 31, STRICT_SAVE);
     a.strb_imm(9, strict_base, strict_off);
+    emit_residency_mark(&mut a, residency_ptr, false);
     a.movz(0, 0, 0);
     a.ldp_d_off(8, 9, DSAVE);
     a.ldp_d_off(10, 11, DSAVE + 16);
@@ -5014,6 +4886,17 @@ pub fn compile(
             }
         }
         Some(JitCode {
+            entry_kind,
+            osr_entry_depths: if borrowed_entry && !chunk.jit_is_resumable() {
+                (0..ops.len()).map(|pc| cfg.osr_entry_depth(pc)).collect()
+            } else {
+                Vec::new()
+            },
+            resume_depths: if borrowed_entry {
+                (0..ops.len()).map(|pc| cfg.stack_depth_at(pc)).collect()
+            } else {
+                Vec::new()
+            },
             needs_global: ops
                 .iter()
                 .any(|o| matches!(o, Op::LoadName(..) | Op::LoadNameForCall(..))),
@@ -5022,16 +4905,59 @@ pub fn compile(
             pc_offsets,
             max_stack,
             executable,
+            residency,
         })
     }
 }
 
 #[cfg(all(
-    target_arch = "x86_64",
+    target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+fn emit_residency_mark(a: &mut asm::Asm, residency: u64, enter: bool) {
+    const _: () = assert!(std::mem::offset_of!(cache::CodeResidency, active) == 0);
+    a.mov_imm64(9, residency);
+    a.ldr_imm(10, 9, 0);
+    if enter {
+        a.add_imm(10, 10, 1);
+    } else {
+        a.sub_imm(10, 10, 1);
+    }
+    a.str_imm(10, 9, 0);
+    if enter {
+        a.movz(10, 1, 0);
+        a.strb_imm(
+            10,
+            9,
+            std::mem::offset_of!(cache::CodeResidency, referenced) as u32,
+        );
+    }
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
 #[path = "jit_x64.rs"]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod x64;
+
+#[cfg(test)]
+#[path = "jit_exec_memory_tests.rs"]
+mod exec_memory_tests;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "jit_call_epoch_tests.rs"]
+mod call_epoch_tests;
+#[cfg(test)]
+#[path = "jit_numeric_array_tests.rs"]
+mod numeric_array_tests;
+#[cfg(test)]
+#[path = "jit_return_tests.rs"]
+mod return_tests;
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -5043,6 +4969,19 @@ pub fn compile(
     ilayout: &crate::interpreter::InterpLayout,
 ) -> Option<JitCode> {
     x64::compile(chunk, layout, ilayout)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn compile_entry(
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    entry_kind: NativeEntryKind,
+) -> Option<JitCode> {
+    x64::compile_entry(chunk, layout, ilayout, entry_kind)
 }
 
 #[cfg(not(any(
@@ -5059,6 +4998,19 @@ pub fn compile(
     _chunk: &Chunk,
     _layout: &crate::value::JitLayout,
     _ilayout: &crate::interpreter::InterpLayout,
+) -> Option<JitCode> {
+    None
+}
+
+#[cfg(not(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+)))]
+fn compile_entry(
+    _chunk: &Chunk,
+    _layout: &crate::value::JitLayout,
+    _ilayout: &crate::interpreter::InterpLayout,
+    _entry_kind: NativeEntryKind,
 ) -> Option<JitCode> {
     None
 }
@@ -5081,9 +5033,32 @@ pub(crate) fn compile_profiled(
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
 ) -> JitCompileOutcome {
+    compile_profiled_with(chunk, || compile(chunk, layout, ilayout))
+}
+
+pub(crate) fn compile_borrowed_profiled(
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+) -> JitCompileOutcome {
+    if chunk.jit_is_resumable() {
+        return JitCompileOutcome::Unavailable;
+    }
+    compile_profiled_with(chunk, || {
+        compile_entry(chunk, layout, ilayout, NativeEntryKind::BorrowedFrame)
+    })
+}
+
+fn compile_profiled_with(
+    chunk: &Chunk,
+    compile: impl FnOnce() -> Option<JitCode>,
+) -> JitCompileOutcome {
     let pressure = CompilationPressureScope::enter();
     let started = perf_metrics_enabled().then(std::time::Instant::now);
-    let result = compile(chunk, layout, ilayout);
+    let result = compile();
+    if let Some(code) = &result {
+        profiler::register(chunk, code.mem, code.len);
+    }
     if let Some(started) = started {
         let elapsed = started.elapsed();
         use std::sync::atomic::Ordering::Relaxed;
@@ -5145,10 +5120,13 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.layout_data_off + layout.vec_len_off < 4096
         && layout.obj_heap.is_multiple_of(8)
         && layout.obj_heap / 8 < 4096
-        && (layout.heap_layouts + layout.vec_ptr_off).is_multiple_of(8)
-        && (layout.heap_layouts + layout.vec_len_off).is_multiple_of(8)
-        && (layout.heap_layouts + layout.vec_ptr_off) / 8 < 4096
-        && (layout.heap_layouts + layout.vec_len_off) / 8 < 4096
+        && layout.heap_layouts.is_multiple_of(8)
+        && layout.shape_layout_entry_size == 16
+        && layout.shape_layout_entry_id == 0
+        && layout.shape_layout_entry_keys == 8
+        && crate::value::SHAPE_LAYOUT_PAGE_BITS == 6
+        && crate::value::SHAPE_LAYOUT_PAGE_SIZE == 64
+        && crate::value::SHAPE_LAYOUT_PAGE_COUNT == 64
 }
 
 #[cfg(all(
@@ -5271,24 +5249,24 @@ fn emit_prop_load_inline(
         && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
     match recv {
         PropRecv::Stack => {
-            a.ldurb(9, 20, -16);
+            emit_exec_word_load(a, 9, 20, -8);
             if str_ok {
                 let obj_recv = a.new_label();
                 let probe_go = a.new_label();
-                a.cmp_imm_w(9, 8);
+                a.lsr_imm(11, 9, 48);
+                a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
+                a.cmp_reg_w(11, 12);
                 a.b_cond(C_EQ, obj_recv);
-                a.cmp_imm_w(9, 6);
-                a.b_cond(C_NE, slow);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 11, slow);
                 a.ldr_imm(10, 19, 72); // ctx.interp
                 a.ldr_imm(10, 10, il.string_proto as u32);
                 a.b(probe_go);
                 a.bind(obj_recv);
-                a.ldur(10, 20, -8);
+                emit_exec_payload(a, 9, 10);
                 a.bind(probe_go);
             } else {
-                a.cmp_imm_w(9, 8);
-                a.b_cond(C_NE, slow);
-                a.ldur(10, 20, -8);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+                emit_exec_payload(a, 9, 10);
             }
             if !method {
                 // receiver refcount > 1 (so the pop-drop below never frees)
@@ -5305,10 +5283,9 @@ fn emit_prop_load_inline(
             a.ldur(10, 14, 8);
         }
         PropRecv::Slot(off) => {
-            a.ldrb_imm(9, 22, off);
-            a.cmp_imm_w(9, 8);
-            a.b_cond(C_NE, slow);
-            a.ldr_imm(10, 22, off + 8);
+            emit_exec_word_load(a, 9, 22, off as i32);
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+            emit_exec_payload(a, 9, 10);
         }
     }
     // After bytecode warmup, ordinary OO sites overwhelmingly have one stable depth/shape/slot.
@@ -5637,97 +5614,23 @@ fn emit_prop_load_inline(
     a.bind(val);
     guard_prop_data(a, 9, 15, ea, slow);
     if layout.entry_accessor == layout.entry_value + 8 {
-        // Decode the NaN-box into the execution tier's wide `{tag,payload}` pair. BigInt keeps
-        // the checked path (matching the old template); strings/symbols/objects clone by bumping
-        // the strong count at their untagged pointer.
-        a.ldur(13, 15, ev);
-        a.lsr_imm(9, 13, 48); // packed tag prefix
-        let decoded = a.new_label();
-        let is_undefined = a.new_label();
-        let is_empty = a.new_label();
-        let is_null = a.new_label();
-        let is_bool = a.new_label();
-        let is_str = a.new_label();
-        let is_sym = a.new_label();
-        let is_obj = a.new_label();
-        let is_number = a.new_label();
-        // Objects and Numbers dominate hot reads. Test the negative-tag Object first, then the
-        // contiguous positive-tag range; ordinary positive/negative f64 prefixes take the
-        // three-branch Number path instead of walking every tag.
-        a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_EQ, is_obj);
-        a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_LO, is_number);
-        a.movz(16, (crate::value::PACK_SYM >> 48) as u32, 0);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_HI, is_number);
-        for (tag, label) in [
-            (crate::value::PACK_BOOL, is_bool),
-            (crate::value::PACK_STR, is_str),
-            (crate::value::PACK_SYM, is_sym),
-            (crate::value::PACK_BIGINT, slow),
-            (crate::value::PACK_UNDEFINED, is_undefined),
-            (crate::value::PACK_EMPTY, is_empty),
-            (crate::value::PACK_NULL, is_null),
-        ] {
-            a.movz(16, (tag >> 48) as u32, 0);
-            a.cmp_reg_x(9, 16);
-            a.b_cond(C_EQ, label);
-        }
-        a.bind(is_number);
-        a.movz(12, 4, 0);
-        a.b(decoded);
-        for (label, tag) in [(is_undefined, 0), (is_empty, 1), (is_null, 2)] {
-            a.bind(label);
-            a.movz(12, tag, 0);
-            a.movz(13, 0, 0);
-            a.b(decoded);
-        }
-        a.bind(is_bool);
-        a.movz(12, 3, 0);
-        // `repr(u8) Value::Bool` keeps its bool payload at byte 1 of the tag word.
-        a.lsl_imm_w(13, 13, 8);
-        a.logic_w(1, 12, 12, 13);
-        a.movz(13, 0, 0);
-        a.b(decoded);
-        for (label, tag) in [(is_str, 6), (is_sym, 7), (is_obj, 8)] {
-            a.bind(label);
-            a.movz(12, tag, 0);
-            a.lsl_imm(13, 13, 16);
-            a.lsr_imm(13, 13, 16);
-            a.ldur(16, 13, strong);
-            a.add_imm(16, 16, 1);
-            a.stur(16, 13, strong);
-            a.b(decoded);
-        }
-        a.bind(decoded);
-    } else {
-        a.ldurb(9, 15, ev); // w9 = value tag (kept live through the loads below)
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, slow);
+        // Heap and execution words share the encoding; clone only the actual owner.
         a.ldur(12, 15, ev);
-        a.ldur(13, 15, ev + 8); // payload word (the Rc pointer for tags 6..8)
-        let nobump = a.new_label();
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, nobump);
-        a.ldur(16, 13, strong);
-        a.add_imm(16, 16, 1);
-        a.stur(16, 13, strong);
-        a.bind(nobump);
+    } else {
+        a.ldur(9, 15, ev);
+        a.ldur(13, 15, ev + 8);
+        emit_exec_encode_wide(a, 9, 13, 12, 16, 17, 0, slow);
     }
+    emit_exec_clone(a, layout, 12, 13, 16, slow);
     // --- commit: everything validated; from here only writes ---
     if !matches!(recv, PropRecv::Stack) {
         // this/slot receivers were never on the stack: just push the value.
-        a.stur(12, 20, 0);
-        a.stur(13, 20, 8);
-        a.add_imm(20, 20, 16);
+        emit_exec_word_store(a, 12, 20, 0);
+        a.add_imm(20, 20, 8);
     } else if method {
         // receiver stays at [-16]; push the method above it
-        a.stur(12, 20, 0);
-        a.stur(13, 20, 8);
-        a.add_imm(20, 20, 16);
+        emit_exec_word_store(a, 12, 20, 0);
+        a.add_imm(20, 20, 8);
     } else {
         // drop the receiver (strong was > 1: decrement, no free). If the value IS the receiver
         // the bump above already balanced this (the count is re-read).
@@ -5735,9 +5638,10 @@ fn emit_prop_load_inline(
         a.sub_imm(9, 9, 1);
         a.stur(9, 10, strong);
         // overwrite the receiver slot with the value (pop obj + push value = same depth)
-        a.stur(12, 20, -16);
-        a.stur(13, 20, -8);
+        emit_exec_word_store(a, 12, 20, -8);
     }
+    #[cfg(test)]
+    regions::emit_property_event(a, 0);
     a.b(done);
     // 6kc. Key-checked landing (out of the hit path's fall-through line): same bounds + entry
     // compute as `load`, then verify the entry's key IS the site's name (length, then content
@@ -5795,23 +5699,27 @@ fn emit_prop_load_inline(
     // Undefined drops touch nothing; the Tdz template sets the same precedent).
     a.bind(absent_hit);
     if !method {
-        a.movz(9, 0, 0);
+        a.mov_imm64(9, crate::value::PACK_UNDEFINED);
         match recv {
             PropRecv::Stack => {
                 // drop the receiver (strong was > 1: decrement, no free), overwrite in place
                 a.ldur(14, 10, strong);
                 a.sub_imm(14, 14, 1);
                 a.stur(14, 10, strong);
-                a.sturb(9, 20, -16);
+                emit_exec_word_store(a, 9, 20, -8);
             }
             PropRecv::This | PropRecv::Slot(_) => {
-                a.strb_imm(9, 20, 0);
-                a.add_imm(20, 20, 16);
+                emit_exec_word_store(a, 9, 20, 0);
+                a.add_imm(20, 20, 8);
             }
         }
+        #[cfg(test)]
+        regions::emit_property_event(a, 1);
         a.b(done);
     }
     a.bind(slow);
+    #[cfg(test)]
+    regions::emit_property_event(a, 2);
     emit_op_helper(a, H_GET_PROP, pc, l_unwind);
     a.bind(done);
 }
@@ -5853,20 +5761,20 @@ fn emit_computed_method_inline(
     let exotic = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
     let object_data = layout.obj_from_rc as u32;
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 6); // only an already-string key
-    a.b_cond(C_NE, slow);
-    a.ldur(8, 20, -8); // LStr allocation identity, pinned by a matching cache way
-    a.ldurb(9, 20, -32);
-    a.cmp_imm_w(9, 8);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 11, slow);
+    emit_exec_payload(a, 9, 8); // LStr identity, pinned by a matching cache way
+    emit_exec_word_load(a, 9, 20, -16);
+    a.lsr_imm(11, 9, 48);
+    a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
+    a.cmp_reg_w(11, 12);
     a.b_cond(C_EQ, object);
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_NE, slow);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 11, slow);
     a.ldr_imm(10, 19, 72);
     a.ldr_imm(10, 10, il.string_proto as u32); // active realm, never embedded prototype identity
     a.b(receiver);
     a.bind(object);
-    a.ldur(10, 20, -24);
+    emit_exec_payload(a, 9, 10);
     a.bind(receiver);
     a.add_imm(11, 10, object_data);
     a.ldr_w_imm(13, 11, shape);
@@ -5975,21 +5883,487 @@ fn emit_computed_method_inline(
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 9, 15, layout.entry_accessor as u32, slow);
-    emit_packed_entry_decode(a, layout, 15, slow);
+    a.ldur(12, 15, layout.entry_value as i32);
+    emit_exec_clone(a, layout, 12, 13, 16, slow);
     // A hit owns a cache pin of this exact LStr, so the operand cannot be its final owner.
     // Clone the result first (it may alias the key); preserve the original receiver for Call.
-    a.ldur(14, 20, -8);
+    emit_exec_word_load(a, 14, 20, -8);
+    emit_exec_payload(a, 14, 14);
     a.ldr_imm(16, 14, 0);
     a.sub_imm(16, 16, 1);
     a.str_imm(16, 14, 0);
-    a.stur(12, 20, -16);
-    a.stur(13, 20, -8);
+    emit_exec_word_store(a, 12, 20, -8);
     a.b(done);
     a.bind(slow);
     emit_op_helper(a, H_GET_METHOD_ELEM, pc, l_unwind);
     a.bind(done);
 }
 
+/// Shared call-site lowering for canonical code and optimized CFG regions. A region
+/// must not replace a warmed direct call/inline intrinsic with a generic Rust dispatch.
+/// Both entries own canonical operands and use the same guarded IC and unwind contract.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_call_inline(
+    a: &mut asm::Asm,
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    pc: usize,
+    fast: u32,
+    array_intrinsics_on: bool,
+    function_call_intrinsic_on: bool,
+    l_unwind: usize,
+    l_direct_finish: usize,
+) {
+    use crate::bytecode::Op;
+    let ops = chunk.jit_ops();
+    let op = &ops[pc];
+    let (Op::Call(argc, c) | Op::CallWithThis(argc, c)) = op else {
+        unreachable!("call emitter requires a call opcode");
+    };
+    let rc_ok = layout.valid && layout.rc_strong_off < 256;
+    let direct_on = fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled();
+    let inline_probe = fast & 524288 != 0;
+    let slow = a.new_label();
+    let done = a.new_label();
+    if inline_probe {
+        let depth = *argc as u32 + 1; // callee sits under the args
+        let off = depth as i32 * -8;
+        if depth <= 65 {
+            let ic0 = chunk.jit_call_cache_ptr(*c);
+            if off >= -256 {
+                emit_exec_word_load(a, 9, 20, off);
+            } else {
+                a.sub_imm(9, 20, depth * 8);
+                a.ldr_imm(9, 9, 0);
+            }
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
+            emit_exec_payload(a, 9, 10); // callee payload (stored Rc ptr)
+                                         // the payload is the STORED RcBox pointer; as_ptr sits one probed
+                                         // header further (comparing them raw was a silent 100% miss)
+            a.add_imm(13, 10, layout.gc_data_off as u32);
+            // Probe ALL 4 ways (a stable polymorphic site — e.g. one dispatch
+            // loop over a handful of receiver classes — otherwise pays the full
+            // helper on every call that isn't way 1): x12 = entry cursor,
+            // w14 = ways left, w15 = live epoch, x17 = ctx.genv.
+            a.mov_imm64(12, ic0 as u64);
+            a.mov_imm64(11, &crate::bytecode::CALL_IC_EPOCH as *const _ as u64);
+            a.ldr_w_imm(15, 11, 0);
+            // LDR W15 zero-extends the u32 epoch: use W arithmetic, preserve X15.
+            a.cmn_imm_w(15, 1);
+            a.b_cond(C_EQ, slow); // exhausted generations are never raw-cache proofs
+            a.ldr_imm(17, 19, 64); // ctx.genv
+            a.movz(14, crate::bytecode::CALL_IC_WAYS as u32, 0);
+            let l_probe = a.new_label();
+            let l_next = a.new_label();
+            let l_hit = a.new_label();
+            let l_primary_hit = a.new_label();
+            a.bind(l_probe);
+            a.ldur(11, 12, 0); // ic.callee (an Rc::as_ptr identity)
+            a.cmp_reg_x(13, 11);
+            a.b_cond(C_NE, l_next);
+            a.ldr_w_imm(11, 12, 56); // ic.epoch
+            a.cmp_reg_w(11, 15);
+            a.b_cond(C_NE, l_next);
+            a.ldr_imm(11, 12, 32); // ic.global_env
+            a.cmp_reg_x(11, 17);
+            a.b_cond(C_EQ, l_primary_hit);
+            a.bind(l_next);
+            // entry stride (size compile-asserted below the JitCtx asserts)
+            let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
+            a.add_imm(12, 12, stride as u32);
+            a.sub_imm(14, 14, 1);
+            a.cbnz(14, false, l_probe);
+            emit_call_overflow_probe(a, ilayout, l_hit, slow);
+            // x15 = the hit way (ways-left counter → index), kept live through
+            // the direct sequence's NO-MUTATION gate checks (they never touch
+            // x15; every route into hit_slow happens before any blr).
+            a.bind(l_primary_hit);
+            a.movz(15, crate::bytecode::CALL_IC_WAYS as u32, 0);
+            a.sub_reg(15, 15, 14);
+            a.bind(l_hit);
+            let with_this = matches!(op, Op::CallWithThis(..));
+            let hit_slow = a.new_label();
+            // Inline intrinsics: a native entry the template can finish without
+            // leaving machine code. charCodeAt on a known-ASCII receiver with an
+            // exact in-bounds u32 index is a byte load — meriyah-style scanners
+            // make millions of these per parse. Any miss (intrinsic id, receiver
+            // tag/hint, index shape, bounds, last-reference operands) takes the
+            // H_CALL_HIT form, whose Rust side handles native entries generally.
+            if with_this && *argc == 1 && rc_ok && layout.rc_strong_off == 0 {
+                let char_at = a.new_label();
+                let char_code = a.new_label();
+                let sqrt = a.new_label();
+                let regexp_exec = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
+                let string_split = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
+                let array_push = array_intrinsics_on.then(|| a.new_label());
+                let no_intr = a.new_label();
+                a.ldrb_imm(9, 12, 96); // ic.intrinsic (offset compile-asserted)
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_AT as u32);
+                a.b_cond(C_EQ, char_at);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32);
+                a.b_cond(C_EQ, char_code);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
+                a.b_cond(C_EQ, sqrt);
+                if let Some(array_push) = array_push {
+                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32);
+                    a.b_cond(C_EQ, array_push);
+                }
+                if let Some(regexp_exec) = regexp_exec {
+                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32);
+                    a.b_cond(C_EQ, regexp_exec);
+                }
+                if let Some(string_split) = string_split {
+                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32);
+                    a.b_cond(C_EQ, string_split);
+                }
+                a.b(no_intr);
+
+                // String#charAt(number): exact builtin identity is already proven.
+                // The dedicated helper handles truncation, UTF-16 units, and the
+                // interned ASCII result while consuming the three operands directly.
+                a.bind(char_at);
+                emit_exec_word_load(a, 9, 20, -24);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_CHAR_AT as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+
+                a.bind(char_code);
+                // receiver: Str with the ASCII hint
+                emit_exec_word_load(a, 9, 20, -24);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                emit_exec_word_load(a, 11, 20, -24);
+                emit_exec_payload(a, 11, 11);
+                a.ldr_w_imm(14, 11, crate::lstr::CAP_OFF as u32);
+                a.lsr_imm(14, 14, 31);
+                a.cbz(14, false, hit_slow);
+                // index: exact u32 Num
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                a.ldur_d(0, 20, -8);
+                a.fcvtzu_w_d(9, 0);
+                a.ucvtf_d_w(1, 9);
+                a.fcmp(0, 1);
+                a.b_cond(C_NE, hit_slow);
+                // bounds (ASCII: byte index == unit index); OOB answers NaN in the
+                // helper
+                a.ldr_w_imm(14, 11, crate::lstr::LEN_OFF as u32);
+                a.cmp_reg_x(9, 14);
+                a.b_cond(C_HS, hit_slow);
+                // both refcounted operands must survive a bare dec
+                a.ldur(14, 11, 0);
+                a.cmp_imm_x(14, 1);
+                a.b_cond(C_LS, hit_slow);
+                a.ldur(13, 10, 0);
+                a.cmp_imm_x(13, 1);
+                a.b_cond(C_LS, hit_slow);
+                // ---- commit: byte load, decs, Num over the receiver slot ----
+                a.add_imm(16, 11, crate::lstr::DATA_OFF as u32);
+                a.ldrb_reg(16, 16, 9);
+                a.ucvtf_d_w(0, 16);
+                a.sub_imm(14, 14, 1);
+                a.stur(14, 11, 0);
+                a.sub_imm(13, 13, 1);
+                a.stur(13, 10, 0);
+                emit_exec_number_store(a, 0, 20, -24, 9);
+                a.sub_imm(20, 20, 16);
+                a.b(done);
+
+                // Math.sqrt(number): the call IC already proved builtin identity.
+                // The receiver is ignored semantically; require an object so it and
+                // the distinct function handle can be released by guarded decrements.
+                a.bind(sqrt);
+                emit_exec_word_load(a, 9, 20, -24);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                emit_exec_word_load(a, 11, 20, -24);
+                emit_exec_payload(a, 11, 11);
+                a.ldur(14, 11, 0);
+                a.cmp_imm_x(14, 1);
+                a.b_cond(C_LS, hit_slow);
+                a.ldur(13, 10, 0);
+                a.cmp_imm_x(13, 1);
+                a.b_cond(C_LS, hit_slow);
+                a.ldur_d(0, 20, -8);
+                a.fsqrt(0, 0);
+                a.sub_imm(14, 14, 1);
+                a.stur(14, 11, 0);
+                a.sub_imm(13, 13, 1);
+                a.stur(13, 10, 0);
+                emit_exec_number_store(a, 0, 20, -24, 9);
+                a.sub_imm(20, 20, 16);
+                a.b(done);
+
+                // Array#push(value): builtin identity is proven by the call IC. The
+                // helper moves `value` into dense storage after live array/prototype/
+                // length guards, and restores the operand before the exact builtin on
+                // any miss.
+                if let Some(array_push) = array_push {
+                    a.bind(array_push);
+                    emit_exec_word_load(a, 9, 20, -24);
+                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                    a.mov(0, 19);
+                    a.movz(1, pc as u32, 0);
+                    a.movk(1, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32, 1);
+                    a.mov(2, 20);
+                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                    a.blr(16);
+                    a.mov(20, 0);
+                    a.cbnz(1, false, l_unwind);
+                    a.b(done);
+                }
+
+                if let Some(regexp_exec) = regexp_exec {
+                    a.bind(regexp_exec);
+                    // Exact built-in identity is already proven by the call IC.
+                    // The helper additionally validates the ordinary RegExp object
+                    // and lastIndex shape before taking its allocation-free path.
+                    emit_exec_word_load(a, 9, 20, -24);
+                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                    emit_exec_word_load(a, 9, 20, -8);
+                    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                    a.mov(0, 19);
+                    a.movz(1, pc as u32, 0);
+                    a.movk(1, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32, 1);
+                    a.mov(2, 20);
+                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                    a.blr(16);
+                    a.mov(20, 0);
+                    a.cbnz(1, false, l_unwind);
+                    a.b(done);
+                }
+
+                if let Some(string_split) = string_split {
+                    a.bind(string_split);
+                    // The call IC proves String#split identity. The helper validates
+                    // the separator's complete RegExp protocol/species dependency
+                    // chain before eliding only the dead result allocations.
+                    emit_exec_word_load(a, 9, 20, -24);
+                    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                    emit_exec_word_load(a, 9, 20, -8);
+                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                    a.mov(0, 19);
+                    a.movz(1, pc as u32, 0);
+                    a.movk(1, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32, 1);
+                    a.mov(2, 20);
+                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                    a.blr(16);
+                    a.mov(20, 0);
+                    a.cbnz(1, false, l_unwind);
+                    a.b(done);
+                }
+
+                a.bind(no_intr);
+            }
+            if with_this && *argc == 0 && array_intrinsics_on {
+                let no_intr = a.new_label();
+                a.ldrb_imm(9, 12, 96);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_POP as u32);
+                a.b_cond(C_NE, no_intr);
+                emit_exec_word_load(a, 9, 20, -16);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_ARRAY_POP as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+                a.bind(no_intr);
+            }
+            if with_this && (1..=8).contains(argc) && function_call_intrinsic_on {
+                let no_intr = a.new_label();
+                a.ldrb_imm(9, 12, 96);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_CALL as u32);
+                a.b_cond(C_NE, no_intr);
+                let receiver_off = -((*argc as i32 + 2) * 8);
+                emit_exec_word_load(a, 9, 20, receiver_off);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(
+                    1,
+                    crate::bytecode::INTRINSIC_FUNCTION_CALL as u32 | ((*argc as u32) << 8),
+                    1,
+                );
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+                a.bind(no_intr);
+            }
+            if with_this && *argc == 2 {
+                let slice = a.new_label();
+                let has_own = a.new_label();
+                let apply = a.new_label();
+                let replace = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
+                let no_intr = a.new_label();
+                a.ldrb_imm(9, 12, 96);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
+                a.b_cond(C_EQ, slice);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32);
+                a.b_cond(C_EQ, has_own);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32);
+                a.b_cond(C_EQ, apply);
+                if let Some(replace) = replace {
+                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32);
+                    a.b_cond(C_EQ, replace);
+                }
+                a.b(no_intr);
+
+                // ASCII String#slice(start, end), both bounds already Numbers: no
+                // user code or exotic conversion can run in the dedicated helper.
+                a.bind(slice);
+                emit_exec_word_load(a, 9, 20, -32);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                emit_exec_word_load(a, 11, 20, -32);
+                emit_exec_payload(a, 11, 11);
+                a.ldr_w_imm(9, 11, crate::lstr::CAP_OFF as u32);
+                a.lsr_imm(9, 9, 31);
+                a.cbz(9, false, hit_slow);
+                for off in [-16i32, -8] {
+                    emit_exec_word_load(a, 9, 20, off);
+                    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                }
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_STRING_SLICE as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+
+                // Object.hasOwn(obj, string): the named intrinsic's implementation
+                // is exactly an own-map lookup for this non-coercing argument shape.
+                a.bind(has_own);
+                emit_exec_word_load(a, 9, 20, -16);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+
+                // Function#apply(targetThis, arguments): builtin identity is already
+                // proven. Restrict the intrinsic helper to an object target and
+                // object list; it performs the ordinary/unmapped/dense guards before
+                // moving entries directly into a compiled target frame.
+                a.bind(apply);
+                emit_exec_word_load(a, 9, 20, -32);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+
+                if let Some(replace) = replace {
+                    a.bind(replace);
+                    for (off, tag) in [
+                        (-32i32, crate::value::PACK_STR),
+                        (-16, crate::value::PACK_OBJ),
+                        (-8, crate::value::PACK_STR),
+                    ] {
+                        emit_exec_word_load(a, 9, 20, off);
+                        emit_exec_tag_guard(a, 9, tag, 16, hit_slow);
+                    }
+                    a.mov(0, 19);
+                    a.movz(1, pc as u32, 0);
+                    a.movk(
+                        1,
+                        crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32,
+                        1,
+                    );
+                    a.mov(2, 20);
+                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                    a.blr(16);
+                    a.mov(20, 0);
+                    a.cbnz(1, false, l_unwind);
+                    a.b(done);
+                }
+                a.bind(no_intr);
+            }
+            // Direct shared-ctx call: its own gate misses land on `hit_slow` =
+            // the H_CALL_HIT form below.
+            if direct_on {
+                let attempted_off = chunk.jit_inline_attempted_off();
+                emit_direct_call(
+                    a,
+                    ilayout,
+                    layout,
+                    attempted_off,
+                    chunk.jit_runs_off(),
+                    chunk.jit_inline_retry_at_off(),
+                    *argc as usize,
+                    with_this,
+                    hit_slow,
+                    slow,
+                    l_unwind,
+                    done,
+                    l_direct_finish,
+                );
+            }
+            a.bind(hit_slow);
+            // Secondary ways are not indices into the caller's four primary
+            // entries. A non-direct/non-intrinsic secondary hit re-probes through
+            // the checked helper; it must never alias primary way zero.
+            a.cmp_imm_w(15, crate::bytecode::CALL_IC_WAYS as u32);
+            a.b_cond(C_HS, slow);
+            a.mov(0, 19);
+            // x1 = pc | way << 16 (pcs are < 65536: every helper call encodes
+            // the pc as one movz)
+            a.movz(1, pc as u32, 0);
+            a.add_shifted(1, 1, 15, 16);
+            a.mov(2, 20);
+            a.ldr_imm(16, 21, (H_CALL_HIT * 8) as u32);
+            a.blr(16);
+            a.mov(20, 0);
+            a.cbnz(1, false, l_unwind);
+            a.b(done);
+        }
+    }
+    a.bind(slow);
+    a.mov(0, 19);
+    a.movz(1, pc as u32, 0);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_CALL * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.bind(done);
+}
 /// Secondary identity probe. Inputs match the primary probe: x13 = live callee identity,
 /// w15 = epoch, x17 = realm, x10 = stored callee pointer. On hit x12 points at a CallIc and
 /// w15 is the non-primary sentinel. No calls, allocation, GC or observable state changes occur.
@@ -6067,13 +6441,15 @@ fn emit_direct_call(
     ilayout: &crate::interpreter::InterpLayout,
     // Stored-pointer → `Rc::as_ptr` header delta (`JitLayout::gc_data_off`): FnFrame.fn_ptr
     // records the as_ptr identity (FnFrame::callee reconstructs an Rc from it).
-    gc_data_off: usize,
+    layout: &crate::value::JitLayout,
     // Byte offset of `Chunk::inline_attempted` (computed by the caller from its own chunk —
     // same monomorphized layout as the callee's): the sequence requires the callee's one-shot
     // recompile to have happened (or been attempted), else it keeps taking H_CALL_HIT, which
     // is what bumps jit_runs toward the trigger. A landed code2 bumps the epoch and refills
     // the site with the new chunk anyway.
     attempted_off: usize,
+    runs_off: usize,
+    retry_off: usize,
     argc: usize,
     with_this: bool,
     hit_slow: usize,
@@ -6089,7 +6465,15 @@ fn emit_direct_call(
     // signed LDUR offsets from sp (which capped the old sequence at eight arguments). Keep a
     // generous code-size ceiling: argument moves are unrolled and real-world JS call sites are
     // overwhelmingly below 64.
-    if !ilayout.valid || argc > 64 || gc_data_off >= 4096 {
+    let gc_data_off = layout.gc_data_off;
+    if !ilayout.valid
+        || argc > 64
+        || gc_data_off >= 4096
+        || !layout.scope_parent_valid
+        || !layout.scope_parent.is_multiple_of(8)
+        || layout.scope_parent / 8 >= 4096
+        || layout.scope_data_off >= 4096
+    {
         return false;
     }
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
@@ -6129,6 +6513,7 @@ fn emit_direct_call(
     let cx_slots = offset_of!(JitCtx, slots) as u32;
     let cx_stack_base = offset_of!(JitCtx, stack_base) as u32;
     let cx_env_raw = offset_of!(JitCtx, env_raw) as u32;
+    let cx_env_parent_raw = offset_of!(JitCtx, env_parent_raw) as u32;
     let cx_chunk = offset_of!(JitCtx, chunk) as u32;
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
     let cx_code_base = offset_of!(JitCtx, code_base) as u32;
@@ -6145,7 +6530,7 @@ fn emit_direct_call(
 
     // ---- checks (entry state: x12 = ic0 ptr, x10 = callee stored Rc ptr; NO mutations) ----
     // direct bits 0 (no force resets) and 2 (recompile settled)
-    if attempted_off >= 4096 {
+    if attempted_off >= 4096 || !fits4(runs_off) || !fits4(retry_off) {
         return false;
     }
     a.ldurb(9, 12, IC_DIRECT);
@@ -6174,15 +6559,6 @@ fn emit_direct_call(
     a.ldrh_imm(9, 12, IC_NPARAMS);
     a.cmp_imm_w(9, argc as u32);
     a.b_cond(C_LO, hit_slow);
-    if PACKED_LOCAL_SLOTS {
-        // BigInt owns compound storage and is intentionally not NaN-boxed. Reject it before
-        // any direct-call state mutation; the layered path handles the move generically.
-        for k in 0..argc {
-            a.ldurb(9, 20, -((argc - k) as i32 * 16));
-            a.cmp_imm_w(9, 5);
-            a.b_cond(C_EQ, hit_slow);
-        }
-    }
     // this binding: a this-using SLOPPY callee needs boxing/global fallback unless the
     // incoming receiver is already an object.
     a.ldrb_imm(9, 12, IC_USES_THIS);
@@ -6191,14 +6567,20 @@ fn emit_direct_call(
     a.ldrb_imm(9, 12, IC_STRICT);
     a.cbnz(9, false, this_ok);
     if with_this {
-        a.sub_imm(9, 20, ((argc + 2) * 16) as u32);
-        a.ldrb_imm(9, 9, 0);
-        a.cmp_imm_w(9, 8);
-        a.b_cond(C_NE, hit_slow);
+        a.sub_imm(9, 20, ((argc + 2) * 8) as u32);
+        a.ldr_imm(9, 9, 0);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, hit_slow);
     } else {
         a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
     }
     a.bind(this_ok);
+    if with_this {
+        // Decode before committing any state. x0/x1 retain this moved wide pair until
+        // installation; the mutation sequence below touches only x3..x17.
+        a.sub_imm(3, 20, ((argc + 2) * 8) as u32);
+        a.ldr_imm(2, 3, 0);
+        emit_exec_decode_wide(a, 2, 0, 1, 3, 4, hit_slow);
+    }
     // Prefer shared callees; same-call binding deletion can still leave the final owner,
     // which the post-call cleanup passes intact to the full-drop helper.
     a.ldur(9, 10, strong);
@@ -6229,6 +6611,20 @@ fn emit_direct_call(
     a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
     a.cbz(7, true, hit_slow);
 
+    // Late feedback can make a previously empty inline plan useful. Count only direct
+    // entries with a pending retry; on the threshold call the helper owns the increment.
+    // This gate runs after every other fallback check, before committing any call state.
+    let retry_done = a.new_label();
+    a.ldur(4, 12, IC_CHUNK_RAW);
+    a.ldr_w_imm(5, 4, retry_off as u32);
+    a.cbz(5, false, retry_done);
+    a.ldr_w_imm(6, 4, runs_off as u32);
+    a.add_imm(6, 6, 1);
+    a.cmp_reg_w(6, 5);
+    a.b_cond(C_HS, hit_slow);
+    a.str_w_imm(6, 4, runs_off as u32);
+    a.bind(retry_done);
+
     // ---- mutations ----
     a.add_imm(11, 11, 1);
     a.str_w_imm(11, 14, il.depth as u32); // depth++ (u32 field)
@@ -6251,52 +6647,27 @@ fn emit_direct_call(
     a.str_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
     a.ldr_imm(5, 14, (il.frame_pool + il.fp_ptr_word) as u32);
     a.ldr_x_lsl3(9, 5, 7);
-    // Move the arguments off the wide caller operand stack. ARM64 callees consume packed local
-    // words; x64 retains the established wide frame ABI.
-    if PACKED_LOCAL_SLOTS {
-        a.mov(8, 9); // the encoder uses x9 for the wide discriminant
-        for k in 0..argc {
-            let off = -((argc - k) as i32 * 16);
-            emit_packed_stack_encode_all(a, off, hit_slow);
-            a.str_imm(16, 8, (k * 8) as u32);
-        }
-        a.mov(9, 8);
-    } else {
-        let bytes = argc * 16;
-        a.sub_imm(8, 20, bytes as u32);
-        for k in 0..argc {
-            a.ldr_imm(4, 8, (k * 16) as u32);
-            a.ldr_imm(5, 8, (k * 16 + 8) as u32);
-            a.str_imm(4, 9, (k * 16) as u32);
-            a.str_imm(5, 9, (k * 16 + 8) as u32);
-        }
+    // Move packed argument owners byte-for-byte; there is no conversion or possible miss.
+    a.sub_imm(8, 20, (argc * 8) as u32);
+    for k in 0..argc {
+        a.ldr_imm(4, 8, (k * 8) as u32);
+        a.str_imm(4, 9, (k * 8) as u32);
     }
-    // Initialize the remaining slots to Undefined.
-    a.ldrh_imm(5, 12, IC_NSLOTS); // w5 = n_slots (stays live for stack_base below)
+    // Initialize every remaining local to a complete packed Undefined word.
+    a.ldrh_imm(5, 12, IC_NSLOTS);
     a.movz(6, argc as u32, 0);
-    a.movz(4, if PACKED_LOCAL_SLOTS { 8 } else { 16 }, 0);
-    if PACKED_LOCAL_SLOTS {
-        a.mov_imm64(17, crate::value::PACK_UNDEFINED);
-    }
+    a.movz(4, 8, 0);
+    a.mov_imm64(17, crate::value::PACK_UNDEFINED);
     let init_loop = a.new_label();
     let init_done = a.new_label();
     a.bind(init_loop);
     a.cmp_reg_w(6, 5);
     a.b_cond(C_HS, init_done);
     a.madd(3, 6, 4, 9);
-    if PACKED_LOCAL_SLOTS {
-        a.stur(17, 3, 0);
-    } else {
-        a.sturb(31, 3, 0);
-    }
+    a.stur(17, 3, 0);
     a.add_imm(6, 6, 1);
     a.b(init_loop);
     a.bind(init_done);
-    if PACKED_LOCAL_SLOTS {
-        // The packed encoder uses x14 for tag prefixes; restore the Interp base used by the
-        // remainder of the frame swap.
-        a.ldr_imm(14, 19, 72);
-    }
 
     // ---- swap: save the caller's frame fields to an SP-carved area, install the callee's --
     a.sub_imm(31, 31, 128);
@@ -6304,10 +6675,10 @@ fn emit_direct_call(
     a.ldr_imm(4, 19, cx_slots);
     a.stur(4, 31, 0);
     a.str_imm(9, 19, cx_slots);
-    // stack_base = slots + n_slots*16
+    // stack_base = slots + n_slots*8
     a.ldr_imm(4, 19, cx_stack_base);
     a.stur(4, 31, 8);
-    a.movz(4, 16, 0);
+    a.movz(4, 8, 0);
     a.madd(3, 5, 4, 9);
     a.str_imm(3, 19, cx_stack_base);
     // env_raw
@@ -6315,6 +6686,15 @@ fn emit_direct_call(
     a.stur(4, 31, 16);
     a.ldur(4, 12, IC_ENV);
     a.str_imm(4, 19, cx_env_raw);
+    // Parent caches follow the callee's actual closure environment, not the caller's.
+    a.ldr_imm(6, 19, cx_env_parent_raw);
+    a.stur(6, 31, 112);
+    a.ldr_imm(6, 4, layout.scope_parent as u32);
+    let no_parent = a.new_label();
+    a.cbz(6, true, no_parent);
+    a.add_imm(6, 6, layout.scope_data_off as u32);
+    a.bind(no_parent);
+    a.str_imm(6, 19, cx_env_parent_raw);
     // chunk
     a.ldr_imm(4, 19, cx_chunk);
     a.stur(4, 31, 24);
@@ -6349,11 +6729,8 @@ fn emit_direct_call(
         // `this` — because the finish helper's `this_val = Undefined` is what consumes it
         // (skipping the caller-stack slot at cleanup without this move leaked the receiver
         // on every this-less method call; Splay OOM'd on exactly that).
-        a.sub_imm(3, 20, ((argc + 2) * 16) as u32);
-        a.ldr_imm(4, 3, 0);
-        a.ldr_imm(5, 3, 8);
-        a.str_imm(4, 19, cx_this);
-        a.str_imm(5, 19, cx_this + 8);
+        a.str_imm(0, 19, cx_this);
+        a.str_imm(1, 19, cx_this + 8);
     } else {
         a.strb_imm(31, 19, cx_this); // Undefined tag (payload stale; tag-only reads)
     }
@@ -6367,7 +6744,13 @@ fn emit_direct_call(
     a.stur(4, 31, 96);
     a.stur(5, 31, 104);
     let (target_base, target_offset) = byte_field_address(a, 14, il.new_target, 16);
-    a.strb_imm(31, target_base, target_offset); // Undefined tag
+    let lexical_target = a.new_label();
+    a.ldurb(4, 12, IC_DIRECT);
+    let lexical_bit = asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
+    a.logic_imm_w(0, 4, 4, lexical_bit);
+    a.cbnz(4, false, lexical_target);
+    a.strb_imm(31, target_base, target_offset); // ordinary calls clear new.target
+    a.bind(lexical_target); // arrows retain their lexical function environment's new.target
 
     // ---- run the callee on the shared ctx ----
     a.mov(0, 19);
@@ -6388,6 +6771,8 @@ fn emit_direct_call(
     a.str_imm(4, 19, cx_stack_base);
     a.ldur(4, 31, 16);
     a.str_imm(4, 19, cx_env_raw);
+    a.ldur(4, 31, 112);
+    a.str_imm(4, 19, cx_env_parent_raw);
     a.ldur(4, 31, 24);
     a.str_imm(4, 19, cx_chunk);
     a.ldur(4, 31, 32);
@@ -6413,22 +6798,36 @@ fn emit_direct_call(
 
     // ---- pop the callee (and skip the consumed this slot); dispatch on threw ----
     emit_direct_callee_drop(a, argc);
-    let popped = ((argc + 1 + with_this as usize) * 16) as u32;
+    let popped = ((argc + 1 + with_this as usize) * 8) as u32;
     a.sub_imm(20, 20, popped);
     a.cbnz(8, true, l_unwind); // threw → caller unwind (fields restored)
-                               // push ctx.ret (move: reset its tag to Undefined)
+                               // Move the complete owned word; no decode/encode or reference-count change.
     a.ldr_imm(4, 19, cx_ret);
-    a.ldr_imm(5, 19, cx_ret + 8);
     a.stur(4, 20, 0);
-    a.stur(5, 20, 8);
-    a.strb_imm(31, 19, cx_ret);
-    a.add_imm(20, 20, 16);
+    a.mov_imm64(5, crate::value::PACK_UNDEFINED);
+    a.str_imm(5, 19, cx_ret);
+    a.add_imm(20, 20, 8);
+    #[cfg(test)]
+    {
+        a.mov_imm64(16, record_direct_packed_return as *const () as u64);
+        a.blr(16);
+    }
     a.b(done);
     a.bind(gc_due);
     a.movz(13, crate::interpreter::GC_CALL_POLL_MASK, 0);
     a.str_w_imm(13, 14, il.gc_tick as u32);
     a.b(gc_slow);
     true
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+thread_local! {
+    static TEST_DIRECT_PACKED_RETURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+extern "C" fn record_direct_packed_return() {
+    TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(count.get() + 1));
 }
 
 /// Release the caller's callee operand after restoring its activation. w8 carries the
@@ -6439,8 +6838,9 @@ fn emit_direct_call(
 ))]
 fn emit_direct_callee_drop(a: &mut asm::Asm, argc: usize) {
     let strong = 0i32;
-    a.sub_imm(3, 20, ((argc + 1) * 16) as u32);
-    a.ldr_imm(5, 3, 8);
+    a.sub_imm(3, 20, ((argc + 1) * 8) as u32);
+    a.ldr_imm(5, 3, 0);
+    emit_exec_payload(a, 5, 5);
     a.ldur(6, 5, strong);
     let last_owner = a.new_label();
     let done = a.new_label();
@@ -6455,9 +6855,9 @@ fn emit_direct_callee_drop(a: &mut asm::Asm, argc: usize) {
     a.stp_pre(8, 31, -16);
     a.mov(0, 19);
     a.movz(1, 0, 0);
-    a.mov_imm64(6, (argc as u64 + 1) * 16);
+    a.mov_imm64(6, (argc as u64 + 1) * 8);
     a.sub_reg(2, 20, 6);
-    a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
+    a.ldr_imm(16, 21, (H_DROP_PACKED_AT * 8) as u32);
     a.blr(16);
     a.ldp_post(8, 31, 16);
     a.bind(done);
@@ -6483,11 +6883,11 @@ fn emit_live_objects_load(a: &mut asm::Asm, cx_live_objects: u32) {
 mod direct_call_tests {
     #[test]
     fn computed_method_native_probe_reads_live_values_and_preserves_owners() {
-        use crate::value::{Object, Property, Value};
+        use crate::value::{Object, PackedValue, Property, Value};
         unsafe extern "C" fn miss(
             ctx: *mut super::JitCtx,
             _pc: u32,
-            sp: *mut Value,
+            sp: *mut PackedValue,
         ) -> super::SpFlag {
             unsafe {
                 *ctx.cast::<usize>() += 1;
@@ -6519,8 +6919,11 @@ mod direct_call_tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         let code = super::ExecutableBuffer::from_bytes(&bytes).unwrap();
-        let entry: unsafe extern "C" fn(*mut usize, *mut Value, *const usize) -> *mut Value =
-            unsafe { std::mem::transmute(code.as_ptr()) };
+        let entry: unsafe extern "C" fn(
+            *mut usize,
+            *mut PackedValue,
+            *const usize,
+        ) -> *mut PackedValue = unsafe { std::mem::transmute(code.as_ptr()) };
         let mut helpers = [0usize; super::N_HELPERS];
         helpers[super::H_GET_METHOD_ELEM] = miss as *const () as usize;
         // Only the activation-relative Interp pointer is read on this no-call hit path.
@@ -6551,14 +6954,17 @@ mod direct_call_tests {
                     .unwrap()
                     .set_value(value.clone());
                 let owners = key.strong_count();
-                let mut operands = [receiver.clone(), Value::Str(key.clone())];
+                let mut operands = [
+                    PackedValue::pack(receiver.clone()),
+                    PackedValue::pack(Value::Str(key.clone())),
+                ];
                 let end = unsafe { operands.as_mut_ptr().add(2) };
                 assert_eq!(
                     unsafe { entry(ctx.as_mut_ptr(), end, helpers.as_ptr()) },
                     end
                 );
                 assert_eq!(ctx[0], 0, "expected a native cache hit, depth {depth}");
-                match (&operands[1], &value) {
+                match (&operands[1].unpack(), &value) {
                     (Value::Num(a), Value::Num(b)) => assert_eq!(a, b),
                     (Value::Str(a), Value::Str(b)) => assert!(crate::lstr::LStr::ptr_eq(a, b)),
                     (Value::Obj(a), Value::Obj(b)) => assert!(std::rc::Rc::ptr_eq(a, b)),
@@ -6579,7 +6985,10 @@ mod direct_call_tests {
                 .set_value(Value::Num(31.0));
             // Same string contents at a different allocation must miss the identity probe.
             let fresh = crate::lstr::LStr::from(key.as_str());
-            let mut operands = [receiver, Value::Str(fresh)];
+            let mut operands = [
+                PackedValue::pack(receiver),
+                PackedValue::pack(Value::Str(fresh)),
+            ];
             unsafe {
                 entry(
                     ctx.as_mut_ptr(),
@@ -6616,7 +7025,10 @@ mod direct_call_tests {
                 .computed_reads
                 .lookup(key.as_ptr() as usize, shape)
                 .is_some();
-            let mut operands = [receiver.clone(), Value::Str(key.clone())];
+            let mut operands = [
+                PackedValue::pack(receiver.clone()),
+                PackedValue::pack(Value::Str(key.clone())),
+            ];
             let end = unsafe { operands.as_mut_ptr().add(2) };
             assert_eq!(
                 unsafe { entry(ctx.as_mut_ptr(), end, helpers.as_ptr()) },
@@ -6628,13 +7040,16 @@ mod direct_call_tests {
                 "native/Rust probe disagreement after growth"
             );
             if cached {
-                assert!(matches!(operands[1], Value::Num(value) if value == n as f64));
+                assert!(matches!(operands[1].unpack(), Value::Num(value) if value == n as f64));
             }
             ctx[0] = 0;
         }
         for (n, key) in keys.iter().enumerate().take(256) {
             assert!(engine.interp.get_computed_property(&receiver, key).is_ok());
-            let mut operands = [receiver.clone(), Value::Str(key.clone())];
+            let mut operands = [
+                PackedValue::pack(receiver.clone()),
+                PackedValue::pack(Value::Str(key.clone())),
+            ];
             unsafe {
                 entry(
                     ctx.as_mut_ptr(),
@@ -6643,7 +7058,7 @@ mod direct_call_tests {
                 );
             }
             assert_eq!(ctx[0], 0, "a refilled key must hit the grown table");
-            assert!(matches!(operands[1], Value::Num(value) if value == n as f64));
+            assert!(matches!(operands[1].unpack(), Value::Num(value) if value == n as f64));
         }
     }
 
@@ -6660,15 +7075,17 @@ mod direct_call_tests {
         // Model only the helper ABI and ownership contract, without constructing an invalid
         // Rust Rc if the generated caller erroneously decrements the count to zero first.
         let mut dropper = super::asm::Asm::new();
-        dropper.ldr_imm(3, 2, 8); // fake Value's stored allocation pointer
+        dropper.ldr_imm(3, 2, 0); // fake packed object's allocation pointer
+        dropper.lsl_imm(3, 3, 16);
+        dropper.lsr_imm(3, 3, 16);
         dropper.ldr_imm(4, 3, 0);
         dropper.str_imm(4, 3, 8); // record the count seen by the full-drop helper
         dropper.str_imm(31, 3, 0); // model destroying the last owner
         dropper.movz(8, 73, 0); // w8 is caller-saved across a C helper
         dropper.ret();
         let dropper = executable(dropper);
-        let mut helpers = [0usize; super::H_DROP_AT + 1];
-        helpers[super::H_DROP_AT] = dropper.as_ptr() as usize;
+        let mut helpers = [0usize; super::N_HELPERS];
+        helpers[super::H_DROP_PACKED_AT] = dropper.as_ptr() as usize;
         for argc in [0usize, 1, 8, 64] {
             let mut asm = super::asm::Asm::new();
             asm.stp_pre(29, 30, -16);
@@ -6689,9 +7106,9 @@ mod direct_call_tests {
             for count in [1usize, 3] {
                 for completion in [0usize, 1] {
                     let mut allocation = [count, usize::MAX];
-                    let mut operands = vec![0usize; (argc + 1) * 2];
-                    operands[0] = 8; // wide Obj tag
-                    operands[1] = allocation.as_mut_ptr() as usize;
+                    let mut operands = vec![crate::value::PACK_UNDEFINED as usize; argc + 1];
+                    operands[0] =
+                        crate::value::PACK_OBJ as usize | allocation.as_mut_ptr() as usize;
                     let result = unsafe {
                         entry(
                             operands.as_ptr().add(operands.len()),
@@ -6785,6 +7202,7 @@ mod direct_call_tests {
     fn direct_call_sequence_is_emitted_for_the_live_interpreter_layout() {
         let mut engine = crate::Engine::new();
         let layout = crate::interpreter::interp_layout(&mut engine.interp);
+        let value_layout = crate::value::jit_layout(&engine.interp.object_proto);
         let mut asm = super::asm::Asm::new();
         let hit_slow = asm.new_label();
         let gc_slow = asm.new_label();
@@ -6794,7 +7212,9 @@ mod direct_call_tests {
         let attempted = std::mem::offset_of!(crate::bytecode::Chunk, inline_attempted);
         assert!(
             super::emit_direct_call(
-                &mut asm, &layout, 0, attempted, 1, false,
+                &mut asm, &layout, &value_layout, attempted,
+                std::mem::offset_of!(crate::bytecode::Chunk, jit_runs),
+                std::mem::offset_of!(crate::bytecode::Chunk, inline_retry_at), 1, false,
                 hit_slow, gc_slow, unwind, done, finish,
             ),
             "direct calls silently disabled: valid={}, depth={}, direct_depth={}, gc_tick={}, gc_next={}, coro={}, constructing={}, new_target={}, frames={}, pool={}, attempted={}",
@@ -6869,7 +7289,50 @@ fn local_store_pair(ops: &[crate::bytecode::Op], pc: usize, targeted: &[bool]) -
         (Op::StoreLocal(stored), Op::LoadLocal(loaded)) if stored == loaded => *stored,
         _ => return None,
     };
-    ((slot as u32) * 16 + 16 < 4096).then_some(slot)
+    ((slot as u32) * 8 + 8 < 4096).then_some(slot)
+}
+
+/// Canonical local update shared by baseline and general-region checked effects. The Number
+/// path has no ownership changes; every coercing kind keeps the authoritative opcode helper.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_update_local(
+    a: &mut asm::Asm,
+    slot: u16,
+    kind: crate::bytecode::UpdKind,
+    pc: u32,
+    unwind: usize,
+) {
+    use crate::bytecode::UpdKind;
+    let off = slot as i32 * 8;
+    let slow = a.new_label();
+    let done = a.new_label();
+    emit_exec_word_load(a, 9, 22, off);
+    emit_exec_number_guard(a, 9, 0, 10, slow);
+    a.fmov_one(1);
+    let dec = matches!(
+        kind,
+        UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
+    );
+    a.f_arith(if dec { 1 } else { 0 }, 2, 0, 1);
+    emit_exec_number_store(a, 2, 22, off, 10);
+    match kind {
+        UpdKind::PreInc | UpdKind::PreDec => {
+            emit_exec_number_store(a, 2, 20, 0, 10);
+            a.add_imm(20, 20, 8);
+        }
+        UpdKind::PostInc | UpdKind::PostDec => {
+            emit_exec_number_store(a, 0, 20, 0, 10);
+            a.add_imm(20, 20, 8);
+        }
+        UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+    }
+    a.b(done);
+    a.bind(slow);
+    emit_exec(a, pc, unwind);
+    a.bind(done);
 }
 
 #[cfg(all(
@@ -6886,7 +7349,7 @@ fn local_read_discard_pair(
         return None;
     }
     match (ops.get(pc)?, ops.get(pc + 1)?) {
-        (Op::LoadLocal(slot), Op::Pop) if (*slot as u32) * 16 + 16 < 4096 => Some(*slot),
+        (Op::LoadLocal(slot), Op::Pop) if (*slot as u32) * 8 + 8 < 4096 => Some(*slot),
         _ => None,
     }
 }
@@ -6897,8 +7360,9 @@ fn local_read_discard_pair(
 ))]
 fn emit_discard_local_read(a: &mut asm::Asm, off: u32, pc: u32, l_unwind: usize) {
     let done = a.new_label();
-    a.ldrb_imm(9, 22, off);
-    a.cmp_imm_w(9, 1);
+    a.ldr_imm(9, 22, off);
+    a.mov_imm64(10, crate::value::PACK_EMPTY);
+    a.cmp_reg_x(9, 10);
     a.b_cond(C_NE, done);
     emit_exec(a, pc, l_unwind);
     emit_exec(a, pc + 1, l_unwind);
@@ -6921,60 +7385,45 @@ fn emit_store_local(
     keep: bool,
     rc_ok: bool,
 ) {
-    let strong = layout.rc_strong_off as i32;
     let slow = a.new_label();
     let done = a.new_label();
     if keep {
         // A second owned copy needs BigInt's checked clone path. Empty must also
         // replay the original sequence so StoreLocal/LoadLocal retains its TDZ error.
-        a.ldurb(9, 20, -16);
-        a.cmp_imm_w(9, 1);
+        a.ldur(9, 20, -8);
+        emit_exec_kind(a, 9, 10, 11, slow);
+        a.cmp_imm_w(10, 1);
         a.b_cond(C_EQ, slow);
-        a.cmp_imm_w(9, if rc_ok { 5 } else { 4 });
+        a.cmp_imm_w(10, if rc_ok { 5 } else { 4 });
         a.b_cond(if rc_ok { C_EQ } else { C_HI }, slow);
     }
-    a.ldrb_imm(9, 22, off);
+    a.ldr_imm(9, 22, off);
     if rc_ok {
         let drop_old = a.new_label();
         let mv = a.new_label();
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, drop_old);
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, mv);
-        a.ldr_imm(10, 22, off + 8);
-        a.ldur(9, 10, strong);
-        a.cmp_imm_x(9, 1);
-        a.b_cond(C_LS, drop_old);
-        a.sub_imm(9, 9, 1);
-        a.stur(9, 10, strong);
+        emit_exec_drop_shared(a, layout, 9, 10, 11, drop_old);
         a.b(mv);
         a.bind(drop_old);
         a.mov(0, 19);
         a.movz(1, 0, 0);
         a.add_imm(2, 22, off);
-        a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
+        a.ldr_imm(16, 21, (H_DROP_PACKED_AT * 8) as u32);
         a.blr(16);
         a.bind(mv);
     } else {
-        a.cmp_imm_w(9, 4);
+        emit_exec_kind(a, 9, 10, 11, slow);
+        a.cmp_imm_w(10, 4);
         a.b_cond(C_HI, slow);
     }
-    a.ldur(9, 20, -16);
-    a.ldur(10, 20, -8);
+    a.ldur(9, 20, -8);
     if keep && rc_ok {
-        let no_clone = a.new_label();
-        a.ldurb(11, 20, -16);
-        a.cmp_imm_w(11, 6);
-        a.b_cond(C_LO, no_clone);
-        a.ldur(11, 10, strong);
-        a.add_imm(11, 11, 1);
-        a.stur(11, 10, strong);
-        a.bind(no_clone);
+        // The pre-mutation kind guard excludes BigInt/Empty. Non-JavaScript
+        // destruction of the previous slot cannot change the rooted stack word.
+        emit_exec_clone(a, layout, 9, 10, 11, slow);
     }
     a.str_imm(9, 22, off);
-    a.str_imm(10, 22, off + 8);
     if !keep {
-        a.sub_imm(20, 20, 16);
+        a.sub_imm(20, 20, 8);
     }
     a.b(done);
     a.bind(slow);
@@ -7100,13 +7549,13 @@ fn emit_direct_finish_stub(
         // that). Bare dec when shared; H_DROP_AT (full drop, may cascade) for a last reference
         // or a BigInt. Only x9 (cursor) and x5 (remaining) survive the helper: spilled around
         // the call, everything else re-read afterwards.
-        let drop_at = |a: &mut asm::Asm, value_reg: u32| {
+        let drop_at = |a: &mut asm::Asm, value_reg: u32, helper: usize| {
             // x<value_reg> = address of the Value to drop; clobbers x0-x17 minus the spills.
             a.stp_pre(9, 5, -16);
             a.mov(2, value_reg);
             a.mov(0, 19);
             a.movz(1, 0, 0);
-            a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
+            a.ldr_imm(16, 21, (helper * 8) as u32);
             a.blr(16);
             a.ldp_post(9, 5, 16);
         };
@@ -7126,7 +7575,7 @@ fn emit_direct_finish_stub(
         a.b(this_done);
         a.bind(this_drop);
         a.add_imm(9, 19, cx_this);
-        drop_at(a, 9);
+        drop_at(a, 9, H_DROP_AT);
         a.bind(this_done);
         // slots
         let c_loop = a.new_label();
@@ -7137,33 +7586,27 @@ fn emit_direct_finish_stub(
         a.ldr_imm(5, 19, cx_n_slots);
         a.bind(c_loop);
         a.cbz(5, true, c_done);
-        if PACKED_LOCAL_SLOTS {
-            a.ldur(11, 9, 0);
-            a.lsr_imm(13, 11, 48);
-            a.movz(12, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+        a.ldur(11, 9, 0);
+        a.lsr_imm(13, 11, 48);
+        a.movz(12, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+        a.cmp_reg_x(13, 12);
+        a.b_cond(C_EQ, c_drop);
+        let packed_ref = a.new_label();
+        for tag in [
+            crate::value::PACK_STR,
+            crate::value::PACK_SYM,
+            crate::value::PACK_OBJ,
+        ] {
+            a.movz(12, (tag >> 48) as u32, 0);
             a.cmp_reg_x(13, 12);
-            a.b_cond(C_EQ, c_drop);
-            let packed_ref = a.new_label();
-            for tag in [
-                crate::value::PACK_STR,
-                crate::value::PACK_SYM,
-                crate::value::PACK_OBJ,
-            ] {
-                a.movz(12, (tag >> 48) as u32, 0);
-                a.cmp_reg_x(13, 12);
-                a.b_cond(C_EQ, packed_ref);
-            }
-            a.b(c_next);
-            a.bind(packed_ref);
-            a.lsl_imm(12, 11, 16);
-            a.lsr_imm(12, 12, 16);
-        } else {
-            a.ldrb_imm(11, 9, 0);
-            a.cmp_imm_w(11, 5);
-            a.b_cond(C_LO, c_next);
-            a.b_cond(C_EQ, c_drop); // BigInt
-            a.ldr_imm(12, 9, 8);
+            a.b_cond(C_EQ, packed_ref);
         }
+        a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
+        a.cmp_reg_x(13, 12);
+        a.b_cond(C_HI, c_drop); // unknown/property-only tags never get scalar treatment
+        a.b(c_next);
+        a.bind(packed_ref);
+        emit_exec_payload(a, 11, 12);
         a.ldur(13, 12, 0);
         a.cmp_imm_x(13, 1);
         a.b_cond(C_LS, c_drop); // last reference
@@ -7171,9 +7614,9 @@ fn emit_direct_finish_stub(
         a.stur(13, 12, 0);
         a.b(c_next);
         a.bind(c_drop);
-        drop_at(a, 9);
+        drop_at(a, 9, H_DROP_PACKED_AT);
         a.bind(c_next);
-        a.add_imm(9, 9, if PACKED_LOCAL_SLOTS { 8 } else { 16 });
+        a.add_imm(9, 9, 8);
         a.sub_imm(5, 5, 1);
         a.b(c_loop);
         a.bind(c_done);
@@ -7278,10 +7721,9 @@ fn emit_update_prop_inline(
     let slow = a.new_label();
     let done = a.new_label();
     // 1. stack: [obj @ -16] — receiver must be an Obj with refcount > 1
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, slow);
-    a.ldur(10, 20, -8);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    emit_exec_payload(a, 9, 10);
     a.ldur(9, 10, strong);
     a.cmp_imm_x(9, 1);
     a.b_cond(C_LS, slow);
@@ -7320,7 +7762,7 @@ fn emit_update_prop_inline(
         let number = a.new_label();
         a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
         a.cmp_reg_x(9, 14);
-        a.b_cond(C_EQ, slow);
+        a.b_cond(C_HS, slow);
         a.movz(14, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
         a.cmp_reg_x(9, 14);
         a.b_cond(C_LO, number);
@@ -7349,15 +7791,11 @@ fn emit_update_prop_inline(
         UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
     );
     a.f_arith(if dec { 1 } else { 0 }, 2, 0, 1);
-    a.stur_d(
-        2,
-        15,
-        if layout.entry_accessor == layout.entry_value + 8 {
-            ev
-        } else {
-            ev + 8
-        },
-    );
+    if layout.entry_accessor == layout.entry_value + 8 {
+        emit_exec_number_store(a, 2, 15, ev, 16);
+    } else {
+        a.stur_d(2, 15, ev + 8);
+    }
     // drop the receiver (strong was > 1)
     a.ldur(9, 10, strong);
     a.sub_imm(9, 9, 1);
@@ -7365,17 +7803,13 @@ fn emit_update_prop_inline(
     // result per kind: Pre* push the new value, Post* the old, *Discard nothing.
     match kind {
         UpdKind::PreInc | UpdKind::PreDec => {
-            a.movz(9, 4, 0);
-            a.stur(9, 20, -16);
-            a.stur_d(2, 20, -8);
+            emit_exec_number_store(a, 2, 20, -8, 9);
         }
         UpdKind::PostInc | UpdKind::PostDec => {
-            a.movz(9, 4, 0);
-            a.stur(9, 20, -16);
-            a.stur_d(0, 20, -8);
+            emit_exec_number_store(a, 0, 20, -8, 9);
         }
         UpdKind::IncDiscard | UpdKind::DecDiscard => {
-            a.sub_imm(20, 20, 16);
+            a.sub_imm(20, 20, 8);
         }
     }
     a.b(done);
@@ -7431,8 +7865,10 @@ fn emit_local_eq_branch(
 
     // w9/w10 are the borrowed Value tags. Empty is a TDZ sentinel, so it must retain the
     // checked LoadLocal path and its precise ReferenceError.
-    a.ldrb_imm(9, 22, lhs_off);
-    a.ldrb_imm(10, 22, rhs_off);
+    emit_exec_word_load(a, 12, 22, lhs_off as i32);
+    emit_exec_word_load(a, 13, 22, rhs_off as i32);
+    emit_exec_kind(a, 12, 9, 14, slow);
+    emit_exec_kind(a, 13, 10, 14, slow);
     a.cmp_imm_w(9, 1);
     a.b_cond(C_EQ, slow);
     a.cmp_imm_w(10, 1);
@@ -7467,8 +7903,8 @@ fn emit_local_eq_branch(
     let not_number = a.new_label();
     a.cmp_imm_w(9, 4);
     a.b_cond(C_NE, not_number);
-    a.ldr_d_imm(0, 22, lhs_off + 8);
-    a.ldr_d_imm(1, 22, rhs_off + 8);
+    a.ldr_d_imm(0, 22, lhs_off);
+    a.ldr_d_imm(1, 22, rhs_off);
     a.fcmp(0, 1);
     a.b_cond(C_EQ, equal);
     a.b(unequal);
@@ -7478,8 +7914,8 @@ fn emit_local_eq_branch(
     let not_bool = a.new_label();
     a.cmp_imm_w(9, 3);
     a.b_cond(C_NE, not_bool);
-    a.ldrb_imm(12, 22, lhs_off + 1);
-    a.ldrb_imm(13, 22, rhs_off + 1);
+    a.ldrb_imm(12, 22, lhs_off);
+    a.ldrb_imm(13, 22, rhs_off);
     a.cmp_reg_w(12, 13);
     a.b_cond(C_EQ, equal);
     a.b(unequal);
@@ -7519,7 +7955,8 @@ fn emit_local_eq_branch(
         a.bind(lhs_null_cmp);
         // The sole object/nullish exception is [[IsHTMLDDA]]. `ic_plain` false sends it back to
         // the helper; an ordinary object is definitively unequal to nullish.
-        a.ldr_imm(12, 22, lhs_off + 8);
+        emit_exec_word_load(a, 12, 22, lhs_off as i32);
+        emit_exec_payload(a, 12, 12);
         a.add_imm(12, 12, layout.obj_from_rc as u32);
         a.ldrb_imm(12, 12, layout.obj_ic_plain as u32);
         a.cbz(12, false, slow);
@@ -7536,7 +7973,8 @@ fn emit_local_eq_branch(
         a.cmp_imm_w(9, 2);
         a.b_cond(C_NE, slow);
         a.bind(rhs_null_cmp);
-        a.ldr_imm(12, 22, rhs_off + 8);
+        emit_exec_word_load(a, 12, 22, rhs_off as i32);
+        emit_exec_payload(a, 12, 12);
         a.add_imm(12, 12, layout.obj_from_rc as u32);
         a.ldrb_imm(12, 12, layout.obj_ic_plain as u32);
         a.cbz(12, false, slow);
@@ -7544,8 +7982,10 @@ fn emit_local_eq_branch(
     }
 
     a.bind(both_obj);
-    a.ldr_imm(12, 22, lhs_off + 8);
-    a.ldr_imm(13, 22, rhs_off + 8);
+    emit_exec_word_load(a, 12, 22, lhs_off as i32);
+    emit_exec_payload(a, 12, 12);
+    emit_exec_word_load(a, 13, 22, rhs_off as i32);
+    emit_exec_payload(a, 13, 13);
     a.cmp_reg_x(12, 13);
     a.b_cond(C_EQ, equal);
     a.b(unequal);
@@ -7645,7 +8085,8 @@ fn emit_instanceof_inline(
     // ordinary-constructor guards below pass; accepting it here avoids a helper call for the
     // ubiquitous linked-list tail check `atom instanceof Pair`. Shared strings/symbols can be
     // released inline; BigInt and unknown tags retain the checked path. w7 keeps the LHS tag.
-    a.ldurb(7, 20, -32);
+    emit_exec_word_load(a, 8, 20, -16);
+    emit_exec_kind(a, 8, 7, 9, slow);
     let lhs_tag_ok = a.new_label();
     a.cmp_imm_w(7, 8);
     a.b_cond(C_EQ, lhs_tag_ok);
@@ -7656,13 +8097,13 @@ fn emit_instanceof_inline(
     a.cmp_imm_w(7, 7);
     a.b_cond(C_HI, slow);
     a.bind(lhs_tag_ok);
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
     a.ldr_imm(9, 19, 32); // ctx.inline_ic_safe
     a.ldrb_imm(9, 9, 0);
     a.cbz(9, false, slow);
-    a.ldur(11, 20, -8);
+    emit_exec_word_load(a, 11, 20, -8);
+    emit_exec_payload(a, 11, 11);
 
     // Popping the RHS must not run a destructor. A refcounted LHS (string/symbol/object) also
     // needs a spare owner. For an object LHS, alias-aware validation mirrors the equality
@@ -7672,7 +8113,8 @@ fn emit_instanceof_inline(
     a.b_cond(C_LS, slow);
     a.cmp_imm_w(7, 6);
     a.b_cond(C_LO, refs_ok);
-    a.ldur(10, 20, -24);
+    emit_exec_word_load(a, 10, 20, -16);
+    emit_exec_payload(a, 10, 10);
     a.ldur(14, 10, strong);
     a.cmp_imm_x(14, 1);
     a.b_cond(C_LS, slow);
@@ -7759,11 +8201,10 @@ fn emit_instanceof_inline(
     a.ldur(14, 11, strong);
     a.sub_imm(14, 14, 1);
     a.stur(14, 11, strong);
-    a.sub_imm(20, 20, 32);
-    a.movz(10, 3, 0);
-    a.stur(10, 20, 0);
-    a.sturb(9, 20, 1);
-    a.add_imm(20, 20, 16);
+    a.mov_imm64(10, crate::value::PACK_BOOL);
+    a.logic_x(1, 9, 9, 10);
+    emit_exec_word_store(a, 9, 20, -16);
+    a.sub_imm(20, 20, 8);
     a.b(done);
     a.bind(slow);
     emit_op_helper(a, H_INSTANCEOF, pc, l_unwind);
@@ -7884,12 +8325,20 @@ fn emit_prop_create_probe(
     // this probe and commit: no helper, allocation, GC or user code runs in that interval.
     a.ldr_imm(16, 11, layout.obj_heap as u32);
     a.ldr_w_imm(14, 12, IC_OFF_HOLDER_SHAPE);
-    a.ldr_imm(17, 16, (layout.heap_layouts + layout.vec_len_off) as u32);
-    a.cmp_reg_x(14, 17);
-    a.b_cond(C_HS, miss);
-    a.ldr_imm(16, 16, (layout.heap_layouts + layout.vec_ptr_off) as u32);
-    a.add_shifted(16, 16, 14, 3); // Option<PropertyLayout> is one nullable Rc word.
-    a.ldr_imm(7, 16, 0);
+    // A bounded paged directory caches globally unique shape identities. Indexing chooses
+    // only a candidate: the complete stored ID must match before borrowing its key layout.
+    a.mov_imm64(17, layout.heap_layouts as u64);
+    a.add_shifted(16, 16, 17, 0);
+    a.ubfx(17, 14, 6, 6);
+    a.add_shifted(16, 16, 17, 3);
+    a.ldr_imm(16, 16, 0); // Option<Box<LayoutPage>> is a nullable allocation pointer.
+    a.cbz(16, true, miss);
+    a.ubfx(17, 14, 0, 6);
+    a.add_shifted(16, 16, 17, 4);
+    a.ldr_w_imm(17, 16, layout.shape_layout_entry_id as u32);
+    a.cmp_reg_w(17, 14);
+    a.b_cond(C_NE, miss);
+    a.ldr_imm(7, 16, layout.shape_layout_entry_keys as u32);
     a.cbz(7, true, miss);
     a.ldr_imm(17, 7, (layout.layout_data_off + layout.vec_len_off) as u32);
     a.cmp_reg_x(13, 17);
@@ -7922,10 +8371,7 @@ fn emit_prop_create_probe(
     a.bind(proto_ready);
     a.cmp_reg_x(14, 16);
     a.b_cond(C_NE, miss);
-    // BigInt packing owns compound storage; all other Values can transfer stack ownership.
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 5);
-    a.b_cond(C_EQ, miss);
+    // Every execution word, including thin BigInt ownership, transfers unchanged.
     a.b(commit);
 }
 
@@ -7943,6 +8389,10 @@ fn emit_set_prop_inline(
     recv: PropRecv,
 ) {
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT};
+    if layout.entry_accessor != layout.entry_value + 8 {
+        emit_op_helper(a, H_SET_PROP, pc, l_unwind);
+        return;
+    }
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
@@ -7961,11 +8411,10 @@ fn emit_set_prop_inline(
     // this/slot forms: [v @ -16] only, the frame owns the receiver.
     match recv {
         PropRecv::Stack => {
-            a.ldurb(9, 20, -32);
-            a.cmp_imm_w(9, 8);
-            a.b_cond(C_NE, slow);
-            a.ldur(10, 20, -24); // receiver rc_ptr
-                                 // receiver refcount > 1 (so the pop-drop below never frees)
+            emit_exec_word_load(a, 9, 20, -16);
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+            emit_exec_payload(a, 9, 10); // receiver rc_ptr
+                                         // receiver refcount > 1 (so the pop-drop below never frees)
             a.ldur(9, 10, strong);
             a.cmp_imm_x(9, 1);
             a.b_cond(C_LS, slow);
@@ -7978,10 +8427,9 @@ fn emit_set_prop_inline(
             a.ldur(10, 14, 8);
         }
         PropRecv::Slot(off) => {
-            a.ldrb_imm(9, 22, off);
-            a.cmp_imm_w(9, 8);
-            a.b_cond(C_NE, slow);
-            a.ldr_imm(10, 22, off + 8);
+            emit_exec_word_load(a, 9, 22, off as i32);
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+            emit_exec_payload(a, 9, 10);
         }
     }
     // 2. object base; exotic None, and not a side-table exotic (proxy/typed-array/namespace).
@@ -8039,53 +8487,7 @@ fn emit_set_prop_inline(
         a.ldr_imm(15, 11, en);
         a.mov_imm64(16, es);
         a.madd(15, 13, 16, 15);
-        a.ldur(16, 20, -8);
-        let packed = a.new_label();
-        let is_undefined = a.new_label();
-        let is_empty = a.new_label();
-        let is_null = a.new_label();
-        let is_bool = a.new_label();
-        let is_str = a.new_label();
-        let is_sym = a.new_label();
-        let is_obj = a.new_label();
-        for (tag, label) in [
-            (0, is_undefined),
-            (1, is_empty),
-            (2, is_null),
-            (3, is_bool),
-            (6, is_str),
-            (7, is_sym),
-            (8, is_obj),
-        ] {
-            a.cmp_imm_w(9, tag);
-            a.b_cond(C_EQ, label);
-        }
-        a.b(packed); // Number payload is already its packed representation.
-        for (label, bits) in [
-            (is_undefined, crate::value::PACK_UNDEFINED),
-            (is_empty, crate::value::PACK_EMPTY),
-            (is_null, crate::value::PACK_NULL),
-        ] {
-            a.bind(label);
-            a.mov_imm64(16, bits);
-            a.b(packed);
-        }
-        a.bind(is_bool);
-        a.ldurb(16, 20, -15);
-        a.mov_imm64(14, crate::value::PACK_BOOL);
-        a.logic_x(1, 16, 16, 14);
-        a.b(packed);
-        for (label, bits) in [
-            (is_str, crate::value::PACK_STR),
-            (is_sym, crate::value::PACK_SYM),
-            (is_obj, crate::value::PACK_OBJ),
-        ] {
-            a.bind(label);
-            a.mov_imm64(14, bits);
-            a.logic_x(1, 16, 16, 14);
-            a.b(packed);
-        }
-        a.bind(packed);
+        emit_exec_word_load(a, 16, 20, -8);
         // The predicted key is already owned by the shared layout (validated pre-commit).
         // Only install Property::plain; no per-instance key ownership operation is needed.
         a.stur(16, 15, ev);
@@ -8107,9 +8509,9 @@ fn emit_set_prop_inline(
             a.ldur(9, 10, strong);
             a.sub_imm(9, 9, 1);
             a.stur(9, 10, strong);
-            a.sub_imm(20, 20, 32);
-        } else {
             a.sub_imm(20, 20, 16);
+        } else {
+            a.sub_imm(20, 20, 8);
         }
         a.b(done);
         a.bind(not_create);
@@ -8156,6 +8558,9 @@ fn emit_set_prop_inline(
             a.movz(14, (crate::value::PACK_BIGINT >> 48) as u32, 0);
             a.cmp_reg_x(9, 14);
             a.b_cond(C_EQ, miss);
+            a.movz(14, (crate::value::PACK_LAZY_PROTO >> 48) as u32, 0);
+            a.cmp_reg_x(9, 14);
+            a.b_cond(C_EQ, miss); // lazy storage has an owning Rc destructor
             let old_ref = a.new_label();
             let old_plain = a.new_label();
             for tag in [
@@ -8215,64 +8620,8 @@ fn emit_set_prop_inline(
     // --- commit: everything validated; from here only writes ---
     // Move v into the entry. Packed storage encodes the wide stack value in x16; ownership of a
     // refcounted payload transfers unchanged from the stack slot into the property.
-    a.ldurb(13, 20, -16);
-    a.ldur(16, 20, -8);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        a.cmp_imm_w(13, 5);
-        a.b_cond(C_EQ, slow); // BigInt's compound path stays checked
-        let packed = a.new_label();
-        let is_undefined = a.new_label();
-        let is_empty = a.new_label();
-        let is_null = a.new_label();
-        let is_bool = a.new_label();
-        let is_str = a.new_label();
-        let is_sym = a.new_label();
-        let is_obj = a.new_label();
-        for (tag, label) in [
-            (0, is_undefined),
-            (1, is_empty),
-            (2, is_null),
-            (3, is_bool),
-            (6, is_str),
-            (7, is_sym),
-            (8, is_obj),
-        ] {
-            a.cmp_imm_w(13, tag);
-            a.b_cond(C_EQ, label);
-        }
-        // Number: payload bits are already the packed representation.
-        a.b(packed);
-        for (label, bits) in [
-            (is_undefined, crate::value::PACK_UNDEFINED),
-            (is_empty, crate::value::PACK_EMPTY),
-            (is_null, crate::value::PACK_NULL),
-        ] {
-            a.bind(label);
-            a.mov_imm64(16, bits);
-            a.b(packed);
-        }
-        a.bind(is_bool);
-        a.ldurb(16, 20, -15);
-        a.mov_imm64(14, crate::value::PACK_BOOL);
-        a.logic_x(1, 16, 16, 14);
-        a.b(packed);
-        for (label, bits) in [
-            (is_str, crate::value::PACK_STR),
-            (is_sym, crate::value::PACK_SYM),
-            (is_obj, crate::value::PACK_OBJ),
-        ] {
-            a.bind(label);
-            a.mov_imm64(14, bits);
-            a.logic_x(1, 16, 16, 14);
-            a.b(packed);
-        }
-        a.bind(packed);
-        a.stur(16, 15, ev);
-    } else {
-        a.ldur(13, 20, -16);
-        a.stur(13, 15, ev);
-        a.stur(16, 15, ev + 8);
-    }
+    emit_exec_word_load(a, 16, 20, -8);
+    a.stur(16, 15, ev);
     // drop the old value (refcounted: strong was > 1, so this never frees)
     let no_old_dec = a.new_label();
     a.cmp_imm_w(9, 6);
@@ -8287,10 +8636,10 @@ fn emit_set_prop_inline(
         a.sub_imm(9, 9, 1);
         a.stur(9, 10, strong);
         // pop both operands, push nothing
-        a.sub_imm(20, 20, 32);
+        a.sub_imm(20, 20, 16);
     } else {
         // pop just the value
-        a.sub_imm(20, 20, 16);
+        a.sub_imm(20, 20, 8);
     }
     a.b(done);
     a.bind(slow);
@@ -8335,9 +8684,60 @@ fn emit_eq_inline(
     let l_true = a.new_label();
     let l_false = a.new_label();
     let l_have = a.new_label();
-    // stack: [a @ -32, b @ -16]; w9 = tag_a, w10 = tag_b
-    a.ldurb(9, 20, -32);
-    a.ldurb(10, 20, -16);
+    // Packed numeric operands need no semantic-kind decoding. Keep the guard's d0/d1 live
+    // through the fused comparison; canonical NaN remains a Number but compares unequal.
+    emit_exec_word_load(a, 12, 20, -16);
+    emit_exec_word_load(a, 13, 20, -8);
+    let tagged = a.new_label();
+    let full_kind = a.new_label();
+    let scalar_bool = a.new_label();
+    emit_exec_number_guard(a, 12, 0, 14, tagged);
+    emit_exec_number_guard(a, 13, 1, 14, tagged);
+    a.b(l_num);
+    a.bind(tagged);
+    // Undefined/Null/Bool pairs are complete scalar comparisons, with no owners to release.
+    // Do not generalize raw-bit equality to Numbers (NaN/±0) or reference-valued operands.
+    a.lsr_imm(9, 12, 48);
+    a.lsr_imm(10, 13, 48);
+    let scalar_pairs = a.new_label();
+    a.cmp_reg_w(9, 10);
+    a.b_cond(C_NE, scalar_pairs);
+    for (tag, target) in [
+        (crate::value::PACK_OBJ, l_ptr),
+        (crate::value::PACK_SYM, l_ptr),
+        (crate::value::PACK_STR, l_str),
+    ] {
+        a.movz(14, (tag >> 48) as u32, 0);
+        a.cmp_reg_w(9, 14);
+        a.b_cond(C_EQ, target);
+    }
+    a.bind(scalar_pairs);
+    a.movz(14, (crate::value::PACK_BOOL >> 48) as u32, 0);
+    a.cmp_reg_w(9, 14);
+    a.b_cond(C_EQ, scalar_bool);
+    a.logic_imm_w(1, 9, 9, asm::logical_imm_w(2).unwrap());
+    a.movz(14, (crate::value::PACK_NULL >> 48) as u32, 0);
+    a.cmp_reg_w(9, 14);
+    a.b_cond(C_NE, full_kind);
+    a.logic_imm_w(1, 10, 10, asm::logical_imm_w(2).unwrap());
+    a.cmp_reg_w(10, 14);
+    a.b_cond(C_NE, full_kind);
+    if strict {
+        a.cmp_reg_x(12, 13);
+        a.cset_w(11, C_EQ);
+    } else {
+        a.movz(11, 1, 0);
+    }
+    a.b(l_have);
+    a.bind(scalar_bool);
+    a.cmp_reg_w(10, 14);
+    a.b_cond(C_NE, full_kind);
+    a.cmp_reg_x(12, 13);
+    a.cset_w(11, C_EQ);
+    a.b(l_have);
+    a.bind(full_kind);
+    emit_exec_kind(a, 12, 9, 14, slow);
+    emit_exec_kind(a, 13, 10, 14, slow);
     let l_notnum = a.new_label();
     a.cmp_imm_w(9, 4);
     a.b_cond(C_NE, l_notnum);
@@ -8368,7 +8768,8 @@ fn emit_eq_inline(
         a.b_cond(C_EQ, slow); // BigInt → helper
         a.cmp_imm_w(10, 6);
         a.b_cond(C_LO, l_false); // Bool/Num: no drop needed
-        a.ldur(13, 20, -8);
+        emit_exec_word_load(a, 13, 20, -8);
+        emit_exec_payload(a, 13, 13);
         let la_drop = a.new_label();
         a.cmp_imm_w(10, 8);
         a.b_cond(C_NE, la_drop);
@@ -8389,7 +8790,8 @@ fn emit_eq_inline(
         a.b_cond(C_EQ, slow);
         a.cmp_imm_w(9, 6);
         a.b_cond(C_LO, l_false);
-        a.ldur(12, 20, -24);
+        emit_exec_word_load(a, 12, 20, -16);
+        emit_exec_payload(a, 12, 12);
         let lb_drop = a.new_label();
         a.cmp_imm_w(9, 8);
         a.b_cond(C_NE, lb_drop);
@@ -8421,16 +8823,18 @@ fn emit_eq_inline(
     a.b_cond(C_HS, l_ptr); // Sym/Obj: identity
     a.b(slow); // BigInt
     a.bind(l_bool);
-    a.ldurb(12, 20, -31);
-    a.ldurb(13, 20, -15);
+    a.ldurb(12, 20, -16);
+    a.ldurb(13, 20, -8);
     a.cmp_reg_w(12, 13);
     a.cset_w(11, C_EQ);
     a.b(l_have);
     // Sym/Obj identity: same pointer → equal (dec by 2; both stack handles die), different →
     // unequal (dec each; both guarded > 1 first so neither dec frees).
     a.bind(l_ptr);
-    a.ldur(12, 20, -24);
-    a.ldur(13, 20, -8);
+    emit_exec_word_load(a, 12, 20, -16);
+    emit_exec_payload(a, 12, 12);
+    emit_exec_word_load(a, 13, 20, -8);
+    emit_exec_payload(a, 13, 13);
     a.cmp_reg_x(12, 13);
     a.b_cond(C_EQ, l_ptr_same);
     a.ldur(14, 12, strong);
@@ -8453,8 +8857,10 @@ fn emit_eq_inline(
     a.b(l_true);
     // Str: identity → equal; different lengths → unequal; same length → helper (content).
     a.bind(l_str);
-    a.ldur(12, 20, -24);
-    a.ldur(13, 20, -8);
+    emit_exec_word_load(a, 12, 20, -16);
+    emit_exec_payload(a, 12, 12);
+    emit_exec_word_load(a, 13, 20, -8);
+    emit_exec_payload(a, 13, 13);
     a.cmp_reg_x(12, 13);
     a.b_cond(C_EQ, l_ptr_same);
     a.ldr_w_imm(14, 12, len_off);
@@ -8483,7 +8889,8 @@ fn emit_eq_inline(
         let ga = a.new_label();
         a.cmp_imm_w(9, 6);
         a.b_cond(C_LO, ga);
-        a.ldur(12, 20, -24);
+        emit_exec_word_load(a, 12, 20, -16);
+        emit_exec_payload(a, 12, 12);
         a.ldur(14, 12, strong);
         a.cmp_imm_x(14, 1);
         a.b_cond(C_LS, slow);
@@ -8491,7 +8898,8 @@ fn emit_eq_inline(
         let gb = a.new_label();
         a.cmp_imm_w(10, 6);
         a.b_cond(C_LO, gb);
-        a.ldur(13, 20, -8);
+        emit_exec_word_load(a, 13, 20, -8);
+        emit_exec_payload(a, 13, 13);
         a.ldur(15, 13, strong);
         a.cmp_imm_x(15, 1);
         a.b_cond(C_LS, slow);
@@ -8511,12 +8919,10 @@ fn emit_eq_inline(
         a.b(l_false);
     }
     a.bind(l_num);
-    a.ldur_d(0, 20, -24);
-    a.ldur_d(1, 20, -8);
     if let Some(target) = branch {
         // Straight-line fused numeric compare — branch on the negated condition, matching the
         // ordered-relation fusion (IEEE unordered must jump for == and fall through for !=).
-        a.sub_imm(20, 20, 32);
+        a.sub_imm(20, 20, 16);
         a.fcmp(0, 1);
         a.b_cond(if negate { C_EQ } else { C_NE }, target);
         a.b(done);
@@ -8531,7 +8937,7 @@ fn emit_eq_inline(
     a.bind(l_false);
     a.movz(11, 0, 0);
     a.bind(l_have);
-    a.sub_imm(20, 20, 32);
+    a.sub_imm(20, 20, 16);
     match branch {
         Some(target) => {
             // JumpIfFalse jumps when `eq ^ negate` is 0 — fold the negate into branch polarity.
@@ -8547,10 +8953,10 @@ fn emit_eq_inline(
                 a.movz(12, 1, 0);
                 a.logic_w(2, 11, 11, 12); // eor: flip the pushed bool
             }
-            a.movz(10, 3, 0); // Bool tag word (payload byte 1 patched below)
-            a.stur(10, 20, 0);
-            a.sturb(11, 20, 1);
-            a.add_imm(20, 20, 16);
+            a.mov_imm64(10, crate::value::PACK_BOOL);
+            a.logic_x(1, 11, 11, 10);
+            emit_exec_word_store(a, 11, 20, 0);
+            a.add_imm(20, 20, 8);
             a.b(done);
         }
     }
@@ -8563,8 +8969,8 @@ fn emit_eq_inline(
     if let Some(target) = branch {
         // Both equality helpers always push a Bool. Consume it directly instead of calling
         // ToBoolean through a second helper.
-        a.ldurb(1, 20, -15);
-        a.sub_imm(20, 20, 16);
+        a.ldurb(1, 20, -8);
+        a.sub_imm(20, 20, 8);
         a.cbz(1, false, target);
     }
     a.bind(done);
@@ -8588,27 +8994,42 @@ fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, 
     let l_num = a.new_label();
     let l_str = a.new_label();
     let l_objsym = a.new_label();
+    let l_obj = a.new_label();
+    let l_sym = a.new_label();
     let l_true = a.new_label();
     let l_have = a.new_label();
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 2);
-    a.b_cond(C_LS, l_true); // undefined/null → !falsy = true
-    a.cmp_imm_w(9, 3);
-    a.b_cond(C_EQ, l_bool);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_EQ, l_num);
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_EQ, l_str);
-    a.cmp_imm_w(9, 7);
-    a.b_cond(C_HS, l_objsym);
-    a.b(slow); // BigInt
+    emit_exec_word_load(a, 12, 20, -8);
+    let tagged = a.new_label();
+    emit_exec_number_guard(a, 12, 0, 10, tagged);
+    a.b(l_num);
+    a.bind(tagged);
+    a.lsr_imm(9, 12, 48);
+    for (tag, target) in [
+        (crate::value::PACK_OBJ, l_obj),
+        (crate::value::PACK_BOOL, l_bool),
+        (crate::value::PACK_UNDEFINED, l_true),
+        (crate::value::PACK_NULL, l_true),
+        (crate::value::PACK_STR, l_str),
+        (crate::value::PACK_SYM, l_sym),
+        (crate::value::PACK_EMPTY, l_true),
+    ] {
+        a.movz(10, (tag >> 48) as u32, 0);
+        a.cmp_reg_w(9, 10);
+        a.b_cond(C_EQ, target);
+    }
+    a.b(slow); // BigInt and property-only/reserved tags retain the checked path.
+    a.bind(l_obj);
+    a.movz(9, 8, 0);
+    a.b(l_objsym);
+    a.bind(l_sym);
+    a.movz(9, 7, 0);
+    a.b(l_objsym);
     a.bind(l_bool);
-    a.ldurb(11, 20, -15);
+    a.ldurb(11, 20, -8);
     a.movz(12, 1, 0);
     a.logic_w(2, 11, 11, 12); // eor: flip
     a.b(l_have);
     a.bind(l_num);
-    a.ldur_d(0, 20, -8);
     a.movz(12, 0, 0);
     a.fmov_d_x(1, 12); // d1 = +0.0
     a.fcmp(0, 1);
@@ -8617,7 +9038,8 @@ fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, 
     a.logic_w(1, 11, 11, 12); // orr
     a.b(l_have);
     a.bind(l_str);
-    a.ldur(12, 20, -8);
+    emit_exec_word_load(a, 12, 20, -8);
+    emit_exec_payload(a, 12, 12);
     a.ldur(14, 12, strong);
     a.cmp_imm_x(14, 1);
     a.b_cond(C_LS, slow); // last reference: the drop runs a destructor
@@ -8628,7 +9050,8 @@ fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, 
     a.stur(14, 12, strong);
     a.b(l_have);
     a.bind(l_objsym);
-    a.ldur(12, 20, -8);
+    emit_exec_word_load(a, 12, 20, -8);
+    emit_exec_payload(a, 12, 12);
     let os_drop = a.new_label();
     a.cmp_imm_w(9, 8);
     a.b_cond(C_NE, os_drop);
@@ -8647,9 +9070,9 @@ fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, 
     a.bind(l_true);
     a.movz(11, 1, 0);
     a.bind(l_have);
-    a.movz(10, 3, 0);
-    a.stur(10, 20, -16);
-    a.sturb(11, 20, -15);
+    a.mov_imm64(10, crate::value::PACK_BOOL);
+    a.logic_x(1, 11, 11, 10);
+    emit_exec_word_store(a, 11, 20, -8);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
@@ -8674,6 +9097,9 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.binding_value + 16 < 256
         && layout.binding_value < 4096
         && layout.binding_init < 4096
+        && layout.binding_import < 4096
+        && layout.scope_with_valid
+        && layout.scope_with < 4096
 }
 
 /// The cached numeric name update additionally writes through the resolved binding/property.
@@ -8729,7 +9155,7 @@ fn emit_update_name_inline(
     let packed_number = a.new_label();
     a.movz(13, (crate::value::PACK_OBJ >> 48) as u32, 0);
     a.cmp_reg_w(9, 13);
-    a.b_cond(C_EQ, slow);
+    a.b_cond(C_HS, slow);
     a.movz(13, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
     a.cmp_reg_w(9, 13);
     a.b_cond(C_LO, packed_number);
@@ -8768,16 +9194,12 @@ fn emit_update_name_inline(
     a.stur_d(2, 14, 0);
     match kind {
         UpdKind::PreInc | UpdKind::PreDec => {
-            a.movz(9, 4, 0);
-            a.stur(9, 20, 0);
-            a.stur_d(2, 20, 8);
-            a.add_imm(20, 20, 16);
+            emit_exec_number_store(a, 2, 20, 0, 9);
+            a.add_imm(20, 20, 8);
         }
         UpdKind::PostInc | UpdKind::PostDec => {
-            a.movz(9, 4, 0);
-            a.stur(9, 20, 0);
-            a.stur_d(0, 20, 8);
-            a.add_imm(20, 20, 16);
+            emit_exec_number_store(a, 0, 20, 0, 9);
+            a.add_imm(20, 20, 8);
         }
         UpdKind::IncDiscard | UpdKind::DecDiscard => {}
     }
@@ -8801,20 +9223,35 @@ fn emit_store_name_inline(
     pc: u32,
     l_unwind: usize,
 ) {
-    let strong = layout.rc_strong_off as i32;
     let slow = a.new_label();
     let done = a.new_label();
-    let scope = a.new_label();
-    let packed_commit = a.new_label();
 
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
+    emit_store_name_value(a, layout, slow, done);
+    a.bind(slow);
+    emit_exec(a, pc, l_unwind);
+    a.bind(done);
+}
+
+/// Store to an already resolved, checked x14 value address; x7 distinguishes property/binding.
+/// No subsequent operation may resolve the identifier again. Shared by name and Reference ICs.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_store_name_value(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    slow: usize,
+    done: usize,
+) {
+    let strong = layout.rc_strong_off as i32;
+    let scope = a.new_label();
+    let packed_commit = a.new_label();
     a.cbz(7, false, scope);
 
     // Packed global property: encode the moved stack value, then release the old packed owner.
     // BigInt stays on the checked path; String/Symbol/Object transfer as one-word owners.
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 5);
-    a.b_cond(C_EQ, slow);
     guard_prop_writable(
         a,
         9,
@@ -8822,71 +9259,10 @@ fn emit_store_name_inline(
         (layout.entry_writable - layout.entry_value) as u32,
         slow,
     );
-
-    // Pack the new wide value into x10 without changing its ownership count.
-    a.ldurb(9, 20, -16);
-    let pack_empty = a.new_label();
-    let pack_null = a.new_label();
-    let pack_bool = a.new_label();
-    let pack_num = a.new_label();
-    let pack_undefined = a.new_label();
-    let pack_str = a.new_label();
-    let pack_sym = a.new_label();
-    let pack_obj = a.new_label();
-    let packed_encoded = a.new_label();
-    a.cbz(9, false, pack_undefined);
-    a.cmp_imm_w(9, 1);
-    a.b_cond(C_EQ, pack_empty);
-    a.cmp_imm_w(9, 2);
-    a.b_cond(C_EQ, pack_null);
-    a.cmp_imm_w(9, 3);
-    a.b_cond(C_EQ, pack_bool);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_EQ, pack_num);
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_EQ, pack_str);
-    a.cmp_imm_w(9, 7);
-    a.b_cond(C_EQ, pack_sym);
-    a.b(pack_obj);
-    a.bind(pack_undefined);
-    a.mov_imm64(10, crate::value::PACK_UNDEFINED);
-    a.b(packed_encoded);
-    a.bind(pack_empty);
-    a.mov_imm64(10, crate::value::PACK_EMPTY);
-    a.b(packed_encoded);
-    a.bind(pack_null);
-    a.mov_imm64(10, crate::value::PACK_NULL);
-    a.b(packed_encoded);
-    a.bind(pack_bool);
-    a.mov_imm64(10, crate::value::PACK_BOOL);
-    a.ldurb(11, 20, -15);
-    a.logic_x(1, 10, 10, 11);
-    a.b(packed_encoded);
-    a.bind(pack_num);
-    a.ldur_d(0, 20, -8);
-    a.fcmp(0, 0);
-    let pack_nan = a.new_label();
-    a.b_cond(C_VS, pack_nan);
-    a.ldur(10, 20, -8);
-    a.b(packed_encoded);
-    a.bind(pack_nan);
-    a.mov_imm64(10, crate::value::PACK_CANON_NAN);
-    a.b(packed_encoded);
-    for (label, tag) in [
-        (pack_str, crate::value::PACK_STR),
-        (pack_sym, crate::value::PACK_SYM),
-        (pack_obj, crate::value::PACK_OBJ),
-    ] {
-        a.bind(label);
-        a.ldur(10, 20, -8);
-        a.mov_imm64(13, tag);
-        a.logic_x(1, 10, 10, 13);
-        a.b(packed_encoded);
-    }
-
+    // Both stores own the same compact word; no repacking or allocation is necessary.
+    emit_exec_word_load(a, 10, 20, -8);
     // Release the old packed owner. Scalars need nothing; common refcounted values decrement
     // inline, while BigInt or a last owner uses the exact packed destructor.
-    a.bind(packed_encoded);
     a.ldur(16, 14, 0);
     a.lsr_imm(9, 16, 48);
     let old_ref = a.new_label();
@@ -8900,6 +9276,9 @@ fn emit_store_name_inline(
     a.cmp_reg_w(9, 13);
     a.b_cond(C_EQ, old_ref);
     a.movz(13, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+    a.cmp_reg_w(9, 13);
+    a.b_cond(C_EQ, old_drop);
+    a.movz(13, (crate::value::PACK_LAZY_PROTO >> 48) as u32, 0);
     a.cmp_reg_w(9, 13);
     a.b_cond(C_EQ, old_drop);
     a.b(packed_commit);
@@ -8922,7 +9301,7 @@ fn emit_store_name_inline(
     a.ldp_post(10, 14, 16);
     a.bind(packed_commit);
     a.stur(10, 14, 0);
-    a.sub_imm(20, 20, 16);
+    a.sub_imm(20, 20, 8);
     a.b(done);
 
     // Wide scope binding: validate mutability. The incoming Value moves from the operand stack
@@ -8936,9 +9315,8 @@ fn emit_store_name_inline(
         (layout.binding_mutable - layout.binding_value) as u32,
     );
     a.cbz(9, false, slow);
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 5);
-    a.b_cond(C_EQ, slow);
+    emit_exec_word_load(a, 8, 20, -8);
+    emit_exec_kind(a, 8, 9, 11, slow);
     a.ldurb(9, 14, 0);
     a.cmp_imm_w(9, 5);
     a.b_cond(C_EQ, slow);
@@ -8953,11 +9331,11 @@ fn emit_store_name_inline(
     a.sub_imm(12, 12, 1);
     a.stur(12, 11, strong);
     a.bind(old_scalar);
-    a.ldur(9, 20, -16);
-    a.ldur(10, 20, -8);
+    emit_exec_word_load(a, 8, 20, -8);
+    emit_exec_decode_wide(a, 8, 9, 10, 11, 13, slow);
     a.stur(9, 14, 0);
     a.stur(10, 14, 8);
-    a.sub_imm(20, 20, 16);
+    a.sub_imm(20, 20, 8);
     a.b(done);
 
     // Releasing the last owner can recursively destroy an object graph, but Value destruction
@@ -8971,23 +9349,18 @@ fn emit_store_name_inline(
     a.ldr_imm(16, 21, (H_DROP_AT * 8) as u32);
     a.blr(16);
     a.ldp_post(14, 15, 16);
-    a.ldur(9, 20, -16);
-    a.ldur(10, 20, -8);
+    emit_exec_word_load(a, 8, 20, -8);
+    emit_exec_decode_wide(a, 8, 9, 10, 11, 13, slow);
     a.stur(9, 14, 0);
     a.stur(10, 14, 8);
-    a.sub_imm(20, 20, 16);
+    a.sub_imm(20, 20, 8);
     a.b(done);
-
-    a.bind(slow);
-    emit_exec(a, pc, l_unwind);
-    a.bind(done);
 }
 
-/// Inline free-name read (`LoadName`) against the per-site [`crate::bytecode::NameIc`]: compare
-/// the live activation env pointer and the scope's binding-map generation, then copy the cached
-/// binding's value straight out of the scope — no hashing, no helper call. The cache is filled
-/// by the VM slow path (`Chunk::name_ic_fill`, depth-0 resolutions only); any mismatch — cold
-/// cache, different env, structural scope change, TDZ, BigInt value — takes the checked helper.
+/// Inline free-name read (`LoadName`) against the per-site [`crate::bytecode::NameIc`]. Ordinary
+/// scope/global/depth-one modes and bounded deep-chain proofs validate the current resolution
+/// before cloning its live value, without hashing or a helper on a supported hit. Cold/stale
+/// proofs, live with/import/TDZ state and unsupported value encodings take the checked helper.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -9003,113 +9376,59 @@ fn emit_load_name_inline(
     // come through a `with` object) below the value; the slow path runs the full op.
     for_call: bool,
 ) {
-    let strong = layout.rc_strong_off as i32;
     let slow = a.new_label();
     let done = a.new_label();
     // Validate the cache and leave a pointer to the resolved Value in x14 (either mode).
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
-    // Value not a BigInt → materialize the wide pair, bump if refcounted, push. x7 identifies
-    // the packed global-property arm; scope bindings are already wide.
-    let loaded = a.new_label();
-    if layout.entry_accessor == layout.entry_value + 8 {
-        let wide = a.new_label();
-        a.cbz(7, false, wide);
-        a.ldur(11, 14, 0);
-        if let Some(bits) = preferred_number {
-            // Hot script constants stay live and mutable: compare the packed global property on
-            // every read, then widen the proven Number with no NaN-box tag decoder. Assignment
-            // of a different value simply falls through to the generic live decoder below.
-            let generic = a.new_label();
-            a.mov_imm64(16, bits);
-            a.cmp_reg_x(11, 16);
-            a.b_cond(C_NE, generic);
-            a.movz(10, 4, 0);
-            a.b(loaded);
-            a.bind(generic);
-        }
-        a.lsr_imm(9, 11, 48);
-        let is_undefined = a.new_label();
-        let is_empty = a.new_label();
-        let is_null = a.new_label();
-        let is_bool = a.new_label();
-        let is_str = a.new_label();
-        let is_sym = a.new_label();
-        let is_obj = a.new_label();
-        let is_number = a.new_label();
-        a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_EQ, is_obj);
-        a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_LO, is_number);
-        a.movz(16, (crate::value::PACK_SYM >> 48) as u32, 0);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_HI, is_number);
-        for (tag, label) in [
-            (crate::value::PACK_BOOL, is_bool),
-            (crate::value::PACK_STR, is_str),
-            (crate::value::PACK_SYM, is_sym),
-            (crate::value::PACK_BIGINT, slow),
-            (crate::value::PACK_UNDEFINED, is_undefined),
-            (crate::value::PACK_EMPTY, is_empty),
-            (crate::value::PACK_NULL, is_null),
-        ] {
-            a.movz(16, (tag >> 48) as u32, 0);
-            a.cmp_reg_x(9, 16);
-            a.b_cond(C_EQ, label);
-        }
-        a.bind(is_number);
-        a.movz(10, 4, 0); // Number; x11 already holds its bits
-        a.b(loaded);
-        for (label, tag) in [(is_undefined, 0), (is_empty, 1), (is_null, 2)] {
-            a.bind(label);
-            a.movz(10, tag, 0);
-            a.movz(11, 0, 0);
-            a.b(loaded);
-        }
-        a.bind(is_bool);
-        a.movz(10, 3, 0);
-        a.lsl_imm_w(11, 11, 8);
-        a.logic_w(1, 10, 10, 11);
-        a.movz(11, 0, 0);
-        a.b(loaded);
-        for (label, tag) in [(is_str, 6), (is_sym, 7), (is_obj, 8)] {
-            a.bind(label);
-            a.movz(10, tag, 0);
-            a.lsl_imm(11, 11, 16);
-            a.lsr_imm(11, 11, 16);
-            a.ldur(16, 11, strong);
-            a.add_imm(16, 16, 1);
-            a.stur(16, 11, strong);
-            a.b(loaded);
-        }
-        a.bind(wide);
-    }
-    a.ldurb(9, 14, 0);
-    a.cmp_imm_w(9, 5);
-    a.b_cond(C_EQ, slow);
-    a.ldur(10, 14, 0);
-    a.ldur(11, 14, 8);
-    let nobump = a.new_label();
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_LO, nobump);
-    a.ldur(16, 11, strong);
-    a.add_imm(16, 16, 1);
-    a.stur(16, 11, strong);
-    a.bind(nobump);
-    a.bind(loaded);
-    if for_call {
-        a.stur(31, 20, 0);
-        a.stur(31, 20, 8);
-        a.add_imm(20, 20, 16);
-    }
-    a.stur(10, 20, 0);
-    a.stur(11, 20, 8);
-    a.add_imm(20, 20, 16);
+    emit_load_name_value(a, layout, preferred_number, slow, for_call);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
     a.bind(done);
+}
+
+/// Clone from a checked x14 value address into the canonical operand stack (x7=storage kind).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_load_name_value(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    preferred_number: Option<u64>,
+    slow: usize,
+    for_call: bool,
+) {
+    // Lexical Binding.value stays wide; object properties already share execution encoding.
+    let loaded = a.new_label();
+    if layout.entry_accessor == layout.entry_value + 8 {
+        let wide = a.new_label();
+        a.cbz(7, false, wide);
+        a.ldur(12, 14, 0);
+        if let Some(bits) = preferred_number {
+            let generic = a.new_label();
+            a.mov_imm64(16, bits);
+            a.cmp_reg_x(12, 16);
+            a.b_cond(C_NE, generic);
+            a.b(loaded); // exact known Number needs no ownership traffic
+            a.bind(generic);
+        }
+        emit_exec_clone(a, layout, 12, 13, 16, slow);
+        a.b(loaded);
+        a.bind(wide);
+    }
+    a.ldur(10, 14, 0);
+    a.ldur(11, 14, 8);
+    emit_exec_encode_wide(a, 10, 11, 12, 13, 16, 0, slow);
+    emit_exec_clone(a, layout, 12, 13, 16, slow);
+    a.bind(loaded);
+    if for_call {
+        a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+        emit_exec_word_store(a, 9, 20, 0);
+        a.add_imm(20, 20, 8);
+    }
+    emit_exec_word_store(a, 12, 20, 0);
+    a.add_imm(20, 20, 8);
 }
 
 /// Shared LoadName cache validation: on success x14 points at the resolved `Value` (the binding's
@@ -9142,10 +9461,19 @@ fn emit_name_ic_value_ptr(
 
     a.mov_imm64(12, cache_ptr as u64);
     a.ldr_imm(9, 19, 40); // ctx.env_raw
+    a.ldrb_imm(17, 9, layout.scope_with as u32);
+    a.cmp_imm_w(17, layout.scope_with_none as u32);
+    a.b_cond(C_NE, slow);
     a.ldr_imm(10, 12, NAME_IC_OFF_ENV);
+    let deep = a.new_label();
+    let have = a.new_label();
     // Classify the cache mode before choosing which scope's generation `gen` describes.
     a.ldr_w_imm(11, 9, sg);
     a.ldr_w_imm(13, 12, NAME_IC_OFF_GEN);
+    // Saturated generations are never pointer proofs, even if a malformed/stale IC matches.
+    // ADDS WZR, Wgen, #1 is zero exactly at u32::MAX; no temporary constant is needed.
+    a.cmn_imm_w(13, 1);
+    a.b_cond(C_EQ, slow);
     let scope = a.new_label();
     let direct_scope = a.new_label();
     let depth_one = a.new_label();
@@ -9157,10 +9485,12 @@ fn emit_name_ic_value_ptr(
     a.logic_x(0, 16, 10, 15);
     a.cbnz(16, false, depth_one);
     // --- global mode: ic.env == env|1 (env is ≥8-aligned, so +1 sets the tag bit) ---
+    // Test identity before generation: DEEP_NAME_IC publishes gen=0, which need not match
+    // this scope. Keep w11 intact for the ordinary global generation proof below.
+    a.add_imm(17, 9, 1);
+    a.cmp_reg_x(17, 10);
+    a.b_cond(C_NE, deep);
     a.cmp_reg_w(11, 13);
-    a.b_cond(C_NE, slow);
-    a.add_imm(11, 9, 1);
-    a.cmp_reg_x(11, 10);
     a.b_cond(C_NE, slow);
     if layout.entry_accessor == layout.entry_value + 8 && !packed_ok {
         // Global bindings live in packed properties; scope bindings below remain wide. Keep the
@@ -9185,7 +9515,15 @@ fn emit_name_ic_value_ptr(
     guard_prop_data(a, 14, 15, g_ea, slow);
     a.add_imm(14, 15, g_ev); // x14 → the entry's Value
     a.movz(7, 1, 0); // packed global property
-    let have = a.new_label();
+    a.b(have);
+    // The uncommon chain proof lives off the successful ordinary paths. GetValue still
+    // checks live with/import/TDZ state; only mode dispatch has moved (ECMA-262 sec-getvalue,
+    // sec-getidentifierreference). Empty or stale unrelated identities cannot reach it.
+    a.bind(deep);
+    a.cmp_imm_x(10, crate::bytecode::lexical_cache::DEEP_NAME_IC as u32);
+    a.b_cond(C_NE, slow);
+    a.ldr_imm(12, 12, NAME_IC_OFF_BINDING);
+    names::emit_deep_name_value_ptr(a, layout, slow, packed_ok);
     a.b(have);
     // --- direct scope mode: `gen` belongs to the current env ---
     a.bind(direct_scope);
@@ -9206,6 +9544,13 @@ fn emit_name_ic_value_ptr(
     a.cbz(15, false, slow);
     a.ldr_w_imm(11, 9, layout.scope_layout as u32);
     a.bind(activation_guard);
+    // A layout token is independently non-recycled; only the generation-mode activation
+    // needs the exhaustion guard.
+    let activation_not_saturated = a.new_label();
+    a.cbnz(16, false, activation_not_saturated);
+    a.cmn_imm_w(15, 1);
+    a.b_cond(C_EQ, slow);
+    a.bind(activation_not_saturated);
     a.cmp_reg_w(11, 15);
     a.b_cond(C_NE, slow);
     a.ldr_imm(14, 19, std::mem::offset_of!(JitCtx, env_parent_raw) as u32);
@@ -9217,6 +9562,9 @@ fn emit_name_ic_value_ptr(
     a.cmp_reg_x(14, 16);
     a.b_cond(C_NE, slow);
     a.ldr_w_imm(15, 14, sg);
+    a.ldrb_imm(17, 14, layout.scope_with as u32);
+    a.cmp_imm_w(17, layout.scope_with_none as u32);
+    a.b_cond(C_NE, slow);
     a.cmp_reg_w(15, 13);
     a.b_cond(C_NE, slow);
     a.b(scope);
@@ -9225,6 +9573,8 @@ fn emit_name_ic_value_ptr(
     a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
     a.ldrb_imm(9, 14, bi);
     a.cbz(9, false, slow);
+    a.ldrb_imm(9, 14, layout.binding_import as u32);
+    a.cbnz(9, false, slow);
     a.add_imm(14, 14, bv); // x14 → the binding's Value
     a.movz(7, 0, 0); // wide scope binding
     a.bind(have);
@@ -9344,12 +9694,10 @@ fn emit_get_elem_inline(
     let slow = a.new_label();
     let done = a.new_label();
     // 1. stack: [obj @ -32, key @ -16] — receiver must be Obj, key must be Num
-    a.ldurb(9, 20, -32);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, slow);
-    a.ldurb(9, 20, -16);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_NE, slow);
+    emit_exec_word_load(a, 9, 20, -16);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_number_guard(a, 9, 0, 11, slow);
     // 2. key must be exactly a u32 (round-trip compare; NaN/negative/fractional/huge all miss)
     a.ldur_d(0, 20, -8);
     a.fcvtzu_w_d(9, 0);
@@ -9357,7 +9705,8 @@ fn emit_get_elem_inline(
     a.fcmp(0, 1);
     a.b_cond(C_NE, slow);
     // 3. receiver refcount > 1 (so the pop-drop below never frees)
-    a.ldur(10, 20, -24);
+    emit_exec_word_load(a, 10, 20, -16);
+    emit_exec_payload(a, 10, 10);
     a.ldur(11, 10, strong);
     a.cmp_imm_x(11, 1);
     a.b_cond(C_LS, slow);
@@ -9394,9 +9743,12 @@ fn emit_get_elem_inline(
     a.b_cond(C_HS, classic);
     a.ldr_imm(12, 12, mvp);
     a.ldr_d_lsl3(0, 12, 9);
-    a.movz(12, 4, 0);
-    a.fmov_x_d(13, 0);
-    a.movz(14, 0, 0);
+    a.fmov_x_d(12, 0);
+    a.fcmp(0, 0);
+    let mirror_number = a.new_label();
+    a.b_cond(7, mirror_number);
+    a.mov_imm64(12, crate::value::PACK_CANON_NAN);
+    a.bind(mirror_number);
     a.b(mirror_hit); // a Num: skip the refcount-bump block
     a.bind(classic);
     // 5b. dense bounds: n < elems.len (x9's upper bits are zero from the w-form fcvtzu)
@@ -9415,7 +9767,8 @@ fn emit_get_elem_inline(
         a.mov_imm64(14, crate::value::PACK_EMPTY);
         a.cmp_reg_x(13, 14);
         a.b_cond(C_EQ, slow); // an absent own element must still consult the prototype chain
-        emit_packed_word_decode(a, layout, slow);
+        a.mov(12, 13);
+        emit_exec_clone(a, layout, 12, 13, 16, slow);
         a.b(mirror_hit);
         a.bind(classic_dense);
     }
@@ -9434,26 +9787,15 @@ fn emit_get_elem_inline(
     a.madd(15, 13, 16, 15);
     // 8. not an accessor
     guard_prop_data(a, 9, 15, ea, slow);
-    // 9. Decode the heap's packed Value into the execution stack's wide `{tag,payload}` pair.
-    // Numbers and objects dominate dense reads; test them first. BigInt remains checked because
-    // its compound payload is not a one-word clone. Refcounted values clone by incrementing the
-    // untagged stored pointer before the receiver's balancing decrement below.
+    // Clone the same compact owner used by the heap; wide legacy layouts encode once.
     if layout.entry_accessor == layout.entry_value + 8 {
-        emit_packed_entry_decode(a, layout, 15, slow);
-    } else {
-        a.ldurb(9, 15, ev);
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, slow);
         a.ldur(12, 15, ev);
+    } else {
+        a.ldur(9, 15, ev);
         a.ldur(13, 15, ev + 8);
-        let nobump = a.new_label();
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, nobump);
-        a.ldur(16, 13, strong);
-        a.add_imm(16, 16, 1);
-        a.stur(16, 13, strong);
-        a.bind(nobump);
+        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 0, slow);
     }
+    emit_exec_clone(a, layout, 12, 13, 16, slow);
     // --- commit: everything validated; from here only writes ---
     a.bind(mirror_hit);
     // drop the receiver (strong was > 1; if the value IS the receiver the bump balanced it)
@@ -9461,12 +9803,11 @@ fn emit_get_elem_inline(
     a.sub_imm(9, 9, 1);
     a.stur(9, 10, strong);
     // pop obj+key, push value → value lands at the obj slot, sp drops one
-    a.stur(12, 20, -32);
-    a.stur(13, 20, -24);
-    a.sub_imm(20, 20, 16);
+    emit_exec_word_store(a, 12, 20, -16);
+    a.sub_imm(20, 20, 8);
     a.b(done);
     a.bind(slow);
-    emit_exec(a, pc, l_unwind);
+    emit_op_helper(a, H_GET_ELEM, pc, l_unwind);
     a.bind(done);
 }
 
@@ -9528,17 +9869,16 @@ fn emit_mirror_store(
     let mvl = (layout.dense_mirror + layout.vec_len_off) as u32;
     let done = a.new_label();
     let inval = a.new_label();
+    let inactive = a.new_label();
     a.ldrb_imm(13, base, mf);
     let ok_bit = asm::logical_imm_w(crate::value::MIRROR_OK as u32).unwrap();
     a.logic_imm_w(0, 12, 13, ok_bit);
-    a.cbz(12, false, done);
+    a.cbz(12, false, inactive);
     // Value → d1 (or reuse the proven register).
     let (dv, proven_num, proven_i32) = match val {
         MirrorVal::Stack(off) => {
-            a.ldurb(9, 20, off);
-            a.cmp_imm_w(9, 4);
-            a.b_cond(C_NE, inval);
-            a.ldur_d(1, 20, off + 8);
+            emit_exec_word_load(a, 9, 20, off);
+            emit_exec_number_guard(a, 9, 1, 12, inval);
             (1u32, false, false)
         }
         MirrorVal::Num(d, i32_proven) => (d, true, i32_proven),
@@ -9591,6 +9931,12 @@ fn emit_mirror_store(
     a.add_shifted(12, 12, 9, 3);
     a.str_d_imm(dv, 12, 0);
     a.b(done);
+    a.bind(inactive);
+    // Even a Number-to-Number indexed mutation ends a failed preparation's retry
+    // suppression, just as Props::set_index_value does. In particular an earlier
+    // fallible allocation may now succeed. Zero flags need no write; an inactive
+    // view supplies no live proof bits that must survive this invalidation.
+    a.cbz(13, false, done);
     a.bind(inval);
     a.strb_imm(31, base, mf);
     a.bind(done);
@@ -9607,6 +9953,10 @@ fn emit_set_elem_inline(
     l_unwind: usize,
     keep: bool,
 ) {
+    if layout.entry_accessor != layout.entry_value + 8 {
+        emit_op_helper(a, H_SET_ELEM, pc, l_unwind);
+        return;
+    }
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
@@ -9625,26 +9975,19 @@ fn emit_set_elem_inline(
     let slow = a.new_label();
     let done = a.new_label();
     // 1. stack: [obj @ -48, key @ -32, v @ -16]
-    a.ldurb(9, 20, -48);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, slow);
-    a.ldurb(9, 20, -32);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_NE, slow);
-    if keep {
-        // v is also the expression result: a BigInt can't clone inline.
-        a.ldurb(9, 20, -16);
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, slow);
-    }
+    emit_exec_word_load(a, 9, 20, -24);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    emit_exec_word_load(a, 9, 20, -16);
+    emit_exec_number_guard(a, 9, 0, 11, slow);
     // 2. key must be exactly a u32
-    a.ldur_d(0, 20, -24);
+    a.ldur_d(0, 20, -16);
     a.fcvtzu_w_d(9, 0);
     a.ucvtf_d_w(1, 9);
     a.fcmp(0, 1);
     a.b_cond(C_NE, slow);
     // 3. receiver refcount > 1
-    a.ldur(10, 20, -40);
+    emit_exec_word_load(a, 10, 20, -24);
+    emit_exec_payload(a, 10, 10);
     a.ldur(11, 10, strong);
     a.cmp_imm_x(11, 1);
     a.b_cond(C_LS, slow);
@@ -9702,15 +10045,8 @@ fn emit_set_elem_inline(
     }
     // --- commit ---
     // Move v into the entry; a refcounted payload transfers ownership without a clone.
-    a.ldur(14, 20, -16);
-    a.ldur(17, 20, -8);
-    if layout.entry_accessor == layout.entry_value + 8 {
-        emit_packed_stack_encode(a, -16, slow);
-        a.stur(16, 15, ev);
-    } else {
-        a.stur(14, 15, ev);
-        a.stur(17, 15, ev + 8);
-    }
+    emit_packed_stack_encode(a, -8, slow);
+    a.stur(16, 15, ev);
     // drop the old value (refcounted: strong was > 1, so this never frees)
     let no_old_dec = a.new_label();
     a.cmp_imm_w(9, 6);
@@ -9725,32 +10061,21 @@ fn emit_set_elem_inline(
         a,
         layout,
         11,
-        MirrorKey::StackF64(-24),
-        MirrorVal::Stack(-16),
+        MirrorKey::StackF64(-16),
+        MirrorVal::Stack(-8),
     );
-    if keep {
-        // v now lives in the slot AND stays on the stack as the result: one bump.
-        a.ldurb(9, 20, -16);
-        let nb = a.new_label();
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, nb);
-        a.ldur(13, 17, strong);
-        a.add_imm(13, 13, 1);
-        a.stur(13, 17, strong);
-        a.bind(nb);
-    }
+    // The packed write guard proved a Number, so keeping the result needs no retain.
     // drop the receiver (strong was > 1)
     a.ldur(13, 10, strong);
     a.sub_imm(13, 13, 1);
     a.stur(13, 10, strong);
     if keep {
         // [obj, key, v] → [v]: the result lands at the obj slot
-        a.ldur(14, 20, -16);
-        a.stur(14, 20, -48);
-        a.stur(17, 20, -40);
-        a.sub_imm(20, 20, 32);
+        emit_exec_word_load(a, 14, 20, -8);
+        emit_exec_word_store(a, 14, 20, -24);
+        a.sub_imm(20, 20, 16);
     } else {
-        a.sub_imm(20, 20, 48);
+        a.sub_imm(20, 20, 24);
     }
     a.b(done);
     a.bind(slow);
@@ -9789,28 +10114,28 @@ fn emit_packed_element_store(
     guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
     guard_prop_writable(a, 14, 15, layout.property_meta as u32, slow);
     emit_packed_number_drop_guard(a, layout, 15, slow);
-    emit_packed_stack_encode(a, -16, slow);
+    emit_packed_stack_encode(a, -8, slow);
     a.stur(16, 15, layout.property_value as i32);
-    // Packed storage is authoritative and normally has no numeric mirror. Invalidate the
-    // optional mirror conservatively, matching representation changes in Props.
-    a.strb_imm(
-        31,
+    // The canonical packed property stays authoritative. Hot numeric arrays can also own an
+    // f64 mirror; this Number-to-Number write preserves it exactly, including -0/NaN.
+    emit_mirror_store(
+        a,
+        layout,
         11,
-        (layout.obj_props + layout.props_mirror_flags) as u32,
+        MirrorKey::StackF64(-16),
+        MirrorVal::Stack(-8),
     );
     if stack_receiver {
         a.ldur(13, 10, layout.rc_strong_off as i32);
         a.sub_imm(13, 13, 1);
         a.stur(13, 10, layout.rc_strong_off as i32);
     }
-    let consumed = if stack_receiver { 48 } else { 32 };
+    let consumed = if stack_receiver { 24 } else { 16 };
     if keep {
         // The expression result retains the original Number, including signed zero and NaN.
-        a.ldur(14, 20, -16);
-        a.ldur(17, 20, -8);
-        a.stur(14, 20, -consumed);
-        a.stur(17, 20, -consumed + 8);
-        a.sub_imm(20, 20, (consumed - 16) as u32);
+        emit_exec_word_load(a, 14, 20, -8);
+        emit_exec_word_store(a, 14, 20, -consumed);
+        a.sub_imm(20, 20, (consumed - 8) as u32);
     } else {
         a.sub_imm(20, 20, consumed as u32);
     }
@@ -9868,7 +10193,7 @@ fn emit_packed_number_drop_guard(
     // PACK_OBJ sorts above the tagged scalar range, so reject it before the two numeric ranges.
     a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
     a.cmp_reg_x(9, 14);
-    a.b_cond(C_EQ, slow);
+    a.b_cond(C_HS, slow);
     let number = a.new_label();
     a.movz(14, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
     a.cmp_reg_x(9, 14);
@@ -9887,177 +10212,8 @@ fn emit_packed_number_drop_guard(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_packed_stack_encode(a: &mut asm::Asm, off: i32, slow: usize) {
-    a.ldurb(13, 20, off);
-    a.cmp_imm_w(13, 4);
-    a.b_cond(C_NE, slow);
-    a.ldur(16, 20, off + 8);
-    // Any NaN payload could overlap a boxed tag. Match PackedValue::pack by canonicalizing it.
-    a.ldur_d(1, 20, off + 8);
-    a.fcmp(1, 1);
-    let nan = a.new_label();
-    let encoded = a.new_label();
-    a.b_cond(C_VS, nan);
-    a.b(encoded);
-    a.bind(nan);
-    a.mov_imm64(16, crate::value::PACK_CANON_NAN);
-    a.bind(encoded);
-}
-
-/// Encode any wide local-slot value except BigInt into x16, transferring the stack value's
-/// ownership when the caller commits. All exits to `slow` happen before frame mutation.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_packed_stack_encode_all(a: &mut asm::Asm, off: i32, slow: usize) {
-    a.ldurb(9, 20, off);
-    a.ldur(16, 20, off + 8);
-    let done = a.new_label();
-    let number = a.new_label();
-    let undefined = a.new_label();
-    let empty = a.new_label();
-    let null = a.new_label();
-    let boolean = a.new_label();
-    let string = a.new_label();
-    let symbol = a.new_label();
-    let object = a.new_label();
-    // Number and Object dominate local writes; keep both at the front of the dispatch chain.
-    for (tag, label) in [
-        (4, number),
-        (8, object),
-        (0, undefined),
-        (3, boolean),
-        (6, string),
-        (7, symbol),
-        (1, empty),
-        (2, null),
-    ] {
-        a.cmp_imm_w(9, tag);
-        a.b_cond(C_EQ, label);
-    }
-    a.b(slow); // BigInt (5), or a corrupt/unknown discriminant.
-    for (label, bits) in [
-        (undefined, crate::value::PACK_UNDEFINED),
-        (empty, crate::value::PACK_EMPTY),
-        (null, crate::value::PACK_NULL),
-    ] {
-        a.bind(label);
-        a.mov_imm64(16, bits);
-        a.b(done);
-    }
-    a.bind(boolean);
-    a.ldurb(16, 20, off + 1);
-    a.mov_imm64(14, crate::value::PACK_BOOL);
-    a.logic_x(1, 16, 16, 14);
-    a.b(done);
-    for (label, bits) in [
-        (string, crate::value::PACK_STR),
-        (symbol, crate::value::PACK_SYM),
-        (object, crate::value::PACK_OBJ),
-    ] {
-        a.bind(label);
-        a.mov_imm64(14, bits);
-        a.logic_x(1, 16, 16, 14);
-        a.b(done);
-    }
-    a.bind(number);
-    a.ldur_d(1, 20, off + 8);
-    a.fcmp(1, 1);
-    let number_nan = a.new_label();
-    let number_ok = a.new_label();
-    a.b_cond(C_VS, number_nan);
-    a.b(number_ok);
-    a.bind(number_nan);
-    a.mov_imm64(16, crate::value::PACK_CANON_NAN);
-    a.bind(number_ok);
-    a.bind(done);
-}
-
-/// Decode one NaN-boxed heap property into the execution stack's wide x12/x13 Value pair.
-/// `entry` points at `(Rc<str>, Property)` and all guards branch to `slow` before mutation.
-/// BigInt stays checked; strings, symbols and objects clone by incrementing their Rc count.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_packed_entry_decode(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    entry: u32,
-    slow: usize,
-) {
-    let ev = layout.entry_value as i32;
-    a.ldur(13, entry, ev);
-    emit_packed_word_decode(a, layout, slow);
-}
-
-/// Decode the packed word in x13 into the wide execution pair x12/x13, cloning any shared
-/// reference payload. BigInt remains on the checked path.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_packed_word_decode(a: &mut asm::Asm, layout: &crate::value::JitLayout, slow: usize) {
-    let strong = layout.rc_strong_off as i32;
-    a.lsr_imm(9, 13, 48);
-    let decoded = a.new_label();
-    let is_number = a.new_label();
-    let is_obj = a.new_label();
-    let is_str = a.new_label();
-    let is_sym = a.new_label();
-    let is_bool = a.new_label();
-    let is_undefined = a.new_label();
-    let is_empty = a.new_label();
-    let is_null = a.new_label();
-    a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_EQ, is_obj);
-    a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_LO, is_number);
-    a.movz(16, (crate::value::PACK_SYM >> 48) as u32, 0);
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_HI, is_number);
-    for (tag, label) in [
-        (crate::value::PACK_UNDEFINED, is_undefined),
-        (crate::value::PACK_EMPTY, is_empty),
-        (crate::value::PACK_NULL, is_null),
-        (crate::value::PACK_BOOL, is_bool),
-        (crate::value::PACK_STR, is_str),
-        (crate::value::PACK_SYM, is_sym),
-        (crate::value::PACK_BIGINT, slow),
-    ] {
-        a.movz(16, (tag >> 48) as u32, 0);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_EQ, label);
-    }
-    a.b(slow);
-    a.bind(is_number);
-    a.movz(12, 4, 0);
-    a.b(decoded);
-    for (label, tag) in [(is_undefined, 0), (is_empty, 1), (is_null, 2)] {
-        a.bind(label);
-        a.movz(12, tag, 0);
-        a.movz(13, 0, 0);
-        a.b(decoded);
-    }
-    a.bind(is_bool);
-    a.movz(12, 3, 0);
-    a.lsl_imm_w(13, 13, 8);
-    a.logic_w(1, 12, 12, 13);
-    a.movz(13, 0, 0);
-    a.b(decoded);
-    for (label, tag) in [(is_str, 6), (is_sym, 7), (is_obj, 8)] {
-        a.bind(label);
-        a.movz(12, tag, 0);
-        a.lsl_imm(13, 13, 16);
-        a.lsr_imm(13, 13, 16);
-        a.ldur(16, 13, strong);
-        a.add_imm(16, 16, 1);
-        a.stur(16, 13, strong);
-        a.b(decoded);
-    }
-    a.bind(decoded);
+    emit_exec_word_load(a, 16, 20, off);
+    emit_exec_number_guard(a, 16, 1, 13, slow);
 }
 
 /// Inline fused element access where the receiver lives in a *parameter* slot
@@ -10098,6 +10254,12 @@ fn emit_elem_local_keyed(
     kind: ElemLocalKind,
     key: KeySrc,
 ) {
+    if kind != ElemLocalKind::Get && layout.entry_accessor != layout.entry_value + 8 {
+        for &pc in pcs {
+            emit_op_helper(a, H_SET_ELEM, pc, l_unwind);
+        }
+        return;
+    }
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
@@ -10116,33 +10278,26 @@ fn emit_elem_local_keyed(
     let get = kind == ElemLocalKind::Get;
     debug_assert!(get || key == KeySrc::Stack);
     // Stack-keyed layout: Get → [key @ -16]; Set* → [key @ -32, v @ -16].
-    let key_off = if get { -16 } else { -32 };
+    let key_off = if get { -8 } else { -16 };
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
     // 1. slot holds an Obj; key (from its source) is a Num, loaded into d0
-    a.ldrb_imm(9, 22, slot_off);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, slow);
+    emit_exec_word_load(a, 9, 22, slot_off as i32);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
     match key {
         KeySrc::Stack => {
-            a.ldurb(9, 20, key_off);
-            a.cmp_imm_w(9, 4);
-            a.b_cond(C_NE, slow);
-            a.ldur_d(0, 20, key_off + 8);
+            emit_exec_word_load(a, 9, 20, key_off);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
         }
         KeySrc::Slot(k_off) => {
-            a.ldrb_imm(9, 22, k_off);
-            a.cmp_imm_w(9, 4);
-            a.b_cond(C_NE, slow);
-            a.ldr_d_imm(0, 22, k_off + 8);
+            emit_exec_word_load(a, 9, 22, k_off as i32);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
         }
         KeySrc::SlotPre(k_off, dec) => {
-            a.ldrb_imm(9, 22, k_off);
-            a.cmp_imm_w(9, 4);
-            a.b_cond(C_NE, slow);
-            a.ldr_d_imm(0, 22, k_off + 8);
+            emit_exec_word_load(a, 9, 22, k_off as i32);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
             a.fmov_one(1);
             a.f_arith(if dec { 1 } else { 0 }, 0, 0, 1); // d0 = slot ± 1 (store deferred)
         }
@@ -10154,7 +10309,8 @@ fn emit_elem_local_keyed(
     a.b_cond(C_NE, slow);
     // 3. receiver rc ptr straight from the slot (no strong-count games — nothing drops)
     // 3. receiver rc ptr straight from the slot (no strong-count games — nothing drops)
-    a.ldr_imm(10, 22, slot_off + 8);
+    emit_exec_word_load(a, 10, 22, slot_off as i32);
+    emit_exec_payload(a, 10, 10);
     // 4. object base; exotic None or Array, and plain
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
@@ -10189,9 +10345,12 @@ fn emit_elem_local_keyed(
         a.b_cond(C_HS, classic);
         a.ldr_imm(12, 12, mvp);
         a.ldr_d_lsl3(1, 12, 9);
-        a.movz(12, 4, 0);
-        a.fmov_x_d(13, 1);
-        a.movz(14, 0, 0);
+        a.fmov_x_d(12, 1);
+        a.fcmp(1, 1);
+        let mirror_number = a.new_label();
+        a.b_cond(7, mirror_number);
+        a.mov_imm64(12, crate::value::PACK_CANON_NAN);
+        a.bind(mirror_number);
         a.b(mirror_hit);
     }
     a.bind(classic);
@@ -10212,7 +10371,8 @@ fn emit_elem_local_keyed(
         a.mov_imm64(14, crate::value::PACK_EMPTY);
         a.cmp_reg_x(13, 14);
         a.b_cond(C_EQ, slow);
-        emit_packed_word_decode(a, layout, slow);
+        a.mov(12, 13);
+        emit_exec_clone(a, layout, 12, 13, 16, slow);
         a.b(mirror_hit);
         a.bind(classic_dense);
     }
@@ -10232,48 +10392,32 @@ fn emit_elem_local_keyed(
     // 8. data property (+ writable for the set forms)
     guard_prop_data(a, 9, 15, ea, slow);
     if get {
-        // 9. clone the element into the execution stack representation.
+        // Clone directly into a compact owner; preserve d0 (the deferred numeric key).
         if layout.entry_accessor == layout.entry_value + 8 {
-            emit_packed_entry_decode(a, layout, 15, slow);
-        } else {
-            a.ldurb(9, 15, ev);
-            a.cmp_imm_w(9, 5);
-            a.b_cond(C_EQ, slow);
             a.ldur(12, 15, ev);
+        } else {
+            a.ldur(9, 15, ev);
             a.ldur(13, 15, ev + 8);
-            let nobump = a.new_label();
-            a.cmp_imm_w(9, 6);
-            a.b_cond(C_LO, nobump);
-            a.ldur(16, 13, strong);
-            a.add_imm(16, 16, 1);
-            a.stur(16, 13, strong);
-            a.bind(nobump);
+            emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 1, slow);
         }
+        emit_exec_clone(a, layout, 12, 13, 16, slow);
         a.bind(mirror_hit);
         match key {
             KeySrc::Stack => {
                 // pop key, push value → result replaces the key slot
-                a.stur(12, 20, -16);
-                a.stur(13, 20, -8);
+                emit_exec_word_store(a, 12, 20, -8);
             }
             KeySrc::Slot(_) | KeySrc::SlotPre(..) => {
                 if let KeySrc::SlotPre(k_off, _) = key {
-                    a.str_d_imm(0, 22, k_off + 8); // commit the deferred ±1 to the slot
+                    a.str_d_imm(0, 22, k_off); // commit the deferred ±1 to the slot
                 }
                 // nothing was on the stack: push the value
-                a.stur(12, 20, 0);
-                a.stur(13, 20, 8);
-                a.add_imm(20, 20, 16);
+                emit_exec_word_store(a, 12, 20, 0);
+                a.add_imm(20, 20, 8);
             }
         }
     } else {
         guard_prop_writable(a, 9, 15, ew, slow);
-        if kind == ElemLocalKind::SetKeep {
-            // v is also the expression result: a BigInt can't clone inline.
-            a.ldurb(9, 20, -16);
-            a.cmp_imm_w(9, 5);
-            a.b_cond(C_EQ, slow);
-        }
         // 9. old value: trivially droppable, or refcounted with strong > 1.
         if layout.entry_accessor == layout.entry_value + 8 {
             emit_packed_number_drop_guard(a, layout, 15, slow);
@@ -10291,15 +10435,8 @@ fn emit_elem_local_keyed(
             a.bind(old_plain);
         }
         // --- commit: move v into the entry, drop the old value ---
-        a.ldur(14, 20, -16);
-        a.ldur(17, 20, -8);
-        if layout.entry_accessor == layout.entry_value + 8 {
-            emit_packed_stack_encode(a, -16, slow);
-            a.stur(16, 15, ev);
-        } else {
-            a.stur(14, 15, ev);
-            a.stur(17, 15, ev + 8);
-        }
+        emit_packed_stack_encode(a, -8, slow);
+        a.stur(16, 15, ev);
         let no_old_dec = a.new_label();
         a.cmp_imm_w(9, 6);
         a.b_cond(C_LO, no_old_dec);
@@ -10308,36 +10445,21 @@ fn emit_elem_local_keyed(
         a.stur(13, 12, strong);
         a.bind(no_old_dec);
         // Element mirror (x9/x12/x13/d1 dead here; the key f64 survives in d0).
-        emit_mirror_store(
-            a,
-            layout,
-            11,
-            MirrorKey::F64InDreg(0),
-            MirrorVal::Stack(-16),
-        );
+        emit_mirror_store(a, layout, 11, MirrorKey::F64InDreg(0), MirrorVal::Stack(-8));
         if kind == ElemLocalKind::SetKeep {
-            // v now lives in the slot AND stays on the stack: one bump, result at the key slot.
-            a.ldurb(9, 20, -16);
-            let nb = a.new_label();
-            a.cmp_imm_w(9, 6);
-            a.b_cond(C_LO, nb);
-            a.ldur(13, 17, strong);
-            a.add_imm(13, 13, 1);
-            a.stur(13, 17, strong);
-            a.bind(nb);
-            a.ldur(14, 20, -16);
-            a.stur(14, 20, -32);
-            a.stur(17, 20, -24);
-            a.sub_imm(20, 20, 16);
+            // The packed store guard proves Number: the result has no Rc owner to clone.
+            emit_exec_word_load(a, 14, 20, -8);
+            emit_exec_word_store(a, 14, 20, -16);
+            a.sub_imm(20, 20, 8);
         } else {
-            a.sub_imm(20, 20, 32);
+            a.sub_imm(20, 20, 16);
         }
     }
     a.b(done);
     a.bind(slow);
     for (index, &p) in pcs.iter().enumerate() {
-        if !get && index + 1 == pcs.len() {
-            emit_op_helper(a, H_SET_ELEM, p, l_unwind);
+        if index + 1 == pcs.len() {
+            emit_op_helper(a, if get { H_GET_ELEM } else { H_SET_ELEM }, p, l_unwind);
         } else {
             emit_exec(a, p, l_unwind);
         }
@@ -10443,7 +10565,6 @@ fn plan_linked_scan(
     use crate::bytecode::Op;
     if fast & (1 << 21) == 0
         || std::env::var_os("LUMEN_JIT_NO_CFG_REGION").is_some()
-        || PACKED_LOCAL_SLOTS
         || !get_prop_inlinable(layout)
         || layout.entry_accessor != layout.entry_value + 8
     {
@@ -10484,9 +10605,9 @@ fn plan_linked_scan(
     if link.depth != 0 {
         return None;
     }
-    let next_off = *next as u32 * 16;
-    let peek_off = *peek as u32 * 16;
-    if next_off + 16 >= 4096 || peek_off + 16 >= 4096 {
+    let next_off = *next as u32 * 8;
+    let peek_off = *peek as u32 * 8;
+    if next_off + 8 >= 4096 || peek_off + 8 >= 4096 {
         return None;
     }
     Some(LinkedScanPlan {
@@ -10543,10 +10664,7 @@ fn plan_numeric_diamond(
             return None;
         }};
     }
-    if fast & (1 << 21) == 0
-        || std::env::var_os("LUMEN_JIT_NO_CFG_REGION").is_some()
-        || PACKED_LOCAL_SLOTS
-    {
+    if fast & (1 << 21) == 0 || std::env::var_os("LUMEN_JIT_NO_CFG_REGION").is_some() {
         reject!("disabled");
     }
     if !get_prop_inlinable(layout)
@@ -10614,9 +10732,9 @@ fn plan_numeric_diamond(
     let Some(reset) = chunk.jit_const_num(*reset).and_then(exact_i32_const) else {
         reject!("reset constant");
     };
-    let index_off = *index as u32 * 16;
-    let owner_off = *owner as u32 * 16;
-    if index_off + 16 >= 4096 || owner_off + 16 >= 4096 {
+    let index_off = *index as u32 * 8;
+    let owner_off = *owner as u32 * 8;
+    if index_off + 8 >= 4096 || owner_off + 8 >= 4096 {
         reject!("slot range");
     }
     Some(NumericDiamondPlan {
@@ -10652,7 +10770,7 @@ fn build_chain(
     fast: u32,
 ) -> Option<(Vec<(ChainOp, usize)>, usize)> {
     use crate::bytecode::Op;
-    let in_range = |s: u16| (s as u32) * 16 + 16 < 4096;
+    let in_range = |s: u16| (s as u32) * 8 + 8 < 4096;
     let elem_ok = fast & 1024 != 0 && get_elem_inlinable(layout);
     let name_ok = fast & 8192 != 0 && load_name_inlinable(layout);
     let prop_ok = fast & 256 != 0
@@ -10680,19 +10798,19 @@ fn build_chain(
                 Some(bits) => (ChainOp::ConstNum(bits), 1, 0),
                 None => break,
             },
-            Op::LoadLocal(s) if in_range(*s) => (ChainOp::Load(*s as u32 * 16), 1, 0),
+            Op::LoadLocal(s) if in_range(*s) => (ChainOp::Load(*s as u32 * 8), 1, 0),
             Op::UpdateLocal(s, kind) if in_range(*s) => {
                 let pushes = !matches!(kind, UpdKind::IncDiscard | UpdKind::DecDiscard);
-                (ChainOp::Update(*s as u32 * 16, *kind), pushes as usize, 0)
+                (ChainOp::Update(*s as u32 * 8, *kind), pushes as usize, 0)
             }
             Op::GetElemLocal(x) if elem_ok && in_range(*x) && vdepth >= 1 => {
-                (ChainOp::GetElem(*x as u32 * 16), 1, 1)
+                (ChainOp::GetElem(*x as u32 * 8), 1, 1)
             }
             Op::SetElemLocal(x) if elem_ok && in_range(*x) && vdepth >= 2 => {
-                (ChainOp::SetElem(*x as u32 * 16, true), 1, 2)
+                (ChainOp::SetElem(*x as u32 * 8, true), 1, 2)
             }
             Op::SetElemLocalDrop(x) if elem_ok && in_range(*x) && vdepth >= 2 => {
-                (ChainOp::SetElem(*x as u32 * 16, false), 0, 2)
+                (ChainOp::SetElem(*x as u32 * 8, false), 0, 2)
             }
             Op::Add | Op::Sub | Op::Mul | Op::Div if vdepth >= 2 => {
                 let f = match ops[pc] {
@@ -10717,7 +10835,7 @@ fn build_chain(
             Op::Neg if vdepth >= 1 => (ChainOp::Neg, 1, 1),
             Op::StoreLocal(s) if in_range(*s) => {
                 if vdepth >= 1 {
-                    (ChainOp::Store(*s as u32 * 16), 0, 1)
+                    (ChainOp::Store(*s as u32 * 8), 0, 1)
                 } else {
                     break;
                 }
@@ -10744,7 +10862,7 @@ fn build_chain(
                 if st.depth > 2 || (st.depth == 2 && st.mid_ok & 1 == 0) {
                     break;
                 }
-                (ChainOp::LoadProp(*s as u32 * 16, st), 1, 0)
+                (ChainOp::LoadProp(*s as u32 * 8, st), 1, 0)
             }
             Op::SetPropThisDrop(n, c)
                 if prop_store_ok
@@ -10779,7 +10897,7 @@ fn build_chain(
                 if st.depth != 0 {
                     break;
                 }
-                (ChainOp::StoreProp(*s as u32 * 16, st), 0, 1)
+                (ChainOp::StoreProp(*s as u32 * 8, st), 0, 1)
             }
             Op::Lt
             | Op::Gt
@@ -11006,7 +11124,7 @@ mod numeric_chain_tests {
             None
         );
         assert_eq!(
-            super::local_store_pair(&[Op::Dup, Op::StoreLocal(255)], 0, &[false; 3]),
+            super::local_store_pair(&[Op::Dup, Op::StoreLocal(511)], 0, &[false; 3]),
             None
         );
     }
@@ -11025,7 +11143,7 @@ mod numeric_chain_tests {
         );
         assert_eq!(super::local_read_discard_pair(&pair, 1, &[false; 3]), None);
         assert_eq!(
-            super::local_read_discard_pair(&[Op::LoadLocal(255), Op::Pop], 0, &[false; 3]),
+            super::local_read_discard_pair(&[Op::LoadLocal(511), Op::Pop], 0, &[false; 3]),
             None
         );
         assert_eq!(
@@ -11095,7 +11213,16 @@ mod numeric_chain_tests {
         .expect("numeric loop plan");
         let mut assembler = super::asm::Asm::new();
         let labels: Vec<_> = (0..=ops.len()).map(|_| assembler.new_label()).collect();
-        super::emit_loop_chain(&mut assembler, &layout, &plan, &labels, &mut targeted);
+        let mut poll_engine = crate::Engine::new();
+        let ilayout = crate::interpreter::interp_layout(&mut poll_engine.interp);
+        super::emit_loop_chain(
+            &mut assembler,
+            &layout,
+            &ilayout,
+            &plan,
+            &labels,
+            &mut targeted,
+        );
         let guard_pc = ops
             .windows(2)
             .position(|pair| matches!(pair, [Op::LoadLocal(_), Op::Pop]))
@@ -11105,7 +11232,7 @@ mod numeric_chain_tests {
         };
         assert!(plan
             .initialization_guards
-            .contains(&(guard_slot as u32 * 16)));
+            .contains(&(guard_slot as u32 * 8)));
         assert!(plan
             .chain
             .iter()
@@ -11113,7 +11240,7 @@ mod numeric_chain_tests {
         assert!(plan
             .slots
             .iter()
-            .any(|slot| slot.off == guard_slot as u32 * 16 && slot.virgin && !slot.preload));
+            .any(|slot| slot.off == guard_slot as u32 * 8 && slot.virgin && !slot.preload));
         assert!(!targeted[guard_pc + 1], "Pop has no bailout edge");
         assert!(super::local_read_discard_pair(ops, guard_pc, &targeted).is_some());
         let element_pc = ops
@@ -11312,11 +11439,10 @@ fn emit_chain(
                 vregs.push((rd, iv));
             }
             ChainOp::Load(off) => {
-                a.ldrb_imm(9, 22, off);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, guard!());
+                a.ldr_imm(9, 22, off);
+                emit_exec_number_guard(a, 9, 0, 10, guard!());
                 let rd = free.pop().expect("chain reg underflow");
-                a.ldr_d_imm(rd, 22, off + 8);
+                a.ldr_d_imm(rd, 22, off);
                 vregs.push((rd, false));
             }
             ChainOp::LoadProp(off, st) => {
@@ -11330,10 +11456,9 @@ fn emit_chain(
                     a.b_cond(C_NE, guard!());
                     a.ldr_imm(10, 14, 8);
                 } else {
-                    a.ldrb_imm(9, 22, off);
-                    a.cmp_imm_w(9, 8);
-                    a.b_cond(C_NE, guard!());
-                    a.ldr_imm(10, 22, off + 8);
+                    a.ldr_imm(10, 22, off);
+                    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
+                    emit_exec_payload(a, 10, 10);
                 }
                 a.add_imm(11, 10, rcv);
                 a.ldrb_imm(14, 11, ex);
@@ -11395,7 +11520,7 @@ fn emit_chain(
                     a.lsr_imm(9, 13, 48);
                     a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
                     a.cmp_reg_x(9, 16);
-                    a.b_cond(C_EQ, guard!());
+                    a.b_cond(C_HS, guard!());
                     let is_num = a.new_label();
                     a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
                     a.cmp_reg_x(9, 16);
@@ -11422,10 +11547,9 @@ fn emit_chain(
                     a.b_cond(C_NE, guard!());
                     a.ldr_imm(10, 14, 8);
                 } else {
-                    a.ldrb_imm(9, 22, off);
-                    a.cmp_imm_w(9, 8);
-                    a.b_cond(C_NE, guard!());
-                    a.ldr_imm(10, 22, off + 8);
+                    a.ldr_imm(10, 22, off);
+                    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
+                    emit_exec_payload(a, 10, 10);
                 }
                 a.add_imm(11, 10, rcv);
                 a.ldrb_imm(14, 11, ex);
@@ -11453,7 +11577,7 @@ fn emit_chain(
                     a.lsr_imm(9, 13, 48);
                     a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
                     a.cmp_reg_x(9, 16);
-                    a.b_cond(C_EQ, guard!());
+                    a.b_cond(C_HS, guard!());
                     let old_num = a.new_label();
                     a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
                     a.cmp_reg_x(9, 16);
@@ -11462,8 +11586,7 @@ fn emit_chain(
                     a.cmp_reg_x(9, 16);
                     a.b_cond(C_LS, guard!());
                     a.bind(old_num);
-                    a.fmov_x_d(13, dv);
-                    a.stur(13, 15, ev);
+                    emit_exec_number_store(a, dv, 15, ev, 13);
                 } else {
                     a.ldrb_imm(9, 15, ev as u32);
                     a.cmp_imm_w(9, 4);
@@ -11481,9 +11604,8 @@ fn emit_chain(
                         rfree.push(mlreg);
                     }
                 }
-                a.ldrb_imm(9, 22, off);
-                a.cmp_imm_w(9, 4);
-                a.b_cond(C_NE, guard!());
+                a.ldr_imm(9, 22, off);
+                emit_exec_number_guard(a, 9, 0, 10, guard!());
                 let dec = matches!(
                     kind,
                     UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
@@ -11492,25 +11614,25 @@ fn emit_chain(
                 match kind {
                     UpdKind::PreInc | UpdKind::PreDec => {
                         let rd = free.pop().expect("chain reg underflow");
-                        a.ldr_d_imm(rd, 22, off + 8);
+                        a.ldr_d_imm(rd, 22, off);
                         a.fmov_one(0);
                         a.f_arith(f, rd, rd, 0);
-                        a.str_d_imm(rd, 22, off + 8);
+                        emit_exec_number_store(a, rd, 22, off as i32, 9);
                         vregs.push((rd, false));
                     }
                     UpdKind::PostInc | UpdKind::PostDec => {
                         let rd = free.pop().expect("chain reg underflow");
-                        a.ldr_d_imm(rd, 22, off + 8);
+                        a.ldr_d_imm(rd, 22, off);
                         a.fmov_one(0);
                         a.f_arith(f, 1, rd, 0);
-                        a.str_d_imm(1, 22, off + 8);
+                        emit_exec_number_store(a, 1, 22, off as i32, 9);
                         vregs.push((rd, false)); // the old value is the result
                     }
                     UpdKind::IncDiscard | UpdKind::DecDiscard => {
-                        a.ldr_d_imm(0, 22, off + 8);
+                        a.ldr_d_imm(0, 22, off);
                         a.fmov_one(1);
                         a.f_arith(f, 0, 0, 1);
-                        a.str_d_imm(0, 22, off + 8);
+                        emit_exec_number_store(a, 0, 22, off as i32, 9);
                     }
                 }
             }
@@ -11541,10 +11663,9 @@ fn emit_chain(
                     }
                     None => {
                         // First access to this receiver in the chain: validate once.
-                        a.ldrb_imm(10, 22, xoff);
-                        a.cmp_imm_w(10, 8);
-                        a.b_cond(C_NE, guard!());
-                        a.ldr_imm(10, 22, xoff + 8);
+                        a.ldr_imm(10, 22, xoff);
+                        emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
+                        emit_exec_payload(a, 10, 10);
                         a.add_imm(11, 10, rcv);
                         a.ldrb_imm(12, 11, ex);
                         let ex_ok = a.new_label();
@@ -11691,7 +11812,13 @@ fn emit_chain(
                         a.mov_imm64(16, f64::NAN.to_bits());
                         a.bind(encoded);
                         a.stur(16, 15, layout.property_value as i32);
-                        a.strb_imm(31, 11, mf);
+                        emit_mirror_store(
+                            a,
+                            layout,
+                            11,
+                            MirrorKey::F64InDreg(dk),
+                            MirrorVal::Num(dv, false),
+                        );
                     } else {
                         a.fmov_d_x(dk, 12);
                     }
@@ -11923,22 +12050,9 @@ fn emit_chain(
                     }
                 }
                 let (dv, _) = vregs.pop().expect("chain vstack");
-                a.ldrb_imm(9, 22, off);
-                a.cmp_imm_w(9, 5);
-                a.b_cond(C_EQ, guard!());
-                let plain = a.new_label();
-                a.cmp_imm_w(9, 6);
-                a.b_cond(C_LO, plain);
-                a.ldr_imm(10, 22, off + 8);
-                a.ldur(11, 10, strong);
-                a.cmp_imm_x(11, 1);
-                a.b_cond(C_LS, guard!());
-                a.sub_imm(11, 11, 1);
-                a.stur(11, 10, strong);
-                a.bind(plain);
-                a.movz(9, 4, 0);
-                a.str_imm(9, 22, off);
-                a.str_d_imm(dv, 22, off + 8);
+                a.ldr_imm(9, 22, off);
+                emit_exec_drop_shared(a, layout, 9, 10, 11, guard!());
+                emit_exec_number_store(a, dv, 22, off as i32, 9);
                 free.push(dv);
             }
             ChainOp::Pop => {
@@ -11966,7 +12080,7 @@ fn emit_chain(
                     let number = a.new_label();
                     a.movz(11, (crate::value::PACK_OBJ >> 48) as u32, 0);
                     a.cmp_reg_x(10, 11);
-                    a.b_cond(C_EQ, guard!());
+                    a.b_cond(C_HS, guard!());
                     a.movz(11, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
                     a.cmp_reg_x(10, 11);
                     a.b_cond(C_LO, number);
@@ -12000,23 +12114,20 @@ fn emit_chain(
     }
     // Chain finished: spill any remaining virtual values to the real stack, in stack order.
     for &(r, _) in &vregs {
-        a.movz(9, 4, 0);
-        a.stur(9, 20, 0);
-        a.stur_d(r, 20, 8);
-        a.add_imm(20, 20, 16);
+        emit_exec_number_store(a, r, 20, 0, 9);
+        a.add_imm(20, 20, 8);
     }
     a.b(done);
     // ---- bail paths: spill the pre-op virtual stack, then re-run the rest via the helper ----
     for (idx, label, snap) in bails {
         a.bind(label);
         for &(r, _) in &snap {
-            a.movz(9, 4, 0);
-            a.stur(9, 20, 0);
-            a.stur_d(r, 20, 8);
-            a.add_imm(20, 20, 16);
+            emit_exec_number_store(a, r, 20, 0, 9);
+            a.add_imm(20, 20, 8);
         }
         for (cop2, pc2) in &chain[idx..] {
             match cop2 {
+                ChainOp::GetElem(_) => emit_op_helper(a, H_GET_ELEM, *pc2 as u32, l_unwind),
                 ChainOp::CmpBranch(_, target) => {
                     // generic compare (pushes a bool) + pop-and-branch, like the unfused pair
                     emit_exec(a, *pc2 as u32, l_unwind);
@@ -12178,6 +12289,9 @@ struct ReceiverPlan {
     /// Any int-typed element read flows from this receiver (preamble then requires
     /// `MIRROR_ALL_I32`, letting those reads use a bare fcvtzs).
     int_reads: bool,
+    /// A numeric store in the region can clear ALL_I32 on this receiver through an alias.
+    /// Such reads must revalidate the fact at the read, not truncate under the entry proof.
+    recheck_i32: bool,
     /// Leftover pin registers holding the mirror length / mirror data / elems data / entries
     /// data pointers (all stable in-region: the vocabulary is helper-free and slim stores
     /// never grow or reallocate). Each pin shaves a dependent load off every element access —
@@ -12243,7 +12357,7 @@ fn plan_loop(
             return None;
         }};
     }
-    let in_range = |s: u16| (s as u32) * 16 + 16 < 4096;
+    let in_range = |s: u16| (s as u32) * 8 + 8 < 4096;
     let name_ok = fast & 8192 != 0 && load_name_inlinable(layout);
 
     // ---- region discovery: the shared CFG admits only the old emitter's linear-loop shape.
@@ -12263,7 +12377,7 @@ fn plan_loop(
     let mut pc = head;
     while pc < jump_pc {
         if let Some(slot) = local_read_discard_pair(ops, pc, targeted) {
-            let off = slot as u32 * 16;
+            let off = slot as u32 * 8;
             if !initialization_guards.contains(&off) {
                 initialization_guards.push(off);
             }
@@ -12277,19 +12391,19 @@ fn plan_loop(
         }
         let (cop, push, pop): (ChainOp, usize, usize) = match &ops[pc] {
             Op::Const(k) => (ChainOp::ConstNum(chunk.jit_const_num(*k)?), 1, 0),
-            Op::LoadLocal(s) if in_range(*s) => (ChainOp::Load(*s as u32 * 16), 1, 0),
+            Op::LoadLocal(s) if in_range(*s) => (ChainOp::Load(*s as u32 * 8), 1, 0),
             Op::UpdateLocal(s, kind) if in_range(*s) => {
                 let pushes = !matches!(kind, UpdKind::IncDiscard | UpdKind::DecDiscard);
-                (ChainOp::Update(*s as u32 * 16, *kind), pushes as usize, 0)
+                (ChainOp::Update(*s as u32 * 8, *kind), pushes as usize, 0)
             }
             Op::GetElemLocal(x) if in_range(*x) && vdepth >= 1 => {
-                (ChainOp::GetElem(*x as u32 * 16), 1, 1)
+                (ChainOp::GetElem(*x as u32 * 8), 1, 1)
             }
             Op::SetElemLocal(x) if in_range(*x) && vdepth >= 2 => {
-                (ChainOp::SetElem(*x as u32 * 16, true), 1, 2)
+                (ChainOp::SetElem(*x as u32 * 8, true), 1, 2)
             }
             Op::SetElemLocalDrop(x) if in_range(*x) && vdepth >= 2 => {
-                (ChainOp::SetElem(*x as u32 * 16, false), 0, 2)
+                (ChainOp::SetElem(*x as u32 * 8, false), 0, 2)
             }
             Op::Add | Op::Sub | Op::Mul | Op::Div if vdepth >= 2 => {
                 let f = match ops[pc] {
@@ -12313,7 +12427,7 @@ fn plan_loop(
             }
             Op::Neg if vdepth >= 1 => (ChainOp::Neg, 1, 1),
             Op::StoreLocal(s) if in_range(*s) && vdepth >= 1 => {
-                (ChainOp::Store(*s as u32 * 16), 0, 1)
+                (ChainOp::Store(*s as u32 * 8), 0, 1)
             }
             Op::Pop if vdepth >= 1 => (ChainOp::Pop, 0, 1),
             Op::Dup if vdepth >= 1 => (ChainOp::Dup, 1, 0),
@@ -12882,9 +12996,10 @@ fn plan_loop(
                     ChainOp::SetElem(_, keep) => {
                         let (vk, vinf) = pop!();
                         pop!();
-                        // Exact-i32 proof for the mirror: an int-kind value bounded to i32 (int
-                        // kinds can never carry -0.0).
-                        setelem_i32.insert(idx, matches!(vk, PushKind::I { .. }) && vinf.exp <= 31);
+                        // The abstract bound is |v| <= 2^exp, inclusive. exp==31 therefore
+                        // admits positive 2^31, which is not i32: the runtime round-trip must
+                        // maintain ALL_I32 in that case. Int kinds cannot carry -0.0.
+                        setelem_i32.insert(idx, matches!(vk, PushKind::I { .. }) && vinf.exp < 31);
                         if keep {
                             push!(vk, vinf);
                         }
@@ -13081,7 +13196,7 @@ fn plan_loop(
             match demote {
                 Some(off) => {
                     if std::env::var_os("LUMEN_JIT_LOOPLOG").is_some() {
-                        eprintln!("[jit-loop] head {head}: demote I slot {}", off / 16);
+                        eprintln!("[jit-loop] head {head}: demote I slot {}", off / 8);
                     }
                     i_slots.retain(|&o| o != off);
                     slot_exp_head.remove(&off);
@@ -13131,7 +13246,7 @@ fn plan_loop(
                     if std::env::var_os("LUMEN_JIT_LOOPLOG").is_some() {
                         eprintln!(
                             "[jit-loop] head {head}: demote I slot {} ({})",
-                            v / 16,
+                            v / 8,
                             if over { "pressure" } else { "pin" }
                         );
                     }
@@ -13227,11 +13342,12 @@ fn plan_loop(
     // leftover resident registers; memos are dropped when none are free.
     // x pins: whatever the universe leaves after I residents and the transient reserve; d pins
     // from the resident bank's leftovers (d transients live in d16.. and never collide).
-    // Pin pool: the caller-saved leftovers, then x23-x28 (callee-saved — using any obliges
+    // Pin pool: the caller-saved leftovers, then x23-x27 (x28 is the poll countdown).
+    // These are callee-saved — using any obliges
     // the loop to bracket itself with save/restore pairs, a fixed ~6-instruction cost per
     // loop ENTRY against one shaved load per element access per iteration). Pops take the
     // caller-saved ones first.
-    let mut free_pin_x: Vec<u32> = [28u32, 27, 26, 25, 24, 23]
+    let mut free_pin_x: Vec<u32> = [27u32, 26, 25, 24, 23]
         .into_iter()
         .chain(
             I_UNIVERSE
@@ -13262,6 +13378,7 @@ fn plan_loop(
             reg,
             mirror: fast & 262144 != 0,
             int_reads: rcv_int.contains(&off),
+            recheck_i32: rcv_int.contains(&off) && setelem_i32.values().any(|&exact| !exact),
             mlreg: None,
             mpreg: None,
             elpreg: None,
@@ -13477,7 +13594,7 @@ fn emit_region_packed_number(
     a.lsr_imm(9, 13, 48);
     a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
     a.cmp_reg_x(9, 16);
-    a.b_cond(C_EQ, fail);
+    a.b_cond(C_HS, fail);
     let number = a.new_label();
     a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
     a.cmp_reg_x(9, 16);
@@ -13541,7 +13658,7 @@ fn emit_numeric_diamond_flush(
     // Both locations were entry-proven Numbers and no helper ran in-region, so payload-only
     // writeback preserves their tags and requires no ownership work.
     a.scvtf_d_x(0, 0);
-    a.str_d_imm(0, 22, plan.index_off + 8);
+    a.str_d_imm(0, 22, plan.index_off);
     a.scvtf_d_x(1, 8);
     a.fmov_x_d(9, 1);
     a.stur(9, 2, layout.entry_value as i32);
@@ -13563,16 +13680,14 @@ fn emit_linked_scan_materialize(
     a.ldur(9, 0, strong);
     a.add_imm(9, 9, if peek_object { 2 } else { 1 });
     a.stur(9, 0, strong);
-    a.movz(9, 8, 0); // Value::Obj
+    a.mov_imm64(9, crate::value::PACK_OBJ);
+    a.logic_x(1, 9, 9, 0);
     a.str_imm(9, 22, plan.next_off);
-    a.str_imm(0, 22, plan.next_off + 8);
     if peek_object {
         a.str_imm(9, 22, plan.peek_off);
-        a.str_imm(0, 22, plan.peek_off + 8);
     } else {
-        a.movz(9, 2, 0); // Value::Null
+        a.mov_imm64(9, crate::value::PACK_NULL);
         a.str_imm(9, 22, plan.peek_off);
-        a.str_imm(31, 22, plan.peek_off + 8);
     }
 
     // Preamble guards proved these decrements cannot hit the last reference, including when the
@@ -13598,6 +13713,7 @@ fn emit_linked_scan_materialize(
 fn emit_linked_scan_region(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
     plan: &LinkedScanPlan,
     pc_labels: &[usize],
 ) -> usize {
@@ -13609,15 +13725,15 @@ fn emit_linked_scan_region(
 
     // Pin the old slot owners for one-time replacement.  Reject BigInt and any reference whose
     // decrement might invoke a destructor; the baseline path remains untouched on rejection.
-    a.ldrb_imm(9, 22, plan.next_off);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, plain_h);
-    a.ldr_imm(3, 22, plan.next_off + 8);
+    a.ldr_imm(9, 22, plan.next_off);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, plain_h);
+    emit_exec_payload(a, 9, 3);
     a.ldur(9, 3, strong);
     a.cmp_imm_x(9, 1);
     a.b_cond(C_LS, plain_h);
-    a.ldrb_imm(4, 22, plan.peek_off);
-    a.ldr_imm(5, 22, plan.peek_off + 8);
+    a.ldr_imm(9, 22, plan.peek_off);
+    emit_exec_kind(a, 9, 4, 10, plain_h);
+    emit_exec_payload(a, 9, 5);
     a.cmp_imm_w(4, 5);
     a.b_cond(C_EQ, plain_h); // BigInt has a different ownership representation
     let peek_safe = a.new_label();
@@ -13660,6 +13776,7 @@ fn emit_linked_scan_region(
     }
     a.mov(0, 15);
     a.movz(8, 1, 0);
+    emit_region_poll_guard(a, ilayout, fail, false);
     a.b(body);
 
     a.bind(found_null);
@@ -13683,6 +13800,7 @@ fn emit_linked_scan_region(
 fn emit_numeric_diamond_region(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
     plan: &NumericDiamondPlan,
     pc_labels: &[usize],
 ) -> usize {
@@ -13690,19 +13808,24 @@ fn emit_numeric_diamond_region(
     let body = a.new_label();
     let exit = a.new_label();
     let store_bail = a.new_label();
+    let poll_bail = a.new_label();
     let ev = layout.entry_value as i32;
+
+    #[cfg(test)]
+    emit_numeric_diamond_probe(a, 0);
 
     // Invariant free-name limit.  Validation comes first because the shared name probe clobbers
     // x9-x17; fixed homes are populated afterwards.
     emit_region_name_i32(a, layout, plan.limit_cache, 1, plain_h);
+    #[cfg(test)]
+    emit_numeric_diamond_probe(a, 1);
 
     // Resolve `owner.array` before populating caller-saved fixed homes. The optional C-ABI
     // protector check may clobber x0-x18; afterwards x4 holds its packed Vec header (or null),
     // x5 keeps the borrowed array Rc pointer, and the remainder of the preamble is helper-free.
-    a.ldrb_imm(9, 22, plan.owner_off);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, plain_h);
-    a.ldr_imm(10, 22, plan.owner_off + 8);
+    a.ldr_imm(10, 22, plan.owner_off);
+    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 9, plain_h);
+    emit_exec_payload(a, 10, 10);
     emit_region_own_entry(a, layout, 10, 11, 12, plan.array_prop, false, plain_h);
     a.ldur(13, 12, ev);
     a.lsr_imm(9, 13, 48);
@@ -13726,12 +13849,12 @@ fn emit_numeric_diamond_region(
     a.mov(1, 23);
     a.mov(5, 24);
     a.ldp_post(23, 24, 16);
+    #[cfg(test)]
+    emit_numeric_diamond_probe(a, 2);
 
     // Numeric induction local, exact i32 and non-negative (dense element key invariant).
-    a.ldrb_imm(9, 22, plan.index_off);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_NE, plain_h);
-    a.ldr_d_imm(0, 22, plan.index_off + 8);
+    a.ldr_imm(9, 22, plan.index_off);
+    emit_exec_number_guard(a, 9, 0, 10, plain_h);
     emit_region_exact_i32(a, 0, 0, plain_h);
     a.cmp_imm_x(0, 0);
     a.b_cond(C_MI, plain_h);
@@ -13748,6 +13871,8 @@ fn emit_numeric_diamond_region(
     emit_region_own_entry(a, layout, 10, 11, 2, plan.counter, true, plain_h);
     emit_region_packed_number(a, 2, ev, 0, plain_h);
     emit_region_exact_i32(a, 0, 8, plain_h);
+    #[cfg(test)]
+    emit_numeric_diamond_probe(a, 3);
 
     // Pin either the packed slots or the coherent classic mirror/entry tables for the loop.
     a.mov(13, 5);
@@ -13766,6 +13891,15 @@ fn emit_numeric_diamond_region(
     a.cbnz(4, true, packed_array);
     let mirror_flags = (layout.obj_props + layout.props_mirror_flags) as u32;
     a.ldrb_imm(9, 3, mirror_flags);
+    // A rejected packed-slot preparation must not interpret its mirror as a classic
+    // index-to-entry map. This specialized hole-filling emitter has its own packed mode.
+    a.logic_imm_w(
+        0,
+        12,
+        9,
+        asm::logical_imm_w(crate::value::MIRROR_PACKED as u32).unwrap(),
+    );
+    a.cbnz(12, false, plain_h);
     let need = (crate::value::MIRROR_OK | crate::value::MIRROR_NO_HOLES) as u32;
     let mask = asm::logical_imm_w(need).expect("mirror region mask");
     a.logic_imm_w(0, 9, 9, mask);
@@ -13791,6 +13925,8 @@ fn emit_numeric_diamond_region(
     a.bind(array_ready);
     a.cmp_reg_x(1, 5);
     a.b_cond(C_HI, plain_h); // every possible loop key is inside the pinned mirror
+    #[cfg(test)]
+    emit_numeric_diamond_probe(a, 4);
 
     // Rotated loop: the zero-trip condition observes no property/element write.
     a.cmp_reg_x(0, 1);
@@ -13831,6 +13967,7 @@ fn emit_numeric_diamond_region(
     a.bind(stored);
 
     a.add_imm(0, 0, 1);
+    emit_region_poll_guard(a, ilayout, poll_bail, false);
     a.cmp_reg_x(0, 1);
     a.b_cond(11, body); // signed <
     a.bind(exit);
@@ -13842,7 +13979,51 @@ fn emit_numeric_diamond_region(
     a.bind(store_bail);
     emit_numeric_diamond_flush(a, layout, plan);
     a.b(pc_labels[plan.head + 12]);
+    a.bind(poll_bail);
+    emit_numeric_diamond_flush(a, layout, plan);
+    a.b(pc_labels[plan.head]);
     plain_h
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+thread_local! {
+    static TEST_NUMERIC_REGION_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_NUMERIC_DIAMOND_STAGES: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+extern "C" fn record_numeric_diamond_stage(stage: usize) {
+    TEST_NUMERIC_DIAMOND_STAGES.with(|counter| {
+        let mut counts = counter.get();
+        counts[stage] += 1;
+        counter.set(counts);
+    });
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+fn emit_numeric_diamond_probe(a: &mut asm::Asm, stage: usize) {
+    a.stp_pre(0, 1, -400);
+    for register in (2..18).step_by(2) {
+        a.stp_off(register, register + 1, register as i32 * 8);
+    }
+    for register in (0..32).step_by(2) {
+        a.stp_d_off(register, register + 1, 144 + register as i32 * 8);
+    }
+    a.mov_imm64(0, stage as u64);
+    a.mov_imm64(16, record_numeric_diamond_stage as *const () as u64);
+    a.blr(16);
+    for register in (0..32).step_by(2) {
+        a.ldp_d_off(register, register + 1, 144 + register as i32 * 8);
+    }
+    for register in (2..18).step_by(2) {
+        a.ldp_off(register, register + 1, register as i32 * 8);
+    }
+    a.ldp_post(0, 1, 400);
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+extern "C" fn record_numeric_region_entry() {
+    TEST_NUMERIC_REGION_ENTRIES.with(|count| count.set(count.get() + 1));
 }
 
 /// Emit the loop chain for `plan`. Returns the label for the plain fallback of the head op —
@@ -13855,10 +14036,19 @@ fn emit_numeric_diamond_region(
 fn emit_loop_chain(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
     plan: &LoopPlan,
     pc_labels: &[usize],
     targeted: &mut [bool],
 ) -> usize {
+    // A helper-free region can keep its poll divider in a register, writing the
+    // shared tick at every exit. Unsupported layouts retain canonical polling.
+    if !ilayout.valid
+        || !ilayout.interrupt_poll_tick.is_multiple_of(4)
+        || ilayout.interrupt_poll_tick / 4 >= 4096
+    {
+        return a.new_label();
+    }
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
@@ -13887,23 +14077,26 @@ fn emit_loop_chain(
     let body_l = a.new_label();
     let exit_a = a.new_label();
     let exit_b = a.new_label();
+    let poll_bail = a.new_label();
     // x23-x28 bracket (see LoopPlan::uses_ext): saved before ANY preamble step (receiver bases
     // may live in ext registers), reloaded on every path out — preamble failures route through
     // `pre_fail`, exits and bails emit the reload inline.
-    let pre_fail = if plan.uses_ext {
-        a.new_label()
-    } else {
-        plain_h
-    };
+    let pre_fail = a.new_label();
     if plan.uses_ext {
         a.stp_pre(23, 24, -48);
         a.stp_off(25, 26, 16);
         a.stp_off(27, 28, 32);
+    } else {
+        a.stp_pre(28, 31, -16);
     }
     let restore_ext = |a: &mut asm::Asm| {
-        a.ldp_off(25, 26, 16);
-        a.ldp_off(27, 28, 32);
-        a.ldp_post(23, 24, 48);
+        if plan.uses_ext {
+            a.ldp_off(25, 26, 16);
+            a.ldp_off(27, 28, 32);
+            a.ldp_post(23, 24, 48);
+        } else {
+            a.ldp_post(28, 31, 16);
+        }
     };
 
     let slot = |off: u32| plan.slots.iter().find(|s| s.off == off);
@@ -13928,8 +14121,9 @@ fn emit_loop_chain(
     // the original loop before its condition/RHS: it may be zero-trip or throw from the RHS
     // first. Once admitted, no operation in the helper-free loop can uninitialize a local.
     for off in &plan.initialization_guards {
-        a.ldrb_imm(9, 22, *off);
-        a.cmp_imm_w(9, 1);
+        a.ldr_imm(9, 22, *off);
+        a.mov_imm64(10, crate::value::PACK_EMPTY);
+        a.cmp_reg_x(9, 10);
         a.b_cond(C_EQ, pre_fail);
     }
     // Validate names before populating integer local homes: the shared IC probe uses x7 as its
@@ -13946,7 +14140,7 @@ fn emit_loop_chain(
             let number = a.new_label();
             a.movz(11, (crate::value::PACK_OBJ >> 48) as u32, 0);
             a.cmp_reg_x(10, 11);
-            a.b_cond(C_EQ, pre_fail);
+            a.b_cond(C_HS, pre_fail);
             a.movz(11, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
             a.cmp_reg_x(10, 11);
             a.b_cond(C_LO, number);
@@ -13975,19 +14169,19 @@ fn emit_loop_chain(
     for s in &plan.slots {
         if s.virgin {
             // The old value must be drop-free so flushes can plain-overwrite.
-            a.ldrb_imm(9, 22, s.off);
-            a.cmp_imm_w(9, 5);
+            a.ldr_imm(9, 22, s.off);
+            emit_exec_kind(a, 9, 10, 11, pre_fail);
+            a.cmp_imm_w(10, 5);
             a.b_cond(C_HS, pre_fail);
         }
         if !s.preload {
             continue;
         }
-        a.ldrb_imm(9, 22, s.off);
-        a.cmp_imm_w(9, 4);
-        a.b_cond(C_NE, pre_fail);
+        a.ldr_imm(9, 22, s.off);
+        emit_exec_number_guard(a, 9, 0, 10, pre_fail);
         match s.res {
             SlotRes::F(d) => {
-                a.ldr_d_imm(d, 22, s.off + 8);
+                a.ldr_d_imm(d, 22, s.off);
                 if s.int_checked {
                     // One-time exact-i32 proof (bit-compare: -0.0 must not pass); the value
                     // stays in its d home and integer consumers convert with a bare fcvtzs.
@@ -14002,7 +14196,7 @@ fn emit_loop_chain(
             SlotRes::I(x) => {
                 // Exact i32 (w-form conversion + compare-back): counters keep the invariant
                 // with a flag-setting ±1, and the planner's range analysis starts from 2^31.
-                a.ldr_d_imm(0, 22, s.off + 8);
+                a.ldr_d_imm(0, 22, s.off);
                 a.fcvtzs_w_d(x, 0);
                 a.scvtf_d_w(1, x);
                 a.fmov_x_d(9, 1);
@@ -14017,10 +14211,9 @@ fn emit_loop_chain(
     // Receiver bases come last because the name probe also clobbers x16/x17.
     for rp in &plan.receivers {
         let (off, r) = (rp.off, rp.reg);
-        a.ldrb_imm(10, 22, off);
-        a.cmp_imm_w(10, 8);
-        a.b_cond(C_NE, pre_fail);
-        a.ldr_imm(10, 22, off + 8);
+        a.ldr_imm(10, 22, off);
+        emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, pre_fail);
+        emit_exec_payload(a, 10, 10);
         a.add_imm(r, 10, rcv);
         a.ldrb_imm(12, r, ex);
         let ex_ok = a.new_label();
@@ -14039,10 +14232,47 @@ fn emit_loop_chain(
                 need |= crate::value::MIRROR_ALL_I32 as u32;
             }
             a.ldrb_imm(12, r, mf);
+            a.mov(13, 12);
             let field = asm::logical_imm_w(need).expect("mirror mask encodable");
             a.logic_imm_w(0, 12, 12, field);
             a.cmp_imm_w(12, need);
-            a.b_cond(C_NE, pre_fail);
+            if packed_elem_inlinable(layout) {
+                let ready = a.new_label();
+                a.b_cond(C_EQ, ready);
+                // Existing coherent non-i32 mirrors cannot satisfy an int-read proof. An
+                // earlier failed packed preparation must not rescan on every slow iteration.
+                for bit in [crate::value::MIRROR_OK, crate::value::MIRROR_PACKED_FAILED] {
+                    a.logic_imm_w(0, 12, 13, asm::logical_imm_w(bit as u32).unwrap());
+                    a.cbnz(12, false, pre_fail);
+                }
+                a.ldr_imm(12, r, el);
+                a.cbz(12, true, pre_fail);
+                emit_packed_elements_base(a, layout, pre_fail);
+                // Cold representation preparation preserves all already established integer
+                // homes/receiver pins. d8..d15 are preserved by the C ABI; no transient FP
+                // operand exists in this preamble. This helper cannot execute JS or GC.
+                a.stp_pre(0, 1, -144);
+                for register in (2..18).step_by(2) {
+                    a.stp_off(register, register + 1, register as i32 * 8);
+                }
+                a.sub_imm(0, r, rcv);
+                // Execution payloads contain Rc's allocation word, not Rc::as_ptr's data
+                // address. Rust's borrowed Rc view requires the probed data adjustment.
+                a.add_imm(0, 0, layout.gc_data_off as u32);
+                a.mov_imm64(16, jit_prepare_packed_numeric_mirror as *const () as u64);
+                a.blr(16);
+                for register in (2..18).step_by(2) {
+                    a.ldp_off(register, register + 1, register as i32 * 8);
+                }
+                a.ldp_post(0, 1, 144);
+                a.ldrb_imm(12, r, mf);
+                a.logic_imm_w(0, 12, 12, field);
+                a.cmp_imm_w(12, need);
+                a.b_cond(C_NE, pre_fail);
+                a.bind(ready);
+            } else {
+                a.b_cond(C_NE, pre_fail);
+            }
         }
         // Pinned vector fields (stable for the whole region — helper-free vocabulary, and slim
         // stores never grow or reallocate).
@@ -14064,6 +14294,29 @@ fn emit_loop_chain(
         if let Some(x) = rp.enreg {
             a.ldr_imm(x, r, en);
         }
+    }
+
+    #[cfg(test)]
+    {
+        // Runtime evidence after every numeric/receiver guard, not a compilation counter.
+        // This test-only observer does not run JS or GC. Preserve all volatile homes;
+        // generated release code has no observer, storage, or additional instructions.
+        a.stp_pre(0, 1, -400);
+        for register in (2..18).step_by(2) {
+            a.stp_off(register, register + 1, register as i32 * 8);
+        }
+        for register in (0..32).step_by(2) {
+            a.stp_d_off(register, register + 1, 144 + register as i32 * 8);
+        }
+        a.mov_imm64(16, record_numeric_region_entry as *const () as u64);
+        a.blr(16);
+        for register in (0..32).step_by(2) {
+            a.ldp_d_off(register, register + 1, 144 + register as i32 * 8);
+        }
+        for register in (2..18).step_by(2) {
+            a.ldp_off(register, register + 1, register as i32 * 8);
+        }
+        a.ldp_post(0, 1, 400);
     }
 
     // ---- emission state --------------------------------------------------------------------
@@ -14258,11 +14511,10 @@ fn emit_loop_chain(
                                 vstack.push(LV::I(xres, true));
                             }
                             SlotRes::None => {
-                                a.ldrb_imm(9, 22, off);
-                                a.cmp_imm_w(9, 4);
-                                a.b_cond(C_NE, guard!());
+                                a.ldr_imm(9, 22, off);
+                                emit_exec_number_guard(a, 9, 0, 10, guard!());
                                 let dt = free_d.pop().expect("loop d pool");
-                                a.ldr_d_imm(dt, 22, off + 8);
+                                a.ldr_d_imm(dt, 22, off);
                                 let iv = matches!(plan.kinds[idx], PushKind::D { iv: true });
                                 vstack.push(LV::D(dt, iv));
                             }
@@ -14325,14 +14577,13 @@ fn emit_loop_chain(
                                 }
                             }
                             SlotRes::None => {
-                                a.ldrb_imm(9, 22, off);
-                                a.cmp_imm_w(9, 4);
-                                a.b_cond(C_NE, guard!());
+                                a.ldr_imm(9, 22, off);
+                                emit_exec_number_guard(a, 9, 0, 10, guard!());
                                 let f = if dec { 1 } else { 0 };
-                                a.ldr_d_imm(0, 22, off + 8);
+                                a.ldr_d_imm(0, 22, off);
                                 a.fmov_one(1);
                                 a.f_arith(f, 1, 0, 1);
-                                a.str_d_imm(1, 22, off + 8);
+                                emit_exec_number_store(a, 1, 22, off as i32, 9);
                                 match kind {
                                     UpdKind::PostInc | UpdKind::PostDec => {
                                         let dt = free_d.pop().expect("loop d pool");
@@ -14404,6 +14655,20 @@ fn emit_loop_chain(
                                     }
                                 };
                                 if matches!(plan.kinds[idx], PushKind::I { .. }) {
+                                    if rp.recheck_i32 {
+                                        // A previous numeric write may target this same object
+                                        // through any receiver local. Guard before consuming
+                                        // this read; earlier stores remain committed on bailout.
+                                        a.ldrb_imm(12, rp.reg, mf);
+                                        a.logic_imm_w(
+                                            0,
+                                            12,
+                                            12,
+                                            asm::logical_imm_w(crate::value::MIRROR_ALL_I32 as u32)
+                                                .unwrap(),
+                                        );
+                                        a.cbz(12, false, guard!());
+                                    }
                                     a.ldr_d_lsl3(0, mpr, 9);
                                     let xt = free_i.pop().expect("loop i pool");
                                     a.fcvtzs_w_d(xt, 0);
@@ -14490,6 +14755,24 @@ fn emit_loop_chain(
                                 }
                             }
                             a.b_cond(C_HS, guard!());
+                            let canonical_stored = a.new_label();
+                            if packed_elem_inlinable(layout) {
+                                let classic_store = a.new_label();
+                                a.ldrb_imm(12, r, mf);
+                                a.logic_imm_w(
+                                    0,
+                                    12,
+                                    12,
+                                    asm::logical_imm_w(crate::value::MIRROR_PACKED as u32).unwrap(),
+                                );
+                                a.cbz(12, false, classic_store);
+                                a.ldr_imm(12, r, el);
+                                emit_packed_elements_base(a, layout, guard!());
+                                a.add_shifted(15, 15, 9, 4);
+                                emit_exec_number_store(a, 2, 15, layout.property_value as i32, 14);
+                                a.b(canonical_stored);
+                                a.bind(classic_store);
+                            }
                             let elpr = match rp.elpreg {
                                 Some(x) => x,
                                 None => {
@@ -14512,7 +14795,12 @@ fn emit_loop_chain(
                             };
                             a.movz(12, es as u32, 0);
                             a.madd(15, 13, 12, enr);
-                            a.stur_d(2, 15, num_ev);
+                            if layout.entry_accessor == layout.entry_value + 8 {
+                                emit_exec_number_store(a, 2, 15, num_ev, 14);
+                            } else {
+                                a.stur_d(2, 15, num_ev);
+                            }
+                            a.bind(canonical_stored);
                             match rp.mpreg {
                                 Some(x) => a.str_d_lsl3(2, x, 9),
                                 None => {
@@ -14750,22 +15038,9 @@ fn emit_loop_chain(
                             },
                             SlotRes::None => {
                                 let dv = to_d!(v);
-                                a.ldrb_imm(9, 22, off);
-                                a.cmp_imm_w(9, 5);
-                                a.b_cond(C_EQ, guard!());
-                                let st_plain = a.new_label();
-                                a.cmp_imm_w(9, 6);
-                                a.b_cond(C_LO, st_plain);
-                                a.ldr_imm(10, 22, off + 8);
-                                a.ldur(11, 10, strong);
-                                a.cmp_imm_x(11, 1);
-                                a.b_cond(C_LS, guard!());
-                                a.sub_imm(11, 11, 1);
-                                a.stur(11, 10, strong);
-                                a.bind(st_plain);
-                                a.movz(9, 4, 0);
-                                a.str_imm(9, 22, off);
-                                a.str_d_imm(dv, 22, off + 8);
+                                a.ldr_imm(9, 22, off);
+                                emit_exec_drop_shared(a, layout, 9, 10, 11, guard!());
+                                emit_exec_number_store(a, dv, 22, off as i32, 9);
                                 dead.push(LV::D(dv, false));
                             }
                         }
@@ -14899,6 +15174,7 @@ fn emit_loop_chain(
     }
 
     // ---- rotated loop ----------------------------------------------------------------------
+    emit_region_poll_start(a, ilayout, 28);
     emit_pass!(0..plan.cond_len, exit_a, Vec::new());
     // Keep hot-loop placement stable when cold preamble checks grow. The override is for
     // release A/B diagnostics, not a semantic switch; 0 disables padding. Large-branch
@@ -14917,6 +15193,8 @@ fn emit_loop_chain(
         exit_b,
         cond_virgins.clone()
     );
+    a.subs_imm_w(28, 28, 1);
+    a.b_cond(C_EQ, poll_bail);
     emit_pass!(0..plan.cond_len, exit_b, all_virgins.clone());
     a.b(body_l);
 
@@ -14937,61 +15215,58 @@ fn emit_loop_chain(
                 }
                 SlotRes::None => continue, // stores wrote through
             };
-            if s.virgin {
-                a.movz(9, 4, 0);
-                a.str_imm(9, 22, s.off);
-                a.str_d_imm(d, 22, s.off + 8);
-            } else {
-                a.str_d_imm(d, 22, s.off + 8);
-            }
+            emit_exec_number_store(a, d, 22, s.off as i32, 9);
         }
     };
     a.bind(exit_a);
     emit_flush(a, &cond_virgins);
-    if plan.uses_ext {
-        restore_ext(a);
-    }
+    emit_region_poll_finish(a, ilayout, 28);
+    restore_ext(a);
     a.b(pc_labels[plan.exit_pc]);
     a.bind(exit_b);
     emit_flush(a, &all_virgins);
-    if plan.uses_ext {
-        restore_ext(a);
-    }
+    emit_region_poll_finish(a, ilayout, 28);
+    restore_ext(a);
     a.b(pc_labels[plan.exit_pc]);
-    if plan.uses_ext {
-        a.bind(pre_fail);
-        restore_ext(a);
-        a.b(plain_h);
-    }
+    a.bind(poll_bail);
+    emit_flush(a, &all_virgins);
+    // Leave the due increment to the canonical header, with every root materialized.
+    a.movz(28, 1, 0);
+    emit_region_poll_finish(a, ilayout, 28);
+    restore_ext(a);
+    a.b(pc_labels[plan.head]);
+    a.bind(pre_fail);
+    restore_ext(a);
+    a.b(plain_h);
 
     for (idx, label, snap, seen) in bails {
         a.bind(label);
         for v in &snap {
             match *v {
                 LV::K(bits) => {
-                    a.mov_imm64(9, bits);
-                    a.movz(10, 4, 0);
-                    a.stur(10, 20, 0);
-                    a.stur(9, 20, 8);
+                    a.mov_imm64(
+                        9,
+                        if f64::from_bits(bits).is_nan() {
+                            crate::value::PACK_CANON_NAN
+                        } else {
+                            bits
+                        },
+                    );
+                    a.stur(9, 20, 0);
                 }
                 LV::I(x, _) => {
                     a.scvtf_d_x(0, x);
-                    a.movz(9, 4, 0);
-                    a.stur(9, 20, 0);
-                    a.stur_d(0, 20, 8);
+                    a.stur_d(0, 20, 0);
                 }
                 LV::D(d, _) => {
-                    a.movz(9, 4, 0);
-                    a.stur(9, 20, 0);
-                    a.stur_d(d, 20, 8);
+                    emit_exec_number_store(a, d, 20, 0, 9);
                 }
             }
-            a.add_imm(20, 20, 16);
+            a.add_imm(20, 20, 8);
         }
         emit_flush(a, &seen);
-        if plan.uses_ext {
-            restore_ext(a);
-        }
+        emit_region_poll_finish(a, ilayout, 28);
+        restore_ext(a);
         let pc = plan.chain[idx].1;
         if pc == plan.head {
             a.b(plain_h);
@@ -15030,9 +15305,9 @@ fn emit_op_helper(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
     a.cbnz(1, false, l_unwind);
 }
 
-/// Cheap generated-loop divider plus the full shared host-control poll. The hot path is six
-/// integer instructions and no call; cancellation/deadline state is consulted every 16,384 loop
-/// headers, matching the interpreter/bytecode cadence.
+/// Generated-loop safepoint. Allocation pressure must not wait for the interrupt divider:
+/// call-free loops can allocate cycles, and deferring optional task collection does not
+/// defer the live-object ceiling. The cold helper sees canonical owned frame roots.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -15043,20 +15318,110 @@ fn emit_interrupt_poll(
     l_unwind: usize,
 ) {
     let offset = ilayout.interrupt_poll_tick;
-    if !ilayout.valid || !offset.is_multiple_of(4) || offset / 4 >= 4096 {
+    if !ilayout.valid
+        || !offset.is_multiple_of(4)
+        || offset / 4 >= 4096
+        || !ilayout.gc_next.is_multiple_of(8)
+        || ilayout.gc_next / 8 >= 4096
+    {
         emit_op_helper(a, H_INTERRUPT, 0, l_unwind);
         return;
     }
     let done = a.new_label();
+    let slow = a.new_label();
     a.ldr_imm(14, 19, 72); // ctx.interp
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
+    a.ldr_imm(9, 9, 0);
+    a.ldr_imm(10, 14, ilayout.gc_next as u32);
+    a.cmp_reg_x(9, 10);
+    a.b_cond(C_GT, slow);
     a.ldr_w_imm(9, 14, offset as u32);
     a.add_imm(9, 9, 1);
     a.str_w_imm(9, 14, offset as u32);
     let mask = asm::logical_imm_w(0x3fff).expect("interrupt divider mask is encodable");
     a.logic_imm_w(0, 10, 9, mask);
     a.cbnz(10, false, done);
+    a.bind(slow);
     emit_op_helper(a, H_INTERRUPT, 0, l_unwind);
     a.bind(done);
+}
+
+/// Start a helper-free region's register countdown. Since its body cannot enter author
+/// code, helpers or GC, the shared tick cannot change before its matching finish.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_region_poll_start(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
+    counter: u32,
+) {
+    a.ldr_imm(14, 19, 72);
+    a.ldr_w_imm(9, 14, ilayout.interrupt_poll_tick as u32);
+    a.logic_imm_w(0, 9, 9, asm::logical_imm_w(0x3fff).unwrap());
+    a.movz(counter, 16384, 0);
+    a.sub_reg(counter, counter, 9);
+}
+
+/// Commit all private backedges, including wraparound, to the shared divider. Cold exits
+/// amortize this memory traffic; the hot loop needs only SUBS + conditional branch.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_region_poll_finish(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
+    counter: u32,
+) {
+    a.ldr_imm(14, 19, 72);
+    a.ldr_w_imm(9, 14, ilayout.interrupt_poll_tick as u32);
+    a.logic_imm_w(1, 9, 9, asm::logical_imm_w(0x3fff).unwrap());
+    a.add_imm(9, 9, 1);
+    a.sub_reg(9, 9, counter);
+    a.str_w_imm(9, 14, ilayout.interrupt_poll_tick as u32);
+}
+
+/// Private optimized backedges must participate in the same cancellation cadence as
+/// canonical headers. On a due tick materialize and revisit that header without storing
+/// the tick: it performs the poll exactly once with all owned roots visible to helpers.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_region_poll_guard(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
+    bail: usize,
+    check_allocation: bool,
+) {
+    let offset = ilayout.interrupt_poll_tick;
+    if !ilayout.valid || !offset.is_multiple_of(4) || offset / 4 >= 4096 {
+        a.b(bail);
+        return;
+    }
+    a.ldr_imm(14, 19, 72);
+    // A general region may allocate through checked effects. Bail to its canonical
+    // header before collection, so virtual operands/private homes are materialized.
+    // Helper-free numeric regions use their separate register-only countdown.
+    if check_allocation {
+        if !ilayout.gc_next.is_multiple_of(8) || ilayout.gc_next / 8 >= 4096 {
+            a.b(bail);
+            return;
+        }
+        a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
+        a.ldr_imm(9, 9, 0);
+        a.ldr_imm(10, 14, ilayout.gc_next as u32);
+        a.cmp_reg_x(9, 10);
+        a.b_cond(C_GT, bail);
+    }
+    a.ldr_w_imm(9, 14, offset as u32);
+    a.add_imm(9, 9, 1);
+    let mask = asm::logical_imm_w(0x3fff).unwrap();
+    a.logic_imm_w(0, 10, 9, mask);
+    a.cbz(10, false, bail);
+    a.str_w_imm(9, 14, offset as u32);
 }
 
 /// An infallible helper (returns the new sp): return/handler bookkeeping.
@@ -15071,6 +15436,42 @@ fn emit_helper(a: &mut asm::Asm, idx: usize, imm: u32) {
     a.ldr_imm(16, 21, (idx * 8) as u32);
     a.blr(16);
     a.mov(20, 0);
+}
+
+/// Return only after the completion router has established that no finalizer/iterator
+/// pad must execute (ECMA-262 ReturnStatement and TryStatement Evaluation). A direct
+/// callee can inherit an occupied result after a failed tail call, so prove vacancy
+/// before transferring ownership; the checked fallback drops a displaced owner once.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_return(a: &mut asm::Asm, mode: u32, ret_ok: usize) {
+    let slow = a.new_label();
+    let ret = std::mem::offset_of!(JitCtx, ret) as u32;
+    a.ldr_imm(9, 19, ret);
+    a.mov_imm64(10, crate::value::PACK_UNDEFINED);
+    a.cmp_reg_x(9, 10);
+    a.b_cond(C_NE, slow);
+    if mode == 1 {
+        a.ldur(9, 20, -8);
+        a.sub_imm(20, 20, 8);
+        a.str_imm(9, 19, ret);
+    }
+    a.b(ret_ok);
+    a.bind(slow);
+    emit_helper(a, H_RETURN, mode);
+    a.b(ret_ok);
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_completion(a: &mut asm::Asm, pc: u32, ret_ok: usize) {
+    emit_helper(a, H_COMPLETE, pc);
+    a.cbz(1, true, ret_ok);
+    a.br(1);
 }
 
 /// Record one unconditional loop back-edge without changing the operand-stack pointer. This is
@@ -15133,13 +15534,15 @@ fn emit_peek_cond_inline(
 ) {
     let done = a.new_label();
     let l_false = a.new_label();
-    a.ldurb(9, 20, -16);
+    emit_exec_word_load(a, 12, 20, -8);
     if not_nullish {
         // Empty is an internal completion marker, not nullish; preserve the helper's exact
         // `Undefined | Null` predicate even though Empty should not escape onto this stack.
-        a.cmp_imm_w(9, 0);
+        a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+        a.cmp_reg_x(12, 9);
         a.b_cond(C_EQ, l_false);
-        a.cmp_imm_w(9, 2);
+        a.mov_imm64(9, crate::value::PACK_NULL);
+        a.cmp_reg_x(12, 9);
         a.cset_w(1, C_NE);
         a.b(done);
         a.bind(l_false);
@@ -15154,27 +15557,30 @@ fn emit_peek_cond_inline(
     let l_str = a.new_label();
     let l_obj = a.new_label();
     let l_true = a.new_label();
-    a.cmp_imm_w(9, 2);
-    a.b_cond(C_LS, l_false);
-    a.cmp_imm_w(9, 3);
-    a.b_cond(C_EQ, l_bool);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_EQ, l_num);
-    a.cmp_imm_w(9, 5);
-    a.b_cond(C_EQ, slow); // BigInt: inspect its arbitrary-precision payload in Rust.
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_EQ, l_str);
-    a.cmp_imm_w(9, 7);
-    a.b_cond(C_EQ, l_true); // Symbol
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_EQ, l_obj);
-    a.b(slow);
+    let tagged = a.new_label();
+    emit_exec_number_guard(a, 12, 0, 10, tagged);
+    a.b(l_num);
+    a.bind(tagged);
+    a.lsr_imm(9, 12, 48);
+    for (tag, target) in [
+        (crate::value::PACK_OBJ, l_obj),
+        (crate::value::PACK_BOOL, l_bool),
+        (crate::value::PACK_UNDEFINED, l_false),
+        (crate::value::PACK_NULL, l_false),
+        (crate::value::PACK_STR, l_str),
+        (crate::value::PACK_SYM, l_true),
+        (crate::value::PACK_EMPTY, l_false),
+    ] {
+        a.movz(10, (tag >> 48) as u32, 0);
+        a.cmp_reg_w(9, 10);
+        a.b_cond(C_EQ, target);
+    }
+    a.b(slow); // BigInt and property-only/reserved tags retain the checked path.
 
     a.bind(l_bool);
-    a.ldurb(1, 20, -15);
+    a.ldurb(1, 20, -8);
     a.b(done);
     a.bind(l_num);
-    a.ldur_d(0, 20, -8);
     a.movz(12, 0, 0);
     a.fmov_d_x(1, 12);
     a.fcmp(0, 1);
@@ -15185,13 +15591,15 @@ fn emit_peek_cond_inline(
     a.logic_w(2, 1, 11, 12); // invert to truthy
     a.b(done);
     a.bind(l_str);
-    a.ldur(12, 20, -8);
+    emit_exec_word_load(a, 12, 20, -8);
+    emit_exec_payload(a, 12, 12);
     a.ldr_w_imm(11, 12, crate::lstr::LEN_OFF as u32);
     a.cmp_imm_w(11, 0);
     a.cset_w(1, C_NE);
     a.b(done);
     a.bind(l_obj);
-    a.ldur(12, 20, -8);
+    emit_exec_word_load(a, 12, 20, -8);
+    emit_exec_payload(a, 12, 12);
     a.add_imm(11, 12, layout.obj_from_rc as u32);
     a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
     a.cbz(11, false, slow); // includes the engine's possible HTMLDDA object
@@ -15215,16 +15623,6 @@ fn emit_peek_cond_inline(
 /// `needs_global` CALLEE if the caller's ctx already carries the pointer — a null here forces
 /// every such call through the layered path. Falls back to null (never needed) or the original
 /// panicking borrow (needed, but the global is mutably borrowed — same failure as before).
-#[cfg(any(
-    all(
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    ),
-    all(
-        target_arch = "x86_64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    )
-))]
 fn jit_global_body(i: &Interp, code: &JitCode) -> *const u8 {
     if let Ok(b) = i.global.try_borrow() {
         &*b as *const crate::value::Object as *const u8
@@ -15234,6 +15632,198 @@ fn jit_global_body(i: &Interp, code: &JitCode) -> *const u8 {
     } else {
         std::ptr::null()
     }
+}
+
+/// Compile a resumable body lazily with the same executable-budget retry policy as ordinary
+/// functions. Unsupported architectures keep the authoritative bytecode continuation.
+pub(crate) fn continuation_code(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
+    debug_assert!(chunk.jit_is_resumable());
+    let permit = if chunk.jit.ready_to_compile()
+        && ensure_executable_capacity(chunk.jit_budget_wait_bytes.get())
+    {
+        chunk.jit.begin_compile()
+    } else {
+        None
+    };
+    if let Some(permit) = permit {
+        let layout = *i
+            .jit_layout
+            .get_or_init(|| crate::value::jit_layout(&i.object_proto));
+        if !i.interp_layout.get().valid {
+            let layout = crate::interpreter::interp_layout(i);
+            i.interp_layout.set(layout);
+        }
+        match compile_profiled(chunk, &layout, &i.interp_layout.get()) {
+            JitCompileOutcome::Compiled(code) => {
+                chunk.jit_budget_wait_bytes.set(0);
+                permit.commit(Some(Rc::new(code)));
+            }
+            JitCompileOutcome::Deferred { required_bytes } => {
+                chunk.jit_budget_wait_bytes.set(required_bytes);
+            }
+            JitCompileOutcome::Unavailable => {
+                permit.commit(None);
+            }
+        }
+    }
+    chunk.jit.get().flatten()
+}
+
+/// Run native instructions until the next exact VmStep, borrowing the heap continuation's
+/// owned-word buffers. Await/GeneratorYield and abrupt-completion routing remain in VmCoro;
+/// there is no suspended native stack or duplicated scope/reference/disposal state.
+///
+/// # Safety
+/// `state` points at distinct live fields of the same VmCoro for this complete call. No one
+/// else accesses its stack while the generated code owns the initialized prefix.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn run_continuation(
+    i: &mut Interp,
+    chunk: &Chunk,
+    code: &JitCode,
+    state: &mut crate::bytecode::NativeContinuation,
+    slots: &mut [PackedValue],
+    pc: &mut usize,
+    this_val: &Value,
+    handlers: &mut Vec<crate::bytecode::Handler>,
+) -> Result<crate::bytecode::VmStep, Abrupt> {
+    assert!(
+        chunk.jit_is_resumable(),
+        "ordinary code cannot enter a continuation"
+    );
+    run_borrowed_frame(i, chunk, code, state, slots, pc, this_val, handlers, false)
+}
+
+/// Borrow the existing execution context without fresh-function setup or replaying any op.
+/// ScriptEvaluation's Realm/environments/completion state remain owned by the VM driver;
+/// this is a tier transition, not a new ECMAScript call or suspension (§§9.4, 16.1.6).
+///
+/// # Safety
+/// All state fields must belong to this exact live Chunk/frame and remain pinned throughout
+/// native execution. The initial OSR caller must prove osr_entry_depth(pc) == stack.len();
+/// later calls resume only canonical completion state returned by this code/its VM driver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn run_borrowed_frame(
+    i: &mut Interp,
+    chunk: &Chunk,
+    code: &JitCode,
+    state: &mut crate::bytecode::NativeContinuation,
+    slots: &mut [PackedValue],
+    pc: &mut usize,
+    this_val: &Value,
+    handlers: &mut Vec<crate::bytecode::Handler>,
+    first_transfer: bool,
+) -> Result<crate::bytecode::VmStep, Abrupt> {
+    assert_eq!(
+        code.entry_kind,
+        NativeEntryKind::BorrowedFrame,
+        "fresh-frame code cannot borrow live execution storage"
+    );
+    assert_eq!(
+        state.chunk, chunk as *const Chunk,
+        "borrowed state must belong to the compiled chunk"
+    );
+    let stack = &mut *state.stack;
+    if first_transfer && code.osr_entry_depth(*pc) != Some(stack.len()) {
+        // Defensive validation happens before lending owners or changing the frame. Normal
+        // unsupported/ineligible headers are filtered by the driver and continue in the VM.
+        return Err(i.throw("InternalError", "invalid initial native OSR state"));
+    }
+    stack.reserve(code.max_stack.saturating_sub(stack.len()));
+    let stack_base = stack.as_mut_ptr();
+    let initial_depth = stack.len();
+    let env = &*state.env;
+    let mut ctx = JitCtx {
+        helpers: i.jit_helpers.as_ptr(),
+        stack_base,
+        final_sp: stack_base.add(initial_depth),
+        slots: slots.as_mut_ptr(),
+        inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
+        env_raw: Rc::as_ptr(env) as *const u8,
+        this_raw: std::ptr::null(),
+        global_body: jit_global_body(i, code),
+        genv: Rc::as_ptr(&i.global_env) as usize,
+        interp: i,
+        chunk,
+        this_val: this_val.clone(),
+        n_slots: slots.len(),
+        handlers: std::mem::take(handlers),
+        handler_floor: 0,
+        code_base: code.mem,
+        pc_offsets: code.pc_offsets.as_ptr(),
+        error: None,
+        ret: PackedValue::pack(Value::Undefined),
+        env_parent_raw: jit_env_parent_raw(env),
+        opstat_enabled: crate::bytecode::jit_opstat_enabled(),
+        callstat_enabled: crate::bytecode::jit_callstat_enabled(),
+        inline_recompile_at: crate::bytecode::inline_recompile_at(),
+        live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        activation: None,
+        resume_activation: state,
+        references_raw: (&mut *state.references).as_mut_ptr(),
+        resume_pc: *pc,
+        resume_step: None,
+    };
+    ctx.this_raw = &ctx.this_val;
+    stack.set_len(0);
+    let entry: extern "C" fn(*mut JitCtx) -> u64 = std::mem::transmute(code.mem);
+    let saved_strict = i.strict;
+    let outcome = loop {
+        if ctx.resume_pc == chunk.jit_ops().len() {
+            break Ok(crate::bytecode::VmStep::Done(Value::Undefined));
+        }
+        let depth = ctx.final_sp.offset_from(stack_base) as usize;
+        // Fail closed before indirect control transfer if a future compiler/driver violates
+        // the settled-stack contract. No unvalidated native code address is ever entered.
+        // Handler unwinding truncates to min(saved_depth, current_depth): an operation can
+        // consume operands before throwing. Its catch (and a later yield in that catch) can
+        // therefore legitimately have fewer live values than the static handler-root bound.
+        if code
+            .resume_depths
+            .get(ctx.resume_pc)
+            .copied()
+            .flatten()
+            .is_none_or(|bound| depth > bound)
+        {
+            break Err(i.throw("InternalError", "invalid native continuation state"));
+        }
+        if let Err(error) = i.interrupt_poll_force() {
+            break Err(error);
+        }
+        i.strict = if (&*state.class_states).iter().any(Option::is_some) {
+            true
+        } else {
+            chunk.jit_is_strict()
+        };
+        chunk.jit_runs.set(chunk.jit_runs.get().saturating_add(1));
+        #[cfg(test)]
+        if chunk.jit_is_resumable() {
+            TEST_NATIVE_SLICES.with(|count| count.set(count.get() + 1));
+        } else {
+            TEST_OSR_ENTRIES.with(|count| count.set(count.get() + 1));
+        }
+        let ok = entry(&mut ctx);
+        if let Some(error) = ctx.error.take() {
+            break Err(error);
+        }
+        assert_eq!(ok, 1, "native continuation exit must retain its error");
+        if let Some(step) = ctx.resume_step.take() {
+            break Ok(step);
+        }
+        // A synchronous DisposeNormal can finish without suspension. Continue from its
+        // settled bytecode successor using the same borrowed activation and no allocation.
+    };
+    i.strict = saved_strict;
+    (*state.stack).set_len(ctx.final_sp.offset_from(stack_base) as usize);
+    *handlers = std::mem::take(&mut ctx.handlers);
+    *pc = ctx.resume_pc;
+    outcome
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_NATIVE_SLICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static TEST_OSR_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Execute a JIT-compiled chunk: mirrors `bytecode::run` (activation env, pooled slot buffer),
@@ -15256,14 +15846,22 @@ pub fn run(
     this_val: Value,
     args: &[Value],
 ) -> Result<Value, Abrupt> {
+    assert_eq!(
+        code.entry_kind,
+        NativeEntryKind::FreshFrame,
+        "ordinary entry cannot borrow a live frame"
+    );
     let env = chunk.jit_make_run_env(i, env, &this_val, args);
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let (n_params, n_slots) = chunk.jit_frame();
     let seed = n_params.min(args.len());
-    slots.extend_from_slice(&args[..seed]);
-    slots.resize(n_slots, Value::Undefined);
+    slots.extend(args[..seed].iter().cloned().map(PackedValue::pack));
+    slots.resize_with(n_slots, || PackedValue::pack(Value::Undefined));
     if let Some(s) = chunk.jit_arguments_slot() {
-        slots[s as usize] = Value::Obj(i.make_compiled_arguments_object(args, &env));
+        slots.write_value(
+            s as usize,
+            Value::Obj(i.make_compiled_arguments_object(args, &env)),
+        );
     }
     stack.clear();
     stack.reserve(code.max_stack);
@@ -15290,21 +15888,21 @@ pub fn run(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         n_slots,
-        slots_packed: false,
         handlers: Vec::new(),
+        activation: None,
+        resume_activation: std::ptr::null_mut(),
+        references_raw: std::ptr::null_mut(),
+        resume_pc: 0,
+        resume_step: None,
         handler_floor: 0,
         code_base: code.mem,
         pc_offsets: code.pc_offsets.as_ptr(),
         error: None,
-        ret: Value::Undefined,
+        ret: PackedValue::pack(Value::Undefined),
     };
     ctx.this_raw = &ctx.this_val as *const Value;
-    if PACKED_LOCAL_SLOTS {
-        unsafe { ctx.pack_slots() };
-    }
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     let ok = entry(&mut ctx);
-    unsafe { ctx.unpack_slots() };
     drop(env); // the env handle must outlive the run (ctx.env_ref aliases it)
                // Drop any operands left on the raw stack (a throw can leave temporaries).
     unsafe {
@@ -15320,7 +15918,7 @@ pub fn run(
         i.vm_pool.push((slots, stack));
     }
     if ok == 1 {
-        Ok(std::mem::take(&mut ctx.ret))
+        Ok(ctx.take_ret().into_value())
     } else {
         Err(ctx
             .error
@@ -15329,19 +15927,19 @@ pub fn run(
     }
 }
 
-/// The per-frame buffer size (in `Value`s) of [`Interp::frame_pool`]: slots + operand stack of a
+/// The per-frame buffer size (in packed words) of [`Interp::frame_pool`]: slots + operand stack of a
 /// JIT fast-call frame carve one fixed raw buffer, so frame setup is a freelist pop + pointer
 /// math instead of `Vec` bookkeeping. Frames that need more fall back to the pooled-`Vec` path.
 pub(crate) const FRAME_BUF: usize = 256;
 
-/// [`run`] for the JIT→JIT fast call: takes ownership of `argc` argument `Value`s at `args`
+/// [`run`] for the JIT→JIT fast call: takes ownership of `argc` argument packed words at `args`
 /// (moved off the caller's operand stack — the caller must NOT drop them), seeding parameter
 /// slots by move instead of clone and dropping any surplus. Only for chunks with no activation
 /// environment (`Chunk::jit_no_activation`), so the arguments have exactly one consumer.
 /// `env` is borrowed raw: the caller keeps the aliased handle alive across the run.
 ///
 /// # Safety
-/// `args..args+argc` must be initialized `Value`s the caller relinquishes entirely; `*env` must
+/// `args..args+argc` must be initialized packed owners the caller relinquishes entirely; `*env` must
 /// outlive the run.
 #[cfg(any(
     all(
@@ -15359,7 +15957,7 @@ pub(crate) unsafe fn run_moved(
     code: &JitCode,
     env: *const Env,
     this_val: Value,
-    args: *mut Value,
+    args: *mut PackedValue,
     argc: usize,
     // `chunk.jit_frame()`, precomputed by the caller (the cached call reads it from its IC).
     frame: (usize, usize),
@@ -15395,16 +15993,16 @@ pub(crate) unsafe fn run_moved_shared(
     code: &JitCode,
     env: *const Env,
     this_val: Value,
-    args: *mut Value,
+    args: *mut PackedValue,
     argc: usize,
     (n_params, n_slots): (usize, usize),
 ) -> Result<Value, Abrupt> {
     let seed = n_params.min(argc);
-    let mut legacy: Option<(Vec<Value>, Vec<Value>)> = None;
+    let mut legacy: Option<crate::execution_storage::CompactFrame> = None;
     let (slots_ptr, stack_base) = if n_slots + code.max_stack <= FRAME_BUF {
         let buf = i.frame_pool.pop().unwrap_or_else(|| {
-            let b: Box<[std::mem::MaybeUninit<Value>]> = Box::new_uninit_slice(FRAME_BUF);
-            std::ptr::NonNull::new(Box::into_raw(b) as *mut Value).unwrap()
+            let b: Box<[std::mem::MaybeUninit<PackedValue>]> = Box::new_uninit_slice(FRAME_BUF);
+            std::ptr::NonNull::new(Box::into_raw(b) as *mut PackedValue).unwrap()
         });
         (buf.as_ptr(), unsafe { buf.as_ptr().add(n_slots) })
     } else {
@@ -15422,7 +16020,7 @@ pub(crate) unsafe fn run_moved_shared(
             std::ptr::drop_in_place(args.add(k));
         }
         for k in seed..n_slots {
-            *(slots_ptr.add(k) as *mut u8) = 0;
+            slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
         }
     }
 
@@ -15436,13 +16034,12 @@ pub(crate) unsafe fn run_moved_shared(
     let old_global_body = caller.global_body;
     let old_chunk = caller.chunk;
     let old_n_slots = caller.n_slots;
-    let old_slots_packed = caller.slots_packed;
     let old_handler_floor = caller.handler_floor;
     let old_code_base = caller.code_base;
     let old_pc_offsets = caller.pc_offsets;
     let old_this = std::mem::replace(&mut caller.this_val, this_val);
     let old_error = caller.error.take();
-    let old_ret = std::mem::take(&mut caller.ret);
+    let old_ret = caller.take_ret();
     let handlers_len = caller.handlers.len();
 
     caller.stack_base = stack_base;
@@ -15453,20 +16050,15 @@ pub(crate) unsafe fn run_moved_shared(
     caller.global_body = jit_global_body(i, code);
     caller.chunk = Rc::as_ptr(chunk);
     caller.n_slots = n_slots;
-    caller.slots_packed = false;
     caller.handler_floor = handlers_len;
     caller.code_base = code.mem;
     caller.pc_offsets = code.pc_offsets.as_ptr();
-    if PACKED_LOCAL_SLOTS {
-        unsafe { caller.pack_slots() };
-    }
 
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     let ok = entry(caller);
-    unsafe { caller.unpack_slots() };
     let callee_final_sp = caller.final_sp;
     let result = if ok == 1 {
-        Ok(std::mem::take(&mut caller.ret))
+        Ok(caller.take_ret().into_value())
     } else {
         Err(caller
             .error
@@ -15480,24 +16072,8 @@ pub(crate) unsafe fn run_moved_shared(
             std::ptr::drop_in_place(p);
             p = p.add(1);
         }
-        let rc_dec_ok = i
-            .jit_layout
-            .get()
-            .is_some_and(|l| l.valid && l.rc_strong_off == 0);
         for k in 0..n_slots {
-            let p = slots_ptr.add(k);
-            let tag = *(p as *const u8);
-            if tag < 5 {
-                continue;
-            }
-            if rc_dec_ok && tag >= 6 {
-                let strong = *(p as *const usize).add(1) as *mut usize;
-                if *strong > 1 {
-                    *strong -= 1;
-                    continue;
-                }
-            }
-            std::ptr::drop_in_place(p);
+            std::ptr::drop_in_place(slots_ptr.add(k));
         }
     }
     match legacy {
@@ -15508,7 +16084,7 @@ pub(crate) unsafe fn run_moved_shared(
             } else {
                 unsafe {
                     drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                        slots_ptr as *mut std::mem::MaybeUninit<Value>,
+                        slots_ptr as *mut std::mem::MaybeUninit<PackedValue>,
                         FRAME_BUF,
                     )));
                 }
@@ -15531,7 +16107,6 @@ pub(crate) unsafe fn run_moved_shared(
     caller.global_body = old_global_body;
     caller.chunk = old_chunk;
     caller.n_slots = old_n_slots;
-    caller.slots_packed = old_slots_packed;
     caller.handler_floor = old_handler_floor;
     caller.code_base = old_code_base;
     caller.pc_offsets = old_pc_offsets;
@@ -15562,11 +16137,14 @@ pub(crate) unsafe fn run_moved_env(
     code: &JitCode,
     definition_env: *const Env,
     this_val: Value,
-    args: *mut Value,
+    args: *mut PackedValue,
     argc: usize,
     frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
-    let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
+    let args_values = crate::execution_storage::DecodedArgs::new(unsafe {
+        std::slice::from_raw_parts(args, argc)
+    });
+    let args_ref = &args_values;
     let activation = chunk.jit_make_run_env(i, unsafe { &*definition_env }, &this_val, args_ref);
     let arguments = chunk.jit_arguments_slot().map(|slot| {
         (
@@ -15574,6 +16152,7 @@ pub(crate) unsafe fn run_moved_env(
             Value::Obj(i.make_compiled_arguments_object(args_ref, &activation)),
         )
     });
+    drop(args_values);
     unsafe {
         run_moved_inner(
             i,
@@ -15605,20 +16184,25 @@ unsafe fn run_moved_inner(
     code: &JitCode,
     env: *const Env,
     this_val: Value,
-    args: *mut Value,
+    args: *mut PackedValue,
     argc: usize,
     (n_params, n_slots): (usize, usize),
     arguments: Option<(usize, Value)>,
 ) -> Result<Value, Abrupt> {
+    assert_eq!(
+        code.entry_kind,
+        NativeEntryKind::FreshFrame,
+        "moved ordinary entry cannot borrow a live frame"
+    );
     let seed = n_params.min(argc);
     // Frame memory: one fixed-size raw buffer from the freelist ([slots | operand stack]);
     // oversized frames use the legacy pooled-Vec pair. The buffer is a plain allocation (not a
     // bump arena), so parked coroutines holding frames on other threads can't be aliased.
-    let mut legacy: Option<(Vec<Value>, Vec<Value>)> = None;
+    let mut legacy: Option<crate::execution_storage::CompactFrame> = None;
     let (slots_ptr, stack_base) = if n_slots + code.max_stack <= FRAME_BUF {
         let buf = i.frame_pool.pop().unwrap_or_else(|| {
-            let b: Box<[std::mem::MaybeUninit<Value>]> = Box::new_uninit_slice(FRAME_BUF);
-            std::ptr::NonNull::new(Box::into_raw(b) as *mut Value).unwrap()
+            let b: Box<[std::mem::MaybeUninit<PackedValue>]> = Box::new_uninit_slice(FRAME_BUF);
+            std::ptr::NonNull::new(Box::into_raw(b) as *mut PackedValue).unwrap()
         });
         (buf.as_ptr(), unsafe { buf.as_ptr().add(n_slots) })
     } else {
@@ -15636,16 +16220,15 @@ unsafe fn run_moved_inner(
         for k in seed..argc {
             std::ptr::drop_in_place(args.add(k));
         }
-        // Initializing a slot to Undefined only needs the tag byte (repr(u8) discriminant 0):
-        // no consumer reads a Value's payload behind tag 0, so stale payload bytes are dead.
+        // A packed Undefined is a complete tagged word, never a zeroed wide discriminant.
         for k in seed..n_slots {
-            *(slots_ptr.add(k) as *mut u8) = 0;
+            slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
         }
         if let Some((slot, value)) = arguments {
             if slot < seed {
                 std::ptr::drop_in_place(slots_ptr.add(slot));
             }
-            slots_ptr.add(slot).write(value);
+            slots_ptr.add(slot).write(PackedValue::pack(value));
         }
     }
 
@@ -15671,54 +16254,31 @@ unsafe fn run_moved_inner(
         slots: slots_ptr,
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         n_slots,
-        slots_packed: false,
         handlers: Vec::new(),
+        activation: None,
+        resume_activation: std::ptr::null_mut(),
+        references_raw: std::ptr::null_mut(),
+        resume_pc: 0,
+        resume_step: None,
         handler_floor: 0,
         code_base: code.mem,
         pc_offsets: code.pc_offsets.as_ptr(),
         error: None,
-        ret: Value::Undefined,
+        ret: PackedValue::pack(Value::Undefined),
     };
     ctx.this_raw = &ctx.this_val as *const Value;
-    if PACKED_LOCAL_SLOTS {
-        unsafe { ctx.pack_slots() };
-    }
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     let ok = entry(&mut ctx);
-    unsafe { ctx.unpack_slots() };
     unsafe {
         let mut p = ctx.stack_base;
         while p < ctx.final_sp {
             std::ptr::drop_in_place(p);
             p = p.add(1);
         }
-        // Drop the frame's local slots (initialized Values throughout the run). Numeric frames
-        // are the common case: a tag peek skips the outlined drop for trivially-copyable tags
-        // (Undefined/Empty/Null/Bool/Num — repr(u8) discriminants 0..=4). Refcounted tags
-        // (Str/Sym/Obj ≥ 6 — the discriminant order the templates rely on) whose payload is a
-        // shared reference collapse to a bare strong-count decrement, exactly like the inline
-        // templates' drop path (strong sits at payload+0 for Rc and LStr alike; BigInt tag 5
-        // and last references take the real drop).
-        // The bare-decrement path shares the templates' layout contract (fail closed if the
-        // probe ever finds a std whose strong count moved).
-        let rc_dec_ok = i
-            .jit_layout
-            .get()
-            .is_some_and(|l| l.valid && l.rc_strong_off == 0);
+        // Every local is an initialized owned packed word. Its exact destructor skips scalar
+        // tags and releases heap payloads, including last owners, without widening the frame.
         for k in 0..n_slots {
-            let p = slots_ptr.add(k);
-            let tag = *(p as *const u8);
-            if tag < 5 {
-                continue;
-            }
-            if rc_dec_ok && tag >= 6 {
-                let strong = *(p as *const usize).add(1) as *mut usize;
-                if *strong > 1 {
-                    *strong -= 1;
-                    continue;
-                }
-            }
-            std::ptr::drop_in_place(p);
+            std::ptr::drop_in_place(slots_ptr.add(k));
         }
     }
     match legacy {
@@ -15729,7 +16289,7 @@ unsafe fn run_moved_inner(
             } else {
                 unsafe {
                     drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                        slots_ptr as *mut std::mem::MaybeUninit<Value>,
+                        slots_ptr as *mut std::mem::MaybeUninit<PackedValue>,
                         FRAME_BUF,
                     )));
                 }
@@ -15744,7 +16304,7 @@ unsafe fn run_moved_inner(
         }
     }
     if ok == 1 {
-        Ok(std::mem::take(&mut ctx.ret))
+        Ok(ctx.take_ret().into_value())
     } else {
         Err(ctx
             .error
@@ -15791,7 +16351,7 @@ pub(crate) unsafe fn run_moved(
     _code: &JitCode,
     _env: *const Env,
     _this_val: Value,
-    _args: *mut Value,
+    _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
@@ -15816,7 +16376,7 @@ pub(crate) unsafe fn run_moved_shared(
     _code: &JitCode,
     _env: *const Env,
     _this_val: Value,
-    _args: *mut Value,
+    _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
@@ -15840,7 +16400,7 @@ pub(crate) unsafe fn run_moved_env(
     _code: &JitCode,
     _env: *const Env,
     _this_val: Value,
-    _args: *mut Value,
+    _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),
 ) -> Result<Value, Abrupt> {

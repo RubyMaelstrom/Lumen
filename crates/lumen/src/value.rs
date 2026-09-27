@@ -7,6 +7,24 @@ use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
+#[path = "property_shapes.rs"]
+mod property_shapes;
+#[cfg(test)]
+use property_shapes::SHAPE_LAYOUT_CACHE_LIMIT;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) use property_shapes::SHAPE_LAYOUT_PAGE_BITS;
+pub(crate) use property_shapes::{
+    is_cacheable_shape, SHAPE_LAYOUT_PAGE_COUNT, SHAPE_LAYOUT_PAGE_SIZE, SHAPE_UNCACHEABLE,
+};
+use property_shapes::{LayoutEntry, LayoutPage, ShapeLayouts};
+
+#[cfg(all(test, feature = "embed"))]
+#[path = "property_shape_tests.rs"]
+mod property_shape_tests;
+
 pub type Gc = Rc<RefCell<Object>>;
 
 /// A native (Rust-implemented) function. It can only throw (via `Err`), never break/return/continue,
@@ -56,6 +74,11 @@ pub trait NativeRetainedMemoryVisitor {
 /// A native function that carries captured state, unlike the bare-`fn` [`NativeFn`]. The embedder
 /// uses this to wrap host callbacks that need associated data a function pointer cannot hold.
 pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
+
+/// A native operation with engine-owned JavaScript captures. Unlike opaque Rust
+/// closures, these captures participate in both collectors' ordinary reachability
+/// graph. The final slice contains the immutable registration-time captures.
+pub type NativeCaptureFn = fn(&mut Interp, Value, &[Value], &[Value]) -> Result<Value, Value>;
 
 /// Optional retained-memory companion for a [`NativeClosure`].
 ///
@@ -116,7 +139,7 @@ pub(crate) fn trace_nullish_property(site: &str, key: &Value) {
 // `Value` enum while the migration is staged; packing at the heap boundary cuts each ordinary
 // property by eight bytes without coupling the experiment to every interpreter pattern match.
 #[repr(transparent)]
-pub(crate) struct PackedValue(u64);
+pub(crate) struct PackedValue(Cell<u64>);
 
 const PACK_PAYLOAD: u64 = 0x0000_ffff_ffff_ffff;
 pub(crate) const PACK_UNDEFINED: u64 = 0x7ff9_0000_0000_0000;
@@ -127,12 +150,61 @@ pub(crate) const PACK_BIGINT: u64 = 0x7ffd_0000_0000_0000;
 pub(crate) const PACK_STR: u64 = 0x7ffe_0000_0000_0000;
 pub(crate) const PACK_SYM: u64 = 0x7fff_0000_0000_0000;
 pub(crate) const PACK_OBJ: u64 = 0xfff9_0000_0000_0000;
+pub(crate) const PACK_LAZY_PROTO: u64 = 0xfffa_0000_0000_0000;
 pub(crate) const PACK_CANON_NAN: u64 = 0x7ff8_0000_0000_0000;
 
+#[path = "lazy_function_prototype.rs"]
+mod lazy_function_prototype;
+use lazy_function_prototype::LazyFunctionPrototype;
+
 impl PackedValue {
+    /// Borrow the encoded bits without transferring their reference ownership. Generated code
+    /// may copy this word only after applying the matching clone/move ownership operation.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn bits(&self) -> u64 {
+        self.0.get()
+    }
+
+    pub(crate) fn scalar_bits(value: &Value) -> Option<u64> {
+        match value {
+            Value::Undefined => Some(PACK_UNDEFINED),
+            Value::Empty => Some(PACK_EMPTY),
+            Value::Null => Some(PACK_NULL),
+            Value::Bool(value) => Some(PACK_BOOL | u64::from(*value)),
+            Value::Num(value) => Some(if value.is_nan() {
+                PACK_CANON_NAN
+            } else {
+                value.to_bits()
+            }),
+            Value::BigInt(_) | Value::Str(_) | Value::Sym(_) | Value::Obj(_) => None,
+        }
+    }
+
     #[inline]
     fn tag(&self) -> u64 {
-        self.0 & !PACK_PAYLOAD
+        self.0.get() & !PACK_PAYLOAD
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.get() == PACK_EMPTY
+    }
+
+    #[inline]
+    pub(crate) fn is_undefined(&self) -> bool {
+        self.0.get() == PACK_UNDEFINED
+    }
+
+    /// Inspect a Number without manufacturing an owning Value. In particular, rejecting a
+    /// reference or deferred prototype must not clone it or materialize it as a side effect.
+    #[inline]
+    pub(crate) fn number(&self) -> Option<f64> {
+        match self.tag() {
+            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL | PACK_BOOL | PACK_BIGINT | PACK_STR
+            | PACK_SYM | PACK_OBJ | PACK_LAZY_PROTO => None,
+            _ => Some(f64::from_bits(self.0.get())),
+        }
     }
 
     unsafe fn into_word<T>(value: T) -> u64 {
@@ -157,7 +229,7 @@ impl PackedValue {
 
     unsafe fn read_word<T>(&self) -> T {
         assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
-        let word = (self.0 & PACK_PAYLOAD) as usize;
+        let word = (self.0.get() & PACK_PAYLOAD) as usize;
         let mut value = std::mem::MaybeUninit::<T>::uninit();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -176,7 +248,7 @@ impl PackedValue {
 
     unsafe fn drop_word<T>(&mut self) {
         assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
-        let word = (self.0 & PACK_PAYLOAD) as usize;
+        let word = (self.0.get() & PACK_PAYLOAD) as usize;
         let mut value = std::mem::MaybeUninit::<T>::uninit();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -188,6 +260,7 @@ impl PackedValue {
         }
     }
 
+    #[inline]
     pub(crate) fn pack(value: Value) -> PackedValue {
         let bits = match value {
             Value::Undefined => PACK_UNDEFINED,
@@ -206,42 +279,70 @@ impl PackedValue {
             Value::Sym(v) => PACK_SYM | unsafe { Self::into_word(v) },
             Value::Obj(v) => PACK_OBJ | unsafe { Self::into_word(v) },
         };
-        PackedValue(bits)
+        PackedValue(Cell::new(bits))
     }
 
+    #[inline]
     pub(crate) fn unpack(&self) -> Value {
         match self.tag() {
             PACK_UNDEFINED => Value::Undefined,
             PACK_EMPTY => Value::Empty,
             PACK_NULL => Value::Null,
-            PACK_BOOL => Value::Bool(self.0 & 1 != 0),
+            PACK_BOOL => Value::Bool(self.0.get() & 1 != 0),
             PACK_BIGINT => Value::BigInt(unsafe { self.clone_word() }),
             PACK_STR => Value::Str(unsafe { self.clone_word() }),
             PACK_SYM => Value::Sym(unsafe { self.clone_word() }),
             PACK_OBJ => Value::Obj(unsafe { self.clone_word() }),
-            _ => Value::Num(f64::from_bits(self.0)),
+            PACK_LAZY_PROTO => {
+                let prototype = {
+                    let lazy = std::mem::ManuallyDrop::new(unsafe {
+                        self.read_word::<Rc<LazyFunctionPrototype>>()
+                    });
+                    lazy.materialize()
+                };
+                // Promotion is representation-only, invokes no JS and preserves the descriptor
+                // and identity. Subsequent native reads see an ordinary PACK_OBJ, not a thunk.
+                let bits = PACK_OBJ | unsafe { Self::into_word(prototype.clone()) };
+                drop(PackedValue(Cell::new(self.0.replace(bits))));
+                Value::Obj(prototype)
+            }
+            _ => Value::Num(f64::from_bits(self.0.get())),
         }
     }
 
     #[inline]
     fn object(&self) -> Option<Gc> {
-        (self.tag() == PACK_OBJ).then(|| unsafe { self.clone_word() })
+        match self.tag() {
+            PACK_OBJ => Some(unsafe { self.clone_word() }),
+            PACK_LAZY_PROTO => {
+                let lazy = std::mem::ManuallyDrop::new(unsafe {
+                    self.read_word::<Rc<LazyFunctionPrototype>>()
+                });
+                Some(lazy.gc_edge())
+            }
+            _ => None,
+        }
     }
 
     /// Consume the packed owner without a refcount round trip. Pointer payload bits become the
     /// returned `Value`'s ownership; `ManuallyDrop` prevents this container from releasing them.
+    #[inline]
     pub(crate) fn into_value(self) -> Value {
         let this = std::mem::ManuallyDrop::new(self);
         match this.tag() {
             PACK_UNDEFINED => Value::Undefined,
             PACK_EMPTY => Value::Empty,
             PACK_NULL => Value::Null,
-            PACK_BOOL => Value::Bool(this.0 & 1 != 0),
+            PACK_BOOL => Value::Bool(this.0.get() & 1 != 0),
             PACK_BIGINT => Value::BigInt(unsafe { this.read_word() }),
             PACK_STR => Value::Str(unsafe { this.read_word() }),
             PACK_SYM => Value::Sym(unsafe { this.read_word() }),
             PACK_OBJ => Value::Obj(unsafe { this.read_word() }),
-            _ => Value::Num(f64::from_bits(this.0)),
+            PACK_LAZY_PROTO => {
+                let lazy = unsafe { this.read_word::<Rc<LazyFunctionPrototype>>() };
+                Value::Obj(lazy.materialize())
+            }
+            _ => Value::Num(f64::from_bits(this.0.get())),
         }
     }
 
@@ -260,51 +361,39 @@ impl PackedValue {
         let old = unsafe { std::ptr::replace(word as *mut PackedValue, PackedValue::pack(value)) };
         drop(old);
     }
-
-    /// Compact `len` initialized wide values into the first half of the same allocation. The
-    /// source stride is 16 and destination stride is 8, so a forward walk never overwrites a
-    /// source that has not been moved yet.
-    ///
-    /// # Safety
-    /// `base` must address `len` initialized contiguous `Value`s and enough aligned storage for
-    /// them. After return only `len` packed words at `base` are initialized.
-    pub(crate) unsafe fn pack_in_place(base: *mut Value, len: usize) {
-        let packed = base.cast::<PackedValue>();
-        for k in 0..len {
-            let value = unsafe { base.add(k).read() };
-            unsafe { packed.add(k).write(PackedValue::pack(value)) };
-        }
-    }
-
-    /// Expand packed frame words back into wide `Value`s without cloning reference payloads.
-    /// Expansion walks backward so each packed source is consumed before a wider destination can
-    /// overlap it.
-    ///
-    /// # Safety
-    /// `base` must address `len` initialized `PackedValue`s followed by enough aligned storage for
-    /// `len` wide values. After return only those wide values are initialized.
-    pub(crate) unsafe fn unpack_in_place(base: *mut Value, len: usize) {
-        let packed = base.cast::<PackedValue>();
-        for k in (0..len).rev() {
-            let value = unsafe { packed.add(k).read() }.into_value();
-            unsafe { base.add(k).write(value) };
-        }
-    }
 }
 
 impl Clone for PackedValue {
+    #[inline]
     fn clone(&self) -> Self {
-        PackedValue::pack(self.unpack())
+        // These exact owning tags all contain a single identity-preserving reference handle.
+        // Clone the corresponding Rust owner once, then transfer that retain to an identical
+        // packed word. Scalar copies need neither Value discriminant decoding nor re-encoding.
+        // Lazy prototypes are property-only: retain their established read/materialize behavior
+        // here rather than accidentally admitting a thunk into execution storage.
+        unsafe {
+            match self.tag() {
+                PACK_BIGINT => std::mem::forget(self.clone_word::<crate::bigint::JsBigInt>()),
+                PACK_STR => std::mem::forget(self.clone_word::<crate::lstr::LStr>()),
+                PACK_SYM => std::mem::forget(self.clone_word::<Rc<SymbolData>>()),
+                PACK_OBJ => std::mem::forget(self.clone_word::<Gc>()),
+                PACK_LAZY_PROTO => return PackedValue::pack(self.unpack()),
+                _ => {}
+            }
+        }
+        PackedValue(Cell::new(self.0.get()))
     }
 }
 
 impl Drop for PackedValue {
+    #[inline]
     fn drop(&mut self) {
         match self.tag() {
             PACK_BIGINT => unsafe { self.drop_word::<crate::bigint::JsBigInt>() },
             PACK_STR => unsafe { self.drop_word::<crate::lstr::LStr>() },
             PACK_SYM => unsafe { self.drop_word::<Rc<SymbolData>>() },
             PACK_OBJ => unsafe { self.drop_word::<Gc>() },
+            PACK_LAZY_PROTO => unsafe { self.drop_word::<Rc<LazyFunctionPrototype>>() },
             _ => {}
         }
     }
@@ -313,6 +402,74 @@ impl Drop for PackedValue {
 #[cfg(test)]
 mod packed_value_tests {
     use super::*;
+
+    #[test]
+    fn packed_numeric_inspection_is_non_owning_and_preserves_number_bits() {
+        for number in [
+            0.0,
+            -0.0,
+            1.25,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::from_bits(PACK_OBJ | 123),
+            f64::from_bits(PACK_SYM | 456),
+        ] {
+            let packed = PackedValue::pack(Value::Num(number));
+            let bits = packed.bits();
+            let actual = packed.number().expect("Number tag");
+            assert!(number.is_nan() && actual.is_nan() || number.to_bits() == actual.to_bits());
+            assert!(!packed.is_empty());
+            assert_eq!(packed.bits(), bits);
+        }
+        let object = Object::new(None);
+        for value in [
+            Value::Undefined,
+            Value::Empty,
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Str("number".into()),
+            Value::Obj(object.clone()),
+        ] {
+            let empty = matches!(value, Value::Empty);
+            let packed = PackedValue::pack(value);
+            let bits = packed.bits();
+            let owners = Rc::strong_count(&object);
+            for _ in 0..20 {
+                assert!(packed.number().is_none());
+                assert_eq!(packed.is_empty(), empty);
+            }
+            assert_eq!(packed.bits(), bits);
+            assert_eq!(Rc::strong_count(&object), owners);
+        }
+    }
+
+    #[test]
+    fn property_scalar_inspection_never_materializes_a_deferred_prototype() {
+        let mut engine = crate::Engine::new();
+        engine.eval("function unobserved(){}", false).unwrap();
+        let env = engine.interp.global_env.clone();
+        let function = engine.interp.get_var("unobserved", &env).ok().unwrap();
+        let object = function.as_obj().unwrap().borrow();
+        let prototype = object.props.get("prototype").unwrap();
+        assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
+        let bits = prototype.packed.bits();
+        for _ in 0..20 {
+            assert!(!prototype.is_empty());
+            assert!(prototype.number_value().is_none());
+        }
+        assert_eq!(prototype.packed.bits(), bits);
+        assert!(matches!(prototype.value(), Value::Obj(_)));
+        assert_eq!(prototype.packed.tag(), PACK_OBJ);
+        let mut property = Property::plain(Value::Num(3.0));
+        assert_eq!(property.number_value(), Some(3.0));
+        property.set_accessor(true);
+        assert!(
+            property.number_value().is_none(),
+            "accessor payload is never a data Number"
+        );
+    }
 
     #[test]
     fn packed_value_is_one_word_and_round_trips_scalars() {
@@ -358,30 +515,129 @@ mod packed_value_tests {
     }
 
     #[test]
-    fn packed_frame_conversion_is_overlap_safe_and_ownership_neutral() {
+    fn packed_value_direct_clones_preserve_bits_and_exact_owner_counts() {
+        for value in [
+            Value::Undefined,
+            Value::Empty,
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Num(0.0),
+            Value::Num(-0.0),
+            Value::Num(f64::INFINITY),
+            Value::Num(f64::NEG_INFINITY),
+            Value::Num(f64::from_bits(0xfffa_0000_0000_1234)),
+        ] {
+            let packed = PackedValue::pack(value);
+            let cloned = packed.clone();
+            assert_eq!(packed.bits(), cloned.bits());
+            assert_eq!(cloned.is_empty(), cloned.bits() == PACK_EMPTY);
+        }
+        let object = Object::new(None);
+        let string = crate::lstr::LStr::from("packed clone owner");
+        let mut interp = crate::interpreter::Interp::new();
+        let Value::Sym(symbol) = interp.new_symbol(None) else {
+            unreachable!()
+        };
+        let original = [
+            PackedValue::pack(Value::Obj(object.clone())),
+            PackedValue::pack(Value::Str(string.clone())),
+            PackedValue::pack(Value::Sym(symbol.clone())),
+        ];
+        let before = [
+            Rc::strong_count(&object),
+            string.strong_count(),
+            Rc::strong_count(&symbol),
+        ];
+        let copies = original.clone();
+        assert_eq!(
+            [
+                Rc::strong_count(&object),
+                string.strong_count(),
+                Rc::strong_count(&symbol)
+            ],
+            before.map(|n| n + 1)
+        );
+        for (a, b) in original.iter().zip(&copies) {
+            assert_eq!(a.bits(), b.bits());
+        }
+        drop(copies);
+        assert_eq!(
+            [
+                Rc::strong_count(&object),
+                string.strong_count(),
+                Rc::strong_count(&symbol)
+            ],
+            before
+        );
+        let integer = crate::bigint::JsBigInt::parse_dec("123456789012345678901234567890").unwrap();
+        let packed = PackedValue::pack(Value::BigInt(integer.clone()));
+        let copied = packed.clone();
+        assert_eq!(packed.bits(), copied.bits());
+        drop(packed);
+        assert!(matches!(copied.into_value(), Value::BigInt(value) if value == integer));
+    }
+
+    #[test]
+    fn packed_numeric_constants_canonicalize_every_reserved_tag_collision() {
+        // ECMA-262 Number identifies all NaNs as one language value. NaN payloads received
+        // through buffers must never be mistaken for owning tagged pointers in execution slots.
+        for sign in [0, 1u64 << 63] {
+            for high in 0x7ff0u64..=0x7fff {
+                let bits = sign | (high << 48) | 0x1234;
+                let number = f64::from_bits(bits);
+                assert!(number.is_nan());
+                let value = Value::Num(number);
+                assert_eq!(PackedValue::scalar_bits(&value), Some(PACK_CANON_NAN));
+                let packed = PackedValue::pack(value);
+                assert_eq!(packed.bits(), PACK_CANON_NAN);
+                assert!(matches!(packed.into_value(), Value::Num(value) if value.is_nan()));
+            }
+        }
+        for number in [
+            0.0f64,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+        ] {
+            assert_eq!(
+                PackedValue::scalar_bits(&Value::Num(number)),
+                Some(number.to_bits())
+            );
+        }
+        assert_eq!(PackedValue::scalar_bits(&Value::str("not copyable")), None);
+    }
+
+    #[test]
+    fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
         let obj = Object::new(None);
         let before = Rc::strong_count(&obj);
-        let mut frame: [std::mem::MaybeUninit<Value>; 5] =
+        let mut frame: [std::mem::MaybeUninit<PackedValue>; 5] =
             std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
-        let base = frame.as_mut_ptr().cast::<Value>();
+        let base = frame.as_mut_ptr().cast::<PackedValue>();
         unsafe {
-            base.add(0).write(Value::Num(1.5));
-            base.add(1).write(Value::Obj(obj.clone()));
-            base.add(2).write(Value::Bool(true));
-            base.add(3).write(Value::Null);
-            base.add(4).write(Value::Num(-0.0));
+            base.add(0).write(PackedValue::pack(Value::Num(1.5)));
+            base.add(1)
+                .write(PackedValue::pack(Value::Obj(obj.clone())));
+            base.add(2).write(PackedValue::pack(Value::Bool(true)));
+            base.add(3).write(PackedValue::pack(Value::Null));
+            base.add(4).write(PackedValue::pack(Value::Num(-0.0)));
         }
         assert_eq!(Rc::strong_count(&obj), before + 1);
         unsafe {
-            PackedValue::pack_in_place(base, 5);
+            let moved = base.add(1).read();
+            base.add(1).write(PackedValue::pack(Value::Undefined));
             assert_eq!(Rc::strong_count(&obj), before + 1);
-            PackedValue::unpack_in_place(base, 5);
+            assert_eq!((*base).bits(), 1.5f64.to_bits());
+            assert!(matches!(moved.unpack(), Value::Obj(o) if Rc::ptr_eq(&o, &obj)));
+            PackedValue::replace_raw(base.add(3).cast(), moved.into_value());
             assert_eq!(Rc::strong_count(&obj), before + 1);
-            assert!(matches!(&*base.add(0), Value::Num(n) if *n == 1.5));
-            assert!(matches!(&*base.add(1), Value::Obj(o) if Rc::ptr_eq(o, &obj)));
-            assert!(matches!(&*base.add(2), Value::Bool(true)));
-            assert!(matches!(&*base.add(3), Value::Null));
-            assert!(matches!(&*base.add(4), Value::Num(n) if n.to_bits() == (-0.0f64).to_bits()));
+            assert!(matches!((*base.add(1)).unpack(), Value::Undefined));
+            assert!(matches!((*base.add(2)).unpack(), Value::Bool(true)));
+            assert!(
+                matches!((*base.add(4)).unpack(), Value::Num(n) if n.to_bits() == (-0.0f64).to_bits())
+            );
             for k in 0..5 {
                 std::ptr::drop_in_place(base.add(k));
             }
@@ -390,39 +646,28 @@ mod packed_value_tests {
     }
 
     #[test]
-    fn shape_identity_exhaustion_never_wraps_or_reuses_an_id() {
-        let mut shapes = ShapeTable {
-            transitions: Default::default(),
-            layouts: Vec::new(),
-            cached_layouts: 0,
-            next: u32::MAX - 1,
-        };
-        assert_eq!(shapes.fresh(), u32::MAX - 1);
-        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shapes.fresh()));
-        assert!(exhausted.is_err(), "shape ids wrapped after exhaustion");
-    }
-
-    #[test]
     fn shared_layout_cache_is_bounded_and_does_not_own_the_agent() {
         let heap = new_gc_heap();
         let symbols = new_symbol_agent();
         let weak_heap = Rc::downgrade(&heap);
         let active = enter_agent(&heap, &symbols);
-        for n in 0..SHARED_LAYOUT_CACHE_LIMIT + 32 {
+        for n in 0..SHAPE_LAYOUT_CACHE_LIMIT + 32 {
             let mut props = Props::new();
             props.insert(format!("field{n}"), Property::plain(Value::Undefined));
             assert!(props.contains(&format!("field{n}")));
         }
         let shapes = heap.shapes.borrow();
-        assert_eq!(shapes.cached_layouts, SHARED_LAYOUT_CACHE_LIMIT);
-        assert_eq!(
-            shapes.layouts.iter().filter(|s| s.is_some()).count(),
-            SHARED_LAYOUT_CACHE_LIMIT
+        // Parallel tests may allocate other globally unique IDs between ours. Hints may
+        // collide/evict, but both the slot count and allocated pages are always bounded.
+        assert!(shapes.layouts.len() <= SHAPE_LAYOUT_CACHE_LIMIT);
+        assert_eq!(shapes.layouts.iter().count(), shapes.layouts.len());
+        assert!(
+            shapes.layouts.allocated_bytes()
+                <= SHAPE_LAYOUT_PAGE_COUNT * std::mem::size_of::<LayoutPage>()
         );
         assert!(shapes
             .layouts
             .iter()
-            .filter_map(Option::as_ref)
             .all(|keys| keys.len() <= SHARED_LAYOUT_MAX_FIELDS));
         drop(shapes);
         let mut a = Props::new();
@@ -482,6 +727,17 @@ mod packed_value_tests {
 pub struct SymbolData {
     pub id: u64,
     pub description: Option<Rc<str>>,
+    pub(crate) weak_observers: RefCell<Option<Box<crate::weak_metadata::DeathObservers>>>,
+}
+
+impl Drop for SymbolData {
+    fn drop(&mut self) {
+        // A Symbol can die while SymbolAgent itself is borrowed/destroyed. Its observers are
+        // independent of that registry and of whichever same-Agent heap is currently active.
+        if let Some(observers) = self.weak_observers.get_mut().take() {
+            observers.notify();
+        }
+    }
 }
 
 /// An ECMAScript Property Key produced by `ToPropertyKey`. Lumen's object maps use a compact
@@ -620,9 +876,12 @@ pub struct JitLayout {
     pub props_layout: usize,
     /// Stored layout Rc pointer -> the key Vec header.
     pub layout_data_off: usize,
-    /// Owning Agent heap Rc within Object, and its stored Rc pointer -> shape-layout Vec.
+    /// Owning Agent heap Rc within Object, and its stored Rc pointer -> nullable page directory.
     pub obj_heap: usize,
     pub heap_layouts: usize,
+    pub shape_layout_entry_size: usize,
+    pub shape_layout_entry_id: usize,
+    pub shape_layout_entry_keys: usize,
     /// The data-pointer word within a `Vec` (not necessarily offset 0 — RawVec layout is unstable).
     pub vec_ptr_off: usize,
     /// The length word within a `Vec` (probed like `vec_ptr_off`).
@@ -671,12 +930,28 @@ pub struct JitLayout {
     pub scope_gen: usize,
     /// The live fixed-binding-layout identity, zero after structural mutation.
     pub scope_layout: usize,
+    /// Parent `Option<Env>` within `Rc::as_ptr(env)`, with its checked nullable-Rc ABI.
+    pub scope_parent: usize,
+    pub scope_data_off: usize,
+    pub scope_parent_valid: bool,
+    /// Guarded repr(Rust) small binding-map arm and its Vec, relative to Rc::as_ptr(env).
+    pub scope_small_tag: usize,
+    pub scope_small_vec: usize,
+    pub scope_binding_stride: usize,
+    pub scope_binding_offset: usize,
+    pub scope_small_valid: bool,
+    /// Option<Value> None tag for an absent object-environment record, checked live.
+    pub scope_with: usize,
+    pub scope_with_none: u8,
+    pub scope_with_valid: bool,
     /// `value` within a `Binding` (the LoadName template's 16-byte copy source).
     pub binding_value: usize,
     /// `mutable` within a `Binding` (free-name update/store guard).
     pub binding_mutable: usize,
     /// `initialized` bool within a `Binding` (TDZ check).
     pub binding_init: usize,
+    /// A live import must take its ModuleEnvironmentRecord path.
+    pub binding_import: usize,
     /// The length word within an `Rc<str>` fat pointer (0 or 8 — layout is unstable).
     pub str_len_word: usize,
     /// The pointer word within an `Rc<str>` fat pointer (the other one).
@@ -763,18 +1038,22 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let object = sample.borrow();
     let heap_word = unsafe { *(&object.gc_heap as *const GcHeap as *const usize) };
     let shapes = object.gc_heap.shapes.borrow();
-    let heap_layouts =
-        (&shapes.layouts as *const Vec<Option<PropertyLayout>> as usize).wrapping_sub(heap_word);
-    let heap_vec_words = unsafe {
-        std::slice::from_raw_parts(
-            &shapes.layouts as *const Vec<Option<PropertyLayout>> as *const usize,
-            3,
-        )
-    };
+    let heap_layouts = (shapes.layouts.pages.as_ptr() as usize).wrapping_sub(heap_word);
+    let page = Some(Box::new(
+        std::array::from_fn::<_, SHAPE_LAYOUT_PAGE_SIZE, _>(|_| LayoutEntry::default()),
+    ));
+    let page_word = unsafe { *(&page as *const Option<Box<LayoutPage>> as *const usize) };
+    let no_page: Option<Box<LayoutPage>> = None;
+    let shape_layout_entry_size = std::mem::size_of::<LayoutEntry>();
+    let shape_layout_entry_id = offset_of!(LayoutEntry, shape);
+    let shape_layout_entry_keys = offset_of!(LayoutEntry, keys);
     let heap_layouts_ok = heap_layouts < 32768
-        && vec_ptr_off.is_some_and(|o| heap_vec_words[o / 8] == shapes.layouts.as_ptr() as usize)
-        && vec_len_off.is_some_and(|o| heap_vec_words[o / 8] == shapes.layouts.len())
-        && vec_cap_off.is_some_and(|o| heap_vec_words[o / 8] == shapes.layouts.capacity());
+        && std::mem::size_of::<Option<Box<LayoutPage>>>() == std::mem::size_of::<usize>()
+        && page_word == page.as_deref().unwrap().as_ptr() as usize
+        && unsafe { *(&no_page as *const Option<Box<LayoutPage>> as *const usize) } == 0
+        && shape_layout_entry_size == 16
+        && shape_layout_entry_id == 0
+        && shape_layout_entry_keys == 8;
     // The element templates index a `Vec<u32>` (`Props::elems`) with the same offsets; verify the
     // layout really is per-Vec-struct, not per-element-type.
     let mut v32: Vec<u32> = Vec::with_capacity(3);
@@ -843,15 +1122,39 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         &*b as *const crate::interpreter::Scope as usize
     };
     let scope_refcell = scope_addr - Rc::as_ptr(&probe_env) as usize;
+    let scope_stored = unsafe { *(&probe_env as *const Env as *const usize) };
+    let scope_data_off = (Rc::as_ptr(&probe_env) as usize).wrapping_sub(scope_stored);
+    let parent_some = Some(probe_env.clone());
+    let parent_none: Option<Env> = None;
+    let scope_parent_valid = std::mem::size_of::<Option<Env>>() == std::mem::size_of::<usize>()
+        && scope_data_off < 256
+        && unsafe { *(&parent_some as *const Option<Env> as *const usize) } == scope_stored
+        && unsafe { *(&parent_none as *const Option<Env> as *const usize) } == 0;
+    let scope_parent = scope_refcell + offset_of!(crate::interpreter::Scope, parent);
     let scope_gen = scope_refcell
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::generation_offset();
     let scope_layout = scope_refcell
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::layout_id_offset();
+    let vars_offset = scope_refcell + offset_of!(crate::interpreter::Scope, vars);
+    let small = crate::interpreter::VarMap::jit_small_storage_layout();
+    let (small_tag, small_vec, scope_binding_stride, scope_binding_offset) =
+        small.unwrap_or((0, 0, 0, 0));
+    let scope_small_tag = vars_offset + small_tag;
+    let scope_small_vec = vars_offset + small_vec;
+    let scope_small_valid = small.is_some();
+    let scope_with = scope_refcell + offset_of!(crate::interpreter::Scope, with_obj);
+    let without_object: Option<Value> = None;
+    let with_object = Some(Value::Num(1.0));
+    let scope_with_none = unsafe { *(&without_object as *const Option<Value> as *const u8) };
+    let scope_with_valid = std::mem::size_of::<Option<Value>>() == std::mem::size_of::<Value>()
+        && scope_with_none > 8
+        && unsafe { *(&with_object as *const Option<Value> as *const u8) } == 4;
     let binding_value = offset_of!(crate::interpreter::Binding, value);
     let binding_mutable = offset_of!(crate::interpreter::Binding, mutable);
     let binding_init = offset_of!(crate::interpreter::Binding, initialized);
+    let binding_import = offset_of!(crate::interpreter::Binding, imported);
 
     let valid = strong_ok
         && niche_ok
@@ -880,6 +1183,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         layout_data_off,
         obj_heap: offset_of!(Object, gc_heap),
         heap_layouts,
+        shape_layout_entry_size,
+        shape_layout_entry_id,
+        shape_layout_entry_keys,
         vec_ptr_off: vec_ptr_off.unwrap_or(0),
         vec_len_off: vec_len_off.unwrap_or(0),
         vec_cap_off: vec_cap_off.unwrap_or(0),
@@ -908,9 +1214,21 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         exotic_strwrap_tag,
         scope_gen,
         scope_layout,
+        scope_parent,
+        scope_data_off,
+        scope_parent_valid,
+        scope_small_tag,
+        scope_small_vec,
+        scope_binding_stride,
+        scope_binding_offset,
+        scope_small_valid,
+        scope_with,
+        scope_with_none,
+        scope_with_valid,
         binding_value,
         binding_mutable,
         binding_init,
+        binding_import,
         valid,
     }
 }
@@ -1018,12 +1336,20 @@ pub struct BoundCallable {
 }
 
 pub struct NativeCallable {
-    pub(crate) func: Rc<NativeClosure>,
+    pub(crate) body: NativeCallableBody,
     pub(crate) retained: Option<Rc<dyn NativeCallableRetained>>,
     /// Registration identity used only by opt-in diagnostics. This is deliberately separate
     /// from the observable `name` property: author code may rewrite that property at any time,
     /// while a profile must continue to attribute calls to the operation the embedder registered.
     pub(crate) identity: Rc<str>,
+}
+
+pub(crate) enum NativeCallableBody {
+    Opaque(Rc<NativeClosure>),
+    Captured {
+        function: NativeCaptureFn,
+        captures: Box<[Value]>,
+    },
 }
 
 #[derive(Clone)]
@@ -1134,6 +1460,7 @@ pub struct Object {
     /// during marking. Between collections this holds the object's weak-registry slot; the
     /// collector restores every slot before sweeping can drop an object.
     pub(crate) gc_mark: Cell<bool>,
+    gc_weak_observed: Cell<bool>,
     pub(crate) gc_internal: Cell<u32>,
     /// Opt-in central-heap identity used during the `heap-bridge` migration. The existing Rc
     /// object remains authoritative until all fields and roots have relocation-aware descriptors.
@@ -1170,6 +1497,7 @@ impl Object {
                 None => {
                     let slot = reg.entries.len();
                     reg.entries.push(None);
+                    reg.young_positions.push(usize::MAX);
                     slot
                 }
             };
@@ -1194,11 +1522,14 @@ impl Object {
                 ic_plain: Cell::new(true),
                 is_constructor: false,
                 gc_mark: Cell::new(false),
+                gc_weak_observed: Cell::new(false),
                 gc_internal: Cell::new(slot_u32),
                 #[cfg(feature = "heap-bridge")]
                 central_ref: Cell::new(Some(central_ref)),
             }));
             reg.entries[slot] = Some(Rc::downgrade(&obj));
+            reg.young_positions[slot] = reg.young_slots.len();
+            reg.young_slots.push(slot);
             obj
         }
     }
@@ -1212,9 +1543,28 @@ impl Drop for Object {
         let slot = self.gc_internal.get() as usize;
         let mut reg = self.gc_heap.registry.borrow_mut();
         if slot < reg.entries.len() && reg.entries[slot].take().is_some() {
+            let position = reg.young_positions[slot];
+            if position != usize::MAX {
+                reg.young_slots.swap_remove(position);
+                if let Some(&moved) = reg.young_slots.get(position) {
+                    reg.young_positions[moved] = position;
+                }
+                reg.young_positions[slot] = usize::MAX;
+            }
             reg.free.push(slot);
         }
         drop(reg);
+        if self.gc_weak_observed.get() {
+            let observers = {
+                let mut watched = self.gc_heap.weak_observers.borrow_mut();
+                let observers = watched.remove(&slot);
+                crate::weak_metadata::shrink_map(&mut watched);
+                observers
+            };
+            if let Some(observers) = observers {
+                observers.notify();
+            }
+        }
         #[cfg(feature = "heap-bridge")]
         if let Some(reference) = self.central_ref.take() {
             let _ = self.gc_heap.central.borrow_mut().free(reference);
@@ -1231,12 +1581,20 @@ impl Drop for Object {
 struct GcRegistry {
     entries: Vec<Option<Weak<RefCell<Object>>>>,
     free: Vec<usize>,
+    /// Dense nursery membership, removed synchronously with object destruction. Unlike an
+    /// append-only Weak list, acyclic allocation churn cannot retain dead allocation headers.
+    young_slots: Vec<usize>,
+    young_positions: Vec<usize>,
 }
 
 pub(crate) struct GcState {
     heap_id: u64,
     registry: RefCell<GcRegistry>,
+    weak_observers: RefCell<crate::fasthash::FastMap<usize, crate::weak_metadata::DeathObservers>>,
     scope_registry: RefCell<Vec<Weak<RefCell<crate::interpreter::Scope>>>>,
+    young_scopes: RefCell<Vec<Weak<RefCell<crate::interpreter::Scope>>>>,
+    minor_collections: Cell<u8>,
+    major_live: Cell<i64>,
     shapes: RefCell<ShapeTable>,
     array_length_shape: Cell<u32>,
     live: Cell<i64>,
@@ -1246,6 +1604,72 @@ pub(crate) struct GcState {
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
+
+/// Sparse destruction watches. Objects that have never been weak targets perform only the flag
+/// check, with no hash lookup or queue operation on destruction.
+pub(crate) fn observe_weak_target(
+    target: &crate::interpreter::WeakTarget,
+    queue: &Rc<crate::weak_metadata::DeathQueue>,
+) {
+    use crate::weak_metadata::DeathObservers;
+    match target.upgrade() {
+        Some(Value::Obj(object)) => {
+            let object = object.borrow();
+            let slot = object.gc_internal.get() as usize;
+            object
+                .gc_heap
+                .weak_observers
+                .borrow_mut()
+                .entry(slot)
+                .or_insert_with(|| DeathObservers::new(target.clone()))
+                .subscribe(queue);
+            object.gc_weak_observed.set(true);
+        }
+        Some(Value::Sym(symbol)) => {
+            symbol
+                .weak_observers
+                .borrow_mut()
+                .get_or_insert_with(|| Box::new(DeathObservers::new(target.clone())))
+                .subscribe(queue);
+        }
+        None => {
+            queue.enqueue(target.clone());
+        }
+        _ => unreachable!("weak target can only be an object or symbol"),
+    }
+}
+
+pub(crate) fn unobserve_weak_target(
+    target: &crate::interpreter::WeakTarget,
+    queue: &Rc<crate::weak_metadata::DeathQueue>,
+) {
+    match target.upgrade() {
+        Some(Value::Obj(object)) => {
+            let object = object.borrow();
+            let slot = object.gc_internal.get() as usize;
+            let mut watched = object.gc_heap.weak_observers.borrow_mut();
+            if watched
+                .get_mut(&slot)
+                .is_some_and(|observers| observers.unsubscribe(queue))
+            {
+                watched.remove(&slot);
+                object.gc_weak_observed.set(false);
+                crate::weak_metadata::shrink_map(&mut watched);
+            }
+        }
+        Some(Value::Sym(symbol)) => {
+            let mut watched = symbol.weak_observers.borrow_mut();
+            if watched
+                .as_mut()
+                .is_some_and(|observers| observers.unsubscribe(queue))
+            {
+                *watched = None;
+            }
+        }
+        // Destruction already moved these subscriptions into their independent queues.
+        _ => {}
+    }
+}
 
 pub(crate) fn scan_gc_heap_retained_memory(
     heap: &GcHeap,
@@ -1264,10 +1688,41 @@ pub(crate) fn scan_gc_heap_retained_memory(
                 .free
                 .capacity()
                 .saturating_mul(std::mem::size_of::<usize>()),
+        )
+        .saturating_add(
+            registry
+                .young_slots
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
+        .saturating_add(
+            registry
+                .young_positions
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
         );
     drop(registry);
+    {
+        let observed = heap.weak_observers.borrow();
+        bytes = bytes.saturating_add(
+            observed.capacity()
+                * std::mem::size_of::<(usize, crate::weak_metadata::DeathObservers)>(),
+        );
+        bytes = bytes.saturating_add(
+            observed
+                .values()
+                .map(crate::weak_metadata::DeathObservers::allocated_bytes)
+                .sum::<usize>(),
+        );
+    }
     bytes = bytes.saturating_add(
         heap.scope_registry
+            .borrow()
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Weak<RefCell<crate::interpreter::Scope>>>()),
+    );
+    bytes = bytes.saturating_add(
+        heap.young_scopes
             .borrow()
             .capacity()
             .saturating_mul(std::mem::size_of::<Weak<RefCell<crate::interpreter::Scope>>>()),
@@ -1283,12 +1738,11 @@ pub(crate) fn scan_gc_heap_retained_memory(
             .len()
             .saturating_mul(std::mem::size_of::<((u32, Rc<str>), u32)>()),
     );
-    bytes = bytes
-        .saturating_add(shapes.layouts.capacity() * std::mem::size_of::<Option<PropertyLayout>>());
+    bytes = bytes.saturating_add(shapes.layouts.allocated_bytes());
     for (_, key) in shapes.transitions.keys() {
         visitor.rc_str(key);
     }
-    for layout in shapes.layouts.iter().flatten() {
+    for layout in shapes.layouts.iter() {
         visitor.property_layout(layout);
     }
     (bytes, shapes.transitions.is_empty())
@@ -1330,6 +1784,9 @@ static GC_SCOPES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static GC_SCOPES_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_PEAK_SCOPES_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_LAST_SCOPES_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_MINOR_COLLECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_MINOR_OBJECTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_MINOR_SCOPES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Internal collection trigger for diagnostics. Collection scheduling is not observable
 /// ECMAScript behavior; retaining the reason lets tuning distinguish allocation pressure from a
@@ -1360,6 +1817,7 @@ pub(crate) fn gc_performance_metrics_finish(
     scopes_before: usize,
     scopes_after: usize,
     cause: GcCause,
+    nursery_scanned: Option<(usize, usize)>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -1375,11 +1833,19 @@ pub(crate) fn gc_performance_metrics_finish(
     GC_PAUSE_NANOS.fetch_add(elapsed, Relaxed);
     GC_MAX_PAUSE_NANOS.fetch_max(elapsed, Relaxed);
     GC_PAUSE_BUCKET_COUNTS[bucket].fetch_add(1, Relaxed);
-    GC_OBJECTS_SEEN.fetch_add(objects_before, Relaxed);
+    let (objects_seen, scopes_seen) = nursery_scanned
+        .map(|(objects, scopes)| (saturating_u64(objects), saturating_u64(scopes)))
+        .unwrap_or((objects_before, scopes_before));
+    if nursery_scanned.is_some() {
+        GC_MINOR_COLLECTIONS.fetch_add(1, Relaxed);
+        GC_MINOR_OBJECTS_SEEN.fetch_add(objects_seen, Relaxed);
+        GC_MINOR_SCOPES_SEEN.fetch_add(scopes_seen, Relaxed);
+    }
+    GC_OBJECTS_SEEN.fetch_add(objects_seen, Relaxed);
     GC_OBJECTS_RECLAIMED.fetch_add(objects_before.saturating_sub(objects_after), Relaxed);
     GC_PEAK_OBJECTS_BEFORE.fetch_max(objects_before, Relaxed);
     GC_LAST_OBJECTS_AFTER.store(objects_after, Relaxed);
-    GC_SCOPES_SEEN.fetch_add(scopes_before, Relaxed);
+    GC_SCOPES_SEEN.fetch_add(scopes_seen, Relaxed);
     GC_SCOPES_RECLAIMED.fetch_add(scopes_before.saturating_sub(scopes_after), Relaxed);
     GC_PEAK_SCOPES_BEFORE.fetch_max(scopes_before, Relaxed);
     GC_LAST_SCOPES_AFTER.store(scopes_after, Relaxed);
@@ -1404,8 +1870,14 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
         .join(",");
     let pause_nanos = GC_PAUSE_NANOS.load(Relaxed);
     let max_pause_nanos = GC_MAX_PAUSE_NANOS.load(Relaxed);
+    let nursery_fields = format!(
+        "\"gc_minor_collections\":{},\"gc_minor_objects_seen\":{},\"gc_minor_scopes_seen\":{}",
+        GC_MINOR_COLLECTIONS.load(Relaxed),
+        GC_MINOR_OBJECTS_SEEN.load(Relaxed),
+        GC_MINOR_SCOPES_SEEN.load(Relaxed),
+    );
     format!(
-        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{}",
+        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{},{nursery_fields}",
         GC_COLLECTIONS.load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::AllocationThreshold as usize].load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::TaskBoundary as usize].load(Relaxed),
@@ -1450,8 +1922,14 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         registry: RefCell::new(GcRegistry {
             entries: Vec::new(),
             free: Vec::new(),
+            young_slots: Vec::new(),
+            young_positions: Vec::new(),
         }),
+        weak_observers: RefCell::new(Default::default()),
         scope_registry: RefCell::new(Vec::new()),
+        young_scopes: RefCell::new(Vec::new()),
+        minor_collections: Cell::new(0),
+        major_live: Cell::new(0),
         shapes: RefCell::new(ShapeTable::new()),
         array_length_shape: Cell::new(SHAPE_EMPTY),
         live: Cell::new(0),
@@ -1657,6 +2135,54 @@ pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
     live
 }
 
+/// Snapshot just the nursery. Old-to-young strong references are conservatively roots in the
+/// refcount-based nursery collector, so no uninstrumented native/property write can lose one.
+pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
+    let objects = {
+        let registry = heap.registry.borrow();
+        registry
+            .young_slots
+            .iter()
+            .filter_map(|&slot| registry.entries[slot].as_ref().and_then(Weak::upgrade))
+            .collect()
+    };
+    let scopes = heap
+        .young_scopes
+        .borrow()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    (objects, scopes)
+}
+
+/// Promote survivors in one pass over the nursery, not the retained old heap. A periodic major
+/// collection revisits inter-generational cycles and conservatively retained ephemeron values.
+pub(crate) fn gc_finish_generation(heap: &GcHeap, major: bool) {
+    let mut registry = heap.registry.borrow_mut();
+    while let Some(slot) = registry.young_slots.pop() {
+        registry.young_positions[slot] = usize::MAX;
+    }
+    drop(registry);
+    heap.young_scopes.borrow_mut().clear();
+    if major {
+        heap.minor_collections.set(0);
+        heap.major_live.set(heap.live.get());
+    } else {
+        heap.minor_collections
+            .set(heap.minor_collections.get().saturating_add(1));
+    }
+}
+
+pub(crate) fn gc_major_due(heap: &GcHeap, nursery_floor: i64) -> bool {
+    heap.minor_collections.get() >= 7
+        || heap.live.get()
+            > heap
+                .major_live
+                .get()
+                .saturating_mul(2)
+                .max(nursery_floor * 2)
+}
+
 /// Dismantle the object/environment graph when its owning interpreter is destroyed.
 /// ECMA-262 #sec-agents and #sec-weakref-execution (snapshot e28783d5fc9d): there
 /// are no remaining execution contexts, and shutdown need not run finalizers.
@@ -1712,10 +2238,9 @@ pub(crate) fn gc_restore_registry_slots(heap: &GcHeap) {
 }
 
 pub(crate) fn gc_register_scope(scope: &Env) {
-    active_gc_heap()
-        .scope_registry
-        .borrow_mut()
-        .push(Rc::downgrade(scope));
+    let heap = active_gc_heap();
+    heap.scope_registry.borrow_mut().push(Rc::downgrade(scope));
+    heap.young_scopes.borrow_mut().push(Rc::downgrade(scope));
 }
 
 pub(crate) fn gc_scope_registry_len(heap: &GcHeap) -> usize {
@@ -1725,6 +2250,9 @@ pub(crate) fn gc_scope_registry_len(heap: &GcHeap) -> usize {
 /// Purge dead weak entries, returning the live count. A dead `Weak` still pins its `RcBox`
 /// allocation, so scope-heavy programs prune independently of the object allocation trigger.
 pub(crate) fn gc_scope_registry_prune(heap: &GcHeap) -> usize {
+    heap.young_scopes
+        .borrow_mut()
+        .retain(|scope| scope.strong_count() > 0);
     let mut registry = heap.scope_registry.borrow_mut();
     registry.retain(|scope| scope.strong_count() > 0);
     registry.len()
@@ -1977,10 +2505,15 @@ impl Property {
     fn retained_requested_storage_bytes(&self) -> usize {
         self.accessors()
             .map_or(0, |_| std::mem::size_of::<Accessors>())
+            + if self.packed.tag() == PACK_LAZY_PROTO {
+                std::mem::size_of::<LazyFunctionPrototype>()
+            } else {
+                0
+            }
     }
 
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
-        visitor.value(&self.value());
+        self.visit_retained_value(visitor);
         if let Some(getter) = self.getter() {
             visitor.value(getter);
         }
@@ -2076,9 +2609,45 @@ impl Property {
     pub(crate) fn value(&self) -> Value {
         self.packed.unpack()
     }
+    /// An owning OrdinaryGet value snapshot with no wide-value round trip.
+    /// PackedValue::clone materializes a deferred MakeConstructor prototype just
+    /// like value(), so execution storage never receives a property-only thunk.
+    #[inline]
+    pub(crate) fn clone_value_packed(&self) -> PackedValue {
+        self.packed.clone()
+    }
+    /// OrdinaryGet's own-data Number case, with no getter invocation or value conversion.
+    /// Callers must still prove ordinary internal methods and fall back for every other case.
+    #[inline]
+    pub(crate) fn number_value(&self) -> Option<f64> {
+        if self.accessor() {
+            None
+        } else {
+            self.packed.number()
+        }
+    }
+    /// Collector-only owning edge. A deferred prototype owns its realm parent until first
+    /// observation; afterward it owns the materialized prototype instead. Do not allocate or
+    /// change the reference graph during collector counting/marking.
     #[inline]
     pub(crate) fn object_value(&self) -> Option<Gc> {
         self.packed.object()
+    }
+    pub(crate) fn visit_retained_value(&self, visitor: &mut crate::memory::Visitor) {
+        if self.packed.tag() == PACK_LAZY_PROTO {
+            let lazy = std::mem::ManuallyDrop::new(unsafe {
+                self.packed.read_word::<Rc<LazyFunctionPrototype>>()
+            });
+            lazy.visit_retained_memory(visitor);
+        } else {
+            visitor.value(&self.value());
+        }
+    }
+    pub(crate) fn defer_function_prototype(&mut self, owner: &Gc, parent: Gc, template: &Props) {
+        let lazy = Rc::new(LazyFunctionPrototype::new(owner, parent, template));
+        self.packed = PackedValue(Cell::new(
+            PACK_LAZY_PROTO | unsafe { PackedValue::into_word(lazy) },
+        ));
     }
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
@@ -2141,6 +2710,13 @@ impl Property {
     pub(crate) fn plain(value: Value) -> Property {
         Property::data(value, true, true, true)
     }
+    /// Move an execution owner directly into an ordinary property, with no decode/repack.
+    pub(crate) fn plain_packed(packed: PackedValue) -> Property {
+        Property {
+            packed,
+            meta: PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE,
+        }
+    }
     /// A non-enumerable method/builtin property: writable + configurable, not enumerable.
     pub(crate) fn builtin(value: Value) -> Property {
         Property::data(value, true, false, true)
@@ -2162,11 +2738,11 @@ impl InlinePacked {
         slots: [const { std::mem::MaybeUninit::uninit() }; INLINE_PACKED_CAPACITY],
     };
 
-    unsafe fn from_raw(items: *mut Value, len: usize) -> InlinePacked {
+    unsafe fn from_raw(items: *mut PackedValue, len: usize) -> InlinePacked {
         debug_assert!(len <= INLINE_PACKED_CAPACITY);
         let mut packed = InlinePacked::default();
         for index in 0..len {
-            packed.slots[index].write(Property::plain(unsafe { items.add(index).read() }));
+            packed.slots[index].write(Property::plain_packed(unsafe { items.add(index).read() }));
         }
         packed.len = len as u8;
         packed
@@ -2176,6 +2752,13 @@ impl InlinePacked {
         unsafe {
             std::slice::from_raw_parts(self.slots.as_ptr().cast::<Property>(), self.len as usize)
         }
+    }
+
+    fn pop(&mut self) -> Option<Property> {
+        self.len = self.len.checked_sub(1)?;
+        // The live prefix owned this initialized slot; shortening it transfers the
+        // owner to the caller and prevents InlinePacked::drop from dropping it again.
+        Some(unsafe { self.slots[self.len as usize].assume_init_read() })
     }
 
     fn into_vec(&mut self) -> Vec<Property> {
@@ -2526,8 +3109,8 @@ pub struct Props {
     /// [`crate::bytecode::IC_CREATE`]). Set by the creation-IC fill walk itself, one-way.
     proto_flag: std::cell::Cell<bool>,
     /// Object shape (hidden class): the id encoding this map's ordered key sequence (see
-    /// [`ShapeTable`]). Two `Props` share an id exactly when they added the same keys in the same
-    /// order, so an inline cache that recorded (shape, slot) from one object can trust that slot
+    /// [`ShapeTable`]). A shared cacheable id proves the same keys in the same order, so an
+    /// inline cache that recorded (shape, slot) from one object can trust that slot
     /// on any other object of the same shape — without a key compare. Bumped to a child on
     /// new-key insert, to a fresh unique on a structural removal. Only consulted for non-exotic
     /// objects (arrays keep the key-compare path — same shape can mean different element counts).
@@ -2538,7 +3121,9 @@ pub struct Props {
     /// `NO_SLOT`; see `note_inserted` and `get_index`.
     elems: DenseStorage,
     /// Raw-f64 read mirror of the dense elements. While `mirror_flags & MIRROR_OK`:
-    /// `mirror.len() == elems.len()`, and for every `n`: `mirror[n]` is [`MIRROR_HOLE`] exactly
+    /// `mirror.len() == elems.len()` for classic storage. With [`MIRROR_PACKED`], the
+    /// mirror instead parallels the authoritative packed Property array and contains no
+    /// holes. For classic storage, `mirror[n]` is [`MIRROR_HOLE`] exactly
     /// when `elems[n]` names no element, else the element is a plain writable data property
     /// whose value is `Num(mirror[n])`. Element reads become one indexed load (no entry chase,
     /// no tag check), and `MIRROR_ALL_I32` lets the JIT's int loops skip the exactness guard
@@ -2581,6 +3166,14 @@ pub(crate) const MIRROR_NO_HOLES: u8 = 2;
 /// Every non-hole mirror value is an exact i32 (bit-identical through an i32 round trip, which
 /// also excludes -0.0).
 pub(crate) const MIRROR_ALL_I32: u8 = 4;
+/// A coherent mirror parallels packed Properties, not the classic index-to-entry map.
+/// It is created on hot numeric-region demand; canonical properties and named IC slots do
+/// not move. Writers must select the correct authoritative storage before updating the mirror.
+pub(crate) const MIRROR_PACKED: u8 = 8;
+/// A packed view could not be prepared in this element state. Native loop entry must not
+/// rescan an unchanged heterogeneous/large array on every iteration. Any indexed mutation or
+/// mutable escape clears this hint; it conveys no semantic or descriptor proof.
+pub(crate) const MIRROR_PACKED_FAILED: u8 = 16;
 /// The mirror's hole sentinel: a quiet-NaN payload no arithmetic produces. A user CAN craft
 /// this exact bit pattern (typed-array punning), so the write paths refuse to mirror it — it is
 /// never stored as data, which is what makes reading it back as "absent" sound.
@@ -2638,49 +3231,34 @@ pub(crate) fn bump_proto_epoch() {
 }
 
 /// The object-shape (hidden-class) transition tree. A shape id encodes an *ordered sequence of
-/// property keys* — two `Props` share an id exactly when they added the same keys in the same
-/// order (attributes are NOT encoded; the inline cache re-checks accessor/writable at the slot).
-/// `transitions[(parent, key)] = child` is memoized, so structurally-identical objects converge
-/// on one id — which is what makes a shared per-site cache's shape compare meaningful (the flaw
-/// that sank the earlier per-object version counter). A structural *removal* can't be a tree
+/// property keys*. A shared cacheable id proves the same keys in the same order (attributes
+/// are NOT encoded; the inline cache re-checks accessor/writable at the slot).
+/// `transitions[(parent, key)] = child` is memoized within an Agent, so its structurally-identical
+/// objects converge on one id. Fresh IDs are process-wide and never reused: foreign objects and
+/// foreign-context mutations cannot collide with another Agent's proofs. A structural *removal* can't be a tree
 /// transition (it doesn't extend the key sequence), so it mints a fresh unique id that no cache
 /// ever holds — forcing a re-derive.
 struct ShapeTable {
     transitions: crate::fasthash::FastMap<(u32, Rc<str>), u32>,
-    /// Direct shape-ID lookup for already-validated creation ICs. Bounded independently of IDs.
-    layouts: Vec<Option<PropertyLayout>>,
-    cached_layouts: usize,
-    next: u32,
+    /// Bounded tagged lookup: process-wide IDs are never dense within a particular heap.
+    layouts: ShapeLayouts,
 }
 
 // Eager prefix sharing is bounded independently of the existing shape identity table. Larger or
 // highly irregular maps use private copy-on-write keys; they do not build a quadratic collection
 // of full layouts. Layouts contain key strings only, never JS objects, prototype chains or values.
 const SHARED_LAYOUT_MAX_FIELDS: usize = 16;
-const SHARED_LAYOUT_CACHE_LIMIT: usize = 4096;
-const SHARED_LAYOUT_SHAPE_LIMIT: usize = 65536;
 
 impl ShapeTable {
     fn new() -> ShapeTable {
         ShapeTable {
             transitions: Default::default(),
-            layouts: Vec::new(),
-            cached_layouts: 0,
-            next: 1, // 0 is reserved for SHAPE_EMPTY.
+            layouts: ShapeLayouts::default(),
         }
     }
 
     fn fresh(&mut self) -> u32 {
-        let id = self.next;
-        // Reusing an id can turn an inline-cache hit into a wrong [[Get]]/[[Set]]. Exhaustion is
-        // therefore a hard implementation limit instead of an ABA wrap. The engine's live-object
-        // and execution limits make reaching ~4.3 billion structural shapes unrealistic, while
-        // keeping the hot guard at one 32-bit compare.
-        self.next = self
-            .next
-            .checked_add(1)
-            .expect("ECMAScript Agent exhausted its object-shape identity space");
-        id
+        property_shapes::fresh_shape()
     }
 }
 
@@ -2692,35 +3270,38 @@ fn shape_transition(
 ) -> (u32, Option<PropertyLayout>) {
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
+        // Unknown parents do not describe one key sequence. In particular, never memoize
+        // (uncacheable, key): two exhausted maps can have entirely different prefixes.
+        if !is_cacheable_shape(parent) {
+            return (SHAPE_UNCACHEABLE, None);
+        }
         let pair = (parent, key.clone());
         let id = if let Some(&id) = shapes.transitions.get(&pair) {
             id
         } else {
             let id = shapes.fresh();
-            shapes.transitions.insert(pair, id);
+            if is_cacheable_shape(id) {
+                shapes.transitions.insert(pair, id);
+            }
             id
         };
+        if !is_cacheable_shape(id) {
+            return (id, None);
+        }
         let Some(prefix) = prefix else {
             return (id, None);
         };
-        if let Some(Some(layout)) = shapes.layouts.get(id as usize) {
+        if let Some(layout) = shapes.layouts.get(id) {
             return (id, Some(layout.clone()));
         }
-        if prefix.len() >= SHARED_LAYOUT_MAX_FIELDS
-            || shapes.cached_layouts >= SHARED_LAYOUT_CACHE_LIMIT
-            || id as usize >= SHARED_LAYOUT_SHAPE_LIMIT
-        {
+        if prefix.len() >= SHARED_LAYOUT_MAX_FIELDS {
             return (id, None);
         }
         let mut names = Vec::with_capacity(prefix.len() + 1);
         names.extend_from_slice(prefix);
         names.push(key.clone());
         let layout = Rc::new(names);
-        if shapes.layouts.len() <= id as usize {
-            shapes.layouts.resize(id as usize + 1, None);
-        }
-        shapes.layouts[id as usize] = Some(layout.clone());
-        shapes.cached_layouts += 1;
+        shapes.layouts.insert(id, layout.clone());
         // Cold transition learning: a previously seen prefix can predict the rest of this
         // ordered insertion chain. Existing instances retain their pinned layout; subsequent
         // instances can reserve once and append into its live prefix without another lookup.
@@ -2731,7 +3312,7 @@ fn shape_transition(
             let Some(&prefix_id) = shapes.transitions.get(&(prefix_shape, name.clone())) else {
                 break;
             };
-            if let Some(Some(prediction)) = shapes.layouts.get_mut(prefix_id as usize) {
+            if let Some(prediction) = shapes.layouts.get_mut(prefix_id) {
                 if prediction.len() < layout.len() && layout.starts_with(prediction.as_slice()) {
                     *prediction = layout.clone();
                 }
@@ -2743,13 +3324,7 @@ fn shape_transition(
 }
 
 fn shape_layout(id: u32) -> Option<PropertyLayout> {
-    with_active_gc_heap(|heap| {
-        heap.shapes
-            .borrow()
-            .layouts
-            .get(id as usize)
-            .and_then(Clone::clone)
-    })
+    with_active_gc_heap(|heap| heap.shapes.borrow().layouts.get(id).cloned())
 }
 
 /// A fresh unique shape id (a structural removal / deopt — no cache should still match).
@@ -2779,9 +3354,8 @@ thread_local! {
 }
 
 /// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals create
-/// this same one-property named map constantly. The memo belongs to the Agent: a pooled coroutine
-/// worker can successively run unrelated Agents whose shape tables assign the same integer to
-/// different key sequences.
+/// this same one-property named map constantly. The memo belongs to the Agent alongside its
+/// transition table; globally unique IDs also remain valid on pooled coroutine workers.
 fn array_length_shape(length_key: &Rc<str>) -> u32 {
     with_active_gc_heap(|heap| {
         let cached = heap.array_length_shape.get();
@@ -2794,7 +3368,9 @@ fn array_length_shape(length_key: &Rc<str>) -> u32 {
             shape
         } else {
             let shape = shapes.fresh();
-            shapes.transitions.insert(key, shape);
+            if is_cacheable_shape(shape) {
+                shapes.transitions.insert(key, shape);
+            }
             shape
         };
         heap.array_length_shape.set(shape);
@@ -2937,14 +3513,14 @@ impl Props {
     /// Construct a small dense array map directly from moved JIT stack values.
     ///
     /// # Safety
-    /// `items..items+len` contains initialized `Value`s relinquished by the caller.
-    pub(crate) unsafe fn packed_array_from_raw(items: *mut Value, len: usize) -> Props {
+    /// `items..items+len` contains initialized `PackedValue`s relinquished by the caller.
+    pub(crate) unsafe fn packed_array_from_raw(items: *mut PackedValue, len: usize) -> Props {
         debug_assert!(len <= 32);
         let inline = len <= INLINE_PACKED_CAPACITY;
         let mut packed = Vec::with_capacity(if inline { 0 } else { len });
         if !inline {
             for index in 0..len {
-                packed.push(Property::plain(unsafe { items.add(index).read() }));
+                packed.push(Property::plain_packed(unsafe { items.add(index).read() }));
             }
         }
         let length_key = fn_key(0);
@@ -2955,19 +3531,30 @@ impl Props {
                 layout: Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone)),
             },
             shape,
-            elems: DenseStorage(Some(Box::new(DenseBuffers {
-                index: None,
-                packed: (!inline).then(|| Box::new(packed)),
-                inline_packed: if inline {
-                    unsafe { InlinePacked::from_raw(items, len) }
-                } else {
-                    InlinePacked::default()
-                },
-                elems: Vec::new(),
-                mirror: Vec::new(),
-                symbols: None,
-            }))),
-            mirror_flags: 0,
+            // An empty InlinePacked has no active packed representation. Preserve the
+            // same empty classic state as ArrayCreate/make_array([]): subsequent numeric
+            // growth must build its mirror rather than inherit a permanent invalidation.
+            elems: if len == 0 {
+                DenseStorage::default()
+            } else {
+                DenseStorage(Some(Box::new(DenseBuffers {
+                    index: None,
+                    packed: (!inline).then(|| Box::new(packed)),
+                    inline_packed: if inline {
+                        unsafe { InlinePacked::from_raw(items, len) }
+                    } else {
+                        InlinePacked::default()
+                    },
+                    elems: Vec::new(),
+                    mirror: Vec::new(),
+                    symbols: None,
+                })))
+            },
+            mirror_flags: if len == 0 {
+                MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
+            } else {
+                0
+            },
             mirror_holes: 0,
             proto_flag: Cell::new(false),
             has_far: Cell::new(false),
@@ -2983,13 +3570,20 @@ impl Props {
     /// again as the caller overwrote each slot. Object-heavy parsers do this millions of times.
     /// The key/shape and lookup sidecars are the reusable part; plain property descriptors are
     /// cheaper and safer to construct directly around the moved values.
-    pub(crate) fn instantiate_plain<I>(&self, mut values: I) -> Props
+    pub(crate) fn instantiate_plain<I>(&self, values: I) -> Props
     where
         I: ExactSizeIterator<Item = Value>,
     {
+        self.instantiate_plain_packed(values.map(PackedValue::pack))
+    }
+
+    pub(crate) fn instantiate_plain_packed<I>(&self, values: I) -> Props
+    where
+        I: ExactSizeIterator<Item = PackedValue>,
+    {
         assert_eq!(values.len(), self.entries.len(), "object-template arity");
         let entries = NamedEntries {
-            fields: values.by_ref().map(Property::plain).collect(),
+            fields: values.map(Property::plain_packed).collect(),
             layout: self.entries.layout.clone(),
         };
         Props {
@@ -3074,15 +3668,78 @@ impl Props {
         if len == 0 || self.proto_flag.get() || self.has_far.get() {
             return None;
         }
-        let packed = self.elems.packed_mut()?;
+        let packed = self.elems.packed_ref()?;
         if packed.len() < len
             || packed[..len].iter().any(|p| {
-                p.accessor() || !p.writable() || !matches!(p.value(), Value::Empty | Value::Num(_))
+                p.accessor() || !p.writable() || !(p.is_empty() || p.number_value().is_some())
             })
         {
             return None;
         }
+        // This raw mutable view escapes mirror-maintaining setters. The existing small-hole
+        // region writes these slots directly, so it must never leave an older mirror live.
+        self.mirror_invalidate();
+        let packed = self.elems.packed_mut().unwrap();
         Some(packed as *mut Vec<Property>)
+    }
+
+    /// Add an f64 read view to a hot numeric packed array without changing its Properties,
+    /// descriptor bits, keys, shape or length slot. No JavaScript, GC or canonical relocation
+    /// occurs. ECMA-262 OrdinaryGet/OrdinarySetWithOwnDescriptor: only existing writable
+    /// Number-valued own data properties qualify; missing indices remain prototype lookups.
+    /// A bounded, fallible allocation keeps this non-safepoint preparation cheap and atomic.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn prepare_packed_numeric_mirror(&mut self) -> bool {
+        if self.mirror_flags & (MIRROR_OK | MIRROR_PACKED) == (MIRROR_OK | MIRROR_PACKED) {
+            return true;
+        }
+        if self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
+            return false;
+        }
+        let Some(packed) = self.elems.packed_ref() else {
+            return false;
+        };
+        self.mirror_flags = MIRROR_PACKED_FAILED;
+        // Larger packed arrays retain checked native access. This bounds allocation and
+        // validation work in a helper that cannot itself run an interrupt/GC safepoint.
+        const MAX_NON_SAFEPOINT_ELEMENTS: usize = 4096;
+        if packed.is_empty() || packed.len() > MAX_NON_SAFEPOINT_ELEMENTS || self.has_far.get() {
+            return false;
+        }
+        let mut all_i32 = true;
+        for property in packed {
+            let Some(number) = property.number_value() else {
+                return false;
+            };
+            if property.accessor() || !property.writable() || number.to_bits() == MIRROR_HOLE {
+                return false;
+            }
+            all_i32 &= f64_exact_i32(number);
+        }
+        let length = packed.len();
+        let buffers = self.elems.buffers_mut();
+        let mirror = &mut buffers.mirror;
+        if mirror
+            .try_reserve_exact(length.saturating_sub(mirror.len()))
+            .is_err()
+        {
+            return false;
+        }
+        mirror.clear();
+        let packed = buffers
+            .packed
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| buffers.inline_packed.as_slice());
+        mirror.extend(
+            packed
+                .iter()
+                .map(|property| property.number_value().unwrap()),
+        );
+        self.mirror_holes = 0;
+        self.mirror_flags =
+            MIRROR_OK | MIRROR_PACKED | MIRROR_NO_HOLES | if all_i32 { MIRROR_ALL_I32 } else { 0 };
+        true
     }
 
     /// Mark this map as an array's (see `elem_mode`). One-way, set when the owning object
@@ -3126,18 +3783,36 @@ impl Props {
         self.shape
     }
 
-    /// Keys plus live enumerable bits identify a small ordinary map's enumeration. Shapes do
-    /// not encode attributes: two objects can share all keys but enumerate different subsets.
-    /// Element-mode maps use a separate index layout and cannot use this shape-only proof.
-    pub(crate) fn enumeration_shape(&self) -> Option<(u32, u64)> {
+    /// Exercise the exhausted identity path without resetting the process-wide allocator or
+    /// changing identities owned by other tests/Agents. This only withdraws this map's proof.
+    #[cfg(test)]
+    pub(crate) fn force_uncacheable_shape_for_test(&mut self) {
+        self.shape = SHAPE_UNCACHEABLE;
+    }
+
+    /// Borrow the immutable key layout, live prefix and attributes for enumeration. Numeric
+    /// shape IDs are globally unique now, but layout identity remains valid even after shape
+    /// identity exhaustion and avoids retaining any source object or prototype chain.
+    /// Empty prefixes need no layout pin; predictions do not create observable properties.
+    pub(crate) fn enumeration_layout(&self) -> Option<(Option<&PropertyLayout>, u8, u64)> {
         if self.elem_mode.get() || self.elems.packed_ref().is_some() || self.entries.len() > 64 {
             return None;
         }
+        let layout = if self.entries.is_empty() {
+            None
+        } else {
+            Some(
+                self.entries
+                    .layout
+                    .as_ref()
+                    .filter(|keys| keys.len() >= self.entries.len())?,
+            )
+        };
         let mut enumerable = 0;
         for (index, property) in self.entries.fields.iter().enumerate() {
             enumerable |= u64::from(property.enumerable()) << index;
         }
-        Some((self.shape, enumerable))
+        Some((layout, self.entries.len() as u8, enumerable))
     }
     /// Final named-property count of a small ordinary instance. The construct JIT records this
     /// after a successful call so forwarding constructors whose own bytecode has no direct
@@ -3155,9 +3830,7 @@ impl Props {
     #[inline]
     pub(crate) fn get_index(&self, n: u32) -> Option<&Property> {
         if let Some(packed) = self.elems.packed_ref() {
-            return packed
-                .get(n as usize)
-                .filter(|p| !matches!(p.value(), Value::Empty));
+            return packed.get(n as usize).filter(|p| !p.is_empty());
         }
         let slot = *self.elems.get(n as usize)?;
         if slot == NO_SLOT {
@@ -3169,7 +3842,7 @@ impl Props {
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).
     #[inline]
     pub(crate) fn mirror_invalidate(&mut self) {
-        if self.mirror_flags & MIRROR_OK != 0 {
+        if self.mirror_flags != 0 {
             self.mirror_flags = 0;
             self.elems.mirror_clear();
         }
@@ -3253,14 +3926,37 @@ impl Props {
     /// generic path.
     #[inline]
     pub(crate) fn set_index_value(&mut self, n: u32, v: Value) -> Result<(), Value> {
-        if let Some(packed) = self.elems.packed_mut() {
+        if self.elems.packed_is_some() {
+            if self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
+                self.mirror_invalidate();
+            }
+            let packed = self.elems.packed_mut().unwrap();
             let Some(p) = packed.get_mut(n as usize) else {
                 return Err(v);
             };
-            if matches!(p.value(), Value::Empty) || p.accessor() || !p.writable() {
+            if p.is_empty() || p.accessor() || !p.writable() {
                 return Err(v);
             }
+            let number = match &v {
+                Value::Num(number) => Some(*number),
+                _ => None,
+            };
             p.set_value(v);
+            if self.mirror_flags & MIRROR_OK != 0 {
+                match number {
+                    Some(number) if number.to_bits() != MIRROR_HOLE => {
+                        if !f64_exact_i32(number) {
+                            self.mirror_flags &= !MIRROR_ALL_I32;
+                        }
+                        if let Some(slot) = self.elems.mirror_get_mut(n as usize) {
+                            *slot = number;
+                        } else {
+                            self.mirror_invalidate();
+                        }
+                    }
+                    _ => self.mirror_invalidate(),
+                }
+            }
             return Ok(());
         }
         let Some(&slot) = self.elems.get(n as usize) else {
@@ -3358,6 +4054,7 @@ impl Props {
                 return Err(prop);
             }
             self.note_structural();
+            self.mirror_invalidate();
             self.elems.packed_mut().unwrap().push(prop);
             return Ok(());
         }
@@ -3438,10 +4135,11 @@ impl Props {
                 return None;
             }
             let p = packed.last()?;
-            if matches!(p.value(), Value::Empty) || p.accessor() || !p.configurable() {
+            if p.is_empty() || p.accessor() || !p.configurable() {
                 return None;
             }
             self.note_structural();
+            self.mirror_invalidate();
             return self
                 .elems
                 .packed_mut()
@@ -3479,6 +4177,118 @@ impl Props {
         }
         Some(p.into_value())
     }
+
+    /// ECMA-262 Array.prototype.shift / OrdinarySetWithOwnDescriptor (e28783d5,
+    /// #sec-array.prototype.shift): batch only an entirely unobservable own-data
+    /// operation. The caller proves ordinary Array internal methods. A miss changes
+    /// no property or mirror, so the generic algorithm retains its partial effects
+    /// and abrupt completions. `length` is included in the proof and update.
+    pub(crate) fn shift_dense_array(&mut self, len: usize) -> Option<Value> {
+        if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
+            return None;
+        }
+        let length = self.length_property()?;
+        if !length.writable() || length.number_value() != Some(len as f64) {
+            return None;
+        }
+        let safe = |index: usize, property: &Property| {
+            !property.is_empty()
+                && !property.accessor()
+                && if index + 1 == len {
+                    // The last source is read/deleted, never assigned.
+                    property.configurable()
+                } else {
+                    // Descriptor attributes stay with the destination index.
+                    property.writable()
+                }
+        };
+        let packed = if let Some(properties) = self.elems.packed_ref() {
+            if properties.len() != len || !properties.iter().enumerate().all(|(n, p)| safe(n, p)) {
+                return None;
+            }
+            true
+        } else {
+            if self.elems.len() != len
+                || !self.elems.elems.iter().enumerate().all(|(n, &slot)| {
+                    slot != NO_SLOT && safe(n, &self.entries.fields[slot as usize])
+                })
+            {
+                return None;
+            }
+            false
+        };
+
+        // No JavaScript, collection or fallible semantic operation follows the
+        // proof. Rotate owning words, not Properties: this keeps each index's
+        // attributes, transfers every reference once, and returns the original
+        // first owner from the removed tail. Rc counts (the nursery's conservative
+        // remembered set) stay correct without per-element retain/drop round trips.
+        let mirror_flags = if self.mirror_flags & MIRROR_OK != 0 && self.elems.mirror_len() == len {
+            self.elems.buffers_mut().mirror.rotate_left(1);
+            self.mirror_flags
+        } else {
+            self.mirror_invalidate();
+            0
+        };
+        let first = if packed {
+            self.note_structural();
+            for pair in self.elems.packed_ref().unwrap().windows(2) {
+                pair[0].packed.0.swap(&pair[1].packed.0);
+            }
+            let buffers = self.elems.0.as_deref_mut().unwrap();
+            let property = if let Some(properties) = buffers.packed.as_deref_mut() {
+                properties.pop().unwrap()
+            } else {
+                // Do not promote a small inline array just to remove an element.
+                buffers.inline_packed.pop().unwrap()
+            };
+            if mirror_flags != 0 {
+                buffers.mirror.pop();
+            }
+            property.into_value()
+        } else {
+            for n in 1..len {
+                let previous = self.elems[n - 1] as usize;
+                let next = self.elems[n] as usize;
+                self.entries.fields[previous]
+                    .packed
+                    .0
+                    .swap(&self.entries.fields[next].packed.0);
+            }
+            let last = len - 1;
+            let slot = self.elems[last] as usize;
+            if slot + 1 == self.entries.len() {
+                // The ordinary append-built representation needs only O(1) tail
+                // maintenance; this also pops the already-rotated numeric mirror.
+                self.pop_last_element(last as u32)
+                    .expect("shift preflight proved removable dense tail")
+            } else {
+                let first = self.entries.fields[slot].take_value();
+                let removed = self.remove(&index_key(last));
+                debug_assert!(removed);
+                // remove() maintains named-key slots, symbol owners, hash indices
+                // and prototype invalidation. Trim its final hole to keep dense
+                // append eligible, including when named properties follow elements.
+                self.elems.pop();
+                if mirror_flags != 0 {
+                    self.elems.mirror_pop();
+                    self.mirror_flags = mirror_flags | MIRROR_NO_HOLES;
+                    self.mirror_holes = 0;
+                }
+                first
+            }
+        };
+        if len == 1 && !self.elems.packed_is_some() {
+            // An emptied inline array resumes the ordinary empty classic state.
+            self.mirror_flags = MIRROR_OK | MIRROR_NO_HOLES | MIRROR_ALL_I32;
+            self.mirror_holes = 0;
+        }
+        let slot = self.find("length").expect("Array length is not removed");
+        self.entries.fields[slot].set_value(Value::Num((len - 1) as f64));
+        self.len_slot.set(slot as u32);
+        Some(first)
+    }
+
     /// The entry slot for `key`. Small maps (≤ [`INDEX_THRESHOLD`] entries — most objects) have
     /// no hash index at all: lookup is a short linear scan and inserts never hash or rehash.
     /// The index is built once when a map grows past the threshold and is authoritative from
@@ -3536,6 +4346,7 @@ impl Props {
             && self.elem_mode.get()
             && array_index.is_none()
             && key != "length"
+            && is_cacheable_shape(self.shape)
             && self.shape == array_length_shape(&fn_key(0))
         {
             return None;
@@ -3606,8 +4417,9 @@ impl Props {
                 .elems
                 .packed_ref()
                 .and_then(|p| p.get(n as usize))
-                .is_some_and(|p| !matches!(p.value(), Value::Empty))
+                .is_some_and(|p| !p.is_empty())
             {
+                self.mirror_invalidate();
                 return self.elems.packed_mut().and_then(|p| p.get_mut(n as usize));
             }
         }
@@ -3669,6 +4481,9 @@ impl Props {
     /// key-string allocation. Only valid on a Props whose entries so far are exactly the dense
     /// elements 0..len.
     pub(crate) fn push_dense(&mut self, prop: Property) {
+        if self.elems.packed_is_some() {
+            self.mirror_invalidate();
+        }
         if let Some(packed) = self.elems.packed_mut() {
             packed.push(prop);
             return;
@@ -3752,17 +4567,20 @@ impl Props {
             let n = n as usize;
             if n < packed.len() {
                 self.note_structural();
+                self.mirror_invalidate();
                 self.elems.packed_mut().unwrap()[n] = prop;
                 return;
             }
             if !self.has_far.get() && n <= packed.len() + 256 {
                 self.note_structural();
+                self.mirror_invalidate();
                 let packed = self.elems.packed_mut().unwrap();
                 packed.resize_with(n, || Property::plain(Value::Empty));
                 packed.push(prop);
                 return;
             }
             self.has_far.set(true);
+            self.mirror_invalidate();
         }
         if let Some(i) = self.find(&key) {
             self.entries.fields[i] = prop;
@@ -3817,9 +4635,10 @@ impl Props {
             Some(n) => (n as usize) < from,
             None => true,
         };
-        let packed_remove = self.elems.packed_ref().is_some_and(|p| {
-            p.len() > from && p[from..].iter().any(|p| !matches!(p.value(), Value::Empty))
-        });
+        let packed_remove = self
+            .elems
+            .packed_ref()
+            .is_some_and(|p| p.len() > from && p[from..].iter().any(|p| !p.is_empty()));
         if !packed_remove && self.entries.iter().all(|(k, _)| keep(k)) {
             return;
         }
@@ -3835,7 +4654,11 @@ impl Props {
             self.build_index();
         }
         self.elems.clear_elems();
-        self.mirror_flags = MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES;
+        self.mirror_flags = if self.elems.packed_is_some() {
+            0
+        } else {
+            MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
+        };
         self.mirror_holes = 0;
         for slot in 0..self.entries.len() {
             self.note_inserted(slot);
@@ -3846,11 +4669,9 @@ impl Props {
 
     pub(crate) fn remove(&mut self, key: &str) -> bool {
         if let (Some(n), Some(packed)) = (canonical_index(key), self.elems.packed_ref()) {
-            if packed
-                .get(n as usize)
-                .is_some_and(|p| !matches!(p.value(), Value::Empty))
-            {
+            if packed.get(n as usize).is_some_and(|p| !p.is_empty()) {
                 self.note_structural();
+                self.mirror_invalidate();
                 self.elems.packed_mut().unwrap()[n as usize] = Property::plain(Value::Empty);
                 return true;
             }
@@ -3909,7 +4730,7 @@ impl Props {
             .packed_ref()
             .into_iter()
             .flat_map(|p| p.iter().enumerate())
-            .filter(|(_, p)| !matches!(p.value(), Value::Empty))
+            .filter(|(_, p)| !p.is_empty())
             .map(|(n, _)| index_key(n))
             .chain(self.entries.iter().map(|(k, _)| k.clone()))
             .filter(|k| !crate::interpreter::Interp::is_private_key(k))
@@ -3926,7 +4747,7 @@ impl Props {
                 packed
                     .iter()
                     .enumerate()
-                    .filter(|(_, p)| !matches!(p.value(), Value::Empty))
+                    .filter(|(_, p)| !p.is_empty())
                     .map(|(n, _)| (n as u32, index_key(n))),
             );
         }
@@ -3979,9 +4800,7 @@ impl Props {
             .packed_ref()
             .into_iter()
             .flat_map(|p| p.iter().enumerate())
-            .filter_map(|(n, p)| {
-                (!matches!(p.value(), Value::Empty) && !p.configurable() && n >= from).then_some(n)
-            });
+            .filter_map(|(n, p)| (!p.is_empty() && !p.configurable() && n >= from).then_some(n));
         let entries = self.entries.iter().filter_map(|(k, p)| {
             (!p.configurable())
                 .then(|| canonical_index(k).map(|n| n as usize))
@@ -3997,7 +4816,7 @@ impl Props {
             .packed_ref()
             .into_iter()
             .flat_map(|p| p.iter())
-            .filter(|p| !matches!(p.value(), Value::Empty))
+            .filter(|p| !p.is_empty())
             .all(valid)
             && self
                 .entries
@@ -4005,6 +4824,14 @@ impl Props {
                 .all(|(k, p)| crate::interpreter::Interp::is_private_key(k) || valid(p))
     }
 }
+
+#[cfg(test)]
+#[path = "value_numeric_mirror_tests.rs"]
+mod numeric_mirror_tests;
+
+#[cfg(test)]
+#[path = "value_array_shift_tests.rs"]
+mod array_shift_tests;
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).
 #[inline(always)]

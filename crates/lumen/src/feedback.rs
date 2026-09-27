@@ -841,7 +841,14 @@ impl FeedbackVector {
             return;
         };
         let site = SiteId(index as u32);
-        if trace.depth > PROPERTY_DEPTH_MASK {
+        if trace.depth > PROPERTY_DEPTH_MASK
+            || trace
+                .receiver_shape
+                .is_some_and(|shape| !crate::value::is_cacheable_shape(shape))
+            || trace
+                .holder_shape
+                .is_some_and(|shape| !crate::value::is_cacheable_shape(shape))
+        {
             let generic = ObservationWord::new(ObservationState::Generic, 0, 0);
             self.merge_write(
                 site,
@@ -1652,6 +1659,7 @@ fn merge_property_access_words(
 }
 
 fn intern_current_shape(shapes: &std::cell::RefCell<Vec<u32>>, shape: u32) -> u32 {
+    debug_assert!(crate::value::is_cacheable_shape(shape));
     let mut shapes = shapes.borrow_mut();
     match shapes.iter().position(|existing| *existing == shape) {
         Some(index) => index as u32 + 1,

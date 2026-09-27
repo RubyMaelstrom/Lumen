@@ -28,6 +28,33 @@ fn check(source: &str, expected: &str) {
 }
 
 #[test]
+fn dense_numeric_typedarray_copy_keeps_holes_accessors_and_conversion_order() {
+    // SetTypedArrayFromArrayLike reads/coerces each element in order. Only already-numeric
+    // ordinary own data properties may batch; a failed proof must not partially write.
+    check(
+        r#"
+        var trace=[],out=[],target=new Float64Array(4);
+        var source=[1,-0,Infinity,NaN];target.set(source);
+        out.push(target[0]===1,Object.is(target[1],-0),target[2]===Infinity,Number.isNaN(target[3]));
+        var inherited=Object.create(Array.prototype);
+        Object.defineProperty(inherited,'1',{get(){trace.push('inherited');return 7}});
+        source=[2,3,4];delete source[1];Object.setPrototypeOf(source,inherited);
+        target.set(source);out.push(target[0],target[1],target[2],trace.join(','));
+        trace=[];target.fill(0);source=[5,6,7];
+        Object.defineProperty(source,'1',{get(){trace.push(target[0]);throw 'sentinel'}});
+        try{target.set(source)}catch(e){out.push(e)}
+        out.push(target.join(','),trace.join(','));
+        trace=[];target.fill(0);source=[8,{valueOf(){trace.push(target[0]);return 9}},10];
+        target.set(source);out.push(target.join(','),trace.join(','));
+        trace=[];source=new Proxy([11,12],{get(t,k){trace.push(k);return t[k]}});
+        target.set(source);out.push(trace.join(','));
+        out.join('|');
+        "#,
+        "true|true|true|true|2|7|4|inherited|sentinel|5,0,0,0|5|8,9,10,0|8|length,0,1",
+    );
+}
+
+#[test]
 fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
     let mut props = Props::new();
     props.mark_array();

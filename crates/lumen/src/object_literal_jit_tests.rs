@@ -80,7 +80,7 @@ fn object_literal_builders_have_real_native_entries() {
             _ => panic!("ordinary user function"),
         };
         assert!(
-            chunk.jit.get().is_some_and(Option::is_some),
+            chunk.jit.get().is_some_and(|code| code.is_some()),
             "{name}: must not silently fall back to the VM"
         );
         assert!(

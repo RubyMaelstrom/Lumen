@@ -29,10 +29,56 @@ const VERSION: u32 = 2;
 /// handed arbitrary bytes. Keep corrupt data from turning its length fields into unbounded work.
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SNAPSHOT_ALLOC_BYTES: usize = 256 * 1024 * 1024;
-// Snapshot decoder frames contain large AST enum temporaries, so this must stay materially below
-// the parser's lighter recursion ceiling on the ordinary Rust test-thread stack.
+// Keep malformed recursion bounded independently of the caller's native stack headroom.
 const MAX_SNAPSHOT_DEPTH: usize = 128;
 const ACCOUNTED_NODE_BYTES: usize = 64;
+
+// Debug codec frames contain large AST enum temporaries: dec_expr_inner measured 11,936 bytes
+// on ARM64. A host can enter the codec with suspended JS/VM frames already occupying most of
+// its stack. Check every recursive AST gateway *before* entering its large inner frame; the
+// intervening collection/property helpers do not recurse without crossing another gateway.
+// 128 KiB leaves substantial room for one such edge, allocation failure, and AST cleanup. New
+// segments are 1 MiB and live only for that continuation. Decode's existing depth/byte/allocation
+// budgets remain authoritative, rather than silently reducing valid input depth on re-entry.
+// This is implementation storage only: ECMA-262 ParseScript/ScriptEvaluation and HTML's
+// run-a-classic-script ordering are unchanged (local ECMA-262 snapshot e28783d5fc9d).
+#[cfg(not(target_arch = "wasm32"))]
+const CODEC_STACK_RED_ZONE: usize = 128 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const CODEC_STACK_SEGMENT: usize = 1024 * 1024;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static CODEC_STACK_SEGMENTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+#[inline]
+fn with_codec_stack<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(not(target_arch = "wasm32"))]
+    if stacker::remaining_stack().is_none_or(|remaining| remaining < CODEC_STACK_RED_ZONE) {
+        #[cfg(test)]
+        struct SegmentGuard;
+        #[cfg(test)]
+        impl Drop for SegmentGuard {
+            fn drop(&mut self) {
+                CODEC_STACK_SEGMENTS.with(|count| {
+                    let (live, total) = count.get();
+                    count.set((live - 1, total));
+                });
+            }
+        }
+        #[cfg(test)]
+        let _guard = {
+            CODEC_STACK_SEGMENTS.with(|count| {
+                let (live, total) = count.get();
+                count.set((live + 1, total + 1));
+            });
+            SegmentGuard
+        };
+        return stacker::grow(CODEC_STACK_SEGMENT, f);
+    }
+    f()
+}
 
 // ---- writer / reader --------------------------------------------------------------------------
 
@@ -340,6 +386,11 @@ fn dec_opt_rcstr(r: &mut Reader) -> R<Option<Rc<str>>> {
 // ---- Stmt -------------------------------------------------------------------------------------
 
 fn enc_stmt(w: &mut Writer, s: &Stmt) {
+    with_codec_stack(|| enc_stmt_inner(w, s));
+}
+
+#[inline(never)]
+fn enc_stmt_inner(w: &mut Writer, s: &Stmt) {
     match s {
         Stmt::Expr(e) => {
             w.u8(0);
@@ -378,12 +429,12 @@ fn enc_stmt(w: &mut Writer, s: &Stmt) {
             w.u8(5);
             enc_stmts(w, b);
         }
-        Stmt::While { test, body } => {
+        Stmt::While { test, body, .. } => {
             w.u8(6);
             enc_expr(w, test);
             enc_stmt(w, body);
         }
-        Stmt::DoWhile { body, test } => {
+        Stmt::DoWhile { body, test, .. } => {
             w.u8(7);
             enc_stmt(w, body);
             enc_expr(w, test);
@@ -393,6 +444,7 @@ fn enc_stmt(w: &mut Writer, s: &Stmt) {
             test,
             update,
             body,
+            ..
         } => {
             w.u8(8);
             match init {
@@ -413,6 +465,7 @@ fn enc_stmt(w: &mut Writer, s: &Stmt) {
             of,
             is_await,
             body,
+            ..
         } => {
             w.u8(9);
             match decl {
@@ -534,11 +587,19 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
 
 fn dec_boxed_stmt(r: &mut Reader) -> R<Box<Stmt>> {
     r.enter_node()?;
-    let result = dec_stmt_inner(r).map(Box::new);
+    let result = with_codec_stack(|| dec_stmt_inner(r).map(Box::new));
     r.leave_node();
     result
 }
 
+fn dec_boxed_loop_body(r: &mut Reader) -> R<Box<LoopBody>> {
+    r.enter_node()?;
+    let result = with_codec_stack(|| dec_stmt_inner(r).map(|stmt| Box::new(LoopBody::new(stmt))));
+    r.leave_node();
+    result
+}
+
+#[inline(never)]
 fn dec_stmt_inner(r: &mut Reader) -> R<Stmt> {
     Ok(match r.u8()? {
         0 => Stmt::Expr(dec_expr(r)?),
@@ -565,10 +626,10 @@ fn dec_stmt_inner(r: &mut Reader) -> R<Stmt> {
         5 => Stmt::Block(dec_stmts(r)?),
         6 => Stmt::While {
             test: dec_expr(r)?,
-            body: dec_boxed_stmt(r)?,
+            body: dec_boxed_loop_body(r)?,
         },
         7 => Stmt::DoWhile {
-            body: dec_boxed_stmt(r)?,
+            body: dec_boxed_loop_body(r)?,
             test: dec_expr(r)?,
         },
         8 => {
@@ -581,7 +642,7 @@ fn dec_stmt_inner(r: &mut Reader) -> R<Stmt> {
                 init,
                 test: dec_opt_expr(r)?,
                 update: dec_opt_expr(r)?,
-                body: dec_boxed_stmt(r)?,
+                body: dec_boxed_loop_body(r)?,
             }
         }
         9 => {
@@ -596,7 +657,7 @@ fn dec_stmt_inner(r: &mut Reader) -> R<Stmt> {
                 right: dec_expr(r)?,
                 of: r.bool()?,
                 is_await: r.bool()?,
-                body: dec_boxed_stmt(r)?,
+                body: dec_boxed_loop_body(r)?,
             }
         }
         10 => Stmt::Break(dec_opt_str(r)?),
@@ -685,6 +746,11 @@ fn dec_stmt_inner(r: &mut Reader) -> R<Stmt> {
 // ---- Expr -------------------------------------------------------------------------------------
 
 fn enc_expr(w: &mut Writer, e: &Expr) {
+    with_codec_stack(|| enc_expr_inner(w, e));
+}
+
+#[inline(never)]
+fn enc_expr_inner(w: &mut Writer, e: &Expr) {
     match e {
         Expr::Paren(x) => {
             w.u8(0);
@@ -886,11 +952,12 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
 
 fn dec_boxed_expr(r: &mut Reader) -> R<Box<Expr>> {
     r.enter_node()?;
-    let result = dec_expr_inner(r).map(Box::new);
+    let result = with_codec_stack(|| dec_expr_inner(r).map(Box::new));
     r.leave_node();
     result
 }
 
+#[inline(never)]
 fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
     Ok(match r.u8()? {
         0 => Expr::Paren(dec_boxed_expr(r)?),
@@ -1145,6 +1212,11 @@ fn dec_propkey(r: &mut Reader) -> R<PropKey> {
 }
 
 fn enc_pattern(w: &mut Writer, p: &Pattern) {
+    with_codec_stack(|| enc_pattern_inner(w, p));
+}
+
+#[inline(never)]
+fn enc_pattern_inner(w: &mut Writer, p: &Pattern) {
     match p {
         Pattern::Ident(n) => {
             w.u8(0);
@@ -1186,11 +1258,12 @@ fn enc_pattern(w: &mut Writer, p: &Pattern) {
 }
 fn dec_pattern(r: &mut Reader) -> R<Pattern> {
     r.enter_node()?;
-    let result = dec_pattern_inner(r);
+    let result = with_codec_stack(|| dec_pattern_inner(r));
     r.leave_node();
     result
 }
 
+#[inline(never)]
 fn dec_pattern_inner(r: &mut Reader) -> R<Pattern> {
     Ok(match r.u8()? {
         0 => Pattern::Ident(r.str()?),
@@ -1229,6 +1302,11 @@ fn dec_pattern_inner(r: &mut Reader) -> R<Pattern> {
 }
 
 fn enc_function(w: &mut Writer, f: &Function) {
+    with_codec_stack(|| enc_function_inner(w, f));
+}
+
+#[inline(never)]
+fn enc_function_inner(w: &mut Writer, f: &Function) {
     enc_opt_str(w, &f.name);
     w.uv(f.params.len() as u64);
     for p in &f.params {
@@ -1255,11 +1333,12 @@ fn enc_function(w: &mut Writer, f: &Function) {
 }
 fn dec_function(r: &mut Reader) -> R<Function> {
     r.enter_node()?;
-    let result = dec_function_inner(r);
+    let result = with_codec_stack(|| dec_function_inner(r));
     r.leave_node();
     result
 }
 
+#[inline(never)]
 fn dec_function_inner(r: &mut Reader) -> R<Function> {
     let name = dec_opt_str(r)?;
     let (n, mut params) = r.collection()?;
@@ -1297,6 +1376,11 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
 }
 
 fn enc_class(w: &mut Writer, c: &Class) {
+    with_codec_stack(|| enc_class_inner(w, c));
+}
+
+#[inline(never)]
+fn enc_class_inner(w: &mut Writer, c: &Class) {
     enc_opt_str(w, &c.name);
     match &c.superclass {
         Some(sc) => {
@@ -1337,11 +1421,12 @@ fn enc_class(w: &mut Writer, c: &Class) {
 }
 fn dec_class(r: &mut Reader) -> R<Class> {
     r.enter_node()?;
-    let result = dec_class_inner(r);
+    let result = with_codec_stack(|| dec_class_inner(r));
     r.leave_node();
     result
 }
 
+#[inline(never)]
 fn dec_class_inner(r: &mut Reader) -> R<Class> {
     let name = dec_opt_str(r)?;
     let superclass = if r.option()? {
@@ -1575,5 +1660,174 @@ mod tests {
         }
         nested.u8(6); // null
         assert!(decode(&nested.buf).unwrap_err().contains("nesting limit"));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn codec_reentered_on_a_small_native_stack_roundtrips() {
+        // A host may decode a child Realm's bootstrap while its caller's JS contexts are
+        // suspended. Model that occupied stack without requiring a browser or generated code.
+        // The snapshot is valid and remains below the existing codec depth budget.
+        let mut writer = snapshot_writer();
+        writer.uv(1);
+        writer.u8(0); // expression statement
+        for _ in 0..96 {
+            writer.u8(20); // binary expression
+            writer.str("+");
+        }
+        writer.u8(1);
+        writer.f64(1.0);
+        for _ in 0..96 {
+            writer.u8(1);
+            writer.f64(2.0);
+        }
+        #[inline(never)]
+        fn reentered(bytes: Vec<u8>) {
+            let occupied = [0x7bu8; 64 * 1024];
+            std::hint::black_box(&occupied);
+            let ast = decode(&bytes).expect("valid nested snapshot");
+            assert_eq!(encode(&ast), bytes);
+            drop(ast);
+            assert_eq!(std::hint::black_box(&occupied)[0], 0x7b);
+            super::CODEC_STACK_SEGMENTS.with(|count| {
+                let (live, total) = count.get();
+                assert_eq!(live, 0, "all codec stack continuations returned");
+                if cfg!(debug_assertions) {
+                    assert!(total > 0, "the debug regression must exercise stack growth");
+                }
+            });
+        }
+        std::thread::Builder::new()
+            .name("snapshot-reentered".into())
+            .stack_size(512 * 1024)
+            // A pthread implementation may reuse a larger cached stack for a smaller
+            // request. An explicit segment makes the occupied-headroom regression
+            // deterministic even after other tests have created large-stack threads.
+            .spawn(move || stacker::grow(512 * 1024, || reentered(writer.buf)))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn codec_recursive_gateways_and_corrupt_inputs_release_small_stacks() {
+        // Exercise every mutually recursive gateway, not just the Binary edge in the browser
+        // reproducer. Build deep fixtures iteratively so parser recursion is not under test.
+        use crate::ast::{ArrayPatElem, Class, DeclKind, Expr, Pattern, Stmt};
+        use std::rc::Rc;
+        let mut expr = Expr::Num(1.0);
+        let mut stmt = Stmt::Empty;
+        let mut pattern = Pattern::Ident("x".into());
+        for _ in 0..96 {
+            expr = Expr::Paren(Box::new(expr));
+            stmt = Stmt::Block(vec![stmt]);
+            pattern = Pattern::Array(vec![ArrayPatElem::Rest(pattern)]);
+        }
+        let function_template = crate::parser::parse_script("function f() {}", false)
+            .ok()
+            .expect("function template parses");
+        let Stmt::FuncDecl(template) = &function_template[0] else {
+            panic!("function fixture");
+        };
+        let mut function_stmt = Stmt::Return(Some(Expr::Num(1.0)));
+        for _ in 0..40 {
+            let mut function = (**template).clone();
+            function.body = vec![function_stmt];
+            function_stmt = Stmt::FuncDecl(Rc::new(function));
+        }
+        let mut class_expr = Expr::Ident("Object".into());
+        for _ in 0..40 {
+            class_expr = Expr::Class(Rc::new(Class {
+                name: None,
+                superclass: Some(Box::new(class_expr)),
+                members: Vec::new(),
+                decorators: Vec::new(),
+                source: None,
+            }));
+        }
+        let programs = [
+            vec![Stmt::Expr(expr)],
+            vec![stmt],
+            vec![Stmt::VarDecl {
+                kind: DeclKind::Let,
+                decls: vec![(pattern, None)],
+            }],
+            vec![function_stmt],
+            vec![Stmt::Expr(class_expr)],
+        ];
+        let blobs: Vec<_> = programs.iter().map(|body| encode(body)).collect();
+        std::thread::Builder::new()
+            .name("snapshot-all-gateways".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                stacker::grow(128 * 1024, || {
+                    for bytes in blobs {
+                        for _ in 0..3 {
+                            let ast = decode(&bytes).expect("valid recursive snapshot");
+                            assert_eq!(encode(&ast), bytes);
+                            drop(ast);
+                        }
+                        // A failed reader must release completed siblings and partial trees, too.
+                        for end in [bytes.len() / 2, bytes.len() - 1] {
+                            assert!(decode(&bytes[..end]).is_err());
+                        }
+                    }
+                    corrupt_lengths_and_varints_fail_before_allocation();
+                    corrupt_structure_is_strictly_bounded();
+                    super::CODEC_STACK_SEGMENTS.with(|count| {
+                        let (live, total) = count.get();
+                        assert_eq!(live, 0);
+                        assert!(total > 0);
+                    });
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn codec_stack_switches_preserve_ownership_and_unwind_cleanup() {
+        std::thread::Builder::new()
+            .name("snapshot-ownership".into())
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                stacker::grow(128 * 1024, || {
+                    use crate::ast::{Expr, Stmt};
+                    use std::rc::Rc;
+                    let text: Rc<str> = Rc::from("retained only by its original owner");
+                    let original = vec![Stmt::Expr(Expr::Str(text.clone()))];
+                    let bytes = encode(&original);
+                    assert_eq!(Rc::strong_count(&text), 2);
+                    let decoded = decode(&bytes).unwrap();
+                    let Stmt::Expr(Expr::Str(decoded_text)) = &decoded[0] else {
+                        panic!("snapshot AST changed");
+                    };
+                    let weak = Rc::downgrade(decoded_text);
+                    assert_eq!(&**decoded_text, &*text);
+                    drop(decoded);
+                    assert!(weak.upgrade().is_none());
+                    drop(original);
+                    assert_eq!(Rc::strong_count(&text), 1);
+                    let caught = std::panic::catch_unwind(|| {
+                        super::with_codec_stack(|| panic!("codec stack unwind test"));
+                    });
+                    assert!(caught.is_err());
+                    super::CODEC_STACK_SEGMENTS.with(|count| {
+                        let (live, total) = count.get();
+                        assert_eq!(live, 0);
+                        assert!(
+                            total > 0,
+                            "ownership and unwind checks must grow the codec stack"
+                        );
+                    });
+                    assert_eq!(encode(&decode(&bytes).unwrap()), bytes);
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

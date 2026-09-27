@@ -32,17 +32,18 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         if !can_be_held_weakly(i, &target) {
             return Err(i.make_error("TypeError", "WeakRef target must be an object or symbol"));
         }
+        i.gc_weak_metadata_safepoint(false);
         let obj = new_from_ctor(i, "WeakRef")?;
         let ptr = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         i.kept_alive.push(target.clone());
-        i.weak_refs.insert(
-            ptr,
-            Some(
-                crate::interpreter::WeakTarget::of(&target)
-                    .expect("CanBeHeldWeakly accepted the WeakRef target"),
-            ),
+        let target = crate::interpreter::WeakTarget::of(&target)
+            .expect("CanBeHeldWeakly accepted the WeakRef target");
+        i.weak_metadata.subscribe(
+            target.clone(),
+            crate::weak_metadata::Subscriber::WeakRef(ptr),
         );
+        i.weak_refs.insert(ptr, Some(target));
         Ok(Value::Obj(obj))
     });
     it.extra_protos.insert("WeakRef", wr_proto.clone());
@@ -81,12 +82,18 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         if !matches!(token, Value::Undefined) && !can_be_held_weakly(i, &token) {
             return Err(i.make_error("TypeError", "unregister token cannot be held weakly"));
         }
+        i.gc_weak_metadata_safepoint(false);
+        let weak_target = crate::interpreter::WeakTarget::of(&target).unwrap();
+        i.weak_metadata.subscribe(
+            weak_target.clone(),
+            crate::weak_metadata::Subscriber::Registry(ptr),
+        );
         let state = i
             .finalization_registries
             .get_mut(&ptr)
             .expect("brand check found FinalizationRegistry state");
         state.cells.push(crate::interpreter::FinalizationCell {
-            target: crate::interpreter::WeakTarget::of(&target),
+            target: Some(weak_target),
             held_value: arg(a, 1),
             unregister_token: (!matches!(token, Value::Undefined))
                 .then(|| crate::interpreter::WeakTarget::of(&token))
@@ -111,15 +118,16 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             .get_mut(&ptr)
             .expect("brand check found FinalizationRegistry state")
             .cells;
-        let before = cells.len();
-        cells.retain(|cell| {
-            !cell
-                .unregister_token
-                .as_ref()
-                .and_then(crate::interpreter::WeakTarget::upgrade)
-                .is_some_and(|registered| same_value(&registered, &token))
-        });
-        let removed = cells.len() != before;
+        let mut removed_targets = Vec::new();
+        let removed = cells.unregister_with_targets(
+            crate::interpreter::WeakKey::of(&token)
+                .expect("CanBeHeldWeakly accepted the unregister token"),
+            |key| removed_targets.push(key),
+        );
+        for target in removed_targets {
+            i.weak_metadata
+                .unsubscribe(target, crate::weak_metadata::Subscriber::Registry(ptr));
+        }
         Ok(Value::Bool(removed))
     });
     let fr_ctor = it.make_native("FinalizationRegistry", 1, |i, _t, a| {
@@ -137,7 +145,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             ptr,
             crate::interpreter::FinalizationState {
                 cleanup_callback,
-                cells: Vec::new(),
+                cells: Default::default(),
                 cleanup_scheduled: false,
             },
         );

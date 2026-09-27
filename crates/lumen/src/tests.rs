@@ -2407,15 +2407,15 @@ fn iterator_protocol() {
         run("String.prototype[Symbol.iterator]=function*(){yield 'x'; yield 'y'}; var [a,b]='ab'; a+b"),
         "xy"
     );
-    // IfAbruptCloseIterator closes an iterator when next() or IteratorValue throws, while
-    // preserving the original abrupt completion if return() also fails (ECMA-262 §7.4.13).
+    // ArrayAccumulation uses ?IteratorStepValue, not IteratorClose. next/done/value failures
+    // mark the record done and propagate without looking up return (ECMA-262 snapshot e28783d).
     assert_eq!(
         run("var closed=false; var src={[Symbol.iterator](){var n=0; return {next(){if(n++) throw Error('boom'); return {value:1,done:false}},return(){closed=true; throw Error('close')}}}}; try{[...src]}catch(e){} closed"),
-        "true"
+        "false"
     );
     assert_eq!(
         run("var closed=false; var src={[Symbol.iterator](){return {next:1,return(){closed=true;return {}}}}}; try{[...src]}catch(e){} closed"),
-        "true"
+        "false"
     );
 }
 
@@ -3963,6 +3963,132 @@ fn deferred_task_gc_keeps_allocation_safepoints_enabled() {
             ),
             "allocation GC was deferred in {tier:?}"
         );
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn compiled_allocation_loop_safepoints_preserve_live_and_kept_roots() {
+    // ECMA-262 #sec-liveness / #sec-clear-kept-objects: allocation collection
+    // may reclaim the previous job's dead cycle, but not this job's kept target
+    // or a function-local object live across a native/general-region safepoint.
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.defer_task_garbage_collection(true);
+        engine
+            .eval_value_interruptible(
+                "var dead={};dead.self=dead;var previous=new WeakRef(dead);dead=null;\n\
+                 function allocate(){\n\
+                   let survivor={answer:42};let total=0;let index=0;\n\
+                   while(index<1000){let cycle={};cycle.self=cycle;total+=index&1;index++;}\n\
+                   do{let cycle={};cycle.self=cycle;total+=index&1;index++;}while(index<2000);\n\
+                   return survivor.answer+total;\n\
+                 }",
+            )
+            .unwrap()
+            .unwrap_or_else(|_| panic!("setup threw in {tier:?}"));
+        engine.run_microtasks_interruptible().unwrap();
+        engine.interp.gc_next = engine.ctx().live_object_count() + 128;
+        let result = engine
+            .eval_value_interruptible(
+                "var kept=new WeakRef({answer:17});\n\
+                 allocate()===1042 && previous.deref()===undefined && kept.deref().answer===17",
+            )
+            .unwrap()
+            .unwrap_or_else(|_| panic!("allocation loop threw in {tier:?}"));
+        assert!(
+            matches!(result, crate::value::Value::Bool(true)),
+            "{tier:?}"
+        );
+        engine.run_microtasks_interruptible().unwrap();
+        engine.ctx().collect_garbage_for_host();
+        assert!(
+            matches!(
+                engine
+                    .eval_value_interruptible("kept.deref()===undefined")
+                    .unwrap()
+                    .unwrap_or_else(|_| panic!("post-job weak read threw in {tier:?}")),
+                crate::value::Value::Bool(true)
+            ),
+            "{tier:?}"
+        );
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn abrupt_continue_allocation_safepoints_run_after_finalizers() {
+    // ECMA-262 LoopContinues / TryStatement Evaluation: continue passes through
+    // all finalizers before entering the next iteration. Such an edge must not
+    // bypass allocation/cancellation safepoints in the VM or native slices.
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for generator in [false, true] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine.defer_task_garbage_collection(true);
+            let declaration = if generator { "function*" } else { "function" };
+            engine
+                .eval_value_interruptible(&format!(
+                    "var dead={{}};dead.self=dead;var previous=new WeakRef(dead);dead=null;\n\
+                 {declaration} allocate(){{\n\
+                   let survivor={{answer:42}};let index=0;let finalized=0;\n\
+                   outer:while(index<2000){{\n\
+                     try{{let cycle={{}};cycle.self=cycle;index++;continue outer;}}\n\
+                     finally{{finalized++;}}\n\
+                   }}\n\
+                   return survivor.answer+finalized;\n\
+                 }}"
+                ))
+                .unwrap()
+                .unwrap_or_else(|_| panic!("setup threw: {tier:?}, generator={generator}"));
+            engine.run_microtasks_interruptible().unwrap();
+            engine.interp.gc_next = engine.ctx().live_object_count() + 128;
+            let call = if generator {
+                "allocate().next().value"
+            } else {
+                "allocate()"
+            };
+            let result = engine
+                .eval_value_interruptible(&format!("{call}===2042 && previous.deref()===undefined"))
+                .unwrap()
+                .unwrap_or_else(|_| panic!("continue loop threw: {tier:?}, generator={generator}"));
+            assert!(
+                matches!(result, crate::value::Value::Bool(true)),
+                "{tier:?}, generator={generator}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.defer_task_garbage_collection(true);
+        engine.interp.gc_next = i64::MAX;
+        let result = engine.eval_value_interruptible(
+            "function allocate(){let index=0;while(index<1000){let cycle={};cycle.self=cycle;index++;}return index;}allocate()"
+        ).unwrap().unwrap_or_else(|_| panic!("maximum-threshold loop threw: {tier:?}"));
+        assert!(
+            matches!(result, crate::value::Value::Num(1000.0)),
+            "{tier:?}"
+        );
+        assert_eq!(engine.interp.gc_next, i64::MAX, "{tier:?}");
+        assert!(engine.interp.interrupt_poll_tick >= 1000, "{tier:?}");
     }
 }
 
@@ -8983,6 +9109,8 @@ fn literal_forms_use_vm_continuations_and_preserve_evaluation_order() {
 }
 #[test]
 fn tagged_import_meta_and_private_forms_use_vm_continuations() {
+    // TaggedTemplate uses EvaluateCall: ArgumentListEvaluation can yield before IsCallable
+    // rejects a non-callable tag (ECMA-262 §§13.3.11.1 and 13.3.6.2).
     let mut generators = Engine::new();
     generators
         .eval(
@@ -8991,13 +9119,15 @@ fn tagged_import_meta_and_private_forms_use_vm_continuations() {
                  Object.isFrozen(strings)+'|'+Object.isFrozen(strings.raw)
              }};
              function* tagged(){return tagger.tag`a${yield 1}b${yield 2}c`}
-             function* noncallable(){return (0)`x${yield 'must-not-run'}y`}
+             function* noncallable(){return (0)`x${yield 'substitution'}y`}
              class Box{#value=1;*has(value){yield 'private';return #value in value}}
              var box=new Box();
              globalThis.taggedIterator=tagged();
              globalThis.privateIterator=box.has(box);
              globalThis.targetIterator=(function*(){yield 'target';return new.target})();
-             try{noncallable().next()}catch(error){globalThis.noncallableResult=error.name}",
+             var noncallableIterator=noncallable();
+             globalThis.noncallableFirst=noncallableIterator.next();
+             try{noncallableIterator.next()}catch(error){globalThis.noncallableResult=error.name}",
             false,
         )
         .expect("tag/private continuation setup parses");
@@ -9012,14 +9142,15 @@ fn tagged_import_meta_and_private_forms_use_vm_continuations() {
                  d=privateIterator.next(),e=privateIterator.next(),
                  f=targetIterator.next(),g=targetIterator.next();
              [a.value,b.value,c.value,c.done,d.value,e.value,e.done,
-              f.value,String(g.value),g.done,noncallableResult].join('~')",
+              f.value,String(g.value),g.done,noncallableFirst.value,noncallableFirst.done,
+              noncallableResult].join('~')",
             false,
         )
         .expect("tag/private continuation drive parses")
     {
         Completion::Value(value) => assert_eq!(
             value,
-            "1~2~P|a3b4c|true|true~true~private~true~true~target~undefined~true~TypeError"
+            "1~2~P|a3b4c|true|true~true~private~true~true~target~undefined~true~substitution~false~TypeError"
         ),
         Completion::Throw { name, message } => {
             panic!("tag/private continuation drive threw {name}: {message}")
@@ -15530,7 +15661,7 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     let before = [
         engine.interp.gc_pins.len(),
         engine.interp.map_data.len(),
-        engine.interp.collection_index.len(),
+        engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),
@@ -15563,7 +15694,7 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     let after = [
         engine.interp.gc_pins.len(),
         engine.interp.map_data.len(),
-        engine.interp.collection_index.len(),
+        engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
         engine.interp.data_views.len(),

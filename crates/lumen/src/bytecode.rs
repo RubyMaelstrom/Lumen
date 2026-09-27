@@ -22,8 +22,23 @@
 use std::rc::Rc;
 
 use crate::ast::*;
+use crate::execution_storage::{DecodedArgs, SlotAccess, StoredValue, ValueStack};
 use crate::interpreter::{Abrupt, Env, Interp};
-use crate::value::Value;
+use crate::value::{PackedValue, Value};
+
+#[path = "bytecode_fragment_cache.rs"]
+pub(crate) mod fragment_cache;
+#[path = "bytecode_loop_fragment.rs"]
+pub(crate) mod loop_fragment;
+
+/// A fragment exits to the parked AST evaluator only after its own cleanup pads ran.
+/// Labels index the pinned chunk's name table; they are not bytecode destinations.
+#[derive(Clone, Copy, Debug)]
+pub enum FragmentExitKind {
+    Normal,
+    Break(u32),
+    Continue(u32),
+}
 
 /// Execution tier. `Interp` must not touch any codegen path at all; `Jit` compiles eligible
 /// chunks to ARM64 machine code (macOS/Apple Silicon), falling back to the bytecode VM.
@@ -35,9 +50,10 @@ pub enum Tier {
 }
 
 /// Per-site property inline-cache state. `depth == IC_EMPTY` means the site has not cached yet.
-/// Otherwise the property was last found as an own, non-accessor data property of the object
+/// Otherwise the property was last found as an own descriptor of the object
 /// `depth` prototype hops above the receiver, at `entries` slot `slot` — and every hop below the
-/// holder had *no* own property of that name. A hit re-validates all of that (each hop plain and
+/// holder had *no* own property of that name. IC_ACCESSOR marks a live getter lookup;
+/// it never caches the getter or its return value. A hit re-validates all of that (each hop plain and
 /// missing `name`, the holder's cached slot still keyed `name`), so a stale cache — including a
 /// *different* object reaching this shared per-site cache — can only cost time, never correctness.
 ///
@@ -107,6 +123,11 @@ pub const PROP_IC_WAYS: usize = 4;
 /// `depth` exactly and so route these to the helper automatically. Only meaningful while
 /// `depth < 0x80` (`IC_CREATE`/`IC_EMPTY` have the bit set but are filtered by range first).
 pub const IC_ARR_KEYCHK: u8 = 0x40;
+/// An accessor descriptor location, not a cached getter/result. Every hit rereads
+/// the live getter and invokes it with the original receiver after releasing all
+/// lookup borrows. Native data templates compare depth exactly, so these states
+/// take the checked helper; no getter may execute in a borrowed data-only region.
+pub const IC_ACCESSOR: u8 = 0x20;
 /// Deepest prototype hop the IC will record; hotter sites deeper than this stay on the slow path.
 pub const IC_MAX_DEPTH: u8 = 5;
 /// `IcState::depth` marker for a property-*creation* cache (constructor `this.x = v` on a fresh
@@ -118,6 +139,54 @@ pub const IC_MAX_DEPTH: u8 = 5;
 /// they re-prove the fill-time chain walk ("no hop has an own copy / setter / non-writable shadow
 /// of this name"), so the insert can skip the whole `OrdinarySet` walk.
 pub const IC_CREATE: u8 = 0xFD;
+
+#[cfg(test)]
+#[path = "shape_proof_tests.rs"]
+mod shape_proof_tests;
+
+impl IcState {
+    /// Only published, globally unique shapes may prove a property layout. The
+    /// exhausted-ID sentinel describes no layout; native probes deliberately need
+    /// no extra branch because no cache way may contain it as a shape guard.
+    /// IC_CREATE's intermediate words are an epoch/pointer, not shape identities.
+    pub(crate) fn has_cacheable_shapes(self) -> bool {
+        use crate::value::is_cacheable_shape;
+        if !is_cacheable_shape(self.recv_shape) {
+            return false;
+        }
+        if self.depth == IC_CREATE {
+            return is_cacheable_shape(self.holder_shape);
+        }
+        if self.depth == IC_ABSENT {
+            let shapes = [
+                self.recv_shape,
+                self.mid_shape,
+                self.mid2_shape,
+                self.mid3_shape,
+                self.mid4_shape,
+                self.holder_shape,
+            ];
+            return (1..=shapes.len()).contains(&(self.slot as usize))
+                && shapes[..self.slot as usize]
+                    .iter()
+                    .copied()
+                    .all(is_cacheable_shape);
+        }
+        let depth = self.depth & !(IC_ARR_KEYCHK | IC_ACCESSOR);
+        if depth > IC_MAX_DEPTH || !is_cacheable_shape(self.holder_shape) {
+            return false;
+        }
+        [
+            self.mid_shape,
+            self.mid2_shape,
+            self.mid3_shape,
+            self.mid4_shape,
+        ]
+        .iter()
+        .enumerate()
+        .all(|(index, &shape)| self.mid_ok & (1 << index) == 0 || is_cacheable_shape(shape))
+    }
+}
 
 /// Per-site free-name inline-cache state (`LoadName` / `LoadNameForCall`): the last successful
 /// *depth-0* resolution — the name was found directly in the scope the chunk runs under (`env`),
@@ -178,7 +247,7 @@ impl NameIc {
         if self.env & 4 != 0 {
             self.act_gen != 0 && vars.layout_id() == self.act_gen
         } else {
-            vars.generation() == self.act_gen
+            vars.matches_generation(self.act_gen)
         }
     }
 }
@@ -188,6 +257,9 @@ pub const NAME_IC_OFF_ENV: u32 = 0;
 pub const NAME_IC_OFF_BINDING: u32 = 8;
 pub const NAME_IC_OFF_GEN: u32 = 16;
 pub const NAME_IC_OFF_ACT_GEN: u32 = 20;
+
+#[path = "bytecode_names.rs"]
+pub(crate) mod lexical_cache;
 
 #[cfg(test)]
 mod binding_layout_cache_tests {
@@ -342,7 +414,8 @@ impl IcState {
 
 /// Bounded computed-property resolutions. A retained engine string makes its pointer an
 /// ABA-safe key and prevents in-place string mutation. No object or property value is retained:
-/// every hit still follows the live prototype chain and checks shapes and data descriptors.
+/// every hit still follows the live prototype chain and checks shapes and descriptors.
+/// Accessor states take the checked Call path rather than the native data-value template.
 #[derive(Default)]
 pub(crate) struct ComputedReadCache {
     storage: Option<Box<ComputedReadStorage>>,
@@ -397,7 +470,9 @@ impl ComputedReadCache {
     pub(crate) fn insert(&mut self, key: &crate::lstr::LStr, state: IcState) {
         // Cap the retained allocation, not merely the visible length of a spare-capacity
         // string. Cold engines allocate no table. Each of at most 4096 keys owns at most 512 B.
-        if key.retained_requested_bytes() > Self::MAX_KEY_ALLOCATION || state.depth == IC_EMPTY {
+        if key.retained_requested_bytes() > Self::MAX_KEY_ALLOCATION
+            || !state.has_cacheable_shapes()
+        {
             return;
         }
         if self.storage.is_none() {
@@ -586,9 +661,10 @@ mod computed_read_cache_tests {
 /// — and therefore that everything recorded at fill time still holds: its `call` field is the
 /// same `Callable::User` (a live function's `call` is never reassigned; the one upgrade site
 /// only converts `Callable::None`), which pins the `Function`, its env, its compiled chunk
-/// (`Function::code` is set once) and machine code (`Chunk::jit` is set once). A hit therefore
-/// skips the borrow + dispatch checks and reads everything through raw pointers with a single
-/// refcount bump (the env handle the frame needs).
+/// (`Function::code` is set once). Machine code is separately protected by the
+/// non-sentinel epoch and an owned lease acquired before reentrancy. A hit therefore
+/// skips the object borrow and dispatch checks. Rust dispatch leases the code;
+/// direct native entry/exit marks protect mappings without a Rust frame.
 ///
 /// The fill happens only after [`crate::interpreter::Interp::call_jit_fast`] passed its full
 /// guard set (plain same-realm user fn, not an arrow / class ctor / proxy, compiled, machine
@@ -612,7 +688,8 @@ pub struct CallIc {
     pub env: *const std::cell::RefCell<crate::interpreter::Scope>,
     /// Address of the `Rc<Chunk>` handle inside the callee's `Function::code` (set-once cell).
     pub chunk: *const Rc<Chunk>,
-    /// `Rc::as_ptr` of the chunk's machine code.
+    /// `Rc::as_ptr` of the chunk's resident machine code. Valid only after the
+    /// non-sentinel epoch guard; acquire a lease before any reentrant work.
     pub code: *const crate::jit::JitCode,
     /// `Rc::as_ptr` of the active realm's global scope at fill time: the fill's same-realm proof
     /// (the callee's env-chain root) is relative to it, so a hit requires the active global to be
@@ -660,6 +737,10 @@ pub struct CallIc {
 /// `run_moved`. Bits 0-3 stay clear on such entries, so the machine-code direct sequence's
 /// first gate routes them to the helper.
 pub const CALL_IC_NEEDS_ENV: u8 = 16;
+
+/// Lexical [[ThisMode]]: the call inherits `new.target` and resolves `this` through its
+/// definition environment. Keep this bit independent of activation/direct-entry eligibility.
+pub const CALL_IC_LEXICAL_THIS: u8 = 32;
 
 /// `String.prototype.charCodeAt`: the call template inlines the all-ASCII receiver + exact-u32
 /// in-bounds index case to a byte load (see `crate::lstr::ASCII_HINT`).
@@ -715,10 +796,17 @@ pub struct InlineTarget {
     pub check_this: bool,
 }
 
-/// Bumped whenever any function gains a second-stage (inlined) compile: every [`CallIc`] fills
-/// with the current value and misses on mismatch, so cached callers re-resolve through
-/// [`crate::interpreter::Interp::call_jit_fast`] and pick up `Function::code2`.
+/// Invalidated before native code is reclaimed and when a function gains its
+/// second-stage compile. Every raw call/construct/overflow probe requires the
+/// current non-sentinel value, so stale executable/landing pointers are never read.
 pub static CALL_IC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Exhaustion permanently disables raw call caches instead of admitting a
+/// repeated generation after code has been reclaimed. All probes reject MAX.
+pub(crate) fn invalidate_call_caches() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = CALL_IC_EPOCH.fetch_update(Relaxed, Relaxed, |epoch| epoch.checked_add(1));
+}
 
 /// A call site's cache: 4-way set-associative over callee identity. Method-dispatch sites are
 /// routinely polymorphic (DeltaBlue rotates a handful of `execute` implementations through one
@@ -755,6 +843,9 @@ impl CallSite {
     /// else the next way round-robin. Return an occupied eviction so the caller can transfer
     /// its existing Weak pin into the engine's bounded secondary cache.
     pub fn fill(&self, ic: CallIc, func: Option<&Rc<Function>>) -> Option<CallIc> {
+        if ic.epoch == u32::MAX {
+            return None;
+        }
         debug_assert_eq!(ic.func, func.map_or(std::ptr::null(), Rc::as_ptr));
         let pin = func.map(Rc::downgrade).unwrap_or_default();
         let mut pins = self.func_pins.borrow_mut();
@@ -855,6 +946,9 @@ impl CallOverflow {
         call: CallIc,
         pin: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
     ) {
+        if call.epoch == u32::MAX {
+            return;
+        }
         debug_assert_ne!(call.callee, 0);
         debug_assert_eq!(call.callee, pin.as_ptr() as usize);
         if self.sets.is_none() {
@@ -885,9 +979,13 @@ impl CallOverflow {
         set.entries[slot] = entry;
     }
 
-    /// Copy only a fully guarded hit. The caller holds a LIVE callee Value whose identity is
-    /// `key`, so its function/environment/code outlive this call; a Weak alone would not suffice.
+    /// Copy only a fully guarded hit. The caller holds a LIVE callee Value whose
+    /// identity is `key`; the epoch protects resident code until the caller takes
+    /// its lease (before reentrancy). A Weak identity pin alone never suffices.
     pub(crate) fn lookup(&self, key: usize, global_env: usize, epoch: u32) -> Option<CallIc> {
+        if epoch == u32::MAX {
+            return None;
+        }
         let set = &self.sets.as_ref()?[Self::set_index(key, self.hash_shift)];
         for entry in &set.entries {
             let call = &entry.call;
@@ -1126,6 +1224,9 @@ pub enum UpdKind {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
+    FragmentExit(FragmentExitKind),
+    /// Annex B writeback using the existing VariableEnvironment, not a fabricated frame.
+    AnnexBSync(u32),
     Const(u32),
     Undef,
     Dup,
@@ -1161,6 +1262,9 @@ pub enum Op {
     /// per-site [`NameIc`] index into `Chunk::name_caches`.
     LoadName(u32, u32),
     StoreName(u32),
+    /// Annex B ScriptEvaluation writeback targets the global VariableEnvironment, not the
+    /// current same-named block lexical (or an intervening with object).
+    StoreGlobalName(u32),
     /// [`Op::StoreName`] with a per-site generation-checked name cache.
     StoreNameCached(u32, u32),
     /// Resolve one identifier Reference now and retain its exact Environment Record/object base
@@ -1550,13 +1654,14 @@ pub enum Op {
 }
 
 /// An active `try` region on the VM's handler stack.
-struct Handler {
-    target: HandlerTarget,
+pub(crate) struct Handler {
+    pub(crate) target: HandlerTarget,
     /// The operand-stack depth to restore before entering a completion pad.
-    stack_depth: usize,
+    pub(crate) stack_depth: usize,
 }
 
-enum HandlerTarget {
+#[derive(Clone, Copy)]
+pub(crate) enum HandlerTarget {
     Catch {
         throw_pc: usize,
     },
@@ -1628,6 +1733,8 @@ pub struct Chunk {
     /// stack, so operations whose Reference semantics depend on strict mode restore this value
     /// for every VM slice.
     strict: bool,
+    /// Resumable bodies use a native slice entry, never the ordinary moved-call ABI.
+    resumable: bool,
     /// Distinct `this.name = …` stores before the body's first control-flow split, capped small.
     /// `new` uses this to reserve the instance property vector exactly once; it costs no bytes
     /// per object and avoids retaining geometric-growth slack.
@@ -1688,6 +1795,11 @@ pub struct Chunk {
     /// One [`NameIc`] slot per free-name op (`LoadName`/`LoadNameForCall`), persisting across
     /// calls like `caches`.
     name_caches: Vec<std::cell::Cell<NameIc>>,
+    /// Lazy bounded chain proofs for lexical addresses beyond the compact JIT NameIc modes.
+    deep_name_caches: std::cell::RefCell<Vec<Option<Box<lexical_cache::DeepNameIc>>>>,
+    /// Resolution (not GetValue) proofs, shared by prepared References of the same interned
+    /// name. The fixed cell array is lazy; each chain is separately bounded by MAX_SCOPES.
+    resolution_caches: std::cell::OnceCell<Box<[lexical_cache::ResolutionSite]>>,
     /// Weak handles pinning each name cache's scope allocation (parallel to `name_caches`), so
     /// the cached raw `env` pointer can never be recycled into a different scope while cached.
     name_pins: std::cell::RefCell<
@@ -1735,14 +1847,20 @@ pub struct Chunk {
     inline_targets: Vec<InlineTarget>,
     /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
     pub(crate) jit_runs: std::cell::Cell<u32>,
-    /// Whether the one-shot inline recompile has been attempted for this chunk.
+    /// Whether an inline recompile has been considered (also enables the direct-call entry).
     pub(crate) inline_attempted: std::cell::Cell<bool>,
-    /// Machine-code tier state: the compile result once attempted (`None` inside = the chunk
-    /// cannot JIT — async, or an unsupported platform — and runs on the bytecode VM forever).
-    pub(crate) jit: std::cell::OnceCell<Option<Rc<crate::jit::JitCode>>>,
-    /// A supported compilation awaiting executable capacity. Keep `jit` unset
-    /// and do not retry emission until this many requested bytes can fit.
+    /// Next adaptive feedback checkpoint, or zero after success/exhaustion/disablement.
+    pub(crate) inline_retry_at: std::cell::Cell<u32>,
+    inline_checks: std::cell::Cell<u8>,
+    inline_feedback: std::cell::Cell<u64>,
+    /// Reclaimable native residency. Structural unavailability is permanent;
+    /// capacity deferral/eviction remain retryable without discarding bytecode.
+    pub(crate) jit: crate::jit::cache::NativeCodeSlot,
+    /// A supported compilation awaiting executable capacity. Do not repeat
+    /// emission until this many bytes fit (possibly after safe reclamation).
     pub(crate) jit_budget_wait_bytes: std::cell::Cell<usize>,
+    /// Separate native entry kind borrowing a live Script VM activation.
+    pub(crate) osr: std::cell::OnceCell<Box<crate::tiering::OsrCodeState>>,
 }
 
 impl Chunk {
@@ -1798,6 +1916,8 @@ impl Chunk {
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
+        bytes = bytes.saturating_add(self.deep_name_cache_bytes());
+        bytes = bytes.saturating_add(self.resolution_cache_bytes());
         bytes = bytes.saturating_add(
             self.feedback_shapes
                 .borrow()
@@ -1922,8 +2042,12 @@ impl Chunk {
         if call_pins.capacity() != 0 {
             visitor.mark_function_bytecode_opaque_storage();
         }
-        if let Some(code) = self.jit.get().and_then(Option::as_ref) {
-            visitor.jit_code(code);
+        if let Some(Some(code)) = self.jit.get() {
+            visitor.jit_code(&code);
+        }
+        bytes = bytes.saturating_add(self.jit.retained_metadata_bytes());
+        if let Some(state) = self.osr.get() {
+            state.scan_retained_memory(visitor);
         }
         visitor.add_function_bytecode_bytes(bytes);
     }
@@ -2006,7 +2130,8 @@ impl InitializerPlan {
 
     pub(crate) fn cached_shapes(&self, epoch: u32, proto: usize, start: u32) -> Option<[u32; 16]> {
         let cached = self.shapes.get();
-        (cached.epoch == epoch
+        (crate::value::is_cacheable_shape(start)
+            && cached.epoch == epoch
             && cached.proto == proto
             && cached.start == start
             && cached.len as usize == self.fields.len())
@@ -2015,6 +2140,13 @@ impl InitializerPlan {
 
     pub(crate) fn cache_shapes(&self, epoch: u32, proto: usize, start: u32, values: &[u32]) {
         debug_assert!(values.len() <= 16);
+        if !crate::value::is_cacheable_shape(start)
+            || values
+                .iter()
+                .any(|&shape| !crate::value::is_cacheable_shape(shape))
+        {
+            return;
+        }
         let mut transitions = [0; 16];
         transitions[..values.len()].copy_from_slice(values);
         self.shapes.set(InitializerShapes {
@@ -2045,7 +2177,8 @@ impl SimpleConstructor<'_> {
 
     pub(crate) fn cached_shapes(&self, epoch: u32, proto: usize, start: u32) -> Option<[u32; 16]> {
         let cached = self.chunk.simple_constructor_shapes.get();
-        (cached.epoch == epoch
+        (crate::value::is_cacheable_shape(start)
+            && cached.epoch == epoch
             && cached.proto == proto
             && cached.start == start
             && cached.len as usize == self.fields.len())
@@ -2054,6 +2187,13 @@ impl SimpleConstructor<'_> {
 
     pub(crate) fn cache_shapes(&self, epoch: u32, proto: usize, start: u32, values: &[u32]) {
         debug_assert!(values.len() <= 16);
+        if !crate::value::is_cacheable_shape(start)
+            || values
+                .iter()
+                .any(|&shape| !crate::value::is_cacheable_shape(shape))
+        {
+            return;
+        }
         let mut transitions = [0; 16];
         transitions[..values.len()].copy_from_slice(values);
         self.chunk.simple_constructor_shapes.set(InitializerShapes {
@@ -2149,6 +2289,10 @@ impl Chunk {
         entry: ConstructSite,
         constructor: &crate::value::Gc,
     ) {
+        if entry.call.epoch == u32::MAX || !crate::value::is_cacheable_shape(entry.prototype_shape)
+        {
+            return;
+        }
         self.construct_caches[cache as usize].set(entry);
         self.call_pins
             .borrow_mut()
@@ -2212,6 +2356,7 @@ impl Chunk {
                                 strict_immutable: false,
                                 initialized: true,
                                 import_ref: None,
+                                imported: false,
                                 deletable: false,
                             },
                         );
@@ -2226,6 +2371,7 @@ impl Chunk {
                                     strict_immutable: false,
                                     initialized: true,
                                     import_ref: None,
+                                    imported: false,
                                     deletable: false,
                                 },
                             );
@@ -2245,6 +2391,7 @@ impl Chunk {
                                 strict_immutable: *is_const,
                                 initialized: false,
                                 import_ref: None,
+                                imported: false,
                                 deletable: false,
                             },
                         );
@@ -2260,6 +2407,7 @@ impl Chunk {
                         strict_immutable: true,
                         initialized: true,
                         import_ref: None,
+                        imported: false,
                         deletable: false,
                     },
                 );
@@ -2275,6 +2423,7 @@ impl Chunk {
                     strict_immutable: false,
                     initialized: true,
                     import_ref: None,
+                    imported: false,
                     deletable: false,
                 },
             );
@@ -2304,6 +2453,23 @@ impl std::fmt::Debug for Chunk {
 // ---------------------------------------------------------------------------------------------
 // Capture analysis
 // ---------------------------------------------------------------------------------------------
+
+/// ECMA-262 LexicallyScopedDeclarations follows labels whose terminal item is a function
+/// declaration. It never descends through an intervening block or another statement kind.
+/// Use the same declaration view for capture discovery and block instantiation so a labelled
+/// duplicate function participates in source-order replacement before the block starts.
+fn lexical_declaration_statement(statement: &Stmt) -> &Stmt {
+    let statement = crate::interpreter::unwrap_export(statement);
+    let mut labelled = statement;
+    while let Stmt::Labeled { body, .. } = labelled {
+        labelled = body;
+    }
+    if matches!(labelled, Stmt::FuncDecl(_)) {
+        labelled
+    } else {
+        statement
+    }
+}
 
 /// Which names the body's *inner functions* can resolve to the outer function's locals — the set
 /// that must live in a real activation environment instead of VM slots. Also whether any inner
@@ -2367,7 +2533,6 @@ struct CaptureScan {
     /// represent `with`; ordinary bytecode functions remain conservative.
     allow_with: bool,
     saw_with: bool,
-    with_requires_inner_env: bool,
     top_names: std::collections::HashSet<String>,
     /// Arrow-ness of each enclosing function on the current path (index 0 = the outer function).
     arrow_path: Vec<bool>,
@@ -2455,9 +2620,10 @@ fn hoisted_vars_stmt(
                     .map(|a| hoisted_vars_stmt(a, false, strict, out))
                     .unwrap_or(true)
         }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
             hoisted_vars_stmt(body, false, strict, out)
         }
+        Stmt::Labeled { body, .. } => hoisted_vars_stmt(body, false, strict, out),
         Stmt::For { init, body, .. } => {
             if let Some(ForInit::VarDecl {
                 kind: DeclKind::Var,
@@ -2532,7 +2698,6 @@ impl CaptureScan {
             saw_direct_eval: false,
             allow_with: allow_direct_eval,
             saw_with: false,
-            with_requires_inner_env: false,
             top_names: Default::default(),
             arrow_path: vec![func.is_arrow],
         };
@@ -2564,14 +2729,27 @@ impl CaptureScan {
                 sc.candidates.remove(name);
             }
         }
-        // Every function-scope binding visible beneath a with object must have an Environment
-        // Record home; direct slots would bypass HasBinding/@@unscopables. Inner block lexicals
-        // need their own correctly ordered Environment Records, which are not flattened yet.
+        // Every binding visible beneath a with object needs an Environment Record home:
+        // direct slots would bypass HasBinding/@@unscopables. Preserve the same source-scope
+        // serial proof as direct eval, including an inner lexical sharing a global/var spelling.
         if sc.saw_with {
-            if sc.with_requires_inner_env {
-                return None;
+            let top_serial = sc.top_serial?;
+            for name in &sc.top_names {
+                sc.captured.insert(name.clone());
+                sc.captured_serials
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(top_serial);
             }
-            sc.captured.extend(sc.top_names.iter().cloned());
+            for name in &sc.depth0_inner_decls {
+                let serials = sc.runtime_candidates.get(name)?;
+                sc.captured.insert(name.clone());
+                sc.captured_serials
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(serials.iter().copied());
+                sc.candidates.remove(name);
+            }
         }
         // A captured name declared by an inner depth-0 scope needs per-block freshness —
         // except a candidate whose EVERY capture resolved through its own scope (a same-name
@@ -2755,7 +2933,7 @@ impl CaptureScan {
         homable: &mut std::collections::HashMap<String, bool>,
     ) {
         for s in stmts {
-            let s = crate::interpreter::unwrap_export(s);
+            let s = lexical_declaration_statement(s);
             match s {
                 Stmt::VarDecl {
                     kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
@@ -2937,14 +3115,14 @@ impl CaptureScan {
                 Some(())
             }
             Stmt::Block(b) => self.block(b),
-            Stmt::While { test, body } => {
+            Stmt::While { test, body, .. } => {
                 self.expr(test)?;
                 self.loop_depth += 1;
                 let r = self.stmt(body);
                 self.loop_depth -= 1;
                 r
             }
-            Stmt::DoWhile { body, test } => {
+            Stmt::DoWhile { body, test, .. } => {
                 self.loop_depth += 1;
                 let r = self.stmt(body);
                 self.loop_depth -= 1;
@@ -2956,6 +3134,7 @@ impl CaptureScan {
                 test,
                 update,
                 body,
+                ..
             } => {
                 let mut names = std::collections::HashSet::new();
                 if let Some(ForInit::VarDecl {
@@ -3003,7 +3182,6 @@ impl CaptureScan {
                 body,
                 ..
             } => {
-                self.expr(right)?;
                 let mut names = std::collections::HashSet::new();
                 match decl {
                     Some(
@@ -3017,6 +3195,10 @@ impl CaptureScan {
                 self.loop_depth += 1;
                 self.push_scope_lets(names, Default::default(), true);
                 let r = (|| {
+                    // ForIn/OfHeadEvaluation installs the uninitialized head bindings before
+                    // evaluating the RHS. A closure created there captures that never-initialized
+                    // environment, not an outer same-named binding or an iteration's sibling.
+                    self.expr(right)?;
                     if decl.is_none() {
                         self.pat_targets(left)?;
                     } else {
@@ -3087,11 +3269,6 @@ impl CaptureScan {
                     return None;
                 }
                 self.saw_with = true;
-                self.with_requires_inner_env |= self
-                    .scopes
-                    .iter()
-                    .skip(1)
-                    .any(|(names, depth, _)| *depth == 0 && !names.is_empty());
                 self.expr(obj)?;
                 self.with_depth += 1;
                 let result = self.stmt(body);
@@ -3521,6 +3698,7 @@ const OBS_FLAG_ARRAY_KEY_CHECK: u8 = 0x80;
 const OBS_FLAG_CREATION: u8 = 0x40;
 
 fn intern_current_shape(shapes: &std::cell::RefCell<Vec<u32>>, shape: u32) -> u32 {
+    debug_assert!(crate::value::is_cacheable_shape(shape));
     let mut shapes = shapes.borrow_mut();
     if let Some(index) = shapes.iter().position(|candidate| *candidate == shape) {
         return index as u32 + 1;
@@ -3569,6 +3747,10 @@ fn refresh_current_layout_feedback(
         let mut generic = false;
         for state in caches.iter().skip(start).take(way_count as usize) {
             let state = state.get();
+            if state.depth != IC_EMPTY && !state.has_cacheable_shapes() {
+                generic = true;
+                break;
+            }
             let observation = match state.depth {
                 IC_EMPTY => continue,
                 IC_ABSENT => CurrentPropertyObservation {
@@ -3589,8 +3771,13 @@ fn refresh_current_layout_feedback(
                 },
                 encoded_depth => {
                     let key_check = encoded_depth & IC_ARR_KEYCHK != 0;
-                    let depth = encoded_depth & !IC_ARR_KEYCHK;
-                    let Some(slot) = state.slot.checked_add(1) else {
+                    let accessor = encoded_depth & IC_ACCESSOR != 0;
+                    let depth = encoded_depth & !(IC_ARR_KEYCHK | IC_ACCESSOR);
+                    let Some(slot) = (if accessor {
+                        Some(0)
+                    } else {
+                        state.slot.checked_add(1)
+                    }) else {
                         generic = true;
                         break;
                     };
@@ -3610,7 +3797,11 @@ fn refresh_current_layout_feedback(
                         access_state: ObservationState::Monomorphic,
                         access_payload: slot,
                         access_flags: property_access_flags(
-                            PropertyOutcome::Data,
+                            if accessor {
+                                PropertyOutcome::Accessor
+                            } else {
+                                PropertyOutcome::Data
+                            },
                             depth,
                             key_check,
                         ),
@@ -4245,10 +4436,11 @@ mod feedback_layout_tests {
         let (layout, bindings) = feedback_layout_for_ops(&[Op::Add], &[]);
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
         let mut interp = Interp::new();
-        let mut stack = vec![Value::str("left"), Value::Num(1.0)];
+        let mut stack = ValueStack::<PackedValue>::default();
+        stack.extend([Value::str("left"), Value::Num(1.0)]);
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
-        assert!(matches!(stack.as_slice(), [Value::Str(value)] if &**value == "left1"));
+        assert!(matches!(stack.last(), Some(Value::Str(value)) if &*value == "left1"));
         let site = feedback.sites().next().unwrap().0;
         assert_eq!(
             feedback
@@ -4276,11 +4468,12 @@ mod feedback_layout_tests {
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, false);
         let retained_before = feedback.retained_bytes();
         let mut interp = Interp::new();
-        let mut stack = vec![Value::Num(1.0), Value::Num(2.0)];
+        let mut stack = ValueStack::<PackedValue>::default();
+        stack.extend([Value::Num(1.0), Value::Num(2.0)]);
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
         assert_eq!(stack.len(), 1);
-        assert!(matches!(stack[0], Value::Num(3.0)));
+        assert!(matches!(stack.read_value(0), Value::Num(3.0)));
         assert_eq!(feedback.retained_bytes(), retained_before);
     }
 
@@ -4289,10 +4482,11 @@ mod feedback_layout_tests {
         let (layout, bindings) = feedback_layout_for_ops(&[Op::Add], &[]);
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
         let mut interp = Interp::new();
-        let mut stack = vec![
+        let mut stack = ValueStack::<PackedValue>::default();
+        stack.extend([
             Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             Value::Num(1.0),
-        ];
+        ]);
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_err());
         let site = feedback.sites().next().unwrap().0;
@@ -4597,7 +4791,38 @@ mod feedback_layout_tests {
             trace.holder_shape,
             object.as_obj().map(|object| object.borrow().props.shape())
         );
-        assert!(caches.iter().all(|cache| cache.get().depth == IC_EMPTY));
+        assert_eq!(caches[0].get().depth, IC_ACCESSOR);
+    }
+
+    #[test]
+    fn getter_cache_feedback_distinguishes_accessors_without_exposing_field_slots() {
+        for array_key_check in [false, true] {
+            let (layout, bindings) = feedback_layout_for_ops(&[Op::GetProp(0, 0)], &[]);
+            let feedback = FeedbackVector::new(layout, bindings);
+            let shapes = std::cell::RefCell::new(Vec::new());
+            let caches = [const { std::cell::Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+            caches[0].set(IcState {
+                recv_shape: 23,
+                holder_shape: 45,
+                slot: u32::MAX,
+                depth: IC_ACCESSOR | 1 | if array_key_check { IC_ARR_KEYCHK } else { 0 },
+                ..IcState::EMPTY
+            });
+            refresh_current_layout_feedback(&feedback, &shapes, &caches);
+            let site = feedback.sites().next().unwrap().0;
+            let access = feedback.read(
+                site,
+                ObservationKind::PropertyAccess,
+                ObservationRole::Access,
+            );
+            assert_eq!(access.state(), ObservationState::Monomorphic);
+            assert_eq!(access.payload(), 0, "a getter has no borrowed data slot");
+            assert_eq!(
+                access.flags(),
+                property_access_flags(PropertyOutcome::Accessor, 1, array_key_check)
+            );
+            assert_eq!(&*shapes.borrow(), &[23, 45]);
+        }
     }
 
     #[test]
@@ -4754,6 +4979,56 @@ mod feedback_layout_tests {
     }
 
     #[test]
+    fn profiled_computed_write_rejects_nullish_before_key_coercion() {
+        let statements = crate::parser::parse_script("function put(o,k,v){o[k]=v}", false)
+            .ok()
+            .expect("fixture parses");
+        let crate::ast::Stmt::FuncDecl(function) = &statements[0] else {
+            panic!("function")
+        };
+        let chunk = compile(function).expect("fixture compiles");
+        let pc = chunk
+            .ops
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    Op::SetElem | Op::SetElemDrop | Op::SetElemLocal(_) | Op::SetElemLocalDrop(_)
+                )
+            })
+            .expect("computed store");
+        let mut interp = Interp::new();
+        let global = interp.global_this();
+        let key = interp
+            .eval_in_realm(
+                &global,
+                "var coercions=0; ({toString(){coercions++;return 'x'}})",
+            )
+            .unwrap_or_else(|_| panic!("key fixture"));
+        for base in [Value::Null, Value::Undefined] {
+            assert!(
+                set_element_profiled(&mut interp, &chunk, pc, &base, &key, Value::Num(1.)).is_err()
+            );
+        }
+        assert!(matches!(
+            interp.eval_in_realm(&global, "coercions"),
+            Ok(Value::Num(0.))
+        ));
+        let object = Value::Obj(interp.new_object());
+        assert!(
+            set_element_profiled(&mut interp, &chunk, pc, &object, &key, Value::Num(7.)).is_ok()
+        );
+        assert!(matches!(
+            interp.eval_in_realm(&global, "coercions"),
+            Ok(Value::Num(1.))
+        ));
+        assert!(matches!(
+            interp.get_member(&object, "x"),
+            Ok(Value::Num(7.))
+        ));
+    }
+
+    #[test]
     fn call_adapter_classifies_callable_families_without_object_identity() {
         let mut interp = Interp::new();
         let global = interp.global_this();
@@ -4834,11 +5109,12 @@ mod feedback_layout_tests {
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, &Default::default(), None, None, false, false).or_else(|| {
-        (!func.is_async && !func.is_generator)
-            .then(|| compile_inner(func, &Default::default(), None, None, false, true))
-            .flatten()
-    });
+    let result =
+        compile_inner(func, &Default::default(), None, None, false, false, false).or_else(|| {
+            (!func.is_async && !func.is_generator)
+                .then(|| compile_inner(func, &Default::default(), None, None, false, true, false))
+                .flatten()
+        });
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4850,7 +5126,7 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
 /// derived class's instance elements through the shared ECMA-262 algorithm.
 pub(crate) fn compile_derived_constructor(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, &Default::default(), None, None, true, false);
+    let result = compile_inner(func, &Default::default(), None, None, true, false, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4888,10 +5164,54 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         Some(bindings),
         false,
         false,
+        false,
     );
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
+
+/// Compile an already-instantiated Script Record without a Function execution context.
+/// ECMA-262 ScriptEvaluation retains the realm's global lexical/variable environments and
+/// returns the StatementList completion. The temporary AST container is analysis-only: no
+/// function object, parameters, arguments object, or FunctionDeclarationInstantiation is made.
+pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
+    let source = Function {
+        name: None,
+        params: Vec::new(),
+        body: body.to_vec(),
+        // Capture analysis must not invent an `arguments` binding or Annex B parameter blocker.
+        is_arrow: true,
+        is_strict: strict,
+        expr_body: false,
+        is_generator: false,
+        is_async: false,
+        is_method: false,
+        is_fn_expr: false,
+        default_ctor: false,
+        source: None,
+        scan: std::cell::Cell::new(0),
+        hoist: std::cell::OnceCell::new(),
+        calls: std::cell::Cell::new(0),
+        code: std::cell::OnceCell::new(),
+        code2: std::cell::OnceCell::new(),
+        fn_maps: std::cell::OnceCell::new(),
+    };
+    let started = crate::jit::perf_stage_start();
+    let result = compile_inner(&source, &Default::default(), None, None, false, false, true);
+    crate::jit::perf_bytecode_compile_end(started, result.is_some());
+    result
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_SCRIPT_ENTRIES: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+#[cfg(test)]
+#[path = "bytecode_osr_tests.rs"]
+mod osr_tests;
 
 /// Second-stage compile: same as [`compile`], with hot monomorphic callees from `plan` spliced
 /// inline at their call sites (guarded; see [`plan_inlines`]).
@@ -4904,7 +5224,7 @@ pub(crate) fn compile_with_inlines(
         .is_none()
         .then_some(hot);
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, plan, seed, None, false, false);
+    let result = compile_inner(func, plan, seed, None, false, false, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -4959,9 +5279,15 @@ fn name_cache_seeds(chunk: &Chunk) -> Vec<NameSeed> {
             let number = chunk.name_num_valid[cache]
                 .get()
                 .then(|| chunk.name_num_bits[cache].get());
+            let mut state = chunk.name_caches[cache].get();
+            if state.env == lexical_cache::DEEP_NAME_IC {
+                // Descriptor ownership does not cross Chunk boundaries when seeding inline
+                // recompilations. The new chunk builds its own chain on its first execution.
+                state = NameIc::EMPTY;
+            }
             Some((
                 chunk.names[name as usize].clone(),
-                chunk.name_caches[cache].get(),
+                state,
                 pins[cache].clone(),
                 number,
             ))
@@ -5021,6 +5347,7 @@ fn compile_inner(
     module_bindings: Option<&[(String, bool)]>,
     derived_constructor: bool,
     prepared_entry: bool,
+    script_body: bool,
 ) -> Option<Rc<Chunk>> {
     // Body facts the scanner already knows: `new.target` is an observation channel into the
     // activation that slots do not provide; `this` / `arguments` in an ordinary arrow are free
@@ -5033,11 +5360,16 @@ fn compile_inner(
     // retain it for every resumption, including as the lexical parent of async arrows. A compiled
     // derived constructor likewise runs under its required Function Environment Record. Other
     // lean ordinary frames still omit the activation, so keep their conservative exclusion.
-    if scan & SCAN_NEW_TARGET != 0 && !is_coroutine && !derived_constructor && !prepared_entry {
+    if scan & SCAN_NEW_TARGET != 0
+        && !func.is_arrow
+        && !is_coroutine
+        && !derived_constructor
+        && !prepared_entry
+    {
         log_bail("fn", "new.target");
         return None;
     }
-    let uses_arguments = scan & SCAN_ARGUMENTS != 0;
+    let uses_arguments = !script_body && scan & SCAN_ARGUMENTS != 0;
     // ECMA-262 §10.2.11: strict functions never map arguments indices to parameter
     // bindings. Simple parameters can therefore use the ordinary compiled entry;
     // defaults/destructuring retain their existing general instantiation path.
@@ -5075,7 +5407,7 @@ fn compile_inner(
     // Capture analysis: which locals inner functions can name (they live in a real activation
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
     let Some((mut captured, env_this, mut block_lets, mut runtime_lexicals, direct_eval)) =
-        CaptureScan::run(func, is_coroutine || prepared_entry)
+        CaptureScan::run(func, is_coroutine || prepared_entry || script_body)
     else {
         let head: String = func
             .source
@@ -5094,11 +5426,11 @@ fn compile_inner(
         return None;
     };
 
-    if prepared_entry {
+    if prepared_entry || script_body {
         // A general entry already instantiated every body-wide binding. Keep those bindings
         // authoritative, including references from parameter-created closures and direct eval.
         // Nested block captures get actual block environments instead of extra activation homes.
-        if !hoisted_vars(&func.body, true, func.is_strict, &mut captured) {
+        if !script_body && !hoisted_vars(&func.body, true, func.is_strict, &mut captured) {
             return None;
         }
         for (name, _) in block_lets.drain(..) {
@@ -5111,12 +5443,17 @@ fn compile_inner(
         // A derived constructor already runs under its mandatory Function Environment Record;
         // arrows must close over that live, initially-uninitialized `this` binding instead of a
         // child activation seeded with the entry-time placeholder.
-        env_this: env_this && module_bindings.is_none() && !derived_constructor && !prepared_entry,
-        lexical_this: func.is_arrow,
+        env_this: env_this
+            && module_bindings.is_none()
+            && !derived_constructor
+            && !prepared_entry
+            && !script_body,
+        lexical_this: func.is_arrow && !script_body,
         derived_constructor,
         strict: func.is_strict,
         is_coroutine,
         module_body: module_bindings.is_some(),
+        script_body,
         direct_eval,
         runtime_lexicals,
         reuse_activation: has_mapped_parameter_aliases || prepared_entry,
@@ -5132,210 +5469,249 @@ fn compile_inner(
             .unwrap_or_default(),
         ..Compiler::default()
     };
-    if let Some(bindings) = module_bindings {
-        for (name, is_const) in bindings {
-            c.env_bind(name, *is_const);
-        }
-        // Any compiler-homed block captures may safely use the once-only module environment.
-        // More importantly, a fresh function activation would put pre-instantiated module cells
-        // in the parent while `LoadCap`/`StoreCap` intentionally address the fixed home directly.
-        c.reuse_activation = true;
-    }
-    // Captured once-per-call block `let`s home in the activation (TDZ from entry, initialized
-    // by the declaring block's own StoreCapInit); CaptureScan proved no enclosing same-name
-    // declaration and block-resolved references only, so the function-flat env map is
-    // faithful (nested same-name declarations shadow it through their slots).
-    for (name, is_const) in &block_lets {
-        c.cap_inits
-            .push(CapInit::Lexical(Rc::from(name.as_str()), *is_const));
-        c.env_bind(name, *is_const);
-        c.homed_lets.insert(name.clone());
-        c.homed_pending.insert(name.clone());
-    }
-    // Ordinary compiled calls instantiate parameters in this chunk, so each formal needs its
-    // positional slot and only the subset whose default initialization is safely lowerable can
-    // compile. Coroutine calls have already completed FunctionDeclarationInstantiation in the
-    // tree-walker before their resumable context is created. For them, flatten BoundNames into
-    // slots and seed those slots from the live bindings; this admits rest/destructuring/default
-    // parameter lists without replaying any binding or initializer operation.
-    let mut defaulted: Vec<(u16, &Expr)> = Vec::new();
-    if prepared_entry {
+    if script_body {
         c.push_compile_scope();
-        for name in crate::interpreter::param_bound_names(&func.params) {
-            // Parameter-expression bindings may be in the body's parent, while a body var
-            // shadows them. Resolve the live reference, never copy it to an independent slot.
-            c.lexical_env_bind(&name, false);
-        }
-    } else if func.is_generator || func.is_async {
-        let bound_names = crate::interpreter::param_bound_names(&func.params);
-        for (k, name) in bound_names.iter().enumerate() {
-            let slot = c.fresh_slot(name);
-            if has_mapped_parameter_aliases {
-                // The arguments exotic object's ParameterMap already aliases this binding in the
-                // retained call activation. Keep all direct and captured accesses there too.
-                c.env_bind(name, false);
-            } else if captured.contains(name) {
-                c.cap_inits
-                    .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
-                c.env_bind(name, false);
-            } else {
-                c.scope_bind(name, slot, false);
+        for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &[]) {
+            match op {
+                HoistOp::Var(name) | HoistOp::Fn(name, _) => {
+                    c.script_vars.insert(name.clone());
+                    c.lexical_env_bind(&name, false);
+                }
+                HoistOp::AnnexB(name, function) => {
+                    c.script_vars.insert(name.clone());
+                    c.lexical_env_bind(&name, false);
+                    c.script_annexb.insert(Rc::as_ptr(&function) as usize);
+                }
             }
         }
-        c.n_params = bound_names.len();
+        for statement in &func.body {
+            match statement {
+                Stmt::VarDecl { kind, decls } if !matches!(kind, DeclKind::Var) => {
+                    let mut names = std::collections::HashSet::new();
+                    for (pattern, _) in decls {
+                        pat_idents(pattern, &mut names);
+                    }
+                    for name in names {
+                        c.lexical_env_bind(&name, !matches!(kind, DeclKind::Let));
+                    }
+                }
+                Stmt::ClassDecl(class) => {
+                    c.lexical_env_bind(class.name.as_ref()?, false);
+                }
+                _ => {}
+            }
+        }
+        // All global declaration cells/properties were created exactly once by the caller.
+        c.reuse_activation = true;
+        let completion = c.fresh_slot("%script-completion%");
+        c.script_completion = Some(completion);
     } else {
-        for (k, p) in func.params.iter().enumerate() {
-            if p.rest {
-                log_bail("params", "rest parameter");
-                return None;
+        if let Some(bindings) = module_bindings {
+            for (name, is_const) in bindings {
+                c.env_bind(name, *is_const);
             }
-            let Pattern::Ident(name) = &p.pattern else {
-                log_bail("params", "destructuring parameter");
-                return None;
-            };
-            if let Some(d) = &p.default {
-                // Lowerable defaults: an uncaptured identifier parameter whose default expression
-                // can't observe this-or-later parameters (see `default_expr_safe`).
+            // Any compiler-homed block captures may safely use the once-only module environment.
+            // More importantly, a fresh function activation would put pre-instantiated module cells
+            // in the parent while `LoadCap`/`StoreCap` intentionally address the fixed home directly.
+            c.reuse_activation = true;
+        }
+        // Captured once-per-call block `let`s home in the activation (TDZ from entry, initialized
+        // by the declaring block's own StoreCapInit); CaptureScan proved no enclosing same-name
+        // declaration and block-resolved references only, so the function-flat env map is
+        // faithful (nested same-name declarations shadow it through their slots).
+        for (name, is_const) in &block_lets {
+            c.cap_inits
+                .push(CapInit::Lexical(Rc::from(name.as_str()), *is_const));
+            c.env_bind(name, *is_const);
+            c.homed_lets.insert(name.clone());
+            c.homed_pending.insert(name.clone());
+        }
+        // Ordinary compiled calls instantiate parameters in this chunk, so each formal needs its
+        // positional slot and only the subset whose default initialization is safely lowerable can
+        // compile. Coroutine calls have already completed FunctionDeclarationInstantiation in the
+        // tree-walker before their resumable context is created. For them, flatten BoundNames into
+        // slots and seed those slots from the live bindings; this admits rest/destructuring/default
+        // parameter lists without replaying any binding or initializer operation.
+        let mut defaulted: Vec<(u16, &Expr)> = Vec::new();
+        if prepared_entry {
+            c.push_compile_scope();
+            for name in crate::interpreter::param_bound_names(&func.params) {
+                // Parameter-expression bindings may be in the body's parent, while a body var
+                // shadows them. Resolve the live reference, never copy it to an independent slot.
+                c.lexical_env_bind(&name, false);
+            }
+        } else if func.is_generator || func.is_async {
+            let bound_names = crate::interpreter::param_bound_names(&func.params);
+            for (k, name) in bound_names.iter().enumerate() {
+                let slot = c.fresh_slot(name);
+                if has_mapped_parameter_aliases {
+                    // The arguments exotic object's ParameterMap already aliases this binding in the
+                    // retained call activation. Keep all direct and captured accesses there too.
+                    c.env_bind(name, false);
+                } else if captured.contains(name) {
+                    c.cap_inits
+                        .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
+                    c.env_bind(name, false);
+                } else {
+                    c.scope_bind(name, slot, false);
+                }
+            }
+            c.n_params = bound_names.len();
+        } else {
+            for (k, p) in func.params.iter().enumerate() {
+                if p.rest {
+                    log_bail("params", "rest parameter");
+                    return None;
+                }
+                let Pattern::Ident(name) = &p.pattern else {
+                    log_bail("params", "destructuring parameter");
+                    return None;
+                };
+                if let Some(d) = &p.default {
+                    // Lowerable defaults: an uncaptured identifier parameter whose default expression
+                    // can't observe this-or-later parameters (see `default_expr_safe`).
+                    if captured.contains(name) {
+                        log_bail("params", "captured defaulted parameter");
+                        return None;
+                    }
+                    let banned: std::collections::HashSet<&str> = func.params[k..]
+                        .iter()
+                        .filter_map(|q| match &q.pattern {
+                            Pattern::Ident(n) => Some(n.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !default_expr_safe(d, &banned) {
+                        log_bail("params", "unsafe default expression");
+                        return None;
+                    }
+                    defaulted.push((k as u16, d));
+                }
+                let slot = c.fresh_slot(name);
                 if captured.contains(name) {
-                    log_bail("params", "captured defaulted parameter");
-                    return None;
+                    c.cap_inits
+                        .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
+                    c.env_bind(name, false);
+                } else {
+                    c.scope_bind(name, slot, false);
                 }
-                let banned: std::collections::HashSet<&str> = func.params[k..]
-                    .iter()
-                    .filter_map(|q| match &q.pattern {
-                        Pattern::Ident(n) => Some(n.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if !default_expr_safe(d, &banned) {
-                    log_bail("params", "unsafe default expression");
-                    return None;
-                }
-                defaulted.push((k as u16, d));
             }
-            let slot = c.fresh_slot(name);
-            if captured.contains(name) {
-                c.cap_inits
-                    .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
-                c.env_bind(name, false);
-            } else {
-                c.scope_bind(name, slot, false);
+            c.n_params = func.params.len();
+            for (slot, d) in defaulted {
+                c.emit(Op::LoadLocal(slot));
+                c.emit(Op::Undef);
+                c.emit(Op::StrictEq);
+                let jf = c.emit(Op::JumpIfFalse(0));
+                c.expr(d).ok()?;
+                c.emit(Op::StoreLocal(slot));
+                c.patch(jf);
             }
         }
-        c.n_params = func.params.len();
-        for (slot, d) in defaulted {
-            c.emit(Op::LoadLocal(slot));
-            c.emit(Op::Undef);
-            c.emit(Op::StrictEq);
-            let jf = c.emit(Op::JumpIfFalse(0));
-            c.expr(d).ok()?;
-            c.emit(Op::StoreLocal(slot));
-            c.patch(jf);
-        }
-    }
-    if uses_arguments && !func.is_arrow && !prepared_entry {
-        if has_mapped_parameter_aliases {
-            c.env_bind("arguments", false);
-        } else if !is_coroutine {
-            if captured.contains("arguments") {
-                // ECMA-262 §15.3.4: an arrow has no own arguments binding. Materialize the
-                // enclosing function's one arguments object in its activation so both the outer
-                // body and every captured arrow resolve the same identity.
+        if uses_arguments && !func.is_arrow && !prepared_entry {
+            if has_mapped_parameter_aliases {
                 c.env_bind("arguments", false);
-                c.env_arguments = true;
-            } else {
-                // Positional parameters must occupy the first n_params slots in every
-                // VM/JIT entry. Allocate the independent arguments slot only after them.
-                let slot = c.fresh_slot("arguments");
-                c.scope_bind("arguments", slot, false);
-                c.arguments_slot = Some(slot);
+            } else if !is_coroutine {
+                if captured.contains("arguments") {
+                    // ECMA-262 §15.3.4: an arrow has no own arguments binding. Materialize the
+                    // enclosing function's one arguments object in its activation so both the outer
+                    // body and every captured arrow resolve the same identity.
+                    c.env_bind("arguments", false);
+                    c.env_arguments = true;
+                } else {
+                    // Positional parameters must occupy the first n_params slots in every
+                    // VM/JIT entry. Allocate the independent arguments slot only after them.
+                    let slot = c.fresh_slot("arguments");
+                    c.scope_bind("arguments", slot, false);
+                    c.arguments_slot = Some(slot);
+                }
             }
+            // Other coroutines deliberately leave `arguments` unresolved in the chunk. The normal
+            // name operation walks the retained activation installed by FunctionDeclarationInstantiation,
+            // or its parents for an arrow, so direct reads and nested arrows observe one object.
         }
-        // Other coroutines deliberately leave `arguments` unresolved in the chunk. The normal
-        // name operation walks the retained activation installed by FunctionDeclarationInstantiation,
-        // or its parents for an arrow, so direct reads and nested arrows observe one object.
-    }
-    // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
-    let mut annexb_blocked = crate::interpreter::param_bound_names(&func.params);
-    if !func.is_arrow {
-        annexb_blocked.push("arguments".to_string());
-    }
-    for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &annexb_blocked) {
-        match op {
-            HoistOp::Var(name) => {
-                if prepared_entry {
-                    c.env_bind(&name, false);
-                } else if c.env_has(&name) {
-                    // A `var` sharing a parameter's Function Environment binding is already
-                    // instantiated. In particular, do not split mapped parameters into slots.
-                } else if captured.contains(&name) {
-                    if !c.env_has(&name) {
+        // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
+        let mut annexb_blocked = crate::interpreter::param_bound_names(&func.params);
+        if !func.is_arrow {
+            annexb_blocked.push("arguments".to_string());
+        }
+        for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &annexb_blocked)
+        {
+            match op {
+                HoistOp::Var(name) => {
+                    if prepared_entry {
+                        c.env_bind(&name, false);
+                    } else if c.env_has(&name) {
+                        // A `var` sharing a parameter's Function Environment binding is already
+                        // instantiated. In particular, do not split mapped parameters into slots.
+                    } else if captured.contains(&name) {
+                        if !c.env_has(&name) {
+                            c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
+                            c.env_bind(&name, false);
+                        }
+                    } else if c.lookup(&name).is_none() {
+                        let slot = c.fresh_slot(&name);
+                        c.scope_bind(&name, slot, false);
+                    }
+                }
+                HoistOp::Fn(name, f) => {
+                    if prepared_entry {
+                        c.env_bind(&name, false);
+                        continue;
+                    }
+                    if c.module_body && c.env_has(&name) {
+                        // ModuleDeclarationInstantiation already created the closure in this exact
+                        // environment. Replaying FunctionDeclarationInstantiation would replace the
+                        // live export cell and, for cycles, expose the wrong function identity.
+                        continue;
+                    }
+                    let fidx = c.funcs.len() as u16;
+                    c.funcs.push(f.clone());
+                    if c.env_has(&name) || captured.contains(&name) {
+                        c.cap_inits.push(CapInit::Fn(fidx, Rc::from(name.as_str())));
+                        c.env_bind(&name, false);
+                    } else {
+                        let slot = match c.lookup(&name) {
+                            Some((s, _)) => s,
+                            None => {
+                                let s = c.fresh_slot(&name);
+                                c.scope_bind(&name, s, false);
+                                s
+                            }
+                        };
+                        // Created at entry, in hoist order, closing over the activation.
+                        c.emit(Op::MakeClosure(fidx as u32, u32::MAX));
+                        c.emit(Op::StoreLocal(slot));
+                    }
+                }
+                HoistOp::AnnexB(name, function) => {
+                    // Annex B.3.2 FunctionDeclarationInstantiation creates/reuses a mutable var home
+                    // initialized to undefined. The block's distinct lexical binding is instantiated
+                    // later; evaluating its declaration copies that function object into this home.
+                    let target = if prepared_entry {
+                        c.env_bind(&name, false);
+                        Home::Env(false)
+                    } else if let Some(home) = c.home(&name) {
+                        home
+                    } else if captured.contains(&name) {
                         c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
                         c.env_bind(&name, false);
-                    }
-                } else if c.lookup(&name).is_none() {
-                    let slot = c.fresh_slot(&name);
-                    c.scope_bind(&name, slot, false);
-                }
-            }
-            HoistOp::Fn(name, f) => {
-                if prepared_entry {
-                    c.env_bind(&name, false);
-                    continue;
-                }
-                if c.module_body && c.env_has(&name) {
-                    // ModuleDeclarationInstantiation already created the closure in this exact
-                    // environment. Replaying FunctionDeclarationInstantiation would replace the
-                    // live export cell and, for cycles, expose the wrong function identity.
-                    continue;
-                }
-                let fidx = c.funcs.len() as u16;
-                c.funcs.push(f.clone());
-                if c.env_has(&name) || captured.contains(&name) {
-                    c.cap_inits.push(CapInit::Fn(fidx, Rc::from(name.as_str())));
-                    c.env_bind(&name, false);
-                } else {
-                    let slot = match c.lookup(&name) {
-                        Some((s, _)) => s,
-                        None => {
-                            let s = c.fresh_slot(&name);
-                            c.scope_bind(&name, s, false);
-                            s
-                        }
+                        Home::Env(false)
+                    } else {
+                        let slot = c.fresh_slot(&name);
+                        c.scope_bind(&name, slot, false);
+                        Home::Slot(slot, false)
                     };
-                    // Created at entry, in hoist order, closing over the activation.
-                    c.emit(Op::MakeClosure(fidx as u32, u32::MAX));
-                    c.emit(Op::StoreLocal(slot));
+                    c.annexb_targets
+                        .insert(Rc::as_ptr(&function) as usize, target);
                 }
-            }
-            HoistOp::AnnexB(name, function) => {
-                // Annex B.3.2 FunctionDeclarationInstantiation creates/reuses a mutable var home
-                // initialized to undefined. The block's distinct lexical binding is instantiated
-                // later; evaluating its declaration copies that function object into this home.
-                let target = if prepared_entry {
-                    c.env_bind(&name, false);
-                    Home::Env(false)
-                } else if let Some(home) = c.home(&name) {
-                    home
-                } else if captured.contains(&name) {
-                    c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
-                    c.env_bind(&name, false);
-                    Home::Env(false)
-                } else {
-                    let slot = c.fresh_slot(&name);
-                    c.scope_bind(&name, slot, false);
-                    Home::Slot(slot, false)
-                };
-                c.annexb_targets
-                    .insert(Rc::as_ptr(&function) as usize, target);
             }
         }
-    }
-    // Body-level lexicals: captured ones home in the activation (inserted in TDZ by
-    // make_run_env), the rest get TDZ slots.
-    if c.declare_body_lexicals(&func.body, &captured).is_err() {
-        log_bail("body-lexicals", "unsupported declaration form");
-        return None;
+        // Body-level lexicals: captured ones home in the activation (inserted in TDZ by
+        // make_run_env), the rest get TDZ slots.
+        if c.declare_body_lexicals(&func.body, &captured).is_err() {
+            log_bail("body-lexicals", "unsupported declaration form");
+            return None;
+        }
     }
     let compile_body = |compiler: &mut Compiler| compiler.statement_list(&func.body);
     let has_body_using = func.body.iter().any(|statement| {
@@ -5355,7 +5731,22 @@ fn compile_inner(
     if body_result.is_err() {
         return None;
     }
-    c.emit(Op::ReturnUndef);
+    if let Some(completion) = c.script_completion {
+        c.emit(Op::LoadLocal(completion));
+        c.emit(Op::Return);
+    } else {
+        c.emit(Op::ReturnUndef);
+    }
+    finish_chunk(c, hot, prepared_entry, is_coroutine, Some(func))
+}
+
+fn finish_chunk(
+    mut c: Compiler,
+    hot: Option<&Chunk>,
+    prepared_entry: bool,
+    is_coroutine: bool,
+    source: Option<&Function>,
+) -> Option<Rc<Chunk>> {
     // Constructors in OO workloads overwhelmingly initialize a short, straight-line list of
     // fields. Count distinct names only until control flow can make the estimate speculative,
     // and decline large reservations: this is an allocation/memory optimization, not metadata
@@ -5432,12 +5823,13 @@ fn compile_inner(
         let (layout, bindings) = feedback_layout_for_ops(&c.ops, &c.names);
         crate::feedback::FeedbackVector::new(layout, bindings)
     };
-    if std::env::var_os("LUMEN_NULLISH_TRACE").is_some()
-        && c.ops.len() == 179
-        && c.ops
-            .get(45)
-            .is_some_and(|op| matches!(op, Op::GetElemLocal(0)))
-    {
+    if let Some(func) = source.filter(|_| {
+        std::env::var_os("LUMEN_NULLISH_TRACE").is_some()
+            && c.ops.len() == 179
+            && c.ops
+                .get(45)
+                .is_some_and(|op| matches!(op, Op::GetElemLocal(0)))
+    }) {
         let source: String = func
             .source
             .as_deref()
@@ -5477,6 +5869,7 @@ fn compile_inner(
         uses_this: c.uses_this,
         lexical_this: c.lexical_this,
         strict: c.strict,
+        resumable: is_coroutine,
         instance_capacity_hint,
         instance_layout,
         forwarded_capacity_hint: std::cell::Cell::new(0),
@@ -5500,6 +5893,8 @@ fn compile_inner(
         caches: c.caches,
         name_pins: std::cell::RefCell::new(c.name_pins),
         name_caches: c.name_caches,
+        deep_name_caches: std::cell::RefCell::new(Vec::new()),
+        resolution_caches: std::cell::OnceCell::new(),
         name_num_bits: c.name_num_bits,
         name_num_valid: c.name_num_valid,
         cap_caches: vec![std::cell::Cell::new(NameIc::EMPTY); cap_cache_len],
@@ -5515,13 +5910,17 @@ fn compile_inner(
         call_pins: std::cell::RefCell::new(c.call_pins),
         inline_targets: c.inline_targets,
         jit_runs: std::cell::Cell::new(0),
-        inline_attempted: std::cell::Cell::new(false),
-        jit: std::cell::OnceCell::new(),
+        inline_attempted: std::cell::Cell::new(inline_recompile_at() == 0),
+        inline_retry_at: std::cell::Cell::new(inline_recompile_at()),
+        inline_checks: std::cell::Cell::new(0),
+        inline_feedback: std::cell::Cell::new(0),
+        jit: crate::jit::cache::NativeCodeSlot::new(),
         jit_budget_wait_bytes: std::cell::Cell::new(0),
+        osr: std::cell::OnceCell::new(),
     }))
 }
 
-/// How many machine-code runs of a chunk trigger the one-shot speculative inline recompile.
+/// Machine-code runs before the first bounded, feedback-adaptive inline checkpoint.
 pub(crate) fn inline_recompile_at() -> u32 {
     static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
@@ -5565,6 +5964,138 @@ pub(crate) fn plan_inlines(
         .unwrap_or(INLINE_SOURCE_OP_BUDGET);
     let mut budget = limit.saturating_sub(chunk.ops.len());
     plan_inlines_at(chunk, caller, global_env, caller_env, 0, &mut budget)
+}
+
+/// What the AST splice can preserve without constructing the callee's execution context.
+/// This is deliberately an allowlist: adding VM/native coverage must not silently authorize
+/// inlining an operation that observes a different Function/Private Environment Record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineCapability {
+    /// Operands, local slots, constants, and branch targets are regenerated in the caller.
+    RemappedFrame,
+    /// Reads require the planner's global/shared-closure proof and shadowing guard.
+    ClosureRead(u32),
+    /// A real call is required until the splice explicitly remaps this context/state.
+    RequiresCallContext,
+}
+
+fn inline_capability(op: &Op) -> InlineCapability {
+    match *op {
+        Op::LoadName(name, _) | Op::LoadNameForCall(name, _) | Op::TypeofName(name) => {
+            InlineCapability::ClosureRead(name)
+        }
+        Op::Const(_)
+        | Op::Undef
+        | Op::Dup
+        | Op::Pop
+        | Op::Dup2
+        | Op::LoadLocal(_)
+        | Op::StoreLocal(_)
+        | Op::UpdateLocal(..)
+        | Op::Tdz(_)
+        | Op::StoreConstLocal(..)
+        | Op::UpdateConst(..)
+        | Op::ResetSlots(..)
+        | Op::LoadThis
+        | Op::RequireObject
+        | Op::RequireCallable
+        | Op::GetProp(..)
+        | Op::GetPropThis(..)
+        | Op::GetPropLocal(..)
+        | Op::SetProp(..)
+        | Op::SetPropDrop(..)
+        | Op::SetPropThisDrop(..)
+        | Op::SetPropLocalDrop(..)
+        | Op::AppendProp(..)
+        | Op::UpdateProp(..)
+        | Op::GetElem
+        | Op::SetElem
+        | Op::SetElemDrop
+        | Op::GetElemLocal(_)
+        | Op::SetElemLocal(_)
+        | Op::SetElemLocalDrop(_)
+        | Op::UpdateElem(_)
+        | Op::GetMethod(..)
+        | Op::GetMethodElem
+        | Op::DeleteProp(..)
+        | Op::DeleteElem(_)
+        | Op::ToPropKey
+        | Op::ToPropKeyLocal(_)
+        | Op::ToStr
+        | Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Mod
+        | Op::BitAnd
+        | Op::BitOr
+        | Op::BitXor
+        | Op::Shl
+        | Op::Shr
+        | Op::UShr
+        | Op::Lt
+        | Op::Gt
+        | Op::Le
+        | Op::Ge
+        | Op::EqEq
+        | Op::NotEq
+        | Op::StrictEq
+        | Op::StrictNotEq
+        | Op::InstanceOf(_)
+        | Op::GenBin(_)
+        | Op::Neg
+        | Op::Plus
+        | Op::Not
+        | Op::BitNot
+        | Op::Typeof
+        | Op::Void
+        | Op::Jump(_)
+        | Op::JumpIfFalse(_)
+        | Op::JumpIfFalsePeek(_)
+        | Op::JumpIfTruePeek(_)
+        | Op::JumpIfNotNullishPeek(_)
+        | Op::Call(..)
+        | Op::CallWithThis(..)
+        | Op::CallSpread(_)
+        | Op::CallSpreadThis(_)
+        | Op::CallArgsArray
+        | Op::CallArgsArrayThis
+        | Op::New(..)
+        | Op::NewArgsArray
+        | Op::MakeRegExp(..)
+        | Op::MakeArray(_)
+        | Op::NewArray
+        | Op::ArrayPush
+        | Op::ArrayHole
+        | Op::ArraySpread
+        | Op::MakeObject(..)
+        | Op::NewObject
+        | Op::ObjectData(_)
+        | Op::ObjectSpread
+        | Op::ObjectProto
+        | Op::ObjectRest(_)
+        | Op::GetIter
+        | Op::ForInKeys
+        | Op::ForInStepL(..)
+        | Op::IterStepL(..)
+        | Op::IterCloseL(_)
+        | Op::DestructureGuard
+        | Op::DestructureArr(_)
+        | Op::DestructureStepL(..)
+        | Op::DestructureRestL(..)
+        | Op::IterCloseIfNotDoneL(..)
+        | Op::Throw
+        | Op::Return
+        | Op::ReturnBare
+        | Op::ReturnUndef => InlineCapability::RemappedFrame,
+        // In particular, SuperThis/SuperBase need BOTH the callee receiver and its live
+        // [[HomeObject]], not the caller's lexical environment. Private names, new.target,
+        // direct eval, closure creation, prepared references, handlers, cleanup and suspension
+        // likewise lack a complete remapping contract. Keep their normal native call intact.
+        // ECMA-262 GetThisEnvironment, GetSuperBase and MakeSuperPropertyReference; local
+        // official snapshot e28783d5fc9dc12b3de905961e2c71410b38a202.
+        _ => InlineCapability::RequiresCallContext,
+    }
 }
 
 fn plan_inlines_at(
@@ -5623,8 +6154,13 @@ fn plan_inlines_at(
             let callee_env = Rc::as_ptr(&user.env);
             let shared_closure = !caller_env.is_null() && callee_env == caller_env;
             let f = &user.func;
-            if f.is_arrow || f.is_strict != caller.is_strict {
-                skip!(idx, "arrow/strictness");
+            if f.is_strict != caller.is_strict {
+                skip!(idx, "strictness");
+            }
+            // Lexical observations must remain in the definition frame. Plain arrow helpers
+            // need no such frame and share the ordinary parameter/free-name guarded splice.
+            if f.is_arrow && f.scan_flags() & (SCAN_THIS | SCAN_ARGUMENTS | SCAN_NEW_TARGET) != 0 {
+                skip!(idx, "arrow lexical observations");
             }
             if f.params.iter().any(|p| {
                 p.rest || p.default.is_some() || !matches!(p.pattern, crate::ast::Pattern::Ident(_))
@@ -5645,47 +6181,17 @@ fn plan_inlines_at(
             {
                 skip!(idx, "callee size/shape");
             }
-            // The splice runs under the caller's frame: no handler regions to relocate, no inner
-            // closures, no name writes. Free-name READS are allowed for global-closure callees —
-            // the compiler re-resolves them at the splice site and refuses shadowed ones.
-            if callee_chunk.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::PushHandler(_)
-                        | Op::TailCall(..)
-                        | Op::TailEvalCallArgsArray
-                        | Op::PushFinally(..)
-                        | Op::PushIterator(..)
-                        | Op::PushDisposeFrame
-                        | Op::AddDisposable(_)
-                        | Op::DisposeNormal
-                        | Op::DisposeThrow
-                        | Op::DisposeReturn
-                        | Op::DisposeBareReturn
-                        | Op::DisposeResumeReturn
-                        | Op::DisposeJump
-                        | Op::PushWith
-                        | Op::PushLex(_)
-                        | Op::PushCatchLex(_)
-                        | Op::CloneLex(_)
-                        | Op::InitLex(_)
-                        | Op::PopEnv
-                        | Op::ResolveNameRef(..)
-                        | Op::LoadRef(_)
-                        | Op::StoreRef(_)
-                        | Op::MakeClosure(..)
-                        | Op::StoreName(_)
-                        | Op::StoreNameCached(..)
-                        | Op::UpdateName(..)
-                        | Op::UpdateNameCached(..)
-                )
-            }) {
-                skip!(idx, "callee ops (handlers/closures/name writes)");
+            if callee_chunk
+                .ops
+                .iter()
+                .any(|op| inline_capability(op) == InlineCapability::RequiresCallContext)
+            {
+                skip!(idx, "callee operation requires an unremapped call context");
             }
             let mut free_names: Vec<Rc<str>> = Vec::new();
             for op in callee_chunk.ops.iter() {
-                if let Op::LoadName(n, _) | Op::LoadNameForCall(n, _) = op {
-                    let name = callee_chunk.names[*n as usize].clone();
+                if let InlineCapability::ClosureRead(n) = inline_capability(op) {
+                    let name = callee_chunk.names[n as usize].clone();
                     if !free_names.contains(&name) {
                         free_names.push(name);
                     }
@@ -5825,6 +6331,13 @@ mod compiler_name_tests {
 
 #[derive(Default)]
 struct Compiler {
+    /// Borrow the already-instantiated AST environment and return exact source completions.
+    fragment_entry: bool,
+    fragment_async_generator: bool,
+    fragment_tail_calls: bool,
+    fragment_root: Option<loop_fragment::RootKind>,
+    fragment_seed_slots: Vec<u16>,
+    fragment_exits: Vec<(usize, FragmentExitKind)>,
     /// The compiled function's strictness (carried into ops whose runtime behavior forks on it).
     strict: bool,
     /// Generator/async chunks use the VM as their resumable execution context, not merely as an
@@ -5833,6 +6346,12 @@ struct Compiler {
     /// Source Text Module execution uses bindings instantiated by the link phase rather than a
     /// fresh FunctionDeclarationInstantiation environment.
     module_body: bool,
+    /// An already-instantiated Script Record. Global bindings are never compiler-local slots.
+    script_body: bool,
+    script_vars: std::collections::HashSet<String>,
+    script_annexb: std::collections::HashSet<usize>,
+    /// StatementList's last nonempty completion, initialized to undefined at script entry.
+    script_completion: Option<u16>,
     /// This coroutine contains direct eval and CaptureScan proved every dynamically visible
     /// depth-0 binding has an exact retained activation or runtime lexical-environment home.
     direct_eval: bool,
@@ -6014,6 +6533,15 @@ enum PreparedAssignmentRef {
     Element {
         base: u16,
         key: u16,
+    },
+    Private {
+        base: u16,
+        name: u32,
+    },
+    Super {
+        receiver: u16,
+        key: u16,
+        base: u16,
     },
 }
 
@@ -6607,7 +7135,7 @@ impl Compiler {
     fn destructure_store(&mut self, pat: &Pattern, kind: DeclKind) -> CResult {
         match pat {
             Pattern::Ident(name) => {
-                if self.current_lexical_env_has(name) {
+                if self.dynamic_declaration_binding(name, kind) {
                     let name = self.name_idx(name);
                     self.emit(if matches!(kind, DeclKind::Var) {
                         Op::StoreName(name)
@@ -6652,10 +7180,11 @@ impl Compiler {
                         _ => return Err(Bail),
                     };
                     let ki = self.name_idx(&key);
+                    let reference = self.prepare_binding_reference(&prop.value, kind)?;
                     self.emit(Op::Dup);
                     let c = self.new_cache(ki);
                     self.emit(Op::GetProp(ki, c));
-                    self.destructure_store(&prop.value, kind)?;
+                    self.finish_binding_reference(reference, &prop.value, kind)?;
                 }
                 self.emit(Op::Pop);
                 Ok(())
@@ -6698,6 +7227,36 @@ impl Compiler {
         }
     }
 
+    /// ECMA-262 IteratorBindingInitialization / KeyedBindingInitialization: a var-mode
+    /// SingleNameBinding resolves its Reference before IteratorStepValue/GetV and the
+    /// initializer. A nested BindingPattern instead resolves its leaves when entered.
+    /// Lexical initialization uses the already-instantiated declarative binding; local
+    /// and captured var homes keep their allocation-free stores when statically proven.
+    fn prepare_binding_reference(
+        &mut self,
+        pattern: &Pattern,
+        kind: DeclKind,
+    ) -> Result<Option<PreparedAssignmentRef>, Bail> {
+        if let (DeclKind::Var, Pattern::Ident(name)) = (kind, pattern) {
+            return self.prepare_identifier_reference(name).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn finish_binding_reference(
+        &mut self,
+        reference: Option<PreparedAssignmentRef>,
+        pattern: &Pattern,
+        kind: DeclKind,
+    ) -> CResult {
+        if let Some(reference) = reference {
+            self.put_assignment_reference(reference);
+            Ok(())
+        } else {
+            self.destructure_store(pattern, kind)
+        }
+    }
+
     fn binding_default(&mut self, pattern: &Pattern, default: Option<&Expr>) -> CResult {
         let Some(default) = default else {
             return Ok(());
@@ -6736,13 +7295,15 @@ impl Compiler {
                     self.emit(Op::Pop);
                 }
                 ArrayPatElem::Elem { pattern, default } => {
+                    let reference = self.prepare_binding_reference(pattern, kind)?;
                     self.emit(Op::DestructureStepL(iterator, next, done));
                     self.binding_default(pattern, default.as_ref())?;
-                    self.destructure_store(pattern, kind)?;
+                    self.finish_binding_reference(reference, pattern, kind)?;
                 }
                 ArrayPatElem::Rest(pattern) => {
+                    let reference = self.prepare_binding_reference(pattern, kind)?;
                     self.emit(Op::DestructureRestL(iterator, next, done));
-                    self.destructure_store(pattern, kind)?;
+                    self.finish_binding_reference(reference, pattern, kind)?;
                 }
             }
         }
@@ -6792,17 +7353,20 @@ impl Compiler {
         for property in &object.props {
             let key = self.assignment_object_key(source, &property.key)?;
             excluded.push(key);
+            let reference = self.prepare_binding_reference(&property.value, kind)?;
             self.load_assignment_property(source, key);
             self.binding_default(&property.value, property.default.as_ref())?;
-            self.destructure_store(&property.value, kind)?;
+            self.finish_binding_reference(reference, &property.value, kind)?;
         }
         if let Some(rest) = &object.rest {
+            let pattern = Pattern::Ident(rest.clone());
+            let reference = self.prepare_binding_reference(&pattern, kind)?;
             self.emit(Op::LoadLocal(source));
             for key in &excluded {
                 self.emit(Op::LoadLocal(*key));
             }
             self.emit(Op::ObjectRest(excluded.len() as u16));
-            self.destructure_store(&Pattern::Ident(rest.clone()), kind)?;
+            self.finish_binding_reference(reference, &pattern, kind)?;
         }
         Ok(())
     }
@@ -6891,6 +7455,98 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Evaluate a call's Reference, retaining its receiver alongside GetValue's result when
+    /// needed. Grouping does not apply GetValue (ECMA-262 §13.2.9.3), including around an
+    /// OptionalExpression. A grouped chain owns its short-circuit boundary: `(null?.m)(arg())`
+    /// must evaluate arg before throwing, while `(null?.m)?.(arg())` skips it.
+    fn callee_reference(&mut self, e: &Expr) -> Result<(bool, bool), Bail> {
+        let mut shorts = Vec::new();
+        let shape = self.call_reference(e, &mut shorts)?;
+        if !shorts.is_empty() {
+            let done = self.emit(Op::Jump(0));
+            for short in shorts {
+                self.patch(short);
+            }
+            if shape.0 {
+                self.emit(Op::Undef); // a short-circuit is a value, not a property Reference
+            }
+            self.emit(Op::Undef);
+            self.patch(done);
+        }
+        Ok(shape)
+    }
+
+    /// The open-chain form shares short-circuit exits with subsequent links. The returned
+    /// booleans select [receiver, callee] versus [callee], and speculative inline eligibility.
+    /// EvaluateCall (§13.3.6.2) also preserves WithBaseObject for Environment References;
+    /// comma/conditional/call results instead pass through ordinary value evaluation.
+    fn call_reference(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> Result<(bool, bool), Bail> {
+        match e {
+            Expr::Paren(inner) => self.call_reference(inner, shorts),
+            Expr::OptionalChain(inner) => self.callee_reference(inner),
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_named_reference(prop);
+                self.emit(Op::SuperGetMethod);
+                Ok((true, false))
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_computed_reference(index)?;
+                self.emit(Op::SuperGetMethod);
+                Ok((true, false))
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional,
+            } if !matches!(**obj, Expr::Super) => {
+                self.opt_chain(obj, shorts)?;
+                if *optional {
+                    self.opt_link(1, shorts);
+                }
+                let name = self.name_idx(prop);
+                if prop.starts_with('#') {
+                    self.emit(Op::GetPrivateMethod(name));
+                    Ok((true, false))
+                } else {
+                    let cache = self.new_cache(name);
+                    self.emit(Op::GetMethod(name, cache));
+                    Ok((true, true))
+                }
+            }
+            Expr::Index {
+                obj,
+                index,
+                optional,
+            } if !matches!(**obj, Expr::Super) => {
+                self.opt_chain(obj, shorts)?;
+                if *optional {
+                    self.opt_link(1, shorts);
+                }
+                self.expr(index)?;
+                self.emit(Op::GetMethodElem);
+                Ok((true, true))
+            }
+            Expr::Ident(name) if self.home(name).is_none() => {
+                let name = self.name_idx(name);
+                let cache = self.new_name_cache(name);
+                self.emit(Op::LoadNameForCall(name, cache));
+                Ok((true, true))
+            }
+            other => {
+                self.opt_chain(other, shorts)?;
+                Ok((false, true))
+            }
+        }
     }
 
     /// `delete obj.p` / `delete obj[k]` on plain (non-optional, non-super, public) references;
@@ -7017,6 +7673,20 @@ impl Compiler {
         Ok(())
     }
 
+    /// Does this expression continue an open optional chain? An OptionalChain wrapper closes
+    /// its own chain; optional links in arguments/keys are separate expressions as well.
+    fn has_open_optional_chain(e: &Expr) -> bool {
+        match e {
+            Expr::Member { obj, optional, .. } | Expr::Index { obj, optional, .. } => {
+                *optional || Self::has_open_optional_chain(obj)
+            }
+            Expr::Call {
+                callee, optional, ..
+            } => *optional || Self::has_open_optional_chain(callee),
+            _ => false,
+        }
+    }
+
     /// Compile an optional chain (`a?.b.c`, `r?.m(args)`): each optional link peeks its base —
     /// nullish pops what the link would have consumed and jumps to a shared pad that pushes the
     /// chain's `undefined` result (skipping every later link, key expression, and argument, per
@@ -7024,6 +7694,12 @@ impl Compiler {
     /// optional callees preserve their distinct receiver rules, including private method
     /// receivers and super References. Optional `delete` retains its separate path.
     fn opt_chain(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
+        if !Self::has_open_optional_chain(e) {
+            // Preserve ordinary expression specializations (GetPropThis/GetPropLocal,
+            // element fusions, etc.) before the first optional link. Besides avoiding extra
+            // dispatch, constructor forwarders use that canonical opcode shape as their proof.
+            return self.expr(e);
+        }
         match e {
             Expr::Member {
                 obj,
@@ -7069,97 +7745,18 @@ impl Compiler {
                 callee,
                 args,
                 optional: call_opt,
-            } => match &**callee {
+            } => {
                 // A SuperCall may be the base of `super()?.x`. Evaluate it through the
                 // constructor continuation, not as an ordinary call to an Expr::Super value.
-                Expr::Super if !call_opt => self.expr(e),
-                Expr::Member {
-                    obj,
-                    prop,
-                    optional: false,
-                } if matches!(**obj, Expr::Super) => {
-                    // ChainEvaluation passes the super Reference to EvaluateCall: its receiver
-                    // is the current this value, not the prototype used for property lookup.
-                    self.super_named_reference(prop);
-                    self.emit(Op::SuperGetMethod);
-                    if *call_opt {
-                        self.opt_link(2, shorts);
-                    }
-                    self.finish_call(args, true, false)
+                if matches!(&**callee, Expr::Super) && !call_opt {
+                    return self.expr(e);
                 }
-                Expr::Index {
-                    obj,
-                    index,
-                    optional: false,
-                } if matches!(**obj, Expr::Super) => {
-                    self.super_computed_reference(index)?;
-                    self.emit(Op::SuperGetMethod);
-                    if *call_opt {
-                        self.opt_link(2, shorts);
-                    }
-                    self.finish_call(args, true, false)
+                let (with_this, allow_inline) = self.call_reference(callee, shorts)?;
+                if *call_opt {
+                    self.opt_link(if with_this { 2 } else { 1 }, shorts);
                 }
-                Expr::Member {
-                    obj,
-                    prop,
-                    optional,
-                } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
-                    self.opt_chain(obj, shorts)?;
-                    if *optional {
-                        self.opt_link(1, shorts);
-                    }
-                    let name = self.name_idx(prop);
-                    let cache = self.new_cache(name);
-                    self.emit(Op::GetMethod(name, cache));
-                    if *call_opt {
-                        // `a.b?.(args)`: the method value is peeked; nullish drops
-                        // [receiver, method].
-                        self.opt_link(2, shorts);
-                    }
-                    self.finish_call(args, true, true)
-                }
-                Expr::Member {
-                    obj,
-                    prop,
-                    optional,
-                } if !matches!(**obj, Expr::Super) && prop.starts_with('#') => {
-                    self.opt_chain(obj, shorts)?;
-                    if *optional {
-                        self.opt_link(1, shorts);
-                    }
-                    let name = self.name_idx(prop);
-                    self.emit(Op::GetPrivateMethod(name));
-                    if *call_opt {
-                        self.opt_link(2, shorts);
-                    }
-                    self.finish_call(args, true, true)
-                }
-                Expr::Index {
-                    obj,
-                    index,
-                    optional,
-                } if !matches!(**obj, Expr::Super) => {
-                    self.opt_chain(obj, shorts)?;
-                    if *optional {
-                        self.opt_link(1, shorts);
-                    }
-                    self.expr(index)?;
-                    self.emit(Op::GetMethodElem);
-                    if *call_opt {
-                        self.opt_link(2, shorts);
-                    }
-                    self.finish_call(args, true, true)
-                }
-                plain => {
-                    self.opt_chain(plain, shorts)?;
-                    if *call_opt {
-                        self.opt_link(1, shorts);
-                    }
-                    // A non-Reference callee and an environment Reference both use undefined as
-                    // `this` here; method References were handled by the two arms above.
-                    self.finish_call(args, false, true)
-                }
-            },
+                self.finish_call(args, with_this, allow_inline)
+            }
             // The chain's base (before any `?.` link): an ordinary expression.
             other => self.expr(other),
         }
@@ -7250,6 +7847,17 @@ impl Compiler {
             .last()
             .is_some_and(|scope| scope.contains_key(name))
     }
+    /// VariableDeclaration/BindingInitialization with an undefined environment uses ordinary
+    /// ResolveBinding. In particular, Annex B catch-parameter redeclarations must write a nearer
+    /// catch slot instead of the same-named global var. Lexical declarations initialize their
+    /// own binding; they must not accidentally initialize an outer binding of the same name.
+    fn dynamic_declaration_binding(&self, name: &str, kind: DeclKind) -> bool {
+        if matches!(kind, DeclKind::Var) {
+            self.home(name).is_none()
+        } else {
+            self.current_lexical_env_has(name)
+        }
+    }
     fn env_bind(&mut self, name: &str, is_const: bool) {
         self.env_names.insert(name.to_string(), is_const);
     }
@@ -7291,7 +7899,17 @@ impl Compiler {
             .map(|is_const| Home::Env(*is_const))
     }
     fn name_reference_can_change(&self, name: &str) -> bool {
-        self.home(name).is_none() && (self.direct_eval || !self.with_scope_floors.is_empty())
+        self.home(name).is_none()
+            && (self.script_body || self.direct_eval || !self.with_scope_floors.is_empty())
+    }
+
+    /// If/iteration/with/switch/try use UpdateEmpty(completion, undefined), unlike a plain
+    /// Block/StatementList. Keeping that boundary explicit also preserves labelled abrupt values.
+    fn reset_script_completion(&mut self) {
+        if let Some(slot) = self.script_completion {
+            self.emit(Op::Undef);
+            self.emit(Op::StoreLocal(slot));
+        }
     }
     fn const_idx(&mut self, v: Value) -> u32 {
         self.consts.push(v);
@@ -7462,6 +8080,35 @@ impl Compiler {
         }
     }
 
+    fn declare_block_function_binding(&mut self, function: &Rc<Function>) -> CResult {
+        let name = function.name.as_ref().ok_or(Bail)?;
+        // Web-legacy duplicate functions share one mutable block binding. Every declaration
+        // still instantiates in source order below, including across switch clauses.
+        if !self
+            .scopes
+            .last()
+            .is_some_and(|scope| scope.iter().any(|(binding, ..)| binding == name))
+        {
+            self.declare_lexical_pattern(&Pattern::Ident(name.clone()), false)?;
+        }
+        Ok(())
+    }
+
+    fn instantiate_block_function(&mut self, function: &Rc<Function>) -> CResult {
+        let name = function.name.as_ref().ok_or(Bail)?;
+        self.emit_closure(function, None);
+        if self.current_lexical_env_has(name) {
+            let name = self.name_idx(name);
+            self.emit(Op::InitLex(name));
+        } else {
+            let Home::Slot(slot, false) = self.home(name).ok_or(Bail)? else {
+                return Err(Bail);
+            };
+            self.emit(Op::StoreLocal(slot));
+        }
+        Ok(())
+    }
+
     /// Instantiate a statement list's block-scoped declarations at block entry. Per ECMA-262
     /// BlockDeclarationInstantiation, every binding exists before statement evaluation and a
     /// block FunctionDeclaration is initialized immediately rather than when its statement is
@@ -7470,6 +8117,7 @@ impl Compiler {
     /// uncaptured subset.
     fn declare_block_lexicals(&mut self, stmts: &[Stmt]) -> CResult {
         for s in stmts {
+            let s = lexical_declaration_statement(s);
             match s {
                 Stmt::VarDecl {
                     kind: DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
@@ -7487,8 +8135,7 @@ impl Compiler {
                     }
                 }
                 Stmt::FuncDecl(function) => {
-                    let name = function.name.as_ref().ok_or(Bail)?;
-                    self.declare_lexical_pattern(&Pattern::Ident(name.clone()), false)?;
+                    self.declare_block_function_binding(function)?;
                 }
                 Stmt::ClassDecl(class) => {
                     let name = class.name.as_ref().ok_or(Bail)?;
@@ -7501,18 +8148,8 @@ impl Compiler {
         // mutable block binding before the first statement executes. Do this after reserving all
         // slots so source-order declarations resolve against the complete block scope.
         for s in stmts {
-            if let Stmt::FuncDecl(function) = s {
-                let name = function.name.as_ref().ok_or(Bail)?;
-                self.emit_closure(function, None);
-                if self.current_lexical_env_has(name) {
-                    let name = self.name_idx(name);
-                    self.emit(Op::InitLex(name));
-                } else {
-                    let Home::Slot(slot, false) = self.home(name).ok_or(Bail)? else {
-                        return Err(Bail);
-                    };
-                    self.emit(Op::StoreLocal(slot));
-                }
+            if let Stmt::FuncDecl(function) = lexical_declaration_statement(s) {
+                self.instantiate_block_function(function)?;
             }
         }
         Ok(())
@@ -7627,14 +8264,53 @@ impl Compiler {
     }
 
     fn stmt(&mut self, s: &Stmt) -> CResult {
+        if self.fragment_root.is_none()
+            && matches!(
+                s,
+                Stmt::If { .. }
+                    | Stmt::While { .. }
+                    | Stmt::DoWhile { .. }
+                    | Stmt::For { .. }
+                    | Stmt::ForInOf { .. }
+                    | Stmt::Switch { .. }
+                    | Stmt::With { .. }
+                    | Stmt::Try { .. }
+            )
+        {
+            self.reset_script_completion();
+        }
         match s {
-            Stmt::Expr(e) => self.expr_stmt(e),
+            Stmt::Expr(e) => {
+                if let Some(slot) = self.script_completion {
+                    self.expr(e)?;
+                    self.emit(Op::StoreLocal(slot));
+                    Ok(())
+                } else {
+                    self.expr_stmt(e)
+                }
+            }
             Stmt::Empty | Stmt::Debugger => Ok(()),
             // Top-level function declarations were hoisted at function entry; block-level ones
             // were initialized by BlockDeclarationInstantiation at block entry. Annex B.3.2 adds
             // one declaration-time step: copy that lexical function object into its separate
             // function-scope var binding.
             Stmt::FuncDecl(function) => {
+                if self.fragment_entry {
+                    let index = self.funcs.len() as u32;
+                    self.funcs.push(function.clone());
+                    self.emit(Op::AnnexBSync(index));
+                    return Ok(());
+                }
+                if self
+                    .script_annexb
+                    .contains(&(Rc::as_ptr(function) as usize))
+                {
+                    let name = function.name.as_ref().ok_or(Bail)?;
+                    self.expr(&Expr::Ident(name.clone()))?;
+                    let name = self.name_idx(name);
+                    self.emit(Op::StoreGlobalName(name));
+                    return Ok(());
+                }
                 let Some(target) = self
                     .annexb_targets
                     .get(&(Rc::as_ptr(function) as usize))
@@ -7686,11 +8362,24 @@ impl Compiler {
                         self.destructure_store(pat, *kind)?;
                         continue;
                     };
-                    let dynamic_lexical = self.current_lexical_env_has(name);
+                    let dynamic_lexical = self.dynamic_declaration_binding(name, *kind);
                     let home = if dynamic_lexical {
                         None
                     } else {
                         Some(self.home(name).ok_or(Bail)?)
+                    };
+                    // VariableDeclaration resolves an identifier Reference before its RHS.
+                    // A with object may delete/reconfigure the property while that RHS runs.
+                    let reference = if matches!(kind, DeclKind::Var)
+                        && init.is_some()
+                        && self.name_reference_can_change(name)
+                    {
+                        let reference = self.fresh_reference()?;
+                        let name = self.name_idx(name);
+                        self.emit(Op::ResolveNameRef(name, reference));
+                        Some(reference)
+                    } else {
+                        None
                     };
                     match init {
                         Some(e) => self.named_expr(e, name)?,
@@ -7707,6 +8396,10 @@ impl Compiler {
                         // InitializeBinding. AddDisposable peeks so the same value then initializes
                         // the immutable lexical home without a clone on the common primitive path.
                         self.emit(Op::AddDisposable(matches!(kind, DeclKind::AwaitUsing)));
+                    }
+                    if let Some(reference) = reference {
+                        self.emit(Op::StoreRef(reference));
+                        continue;
                     }
                     if dynamic_lexical {
                         let name = self.name_idx(name);
@@ -7736,6 +8429,11 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Return(arg) => {
+                // Async-generator ReturnStatement awaits an expression before cleanup. That is
+                // a real suspension boundary, unlike a nested async function declaration.
+                if self.fragment_async_generator && arg.is_some() {
+                    return Err(Bail);
+                }
                 // Inside a spliced callee body, `return v` is "leave v on the stack and jump to
                 // the join point" (the plan guarantees no handlers/for-of regions to unwind:
                 // the callee chunk contains no PushHandler).
@@ -7751,7 +8449,11 @@ impl Compiler {
                     return Ok(());
                 }
                 let explicit = if let Some(e) = arg {
-                    if self.strict && !self.is_coroutine && self.tail_blocked == 0 {
+                    if self.strict
+                        && !self.is_coroutine
+                        && (!self.fragment_entry || self.fragment_tail_calls)
+                        && self.tail_blocked == 0
+                    {
                         self.tail_expr(e)?;
                     } else {
                         self.expr(e)?;
@@ -7760,7 +8462,7 @@ impl Compiler {
                 } else {
                     false
                 };
-                if !self.is_coroutine {
+                if !self.is_coroutine && !self.fragment_entry {
                     // Ordinary/JIT frames do not return through drive_vm. Preserve their direct
                     // cleanup lowering; coroutine frames use completion-aware iterator handlers
                     // so injected returns and suspending finalizers share the normative path.
@@ -7839,7 +8541,8 @@ impl Compiler {
                 self.pop_compile_scope();
                 r
             }
-            Stmt::While { test, body } => {
+            Stmt::While { test, body, .. } => {
+                self.fragment_root.take();
                 let labels = std::mem::take(&mut self.pending_labels);
                 let start = self.ops.len();
                 self.expr(test)?;
@@ -7862,7 +8565,8 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Stmt::DoWhile { body, test } => {
+            Stmt::DoWhile { body, test, .. } => {
+                self.fragment_root.take();
                 let labels = std::mem::take(&mut self.pending_labels);
                 let start = self.ops.len();
                 self.loops.push(LoopCtx {
@@ -7891,6 +8595,7 @@ impl Compiler {
                 test,
                 update,
                 body,
+                ..
             } => {
                 self.push_compile_scope();
                 let r = self.for_loop(init.as_deref(), test.as_ref(), update.as_ref(), body);
@@ -7923,8 +8628,10 @@ impl Compiler {
                 let idx = self
                     .loops
                     .iter()
-                    .rposition(|c| c.labels.iter().any(|l| l == name))
-                    .ok_or(Bail)?;
+                    .rposition(|c| c.labels.iter().any(|l| l == name));
+                let Some(idx) = idx else {
+                    return self.fragment_external_exit(name, false);
+                };
                 let j = self.emit_exit_jump(idx, false)?;
                 self.loops[idx].breaks.push(j);
                 Ok(())
@@ -7932,13 +8639,12 @@ impl Compiler {
             Stmt::Continue(Some(name)) => {
                 // A labelled continue must target a loop — a label on a switch is only a break
                 // target (the parser rejects `continue` to it; not-found bails to the oracle).
-                let idx = self
-                    .loops
-                    .iter()
-                    .rposition(|c| {
-                        !c.is_switch && !c.is_label_block && c.labels.iter().any(|l| l == name)
-                    })
-                    .ok_or(Bail)?;
+                let idx = self.loops.iter().rposition(|c| {
+                    !c.is_switch && !c.is_label_block && c.labels.iter().any(|l| l == name)
+                });
+                let Some(idx) = idx else {
+                    return self.fragment_external_exit(name, true);
+                };
                 let j = self.emit_exit_jump(idx, true)?;
                 self.loops[idx].continues.push(j);
                 Ok(())
@@ -7950,6 +8656,7 @@ impl Compiler {
                 Stmt::While { .. }
                 | Stmt::DoWhile { .. }
                 | Stmt::For { .. }
+                | Stmt::ForInOf { .. }
                 | Stmt::Switch { .. }
                 | Stmt::Labeled { .. } => {
                     self.pending_labels.push(label.clone());
@@ -8115,10 +8822,28 @@ impl Compiler {
                     self.patch(bare_return_to_finally);
                     self.patch(resume_return_to_finally);
 
+                    // Finally's normal value is discarded; an abrupt finalizer replaces the
+                    // incoming completion, including its StatementList value. Saving at this
+                    // common landing point also covers break/continue routed through handlers.
+                    let saved_script_completion = self.script_completion.map(|completion| {
+                        let saved = self.fresh_slot("%finally-script-completion%");
+                        self.emit(Op::LoadLocal(completion));
+                        self.emit(Op::StoreLocal(saved));
+                        self.reset_script_completion();
+                        saved
+                    });
                     self.push_compile_scope();
                     let finally_result = self.block_body(finalizer);
                     self.pop_compile_scope();
                     finally_result?;
+                    if let Some(saved) = saved_script_completion {
+                        self.emit(Op::LoadLocal(saved));
+                        self.emit(Op::StoreLocal(
+                            self.script_completion.expect("script completion"),
+                        ));
+                        self.emit(Op::Undef);
+                        self.emit(Op::StoreLocal(saved));
+                    }
 
                     self.emit(Op::LoadLocal(completion_kind));
                     self.emit(Op::Const(throwing));
@@ -8189,8 +8914,10 @@ impl Compiler {
                 of,
                 is_await,
                 body,
+                ..
             } => {
                 let labels = std::mem::take(&mut self.pending_labels);
+                let fragment_root = self.fragment_root.take();
                 if *is_await && (!*of || !self.is_coroutine) {
                     return Err(Bail);
                 }
@@ -8213,7 +8940,9 @@ impl Compiler {
                     runtime_bindings.extend(
                         names
                             .into_iter()
-                            .filter(|name| self.runtime_lexicals.contains(name))
+                            .filter(|name| {
+                                self.fragment_entry || self.runtime_lexicals.contains(name)
+                            })
                             .map(|name| (name, !matches!(kind, DeclKind::Let))),
                     );
                 }
@@ -8303,7 +9032,10 @@ impl Compiler {
                         // VariableEnvironment binding; it does not create a per-iteration slot.
                         Some(Home::Slot(slot, false)) => Bind::Slot(slot),
                         Some(Home::Env(false)) => Bind::Cap(self.name_idx(name)),
-                        None if !self.with_scope_floors.is_empty() => {
+                        None if self.fragment_entry
+                            || self.script_vars.contains(name)
+                            || !self.with_scope_floors.is_empty() =>
+                        {
                             Bind::Name(self.name_idx(name))
                         }
                         _ => {
@@ -8317,7 +9049,11 @@ impl Compiler {
                         // follows the same IteratorClose path as lexical patterns.
                         let mut leaf_names = std::collections::HashSet::new();
                         pat_idents(pat, &mut leaf_names);
-                        if leaf_names.iter().any(|name| self.home(name).is_none()) {
+                        if leaf_names.iter().any(|name| {
+                            !self.fragment_entry
+                                && self.home(name).is_none()
+                                && !self.script_vars.contains(name)
+                        }) {
                             self.pop_compile_scope();
                             return Err(Bail);
                         }
@@ -8369,6 +9105,12 @@ impl Compiler {
                     let zero = self.const_idx(Value::Num(0.0));
                     self.emit(Op::Const(zero));
                     self.emit(Op::StoreLocal(index_s));
+                    if matches!(fragment_root, Some(loop_fragment::RootKind::ForIn)) {
+                        // Head evaluation already ran in the AST. Keep only its compile-time
+                        // binding schema; transfer the exact source/backing/cursor owners.
+                        self.ops.clear();
+                        self.fragment_seed_slots = vec![source_s, keys_s, index_s];
+                    }
                     self.loops.push(LoopCtx {
                         labels,
                         entry_try_depth: self.try_depth,
@@ -8451,6 +9193,10 @@ impl Compiler {
                     foreach_async_from_sync: async_from_sync_s,
                     ..Default::default()
                 });
+                if matches!(fragment_root, Some(loop_fragment::RootKind::ForOf)) {
+                    self.ops.clear();
+                    self.fragment_seed_slots = vec![iter_s, next_s];
+                }
                 let loop_head = self.ops.len();
                 if let Some(from_sync_s) = async_from_sync_s {
                     let done_s = self.fresh_slot("%async-step-done%");
@@ -8464,7 +9210,7 @@ impl Compiler {
                 // assignment in the status whose abrupt completion closes the iterator. Push the
                 // body handler before even the identifier stores: a strict unresolved assignment
                 // or environment operation can be abrupt just like a member/pattern PutValue.
-                let push = if self.is_coroutine {
+                let push = if self.is_coroutine || self.fragment_entry {
                     self.emit(Op::PushIterator(0, 0, 0, 0))
                 } else {
                     self.emit(Op::PushHandler(0))
@@ -8546,7 +9292,7 @@ impl Compiler {
                 } else {
                     self.emit(Op::IterAbortL(iter_s));
                 }
-                if self.is_coroutine {
+                if self.is_coroutine || self.fragment_entry {
                     let return_pc = self.ops.len() as u32;
                     if let Some(from_sync_s) = async_from_sync_s {
                         self.emit(Op::AsyncIterCloseL(iter_s, from_sync_s, false));
@@ -8624,7 +9370,11 @@ impl Compiler {
                 }
                 declaration => self.stmt(declaration),
             },
-            Stmt::With { obj, body } if self.is_coroutine => self.with_scope(obj, body),
+            Stmt::With { obj, body }
+                if self.is_coroutine || self.script_body || self.fragment_entry =>
+            {
+                self.with_scope(obj, body)
+            }
             other => {
                 log_bail("stmt", &format!("{:.60}", format!("{other:?}")));
                 Err(Bail)
@@ -8666,25 +9416,10 @@ impl Compiler {
                 Ok(())
             }
             target @ (Expr::Array(_) | Expr::Object(_)) => {
-                // A direct yield/await in a default, computed key, or target expression must be
-                // represented as VM suspension points rather than entered through the oracle.
-                let suspends = crate::eval::expr_contains(target, |expr| {
-                    matches!(expr, Expr::Yield { .. } | Expr::Await(_))
-                });
-                if self.is_coroutine && suspends {
-                    self.emit(Op::LoadLocal(value_slot));
-                    return self.assignment_pattern(target);
-                }
-                let locals = self.projected_locals();
-                let index = self.assignment_targets.len() as u32;
-                self.assignment_targets.push(AssignmentTargetPlan {
-                    target: target.clone(),
-                    locals,
-                    strict: self.strict,
-                });
+                // ForIn/OfBodyEvaluation uses the same AssignmentPattern algorithm as `=`.
+                // Lower its references and iterator cleanup explicitly in every execution tier.
                 self.emit(Op::LoadLocal(value_slot));
-                self.emit(Op::AssignTarget(index));
-                Ok(())
+                self.assignment_pattern(target)
             }
             _ => Err(Bail),
         }
@@ -8729,39 +9464,67 @@ impl Compiler {
         self.emit(Op::EvalExpr(plan));
     }
 
+    fn prepare_identifier_reference(&mut self, name: &str) -> Result<PreparedAssignmentRef, Bail> {
+        let name_index = self.name_idx(name);
+        Ok(match self.home(name) {
+            Some(Home::Slot(slot, is_const)) => PreparedAssignmentRef::Local {
+                slot,
+                is_const,
+                name: name_index,
+            },
+            Some(Home::Env(is_const)) => PreparedAssignmentRef::Captured {
+                name: name_index,
+                is_const,
+            },
+            None if self.name_reference_can_change(name) => {
+                let reference = self.fresh_reference()?;
+                self.emit(Op::ResolveNameRef(name_index, reference));
+                PreparedAssignmentRef::Reference(reference)
+            }
+            None => PreparedAssignmentRef::Name(name_index),
+        })
+    }
+
     fn prepare_assignment_reference(
         &mut self,
         target: &Expr,
     ) -> Result<PreparedAssignmentRef, Bail> {
         match target {
             Expr::Paren(inner) => self.prepare_assignment_reference(inner),
-            Expr::Ident(name) => {
-                let name_index = self.name_idx(name);
-                Ok(match self.home(name) {
-                    Some(Home::Slot(slot, is_const)) => PreparedAssignmentRef::Local {
-                        slot,
-                        is_const,
-                        name: name_index,
-                    },
-                    Some(Home::Env(is_const)) => PreparedAssignmentRef::Captured {
-                        name: name_index,
-                        is_const,
-                    },
-                    None if self.name_reference_can_change(name) => {
-                        let reference = self.fresh_reference()?;
-                        self.emit(Op::ResolveNameRef(name_index, reference));
-                        PreparedAssignmentRef::Reference(reference)
-                    }
-                    None => PreparedAssignmentRef::Name(name_index),
-                })
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_named_reference(prop);
+                Ok(self.save_assignment_super_reference())
             }
+            Expr::Index {
+                obj,
+                index,
+                optional: false,
+            } if matches!(**obj, Expr::Super) => {
+                self.super_computed_reference(index)?;
+                Ok(self.save_assignment_super_reference())
+            }
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+            } if prop.starts_with('#') => {
+                self.expr(obj)?;
+                let base = self.fresh_slot("%assignment-private-base%");
+                self.emit(Op::StoreLocal(base));
+                let name = self.name_idx(prop);
+                Ok(PreparedAssignmentRef::Private { base, name })
+            }
+            Expr::Ident(name) => self.prepare_identifier_reference(name),
             Expr::Member {
                 obj,
                 prop,
                 optional: false,
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
-                self.emit(Op::RequireObject);
                 let base = self.fresh_slot("%assignment-base%");
                 self.emit(Op::StoreLocal(base));
                 let name = self.name_idx(prop);
@@ -8775,9 +9538,9 @@ impl Compiler {
             } if !matches!(**obj, Expr::Super) => {
                 self.expr(obj)?;
                 self.expr(index)?;
-                // EvaluatePropertyAccessWithExpressionKey performs RequireObjectCoercible and
-                // ToPropertyKey while creating the Reference, before any later iterator step.
-                self.emit(Op::ToPropKey);
+                // EvaluatePropertyAccessWithExpressionKey retains the raw base/key in its
+                // Reference. PutValue performs the nullish check and ToPropertyKey only after
+                // the iterator step/default, including when either operation has side effects.
                 let key = self.fresh_slot("%assignment-key%");
                 let base = self.fresh_slot("%assignment-base%");
                 self.emit(Op::StoreLocal(key));
@@ -8785,6 +9548,22 @@ impl Compiler {
                 Ok(PreparedAssignmentRef::Element { base, key })
             }
             _ => Err(Bail),
+        }
+    }
+
+    fn save_assignment_super_reference(&mut self) -> PreparedAssignmentRef {
+        // MakeSuperPropertyReference retains the uncoerced computed key: PutValue performs
+        // ToPropertyKey only after the iterator/property read and initializer have completed.
+        let base = self.fresh_slot("%assignment-super-base%");
+        let key = self.fresh_slot("%assignment-super-key%");
+        let receiver = self.fresh_slot("%assignment-super-this%");
+        self.emit(Op::StoreLocal(base));
+        self.emit(Op::StoreLocal(key));
+        self.emit(Op::StoreLocal(receiver));
+        PreparedAssignmentRef::Super {
+            receiver,
+            key,
+            base,
         }
     }
 
@@ -8842,6 +9621,28 @@ impl Compiler {
                 self.emit(Op::LoadLocal(key));
                 self.emit(Op::LoadLocal(value));
                 self.emit(Op::SetElemDrop);
+            }
+            PreparedAssignmentRef::Private { base, name } => {
+                let value = self.fresh_slot("%assignment-value%");
+                self.emit(Op::StoreLocal(value));
+                self.emit(Op::LoadLocal(base));
+                self.emit(Op::LoadLocal(value));
+                self.emit(Op::SetPrivate(name));
+                self.emit(Op::Pop);
+            }
+            PreparedAssignmentRef::Super {
+                receiver,
+                key,
+                base,
+            } => {
+                let value = self.fresh_slot("%assignment-value%");
+                self.emit(Op::StoreLocal(value));
+                self.emit(Op::LoadLocal(receiver));
+                self.emit(Op::LoadLocal(key));
+                self.emit(Op::LoadLocal(base));
+                self.emit(Op::LoadLocal(value));
+                self.emit(Op::SuperSet);
+                self.emit(Op::Pop);
             }
         }
     }
@@ -9113,6 +9914,7 @@ impl Compiler {
     fn switch_body(&mut self, discriminant: u16, cases: &[SwitchCase]) -> CResult {
         for case in cases {
             for statement in &case.body {
+                let statement = lexical_declaration_statement(statement);
                 match statement {
                     Stmt::VarDecl {
                         kind: kind @ (DeclKind::Let | DeclKind::Const),
@@ -9132,8 +9934,7 @@ impl Compiler {
                         ..
                     } => return Err(Bail),
                     Stmt::FuncDecl(function) => {
-                        let name = function.name.as_ref().ok_or(Bail)?;
-                        self.declare_lexical_pattern(&Pattern::Ident(name.clone()), false)?;
+                        self.declare_block_function_binding(function)?;
                     }
                     _ => {}
                 }
@@ -9144,18 +9945,8 @@ impl Compiler {
         // later/default clauses are visible throughout the CaseBlock.
         for case in cases {
             for statement in &case.body {
-                if let Stmt::FuncDecl(function) = statement {
-                    let name = function.name.as_ref().ok_or(Bail)?;
-                    self.emit_closure(function, None);
-                    if self.current_lexical_env_has(name) {
-                        let name = self.name_idx(name);
-                        self.emit(Op::InitLex(name));
-                    } else {
-                        let Home::Slot(slot, false) = self.home(name).ok_or(Bail)? else {
-                            return Err(Bail);
-                        };
-                        self.emit(Op::StoreLocal(slot));
-                    }
+                if let Stmt::FuncDecl(function) = lexical_declaration_statement(statement) {
+                    self.instantiate_block_function(function)?;
                 }
             }
         }
@@ -9219,13 +10010,14 @@ impl Compiler {
     /// lexical scope. Binding-pattern defaults and iterator closing use the same suspension-aware
     /// machinery as declarations, while an omitted parameter simply discards the thrown value.
     fn catch_clause(&mut self, param: Option<&Pattern>, body: &[Stmt]) -> CResult {
+        self.reset_script_completion();
         if let Some(pattern) = param {
             self.push_compile_scope();
             let mut names = std::collections::HashSet::new();
             pat_idents(pattern, &mut names);
             let mut bindings: Vec<_> = names
                 .into_iter()
-                .filter(|name| self.runtime_lexicals.contains(name))
+                .filter(|name| self.fragment_entry || self.runtime_lexicals.contains(name))
                 .map(|name| (name, false))
                 .collect();
             bindings.sort_by(|left, right| left.0.cmp(&right.0));
@@ -9297,7 +10089,7 @@ impl Compiler {
             let mut names: Vec<_> = names.into_iter().collect();
             names.sort();
             for name in names {
-                if self.runtime_lexicals.contains(&name)
+                if (self.fragment_entry || self.runtime_lexicals.contains(&name))
                     && !bindings.iter().any(|(existing, _)| existing == &name)
                 {
                     bindings.push((name, is_const));
@@ -9305,6 +10097,7 @@ impl Compiler {
             }
         };
         for statement in body {
+            let statement = lexical_declaration_statement(statement);
             match statement {
                 Stmt::VarDecl { kind, decls }
                     if matches!(
@@ -9532,9 +10325,24 @@ impl Compiler {
         update: Option<&Expr>,
         body: &Stmt,
     ) -> CResult {
+        if matches!(
+            self.fragment_root.take(),
+            Some(loop_fragment::RootKind::For)
+        ) {
+            return self.fragment_for_remainder(init, test, update, body);
+        }
         // Claim any labels from an enclosing `Stmt::Labeled` before the head runs, so they land on
         // this loop's context (the head itself introduces no labelled break/continue targets).
         let labels = std::mem::take(&mut self.pending_labels);
+        if self.fragment_entry {
+            if let Some(ForInit::VarDecl {
+                kind: kind @ (DeclKind::Using | DeclKind::AwaitUsing),
+                decls,
+            }) = init
+            {
+                return self.fragment_using_for(labels, *kind, decls, test, update, body);
+            }
+        }
         let mut runtime_bindings = Vec::new();
         if let Some(ForInit::VarDecl {
             kind: kind @ (DeclKind::Let | DeclKind::Const),
@@ -9549,7 +10357,7 @@ impl Compiler {
                 runtime_bindings.extend(
                     names
                         .into_iter()
-                        .filter(|name| self.runtime_lexicals.contains(name))
+                        .filter(|name| self.fragment_entry || self.runtime_lexicals.contains(name))
                         .map(|name| (name, matches!(kind, DeclKind::Const))),
                 );
             }
@@ -9630,11 +10438,22 @@ impl Compiler {
                         self.destructure_store(pat, *kind)?;
                         continue;
                     };
-                    let dynamic_lexical = self.current_lexical_env_has(name);
+                    let dynamic_lexical = self.dynamic_declaration_binding(name, *kind);
                     let home = if dynamic_lexical {
                         None
                     } else {
                         Some(self.home(name).ok_or(Bail)?)
+                    };
+                    let reference = if matches!(kind, DeclKind::Var)
+                        && initv.is_some()
+                        && self.name_reference_can_change(name)
+                    {
+                        let reference = self.fresh_reference()?;
+                        let name = self.name_idx(name);
+                        self.emit(Op::ResolveNameRef(name, reference));
+                        Some(reference)
+                    } else {
+                        None
                     };
                     match initv {
                         Some(initializer) => self.named_expr(initializer, name)?,
@@ -9642,6 +10461,10 @@ impl Compiler {
                         None => {
                             self.emit(Op::Undef);
                         }
+                    }
+                    if let Some(reference) = reference {
+                        self.emit(Op::StoreRef(reference));
+                        continue;
                     }
                     if dynamic_lexical {
                         let name = self.name_idx(name);
@@ -9967,9 +10790,7 @@ impl Compiler {
         }
         if let Expr::Class(class) = e {
             if class.name.is_none() {
-                if crate::eval::expr_contains(e, |expr| {
-                    matches!(expr, Expr::Yield { .. } | Expr::Await(_))
-                }) {
+                if crate::eval::expr_has_own_suspension(e) {
                     return self.staged_class(class, Some(name));
                 }
                 self.retain_named_eval_expr(e, Some(name));
@@ -10174,11 +10995,7 @@ impl Compiler {
                 self.emit_closure(f, None);
                 Ok(())
             }
-            Expr::Class(class)
-                if crate::eval::expr_contains(e, |expression| {
-                    matches!(expression, Expr::Yield { .. } | Expr::Await(_))
-                }) =>
-            {
+            Expr::Class(class) if crate::eval::expr_has_own_suspension(e) => {
                 self.staged_class(class, None)
             }
             Expr::Num(n) => {
@@ -10236,7 +11053,7 @@ impl Compiler {
                     }
                 }
                 self.uses_this = true;
-                if self.lexical_this && !self.is_coroutine {
+                if self.lexical_this && !self.is_coroutine && !self.fragment_entry {
                     // Resolve at the expression, not at entry: a derived constructor's `this`
                     // may still be in TDZ, and an untaken branch must not eagerly throw. The
                     // normal guarded name cache reads the captured binding live on every hit.
@@ -10514,64 +11331,9 @@ impl Compiler {
                 quasis,
                 subs,
             } => {
-                // Evaluation produces a Reference first, so method/with receivers are retained;
-                // IsCallable is checked before GetTemplateObject and every substitution.
-                match &**tag {
-                    Expr::Member {
-                        obj,
-                        prop,
-                        optional: false,
-                    } if matches!(**obj, Expr::Super) => {
-                        self.super_named_reference(prop);
-                        self.emit(Op::SuperGetMethod);
-                    }
-                    Expr::Index {
-                        obj,
-                        index,
-                        optional: false,
-                    } if matches!(**obj, Expr::Super) => {
-                        self.super_computed_reference(index)?;
-                        self.emit(Op::SuperGetMethod);
-                    }
-                    Expr::Member {
-                        obj,
-                        prop,
-                        optional: false,
-                    } if prop.starts_with('#') => {
-                        self.expr(obj)?;
-                        let name = self.name_idx(prop);
-                        self.emit(Op::GetPrivateMethod(name));
-                    }
-                    Expr::Member {
-                        obj,
-                        prop,
-                        optional: false,
-                    } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
-                        self.expr(obj)?;
-                        let name = self.name_idx(prop);
-                        let cache = self.new_cache(name);
-                        self.emit(Op::GetMethod(name, cache));
-                    }
-                    Expr::Index {
-                        obj,
-                        index,
-                        optional: false,
-                    } if !matches!(**obj, Expr::Super) => {
-                        self.expr(obj)?;
-                        self.expr(index)?;
-                        self.emit(Op::GetMethodElem);
-                    }
-                    Expr::Ident(name) if self.home(name).is_none() => {
-                        let name = self.name_idx(name);
-                        let cache = self.new_name_cache(name);
-                        self.emit(Op::LoadNameForCall(name, cache));
-                    }
-                    other => {
-                        self.emit(Op::Undef);
-                        self.expr(other)?;
-                    }
-                }
-                self.emit(Op::RequireCallable);
+                // Evaluation retains the Reference receiver. EvaluateCall checks IsCallable
+                // only after TemplateLiteral ArgumentListEvaluation, including substitutions.
+                let (with_this, _) = self.callee_reference(tag)?;
                 let site = self.templates.len() as u32;
                 self.templates.push((*site_id, quasis.clone()));
                 self.emit(Op::TemplateObject(site));
@@ -10580,7 +11342,11 @@ impl Compiler {
                 }
                 let argc = u16::try_from(subs.len() + 1).map_err(|_| Bail)?;
                 let cache = self.new_call_cache();
-                self.emit(Op::CallWithThis(argc, cache));
+                self.emit(if with_this {
+                    Op::CallWithThis(argc, cache)
+                } else {
+                    Op::Call(argc, cache)
+                });
                 Ok(())
             }
             Expr::OptionalChain(inner) => {
@@ -10640,55 +11406,6 @@ impl Compiler {
                     return Ok(());
                 }
                 match &**callee {
-                    Expr::Member {
-                        obj,
-                        prop,
-                        optional: false,
-                    } if matches!(**obj, Expr::Super) => {
-                        self.super_named_reference(prop);
-                        self.emit(Op::SuperGetMethod);
-                        self.finish_call(args, true, false)?;
-                    }
-                    Expr::Index {
-                        obj,
-                        index,
-                        optional: false,
-                    } if matches!(**obj, Expr::Super) => {
-                        self.super_computed_reference(index)?;
-                        self.emit(Op::SuperGetMethod);
-                        self.finish_call(args, true, false)?;
-                    }
-                    Expr::Member {
-                        obj,
-                        prop,
-                        optional: false,
-                    } if prop.starts_with('#') => {
-                        self.expr(obj)?;
-                        let name = self.name_idx(prop);
-                        self.emit(Op::GetPrivateMethod(name));
-                        self.finish_call(args, true, false)?;
-                    }
-                    Expr::Member {
-                        obj,
-                        prop,
-                        optional: false,
-                    } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
-                        self.expr(obj)?;
-                        let i = self.name_idx(prop);
-                        let c = self.new_cache(i);
-                        self.emit(Op::GetMethod(i, c));
-                        self.finish_call(args, true, true)?;
-                    }
-                    Expr::Index {
-                        obj,
-                        index,
-                        optional: false,
-                    } if !matches!(**obj, Expr::Super) => {
-                        self.expr(obj)?;
-                        self.expr(index)?;
-                        self.emit(Op::GetMethodElem);
-                        self.finish_call(args, true, true)?;
-                    }
                     Expr::Super => {
                         // ECMA-262 §13.3.7.1 obtains new.target and the live superclass before
                         // ArgumentListEvaluation. Keep both on the continuation stack while any
@@ -10711,17 +11428,9 @@ impl Compiler {
                         }
                         self.emit(Op::SuperCallArgsArray);
                     }
-                    Expr::Ident(name) if self.home(name).is_none() => {
-                        // Free-name callee: resolved before the arguments (spec order), and a
-                        // `with (obj) f()` hit supplies obj as `this`.
-                        let i = self.name_idx(name);
-                        let c = self.new_name_cache(i);
-                        self.emit(Op::LoadNameForCall(i, c));
-                        self.finish_call(args, true, true)?;
-                    }
                     other => {
-                        self.expr(other)?;
-                        self.finish_call(args, false, true)?;
+                        let (with_this, allow_inline) = self.callee_reference(other)?;
+                        self.finish_call(args, with_this, allow_inline)?;
                     }
                 }
                 Ok(())
@@ -10886,9 +11595,7 @@ impl Compiler {
                 Ok(())
             }
             other => {
-                if crate::eval::expr_contains(other, |expr| {
-                    matches!(expr, Expr::Yield { .. } | Expr::Await(_))
-                }) {
+                if crate::eval::expr_has_own_suspension(other) {
                     log_bail("expr", &format!("{:.60}", format!("{other:?}")));
                     return Err(Bail);
                 }
@@ -10990,11 +11697,9 @@ impl Compiler {
             return self.logical_assign(op, target, value);
         }
         if op == "=" && matches!(target, Expr::Array(_) | Expr::Object(_)) {
-            if !self.is_coroutine {
-                return Err(Bail);
-            }
-            // AssignmentExpression returns the unmodified RHS value after running the pattern.
-            // Keep one copy beneath the continuation-aware AssignmentPattern operation.
+            // ECMA-262 DestructuringAssignmentEvaluation applies equally to ordinary and
+            // resumable bodies. Preserve the exact RHS identity beneath the explicit pattern
+            // lowering, including its prepared references and IteratorClose cleanup pads.
             self.expr(value)?;
             self.emit(Op::Dup);
             self.assignment_pattern(target)?;
@@ -11409,6 +12114,8 @@ pub enum DisposeCompletion {
 /// How one run of the VM ended: the body returned a value, suspended at an `await` (async bodies
 /// only — see [`VmCoro`]), or — carried as `Err(Abrupt::Throw)` — threw.
 pub enum VmStep {
+    /// Terminal exit from a borrowed AST fragment, after every local cleanup pad.
+    FragmentExit(FragmentExitKind, Value),
     Done(Value),
     /// An explicit `return expression`; async generators must Await its value before completion.
     Return(Value),
@@ -11453,16 +12160,43 @@ pub fn run(
     this_val: Value,
     args: &[Value],
 ) -> Result<Value, Abrupt> {
+    run_inner(i, chunk, env, this_val, args, None)
+}
+
+/// Enter baseline Script bytecode and tier only this already-live activation.
+/// The caller pins the exact Chunk for the entire run; no Script/GDI replay occurs.
+#[cfg(test)]
+pub(crate) fn run_tiered_script(
+    i: &mut Interp,
+    chunk: &Rc<Chunk>,
+    env: &Env,
+    this_val: Value,
+) -> Result<Value, Abrupt> {
+    let mut tiering = crate::tiering::VmTiering::new();
+    run_inner(i, chunk, env, this_val, &[], Some(&mut tiering))
+}
+
+fn run_inner(
+    i: &mut Interp,
+    chunk: &Chunk,
+    env: &Env,
+    this_val: Value,
+    args: &[Value],
+    tiering: Option<&mut crate::tiering::VmTiering>,
+) -> Result<Value, Abrupt> {
     // Captured locals (and a lexically-read `this`) live in a per-call activation env; slots
     // hold everything else. No captures → the definition env is used directly.
     let mut env = chunk.make_run_env(i, env, &this_val, args);
     let cap_env = env.clone();
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     let seed = chunk.n_params.min(args.len());
-    slots.extend_from_slice(&args[..seed]);
-    slots.resize(chunk.n_slots, Value::Undefined);
+    slots.extend(args[..seed].iter().cloned().map(PackedValue::pack));
+    slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
     if let Some(s) = chunk.arguments_slot {
-        slots[s as usize] = Value::Obj(i.make_compiled_arguments_object(args, &env));
+        slots.write_value(
+            s as usize,
+            Value::Obj(i.make_compiled_arguments_object(args, &env)),
+        );
     }
     let mut pc = 0usize;
     let mut handlers: Vec<Handler> = Vec::new();
@@ -11470,7 +12204,9 @@ pub fn run(
     let mut class_states = (0..chunk.class_plans.len())
         .map(|_| None)
         .collect::<Vec<_>>();
-    let mut references = (0..chunk.n_refs).map(|_| None).collect::<Vec<_>>();
+    let mut references = (0..chunk.n_refs)
+        .map(|_| crate::eval::PreparedReferenceSlot::default())
+        .collect::<Vec<_>>();
     let r = drive_vm(
         i,
         chunk,
@@ -11486,6 +12222,7 @@ pub fn run(
         &mut class_states,
         None,
         false,
+        tiering,
     );
     slots.clear();
     stack.clear();
@@ -11496,6 +12233,7 @@ pub fn run(
         VmStep::Done(v) | VmStep::Return(v) | VmStep::ResumeReturn(v) => Ok(v),
         VmStep::BareReturn => Ok(Value::Undefined),
         VmStep::AbruptJump { .. } => unreachable!("drive_vm consumes loop completions"),
+        VmStep::FragmentExit(..) => unreachable!("ordinary entry cannot run an AST fragment"),
         VmStep::Await(_)
         | VmStep::AsyncClose { .. }
         | VmStep::Dispose { .. }
@@ -11516,9 +12254,9 @@ fn drive_vm(
     chunk: &Chunk,
     env: &mut Env,
     cap_env: &Env,
-    references: &mut [Option<crate::eval::PreparedReference>],
-    slots: &mut [Value],
-    stack: &mut Vec<Value>,
+    references: &mut [crate::eval::PreparedReferenceSlot],
+    slots: &mut [PackedValue],
+    stack: &mut ValueStack<PackedValue>,
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<Handler>,
@@ -11526,7 +12264,14 @@ fn drive_vm(
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
     mut pending: Option<PendingCompletion>,
     defer_source_return: bool,
+    mut tiering: Option<&mut crate::tiering::VmTiering>,
 ) -> Result<VmStep, Abrupt> {
+    let mut native = if chunk.resumable && matches!(i.tier, Tier::Jit) {
+        crate::jit::continuation_code(i, chunk)
+    } else {
+        None
+    };
+    let mut first_transfer = false;
     loop {
         let outcome = match pending.take() {
             Some(PendingCompletion::Throw(error)) => Err(Abrupt::Throw(error)),
@@ -11540,7 +12285,47 @@ fn drive_vm(
                 target,
                 handler_depth,
             }),
-            None => run_vm(
+            None if native.is_some() => {
+                let mut state = NativeContinuation {
+                    chunk,
+                    env,
+                    cap_env,
+                    references,
+                    stack,
+                    disposal_frames,
+                    class_states,
+                };
+                // VmCoro owns these exact fields for the complete call. Native code borrows
+                // them only until the next suspension/completion and retains no stack address.
+                unsafe {
+                    if chunk.resumable {
+                        crate::jit::run_continuation(
+                            i,
+                            chunk,
+                            native.as_ref().unwrap(),
+                            &mut state,
+                            slots,
+                            pc,
+                            this_val,
+                            handlers,
+                        )
+                    } else {
+                        let initial = std::mem::take(&mut first_transfer);
+                        crate::jit::run_borrowed_frame(
+                            i,
+                            chunk,
+                            native.as_ref().unwrap(),
+                            &mut state,
+                            slots,
+                            pc,
+                            this_val,
+                            handlers,
+                            initial,
+                        )
+                    }
+                }
+            }
+            None => match run_vm(
                 i,
                 chunk,
                 env,
@@ -11553,7 +12338,22 @@ fn drive_vm(
                 handlers,
                 disposal_frames,
                 class_states,
-            ),
+                None,
+                tiering.as_deref_mut(),
+            ) {
+                Ok(VmRunExit::Step(step)) => Ok(step),
+                Ok(VmRunExit::TierRequest) => {
+                    match script_osr_code(i, chunk, *pc, stack.len(), tiering.as_deref_mut()) {
+                        Ok(code) => {
+                            native = code;
+                            first_transfer = native.is_some();
+                            continue;
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            },
         };
         match outcome {
             Ok(VmStep::Return(value)) => {
@@ -11638,7 +12438,37 @@ fn drive_vm(
                 }
                 if completion.is_some() {
                     debug_assert_eq!(handlers.len(), handler_depth);
+                    if native.is_none() && target < *pc {
+                        // LoopContinues applies only after every exited finalizer has
+                        // completed. Its backward edge has the same safepoint as Jump;
+                        // a resource throw still belongs to any enclosing handlers.
+                        match i.interrupt_poll().and_then(|()| i.gc_check()) {
+                            Ok(()) => {}
+                            Err(Abrupt::Throw(error)) => {
+                                pending = Some(PendingCompletion::Throw(error));
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let from = pc.saturating_sub(1);
                     *pc = target;
+                    if native.is_none()
+                        && tiering
+                            .as_deref_mut()
+                            .is_some_and(|tier| tier.backedge(from, target))
+                    {
+                        match script_osr_code(i, chunk, *pc, stack.len(), tiering.as_deref_mut()) {
+                            Ok(code) => {
+                                native = code;
+                                first_transfer = native.is_some();
+                            }
+                            Err(Abrupt::Throw(error)) => {
+                                pending = Some(PendingCompletion::Throw(error))
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
                 }
             }
             Ok(step) => return Ok(step),
@@ -11667,16 +12497,43 @@ fn drive_vm(
     }
 }
 
-fn for_in_step(
+/// Admission failure leaves every VM field untouched, including the already-published
+/// target PC. Unsupported/budget-limited code stays baseline without replaying an edge.
+fn script_osr_code(
     i: &mut Interp,
-    slots: &mut [Value],
+    chunk: &Chunk,
+    pc: usize,
+    depth: usize,
+    tiering: Option<&mut crate::tiering::VmTiering>,
+) -> Result<Option<Rc<crate::jit::JitCode>>, Abrupt> {
+    i.interrupt_poll_force()?;
+    let state = chunk
+        .osr
+        .get_or_init(|| Box::new(crate::tiering::OsrCodeState::default()));
+    let code = state.code(i, chunk);
+    i.interrupt_poll_force()?;
+    if state.unavailable() {
+        if let Some(tiering) = tiering {
+            tiering.disable();
+        }
+    }
+    Ok(code.filter(|code| code.osr_entry_depth(pc) == Some(depth)))
+}
+
+fn for_in_step<S: StoredValue>(
+    i: &mut Interp,
+    slots: &mut [S],
     keys_slot: u16,
     index_slot: u16,
     source_slot: u16,
 ) -> Result<Option<Value>, Abrupt> {
-    let keys = slots[keys_slot as usize].clone();
-    let source = slots[source_slot as usize].clone();
-    for_in_next(i, &keys, &mut slots[index_slot as usize], &source)
+    let keys = slots.read_value(keys_slot as usize);
+    let source = slots.read_value(source_slot as usize);
+    let mut cursor = slots.read_value(index_slot as usize);
+    let result = for_in_next(i, &keys, &mut cursor, &source);
+    // The cursor advances before the observable HasProperty, including abrupt completion.
+    slots.write_value(index_slot as usize, cursor);
+    result
 }
 
 fn for_in_next(
@@ -11696,7 +12553,7 @@ fn for_in_next(
                 .props
                 .get_index(index)
                 .map(|prop| prop.value()),
-            _ => unreachable!("for-in keys are stored in an internal array"),
+            _ => unreachable!("for-in keys are stored in a private immutable backing"),
         };
         let Some(key) = key else {
             return Ok(None);
@@ -11718,18 +12575,18 @@ fn for_in_next(
 /// Environment Records, so project the lexically visible slot bindings into one child record,
 /// execute the normative algorithm, and copy bindings back even after an abrupt completion (an
 /// earlier element/property assignment remains observable when a later one throws).
-fn assign_target_with_slots(
+fn assign_target_with_slots<S: StoredValue>(
     i: &mut Interp,
     plan: &AssignmentTargetPlan,
     value: Value,
     env: &Env,
-    slots: &mut [Value],
+    slots: &mut [S],
 ) -> Result<(), Abrupt> {
     let projected = crate::interpreter::new_scope(Some(env.clone()));
     {
         let mut scope = projected.borrow_mut();
         for local in &plan.locals {
-            let value = slots[local.slot as usize].clone();
+            let value = slots.read_value(local.slot as usize);
             let initialized = !matches!(value, Value::Empty);
             scope.vars.insert(
                 local.name.clone(),
@@ -11750,11 +12607,14 @@ fn assign_target_with_slots(
             .vars
             .get(&local.name)
             .expect("projected assignment binding remains present");
-        slots[local.slot as usize] = if binding.initialized {
-            binding.value.clone()
-        } else {
-            Value::Empty
-        };
+        slots.write_value(
+            local.slot as usize,
+            if binding.initialized {
+                binding.value.clone()
+            } else {
+                Value::Empty
+            },
+        );
     }
     result
 }
@@ -11762,17 +12622,17 @@ fn assign_target_with_slots(
 /// Execute one uncommon, non-suspending expression through the normative evaluator while the
 /// surrounding function remains a heap VM continuation. Slot bindings are projected exactly like
 /// AssignmentPattern's shared bridge and copied back after both normal and abrupt completion.
-fn eval_expr_with_slots(
+fn eval_expr_with_slots<S: StoredValue>(
     i: &mut Interp,
     plan: &EvalExprPlan,
     env: &Env,
-    slots: &mut [Value],
+    slots: &mut [S],
 ) -> Result<Value, Abrupt> {
     let projected = crate::interpreter::new_scope(Some(env.clone()));
     {
         let mut scope = projected.borrow_mut();
         for local in &plan.locals {
-            let value = slots[local.slot as usize].clone();
+            let value = slots.read_value(local.slot as usize);
             let initialized = !matches!(value, Value::Empty);
             scope.vars.insert(
                 local.name.clone(),
@@ -11793,11 +12653,14 @@ fn eval_expr_with_slots(
             .vars
             .get(&local.name)
             .expect("projected expression binding remains present");
-        slots[local.slot as usize] = if binding.initialized {
-            binding.value.clone()
-        } else {
-            Value::Empty
-        };
+        slots.write_value(
+            local.slot as usize,
+            if binding.initialized {
+                binding.value.clone()
+            } else {
+                Value::Empty
+            },
+        );
     }
     result
 }
@@ -11830,25 +12693,7 @@ fn async_from_sync_abrupt_promise(i: &mut Interp, completion: Abrupt) -> Result<
 }
 
 fn array_literal_append(i: &mut Interp, array: &Value, value: Option<Value>) -> Result<(), Abrupt> {
-    let Value::Obj(array) = array else {
-        unreachable!("array literal builder retains an Array")
-    };
-    let index = i.array_length(array);
-    if index >= u32::MAX as usize {
-        return Err(i.throw("RangeError", "invalid array length"));
-    }
-    let mut object = array.borrow_mut();
-    if let Some(value) = value {
-        object
-            .props
-            .insert(index.to_string(), crate::value::Property::plain(value));
-    }
-    object
-        .props
-        .get_mut("length")
-        .expect("fresh Array has length")
-        .set_value(Value::Num(index as f64 + 1.0));
-    Ok(())
+    i.append_array_literal(array, value)
 }
 
 /// Consume the private dense array built by ArgumentListEvaluation lowering. No user code can
@@ -11874,26 +12719,101 @@ fn argument_array_values(i: &Interp, array: Value) -> Vec<Value> {
 /// only), or throws (`Err(Abrupt::Throw)`, caught by [`drive_vm`]). Operates on borrowed state so an
 /// async [`VmCoro`] can save it at a suspension and restore it on resume.
 #[allow(clippy::too_many_arguments)]
-fn run_vm(
+fn run_vm<S: StoredValue>(
     i: &mut Interp,
     chunk: &Chunk,
     env: &mut Env,
     cap_env: &Env,
-    references: &mut [Option<crate::eval::PreparedReference>],
-    slots: &mut [Value],
-    stack: &mut Vec<Value>,
+    references: &mut [crate::eval::PreparedReferenceSlot],
+    slots: &mut [S],
+    stack: &mut ValueStack<S>,
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<Handler>,
     disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
     class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
+    stop_at: Option<usize>,
+    tiering: Option<&mut crate::tiering::VmTiering>,
+) -> Result<VmRunExit, Abrupt> {
+    let mut requested = false;
+    let step = run_vm_inner(
+        i,
+        chunk,
+        env,
+        cap_env,
+        references,
+        slots,
+        stack,
+        pc,
+        this_val,
+        handlers,
+        disposal_frames,
+        class_states,
+        stop_at,
+        tiering,
+        &mut requested,
+    )?;
+    Ok(if requested {
+        VmRunExit::TierRequest
+    } else {
+        VmRunExit::Step(step)
+    })
+}
+
+/// Tier requests are driver events, never ECMAScript completions. The inner VM
+/// publishes this private flag only after settling an edge, before any next op.
+enum VmRunExit {
+    Step(VmStep),
+    TierRequest,
+}
+
+impl VmRunExit {
+    fn single_operation(self) -> VmStep {
+        match self {
+            Self::Step(step) => step,
+            Self::TierRequest => unreachable!("single-operation bridges never enable tiering"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_vm_inner<S: StoredValue>(
+    i: &mut Interp,
+    chunk: &Chunk,
+    env: &mut Env,
+    cap_env: &Env,
+    references: &mut [crate::eval::PreparedReferenceSlot],
+    slots: &mut [S],
+    stack: &mut ValueStack<S>,
+    pc: &mut usize,
+    this_val: &Value,
+    handlers: &mut Vec<Handler>,
+    disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
+    class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
+    stop_at: Option<usize>,
+    mut tiering: Option<&mut crate::tiering::VmTiering>,
+    requested: &mut bool,
 ) -> Result<VmStep, Abrupt> {
+    macro_rules! tier_backedge {
+        ($from:expr, $to:expr) => {
+            if tiering
+                .as_deref_mut()
+                .is_some_and(|tier| tier.backedge($from, $to))
+            {
+                *requested = true;
+                return Ok(VmStep::Done(Value::Undefined));
+            }
+        };
+    }
     macro_rules! pop {
         () => {
             stack.pop().expect("vm stack underflow")
         };
     }
     loop {
+        if stop_at == Some(*pc) {
+            return Ok(VmStep::Done(Value::Undefined));
+        }
         let op_pc = *pc;
         let op = chunk.ops[op_pc];
         *pc += 1;
@@ -11901,15 +12821,15 @@ fn run_vm(
             Op::Const(k) => stack.push(chunk.consts[k as usize].clone()),
             Op::Undef => stack.push(Value::Undefined),
             Op::Dup => {
-                let t = stack.last().expect("vm stack underflow").clone();
-                stack.push(t);
+                let t = stack.last_stored().expect("vm stack underflow").clone();
+                stack.push_stored(t);
             }
             Op::Pop => {
-                pop!();
+                stack.pop_stored().expect("vm stack underflow");
             }
             Op::LoadLocal(s) => {
-                let v = slots[s as usize].clone();
-                if matches!(v, Value::Empty) {
+                let v = &slots[s as usize];
+                if v.is_empty() {
                     return Err(i.throw(
                         "ReferenceError",
                         format!(
@@ -11918,12 +12838,15 @@ fn run_vm(
                         ),
                     ));
                 }
-                stack.push(v);
+                stack.push_stored(v.clone());
             }
-            Op::StoreLocal(s) => slots[s as usize] = pop!(),
+            Op::StoreLocal(s) => {
+                slots[s as usize] = stack.pop_stored().expect("vm stack underflow")
+            }
             Op::UpdateLocal(s, kind) => {
                 let idx = s as usize;
-                match &slots[idx] {
+                let current = slots.read_value(idx);
+                match &current {
                     // Reading a slot still in its TDZ is the same ReferenceError as LoadLocal.
                     Value::Empty => {
                         return Err(i.throw(
@@ -11937,14 +12860,19 @@ fn run_vm(
                     // Fast path: a numeric slot updates in place.
                     Value::Num(n) => {
                         let profiling =
-                            observe_arithmetic_operand(&chunk.feedback, op_pc, &slots[idx]);
+                            observe_arithmetic_operand(&chunk.feedback, op_pc, &current);
                         let old = *n;
                         let new = match kind {
                             UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard => old + 1.0,
                             UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => old - 1.0,
                         };
-                        slots[idx] = Value::Num(new);
-                        observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &slots[idx]);
+                        slots.write_value(idx, Value::Num(new));
+                        observe_arithmetic_result(
+                            &chunk.feedback,
+                            op_pc,
+                            profiling,
+                            &Value::Num(new),
+                        );
                         match kind {
                             UpdKind::PreInc | UpdKind::PreDec => stack.push(Value::Num(new)),
                             UpdKind::PostInc | UpdKind::PostDec => stack.push(Value::Num(old)),
@@ -11955,7 +12883,7 @@ fn run_vm(
                     // Number and never thrown on like unary `+` would.
                     Value::BigInt(n) => {
                         let profiling =
-                            observe_arithmetic_operand(&chunk.feedback, op_pc, &slots[idx]);
+                            observe_arithmetic_operand(&chunk.feedback, op_pc, &current);
                         let old = n.clone();
                         let one = crate::bigint::JsBigInt::from_u64(1);
                         let new = match kind {
@@ -11966,8 +12894,9 @@ fn run_vm(
                                 old.sub(&one)
                             }
                         };
-                        slots[idx] = Value::BigInt(new.clone());
-                        observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &slots[idx]);
+                        let value = Value::BigInt(new.clone());
+                        observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &value);
+                        slots.write_value(idx, value);
                         match kind {
                             UpdKind::PreInc | UpdKind::PreDec => stack.push(Value::BigInt(new)),
                             UpdKind::PostInc | UpdKind::PostDec => stack.push(Value::BigInt(old)),
@@ -11977,10 +12906,10 @@ fn run_vm(
                     // Anything else: the shared ToNumeric path may run user code and may produce
                     // either Number or BigInt. This is cold compared with the two direct tags.
                     _ => {
-                        let old = slots[idx].clone();
+                        let old = current;
                         if let Some(value) =
                             step_value(i, &chunk.feedback, op_pc, kind, old, |_, value| {
-                                slots[idx] = value;
+                                slots.write_value(idx, value);
                                 Ok(())
                             })?
                         {
@@ -11989,7 +12918,7 @@ fn run_vm(
                     }
                 }
             }
-            Op::Tdz(s) => slots[s as usize] = Value::Empty,
+            Op::Tdz(s) => slots.write_value(s as usize, Value::Empty),
             Op::LoadCap(n) => {
                 stack.push(chunk.load_cap_ic(i, cap_env, n)?);
             }
@@ -12003,6 +12932,8 @@ fn run_vm(
             }
             Op::UpdateCap(n, kind) => {
                 let name = &chunk.names[n as usize];
+                let mut reference =
+                    crate::eval::PreparedReference::scope(name.clone(), cap_env.clone(), i.strict);
                 let old = {
                     let b = cap_env.borrow();
                     let bd = b.vars.get(name).expect("captured binding missing");
@@ -12013,25 +12944,23 @@ fn run_vm(
                     }
                     bd.value.clone()
                 };
-                step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |_, v| {
-                    if let Some(bd) = cap_env.borrow_mut().vars.get_mut(name) {
-                        bd.value = v;
-                    }
-                    Ok(())
+                step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
+                    i.write_prepared_reference(&mut reference, v)
                 })?;
             }
             Op::UpdateName(n, kind) => {
-                let name = &chunk.names[n as usize];
-                let old = i.get_var(name, env)?;
+                let mut reference = chunk.resolve_name_reference(i, env, n)?;
+                let old = i.read_prepared_reference(&mut reference)?;
                 step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
-                    i.assign_free_name(name, v, env)
+                    i.write_prepared_reference(&mut reference, v)
                 })?;
             }
             Op::UpdateNameCached(n, c, kind) => {
-                let name = &chunk.names[n as usize];
-                let old = chunk.load_name_ic(i, env, n, c)?;
+                let mut reference = chunk.resolve_name_reference(i, env, n)?;
+                let old = i.read_prepared_reference(&mut reference)?;
+                let _ = chunk.name_ic_fill(i, env, n, c);
                 step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
-                    i.assign_free_name(name, v, env)
+                    i.write_prepared_reference(&mut reference, v)
                 })?;
             }
             Op::MakeClosure(fidx, name_n) => {
@@ -12055,13 +12984,16 @@ fn run_vm(
                 let v = pop!();
                 i.assign_free_name(&chunk.names[n as usize], v, env)?;
             }
+            Op::StoreGlobalName(n) => {
+                let v = pop!();
+                i.assign_free_name(&chunk.names[n as usize], v, &i.global_env.clone())?;
+            }
             Op::StoreNameCached(n, c) => {
                 let v = pop!();
                 chunk.store_name_ic(i, env, n, c, v)?;
             }
             Op::ResolveNameRef(name, reference) => {
-                references[reference as usize] =
-                    Some(i.prepare_name_reference(&chunk.names[name as usize], env)?);
+                references[reference as usize].set(chunk.resolve_name_reference(i, env, name)?);
             }
             Op::LoadRef(reference) => {
                 let reference = references[reference as usize]
@@ -12078,7 +13010,7 @@ fn run_vm(
             }
             Op::StoreConstLocal(s, n) => {
                 pop!();
-                if matches!(slots[s as usize], Value::Empty) {
+                if matches!(slots.read_value(s as usize), Value::Empty) {
                     return Err(i.throw(
                         "ReferenceError",
                         format!(
@@ -12112,7 +13044,7 @@ fn run_vm(
                 unreachable!("immutable update always completes abruptly");
             }
             Op::LoadThis => stack.push(this_val.clone()),
-            Op::LoadLexicalThis => stack.push(i.get_var("this", env)?),
+            Op::LoadLexicalThis => stack.push(i.resolve_this_binding(env)?),
             Op::RequireObject => {
                 if matches!(
                     stack.last().expect("vm stack underflow"),
@@ -12145,7 +13077,7 @@ fn run_vm(
                 stack.push(v);
             }
             Op::GetPropLocal(s, n, c) => {
-                let obj = slots[s as usize].clone();
+                let obj = slots.read_value(s as usize);
                 if matches!(obj, Value::Empty) {
                     return Err(i.throw(
                         "ReferenceError",
@@ -12206,7 +13138,7 @@ fn run_vm(
             }
             Op::SetPropLocalDrop(s, n, c) => {
                 let v = pop!();
-                let obj = slots[s as usize].clone();
+                let obj = slots.read_value(s as usize);
                 if matches!(obj, Value::Empty) {
                     return Err(i.throw(
                         "ReferenceError",
@@ -12384,6 +13316,7 @@ fn run_vm(
                                 strict_immutable: binding.is_const,
                                 initialized: false,
                                 import_ref: None,
+                                imported: false,
                                 deletable: false,
                             },
                         );
@@ -12415,6 +13348,7 @@ fn run_vm(
                                 strict_immutable: previous.strict_immutable,
                                 initialized: previous.initialized,
                                 import_ref: None,
+                                imported: false,
                                 deletable: false,
                             },
                         );
@@ -12443,7 +13377,7 @@ fn run_vm(
             Op::PushDisposeFrame => disposal_frames.push(Vec::new()),
             Op::AddDisposable(is_async) => {
                 let value = stack.last().expect("vm stack underflow");
-                if let Some(resource) = i.create_disposable(value, is_async)? {
+                if let Some(resource) = i.create_disposable(&value, is_async)? {
                     disposal_frames
                         .last_mut()
                         .expect("using declaration outside a disposal boundary")
@@ -12609,10 +13543,7 @@ fn run_vm(
                     CallArgsMode::FinalSpread(argc) => {
                         let spread = pop!();
                         let mut args = stack.split_off(stack.len() - (argc as usize - 1));
-                        let (iterator, next) = i.get_iterator(&spread)?;
-                        while let Some(value) = i.iterator_step(&iterator, &next)? {
-                            args.push(value);
-                        }
+                        i.append_spread_arguments(&spread, &mut args)?;
                         args
                     }
                     CallArgsMode::Array => argument_array_values(i, pop!()),
@@ -12626,10 +13557,7 @@ fn run_vm(
                 let spread = pop!();
                 let at = stack.len() - (argc as usize - 1);
                 let mut args: Vec<Value> = stack.split_off(at);
-                let (it, nx) = i.get_iterator(&spread)?;
-                while let Some(x) = i.iterator_step(&it, &nx)? {
-                    args.push(x);
-                }
+                i.append_spread_arguments(&spread, &mut args)?;
                 let callee = pop!();
                 let this = if matches!(op, Op::CallSpreadThis(_)) {
                     pop!()
@@ -12728,55 +13656,18 @@ fn run_vm(
                 let v = pop!();
                 let key = pop!();
                 let obj = pop!();
-                if chunk.feedback.detailed_enabled() {
-                    let ret = v.clone();
-                    set_element_profiled(i, chunk, op_pc, &obj, &key, v)?;
-                    stack.push(ret);
-                    continue;
-                }
-                if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
-                    let ret = v.clone();
-                    match i.fast_set_elem(o, *n, v) {
-                        Ok(()) => {
-                            stack.push(ret);
-                            continue;
-                        }
-                        Err(back) => {
-                            let k = i.to_property_key(&key)?;
-                            i.set_member(&obj, &k, back)?;
-                            stack.push(ret);
-                            continue;
-                        }
-                    }
-                }
-                let k = i.to_property_key(&key)?;
-                i.set_member(&obj, &k, v.clone())?;
+                set_computed_element(i, chunk, op_pc, &obj, &key, v.clone())?;
                 stack.push(v);
             }
             Op::SetElemDrop => {
                 let v = pop!();
                 let key = pop!();
                 let obj = pop!();
-                if chunk.feedback.detailed_enabled() {
-                    set_element_profiled(i, chunk, op_pc, &obj, &key, v)?;
-                    continue;
-                }
-                if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
-                    match i.fast_set_elem(o, *n, v) {
-                        Ok(()) => continue,
-                        Err(back) => {
-                            let k = i.to_property_key(&key)?;
-                            i.set_member(&obj, &k, back)?;
-                            continue;
-                        }
-                    }
-                }
-                let k = i.to_property_key(&key)?;
-                i.set_member(&obj, &k, v)?;
+                set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
             }
             Op::GetElemLocal(s) => {
                 let key = pop!();
-                let obj = slots[s as usize].clone();
+                let obj = slots.read_value(s as usize);
                 let value = get_computed_element(i, chunk, op_pc, &obj, &key)?;
                 stack.push(value);
             }
@@ -12784,31 +13675,11 @@ fn run_vm(
                 let keep = matches!(op, Op::SetElemLocal(_));
                 let v = pop!();
                 let key = pop!();
-                if chunk.feedback.detailed_enabled() {
-                    if keep {
-                        stack.push(v.clone());
-                    }
-                    let obj = slots[s as usize].clone();
-                    set_element_profiled(i, chunk, op_pc, &obj, &key, v)?;
-                    continue;
-                }
                 if keep {
                     stack.push(v.clone());
                 }
-                if let (Value::Obj(o), Value::Num(n)) = (&slots[s as usize], &key) {
-                    match i.fast_set_elem(o, *n, v) {
-                        Ok(()) => continue,
-                        Err(back) => {
-                            let obj = slots[s as usize].clone();
-                            let k = i.to_property_key(&key)?;
-                            i.set_member(&obj, &k, back)?;
-                            continue;
-                        }
-                    }
-                }
-                let obj = slots[s as usize].clone();
-                let k = i.to_property_key(&key)?;
-                i.set_member(&obj, &k, v)?;
+                let obj = slots.read_value(s as usize);
+                set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
             }
             Op::UpdateProp(n, c, kind) => {
                 let obj = pop!();
@@ -12873,15 +13744,15 @@ fn run_vm(
                 })?;
             }
             Op::ToPropKeyLocal(s) => {
-                if matches!(slots[s as usize], Value::Undefined | Value::Null) {
+                if matches!(slots.read_value(s as usize), Value::Undefined | Value::Null) {
                     return Err(i.throw("TypeError", "cannot access property of null or undefined"));
                 }
                 match stack.last().expect("vm stack underflow") {
-                    Value::Num(_) | Value::Str(_) => {}
+                    Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
                     _ => {
                         let key = pop!();
                         let k = i.to_property_key(&key)?;
-                        stack.push(Value::str(k.into_string()));
+                        stack.push(k.into_value());
                     }
                 }
             }
@@ -12895,20 +13766,20 @@ fn run_vm(
                 match stack.last().expect("vm stack underflow") {
                     // Side-effect-free and deterministic to coerce later; numbers stay numeric
                     // so GetElem/SetElem keep their dense fast path.
-                    Value::Num(_) | Value::Str(_) => {}
+                    Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
                     _ => {
                         let key = pop!();
                         let k = i.to_property_key(&key)?;
-                        stack.push(Value::str(k.into_string()));
+                        stack.push(k.into_value());
                     }
                 }
             }
             Op::Dup2 => {
                 let len = stack.len();
-                let a = stack[len - 2].clone();
-                let b = stack[len - 1].clone();
-                stack.push(a);
-                stack.push(b);
+                let a = stack.raw_slice()[len - 2].clone();
+                let b = stack.raw_slice()[len - 1].clone();
+                stack.push_stored(a);
+                stack.push_stored(b);
             }
             Op::GetMethod(n, c) => {
                 let obj = pop!();
@@ -12935,14 +13806,20 @@ fn run_vm(
                 // operands are already evaluated; only the non-coercing, non-throwing string
                 // case may release that owner before addition. The existing Add/Store ops and
                 // feedback remain intact, and real aliases still prevent in-place mutation.
-                if let [.., Value::Str(left), Value::Str(right)] = stack.as_slice() {
+                if let (Some(Value::Str(left)), Some(Value::Str(right))) =
+                    (stack.get(stack.len().saturating_sub(2)), stack.last())
+                {
                     if left.len().saturating_add(right.len()) <= crate::interpreter::MAX_STR_LEN {
                         match chunk.ops.get(op_pc + 1) {
                             Some(Op::StoreLocal(slot)) => {
-                                release_overwritten_string_local(&mut slots[*slot as usize], left);
+                                if matches!(slots.read_value(*slot as usize), Value::Str(current)
+                                    if crate::lstr::LStr::ptr_eq(&current, &left))
+                                {
+                                    slots.write_value(*slot as usize, Value::Undefined);
+                                }
                             }
                             Some(Op::StoreCap(name)) => {
-                                chunk.release_overwritten_captured_string(cap_env, *name, left);
+                                chunk.release_overwritten_captured_string(cap_env, *name, &left);
                             }
                             _ => {}
                         }
@@ -13082,21 +13959,23 @@ fn run_vm(
             Op::Jump(t) => {
                 if t as usize <= *pc {
                     i.interrupt_poll()?;
+                    i.gc_check()?;
                     if chunk.feedback.detailed_enabled() {
                         chunk.feedback.observe_loop_backedge(op_pc);
                     }
                 }
                 *pc = t as usize;
+                tier_backedge!(op_pc, *pc);
             }
             Op::InlineGuard(t, target) => {
                 let it = &chunk.inline_targets[t as usize];
                 let d = it.argc as usize + 1;
                 let callee_ok = matches!(
-                    &stack[stack.len() - d],
+                    &stack.read_value(stack.len() - d),
                     Value::Obj(o) if Rc::as_ptr(o) as usize == it.expected
                 );
-                let this_ok =
-                    !it.check_this || matches!(&stack[stack.len() - d - 1], Value::Obj(_));
+                let this_ok = !it.check_this
+                    || matches!(stack.read_value(stack.len() - d - 1), Value::Obj(_));
                 let env_ok = it.expected_env == 0 || Rc::as_ptr(env) as usize == it.expected_env;
                 if !(callee_ok && this_ok && env_ok) {
                     *pc = target as usize;
@@ -13104,7 +13983,7 @@ fn run_vm(
             }
             Op::ResetSlots(start, count) => {
                 for k in start as usize..start as usize + count as usize {
-                    slots[k] = Value::Undefined;
+                    slots.write_value(k, Value::Undefined);
                 }
             }
             Op::JumpIfFalse(t) => {
@@ -13112,36 +13991,42 @@ fn run_vm(
                 let taken = !i.to_boolean(&a);
                 if taken && t as usize <= *pc {
                     i.interrupt_poll()?;
+                    i.gc_check()?;
                 }
                 if chunk.feedback.detailed_enabled() {
                     chunk.feedback.observe_branch(op_pc, taken);
                 }
                 if taken {
                     *pc = t as usize;
+                    tier_backedge!(op_pc, *pc);
                 }
             }
             Op::JumpIfFalsePeek(t) => {
-                let taken = !i.to_boolean(stack.last().expect("vm stack underflow"));
+                let taken = !i.to_boolean(&stack.last().expect("vm stack underflow"));
                 if taken && t as usize <= *pc {
                     i.interrupt_poll()?;
+                    i.gc_check()?;
                 }
                 if chunk.feedback.detailed_enabled() {
                     chunk.feedback.observe_branch(op_pc, taken);
                 }
                 if taken {
                     *pc = t as usize;
+                    tier_backedge!(op_pc, *pc);
                 }
             }
             Op::JumpIfTruePeek(t) => {
-                let taken = i.to_boolean(stack.last().expect("vm stack underflow"));
+                let taken = i.to_boolean(&stack.last().expect("vm stack underflow"));
                 if taken && t as usize <= *pc {
                     i.interrupt_poll()?;
+                    i.gc_check()?;
                 }
                 if chunk.feedback.detailed_enabled() {
                     chunk.feedback.observe_branch(op_pc, taken);
                 }
                 if taken {
                     *pc = t as usize;
+                    tier_backedge!(op_pc, *pc);
                 }
             }
             Op::JumpIfNotNullishPeek(t) => {
@@ -13151,12 +14036,14 @@ fn run_vm(
                 );
                 if taken && t as usize <= *pc {
                     i.interrupt_poll()?;
+                    i.gc_check()?;
                 }
                 if chunk.feedback.detailed_enabled() {
                     chunk.feedback.observe_branch(op_pc, taken);
                 }
                 if taken {
                     *pc = t as usize;
+                    tier_backedge!(op_pc, *pc);
                 }
             }
             // Calls pass the argument window as a slice of the operand stack — no per-call `Vec`.
@@ -13165,12 +14052,14 @@ fn run_vm(
             // fine: the handler unwind (or function exit) truncates it.
             Op::Call(argc, _) => {
                 let at = stack.len() - argc as usize;
-                let callee = stack[at - 1].clone();
-                let v = if chunk.feedback.detailed_enabled() {
-                    call_profiled(i, chunk, op_pc, callee, Value::Undefined, &stack[at..])?
-                } else {
-                    i.call(callee, Value::Undefined, &stack[at..])?
-                };
+                let callee = stack.read_value(at - 1);
+                let v = stack.with_tail(at, |args| {
+                    if chunk.feedback.detailed_enabled() {
+                        call_profiled(i, chunk, op_pc, callee, Value::Undefined, args)
+                    } else {
+                        i.call(callee, Value::Undefined, args)
+                    }
+                })?;
                 stack.truncate(at - 1);
                 stack.push(v);
             }
@@ -13191,15 +14080,17 @@ fn run_vm(
             }
             Op::CallWithThis(argc, _) => {
                 let at = stack.len() - argc as usize;
-                let m = stack[at - 1].clone();
-                let this = stack[at - 2].clone();
+                let m = stack.read_value(at - 1);
+                let this = stack.read_value(at - 2);
                 // `CallWithThis` immediately followed by `Op::Pop` proves the result is dead: the
                 // JIT fuses this exact pattern into the allocation-free RegExp/string discard
                 // intrinsics, and the bytecode tier routes it through the same guarded routines.
                 // On a guard miss the fast path returns `None` without touching any state and the
                 // generic call below runs unmodified, so this is observably invisible.
                 if matches!(chunk.ops.get(*pc), Some(Op::Pop)) {
-                    match crate::builtins::vm_discard_call(i, &this, &m, &stack[at..]) {
+                    match stack.with_tail(at, |args| {
+                        crate::builtins::vm_discard_call(i, &this, &m, args)
+                    }) {
                         Ok(Some(_)) => {
                             stack.truncate(at - 2);
                             i.interrupt_poll_force()?;
@@ -13212,22 +14103,26 @@ fn run_vm(
                         Err(error) => return Err(Abrupt::Throw(error)),
                     }
                 }
-                let v = if chunk.feedback.detailed_enabled() {
-                    call_profiled(i, chunk, op_pc, m, this, &stack[at..])?
-                } else {
-                    i.call(m, this, &stack[at..])?
-                };
+                let v = stack.with_tail(at, |args| {
+                    if chunk.feedback.detailed_enabled() {
+                        call_profiled(i, chunk, op_pc, m, this, args)
+                    } else {
+                        i.call(m, this, args)
+                    }
+                })?;
                 stack.truncate(at - 2);
                 stack.push(v);
             }
             Op::New(argc, _) => {
                 let at = stack.len() - argc as usize;
-                let callee = stack[at - 1].clone();
-                let v = if chunk.feedback.detailed_enabled() {
-                    construct_profiled(i, chunk, op_pc, callee, &stack[at..])?
-                } else {
-                    i.construct(callee, &stack[at..])?
-                };
+                let callee = stack.read_value(at - 1);
+                let v = stack.with_tail(at, |args| {
+                    if chunk.feedback.detailed_enabled() {
+                        construct_profiled(i, chunk, op_pc, callee, args)
+                    } else {
+                        i.construct(callee, args)
+                    }
+                })?;
                 stack.truncate(at - 1);
                 stack.push(v);
             }
@@ -13290,15 +14185,19 @@ fn run_vm(
                 // Default-constructor super spread forwards the raw argument list (ECMA-262
                 // ClassDefinitionEvaluation) without the observable %Symbol.iterator% call.
                 if let Some(forward) = i.super_forward_args.take() {
-                    for value in forward.iter() {
+                    for (index, value) in forward.iter().enumerate() {
+                        if index & 255 == 0 {
+                            i.interrupt_poll_force()?;
+                            i.gc_check()?;
+                        }
                         array_literal_append(i, &array, Some(value.clone()))?;
                     }
                     continue;
                 }
-                let (iterator, next) = i.get_iterator(&spread)?;
-                while let Some(value) = i.iterator_step(&iterator, &next)? {
-                    array_literal_append(i, &array, Some(value))?;
-                }
+                let prefix = i.array_length(array.as_obj().expect("array builder"));
+                i.expand_spread(&spread, prefix, |i, value| {
+                    array_literal_append(i, &array, Some(value))
+                })?;
             }
             Op::MakeObject(start, count, tidx) => {
                 let at = stack.len() - count as usize;
@@ -13330,7 +14229,10 @@ fn run_vm(
             Op::ObjectData(name_anonymous) => {
                 let value = pop!();
                 let key = pop!();
-                let key = i.to_property_key(&key)?.into_string();
+                // ToPropertyKey returns an owning String-or-Symbol. Keep that
+                // owner until CreateDataProperty has retained the identity
+                // (ECMA-262 e28783d5, sec-topropertykey).
+                let key = i.to_property_key(&key)?;
                 if name_anonymous {
                     let name = i.fn_name_for_key(&key);
                     i.set_fn_name(&value, &name);
@@ -13341,14 +14243,14 @@ fn run_vm(
                 object
                     .borrow_mut()
                     .props
-                    .insert(key, crate::value::Property::plain(value));
+                    .insert(key.as_str(), crate::value::Property::plain(value));
             }
             Op::ObjectSpread => {
                 let source = pop!();
                 let Value::Obj(object) = stack.last().expect("object builder missing") else {
                     unreachable!("object literal builder retains an Object")
                 };
-                i.copy_data_properties_into(object, &source, &[])?;
+                i.copy_data_properties_into(&object, &source, &[])?;
             }
             Op::ObjectProto => {
                 let prototype = pop!();
@@ -13363,7 +14265,7 @@ fn run_vm(
             }
             Op::ObjectMethod(function, kind) => {
                 let key = pop!();
-                let key = i.to_property_key(&key)?.into_string();
+                let key = i.to_property_key(&key)?;
                 let Value::Obj(object) = stack.last().expect("object builder missing") else {
                     unreachable!("object literal builder retains an Object")
                 };
@@ -13377,15 +14279,15 @@ fn run_vm(
                         object
                             .borrow_mut()
                             .props
-                            .insert(key, crate::value::Property::plain(value));
+                            .insert(key.as_str(), crate::value::Property::plain(value));
                     }
                     1 => {
                         i.set_fn_name(&value, &format!("get {name}"));
-                        i.define_accessor(object, &key, Some(value), None);
+                        i.define_accessor(&object, &key, Some(value), None);
                     }
                     2 => {
                         i.set_fn_name(&value, &format!("set {name}"));
-                        i.define_accessor(object, &key, None, Some(value));
+                        i.define_accessor(&object, &key, None, Some(value));
                     }
                     _ => unreachable!("object method kind is compiler-internal"),
                 }
@@ -13489,10 +14391,10 @@ fn run_vm(
                 if matches!(base, Value::Null | Value::Undefined) {
                     return Err(i.throw("TypeError", "cannot read property of null super base"));
                 }
-                let key = i.to_property_key(&key)?.into_string();
+                let key = i.to_property_key(&key)?;
                 let value = i.get_member_recv(&base, &key, receiver.clone())?;
                 stack.push(receiver);
-                stack.push(Value::from_string(key));
+                stack.push(key.into_value());
                 stack.push(base);
                 stack.push(value);
             }
@@ -13511,7 +14413,7 @@ fn run_vm(
                 if matches!(base, Value::Null | Value::Undefined) {
                     return Err(i.throw("TypeError", "cannot read property of null super base"));
                 }
-                let key = i.to_property_key(&key)?.into_string();
+                let key = i.to_property_key(&key)?;
                 let old = i.get_member_recv(&base, &key, receiver.clone())?;
                 if let Some(value) =
                     step_value(i, &chunk.feedback, op_pc, kind, old, |i, value| {
@@ -13555,12 +14457,7 @@ fn run_vm(
             }
             Op::ForInKeys => {
                 let source = pop!();
-                let keys = i
-                    .for_in_keys(&source)?
-                    .into_iter()
-                    .map(Value::Str)
-                    .collect();
-                stack.push(i.make_array(keys));
+                stack.push(i.for_in_keys(&source)?.into_value());
             }
             Op::ForInStepL(keys, index, source) => {
                 if let Some(key) = for_in_step(i, slots, keys, index, source)? {
@@ -13572,8 +14469,8 @@ fn run_vm(
                 }
             }
             Op::IterStepL(is, ns) => {
-                let it = slots[is as usize].clone();
-                let nx = slots[ns as usize].clone();
+                let it = slots.read_value(is as usize);
+                let nx = slots.read_value(ns as usize);
                 match i.iterator_step(&it, &nx)? {
                     Some(v) => {
                         stack.push(v);
@@ -13586,69 +14483,62 @@ fn run_vm(
                 }
             }
             Op::IterCloseL(s) => {
-                let it = slots[s as usize].clone();
+                let it = slots.read_value(s as usize);
                 i.iterator_close_normal(&it)?;
             }
             Op::IterAbortL(s) => {
                 let exc = pop!();
-                let it = slots[s as usize].clone();
+                let it = slots.read_value(s as usize);
                 i.iterator_close(&it);
                 return Err(Abrupt::Throw(exc));
             }
             Op::DestructureStepL(iter_s, next_s, done_s) => {
-                if matches!(slots[done_s as usize], Value::Bool(true)) {
+                if matches!(slots.read_value(done_s as usize), Value::Bool(true)) {
                     stack.push(Value::Undefined);
                     continue;
                 }
                 // IteratorDestructuringAssignmentEvaluation sets [[Done]] before propagating an
                 // abrupt IteratorStep. Restore false only after obtaining a live value.
-                slots[done_s as usize] = Value::Bool(true);
-                let iterator = slots[iter_s as usize].clone();
-                let next = slots[next_s as usize].clone();
+                slots.write_value(done_s as usize, Value::Bool(true));
+                let iterator = slots.read_value(iter_s as usize);
+                let next = slots.read_value(next_s as usize);
                 match i.iterator_step(&iterator, &next)? {
                     Some(value) => {
-                        slots[done_s as usize] = Value::Bool(false);
+                        slots.write_value(done_s as usize, Value::Bool(false));
                         stack.push(value);
                     }
                     None => stack.push(Value::Undefined),
                 }
             }
             Op::DestructureRestL(iter_s, next_s, done_s) => {
-                let mut values = Vec::new();
-                while !matches!(slots[done_s as usize], Value::Bool(true)) {
-                    slots[done_s as usize] = Value::Bool(true);
-                    let iterator = slots[iter_s as usize].clone();
-                    let next = slots[next_s as usize].clone();
-                    match i.iterator_step(&iterator, &next)? {
-                        Some(value) => {
-                            slots[done_s as usize] = Value::Bool(false);
-                            values.push(value);
-                        }
-                        None => break,
-                    }
-                }
+                let iterator = slots.read_value(iter_s as usize);
+                let next = slots.read_value(next_s as usize);
+                let mut done = matches!(slots.read_value(done_s as usize), Value::Bool(true));
+                let result = i.drain_iterator_rest(&iterator, &next, &mut done);
+                slots.write_value(done_s as usize, Value::Bool(done));
+                let values = result?;
                 stack.push(i.make_array(values));
             }
             Op::IterCloseIfNotDoneL(iter_s, done_s) => {
-                if !matches!(slots[done_s as usize], Value::Bool(true)) {
-                    slots[done_s as usize] = Value::Bool(true);
-                    let iterator = slots[iter_s as usize].clone();
+                if !matches!(slots.read_value(done_s as usize), Value::Bool(true)) {
+                    slots.write_value(done_s as usize, Value::Bool(true));
+                    let iterator = slots.read_value(iter_s as usize);
                     i.iterator_close_normal(&iterator)?;
                 }
             }
             Op::IterAbortIfNotDoneL(iter_s, done_s) => {
                 let error = pop!();
-                if !matches!(slots[done_s as usize], Value::Bool(true)) {
-                    slots[done_s as usize] = Value::Bool(true);
-                    let iterator = slots[iter_s as usize].clone();
+                if !matches!(slots.read_value(done_s as usize), Value::Bool(true)) {
+                    slots.write_value(done_s as usize, Value::Bool(true));
+                    let iterator = slots.read_value(iter_s as usize);
                     i.iterator_close(&iterator);
                 }
                 return Err(Abrupt::Throw(error));
             }
             Op::AsyncIterStepL(iter_s, next_s, from_sync_s, done_s) => {
-                let iterator = slots[iter_s as usize].clone();
-                let next = slots[next_s as usize].clone();
-                let from_sync = matches!(slots[from_sync_s as usize], Value::Bool(true));
+                let iterator = slots.read_value(iter_s as usize);
+                let next = slots.read_value(next_s as usize);
+                let from_sync = matches!(slots.read_value(from_sync_s as usize), Value::Bool(true));
                 let result = match i.call(next, iterator.clone(), &[]) {
                     Ok(result) => result,
                     Err(error) if from_sync => {
@@ -13676,7 +14566,7 @@ fn run_vm(
                         return Ok(VmStep::Await(async_from_sync_abrupt_promise(i, error)?));
                     }
                 };
-                slots[done_s as usize] = Value::Bool(done);
+                slots.write_value(done_s as usize, Value::Bool(done));
                 // AsyncFromSyncIteratorContinuation resolves and chains the value into the
                 // adapter promise before the loop's Await. A live value rejection closes the
                 // underlying sync iterator in that reaction job, not one Await job later.
@@ -13705,9 +14595,9 @@ fn run_vm(
             }
             Op::AsyncIterResumeL(from_sync_s, done_s) => {
                 let settled = pop!();
-                let from_sync = matches!(slots[from_sync_s as usize], Value::Bool(true));
+                let from_sync = matches!(slots.read_value(from_sync_s as usize), Value::Bool(true));
                 let (done, value) = if from_sync {
-                    let done = matches!(slots[done_s as usize], Value::Bool(true));
+                    let done = matches!(slots.read_value(done_s as usize), Value::Bool(true));
                     (done, if done { Value::Undefined } else { settled })
                 } else {
                     if !matches!(settled, Value::Obj(_)) {
@@ -13727,8 +14617,8 @@ fn run_vm(
             }
             Op::AsyncIterCloseL(iter_s, from_sync_s, swallow_error) => {
                 return Ok(VmStep::AsyncClose {
-                    iterator: slots[iter_s as usize].clone(),
-                    from_sync: matches!(slots[from_sync_s as usize], Value::Bool(true)),
+                    iterator: slots.read_value(iter_s as usize),
+                    from_sync: matches!(slots.read_value(from_sync_s as usize), Value::Bool(true)),
                     swallow_error,
                 });
             }
@@ -13758,6 +14648,23 @@ fn run_vm(
                     target,
                     handler_depth,
                 });
+            }
+            Op::FragmentExit(kind) => {
+                debug_assert!(
+                    handlers.is_empty(),
+                    "fragment cleanup must precede its terminal"
+                );
+                return Ok(VmStep::FragmentExit(kind, pop!()));
+            }
+            Op::AnnexBSync(function) => {
+                let function = &chunk.funcs[function as usize];
+                if let Some(name) = &function.name {
+                    if i.annexb_fn_sync
+                        .contains_key(&(Rc::as_ptr(function) as usize))
+                    {
+                        i.annexb_fn_sync_eval(name, function, env);
+                    }
+                }
             }
             Op::ReturnUndef => return Ok(VmStep::Done(Value::Undefined)),
             Op::Await => return Ok(VmStep::Await(pop!())),
@@ -14445,10 +15352,10 @@ pub struct VmCoro {
     /// nested Object Environment Record while a suspending `with` body is active.
     cap_env: Env,
     env: Env,
-    references: Vec<Option<crate::eval::PreparedReference>>,
+    references: Vec<crate::eval::PreparedReferenceSlot>,
     this_val: Value,
-    slots: Vec<Value>,
-    stack: Vec<Value>,
+    slots: Vec<PackedValue>,
+    stack: ValueStack<PackedValue>,
     pc: usize,
     /// The `try` handler stack, saved across suspensions so a rejected `await` inside a `try` still
     /// lands in its `catch`.
@@ -14518,8 +15425,8 @@ impl VmCoro {
         edges.scope(cap_env);
         edges.scope(env);
         edges.value(this_val);
-        for value in slots.iter().chain(stack) {
-            edges.value(value);
+        for value in slots.iter().chain(stack.raw_slice()) {
+            edges.value(&value.unpack());
         }
         for reference in references.iter().flatten() {
             reference.trace_gc(edges);
@@ -14601,16 +15508,16 @@ impl VmCoro {
         let mut bytes = self
             .references
             .capacity()
-            .saturating_mul(std::mem::size_of::<Option<crate::eval::PreparedReference>>())
+            .saturating_mul(std::mem::size_of::<crate::eval::PreparedReferenceSlot>())
             .saturating_add(
                 self.slots
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<Value>()),
+                    .saturating_mul(std::mem::size_of::<PackedValue>()),
             )
             .saturating_add(
                 self.stack
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<Value>()),
+                    .saturating_mul(std::mem::size_of::<PackedValue>()),
             )
             .saturating_add(
                 self.handlers
@@ -14632,8 +15539,8 @@ impl VmCoro {
         for reference in self.references.iter().flatten() {
             bytes = bytes.saturating_add(reference.scan_retained_memory(visitor));
         }
-        for value in self.slots.iter().chain(&self.stack) {
-            visitor.value(value);
+        for value in self.slots.iter().chain(self.stack.raw_slice()) {
+            visitor.value(&value.unpack());
         }
         for frame in &self.disposal_frames {
             bytes = bytes.saturating_add(
@@ -14687,13 +15594,20 @@ impl VmCoro {
         arguments: &[Value],
     ) -> VmCoro {
         let env = chunk.make_run_env(i, &env, &this_val, params);
-        let references = (0..chunk.n_refs).map(|_| None).collect();
-        let mut slots = vec![Value::Undefined; chunk.n_slots];
+        let references = (0..chunk.n_refs)
+            .map(|_| crate::eval::PreparedReferenceSlot::default())
+            .collect();
+        let mut slots: Vec<PackedValue> = (0..chunk.n_slots)
+            .map(|_| PackedValue::pack(Value::Undefined))
+            .collect();
         for (k, a) in params.iter().take(chunk.n_params).enumerate() {
-            slots[k] = a.clone();
+            slots.write_value(k, a.clone());
         }
         if let Some(slot) = chunk.arguments_slot {
-            slots[slot as usize] = Value::Obj(i.make_compiled_arguments_object(arguments, &env));
+            slots.write_value(
+                slot as usize,
+                Value::Obj(i.make_compiled_arguments_object(arguments, &env)),
+            );
         }
         let class_states = (0..chunk.class_plans.len()).map(|_| None).collect();
         VmCoro {
@@ -14705,7 +15619,7 @@ impl VmCoro {
             references,
             this_val,
             slots,
-            stack: Vec::with_capacity(16),
+            stack: ValueStack::with_capacity(16),
             pc: 0,
             handlers: Vec::new(),
             disposal_frames: Vec::new(),
@@ -14967,6 +15881,7 @@ impl VmCoro {
                 &mut self.class_states,
                 pending,
                 self.is_async_generator,
+                None,
             );
             i.strict = saved_strict;
             match step {
@@ -15075,6 +15990,9 @@ impl VmCoro {
                 Ok(VmStep::AbruptJump { .. }) => {
                     unreachable!("drive_vm consumes loop completions")
                 }
+                Ok(VmStep::FragmentExit(..)) => {
+                    unreachable!("language coroutines never contain an AST fragment terminal")
+                }
                 Err(Abrupt::Throw(error)) => {
                     self.done = true;
                     return Suspend::Throw(error);
@@ -15129,9 +16047,9 @@ fn step_value(
 }
 
 /// [`step_value`] pushing its result onto the VM's operand stack.
-fn step_and_store(
+fn step_and_store<S: StoredValue>(
     i: &mut Interp,
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack<S>,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     kind: UpdKind,
@@ -15259,6 +16177,11 @@ fn set_element_profiled(
     raw_key: &Value,
     value: Value,
 ) -> Result<(), Abrupt> {
+    // PutValue performs ToObject before ToPropertyKey (ECMA-262 e28783d5,
+    // sec-putvalue). Profiling must preserve the same observable ordering.
+    if matches!(base, Value::Undefined | Value::Null) {
+        return Err(i.throw("TypeError", "cannot set property of null or undefined"));
+    }
     let key = i.to_property_key(raw_key)?;
     let mut trace = crate::feedback::CurrentPropertyTrace::default();
     let result = i.set_member_profiled(base, key.as_str(), value, &mut trace);
@@ -15330,9 +16253,9 @@ fn construct_profiled(
 }
 
 #[inline]
-fn bin_num(
+fn bin_num<S: StoredValue>(
     i: &mut Interp,
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack<S>,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
@@ -15474,9 +16397,9 @@ fn try_tagged_numeric_pow(left: &Value, right: &Value) -> Option<Value> {
 }
 
 #[inline]
-fn bin_i32(
+fn bin_i32<S: StoredValue>(
     i: &mut Interp,
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack<S>,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
@@ -15505,9 +16428,9 @@ fn bin_i32(
 }
 
 #[inline]
-fn bin_cmp(
+fn bin_cmp<S: StoredValue>(
     i: &mut Interp,
-    stack: &mut Vec<Value>,
+    stack: &mut ValueStack<S>,
     op: &'static str,
     f: impl Fn(f64, f64) -> bool,
 ) -> Result<(), Abrupt> {
@@ -15536,32 +16459,6 @@ fn bin_cmp(
 // templates bake the op index in as an immediate and keep the stack top in a register. Control
 // flow never reaches here — jumps, returns and try bookkeeping are real branches in the JIT.
 // ---------------------------------------------------------------------------------------------
-
-/// Rust helper scopes temporarily expand ARM64's packed local slots in place. The raw-pointer
-/// guard deliberately does not borrow `JitCtx`, allowing the helper body to use it normally; on
-/// every ordinary return it restores packed ownership before generated code resumes.
-struct JitWideSlots {
-    ctx: *mut crate::jit::JitCtx,
-    repack: bool,
-}
-
-impl JitWideSlots {
-    unsafe fn enter(ctx: *mut crate::jit::JitCtx) -> JitWideSlots {
-        let repack = unsafe { (*ctx).slots_packed };
-        if repack {
-            unsafe { (*ctx).unpack_slots() };
-        }
-        JitWideSlots { ctx, repack }
-    }
-}
-
-impl Drop for JitWideSlots {
-    fn drop(&mut self) {
-        if self.repack {
-            unsafe { (*self.ctx).pack_slots() };
-        }
-    }
-}
 
 impl Chunk {
     pub(crate) fn jit_ops(&self) -> &[Op] {
@@ -15602,7 +16499,7 @@ impl Chunk {
         // native probe whenever warmup observed more than one receiver shape.
         let mono =
             (1..PROP_IC_WAYS).all(|way| self.caches[idx as usize + way].get().depth == IC_EMPTY);
-        (st.depth != IC_EMPTY && mono).then_some(st)
+        (st.has_cacheable_shapes() && mono).then_some(st)
     }
     /// The stable address of call site `idx`'s way-1 `Cell<CallIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]: `call_caches` is fixed once compilation finishes and the Chunk
@@ -15649,17 +16546,20 @@ impl Chunk {
     #[inline]
     fn name_ic_hit(&self, i: &Interp, env: &Env, c: u32) -> Option<Value> {
         let ic = self.name_caches[c as usize].get();
+        if ic.env == lexical_cache::DEEP_NAME_IC {
+            return self.deep_name_ic_hit(i, env, c);
+        }
         let raw = Rc::as_ptr(env) as usize;
         if ic.env == raw {
             let b = env.borrow();
-            if b.vars.generation() != ic.gen {
+            if !b.vars.matches_generation(ic.gen) {
                 return None;
             }
             // The unchanged generation proves the map is structurally untouched since the fill:
             // the pointer is live and the resolution unchanged (see NameIc). The value and TDZ
             // flag are read live — in-place writes flow through.
             let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) };
-            return if bd.initialized {
+            return if bd.initialized && bd.import_ref.is_none() {
                 Some(bd.value.clone())
             } else {
                 None
@@ -15668,7 +16568,7 @@ impl Chunk {
         if ic.env == raw | 1 {
             // Global-object mode (see NameIc): scope still empty of this name (generation),
             // global layout unchanged (shape) → the cached slot is still the resolution.
-            if env.borrow().vars.generation() != ic.gen {
+            if !env.borrow().vars.matches_generation(ic.gen) {
                 return None;
             }
             let g = i.global.borrow();
@@ -15696,11 +16596,11 @@ impl Chunk {
                 return None;
             }
             let pb = p.borrow();
-            if pb.vars.generation() != ic.gen {
+            if !pb.vars.matches_generation(ic.gen) {
                 return None;
             }
             let bd = unsafe { &*(ic.binding as usize as *const crate::interpreter::Binding) };
-            return if bd.initialized {
+            return if bd.initialized && bd.import_ref.is_none() {
                 Some(bd.value.clone())
             } else {
                 None
@@ -15716,7 +16616,7 @@ impl Chunk {
     fn name_ic_fill(&self, i: &Interp, env: &Env, n: u32, c: u32) -> Option<Value> {
         {
             let b = env.borrow();
-            if b.with_obj.is_some() {
+            if b.with_obj.is_some() || b.vars.generation() == u32::MAX {
                 return None;
             }
             if let Some(bd) = b.vars.get(&self.names[n as usize]) {
@@ -15745,7 +16645,10 @@ impl Chunk {
             if layout_id != 0 || self.makes_env() {
                 if let Some(p) = &b.parent {
                     let pb = p.borrow();
-                    if pb.with_obj.is_none() {
+                    if pb.with_obj.is_none()
+                        && pb.vars.layout_id() == 0
+                        && pb.vars.generation() != u32::MAX
+                    {
                         if let Some(bd) = pb.vars.get(&self.names[n as usize]) {
                             if bd.initialized && bd.import_ref.is_none() {
                                 let v = bd.value.clone();
@@ -15776,10 +16679,12 @@ impl Chunk {
         // Global mode: only when there are no intermediate scopes whose later mutation could
         // re-route the name — i.e. the chunk runs directly under the global scope.
         if !Rc::ptr_eq(env, &i.global_env) || !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize) {
-            return None;
+            return self.deep_name_ic_fill(i, env, n, c);
         }
         let g = i.global.borrow();
-        if !matches!(g.exotic, crate::value::Exotic::None) {
+        if !matches!(g.exotic, crate::value::Exotic::None)
+            || !crate::value::is_cacheable_shape(g.props.shape())
+        {
             return None;
         }
         let slot = g.props.slot_of(&self.names[n as usize])?;
@@ -15827,7 +16732,7 @@ impl Chunk {
         let ic = self.cap_caches[index].get();
         {
             let b = env.borrow();
-            if ic.env == raw && b.vars.generation() == ic.gen {
+            if ic.env == raw && b.vars.matches_generation(ic.gen) {
                 return ic.binding as usize as *mut crate::interpreter::Binding;
             }
         }
@@ -15839,13 +16744,18 @@ impl Chunk {
                 as *mut crate::interpreter::Binding;
             (binding, generation)
         };
-        self.cap_caches[index].set(NameIc {
-            env: raw,
-            binding: binding as usize as u64,
-            gen: generation,
-            act_gen: 0,
-        });
-        self.cap_pins.borrow_mut()[index] = Some(Rc::downgrade(env));
+        if generation != u32::MAX {
+            self.cap_caches[index].set(NameIc {
+                env: raw,
+                binding: binding as usize as u64,
+                gen: generation,
+                act_gen: 0,
+            });
+            self.cap_pins.borrow_mut()[index] = Some(Rc::downgrade(env));
+        } else {
+            self.cap_caches[index].set(NameIc::EMPTY);
+            self.cap_pins.borrow_mut()[index] = None;
+        }
         binding
     }
 
@@ -15934,10 +16844,19 @@ impl Chunk {
         value: Value,
     ) -> Result<(), Abrupt> {
         let ic = self.name_caches[c as usize].get();
+        if ic.env == lexical_cache::DEEP_NAME_IC {
+            let mut pending = Some(value);
+            if self.deep_name_ic_store(i, env, c, &mut pending) {
+                return Ok(());
+            }
+            i.assign_free_name(&self.names[n as usize], pending.unwrap(), env)?;
+            let _ = self.name_ic_fill(i, env, n, c);
+            return Ok(());
+        }
         let raw = Rc::as_ptr(env) as usize;
         let value = if ic.env == raw {
             let b = env.borrow_mut();
-            if b.vars.generation() == ic.gen {
+            if b.vars.matches_generation(ic.gen) {
                 let bd = unsafe { &mut *(ic.binding as usize as *mut crate::interpreter::Binding) };
                 if bd.initialized && bd.mutable && bd.import_ref.is_none() {
                     bd.value = value;
@@ -15946,7 +16865,7 @@ impl Chunk {
             }
             value
         } else if ic.env == raw | 1 {
-            if env.borrow().vars.generation() == ic.gen {
+            if env.borrow().vars.matches_generation(ic.gen) {
                 let mut g = i.global.borrow_mut();
                 if matches!(g.exotic, crate::value::Exotic::None)
                     && g.props.shape() == (ic.binding >> 32) as u32
@@ -15970,7 +16889,7 @@ impl Chunk {
             if let Some(parent) = parent {
                 if Rc::as_ptr(&parent) as usize == ic.env & !7 {
                     let pb = parent.borrow_mut();
-                    if pb.vars.generation() == ic.gen {
+                    if pb.vars.matches_generation(ic.gen) {
                         let bd = unsafe {
                             &mut *(ic.binding as usize as *mut crate::interpreter::Binding)
                         };
@@ -16223,7 +17142,10 @@ impl Chunk {
     /// Whether calls run without an activation environment (nothing captured, no lexical
     /// `this`) — the precondition for the JIT→JIT fast call's moved-argument entry.
     pub(crate) fn jit_no_activation(&self) -> bool {
-        !self.needs_env()
+        !self.resumable && !self.needs_env()
+    }
+    pub(crate) fn jit_is_resumable(&self) -> bool {
+        self.resumable
     }
     pub(crate) fn jit_is_strict(&self) -> bool {
         self.strict
@@ -16233,11 +17155,54 @@ impl Chunk {
     pub(crate) fn jit_inline_attempted_off(&self) -> usize {
         &self.inline_attempted as *const _ as usize - self as *const Chunk as usize
     }
+    pub(crate) fn jit_runs_off(&self) -> usize {
+        &self.jit_runs as *const _ as usize - self as *const Chunk as usize
+    }
+    pub(crate) fn jit_inline_retry_at_off(&self) -> usize {
+        &self.inline_retry_at as *const _ as usize - self as *const Chunk as usize
+    }
+    pub(crate) fn inline_retry_due(&self, runs: u32) -> bool {
+        let at = self.inline_retry_at.get();
+        at != 0 && runs >= at
+    }
+    /// Four exponentially spaced feedback checkpoints bound compilation work. Empty early
+    /// profiles can mature, but unchanged profiles never rerun the planner. Only identities
+    /// and immutable compile states enter this signature; no user property reads are needed.
+    pub(crate) fn advance_inline_feedback(&self) -> bool {
+        use std::hash::{Hash, Hasher};
+        let checks = self.inline_checks.get().saturating_add(1);
+        self.inline_checks.set(checks);
+        self.inline_retry_at.set(if checks >= 4 {
+            0
+        } else {
+            self.jit_runs.get().saturating_add(
+                inline_recompile_at()
+                    .max(1)
+                    .saturating_mul(4u32.pow(checks as u32)),
+            )
+        });
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+        for site in &self.call_caches {
+            for entry in &site.entries {
+                let ic = entry.get();
+                ic.callee.hash(&mut fingerprint);
+                ic.func.hash(&mut fingerprint);
+                ic.chunk_raw.hash(&mut fingerprint);
+                ic.env.hash(&mut fingerprint);
+                ic.epoch.hash(&mut fingerprint);
+            }
+        }
+        let next = fingerprint.finish();
+        let first = !self.inline_attempted.replace(true);
+        let changed = self.inline_feedback.replace(next) != next;
+        first || changed
+    }
     /// [`CallIc::direct`] gates for this chunk (see its docs).
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
-        if !direct_shared_context_enabled() {
+        if self.resumable || !direct_shared_context_enabled() || self.jit_needs_activation_state() {
             return 0;
         }
+        #[allow(unused_mut)] // Only the ARM64 shared-call backend adds frame flags.
         let mut f = 1u8;
         #[cfg(all(
             target_arch = "aarch64",
@@ -16262,12 +17227,21 @@ impl Chunk {
         let _ = code;
         f
     }
+
+    pub(crate) fn jit_needs_activation_state(&self) -> bool {
+        self.ops.iter().any(jit_bridge_op)
+    }
     /// Whether const `k` is a trivially-copyable value the JIT may materialize inline.
     pub(crate) fn jit_const_copyable(&self, k: u32) -> bool {
         matches!(
             self.consts[k as usize],
             Value::Undefined | Value::Null | Value::Bool(_) | Value::Num(_)
         )
+    }
+    /// One-word execution encoding for an immediate constant; heap constants need ownership
+    /// cloning and are deliberately excluded. All Number NaNs use the canonical packed bits.
+    pub(crate) fn jit_const_packed_bits(&self, k: u32) -> Option<u64> {
+        PackedValue::scalar_bits(&self.consts[k as usize])
     }
     /// Stable address of const `k` (the chunk is pinned by any code that runs it): the JIT's
     /// string-const template copies the Value and bumps its refcount inline.
@@ -16309,6 +17283,20 @@ impl Chunk {
     /// (pops, pushes) of the op at `pc`, for the static stack-depth analysis. `None` = an op the
     /// JIT can't account for (which refuses compilation).
     pub(crate) fn jit_stack_effect(&self, pc: usize) -> Option<(usize, usize)> {
+        self.jit_stack_effect_for_entry(pc, false)
+    }
+
+    /// A borrowed synchronous activation already owns disposal frames and completion state.
+    /// Its native slice can return disposal operations to the canonical VM driver without
+    /// pretending the language-level function is resumable or admitting a fresh-call entry.
+    pub(crate) fn jit_borrowed_stack_effect(&self, pc: usize) -> Option<(usize, usize)> {
+        self.jit_stack_effect_for_entry(pc, true)
+    }
+
+    fn jit_stack_effect_for_entry(&self, pc: usize, borrowed: bool) -> Option<(usize, usize)> {
+        if matches!(self.ops[pc], Op::FragmentExit(_)) && !borrowed {
+            return None;
+        }
         // AssignTarget enters the normative tree-walker with a projected Environment Record.
         // Keep that uncommon bridge in the bytecode VM: re-entering arbitrary evaluator code
         // from a packed ARM64 frame is both unnecessary for coroutine conversion and unsafe for
@@ -16355,10 +17343,8 @@ impl Chunk {
                 | Op::EvalCallArgsArray
                 | Op::TailEvalCallArgsArray
                 | Op::NewArgsArray
-                | Op::ObjectSpread
                 | Op::ObjectMethod(..)
                 | Op::ImportMeta
-                | Op::NewTarget
                 | Op::DynamicImport(..)
                 | Op::PrivateIn(_)
                 | Op::GetPrivate(_)
@@ -16384,7 +17370,19 @@ impl Chunk {
                 | Op::ClassDecorator(..)
                 | Op::ClassFinish(_)
                 | Op::ClassAbort(_)
-        ) {
+        ) && !jit_bridge_op(&self.ops[pc])
+            && !(self.resumable && jit_slice_exit_op(&self.ops[pc]))
+            && !(borrowed
+                && matches!(
+                    self.ops[pc],
+                    Op::DisposeNormal
+                        | Op::DisposeThrow
+                        | Op::DisposeReturn
+                        | Op::DisposeBareReturn
+                        | Op::DisposeResumeReturn
+                        | Op::DisposeJump
+                ))
+        {
             return None;
         }
         let upd = |k: &UpdKind| match k {
@@ -16392,6 +17390,8 @@ impl Chunk {
             _ => 1,
         };
         Some(match &self.ops[pc] {
+            Op::FragmentExit(_) => (1, 0),
+            Op::AnnexBSync(_) => (0, 0),
             Op::Const(_)
             | Op::Undef
             | Op::LoadLocal(_)
@@ -16407,6 +17407,7 @@ impl Chunk {
             | Op::StoreCap(_)
             | Op::StoreCapInit(_)
             | Op::StoreName(_)
+            | Op::StoreGlobalName(_)
             | Op::StoreNameCached(..)
             | Op::StoreConstLocal(..)
             | Op::StoreConstCap(_)
@@ -16565,11 +17566,389 @@ impl Chunk {
 /// # Safety
 /// Called from JIT code with `ctx` pointing at the live `JitCtx` for this activation and `sp`
 /// inside its stack buffer, whose capacity covers the chunk's statically-computed maximum depth.
+/// Owned state for uncommon synchronous operations in an otherwise native activation.
+pub(crate) struct NativeActivation {
+    chunk: *const Chunk,
+    env: Env,
+    cap_env: Env,
+    stack: ValueStack<PackedValue>,
+    references: Vec<crate::eval::PreparedReferenceSlot>,
+    disposal_frames: Vec<Vec<crate::interpreter::Disposable>>,
+    class_states: Vec<Option<crate::eval::PreparedClassEvaluation>>,
+}
+
+/// A borrow of the authoritative VmCoro state, valid only for one native slice. No machine
+/// stack address or code address is retained by the suspended continuation. The operand Vec
+/// lends its allocation to generated code (length zero), then regains the initialized prefix
+/// at every checked operation or exit. Locals already use the same owned-word representation.
+pub(crate) struct NativeContinuation {
+    pub(crate) chunk: *const Chunk,
+    pub(crate) env: *mut Env,
+    pub(crate) cap_env: *const Env,
+    pub(crate) references: *mut [crate::eval::PreparedReferenceSlot],
+    pub(crate) stack: *mut ValueStack<PackedValue>,
+    pub(crate) disposal_frames: *mut Vec<Vec<crate::interpreter::Disposable>>,
+    pub(crate) class_states: *mut [Option<crate::eval::PreparedClassEvaluation>],
+}
+
+/// Instructions whose exact Completion/suspension must return to the shared driver. They are
+/// full materialization barriers: no register or borrowed owner can survive an Await/Yield.
+pub(crate) fn jit_slice_exit_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Await
+            | Op::FragmentExit(_)
+            | Op::Yield
+            | Op::YieldStar
+            | Op::AsyncIterStepL(..)
+            | Op::AsyncIterCloseL(..)
+            | Op::DisposeNormal
+            | Op::DisposeThrow
+            | Op::DisposeReturn
+            | Op::DisposeBareReturn
+            | Op::DisposeResumeReturn
+            | Op::DisposeJump
+            | Op::Return
+            | Op::ReturnBare
+            | Op::ReturnUndef
+            | Op::ResumeReturn
+            | Op::Throw
+            | Op::AbruptJump(..)
+            | Op::ResumeJump
+            | Op::IterAbortL(_)
+            | Op::IterAbortIfNotDoneL(..)
+    )
+}
+
+/// A normally resumed suspension adds one value for Await/Yield/iterator stepping, but no
+/// value for asynchronous cleanup. This is separate from normal CFG edges and dominance.
+pub(crate) fn jit_resume_after(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Await
+            | Op::Yield
+            | Op::YieldStar
+            | Op::AsyncIterStepL(..)
+            | Op::AsyncIterCloseL(..)
+            | Op::DisposeNormal
+    )
+}
+
+fn jit_bridge_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::AnnexBSync(_)
+            | Op::AssignTarget(_)
+            | Op::EvalExpr(_)
+            | Op::PushWith
+            | Op::PushLex(_)
+            | Op::PushCatchLex(_)
+            | Op::CloneLex(_)
+            | Op::InitLex(_)
+            | Op::PopEnv
+            | Op::ResolveNameRef(..)
+            | Op::LoadRef(_)
+            | Op::StoreRef(_)
+            | Op::StoreConstLocal(..)
+            | Op::StoreConstCap(_)
+            | Op::UpdateConst(..)
+            | Op::RequireObject
+            | Op::DestructureStepL(..)
+            | Op::DestructureRestL(..)
+            | Op::IterCloseIfNotDoneL(..)
+            | Op::IterAbortIfNotDoneL(..)
+            | Op::ObjectRest(_)
+            | Op::NewArray
+            | Op::ArrayPush
+            | Op::ArrayHole
+            | Op::ArraySpread
+            | Op::CallArgsArray
+            | Op::CallArgsArrayThis
+            | Op::EvalCallArgsArray
+            | Op::NewArgsArray
+            | Op::ObjectMethod(..)
+            | Op::ImportMeta
+            | Op::DynamicImport(..)
+            | Op::PrivateIn(_)
+            | Op::GetPrivate(_)
+            | Op::GetPrivateKeep(_)
+            | Op::GetPrivateMethod(_)
+            | Op::SetPrivate(_)
+            | Op::UpdatePrivate(..)
+            | Op::SuperCallStart
+            | Op::SuperCallArgsArray
+            | Op::LoadLexicalThis
+            | Op::SuperThis
+            | Op::SuperBase
+            | Op::SuperGet
+            | Op::SuperGetKeep
+            | Op::SuperGetMethod
+            | Op::SuperSet
+            | Op::SuperUpdate(_)
+            | Op::TemplateObject(_)
+            | Op::RequireCallable
+            | Op::ClassStart(..)
+            | Op::ClassHeritage(..)
+            | Op::ClassKey(..)
+            | Op::ClassDecorator(..)
+            | Op::ClassFinish(_)
+            | Op::ClassAbort(_)
+            | Op::PushDisposeFrame
+            | Op::AddDisposable(_)
+            | Op::GetAsyncIter
+            | Op::AsyncIterResumeL(..)
+    )
+}
+
+/// Run one checked operation against the canonical borrowed continuation, not an activation
+/// copy. A nested ordinary direct callee has another chunk and must not use this view.
+unsafe fn jit_continuation_operation(
+    ctx: &mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut PackedValue,
+    exits: bool,
+) -> crate::jit::SpFlag {
+    let state = &mut *ctx.resume_activation;
+    debug_assert_eq!(state.chunk, ctx.chunk);
+    let chunk = &*ctx.chunk;
+    let stack = &mut *state.stack;
+    debug_assert!(stack.is_empty());
+    debug_assert_eq!(stack.as_mut_ptr(), ctx.stack_base);
+    stack.set_len(sp.offset_from(ctx.stack_base) as usize);
+    let mut next = pc as usize;
+    let result = if next == chunk.ops.len() {
+        Ok(VmStep::Done(Value::Undefined))
+    } else {
+        run_vm(
+            &mut *ctx.interp,
+            chunk,
+            &mut *state.env,
+            &*state.cap_env,
+            &mut *state.references,
+            std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots),
+            stack,
+            &mut next,
+            &ctx.this_val,
+            &mut ctx.handlers,
+            &mut *state.disposal_frames,
+            &mut *state.class_states,
+            Some(pc as usize + 1),
+            None,
+        )
+        .map(VmRunExit::single_operation)
+    };
+    // CFG capacity covers every settled depth and the helper's temporary operand suffix.
+    // Helpers must never replace the borrowed allocation under the machine stack pointer.
+    assert_eq!(
+        stack.as_mut_ptr(),
+        ctx.stack_base,
+        "native continuation stack reallocated"
+    );
+    let sp = ctx.stack_base.add(stack.len());
+    stack.set_len(0);
+    ctx.env_raw = Rc::as_ptr(&*state.env) as *const u8;
+    ctx.env_parent_raw = (*state.env)
+        .borrow()
+        .parent
+        .as_ref()
+        .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8);
+    if exits {
+        ctx.resume_pc = next;
+    }
+    match result {
+        Ok(VmStep::Done(_))
+            if (pc as usize) < chunk.ops.len()
+                && !matches!(chunk.ops[pc as usize], Op::ReturnUndef) =>
+        {
+            crate::jit::SpFlag { sp, flag: 0 }
+        }
+        Ok(step) if exits => {
+            ctx.resume_step = Some(step);
+            crate::jit::SpFlag { sp, flag: 0 }
+        }
+        Ok(_) => unreachable!("only slice exit operations may suspend or return"),
+        Err(error) => {
+            ctx.error = Some(error);
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn jit_slice_op(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    jit_continuation_operation(&mut *ctx, pc, sp, true)
+}
+
+unsafe fn ensure_native_activation(ctx: &mut crate::jit::JitCtx) {
+    let chunk = &*ctx.chunk;
+    if ctx.activation.is_none() {
+        let borrowed = std::mem::ManuallyDrop::new(Rc::from_raw(
+            ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+        ));
+        let env = Rc::clone(&borrowed);
+        ctx.activation = Some(Box::new(NativeActivation {
+            chunk: ctx.chunk,
+            cap_env: env.clone(),
+            env,
+            stack: ValueStack::default(),
+            references: (0..chunk.n_refs)
+                .map(|_| crate::eval::PreparedReferenceSlot::default())
+                .collect(),
+            disposal_frames: Vec::new(),
+            class_states: (0..chunk.class_plans.len()).map(|_| None).collect(),
+        }));
+    }
+    let activation = ctx
+        .activation
+        .as_mut()
+        .expect("native activation initialized");
+    debug_assert_eq!(
+        activation.chunk, ctx.chunk,
+        "stateful callees must use separate contexts"
+    );
+    ctx.references_raw = activation.references.as_mut_ptr();
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_REFERENCE_HELPERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Dedicated Reference slow path: operates directly on canonical owners, without copying the
+/// operand stack into a one-operation VM or replaying resolution after an effect.
+pub(crate) unsafe extern "C" fn jit_reference_op(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    mut sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    #[cfg(test)]
+    TEST_REFERENCE_HELPERS.with(|count| count.set(count.get() + 1));
+    let ctx = &mut *ctx;
+    let chunk = &*ctx.chunk;
+    if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk {
+        ctx.references_raw = (&mut *(*ctx.resume_activation).references).as_mut_ptr();
+    } else {
+        ensure_native_activation(ctx);
+    }
+    jit_opstat(ctx, pc);
+    let i = &mut *ctx.interp;
+    let result = match chunk.ops[pc as usize] {
+        Op::ResolveNameRef(name, reference) => {
+            let env = std::mem::ManuallyDrop::new(Rc::from_raw(
+                ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+            ));
+            chunk.resolve_name_reference(i, &env, name).map(|value| {
+                (*ctx.references_raw.add(reference as usize)).set(value);
+            })
+        }
+        Op::LoadRef(reference) => {
+            let reference = (*ctx.references_raw.add(reference as usize))
+                .as_mut()
+                .expect("prepared Reference resolved before GetValue");
+            i.read_prepared_reference(reference).map(|value| {
+                sp.write(PackedValue::pack(value));
+                sp = sp.add(1);
+            })
+        }
+        Op::StoreRef(reference) => {
+            sp = sp.sub(1);
+            let value = sp.read().into_value();
+            let reference = (*ctx.references_raw.add(reference as usize))
+                .as_mut()
+                .expect("prepared Reference resolved before PutValue");
+            i.write_prepared_reference(reference, value)
+        }
+        _ => unreachable!("Reference helper operation"),
+    };
+    match result {
+        Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+        Err(error) => {
+            ctx.error = Some(error);
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
+unsafe fn jit_vm_operation(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let ctx = &mut *ctx;
+    let chunk = &*ctx.chunk;
+    if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk {
+        return jit_continuation_operation(ctx, pc, sp, false);
+    }
+    jit_opstat(ctx, pc);
+    ensure_native_activation(ctx);
+    let activation = ctx
+        .activation
+        .as_mut()
+        .expect("native activation initialized");
+    let depth = sp.offset_from(ctx.stack_base) as usize;
+    debug_assert!(activation.stack.is_empty());
+    activation.stack.reserve(depth);
+    std::ptr::copy_nonoverlapping(ctx.stack_base, activation.stack.as_mut_ptr(), depth);
+    activation.stack.set_len(depth);
+    let mut next = pc as usize;
+    let result = run_vm(
+        &mut *ctx.interp,
+        chunk,
+        &mut activation.env,
+        &activation.cap_env,
+        &mut activation.references,
+        std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots),
+        &mut activation.stack,
+        &mut next,
+        &ctx.this_val,
+        &mut ctx.handlers,
+        &mut activation.disposal_frames,
+        &mut activation.class_states,
+        Some(pc as usize + 1),
+        None,
+    )
+    .map(VmRunExit::single_operation);
+    // Transfer the live suffix back even on error. The native unwinder must never
+    // observe moved-out inputs or omit values produced before a later abrupt step.
+    let depth = activation.stack.len();
+    std::ptr::copy_nonoverlapping(activation.stack.as_ptr(), ctx.stack_base, depth);
+    activation.stack.set_len(0);
+    ctx.env_raw = Rc::as_ptr(&activation.env) as *const u8;
+    ctx.env_parent_raw = activation
+        .env
+        .borrow()
+        .parent
+        .as_ref()
+        .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8);
+    let sp = ctx.stack_base.add(depth);
+    match result {
+        Ok(VmStep::Done(_)) => crate::jit::SpFlag { sp, flag: 0 },
+        Err(error) => {
+            ctx.error = Some(error);
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+        _ => unreachable!("native one-op bridge cannot suspend or return"),
+    }
+}
+
 pub(crate) unsafe extern "C" fn jit_exec(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
+    let chunk = &*(*ctx).chunk;
+    if matches!(
+        chunk.ops[pc as usize],
+        Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_)
+    ) {
+        return jit_reference_op(ctx, pc, sp);
+    }
+    if jit_bridge_op(&chunk.ops[pc as usize]) {
+        return jit_vm_operation(ctx, pc, sp);
+    }
     #[cfg(test)]
     if matches!(
         unsafe { &(&(*(*ctx).chunk).ops)[pc as usize] },
@@ -16582,115 +17961,6 @@ pub(crate) unsafe extern "C" fn jit_exec(
     ) {
         TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(count.get() + 1));
     }
-    // Packed local misses must remain O(1): widening every slot for a single object overwrite
-    // dominates object-heavy kernels. These two ownership operations need no interpreter state;
-    // TDZ loads retain the generic path so it can construct the precise ReferenceError.
-    if unsafe { (*ctx).slots_packed } {
-        let chunk = unsafe { &*(*ctx).chunk };
-        let op = &chunk.ops[pc as usize];
-        match *op {
-            Op::ForInStepL(keys, index, source) => {
-                let ctx = unsafe { &mut *ctx };
-                jit_opstat(ctx, pc);
-                let keys = unsafe { ctx.clone_slot(keys as usize) };
-                let source = unsafe { ctx.clone_slot(source as usize) };
-                let mut cursor = unsafe { ctx.clone_slot(index as usize) };
-                let result = for_in_next(unsafe { &mut *ctx.interp }, &keys, &mut cursor, &source);
-                // The cursor advances before the observable property check, including throws.
-                let word = unsafe { ctx.slots.cast::<u64>().add(index as usize) };
-                unsafe { crate::value::PackedValue::replace_raw(word, cursor) };
-                match result {
-                    Ok(key) => {
-                        let found = key.is_some();
-                        unsafe {
-                            sp.write(key.unwrap_or(Value::Undefined));
-                            sp.add(1).write(Value::Bool(found));
-                        }
-                        return crate::jit::SpFlag {
-                            sp: unsafe { sp.add(2) },
-                            flag: 0,
-                        };
-                    }
-                    Err(error) => {
-                        ctx.error = Some(error);
-                        return crate::jit::SpFlag { sp, flag: 1 };
-                    }
-                }
-            }
-            Op::GetElemLocal(slot) => {
-                // A computed read can call getters, but it only needs this one local. Keep
-                // unrelated packed locals untouched instead of widening the entire frame.
-                let ctx = unsafe { &mut *ctx };
-                jit_opstat(ctx, pc);
-                let object = unsafe { ctx.clone_slot(slot as usize) };
-                sp = unsafe { sp.sub(1) };
-                let key = unsafe { sp.read() };
-                match get_computed_element(
-                    unsafe { &mut *ctx.interp },
-                    chunk,
-                    pc as usize,
-                    &object,
-                    &key,
-                ) {
-                    Ok(value) => {
-                        unsafe { sp.write(value) };
-                        return crate::jit::SpFlag {
-                            sp: unsafe { sp.add(1) },
-                            flag: 0,
-                        };
-                    }
-                    Err(error) => {
-                        ctx.error = Some(error);
-                        return crate::jit::SpFlag { sp, flag: 1 };
-                    }
-                }
-            }
-            Op::LoadLocal(slot) => {
-                let word = unsafe { (*ctx).slots.cast::<u64>().add(slot as usize) };
-                let value = unsafe { crate::value::PackedValue::clone_raw(word) };
-                if !matches!(value, Value::Empty) {
-                    unsafe { sp.write(value) };
-                    return crate::jit::SpFlag {
-                        sp: unsafe { sp.add(1) },
-                        flag: 0,
-                    };
-                }
-            }
-            Op::StoreLocal(slot) => {
-                sp = unsafe { sp.sub(1) };
-                let value = unsafe { sp.read() };
-                let word = unsafe { (*ctx).slots.cast::<u64>().add(slot as usize) };
-                unsafe { crate::value::PackedValue::replace_raw(word, value) };
-                return crate::jit::SpFlag { sp, flag: 0 };
-            }
-            _ => {}
-        }
-    }
-    let chunk = unsafe { &*(*ctx).chunk };
-    let needs_wide_slots = matches!(
-        chunk.ops[pc as usize],
-        Op::LoadLocal(_)
-            | Op::StoreLocal(_)
-            | Op::UpdateLocal(..)
-            | Op::Tdz(_)
-            | Op::GetPropLocal(..)
-            | Op::SetPropLocalDrop(..)
-            | Op::GetElemLocal(_)
-            | Op::SetElemLocal(_)
-            | Op::SetElemLocalDrop(_)
-            | Op::ToPropKeyLocal(_)
-            | Op::ForInStepL(..)
-            | Op::IterStepL(..)
-            | Op::IterCloseL(_)
-            | Op::IterAbortL(_)
-            | Op::AssignTarget(_)
-            | Op::ResetSlots(..)
-    );
-    let _wide_slots = if needs_wide_slots {
-        Some(unsafe { JitWideSlots::enter(ctx) })
-    } else {
-        None
-    };
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
     match jit_exec_inner(ctx, pc, &mut sp) {
@@ -16702,31 +17972,24 @@ pub(crate) unsafe extern "C" fn jit_exec(
     }
 }
 
-/// Drop the single `Value` at `sp` (rare path: the direct-call sequence's callee slot when its
-/// refcount is one, or any slot the inline decrement can't handle).
+/// Drop one wide boundary Value (`this`, return or hardware-saved state), never an execution
+/// word. Generated packed local/operand/property drops use `jit_drop_packed_at` explicitly.
 pub(crate) unsafe extern "C" fn jit_drop_at(
-    ctx: *mut crate::jit::JitCtx,
+    _ctx: *mut crate::jit::JitCtx,
     _imm: u32,
     sp: *mut Value,
 ) -> *mut Value {
-    let ctx = &mut *ctx;
-    let addr = sp as usize;
-    let slots = ctx.slots as usize;
-    if ctx.slots_packed && addr >= slots && addr < slots + ctx.n_slots * 8 {
-        crate::value::PackedValue::drop_raw(sp.cast::<u64>());
-    } else {
-        std::ptr::drop_in_place(sp);
-    }
+    std::ptr::drop_in_place(sp);
     sp
 }
 
-/// Drop one NaN-boxed property owner at `word`. Generated stores use this only after all
-/// observable guards pass; packed destruction cannot execute JavaScript.
+/// Drop one NaN-boxed execution or property owner at `word`. Generated stores use this only
+/// after all observable guards pass; packed destruction cannot execute JavaScript.
 pub(crate) unsafe extern "C" fn jit_drop_packed_at(
     _ctx: *mut crate::jit::JitCtx,
     _imm: u32,
-    word: *mut Value,
-) -> *mut Value {
+    word: *mut PackedValue,
+) -> *mut PackedValue {
     unsafe { crate::value::PackedValue::drop_raw(word.cast::<u64>()) };
     word
 }
@@ -16738,20 +18001,20 @@ pub(crate) unsafe extern "C" fn jit_drop_packed_at(
 pub(crate) unsafe extern "C" fn jit_strict_eq(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let chunk = unsafe { &*ctx.chunk };
     let op = &chunk.ops[pc as usize];
     debug_assert!(matches!(op, Op::StrictEq | Op::StrictNotEq));
     let base = unsafe { sp.sub(2) };
-    let left = unsafe { base.read() };
-    let right = unsafe { base.add(1).read() };
+    let left = unsafe { base.read().into_value() };
+    let right = unsafe { base.add(1).read().into_value() };
     let mut equal = unsafe { (&*ctx.interp).strict_equals(&left, &right) };
     if matches!(op, Op::StrictNotEq) {
         equal = !equal;
     }
-    unsafe { base.write(Value::Bool(equal)) };
+    unsafe { base.write(PackedValue::pack(Value::Bool(equal))) };
     crate::jit::SpFlag {
         sp: unsafe { base.add(1) },
         flag: 0,
@@ -16762,7 +18025,7 @@ pub(crate) unsafe extern "C" fn jit_strict_eq(
 pub(crate) unsafe extern "C" fn jit_make_regexp(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let chunk = unsafe { &*ctx.chunk };
@@ -16779,7 +18042,7 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
                     .len()
                     .saturating_add(chunk.names[flags as usize].len()),
             );
-            unsafe { sp.write(value) };
+            unsafe { sp.write(PackedValue::pack(value)) };
             crate::jit::SpFlag {
                 sp: unsafe { sp.add(1) },
                 flag: 0,
@@ -16799,19 +18062,19 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
 pub(crate) unsafe extern "C" fn jit_add_strings(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let base = unsafe { sp.sub(2) };
-    if !matches!(unsafe { &*base }, Value::Str(_))
-        || !matches!(unsafe { &*base.add(1) }, Value::Str(_))
+    if !matches!(unsafe { &(*base).unpack() }, Value::Str(_))
+        || !matches!(unsafe { &(*base.add(1)).unpack() }, Value::Str(_))
     {
         return unsafe { jit_exec(ctx, pc, sp) };
     }
 
-    let Value::Str(left) = (unsafe { base.read() }) else {
+    let Value::Str(left) = (unsafe { base.read().into_value() }) else {
         unreachable!()
     };
-    let Value::Str(right) = (unsafe { base.add(1).read() }) else {
+    let Value::Str(right) = (unsafe { base.add(1).read().into_value() }) else {
         unreachable!()
     };
     if left.len().saturating_add(right.len()) > crate::interpreter::MAX_STR_LEN {
@@ -16824,19 +18087,14 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     let ctx = unsafe { &mut *ctx };
     let chunk = unsafe { &*ctx.chunk };
     if let Some(Op::StoreLocal(slot)) = chunk.ops.get(pc as usize + 1) {
-        if ctx.slots_packed {
-            // Inspect/retire this one packed owner; never widen an entire native frame for
-            // each appended character. The operand `left` keeps its allocation alive here.
-            let word = unsafe { ctx.slots.cast::<u64>().add(*slot as usize) };
-            let current = unsafe { crate::value::PackedValue::clone_raw(word) };
-            let same = matches!(&current, Value::Str(current) if crate::lstr::LStr::ptr_eq(current, &left));
-            drop(current);
-            if same {
-                unsafe { crate::value::PackedValue::replace_raw(word, Value::Undefined) };
-            }
-        } else {
-            let slot = unsafe { &mut *ctx.slots.add(*slot as usize) };
-            release_overwritten_string_local(slot, &left);
+        // Inspect/retire this one packed owner. The operand `left` keeps it alive here.
+        let word = unsafe { ctx.slots.cast::<u64>().add(*slot as usize) };
+        let current = unsafe { crate::value::PackedValue::clone_raw(word) };
+        let same =
+            matches!(&current, Value::Str(current) if crate::lstr::LStr::ptr_eq(current, &left));
+        drop(current);
+        if same {
+            unsafe { crate::value::PackedValue::replace_raw(word, Value::Undefined) };
         }
     } else if let Some(Op::StoreCap(name)) = chunk.ops.get(pc as usize + 1) {
         // As in jit_exec_inner, env_raw is the activation swapped for this native frame, not
@@ -16847,7 +18105,7 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
         chunk.release_overwritten_captured_string(&env, *name, &left);
     }
 
-    unsafe { base.write(Value::Str(left.concat_owned(&right))) };
+    unsafe { base.write(PackedValue::pack(Value::Str(left.concat_owned(&right)))) };
     crate::jit::SpFlag {
         sp: unsafe { base.add(1) },
         flag: 0,
@@ -16861,7 +18119,7 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
 pub(crate) unsafe extern "C" fn jit_intrinsic(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let i = &mut *ctx.interp;
@@ -16895,10 +18153,10 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                 let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
                 let r = match intrinsic {
                     INTRINSIC_CHAR_AT => {
-                        let Value::Str(s) = &*base else {
+                        let Value::Str(s) = &(*base).unpack() else {
                             unreachable!("charAt intrinsic receiver guard")
                         };
-                        let Value::Num(n) = &*base.add(2) else {
+                        let Value::Num(n) = &(*base.add(2)).unpack() else {
                             unreachable!("charAt intrinsic index guard")
                         };
                         let idx = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -16912,13 +18170,13 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         })
                     }
                     INTRINSIC_STRING_SLICE => {
-                        let Value::Str(s) = &*base else {
+                        let Value::Str(s) = &(*base).unpack() else {
                             unreachable!("slice intrinsic receiver guard")
                         };
-                        let Value::Num(start) = &*base.add(2) else {
+                        let Value::Num(start) = &(*base.add(2)).unpack() else {
                             unreachable!("slice intrinsic start guard")
                         };
-                        let Value::Num(end) = &*base.add(3) else {
+                        let Value::Num(end) = &(*base.add(3)).unpack() else {
                             unreachable!("slice intrinsic end guard")
                         };
                         debug_assert!(s.ascii_hint());
@@ -16950,10 +18208,10 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         })
                     }
                     INTRINSIC_OBJECT_HAS_OWN => {
-                        let object @ Value::Obj(_) = &*base.add(2) else {
+                        let object @ Value::Obj(_) = &(*base.add(2)).unpack() else {
                             unreachable!("hasOwn intrinsic object guard")
                         };
-                        let Value::Str(key) = &*base.add(3) else {
+                        let Value::Str(key) = &(*base.add(3)).unpack() else {
                             unreachable!("hasOwn intrinsic key guard")
                         };
                         crate::builtins::has_own_property_trapped(i, object, key.as_str())
@@ -16967,7 +18225,13 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         // exact Function.prototype.call builtin.
                         debug_assert!(call_argc >= 1);
                         let forwarded = call_argc - 1;
-                        match i.call_jit_fast(&*base, base.add(2), base.add(3), forwarded, None) {
+                        match i.call_jit_fast(
+                            &(*base).unpack(),
+                            base.add(2),
+                            base.add(3),
+                            forwarded,
+                            None,
+                        ) {
                             Some(r) => {
                                 this_moved = true;
                                 call_args_moved = forwarded;
@@ -16975,8 +18239,11 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                             }
                             None => crate::builtins::nf_function_call(
                                 i,
-                                (*base).clone(),
-                                std::slice::from_raw_parts(base.add(2), call_argc),
+                                (*base).unpack(),
+                                &DecodedArgs::new(std::slice::from_raw_parts(
+                                    base.add(2),
+                                    call_argc,
+                                )),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -16987,7 +18254,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         // into an already-JIT-compiled target frame. No observable operation occurs
                         // before every list guard has passed; unusual array-likes and non-JIT targets
                         // execute the named builtin unchanged.
-                        let dense = match (&*base, &*base.add(3)) {
+                        let dense = match (&(*base).unpack(), &(*base.add(3)).unpack()) {
                             (Value::Obj(_), Value::Obj(list))
                                 if i.ordinary_get_ptr(Rc::as_ptr(list) as usize)
                                     && !i
@@ -17018,7 +18285,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                                             .get_index(k as u32)
                                             .filter(|p| !p.accessor())
                                             .map(|p| p.value())?;
-                                        values.push(value);
+                                        values.push(PackedValue::pack(value));
                                     }
                                     Some(values)
                                 })
@@ -17027,7 +18294,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         };
                         if let Some(mut values) = dense {
                             match i.call_jit_fast(
-                                &*base,
+                                &(*base).unpack(),
                                 base.add(2),
                                 values.as_mut_ptr(),
                                 values.len(),
@@ -17041,25 +18308,25 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                                 }
                                 None => crate::builtins::nf_function_apply(
                                     i,
-                                    (*base).clone(),
-                                    std::slice::from_raw_parts(base.add(2), 2),
+                                    (*base).unpack(),
+                                    &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 2)),
                                 )
                                 .map_err(Abrupt::Throw),
                             }
                         } else {
                             crate::builtins::nf_function_apply(
                                 i,
-                                (*base).clone(),
-                                std::slice::from_raw_parts(base.add(2), 2),
+                                (*base).unpack(),
+                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 2)),
                             )
                             .map_err(Abrupt::Throw)
                         }
                     }
                     INTRINSIC_ARRAY_PUSH => {
-                        let Value::Obj(o) = &*base else {
+                        let Value::Obj(o) = &(*base).unpack() else {
                             unreachable!("push intrinsic receiver guard")
                         };
-                        let arg = base.add(2).read();
+                        let arg = base.add(2).read().into_value();
                         push_arg_moved = true;
                         match crate::builtins::jit_array_push_one(i, o, arg) {
                             Ok(v) => Ok(v),
@@ -17067,40 +18334,43 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                                 // The transfer helper promises a guard miss has no side effects and
                                 // returns the original owner, so the generic builtin sees the exact
                                 // operand stack it would have seen without specialization.
-                                base.add(2).write(arg);
+                                base.add(2).write(PackedValue::pack(arg));
                                 push_arg_moved = false;
                                 crate::builtins::nf_array_push(
                                     i,
-                                    (*base).clone(),
-                                    std::slice::from_raw_parts(base.add(2), 1),
+                                    (*base).unpack(),
+                                    &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 1)),
                                 )
                                 .map_err(Abrupt::Throw)
                             }
                         }
                     }
                     INTRINSIC_ARRAY_POP => {
-                        let Value::Obj(o) = &*base else {
+                        let Value::Obj(o) = &(*base).unpack() else {
                             unreachable!("pop intrinsic receiver guard")
                         };
                         match crate::builtins::jit_array_pop(i, o) {
                             Some(v) => Ok(v),
-                            None => crate::builtins::nf_array_pop(i, (*base).clone(), &[])
+                            None => crate::builtins::nf_array_pop(i, (*base).unpack(), &[])
                                 .map_err(Abrupt::Throw),
                         }
                     }
                     INTRINSIC_REGEXP_EXEC_DISCARD => {
-                        let (Value::Obj(_), Value::Str(input)) = (&*base, &*base.add(2)) else {
+                        let (Value::Obj(_), Value::Str(input)) =
+                            (&(*base).unpack(), &(*base.add(2)).unpack())
+                        else {
                             unreachable!("regexp exec intrinsic guards")
                         };
-                        match crate::builtins::regexp_exec_discard_fast(i, &*base, input) {
+                        match crate::builtins::regexp_exec_discard_fast(i, &(*base).unpack(), input)
+                        {
                             Some(r) => {
                                 i.interrupt_poll_force()?;
                                 r.map(|_| Value::Undefined).map_err(Abrupt::Throw)
                             }
                             None => crate::builtins::regexp_exec(
                                 i,
-                                (*base).clone(),
-                                std::slice::from_raw_parts(base.add(2), 1),
+                                (*base).unpack(),
+                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 1)),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -17108,9 +18378,9 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                     INTRINSIC_STRING_REPLACE_DISCARD => {
                         match crate::builtins::string_replace_discard_fast(
                             i,
-                            &*base,
-                            &*base.add(2),
-                            &*base.add(3),
+                            &(*base).unpack(),
+                            &(*base.add(2)).unpack(),
+                            &(*base.add(3)).unpack(),
                         ) {
                             Some(r) => {
                                 i.interrupt_poll_force()?;
@@ -17118,8 +18388,8 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                             }
                             None => crate::builtins::nf_string_replace(
                                 i,
-                                (*base).clone(),
-                                std::slice::from_raw_parts(base.add(2), 2),
+                                (*base).unpack(),
+                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 2)),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -17127,15 +18397,15 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                     INTRINSIC_STRING_SPLIT_DISCARD => {
                         match crate::builtins::string_split_discard_fast(
                             i,
-                            &*base,
-                            &*base.add(2),
+                            &(*base).unpack(),
+                            &(*base.add(2)).unpack(),
                             &Value::Undefined,
                         ) {
                             Some(r) => r.map_err(Abrupt::Throw),
                             None => crate::builtins::nf_string_split(
                                 i,
-                                (*base).clone(),
-                                std::slice::from_raw_parts(base.add(2), 1),
+                                (*base).unpack(),
+                                &DecodedArgs::new(std::slice::from_raw_parts(base.add(2), 1)),
                             )
                             .map_err(Abrupt::Throw),
                         }
@@ -17161,7 +18431,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     }
     match r {
         Ok(v) => {
-            base.write(v);
+            base.write(PackedValue::pack(v));
             crate::jit::SpFlag {
                 sp: base.add(1),
                 flag: 0,
@@ -17186,7 +18456,6 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
             return 0;
         }};
     }
-    let _wide_slots = unsafe { JitWideSlots::enter(ctx) };
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
     let chunk = unsafe { &*ctx.chunk };
@@ -17215,7 +18484,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
     {
         decline!();
     }
-    let Value::Num(mut index_num) = *ctx.slots.add(*local0 as usize) else {
+    let Value::Num(mut index_num) = (*ctx.slots.add(*local0 as usize)).unpack() else {
         decline!();
     };
     if !index_num.is_finite()
@@ -17332,7 +18601,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
         }
         index_num += 1.0;
     }
-    *ctx.slots.add(*local0 as usize) = Value::Num(index_num);
+    *ctx.slots.add(*local0 as usize) = PackedValue::pack(Value::Num(index_num));
     1
 }
 
@@ -17350,7 +18619,6 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_exec_discard(
             return 0;
         }};
     }
-    let _wide_slots = unsafe { JitWideSlots::enter(ctx) };
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
     let chunk = unsafe { &*ctx.chunk };
@@ -17409,7 +18677,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_exec_discard(
             if !i.ordinary_get_ptr(Rc::as_ptr(&array_obj) as usize) {
                 decline!();
             }
-            let Value::Num(index) = *ctx.slots.add(index as usize) else {
+            let Value::Num(index) = (*ctx.slots.add(index as usize)).unpack() else {
                 decline!();
             };
             if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > u32::MAX as f64
@@ -17461,7 +18729,6 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_replace_discard(
             return 0;
         }};
     }
-    let _wide_slots = unsafe { JitWideSlots::enter(ctx) };
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
     let chunk = unsafe { &*ctx.chunk };
@@ -17501,7 +18768,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_replace_discard(
     if !i.ordinary_get_ptr(Rc::as_ptr(&array_obj) as usize) {
         decline!();
     }
-    let Value::Num(index) = *ctx.slots.add(*index as usize) else {
+    let Value::Num(index) = (*ctx.slots.add(*index as usize)).unpack() else {
         decline!();
     };
     if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > u32::MAX as f64 {
@@ -17557,7 +18824,6 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
             return 0;
         }};
     }
-    let _wide_slots = unsafe { JitWideSlots::enter(ctx) };
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
     let chunk = unsafe { &*ctx.chunk };
@@ -17595,7 +18861,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
     if !i.ordinary_get_ptr(Rc::as_ptr(&array_obj) as usize) {
         decline!();
     }
-    let Value::Num(index) = *ctx.slots.add(*index as usize) else {
+    let Value::Num(index) = (*ctx.slots.add(*index as usize)).unpack() else {
         decline!();
     };
     if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > u32::MAX as f64 {
@@ -17650,18 +18916,13 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
 pub(crate) unsafe extern "C" fn jit_direct_finish(
     ctx: *mut crate::jit::JitCtx,
     threw: u32,
-    _sp: *mut Value,
+    _sp: *mut PackedValue,
 ) -> u64 {
     let ctx = &mut *ctx;
     // Returning from inside a try bypasses the lexical PopHandler. Direct calls share their
     // caller's handler allocation, so discard every record above this activation's watermark
     // before the caller resumes (ECMA-262 14.10.1 and 14.15.3).
     ctx.handlers.truncate(ctx.handler_floor);
-    let caller_uses_packed_slots = ctx.slots_packed;
-    // Expand the packed callee once for the existing destructor loop. Assembly restores the
-    // caller's still-packed slot pointer immediately after this helper, so only the flag is
-    // restored after the callee buffer has been released.
-    ctx.unpack_slots();
     let i = &mut *ctx.interp;
     // Leftover operand stack (only on throw; clean returns leave it empty).
     let mut p = ctx.stack_base;
@@ -17669,25 +18930,9 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
         std::ptr::drop_in_place(p);
         p = p.add(1);
     }
-    // Slot drops with the shared-reference fast path (mirrors run_moved's exit loop).
-    let rc_dec_ok = i
-        .jit_layout
-        .get()
-        .is_some_and(|l| l.valid && l.rc_strong_off == 0);
+    // Exact packed-owner destruction; numeric words require no heap operation.
     for k in 0..ctx.n_slots {
-        let p = ctx.slots.add(k);
-        let tag = *(p as *const u8);
-        if tag < 5 {
-            continue;
-        }
-        if rc_dec_ok && tag >= 6 {
-            let strong = *(p as *const usize).add(1) as *mut usize;
-            if *strong > 1 {
-                *strong -= 1;
-                continue;
-            }
-        }
-        std::ptr::drop_in_place(p);
+        std::ptr::drop_in_place(ctx.slots.add(k));
     }
     // Return the frame buffer (asm popped it from the freelist; base == ctx.slots).
     let buf = std::ptr::NonNull::new_unchecked(ctx.slots);
@@ -17695,7 +18940,7 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
         i.frame_pool.0.push(buf);
     } else {
         drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-            ctx.slots as *mut std::mem::MaybeUninit<Value>,
+            ctx.slots as *mut std::mem::MaybeUninit<PackedValue>,
             crate::jit::FRAME_BUF,
         )));
     }
@@ -17713,7 +18958,7 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
             let (f, t, a) = *bx;
             let r = i.gc_check_amortized().and_then(|()| i.call_tail(f, t, &a));
             match r {
-                Ok(v) => ctx.ret = v,
+                Ok(v) => ctx.ret = PackedValue::pack(v),
                 Err(e) => {
                     ctx.error = Some(e);
                     threw = true;
@@ -17723,7 +18968,6 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
         }
     }
     i.depth -= 1;
-    ctx.slots_packed = caller_uses_packed_slots;
     threw as u64
 }
 
@@ -17735,7 +18979,7 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
 pub(crate) unsafe extern "C" fn jit_call_hit(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let way = (pc >> 16) as usize & (CALL_IC_WAYS - 1);
@@ -17761,32 +19005,35 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
         _ => unreachable!("jit_call_hit emitted only for call ops"),
     };
     let ic = chunk.call_caches[c as usize].entries[way].get();
+    // The emitted probe already validated this epoch. Acquire before inline
+    // recompilation, which may now reclaim other inactive native code.
+    let code = (ic.native == 0).then(|| crate::jit::cache::lease_raw(ic.code));
     jit_callstat(i, ctx, &ic, argc, with_this, sp);
     if ic.native == 0 {
         let chunk_ref = &*ic.chunk;
-        let runs = chunk_ref.jit_runs.get().wrapping_add(1);
+        let runs = chunk_ref.jit_runs.get().saturating_add(1);
         chunk_ref.jit_runs.set(runs);
-        if runs == ctx.inline_recompile_at {
+        if chunk_ref.inline_retry_due(runs) {
             i.try_inline_recompile(ic.func, chunk_ref, ic.env);
         }
     }
     let args_ptr = sp.sub(argc);
-    let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);
-    let this_slot: *const Value = if with_this {
+    let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
+    let this_slot: *const PackedValue = if with_this {
         sp.sub(argc + 2)
     } else {
-        &raw mut *undef as *const Value
+        &raw mut *undef as *const PackedValue
     };
     let r = if ic.native != 0 {
         let nf: crate::value::NativeFn = std::mem::transmute(ic.native);
         i.call_native_committed(nf, this_slot, args_ptr, argc)
     } else {
-        i.call_jit_committed(ic, this_slot, args_ptr, argc)
+        i.call_jit_committed(ic, code.as_deref().unwrap(), this_slot, args_ptr, argc)
     };
     // Arguments and `this` were moved; pop them virtually and drop only the callee slot
     // (same ownership story as jit_call_inner's Some arm).
     sp = args_ptr.sub(1);
-    match sp.read() {
+    match sp.read().into_value() {
         Value::Obj(o) => {
             if Rc::strong_count(&o) > 1 {
                 unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
@@ -17801,7 +19048,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
     }
     match r {
         Ok(v) => {
-            sp.write(v);
+            sp.write(PackedValue::pack(v));
             crate::jit::SpFlag {
                 sp: sp.add(1),
                 flag: 0,
@@ -17820,7 +19067,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
 pub(crate) unsafe extern "C" fn jit_make_object(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -17837,7 +19084,7 @@ pub(crate) unsafe extern "C" fn jit_make_object(
     } else {
         let mut values = Vec::with_capacity(count);
         for k in 0..count {
-            values.push(base.add(k).read());
+            values.push(base.add(k).read().into_value());
         }
         i.make_plain_object_vm(keys, values)
     };
@@ -17848,7 +19095,7 @@ pub(crate) unsafe extern "C" fn jit_make_object(
         count,
     );
     sp = base;
-    sp.write(v);
+    sp.write(PackedValue::pack(v));
     crate::jit::SpFlag {
         sp: sp.add(1),
         flag: 0,
@@ -17860,7 +19107,7 @@ pub(crate) unsafe extern "C" fn jit_make_object(
 pub(crate) unsafe extern "C" fn jit_make_array(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
@@ -17877,7 +19124,7 @@ pub(crate) unsafe extern "C" fn jit_make_array(
         count as usize,
     );
     sp = base;
-    unsafe { sp.write(value) };
+    unsafe { sp.write(PackedValue::pack(value)) };
     crate::jit::SpFlag {
         sp: unsafe { sp.add(1) },
         flag: 0,
@@ -17892,6 +19139,10 @@ thread_local! {
     pub(crate) static TEST_JIT_EXEC_ELEMENT_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// Actual compact checked reads, indexed by stack/local/method operand shape.
+    pub(crate) static TEST_JIT_GET_ELEM_HELPERS: std::cell::Cell<[usize; 3]> = const {
+        std::cell::Cell::new([0; 3])
+    };
 }
 
 /// Dedicated element-store entry (same contract as [`jit_exec`]): handles the four element
@@ -17901,7 +19152,7 @@ thread_local! {
 pub(crate) unsafe extern "C" fn jit_set_elem(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     #[cfg(test)]
     TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(count.get() + 1));
@@ -17913,28 +19164,15 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
         Op::SetElem | Op::SetElemDrop => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElem);
             sp = unsafe { sp.sub(1) };
-            let value = unsafe { sp.read() };
+            let value = unsafe { sp.read().into_value() };
             sp = unsafe { sp.sub(1) };
-            let key = unsafe { sp.read() };
+            let key = unsafe { sp.read().into_value() };
             sp = unsafe { sp.sub(1) };
-            let object = unsafe { sp.read() };
+            let object = unsafe { sp.read().into_value() };
             let retained = keep.then(|| value.clone());
-            if chunk.feedback.detailed_enabled() {
-                set_element_profiled(i, chunk, pc as usize, &object, &key, value)?;
-            } else if let (Value::Obj(o), Value::Num(n)) = (&object, &key) {
-                match i.fast_set_elem(o, *n, value) {
-                    Ok(()) => {}
-                    Err(back) => {
-                        let property_key = i.to_property_key(&key)?;
-                        i.set_member(&object, &property_key, back)?;
-                    }
-                }
-            } else {
-                let property_key = i.to_property_key(&key)?;
-                i.set_member(&object, &property_key, value)?;
-            }
+            set_computed_element(i, chunk, pc as usize, &object, &key, value)?;
             if let Some(value) = retained {
-                unsafe { sp.write(value) };
+                unsafe { sp.write(PackedValue::pack(value)) };
                 sp = unsafe { sp.add(1) };
             }
             Ok(())
@@ -17942,30 +19180,15 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
         Op::SetElemLocal(slot) | Op::SetElemLocalDrop(slot) => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElemLocal(_));
             sp = unsafe { sp.sub(1) };
-            let value = unsafe { sp.read() };
+            let value = unsafe { sp.read().into_value() };
             sp = unsafe { sp.sub(1) };
-            let key = unsafe { sp.read() };
+            let key = unsafe { sp.read().into_value() };
             if keep {
-                unsafe { sp.write(value.clone()) };
+                unsafe { sp.write(PackedValue::pack(value.clone())) };
                 sp = unsafe { sp.add(1) };
             }
             let local = unsafe { ctx.clone_slot(slot as usize) };
-            if chunk.feedback.detailed_enabled() {
-                set_element_profiled(i, chunk, pc as usize, &local, &key, value)?;
-            } else if let (Value::Obj(o), Value::Num(n)) = (&local, &key) {
-                match i.fast_set_elem(o, *n, value) {
-                    Ok(()) => {}
-                    Err(back) => {
-                        let object = local.clone();
-                        let property_key = i.to_property_key(&key)?;
-                        i.set_member(&object, &property_key, back)?;
-                    }
-                }
-            } else {
-                let object = local.clone();
-                let property_key = i.to_property_key(&key)?;
-                i.set_member(&object, &property_key, value)?;
-            }
+            set_computed_element(i, chunk, pc as usize, &local, &key, value)?;
             Ok(())
         }
         _ => unreachable!("jit_set_elem emitted only for element stores"),
@@ -17984,7 +19207,7 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
 pub(crate) unsafe extern "C" fn jit_new(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     let pc = packed & 0xFFFF;
@@ -17999,8 +19222,9 @@ pub(crate) unsafe extern "C" fn jit_new(
     if chunk.feedback.detailed_enabled() {
         let argc = argc as usize;
         let args_ptr = unsafe { sp.sub(argc) };
-        let callee = unsafe { (*sp.sub(argc + 1)).clone() };
-        let args = unsafe { std::slice::from_raw_parts(args_ptr, argc) };
+        let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
+        let args_values = DecodedArgs::new(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
+        let args = &*args_values;
         let value = match construct_profiled(i, chunk, pc as usize, callee, args) {
             Ok(value) => value,
             Err(abrupt) => {
@@ -18009,7 +19233,7 @@ pub(crate) unsafe extern "C" fn jit_new(
             }
         };
         sp = unsafe { jit_consume(sp, argc + 1) };
-        unsafe { sp.write(value) };
+        unsafe { sp.write(PackedValue::pack(value)) };
         return crate::jit::SpFlag {
             sp: unsafe { sp.add(1) },
             flag: 0,
@@ -18041,7 +19265,7 @@ pub(crate) unsafe extern "C" fn jit_new(
 pub(crate) unsafe extern "C" fn jit_instanceof(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
@@ -18049,15 +19273,15 @@ pub(crate) unsafe extern "C" fn jit_instanceof(
     let Op::InstanceOf(cache) = chunk.ops[pc as usize] else {
         unreachable!("jit_instanceof emitted only for InstanceOf");
     };
-    let rhs = unsafe { sp.sub(1).read() };
-    let lhs = unsafe { sp.sub(2).read() };
+    let rhs = unsafe { sp.sub(1).read().into_value() };
+    let lhs = unsafe { sp.sub(2).read().into_value() };
     let out = unsafe { &mut *ctx.interp }.instanceof_ic(&lhs, &rhs, &chunk.caches[cache as usize]);
     let base = unsafe { sp.sub(2) };
     drop(lhs);
     drop(rhs);
     match out {
         Ok(value) => {
-            unsafe { base.write(value) };
+            unsafe { base.write(PackedValue::pack(value)) };
             crate::jit::SpFlag {
                 sp: unsafe { base.add(1) },
                 flag: 0,
@@ -18075,16 +19299,22 @@ unsafe fn jit_new_inner(
     caller_ctx: Option<*mut crate::jit::JitCtx>,
     site: Option<(&Chunk, u32)>,
     argc: usize,
-    sp: &mut *mut Value,
+    sp: &mut *mut PackedValue,
 ) -> Result<(), Abrupt> {
     let args_ptr = unsafe { sp.sub(argc) };
     // Identity-cached construct: on Some the arguments were MOVED into the callee's frame — pop
     // them virtually and drop only the callee slot.
-    if let Some(r) =
-        unsafe { i.construct_jit_fast(&*sp.sub(argc + 1), args_ptr, argc, caller_ctx, site) }
-    {
+    if let Some(r) = unsafe {
+        i.construct_jit_fast(
+            &(*sp.sub(argc + 1)).unpack(),
+            args_ptr,
+            argc,
+            caller_ctx,
+            site,
+        )
+    } {
         *sp = unsafe { args_ptr.sub(1) };
-        match unsafe { sp.read() } {
+        match unsafe { sp.read().into_value() } {
             Value::Obj(o) => {
                 if Rc::strong_count(&o) > 1 {
                     unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
@@ -18095,15 +19325,16 @@ unsafe fn jit_new_inner(
             other => drop(other),
         }
         let v = r?;
-        unsafe { sp.write(v) };
+        unsafe { sp.write(PackedValue::pack(v)) };
         *sp = unsafe { sp.add(1) };
         return Ok(());
     }
-    let args = unsafe { std::slice::from_raw_parts(args_ptr, argc) };
-    let callee = unsafe { (*sp.sub(argc + 1)).clone() };
+    let args_values = DecodedArgs::new(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
+    let args = &*args_values;
+    let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
     let v = i.construct(callee, args)?;
     *sp = unsafe { jit_consume(*sp, argc + 1) };
-    unsafe { sp.write(v) };
+    unsafe { sp.write(PackedValue::pack(v)) };
     *sp = unsafe { sp.add(1) };
     Ok(())
 }
@@ -18122,7 +19353,7 @@ thread_local! {
 pub(crate) unsafe extern "C" fn jit_set_prop(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     #[cfg(test)]
     TEST_JIT_SET_PROP_HELPERS.with(|count| count.set(count.get() + 1));
@@ -18133,9 +19364,9 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     let r: Result<(), Abrupt> = (|| match chunk.ops[pc as usize] {
         Op::SetProp(n, c) => {
             sp = sp.sub(1);
-            let v = sp.read();
+            let v = sp.read().into_value();
             sp = sp.sub(1);
-            let obj = sp.read();
+            let obj = sp.read().into_value();
             set_named_property(
                 i,
                 chunk,
@@ -18145,15 +19376,15 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                 v.clone(),
                 &chunk.caches[c as usize],
             )?;
-            sp.write(v);
+            sp.write(PackedValue::pack(v));
             sp = sp.add(1);
             Ok(())
         }
         Op::SetPropDrop(n, c) => {
             sp = sp.sub(1);
-            let v = sp.read();
+            let v = sp.read().into_value();
             sp = sp.sub(1);
-            let obj = sp.read();
+            let obj = sp.read().into_value();
             set_named_property(
                 i,
                 chunk,
@@ -18166,7 +19397,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
         }
         Op::SetPropThisDrop(n, c) => {
             sp = sp.sub(1);
-            let v = sp.read();
+            let v = sp.read().into_value();
             let this = (*ctx.this_raw).clone();
             set_named_property(
                 i,
@@ -18180,7 +19411,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
         }
         Op::SetPropLocalDrop(s, n, c) => {
             sp = sp.sub(1);
-            let v = sp.read();
+            let v = sp.read().into_value();
             let obj = ctx.clone_slot(s as usize);
             if matches!(obj, Value::Empty) {
                 return Err(i.throw(
@@ -18242,35 +19473,114 @@ fn get_computed_element(
     i.get_member(obj, &key)
 }
 
-/// Dedicated computed-method entry. Both operands move out before any coercion/getter can
-/// throw, so the returned stack pointer never asks the unwinder to destroy them a second time.
-pub(crate) unsafe extern "C" fn jit_get_method_elem(
+/// PutValue for a computed property Reference. The caller has evaluated the RHS;
+/// ToObject must now reject a nullish base before ToPropertyKey can execute author
+/// code. Keep the resulting String-or-Symbol owner alive through [[Set]]. Shared
+/// by the VM, native slow entry and exact-PC fallback (ECMA-262 e28783d5,
+/// sec-putvalue, sec-evaluate-property-access-with-expression-key).
+#[inline]
+fn set_computed_element(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    object: &Value,
+    key: &Value,
+    value: Value,
+) -> Result<(), Abrupt> {
+    if chunk.feedback.detailed_enabled() {
+        return set_element_profiled(i, chunk, pc, object, key, value);
+    }
+    if matches!(object, Value::Undefined | Value::Null) {
+        return Err(i.throw("TypeError", "cannot set property of null or undefined"));
+    }
+    let value = if let (Value::Obj(object), Value::Num(index)) = (object, key) {
+        match i.fast_set_elem(object, *index, value) {
+            Ok(()) => return Ok(()),
+            Err(value) => value,
+        }
+    } else {
+        value
+    };
+    let key = i.to_property_key(key)?;
+    i.set_member(object, &key, value)
+}
+
+/// Compact computed-read boundary for the three receiver/operand shapes. Move consumed
+/// operands out before author code and publish only an owned PackedValue on success (plus
+/// the original receiver for a method Reference). This deliberately does not route a wide
+/// Result<Value, Abrupt> through the generic opcode dispatcher's shared result temporary.
+///
+/// ECMA-262 e28783d5, GetValue and EvaluatePropertyAccessWithExpressionKey: the evaluated
+/// key is used once, ToObject precedes ToPropertyKey, and [[Get]] keeps the original receiver.
+/// On failure `base` excludes every moved owner; the unwinder must not drop them again.
+pub(crate) unsafe extern "C" fn jit_get_element(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     unsafe { jit_opstat(ctx, pc) };
-    let base = unsafe { sp.sub(2) };
-    let obj = unsafe { base.read() };
-    let key = unsafe { base.add(1).read() };
-    if ctx.opstat_enabled {
+    let chunk = unsafe { &*ctx.chunk };
+    #[cfg(test)]
+    TEST_JIT_GET_ELEM_HELPERS.with(|count| {
+        let mut counts = count.get();
+        counts[match chunk.ops[pc as usize] {
+            Op::GetElem => 0,
+            Op::GetElemLocal(_) => 1,
+            Op::GetMethodElem => 2,
+            _ => unreachable!("computed-read helper opcode"),
+        }] += 1;
+        count.set(counts);
+    });
+    let (base, obj, key, method) = match chunk.ops[pc as usize] {
+        Op::GetElem | Op::GetMethodElem => {
+            let base = unsafe { sp.sub(2) };
+            let object = unsafe { base.read().into_value() };
+            let key = unsafe { base.add(1).read().into_value() };
+            (
+                base,
+                object,
+                key,
+                matches!(chunk.ops[pc as usize], Op::GetMethodElem),
+            )
+        }
+        Op::GetElemLocal(slot) => {
+            let base = unsafe { sp.sub(1) };
+            let key = unsafe { base.read().into_value() };
+            // Clone before a coercion/getter can reenter and overwrite the canonical slot.
+            let object = unsafe { ctx.clone_slot(slot as usize) };
+            if matches!(object, Value::Empty) {
+                ctx.error = Some(unsafe { &mut *ctx.interp }.throw(
+                    "ReferenceError",
+                    format!(
+                        "cannot access '{}' before initialization",
+                        chunk.slot_names[slot as usize]
+                    ),
+                ));
+                return crate::jit::SpFlag { sp: base, flag: 1 };
+            }
+            (base, object, key, false)
+        }
+        _ => unreachable!("jit_get_element emitted only for computed reads"),
+    };
+    if method && ctx.opstat_enabled {
         jit_method_operand_stat(&obj, &key);
     }
-    let result = get_computed_element(
-        unsafe { &mut *ctx.interp },
-        unsafe { &*ctx.chunk },
-        pc as usize,
-        &obj,
-        &key,
-    );
+    let result = get_computed_element(unsafe { &mut *ctx.interp }, chunk, pc as usize, &obj, &key);
     match result {
-        Ok(method) => {
+        Ok(value) => {
+            let mut output = base;
             unsafe {
-                base.write(obj);
-                base.add(1).write(method);
+                if method {
+                    output.write(PackedValue::pack(obj));
+                    output = output.add(1);
+                }
+                output.write(PackedValue::pack(value));
             }
-            crate::jit::SpFlag { sp, flag: 0 }
+            crate::jit::SpFlag {
+                sp: unsafe { output.add(1) },
+                flag: 0,
+            }
         }
         Err(error) => {
             ctx.error = Some(error);
@@ -18279,13 +19589,17 @@ pub(crate) unsafe extern "C" fn jit_get_method_elem(
     }
 }
 
+#[cfg(test)]
+#[path = "bytecode_computed_read_tests.rs"]
+mod computed_read_helper_tests;
+
 /// Dedicated property-read entry (same contract as [`jit_exec`]): straight into
 /// [`crate::interpreter::Interp::get_prop_ic`] for the four read shapes, skipping the generic
 /// op decode.
 pub(crate) unsafe extern "C" fn jit_get_prop(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -18295,7 +19609,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
         match chunk.ops[pc as usize] {
             Op::GetProp(n, c) => {
                 sp = sp.sub(1);
-                let obj = sp.read();
+                let obj = sp.read().into_value();
                 let v = get_named_property(
                     i,
                     chunk,
@@ -18304,7 +19618,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
-                sp.write(v);
+                sp.write(PackedValue::pack(v));
                 sp = sp.add(1);
                 Ok(())
             }
@@ -18318,7 +19632,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
-                sp.write(v);
+                sp.write(PackedValue::pack(v));
                 sp = sp.add(1);
                 Ok(())
             }
@@ -18341,12 +19655,12 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
-                sp.write(v);
+                sp.write(PackedValue::pack(v));
                 sp = sp.add(1);
                 Ok(())
             }
             Op::GetMethod(n, c) => {
-                let obj = &*sp.sub(1); // receiver stays on the stack
+                let obj = &(*sp.sub(1)).unpack(); // receiver stays on the stack
                 let m = get_named_property(
                     i,
                     chunk,
@@ -18355,7 +19669,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
-                sp.write(m);
+                sp.write(PackedValue::pack(m));
                 sp = sp.add(1);
                 Ok(())
             }
@@ -18377,7 +19691,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
 pub(crate) unsafe extern "C" fn jit_call(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
@@ -18393,13 +19707,13 @@ pub(crate) unsafe extern "C" fn jit_call(
 unsafe fn jit_call_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    sp: &mut *mut Value,
+    sp: &mut *mut PackedValue,
 ) -> Result<(), Abrupt> {
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
     macro_rules! push {
         ($v:expr) => {{
-            sp.write($v);
+            sp.write(PackedValue::pack($v));
             *sp = sp.add(1);
         }};
     }
@@ -18410,10 +19724,11 @@ unsafe fn jit_call_inner(
     };
     let args_ptr = sp.sub(argc);
     if chunk.feedback.detailed_enabled() {
-        let args = std::slice::from_raw_parts(args_ptr, argc);
-        let callee = (*sp.sub(argc + 1)).clone();
+        let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
+        let args = &*args_values;
+        let callee = (*sp.sub(argc + 1)).unpack();
         let this = if with_this {
-            (*sp.sub(argc + 2)).clone()
+            (*sp.sub(argc + 2)).unpack()
         } else {
             Value::Undefined
         };
@@ -18424,15 +19739,15 @@ unsafe fn jit_call_inner(
     }
     // See the Op::Call arm of `jit_exec_inner` for the ownership story: on Some the arguments
     // and the `this` slot were MOVED into the callee.
-    let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);
-    let this_slot: *const Value = if with_this {
+    let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
+    let this_slot: *const PackedValue = if with_this {
         sp.sub(argc + 2)
     } else {
-        &raw mut *undef as *const Value
+        &raw mut *undef as *const PackedValue
     };
     let mut r = i.call_jit_cached(
         &chunk.call_caches[c as usize],
-        &*sp.sub(argc + 1),
+        &(*sp.sub(argc + 1)).unpack(),
         this_slot,
         args_ptr,
         argc,
@@ -18443,7 +19758,7 @@ unsafe fn jit_call_inner(
         // entry (identity-pinned like a user callee), so subsequent calls take the machine-code
         // probe + `call_native_committed` — no receiver borrow, no `Callable` dispatch.
         {
-            let callee = &*sp.sub(argc + 1);
+            let callee = &(*sp.sub(argc + 1)).unpack();
             if let Value::Obj(o) = callee {
                 let nf = {
                     let object = o.borrow();
@@ -18575,16 +19890,17 @@ unsafe fn jit_call_inner(
                             }
                         }
                     }
-                    let mut undef2 = std::mem::ManuallyDrop::new(Value::Undefined);
-                    let this_slot2: *const Value = if with_this {
+                    let mut undef2 =
+                        std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
+                    let this_slot2: *const PackedValue = if with_this {
                         sp.sub(argc + 2)
                     } else {
-                        &raw mut *undef2 as *const Value
+                        &raw mut *undef2 as *const PackedValue
                     };
                     let r = i.call_native_committed(nf, this_slot2, args_ptr, argc);
                     // Arguments and `this` were consumed; drop only the callee slot.
                     *sp = args_ptr.sub(1);
-                    match sp.read() {
+                    match sp.read().into_value() {
                         Value::Obj(o) => {
                             if Rc::strong_count(&o) > 1 {
                                 unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
@@ -18606,7 +19922,7 @@ unsafe fn jit_call_inner(
     }
     if r.is_none() {
         r = i.call_jit_fast(
-            &*sp.sub(argc + 1),
+            &(*sp.sub(argc + 1)).unpack(),
             this_slot,
             args_ptr,
             argc,
@@ -18618,7 +19934,7 @@ unsafe fn jit_call_inner(
         // Drop the callee/method slot. It is virtually always a function object with other
         // live references, so peel that case into a bare refcount decrement instead of the
         // outlined generic Value drop.
-        match sp.read() {
+        match sp.read().into_value() {
             Value::Obj(o) => {
                 if Rc::strong_count(&o) > 1 {
                     unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
@@ -18635,10 +19951,11 @@ unsafe fn jit_call_inner(
         push!(v);
         return Ok(());
     }
-    let args = std::slice::from_raw_parts(args_ptr, argc);
-    let callee = (*sp.sub(argc + 1)).clone();
+    let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
+    let args = &*args_values;
+    let callee = (*sp.sub(argc + 1)).unpack();
     let this = if with_this {
-        (*sp.sub(argc + 2)).clone()
+        (*sp.sub(argc + 2)).unpack()
     } else {
         Value::Undefined
     };
@@ -18688,7 +20005,7 @@ unsafe fn jit_callstat(
     ic: &CallIc,
     argc: usize,
     with_this: bool,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) {
     if !ctx.callstat_enabled || !jit_profile_window_open() {
         return;
@@ -18729,7 +20046,7 @@ unsafe fn jit_callstat(
     {
         NATIVES.with(|counts| {
             let mut counts = counts.borrow_mut();
-            let name = match &*sp.sub(argc + 1) {
+            let name = match &(*sp.sub(argc + 1)).unpack() {
                 Value::Obj(o) => {
                     let borrowed = o.borrow();
                     match &borrowed.call {
@@ -18785,13 +20102,12 @@ unsafe fn jit_callstat(
             if !with_this {
                 break 'r "gate: sloppy this-user, no receiver";
             }
-            let tag = *(sp.sub(argc + 2) as *const u8);
-            if tag != 8 {
+            if !matches!((*sp.sub(argc + 2)).unpack(), Value::Obj(_)) {
                 break 'r "gate: sloppy this-user, non-object receiver";
             }
         }
-        if let Value::Obj(o) = &*sp.sub(argc + 1) {
-            if Rc::strong_count(o) <= 1 {
+        if let Value::Obj(o) = &(*sp.sub(argc + 1)).unpack() {
+            if Rc::strong_count(o) <= 2 {
                 break 'r "gate: callee refcount <= 1";
             }
         }
@@ -18934,7 +20250,7 @@ fn stage_tail_call(
 unsafe fn jit_exec_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
-    sp: &mut *mut Value,
+    sp: &mut *mut PackedValue,
 ) -> Result<(), Abrupt> {
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
@@ -18948,22 +20264,30 @@ unsafe fn jit_exec_inner(
         Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
     });
     let env: &Env = &env_h;
-    // Stack-only helpers leave locals packed. Do not form a Value slice over NaN-boxed
-    // words: those words neither have Value's stride nor its valid enum discriminants.
-    let slots = if ctx.slots_packed {
-        &mut []
-    } else {
-        std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots)
-    };
+    let cap_env = ctx
+        .activation
+        .as_ref()
+        .filter(|activation| activation.chunk == ctx.chunk)
+        .map_or_else(
+            || {
+                if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk {
+                    &*(*ctx.resume_activation).cap_env
+                } else {
+                    env
+                }
+            },
+            |activation| &activation.cap_env,
+        );
+    let slots = std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots);
     macro_rules! pop {
         () => {{
             *sp = sp.sub(1);
-            sp.read()
+            sp.read().into_value()
         }};
     }
     macro_rules! push {
         ($v:expr) => {{
-            sp.write($v);
+            sp.write(PackedValue::pack($v));
             *sp = sp.add(1);
         }};
     }
@@ -18971,21 +20295,24 @@ unsafe fn jit_exec_inner(
         Op::Const(k) => push!(chunk.consts[k as usize].clone()),
         Op::Undef => push!(Value::Undefined),
         Op::Dup => {
-            let t = (*sp.sub(1)).clone();
-            push!(t);
+            let value = (*sp.sub(1)).clone();
+            sp.write(value);
+            *sp = sp.add(1);
         }
         Op::Pop => {
-            pop!();
+            *sp = sp.sub(1);
+            std::ptr::drop_in_place(*sp);
         }
         Op::Dup2 => {
             let a = (*sp.sub(2)).clone();
             let b = (*sp.sub(1)).clone();
-            push!(a);
-            push!(b);
+            sp.write(a);
+            sp.add(1).write(b);
+            *sp = sp.add(2);
         }
         Op::LoadLocal(s) => {
-            let v = slots[s as usize].clone();
-            if matches!(v, Value::Empty) {
+            let v = &slots[s as usize];
+            if v.is_empty() {
                 return Err(i.throw(
                     "ReferenceError",
                     format!(
@@ -18994,12 +20321,16 @@ unsafe fn jit_exec_inner(
                     ),
                 ));
             }
-            push!(v);
+            sp.write(v.clone());
+            *sp = sp.add(1);
         }
-        Op::StoreLocal(s) => slots[s as usize] = pop!(),
+        Op::StoreLocal(s) => {
+            *sp = sp.sub(1);
+            slots[s as usize] = sp.read();
+        }
         Op::UpdateLocal(s, kind) => {
             let idx = s as usize;
-            if matches!(slots[idx], Value::Empty) {
+            if matches!(slots.read_value(idx), Value::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
                     format!(
@@ -19008,30 +20339,32 @@ unsafe fn jit_exec_inner(
                     ),
                 ));
             }
-            let old = slots[idx].clone();
+            let old = slots.read_value(idx);
             if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |_, v| {
-                slots[idx] = v;
+                slots.write_value(idx, v);
                 Ok(())
             })? {
                 push!(v);
             }
         }
-        Op::Tdz(s) => slots[s as usize] = Value::Empty,
+        Op::Tdz(s) => slots.write_value(s as usize, Value::Empty),
         Op::LoadCap(n) => {
-            push!(chunk.load_cap_ic(i, env, n)?);
+            push!(chunk.load_cap_ic(i, cap_env, n)?);
         }
         Op::StoreCap(n) => {
             let v = pop!();
-            chunk.store_cap_ic(i, env, n, v, false)?;
+            chunk.store_cap_ic(i, cap_env, n, v, false)?;
         }
         Op::StoreCapInit(n) => {
             let v = pop!();
-            chunk.store_cap_ic(i, env, n, v, true)?;
+            chunk.store_cap_ic(i, cap_env, n, v, true)?;
         }
         Op::UpdateCap(n, kind) => {
             let name = &chunk.names[n as usize];
+            let mut reference =
+                crate::eval::PreparedReference::scope(name.clone(), cap_env.clone(), i.strict);
             let old = {
-                let b = env.borrow();
+                let b = cap_env.borrow();
                 let bd = b.vars.get(name).expect("captured binding missing");
                 if !bd.initialized {
                     let msg = format!("cannot access '{name}' before initialization");
@@ -19040,29 +20373,27 @@ unsafe fn jit_exec_inner(
                 }
                 bd.value.clone()
             };
-            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |_, v| {
-                if let Some(bd) = env.borrow_mut().vars.get_mut(name) {
-                    bd.value = v;
-                }
-                Ok(())
+            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                i.write_prepared_reference(&mut reference, v)
             })? {
                 push!(v);
             }
         }
         Op::UpdateName(n, kind) => {
-            let name = &chunk.names[n as usize];
-            let old = i.get_var(name, env)?;
+            let mut reference = chunk.resolve_name_reference(i, env, n)?;
+            let old = i.read_prepared_reference(&mut reference)?;
             if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.assign_free_name(name, v, env)
+                i.write_prepared_reference(&mut reference, v)
             })? {
                 push!(v);
             }
         }
         Op::UpdateNameCached(n, c, kind) => {
-            let name = &chunk.names[n as usize];
-            let old = chunk.load_name_ic(i, env, n, c)?;
+            let mut reference = chunk.resolve_name_reference(i, env, n)?;
+            let old = i.read_prepared_reference(&mut reference)?;
+            let _ = chunk.name_ic_fill(i, env, n, c);
             if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.assign_free_name(name, v, env)
+                i.write_prepared_reference(&mut reference, v)
             })? {
                 push!(v);
             }
@@ -19087,6 +20418,10 @@ unsafe fn jit_exec_inner(
         Op::StoreName(n) => {
             let v = pop!();
             i.assign_free_name(&chunk.names[n as usize], v, env)?;
+        }
+        Op::StoreGlobalName(n) => {
+            let v = pop!();
+            i.assign_free_name(&chunk.names[n as usize], v, &i.global_env.clone())?;
         }
         Op::StoreNameCached(n, c) => {
             let v = pop!();
@@ -19118,7 +20453,7 @@ unsafe fn jit_exec_inner(
             push!(v);
         }
         Op::GetPropLocal(s, n, c) => {
-            let obj = slots[s as usize].clone();
+            let obj = slots.read_value(s as usize);
             if matches!(obj, Value::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
@@ -19180,7 +20515,7 @@ unsafe fn jit_exec_inner(
         }
         Op::SetPropLocalDrop(s, n, c) => {
             let v = pop!();
-            let obj = slots[s as usize].clone();
+            let obj = slots.read_value(s as usize);
             if matches!(obj, Value::Empty) {
                 return Err(i.throw(
                     "ReferenceError",
@@ -19201,7 +20536,7 @@ unsafe fn jit_exec_inner(
             )?;
         }
         Op::DestructureGuard => {
-            if matches!(&*sp.sub(1), Value::Undefined | Value::Null) {
+            if matches!(&(*sp.sub(1)).unpack(), Value::Undefined | Value::Null) {
                 return Err(i.throw("TypeError", "cannot destructure null or undefined"));
             }
         }
@@ -19271,19 +20606,16 @@ unsafe fn jit_exec_inner(
                 CallArgsMode::Fixed(argc) => {
                     *sp = sp.sub(argc as usize);
                     (0..argc as usize)
-                        .map(|index| sp.add(index).read())
+                        .map(|index| sp.add(index).read().into_value())
                         .collect()
                 }
                 CallArgsMode::FinalSpread(argc) => {
                     let spread = pop!();
                     *sp = sp.sub(argc as usize - 1);
                     let mut args: Vec<Value> = (0..argc as usize - 1)
-                        .map(|index| sp.add(index).read())
+                        .map(|index| sp.add(index).read().into_value())
                         .collect();
-                    let (iterator, next) = i.get_iterator(&spread)?;
-                    while let Some(value) = i.iterator_step(&iterator, &next)? {
-                        args.push(value);
-                    }
+                    i.append_spread_arguments(&spread, &mut args)?;
                     args
                 }
                 CallArgsMode::Array => argument_array_values(i, pop!()),
@@ -19304,10 +20636,7 @@ unsafe fn jit_exec_inner(
                 Value::Undefined
             };
             let mut args = plain;
-            let (it, nx) = i.get_iterator(&spread)?;
-            while let Some(x) = i.iterator_step(&it, &nx)? {
-                args.push(x);
-            }
+            i.append_spread_arguments(&spread, &mut args)?;
             let v = if chunk.feedback.detailed_enabled() {
                 call_profiled(i, chunk, pc as usize, callee, this, &args)?
             } else {
@@ -19363,55 +20692,18 @@ unsafe fn jit_exec_inner(
             let v = pop!();
             let key = pop!();
             let obj = pop!();
-            if chunk.feedback.detailed_enabled() {
-                let ret = v.clone();
-                set_element_profiled(i, chunk, pc as usize, &obj, &key, v)?;
-                push!(ret);
-                return Ok(());
-            }
-            if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
-                let ret = v.clone();
-                match i.fast_set_elem(o, *n, v) {
-                    Ok(()) => {
-                        push!(ret);
-                        return Ok(());
-                    }
-                    Err(back) => {
-                        let k = i.to_property_key(&key)?;
-                        i.set_member(&obj, &k, back)?;
-                        push!(ret);
-                        return Ok(());
-                    }
-                }
-            }
-            let k = i.to_property_key(&key)?;
-            i.set_member(&obj, &k, v.clone())?;
+            set_computed_element(i, chunk, pc as usize, &obj, &key, v.clone())?;
             push!(v);
         }
         Op::SetElemDrop => {
             let v = pop!();
             let key = pop!();
             let obj = pop!();
-            if chunk.feedback.detailed_enabled() {
-                set_element_profiled(i, chunk, pc as usize, &obj, &key, v)?;
-                return Ok(());
-            }
-            if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
-                match i.fast_set_elem(o, *n, v) {
-                    Ok(()) => return Ok(()),
-                    Err(back) => {
-                        let k = i.to_property_key(&key)?;
-                        i.set_member(&obj, &k, back)?;
-                        return Ok(());
-                    }
-                }
-            }
-            let k = i.to_property_key(&key)?;
-            i.set_member(&obj, &k, v)?;
+            set_computed_element(i, chunk, pc as usize, &obj, &key, v)?;
         }
         Op::GetElemLocal(s) => {
             let key = pop!();
-            let obj = slots[s as usize].clone();
+            let obj = slots.read_value(s as usize);
             let value = get_computed_element(i, chunk, pc as usize, &obj, &key)?;
             push!(value);
         }
@@ -19419,31 +20711,11 @@ unsafe fn jit_exec_inner(
             let keep = matches!(chunk.ops[pc as usize], Op::SetElemLocal(_));
             let v = pop!();
             let key = pop!();
-            if chunk.feedback.detailed_enabled() {
-                if keep {
-                    push!(v.clone());
-                }
-                let obj = slots[s as usize].clone();
-                set_element_profiled(i, chunk, pc as usize, &obj, &key, v)?;
-                return Ok(());
-            }
             if keep {
                 push!(v.clone());
             }
-            if let (Value::Obj(o), Value::Num(n)) = (&slots[s as usize], &key) {
-                match i.fast_set_elem(o, *n, v) {
-                    Ok(()) => return Ok(()),
-                    Err(back) => {
-                        let obj = slots[s as usize].clone();
-                        let k = i.to_property_key(&key)?;
-                        i.set_member(&obj, &k, back)?;
-                        return Ok(());
-                    }
-                }
-            }
-            let obj = slots[s as usize].clone();
-            let k = i.to_property_key(&key)?;
-            i.set_member(&obj, &k, v)?;
+            let obj = slots.read_value(s as usize);
+            set_computed_element(i, chunk, pc as usize, &obj, &key, v)?;
         }
         Op::UpdateProp(n, c, kind) => {
             let obj = pop!();
@@ -19499,28 +20771,28 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::ToPropKey => {
-            if matches!(&*sp.sub(2), Value::Undefined | Value::Null) {
+            if matches!(&(*sp.sub(2)).unpack(), Value::Undefined | Value::Null) {
                 return Err(i.throw("TypeError", "cannot access property of null or undefined"));
             }
-            match &*sp.sub(1) {
-                Value::Num(_) | Value::Str(_) => {}
+            match &(*sp.sub(1)).unpack() {
+                Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
                 _ => {
                     let key = pop!();
                     let k = i.to_property_key(&key)?;
-                    push!(Value::str(k.into_string()));
+                    push!(k.into_value());
                 }
             }
         }
         Op::ToPropKeyLocal(s) => {
-            if matches!(slots[s as usize], Value::Undefined | Value::Null) {
+            if matches!(slots.read_value(s as usize), Value::Undefined | Value::Null) {
                 return Err(i.throw("TypeError", "cannot access property of null or undefined"));
             }
-            match &*sp.sub(1) {
-                Value::Num(_) | Value::Str(_) => {}
+            match &(*sp.sub(1)).unpack() {
+                Value::Num(_) | Value::Str(_) | Value::Sym(_) => {}
                 _ => {
                     let key = pop!();
                     let k = i.to_property_key(&key)?;
-                    push!(Value::str(k.into_string()));
+                    push!(k.into_value());
                 }
             }
         }
@@ -19644,8 +20916,9 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
             if chunk.feedback.detailed_enabled() {
-                let args = std::slice::from_raw_parts(args_ptr, argc);
-                let callee = (*sp.sub(argc + 1)).clone();
+                let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
+                let args = &*args_values;
+                let callee = (*sp.sub(argc + 1)).unpack();
                 let value = call_profiled(i, chunk, pc as usize, callee, Value::Undefined, args)?;
                 *sp = jit_consume(*sp, argc + 1);
                 push!(value);
@@ -19657,18 +20930,18 @@ unsafe fn jit_exec_inner(
             // Some (no double drop), and leaking it on None is a no-op (no payload).
             // The per-site callee cache short-circuits the dispatch guards on an identity hit;
             // a miss falls into `call_jit_fast`, which refills it.
-            let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);
+            let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
             let mut r = i.call_jit_cached(
                 &chunk.call_caches[c as usize],
-                &*sp.sub(argc + 1),
-                &raw mut *undef as *const Value,
+                &(*sp.sub(argc + 1)).unpack(),
+                &raw mut *undef as *const PackedValue,
                 args_ptr,
                 argc,
             );
             if r.is_none() {
                 r = i.call_jit_fast(
-                    &*sp.sub(argc + 1),
-                    &raw mut *undef as *const Value,
+                    &(*sp.sub(argc + 1)).unpack(),
+                    &raw mut *undef as *const PackedValue,
                     args_ptr,
                     argc,
                     Some((&chunk.call_caches[c as usize], &chunk.call_pins)),
@@ -19681,8 +20954,9 @@ unsafe fn jit_exec_inner(
                 push!(v);
                 return Ok(());
             }
-            let args = std::slice::from_raw_parts(args_ptr, argc);
-            let callee = (*sp.sub(argc + 1)).clone();
+            let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
+            let args = &*args_values;
+            let callee = (*sp.sub(argc + 1)).unpack();
             let v = i.call(callee, Value::Undefined, args)?;
             *sp = jit_consume(*sp, argc + 1);
             push!(v);
@@ -19705,9 +20979,10 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             let args_ptr = sp.sub(argc);
             if chunk.feedback.detailed_enabled() {
-                let args = std::slice::from_raw_parts(args_ptr, argc);
-                let method = (*sp.sub(argc + 1)).clone();
-                let this = (*sp.sub(argc + 2)).clone();
+                let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
+                let args = &*args_values;
+                let method = (*sp.sub(argc + 1)).unpack();
+                let this = (*sp.sub(argc + 2)).unpack();
                 let value = call_profiled(i, chunk, pc as usize, method, this, args)?;
                 *sp = jit_consume(*sp, argc + 2);
                 push!(value);
@@ -19715,14 +20990,14 @@ unsafe fn jit_exec_inner(
             }
             let mut r = i.call_jit_cached(
                 &chunk.call_caches[c as usize],
-                &*sp.sub(argc + 1),
+                &(*sp.sub(argc + 1)).unpack(),
                 sp.sub(argc + 2),
                 args_ptr,
                 argc,
             );
             if r.is_none() {
                 r = i.call_jit_fast(
-                    &*sp.sub(argc + 1),
+                    &(*sp.sub(argc + 1)).unpack(),
                     sp.sub(argc + 2),
                     args_ptr,
                     argc,
@@ -19737,9 +21012,10 @@ unsafe fn jit_exec_inner(
                 push!(v);
                 return Ok(());
             }
-            let args = std::slice::from_raw_parts(args_ptr, argc);
-            let m = (*sp.sub(argc + 1)).clone();
-            let this = (*sp.sub(argc + 2)).clone();
+            let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
+            let args = &*args_values;
+            let m = (*sp.sub(argc + 1)).unpack();
+            let this = (*sp.sub(argc + 2)).unpack();
             let v = i.call(m, this, args)?;
             *sp = jit_consume(*sp, argc + 2);
             push!(v);
@@ -19748,8 +21024,9 @@ unsafe fn jit_exec_inner(
             let argc = argc as usize;
             if chunk.feedback.detailed_enabled() {
                 let args_ptr = sp.sub(argc);
-                let callee = (*sp.sub(argc + 1)).clone();
-                let args = std::slice::from_raw_parts(args_ptr, argc);
+                let callee = (*sp.sub(argc + 1)).unpack();
+                let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
+                let args = &*args_values;
                 let value = construct_profiled(i, chunk, pc as usize, callee, args)?;
                 *sp = jit_consume(*sp, argc + 1);
                 push!(value);
@@ -19783,7 +21060,7 @@ unsafe fn jit_exec_inner(
             let mut items = Vec::with_capacity(n);
             let base = sp.sub(n);
             for k in 0..n {
-                items.push(base.add(k).read());
+                items.push(base.add(k).read().into_value());
             }
             *sp = base;
             let value = i.make_array(items);
@@ -19800,7 +21077,7 @@ unsafe fn jit_exec_inner(
             let mut values = Vec::with_capacity(count);
             let base = sp.sub(count);
             for k in 0..count {
-                values.push(base.add(k).read());
+                values.push(base.add(k).read().into_value());
             }
             *sp = base;
             let keys = &chunk.names[start as usize..start as usize + count];
@@ -19833,22 +21110,22 @@ unsafe fn jit_exec_inner(
             // owners are dropped by Rust on an abrupt completion, never again by the JIT.
             let value = pop!();
             let key = pop!();
-            let key = i.to_property_key(&key)?.into_string();
+            let key = i.to_property_key(&key)?;
             if name_anonymous {
                 let name = i.fn_name_for_key(&key);
                 i.set_fn_name(&value, &name);
             }
-            let Value::Obj(object) = &*sp.sub(1) else {
+            let Value::Obj(object) = &(*sp.sub(1)).unpack() else {
                 unreachable!("object literal builder retains an Object")
             };
             object
                 .borrow_mut()
                 .props
-                .insert(key, crate::value::Property::plain(value));
+                .insert(key.as_str(), crate::value::Property::plain(value));
         }
         Op::ObjectProto => {
             let prototype = pop!();
-            let Value::Obj(object) = &*sp.sub(1) else {
+            let Value::Obj(object) = &(*sp.sub(1)).unpack() else {
                 unreachable!("object literal builder retains an Object")
             };
             // This is a fresh, unexposed ordinary object, not an author-visible
@@ -19858,6 +21135,21 @@ unsafe fn jit_exec_inner(
                 Value::Null => object.borrow_mut().proto = None,
                 _ => {}
             }
+        }
+        Op::ObjectSpread => {
+            // ECMA-262 CopyDataProperties: retain the fresh target on the live
+            // stack while source getters/proxy traps run, and consume the source
+            // before any fallible operation so unwind cannot drop it twice.
+            let source = pop!();
+            let Value::Obj(object) = &(*sp.sub(1)).unpack() else {
+                unreachable!("object literal builder retains an Object")
+            };
+            i.copy_data_properties_into(object, &source, &[])?;
+        }
+        Op::NewTarget => {
+            // GetNewTarget follows the nearest this-binding Environment Record;
+            // an arrow must observe its defining environment, not the caller.
+            push!(i.new_target_vm(env));
         }
         Op::ToStr => {
             let v = pop!();
@@ -19879,12 +21171,7 @@ unsafe fn jit_exec_inner(
         }
         Op::ForInKeys => {
             let source = pop!();
-            let keys = i
-                .for_in_keys(&source)?
-                .into_iter()
-                .map(Value::Str)
-                .collect();
-            push!(i.make_array(keys));
+            push!(i.for_in_keys(&source)?.into_value());
         }
         Op::ForInStepL(keys, index, source) => {
             if let Some(key) = for_in_step(i, slots, keys, index, source)? {
@@ -19896,8 +21183,8 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::IterStepL(is, ns) => {
-            let it = slots[is as usize].clone();
-            let nx = slots[ns as usize].clone();
+            let it = slots.read_value(is as usize);
+            let nx = slots.read_value(ns as usize);
             match i.iterator_step(&it, &nx)? {
                 Some(v) => {
                     push!(v);
@@ -19910,12 +21197,12 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::IterCloseL(s) => {
-            let it = slots[s as usize].clone();
+            let it = slots.read_value(s as usize);
             i.iterator_close_normal(&it)?;
         }
         Op::IterAbortL(s) => {
             let exc = pop!();
-            let it = slots[s as usize].clone();
+            let it = slots.read_value(s as usize);
             i.iterator_close(&it);
             return Err(Abrupt::Throw(exc));
         }
@@ -19925,10 +21212,12 @@ unsafe fn jit_exec_inner(
         }
         Op::ResetSlots(start, count) => {
             for k in start as usize..start as usize + count as usize {
-                slots[k] = Value::Undefined;
+                slots.write_value(k, Value::Undefined);
             }
         }
-        Op::Jump(_)
+        Op::FragmentExit(_)
+        | Op::AnnexBSync(_)
+        | Op::Jump(_)
         | Op::StoreConstLocal(..)
         | Op::StoreConstCap(_)
         | Op::UpdateConst(..)
@@ -19962,10 +21251,8 @@ unsafe fn jit_exec_inner(
         | Op::ArraySpread
         | Op::EvalCallArgsArray
         | Op::TailEvalCallArgsArray
-        | Op::ObjectSpread
         | Op::ObjectMethod(..)
         | Op::ImportMeta
-        | Op::NewTarget
         | Op::DynamicImport(..)
         | Op::PrivateIn(_)
         | Op::GetPrivate(_)
@@ -20017,31 +21304,26 @@ unsafe fn jit_exec_inner(
 }
 
 /// Drop `n` consumed operands below `sp` (post-call cleanup) and return the new top.
-unsafe fn jit_consume(sp: *mut Value, n: usize) -> *mut Value {
+unsafe fn jit_consume(sp: *mut PackedValue, n: usize) -> *mut PackedValue {
     let base = sp.sub(n);
     for k in 0..n {
-        // Tag peek: trivially-copyable tags (repr(u8) discriminants 0..=4) skip the outlined
-        // drop — operands are overwhelmingly numbers.
-        let p = base.add(k);
-        if *(p as *const u8) >= 5 {
-            std::ptr::drop_in_place(p);
-        }
+        std::ptr::drop_in_place(base.add(k));
     }
     base
 }
 
 unsafe fn jit_bin_num(
     i: &mut Interp,
-    sp: &mut *mut Value,
+    sp: &mut *mut PackedValue,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<(), Abrupt> {
     *sp = sp.sub(1);
-    let b = sp.read();
+    let b = sp.read().into_value();
     *sp = sp.sub(1);
-    let a = sp.read();
+    let a = sp.read().into_value();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
     let v = if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
         Value::Num(f(*x, *y))
@@ -20049,23 +21331,23 @@ unsafe fn jit_bin_num(
         i.binary(op, a, b)?
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
-    sp.write(v);
+    sp.write(PackedValue::pack(v));
     *sp = sp.add(1);
     Ok(())
 }
 
 unsafe fn jit_bin_i32(
     i: &mut Interp,
-    sp: &mut *mut Value,
+    sp: &mut *mut PackedValue,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
     f: impl Fn(i32, i32) -> i32,
 ) -> Result<(), Abrupt> {
     *sp = sp.sub(1);
-    let b = sp.read();
+    let b = sp.read().into_value();
     *sp = sp.sub(1);
-    let a = sp.read();
+    let a = sp.read().into_value();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
     let primitive_i32 = |v: &Value| match v {
         Value::Num(n) => Some(crate::eval::to_int32(*n)),
@@ -20078,29 +21360,34 @@ unsafe fn jit_bin_i32(
         i.binary(op, a, b)?
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
-    sp.write(v);
+    sp.write(PackedValue::pack(v));
     *sp = sp.add(1);
     Ok(())
 }
 
 unsafe fn jit_bin_cmp(
     i: &mut Interp,
-    sp: &mut *mut Value,
+    sp: &mut *mut PackedValue,
     op: &'static str,
     f: impl Fn(f64, f64) -> bool,
 ) -> Result<(), Abrupt> {
     *sp = sp.sub(1);
-    let b = sp.read();
+    let b = sp.read().into_value();
     *sp = sp.sub(1);
-    let a = sp.read();
+    let a = sp.read().into_value();
     let v = if let (Value::Num(x), Value::Num(y)) = (&a, &b) {
         Value::Bool(f(*x, *y))
     } else {
         i.binary(op, a, b)?
     };
-    sp.write(v);
+    sp.write(PackedValue::pack(v));
     *sp = sp.add(1);
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_JIT_COND_HELPERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Conditional-branch helper: evaluates the branch predicate per `mode` (see `jit::COND_*`),
@@ -20108,8 +21395,10 @@ unsafe fn jit_bin_cmp(
 pub(crate) unsafe extern "C" fn jit_cond(
     ctx: *mut crate::jit::JitCtx,
     packed_mode: u32,
-    mut sp: *mut Value,
+    mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
+    #[cfg(test)]
+    TEST_JIT_COND_HELPERS.with(|count| count.set(count.get() + 1));
     let ctx = &mut *ctx;
     let i = &mut *ctx.interp;
     let profiled = packed_mode & (1 << 2) != 0;
@@ -20118,11 +21407,11 @@ pub(crate) unsafe extern "C" fn jit_cond(
     let flag = match mode {
         crate::jit::COND_POP_TRUTHY => {
             sp = sp.sub(1);
-            let v = sp.read();
+            let v = sp.read().into_value();
             i.to_boolean(&v) as u64
         }
-        crate::jit::COND_PEEK_TRUTHY => i.to_boolean(&*sp.sub(1)) as u64,
-        _ => !matches!(&*sp.sub(1), Value::Undefined | Value::Null) as u64,
+        crate::jit::COND_PEEK_TRUTHY => i.to_boolean(&(*sp.sub(1)).unpack()) as u64,
+        _ => !matches!(&(*sp.sub(1)).unpack(), Value::Undefined | Value::Null) as u64,
     };
     if profiled {
         let taken = (flag != 0) == take_when_true;
@@ -20133,21 +21422,28 @@ pub(crate) unsafe extern "C" fn jit_cond(
     crate::jit::SpFlag { sp, flag }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_JIT_RETURN_HELPERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Return helper: mode 1 pops the return value into `ctx.ret`; mode 0 returns undefined.
 pub(crate) unsafe extern "C" fn jit_return(
     ctx: *mut crate::jit::JitCtx,
     mode: u32,
-    mut sp: *mut Value,
-) -> *mut Value {
+    mut sp: *mut PackedValue,
+) -> *mut PackedValue {
+    #[cfg(test)]
+    TEST_JIT_RETURN_HELPERS.with(|count| count.set(count.get() + 1));
     let ctx = &mut *ctx;
-    // Gate before constructing a temporary Value: an empty destination needs
+    // An empty destination needs
     // neither a destructor nor a spill across one. Decrementing sp transfers
     // the source slot's ownership; it is outside the live operand stack after
     // return, exactly as with read() in the checked fallback below.
-    if matches!(ctx.ret, Value::Undefined) {
+    if ctx.ret.is_undefined() {
         if mode == 1 {
             sp = sp.sub(1);
-            std::ptr::copy_nonoverlapping(sp, &mut ctx.ret, 1);
+            std::ptr::write(&mut ctx.ret, sp.read());
         }
         return sp;
     }
@@ -20157,27 +21453,49 @@ pub(crate) unsafe extern "C" fn jit_return(
         sp = sp.sub(1);
         sp.read()
     } else {
-        Value::Undefined
+        PackedValue::pack(Value::Undefined)
     };
     sp
 }
 
 pub(crate) unsafe extern "C" fn jit_push_handler(
     ctx: *mut crate::jit::JitCtx,
-    catch_pc: u32,
-    sp: *mut Value,
-) -> *mut Value {
+    pc: u32,
+    sp: *mut PackedValue,
+) -> *mut PackedValue {
     let ctx = &mut *ctx;
     let depth = sp.offset_from(ctx.stack_base) as usize;
-    ctx.handlers.push((catch_pc, depth));
+    let target = match (&*ctx.chunk).jit_ops()[pc as usize] {
+        Op::PushHandler(t) => HandlerTarget::Catch {
+            throw_pc: t as usize,
+        },
+        Op::PushFinally(t, r, b, s, j) => HandlerTarget::Finally {
+            throw_pc: t as usize,
+            return_pc: r as usize,
+            bare_return_pc: b as usize,
+            resume_return_pc: s as usize,
+            jump_pc: j as usize,
+        },
+        Op::PushIterator(t, r, b, s) => HandlerTarget::Iterator {
+            throw_pc: t as usize,
+            return_pc: r as usize,
+            bare_return_pc: b as usize,
+            resume_return_pc: s as usize,
+        },
+        _ => unreachable!("native handler entry must name its bytecode"),
+    };
+    ctx.handlers.push(Handler {
+        target,
+        stack_depth: depth,
+    });
     sp
 }
 
 pub(crate) unsafe extern "C" fn jit_pop_handler(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
-    sp: *mut Value,
-) -> *mut Value {
+    sp: *mut PackedValue,
+) -> *mut PackedValue {
     (*ctx).handlers.pop();
     sp
 }
@@ -20187,7 +21505,7 @@ pub(crate) unsafe extern "C" fn jit_pop_handler(
 pub(crate) unsafe extern "C" fn jit_unwind(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     // Only thrown completions are catchable; anything else propagates out.
@@ -20210,15 +21528,22 @@ pub(crate) unsafe extern "C" fn jit_unwind(
             sp: std::ptr::null_mut(),
             flag: sp as u64,
         },
-        Some((catch_pc, saved_depth)) => {
-            crate::jit::perf_error_caught();
+        Some(handler) => {
+            if matches!(handler.target, HandlerTarget::Catch { .. }) {
+                crate::jit::perf_error_caught();
+            }
+            let catch_pc = match handler.target {
+                HandlerTarget::Catch { throw_pc }
+                | HandlerTarget::Finally { throw_pc, .. }
+                | HandlerTarget::Iterator { throw_pc, .. } => throw_pc,
+            };
             // A handler may be installed while operands needed for BindingInitialization are
             // still live; the protected operation can consume them before throwing. Vec::truncate
             // (used by the bytecode VM) keeps the smaller current depth in that case. Mirroring
             // it here is essential: restoring the older, deeper depth would expose moved-out raw
             // stack entries and later drop them a second time.
             let current_depth = sp.offset_from(ctx.stack_base) as usize;
-            let depth = saved_depth.min(current_depth);
+            let depth = handler.stack_depth.min(current_depth);
             let target = ctx.stack_base.add(depth);
             // Drop operands above the handler's depth.
             let mut p = target;
@@ -20229,24 +21554,122 @@ pub(crate) unsafe extern "C" fn jit_unwind(
             let Some(Abrupt::Throw(exc)) = ctx.error.take() else {
                 unreachable!()
             };
-            target.write(exc);
+            target.write(PackedValue::pack(exc));
             let addr = ctx.code_base as usize + *ctx.pc_offsets.add(catch_pc as usize) as usize;
             crate::jit::SpFlag {
-                sp: addr as *mut Value,
+                sp: addr as *mut PackedValue,
                 flag: target.add(1) as u64,
             }
         }
     }
 }
 
-/// Full host-control poll reached by the generated tier's cheap loop divider.
+/// Route synchronous abrupt completions without leaving the native activation. As in
+/// ECMA-262 TryStatement Evaluation, a finalizer may replace the saved completion; its
+/// completion-specific bytecode pad is shared with `drive_vm`, not reimplemented here.
+/// The second ABI word is zero for return, or the native continuation address.
+pub(crate) unsafe extern "C" fn jit_complete(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    mut sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let ctx = &mut *ctx;
+    let op = &(&*ctx.chunk).jit_ops()[pc as usize];
+    let mut value = None;
+    let jump = match op {
+        Op::AbruptJump(target, depth) => Some((*target as usize, *depth as usize)),
+        Op::ResumeJump => {
+            sp = sp.sub(1);
+            let Value::Num(depth) = sp.read().into_value() else {
+                unreachable!()
+            };
+            sp = sp.sub(1);
+            let Value::Num(target) = sp.read().into_value() else {
+                unreachable!()
+            };
+            Some((target as usize, depth as usize))
+        }
+        Op::Return | Op::ResumeReturn => {
+            sp = sp.sub(1);
+            value = Some(sp.read());
+            None
+        }
+        Op::ReturnBare => None,
+        _ => unreachable!("native completion helper requires an abrupt completion"),
+    };
+    let floor = jump.map_or(ctx.handler_floor, |(_, depth)| ctx.handler_floor + depth);
+    while ctx.handlers.len() > floor {
+        let handler = ctx.handlers.pop().expect("handler depth checked");
+        let target_pc = match (handler.target, op, jump) {
+            (HandlerTarget::Finally { jump_pc, .. }, _, Some(_)) => jump_pc,
+            (_, _, Some(_)) | (HandlerTarget::Catch { .. }, _, _) => continue,
+            (
+                HandlerTarget::Finally { bare_return_pc, .. }
+                | HandlerTarget::Iterator { bare_return_pc, .. },
+                Op::ReturnBare,
+                _,
+            ) => bare_return_pc,
+            (
+                HandlerTarget::Finally {
+                    resume_return_pc, ..
+                }
+                | HandlerTarget::Iterator {
+                    resume_return_pc, ..
+                },
+                Op::ResumeReturn,
+                _,
+            ) => resume_return_pc,
+            (
+                HandlerTarget::Finally { return_pc, .. }
+                | HandlerTarget::Iterator { return_pc, .. },
+                _,
+                _,
+            ) => return_pc,
+        };
+        let depth = handler
+            .stack_depth
+            .min(sp.offset_from(ctx.stack_base) as usize);
+        let target = ctx.stack_base.add(depth);
+        while sp > target {
+            sp = sp.sub(1);
+            std::ptr::drop_in_place(sp);
+        }
+        if let Some((target, depth)) = jump {
+            sp.write(PackedValue::pack(Value::Num(target as f64)));
+            sp = sp.add(1);
+            sp.write(PackedValue::pack(Value::Num(depth as f64)));
+            sp = sp.add(1);
+        } else if let Some(value) = value.take() {
+            sp.write(value);
+            sp = sp.add(1);
+        }
+        return crate::jit::SpFlag {
+            sp,
+            flag: ctx.code_base.add(*ctx.pc_offsets.add(target_pc) as usize) as u64,
+        };
+    }
+    if let Some((target, _)) = jump {
+        crate::jit::SpFlag {
+            sp,
+            flag: ctx.code_base.add(*ctx.pc_offsets.add(target) as usize) as u64,
+        }
+    } else {
+        ctx.ret = value.unwrap_or_else(|| PackedValue::pack(Value::Undefined));
+        crate::jit::SpFlag { sp, flag: 0 }
+    }
+}
+
+/// Full loop safepoint reached by the generated tier's interrupt divider or allocation
+/// pressure guard. KeptAlive roots remain intact until the host's job boundary; optional
+/// task collection deferral must not suppress allocation-limit/cycle-collection safepoints.
 pub(crate) unsafe extern "C" fn jit_interrupt(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
-    sp: *mut Value,
+    sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
-    match unsafe { &mut *ctx.interp }.interrupt_poll_force() {
+    let i = unsafe { &mut *ctx.interp };
+    match i.interrupt_poll_force().and_then(|()| i.gc_check()) {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(abrupt) => {
             ctx.error = Some(abrupt);
@@ -20260,8 +21683,8 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
 pub(crate) unsafe extern "C" fn jit_loop_backedge(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
-    sp: *mut Value,
-) -> *mut Value {
+    sp: *mut PackedValue,
+) -> *mut PackedValue {
     let ctx = unsafe { &*ctx };
     unsafe { (&*ctx.chunk).feedback.observe_loop_backedge(pc as usize) };
     sp
@@ -20297,13 +21720,17 @@ mod return_slot_tests {
             chunk: std::ptr::null(),
             this_val: Value::Undefined,
             n_slots: 0,
-            slots_packed: false,
             handlers: Vec::new(),
+            activation: None,
+            resume_activation: std::ptr::null_mut(),
+            references_raw: std::ptr::null_mut(),
+            resume_pc: 0,
+            resume_step: None,
             handler_floor: 0,
             code_base: std::ptr::null(),
             pc_offsets: std::ptr::null(),
             error: None,
-            ret,
+            ret: PackedValue::pack(ret),
             env_parent_raw: std::ptr::null(),
             opstat_enabled: false,
             callstat_enabled: false,
@@ -20325,13 +21752,13 @@ mod return_slot_tests {
             });
             let returned = crate::value::Object::new(None);
             let returned_weak = Rc::downgrade(&returned);
-            let mut operand = ManuallyDrop::new([Value::Obj(returned)]);
+            let mut operand = ManuallyDrop::new([PackedValue::pack(Value::Obj(returned))]);
             let base = operand.as_mut_ptr();
             let result = unsafe { jit_return(&mut ctx, 1, base.add(1)) };
             assert_eq!(result, base);
             assert_eq!(displaced_weak.strong_count(), 0);
             assert_eq!(returned_weak.strong_count(), 1);
-            assert!(matches!(ctx.ret, Value::Obj(_)));
+            assert!(matches!(ctx.ret.unpack(), Value::Obj(_)));
             drop(ctx);
             assert_eq!(returned_weak.strong_count(), 0);
         }
@@ -20342,16 +21769,87 @@ mod return_slot_tests {
         let object = crate::value::Object::new(None);
         let weak = Rc::downgrade(&object);
         let mut ctx = context(Value::Obj(object.clone()));
-        let mut operand = ManuallyDrop::new([Value::Obj(object)]);
+        let mut operand = ManuallyDrop::new([PackedValue::pack(Value::Obj(object))]);
         let base = operand.as_mut_ptr();
         assert_eq!(weak.strong_count(), 2);
         assert_eq!(unsafe { jit_return(&mut ctx, 1, base.add(1)) }, base);
         assert_eq!(weak.strong_count(), 1);
         // A bare return must not dereference or consume the operand pointer.
-        let unused = std::ptr::NonNull::<Value>::dangling().as_ptr();
+        let unused = std::ptr::NonNull::<PackedValue>::dangling().as_ptr();
         assert_eq!(unsafe { jit_return(&mut ctx, 0, unused) }, unused);
-        assert!(matches!(ctx.ret, Value::Undefined));
+        assert!(ctx.ret.is_undefined());
         assert_eq!(weak.strong_count(), 0);
         assert_eq!(unsafe { jit_return(&mut ctx, 0, unused) }, unused);
+    }
+
+    #[test]
+    fn packed_return_helper_preserves_empty_and_canonical_hostile_nan_words() {
+        // Empty is an internal execution sentinel, never a valid JS local read.
+        // This raw ownership boundary must still preserve its exact word. Hostile
+        // NaNs become canonical when packed, not reinterpretations of owner tags.
+        let mut values = vec![Value::Empty, Value::Num(-0.0), Value::Num(f64::NAN)];
+        for high in [
+            0x7ff9u64, 0x7ffa, 0x7ffb, 0x7ffc, 0x7ffd, 0x7ffe, 0x7fff, 0xfff9, 0xfffa, 0xffff,
+        ] {
+            values.push(Value::Num(f64::from_bits((high << 48) | 0x1234)));
+        }
+        for value in values {
+            for occupied in [false, true] {
+                let packed = PackedValue::pack(value.clone());
+                let expected = packed.bits();
+                let mut operand = ManuallyDrop::new([packed]);
+                let base = operand.as_mut_ptr();
+                let mut ctx = context(if occupied {
+                    Value::Str("displaced".into())
+                } else {
+                    Value::Undefined
+                });
+                assert_eq!(unsafe { jit_return(&mut ctx, 1, base.add(1)) }, base);
+                assert_eq!(ctx.ret.bits(), expected);
+                if matches!(value, Value::Empty) {
+                    assert!(ctx.ret.is_empty());
+                    assert!(!ctx.ret.is_undefined());
+                }
+                let moved = ctx.take_ret();
+                assert!(ctx.ret.is_undefined());
+                assert_eq!(moved.bits(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<PackedValue>(), 8);
+        assert_eq!(std::mem::size_of_val(&context(Value::Undefined).ret), 8);
+        if size_of::<usize>() == 8 {
+            assert_eq!(offset_of!(JitCtx, helpers), 0);
+            assert_eq!(offset_of!(JitCtx, stack_base), 8);
+            assert_eq!(offset_of!(JitCtx, final_sp), 16);
+            assert_eq!(offset_of!(JitCtx, slots), 24);
+            assert_eq!(offset_of!(JitCtx, inline_ic_safe), 32);
+            assert_eq!(offset_of!(JitCtx, env_raw), 40);
+            assert_eq!(offset_of!(JitCtx, this_raw), 48);
+            assert_eq!(offset_of!(JitCtx, global_body), 56);
+            assert_eq!(offset_of!(JitCtx, genv), 64);
+            assert_eq!(size_of::<crate::jit::SpFlag>(), 16);
+        }
+        let object = crate::value::Object::new(None);
+        let weak = Rc::downgrade(&object);
+        let mut packed = ManuallyDrop::new(PackedValue::pack(Value::Obj(object.clone())));
+        let mut wide = ManuallyDrop::new(Value::Obj(object));
+        let packed_ptr = &raw mut *packed;
+        let wide_ptr = &raw mut *wide;
+        assert_eq!(weak.strong_count(), 2);
+        assert_eq!(
+            unsafe { jit_drop_packed_at(std::ptr::null_mut(), 0, packed_ptr) },
+            packed_ptr
+        );
+        assert_eq!(weak.strong_count(), 1);
+        assert_eq!(
+            unsafe { jit_drop_at(std::ptr::null_mut(), 0, wide_ptr) },
+            wide_ptr
+        );
+        assert_eq!(weak.strong_count(), 0);
     }
 }

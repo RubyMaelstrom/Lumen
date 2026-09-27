@@ -5,6 +5,7 @@
 //! `Throw`, while statements additionally produce `Return`/`Break`/`Continue` completions.
 
 use crate::ast::*;
+use crate::execution_storage::StoredValue;
 use crate::value::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -694,14 +695,6 @@ impl WeakKey {
     }
 }
 
-/// Ordered-entry offsets sharing one SameValueZero hash. Almost every bucket has one entry; the
-/// collision form preserves full SameValueZero comparison without allocating a `Vec` per key.
-#[derive(Debug)]
-pub(crate) enum CollectionBucket {
-    One(usize),
-    Many(Vec<usize>),
-}
-
 /// A weakly held ECMAScript value. `Weak` keeps an object's allocation header alive, so the raw
 /// identity used by the O(1) weak-collection index cannot be recycled while an entry still exists.
 /// ECMA-262 §9.9 requires these edges not to contribute to liveness.
@@ -733,10 +726,6 @@ impl WeakTarget {
             Self::Symbol(symbol, _) => symbol.upgrade().map(Value::Sym),
         }
     }
-
-    fn object_is_in(&self, objects: &crate::fasthash::FastSet<usize>) -> bool {
-        matches!(self, Self::Object(object) if objects.contains(&(object.as_ptr() as usize)))
-    }
 }
 
 /// One FinalizationRegistry Cell record. The held value is the cell's sole strong edge; target and
@@ -750,7 +739,7 @@ pub(crate) struct FinalizationCell {
 /// Internal slots of a FinalizationRegistry instance (ECMA-262 §26.2).
 pub(crate) struct FinalizationState {
     pub(crate) cleanup_callback: JobCallback,
-    pub(crate) cells: Vec<FinalizationCell>,
+    pub(crate) cells: crate::finalization_cells::FinalizationCells,
     pub(crate) cleanup_scheduled: bool,
 }
 
@@ -965,10 +954,10 @@ fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
 
 /// The JIT fast call's frame-buffer freelist (see `Interp::frame_pool`). A newtype so teardown
 /// frees the raw buffers (their contents are already dropped whenever a buffer is pooled).
-pub(crate) struct FramePool(pub(crate) Vec<std::ptr::NonNull<Value>>);
+pub(crate) struct FramePool(pub(crate) Vec<std::ptr::NonNull<crate::value::PackedValue>>);
 
 impl std::ops::Deref for FramePool {
-    type Target = Vec<std::ptr::NonNull<Value>>;
+    type Target = Vec<std::ptr::NonNull<crate::value::PackedValue>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -983,7 +972,7 @@ impl Drop for FramePool {
         for p in self.0.drain(..) {
             unsafe {
                 drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    p.as_ptr() as *mut std::mem::MaybeUninit<Value>,
+                    p.as_ptr() as *mut std::mem::MaybeUninit<crate::value::PackedValue>,
                     crate::jit::FRAME_BUF,
                 )));
             }
@@ -1078,6 +1067,7 @@ fn allocate_binding_layout_id(next: &std::sync::atomic::AtomicU32) -> u32 {
 
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
 
+#[repr(u8)]
 enum VarStorage {
     Small(Vec<(std::rc::Rc<str>, Binding)>),
     Large(crate::fasthash::FastMap<std::rc::Rc<str>, Binding>),
@@ -1179,9 +1169,20 @@ impl VarMap {
     pub(crate) fn generation(&self) -> u32 {
         self.generation.get()
     }
+    /// Exhaustion permanently disables identity/generation pointer proofs for this map.
+    /// Published fixed-layout identities are independent, non-recycled key-set proofs.
+    #[inline]
+    pub(crate) fn matches_generation(&self, generation: u32) -> bool {
+        generation != u32::MAX && self.generation.get() == generation
+    }
+    #[cfg(test)]
+    pub(crate) fn set_generation_for_test(&mut self, generation: u32) {
+        self.generation.set(generation);
+        self.layout_id = 0;
+    }
     #[inline]
     fn bump(&mut self) {
-        self.generation.set(self.generation.get().wrapping_add(1));
+        self.generation.set(self.generation.get().saturating_add(1));
         self.layout_id = 0;
     }
 
@@ -1190,12 +1191,42 @@ impl VarMap {
         self.layout_id
     }
 
+    /// Stable ordered slot within a small fixed-layout activation. A published layout proves
+    /// the ordered insertion plan; large hash maps deliberately use one final name lookup.
+    pub(crate) fn binding_slot(&self, name: &str) -> Option<usize> {
+        match &self.map {
+            VarStorage::Small(entries) => entries.iter().position(|(key, _)| &**key == name),
+            VarStorage::Large(_) => None,
+        }
+    }
+
+    pub(crate) fn binding_at(&self, slot: usize, name: &str) -> Option<&Binding> {
+        match &self.map {
+            VarStorage::Small(entries) => entries
+                .get(slot)
+                .filter(|(key, _)| &**key == name)
+                .map(|(_, binding)| binding),
+            VarStorage::Large(_) => None,
+        }
+    }
+
+    pub(crate) fn binding_at_mut(&mut self, slot: usize, name: &str) -> Option<&mut Binding> {
+        match &mut self.map {
+            VarStorage::Small(entries) => entries
+                .get_mut(slot)
+                .filter(|(key, _)| &**key == name)
+                .map(|(_, binding)| binding),
+            VarStorage::Large(_) => None,
+        }
+    }
+
     /// Only the creator of a fresh, fully initialized fixed-key activation may
     /// publish its plan's identity. Never publish on a reused/dynamic environment.
     pub(crate) fn publish_layout(&mut self, layout_id: u32) {
         self.layout_id = layout_id;
     }
-    pub fn insert(&mut self, k: impl Into<std::rc::Rc<str>>, v: Binding) -> Option<Binding> {
+    pub fn insert(&mut self, k: impl Into<std::rc::Rc<str>>, mut v: Binding) -> Option<Binding> {
+        v.imported = v.import_ref.is_some();
         self.bump();
         let k = k.into();
         match &mut self.map {
@@ -1285,6 +1316,33 @@ impl VarMap {
 
     pub(crate) fn layout_id_offset() -> usize {
         std::mem::offset_of!(VarMap, layout_id)
+    }
+
+    /// Probe the repr(Rust) small-map arm rather than baking an enum/vector layout. A native
+    /// fresh-activation hit additionally requires the same nonzero ordered layout identity.
+    /// Unknown compiler layouts simply retain the checked map path.
+    pub(crate) fn jit_small_storage_layout() -> Option<(usize, usize, usize, usize)> {
+        let mut small = Self::with_capacity(1);
+        small.insert("probe", Binding::data(Value::Num(7.0), true, true));
+        let large = Self::with_capacity(SMALL_VAR_MAP_CAPACITY + 1);
+        let tag = std::mem::offset_of!(VarMap, map);
+        let small_tag = unsafe { *(&small.map as *const VarStorage as *const u8) };
+        let large_tag = unsafe { *(&large.map as *const VarStorage as *const u8) };
+        if small_tag != 0 || large_tag != 1 {
+            return None;
+        }
+        let VarStorage::Small(entries) = &small.map else {
+            return None;
+        };
+        let vector =
+            entries as *const Vec<(Rc<str>, Binding)> as usize - &small as *const VarMap as usize;
+        let binding = &entries[0].1 as *const Binding as usize - entries.as_ptr() as usize;
+        Some((
+            tag,
+            vector,
+            std::mem::size_of::<(Rc<str>, Binding)>(),
+            binding,
+        ))
     }
 }
 
@@ -1417,6 +1475,9 @@ pub struct Binding {
     pub initialized: bool,
     /// A live module import: reads/writes redirect to `(exporter scope, local name)`.
     pub import_ref: Option<(Env, String)>,
+    /// Native-visible kind bit, occupying existing flag padding. All structural insertion
+    /// paths normalize it; in-place import changes must use set_import_reference.
+    pub(crate) imported: bool,
     /// `true` for a `var`/function binding created by a sloppy `eval` (CreateMutableBinding with
     /// `deletable` set): `delete <name>` may remove it, unlike ordinary declarations.
     pub deletable: bool,
@@ -1428,12 +1489,18 @@ pub struct Binding {
 }
 
 impl Binding {
+    #[cfg(test)]
+    pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, String)>) {
+        self.imported = reference.is_some();
+        self.import_ref = reference;
+    }
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
         Binding {
             value,
             mutable,
             initialized,
             import_ref: None,
+            imported: false,
             deletable: false,
             // An immutable binding created through this helper (const/TDZ) is strict by default.
             strict_immutable: !mutable,
@@ -1717,6 +1784,10 @@ impl Default for StubEntry {
 const STUB_CACHE_SIZE: usize = 4096;
 const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
 
+#[path = "property_read.rs"]
+mod property_read;
+use property_read::CachedGet;
+
 #[cfg(test)]
 mod deep_property_ic_tests {
     use super::*;
@@ -1802,11 +1873,30 @@ impl Interp {
     /// is sufficient: cache identity is the property name, not the particular chunk allocation.
     #[inline]
     fn stub_cache_set(&self, shape: u32, name: &str, st: crate::bytecode::IcState) {
+        if !crate::value::is_cacheable_shape(shape) || !st.has_cacheable_shapes() {
+            return;
+        }
         let slot = stub_slot(shape, name);
         self.stub_cache_names.borrow_mut()[slot] = Some(Rc::from(name));
         self.stub_cache[slot].set(StubEntry { st });
     }
 }
+
+#[cfg(test)]
+#[path = "uncacheable_shape_tests.rs"]
+mod uncacheable_shape_tests;
+
+#[cfg(test)]
+#[path = "ordinary_data_read_tests.rs"]
+mod ordinary_data_read_tests;
+
+#[cfg(test)]
+#[path = "property_read_tests.rs"]
+mod property_read_tests;
+
+#[cfg(test)]
+#[path = "constructor_transfer_tests.rs"]
+mod constructor_transfer_tests;
 
 #[cfg(test)]
 mod computed_key_cache_tests {
@@ -1904,7 +1994,7 @@ pub(crate) struct InterpLayout {
     pub fnf_ptr_word: usize,
     pub fnf_len_word: usize,
     pub fnf_cap_word: usize,
-    /// `frame_pool` (Vec<NonNull<Value>>) base + its word offsets.
+    /// `frame_pool` (Vec<NonNull<PackedValue>>) base + its word offsets.
     pub frame_pool: usize,
     pub fp_ptr_word: usize,
     pub fp_len_word: usize,
@@ -1961,7 +2051,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
     for _ in 0..3 {
         i.frame_pool
             .0
-            .push(std::ptr::NonNull::new(0x2000 as *mut Value).unwrap());
+            .push(std::ptr::NonNull::new(0x2000 as *mut PackedValue).unwrap());
     }
     let fp = probe_vec_words(&i.frame_pool.0, 3, i.frame_pool.0.capacity());
     i.frame_pool.0.clear();
@@ -2059,7 +2149,7 @@ pub struct Interp {
     pub(crate) super_forward_args: Option<Rc<[Value]>>,
     /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
     /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
-    pub(crate) vm_pool: Vec<(Vec<Value>, Vec<Value>)>,
+    pub(crate) vm_pool: Vec<crate::execution_storage::CompactFrame>,
     /// Recycled argument buffers for `Function.prototype.apply` list assembly, so a hot
     /// `f.apply(null, denseArray)` loop doesn't allocate a fresh `Vec` per call. Buffers are
     /// cleared before recycling; the memory walker counts their payload exactly like `vm_pool`.
@@ -2077,8 +2167,10 @@ pub struct Interp {
     pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
     pub(crate) stub_cache_names: std::cell::RefCell<Vec<Option<Rc<str>>>>,
     pub(crate) computed_reads: crate::bytecode::ComputedReadCache,
+    /// Quiescent source-scoped loop plans; executing plans have only weak cache entries.
+    pub(crate) fragment_cache: crate::bytecode::fragment_cache::Cache,
     pub(crate) enumeration_keys:
-        crate::cache::ByteLru<crate::eval::EnumerationShape, Vec<crate::lstr::LStr>>,
+        crate::cache::ByteLru<crate::eval::EnumerationShape, crate::eval::CachedForInKeys>,
     /// Freelist of fixed-size raw frame buffers ([`crate::jit::FRAME_BUF`] `Value`s each) for the
     /// JIT fast call's slots + operand stack — a pop and pointer math per call instead of `Vec`
     /// bookkeeping. Buffers hold no live values while pooled.
@@ -2167,6 +2259,9 @@ pub struct Interp {
     construct_ics: crate::fasthash::FastMap<usize, ConstructIc>,
     /// Shared, lazily allocated secondary cache for evictions from four-way call sites.
     pub(crate) call_overflow: crate::bytecode::CallOverflow,
+    /// Lazily allocated reusable entry for already-resolved accessor/proxy/host callbacks.
+    /// All JS identity and AST pins are Weak; this cache cannot keep a closure or realm alive.
+    pub(crate) native_callback_cache: Option<Rc<crate::callback::CallbackCache>>,
     /// Small ordered key layouts learned from successful ordinary construction, keyed and
     /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
@@ -2221,22 +2316,21 @@ pub struct Interp {
         usize,
         crate::fasthash::FastMap<String, crate::modules::NsBinding>,
     >,
-    /// Backing store for Map/Set/WeakMap/WeakSet instances (ordered entries), keyed by the object's
-    /// pointer — the engine analogue of an internal `[[MapData]]` slot.
-    pub(crate) map_data: crate::fasthash::FastMap<usize, Vec<(Value, Value)>>,
-    /// SameValueZero key identity to live ordered-entry offset for each Map/Set. The parallel
-    /// index provides the average-sublinear access required by ECMA-262 §§24.1 and 24.2 while
-    /// `map_data` retains tombstones, insertion order, and live-iterator semantics.
-    pub(crate) collection_index:
-        crate::fasthash::FastMap<usize, crate::fasthash::FastMap<u64, CollectionBucket>>,
+    /// Ordered, indexed [[MapData]] / [[SetData]], including internal kind and live cursor tracking.
+    pub(crate) map_data:
+        crate::fasthash::FastMap<usize, crate::ordered_collection::OrderedCollection>,
+    /// Unforgeable Map/Set iterator slots. Live targets are strong edges from the iterator owner;
+    /// exhausted iterators keep their brand but release the target and cursor.
+    pub(crate) collection_iterators:
+        crate::fasthash::FastMap<usize, crate::ordered_collection::CollectionIterator>,
     /// WeakMap/WeakSet cells. Keys are real weak handles; only WeakMap values are strong, and then
     /// only ephemerally while both the collection and key are live.
     pub(crate) weak_collection_data: crate::fasthash::FastMap<usize, Vec<(WeakTarget, Value)>>,
     /// Object/symbol identity to entry offset for WeakMap/WeakSet. Their order is unobservable, and
     /// ECMA-262 requires average access time sublinear in the collection size; the parallel index
-    /// makes get/set/has/delete average O(1) while `map_data` retains the internal-slot payload.
+    /// makes get/set/has/delete average O(1) while `weak_collection_data` retains the payload.
     pub(crate) weak_collection_index:
-        crate::fasthash::FastMap<usize, crate::fasthash::FastMap<WeakKey, usize>>,
+        crate::fasthash::FastMap<usize, crate::weak_metadata::WeakCollectionIndex>,
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
@@ -2458,6 +2552,8 @@ pub struct Interp {
     pub(crate) module_source_objs: crate::fasthash::FastMap<String, Value>,
     /// WeakRef [[WeakRefTarget]] slots, keyed by the WeakRef instance.
     pub(crate) weak_refs: crate::fasthash::FastMap<usize, Option<WeakTarget>>,
+    /// Weak-target reverse subscriptions and pinned acyclic-death notifications; no strong edges.
+    pub(crate) weak_metadata: crate::weak_metadata::WeakMetadata,
     /// FinalizationRegistry internal slots, keyed by the registry instance.
     pub(crate) finalization_registries: crate::fasthash::FastMap<usize, FinalizationState>,
     /// HostEnqueueFinalizationRegistryCleanupJob captures registries strongly until a later job.
@@ -2516,6 +2612,7 @@ interp_memory_inventory! {
     stub_cache => "measured",
     stub_cache_names => "measured",
     computed_reads => "measured",
+    fragment_cache => "measured",
     enumeration_keys => "measured",
     frame_pool => "measured",
     creation_pins => "measured",
@@ -2539,6 +2636,7 @@ interp_memory_inventory! {
     elems_protector => "non_owning",
     construct_ics => "measured",
     call_overflow => "measured",
+    native_callback_cache => "measured",
     construct_capacity_hints => "measured",
     iterator_sym => "measured",
     wk_syms => "measured",
@@ -2553,7 +2651,7 @@ interp_memory_inventory! {
     next_dynamic_import_id => "non_owning",
     module_ns => "measured",
     map_data => "measured",
-    collection_index => "measured",
+    collection_iterators => "measured",
     weak_collection_data => "measured",
     weak_collection_index => "measured",
     extra_protos => "measured",
@@ -2628,6 +2726,7 @@ interp_memory_inventory! {
     mapped_arguments => "measured",
     module_source_objs => "measured",
     weak_refs => "measured",
+    weak_metadata => "measured",
     finalization_registries => "measured",
     pending_finalization_cleanup => "measured",
     async_gen_busy => "measured",
@@ -2653,7 +2752,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 143);
+    assert_eq!(names.len(), 146);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3106,6 +3205,7 @@ impl Interp {
                     strict_immutable: true,
                     initialized: true,
                     import_ref: None,
+                    imported: false,
                     deletable: false,
                 },
             );
@@ -3218,6 +3318,7 @@ impl Interp {
                 strict_immutable: true,
                 initialized: true,
                 import_ref: None,
+                imported: false,
                 deletable: false,
             },
         );
@@ -3426,6 +3527,7 @@ impl Interp {
             elems_protector: std::cell::Cell::new((0, false)),
             construct_ics: Default::default(),
             call_overflow: Default::default(),
+            native_callback_cache: None,
             construct_capacity_hints: Default::default(),
             iterator_sym: None,
             wk_syms: Vec::new(),
@@ -3455,6 +3557,7 @@ impl Interp {
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
             computed_reads: Default::default(),
+            fragment_cache: Default::default(),
             enumeration_keys: crate::cache::ByteLru::new(1 << 20, 256),
             frame_pool: FramePool(Vec::new()),
             creation_pins: Default::default(),
@@ -3470,7 +3573,7 @@ impl Interp {
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
             map_data: Default::default(),
-            collection_index: Default::default(),
+            collection_iterators: Default::default(),
             weak_collection_data: Default::default(),
             weak_collection_index: Default::default(),
             extra_protos: Default::default(),
@@ -3545,6 +3648,7 @@ impl Interp {
             mapped_arguments: Default::default(),
             module_source_objs: Default::default(),
             weak_refs: Default::default(),
+            weak_metadata: Default::default(),
             finalization_registries: Default::default(),
             pending_finalization_cleanup: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
@@ -3561,6 +3665,7 @@ impl Interp {
                 strict_immutable: true,
                 initialized: true,
                 import_ref: None,
+                imported: false,
                 deletable: false,
             },
         );
@@ -3949,9 +4054,7 @@ impl Interp {
                 source
                     .props
                     .get_index(index as u32)
-                    .is_some_and(|property| {
-                        !property.accessor() && matches!(property.value(), Value::Num(_))
-                    })
+                    .is_some_and(|property| property.number_value().is_some())
             })
         {
             return false;
@@ -3972,9 +4075,11 @@ impl Interp {
             .chunks_exact_mut(size)
             .enumerate()
         {
-            let Value::Num(number) = source.props.get_index(index as u32).unwrap().value() else {
-                unreachable!("numeric array validated without running author code");
-            };
+            let number = source
+                .props
+                .get_index(index as u32)
+                .and_then(Property::number_value)
+                .expect("numeric array validated without running author code");
             info.kind.write_into(number, bytes);
         }
         drop(buffer);
@@ -3996,6 +4101,7 @@ impl Interp {
         let data = Rc::new(SymbolData {
             id: agent.next_id,
             description,
+            weak_observers: RefCell::new(None),
         });
         agent.symbols.insert(data.id, Rc::downgrade(&data));
         // Symbol-only churn does not advance the object collector's allocation trigger. Prune
@@ -4356,10 +4462,10 @@ impl Interp {
         }
         let result = if let Some(global) = &callback.script_caller {
             self.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
-                ctx.call(callback.callback.clone(), this, args)
+                ctx.call_callback(callback.callback.clone(), this, args)
             })
         } else {
-            self.call(callback.callback.clone(), this, args)
+            self.call_callback(callback.callback.clone(), this, args)
         };
         self.host_entry_realm = previous_entry;
         result
@@ -4462,9 +4568,20 @@ impl Interp {
         let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
         let live = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
+        self.gc_next = crate::gc_generational::next_threshold(live);
         self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         before.saturating_sub(live)
+    }
+
+    /// Diagnostic nursery collection for embedder graph/barrier conformance tests.
+    /// Unlike the normal host collector, this deliberately preserves every old object.
+    /// It is not a replacement for major/idle collection or a supported scheduling API.
+    #[doc(hidden)]
+    pub fn unstable_collect_young_for_host_tests(&mut self) -> i64 {
+        self.activate_gc_heap();
+        let before = crate::value::heap_live_objects(&self.gc_heap);
+        self.gc_collect_young(crate::value::GcCause::Explicit);
+        before.saturating_sub(crate::value::heap_live_objects(&self.gc_heap))
     }
 
     /// Create a pending intrinsic Promise and its resolving functions for a host operation.
@@ -4575,6 +4692,32 @@ impl Interp {
     /// build its instance only under `new`.
     pub fn is_constructing(&self) -> bool {
         self.constructing
+    }
+
+    /// The active native constructor's NewTarget, or Undefined for an ordinary
+    /// call. ECMA-262 BuiltinCallOrConstruct passes this independently of `this`.
+    /// Returning an owned handle preserves it across reentrant conversions/GC.
+    pub fn constructor_new_target(&self) -> Value {
+        self.new_target.clone()
+    }
+
+    /// GetFunctionRealm for host bindings which implement constructor prototype
+    /// fallback (for example Web IDL's interface object creation). This follows
+    /// bound/proxy targets, checks revocation, and does not read author properties.
+    pub fn callable_realm_global(&mut self, function: &Value) -> Result<Value, Value> {
+        let Some(object) = function.as_obj().filter(|_| function.is_callable()) else {
+            return Err(self.make_error("TypeError", "value is not callable"));
+        };
+        let key = self
+            .get_function_realm_global(object)
+            .map_err(|error| match error {
+                Abrupt::Throw(value) => value,
+                _ => self.make_error("Error", "unexpected GetFunctionRealm completion"),
+            })?;
+        Ok(key.and_then(|key| self.realms.get(&key)).map_or_else(
+            || self.global_this(),
+            |realm| Value::Obj(realm.global.clone()),
+        ))
     }
 
     /// A fresh object with an explicit `[[Prototype]]` (`null` → no prototype). For host addons
@@ -4776,9 +4919,9 @@ impl Interp {
     /// Build an array by moving `len` initialized values directly from a JIT operand stack.
     ///
     /// # Safety
-    /// `items` must point to `len` live, non-overlapping `Value`s. This method consumes every
+    /// `items` must point to `len` live, non-overlapping `PackedValue`s. This method consumes every
     /// value exactly once; the caller must reset its stack pointer to `items` before returning.
-    pub(crate) unsafe fn make_array_from_raw(&self, items: *mut Value, len: usize) -> Value {
+    pub(crate) unsafe fn make_array_from_raw(&self, items: *mut PackedValue, len: usize) -> Value {
         if len <= 32 {
             let obj = Object::new_with_parts(
                 Some(self.array_proto.clone()),
@@ -4788,7 +4931,8 @@ impl Interp {
             return Value::Obj(obj);
         }
         let obj = Object::new(Some(self.array_proto.clone()));
-        let numeric = (0..len).all(|k| matches!(unsafe { &*items.add(k) }, Value::Num(_)));
+        let numeric =
+            (0..len).all(|k| matches!(unsafe { (*items.add(k)).unpack() }, Value::Num(_)));
         {
             let mut b = obj.borrow_mut();
             b.props.mark_array();
@@ -4796,7 +4940,7 @@ impl Interp {
             b.exotic = Exotic::Array;
             for k in 0..len {
                 b.props
-                    .push_dense(Property::plain(unsafe { items.add(k).read() }));
+                    .push_dense(Property::plain_packed(unsafe { items.add(k).read() }));
             }
             b.props.insert(
                 "length",
@@ -4837,10 +4981,15 @@ impl Interp {
         let perf_started = crate::jit::perf_stage_start();
         let result = match call {
             Callable::Native(f) => f(self, this, args),
-            Callable::NativeData(data) => {
-                let f = data.func.clone();
-                f(self, this, args)
-            }
+            Callable::NativeData(data) => match &data.body {
+                crate::value::NativeCallableBody::Opaque(f) => {
+                    let f = f.clone();
+                    f(self, this, args)
+                }
+                crate::value::NativeCallableBody::Captured { function, captures } => {
+                    function(self, this, args, captures)
+                }
+            },
             _ => unreachable!("dispatch_native on a non-native callable"),
         };
         crate::jit::perf_native_end(
@@ -4877,6 +5026,33 @@ impl Interp {
         Value::Obj(self.make_native_closure_with_retained_memory(name, len, f, retained))
     }
 
+    /// A native function whose JavaScript captures are owned and traced by the
+    /// engine, including cycles through the function itself. The operation is a
+    /// function pointer, so it cannot hide additional JavaScript handles in a
+    /// Rust closure. Use `op_state` for independent native host state.
+    ///
+    /// Captures are immutable as a list; captured objects retain normal mutable
+    /// JavaScript behavior. A live function, active invocation, or Rust callable
+    /// lease keeps its captures alive. Unreachable captured cycles can be reclaimed.
+    /// This does not change the ordinary function's receiver or argument list.
+    pub fn new_native_fn_with_captures(
+        &self,
+        name: &str,
+        len: usize,
+        function: crate::value::NativeCaptureFn,
+        captures: Vec<Value>,
+    ) -> Value {
+        Value::Obj(self.make_native_callable(
+            name,
+            len,
+            crate::value::NativeCallableBody::Captured {
+                function,
+                captures: captures.into_boxed_slice(),
+            },
+            None,
+        ))
+    }
+
     /// A function object backed by a data-carrying native closure (see [`NativeClosure`]). Like
     /// [`make_native`], but the callable can capture host state (used for N-API functions).
     pub fn make_native_closure(
@@ -4905,11 +5081,26 @@ impl Interp {
         f: std::rc::Rc<crate::value::NativeClosure>,
         retained: Option<std::rc::Rc<dyn crate::value::NativeCallableRetained>>,
     ) -> Gc {
+        self.make_native_callable(
+            name,
+            len,
+            crate::value::NativeCallableBody::Opaque(f),
+            retained,
+        )
+    }
+
+    fn make_native_callable(
+        &self,
+        name: &str,
+        len: usize,
+        body: crate::value::NativeCallableBody,
+        retained: Option<std::rc::Rc<dyn crate::value::NativeCallableRetained>>,
+    ) -> Gc {
         let obj = Object::new(Some(self.function_proto.clone()));
         {
             let mut b = obj.borrow_mut();
             b.call = Callable::NativeData(Rc::new(crate::value::NativeCallable {
-                func: f,
+                body,
                 retained,
                 identity: Rc::from(name),
             }));
@@ -5010,7 +5201,7 @@ impl Interp {
     /// [`call`](Interp::call) with an abrupt completion lowered to the thrown value — the
     /// shape a [`NativeFn`] returns, for native fns that call back into JS.
     pub fn invoke(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Value> {
-        self.call(callee, this, args).map_err(abrupt_value)
+        self.call_callback(callee, this, args).map_err(abrupt_value)
     }
 
     /// [`construct`](Interp::construct) with an abrupt completion lowered to the thrown value —
@@ -5468,24 +5659,16 @@ impl Interp {
                 _ => None,
             }
             .or_else(|| Some(self.object_proto.clone()));
-            let proto = Object::new(proto_parent);
-            {
-                let mut pb = proto.borrow_mut();
-                pb.props = proto_map.as_ref().expect("prototype template").clone();
-                if !is_generator {
-                    pb.props
-                        .entry_at_mut(0)
-                        .expect("constructor slot")
-                        .1
-                        .set_value(Value::Obj(obj.clone()));
-                }
-            }
             obj.borrow_mut()
                 .props
                 .entry_at_mut(2)
                 .expect("prototype slot")
                 .1
-                .set_value(Value::Obj(proto));
+                .defer_function_prototype(
+                    &obj,
+                    proto_parent.expect("function prototype intrinsic parent"),
+                    proto_map.as_ref().expect("prototype template"),
+                );
         }
         if !is_arrow && !is_method && !is_async && !is_generator {
             obj.borrow_mut().is_constructor = true;
@@ -5498,6 +5681,7 @@ impl Interp {
                     mutable: false,
                     initialized: true,
                     import_ref: None,
+                    imported: false,
                     deletable: false,
                     // CreateImmutableBinding(name, false): sloppy writes are silent no-ops.
                     strict_immutable: false,
@@ -5803,7 +5987,8 @@ impl Interp {
     /// object `depth` prototype hops up (methods!). A hit re-validates everything it relies on —
     /// each hop below the holder is hash-checked to still lack an own `name`, the holder slot is
     /// key-compared — so staleness costs a re-derivation, never a wrong answer. Anything not a
-    /// plain data property on an ordinary (or array) chain falls through to full `[[Get]]`.
+    /// ordinary descriptor on an ordinary (or array) chain falls through to full `[[Get]]`.
+    /// Accessor hits snapshot the live getter and perform Call after all lookup borrows end.
     pub(crate) fn get_prop_ic(
         &mut self,
         base: &Value,
@@ -5875,7 +6060,7 @@ impl Interp {
                 let shape = object.borrow().props.shape();
                 if let Some(state) = self.computed_reads.lookup(key.as_ptr() as usize, shape) {
                     if let Some(value) = self.ic_shape_probe(head, key, state) {
-                        return Ok(value);
+                        return self.finish_cached_get(value, base, None);
                     }
                 }
                 // This probe/derivation never executes author code. Do not harvest scratch
@@ -5888,7 +6073,7 @@ impl Interp {
                 // Derive once and retain the key only in the bounded computed cache.
                 if let Some(value) = self.ic_get_rederive(object, key, &scratch[0], false) {
                     self.computed_reads.insert(key, scratch[0].get());
-                    return Ok(value);
+                    return self.finish_cached_get(value, base, None);
                 }
             }
         }
@@ -5906,7 +6091,7 @@ impl Interp {
         match base {
             Value::Obj(o) => {
                 if let Some(v) = self.try_ic_get(o, name, cache, stable_name) {
-                    return Ok(v);
+                    return self.finish_cached_get(v, base, trace);
                 }
             }
             // Primitive receivers: named non-index reads (`"x".replace`, `(1).toFixed`) resolve
@@ -5923,7 +6108,7 @@ impl Interp {
                     _ => self.boolean_proto.clone(),
                 };
                 if let Some(v) = self.try_ic_get(&proto, name, cache, stable_name) {
-                    return Ok(v);
+                    return self.finish_cached_get(v, base, trace);
                 }
             }
             _ => {}
@@ -5970,7 +6155,7 @@ impl Interp {
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
-    ) -> Option<Value> {
+    ) -> Option<CachedGet> {
         let head = Rc::as_ptr(o);
         // PROP_IC_WAYS ways per site (polymorphic receivers — subclass hierarchies rotating
         // through one access site — miss fewer ways constantly): probe all, then the global
@@ -6018,6 +6203,9 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         st: crate::bytecode::IcState,
     ) {
+        if !st.has_cacheable_shapes() {
+            return;
+        }
         for k in (1..crate::bytecode::PROP_IC_WAYS).rev() {
             self.ic_way(cache, k).set(self.ic_way(cache, k - 1).get());
         }
@@ -6031,15 +6219,16 @@ impl Interp {
     /// recorded from one instance validates the same slot on any sibling instance; a shape
     /// match on a non-holder hop proves it still *lacks* the name. Protos are re-followed
     /// live and every hop's shape re-checked, so a proto swap or hop mutation is caught.
-    /// `None` = miss (no side effects): arrays-as-holders, deeper chains, accessors.
+    /// `None` = miss (no side effects). Accessors return an owned descriptor snapshot,
+    /// never execute JavaScript during the borrowed chain walk.
     #[inline(always)]
     fn ic_shape_probe(
         &self,
         head: *const std::cell::RefCell<Object>,
         name: &str,
         st: crate::bytecode::IcState,
-    ) -> Option<Value> {
-        use crate::bytecode::{IC_ABSENT, IC_ARR_KEYCHK, IC_EMPTY};
+    ) -> Option<CachedGet> {
+        use crate::bytecode::{IC_ABSENT, IC_ACCESSOR, IC_ARR_KEYCHK, IC_EMPTY};
         let _ = IC_EMPTY;
         // Cached absence: re-walk the live chain, validating each level's shape (and the same
         // plainness/exotic gates a rederive would demand). All shapes matching proves the key
@@ -6070,7 +6259,7 @@ impl Interp {
                     Some(p) => cur = Rc::as_ptr(p),
                     None => {
                         return if k + 1 == levels {
-                            Some(Value::Undefined)
+                            Some(CachedGet::undefined())
                         } else {
                             None
                         }
@@ -6086,7 +6275,8 @@ impl Interp {
             return None;
         }
         let keychk = st.depth & IC_ARR_KEYCHK != 0;
-        let depth = st.depth & !IC_ARR_KEYCHK;
+        let accessor = st.depth & IC_ACCESSOR != 0;
+        let depth = st.depth & !(IC_ARR_KEYCHK | IC_ACCESSOR);
         let required_mids = (1u8 << depth.saturating_sub(1).min(7)) - 1;
         if depth > crate::bytecode::IC_MAX_DEPTH || st.mid_ok & required_mids != required_mids {
             return None;
@@ -6114,8 +6304,14 @@ impl Interp {
                         rb.props.property_at(st.slot as usize)
                     };
                     if let Some(p) = property {
-                        if !p.accessor() {
-                            return Some(p.value());
+                        if p.accessor() == accessor {
+                            return self.snapshot_cached_get(
+                                p,
+                                name,
+                                rb.props.shape(),
+                                depth,
+                                keychk,
+                            );
                         }
                     }
                 } else if let Some(pr) = rb.proto.as_ref() {
@@ -6149,8 +6345,14 @@ impl Interp {
                             hb.props.property_at(st.slot as usize)
                         };
                         if let Some(p) = property {
-                            if !p.accessor() {
-                                return Some(p.value());
+                            if p.accessor() == accessor {
+                                return self.snapshot_cached_get(
+                                    p,
+                                    name,
+                                    hb.props.shape(),
+                                    depth,
+                                    keychk,
+                                );
                             }
                         }
                     }
@@ -6168,14 +6370,14 @@ impl Interp {
         name: &str,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
-    ) -> Option<Value> {
+    ) -> Option<CachedGet> {
         use crate::bytecode::{IcState, IC_MAX_DEPTH};
         type ObjCell = std::cell::RefCell<Object>;
         let head = Rc::as_ptr(o);
         // Re-derive: walk the chain by raw pointer (every object is kept alive transitively by
-        // `o`, nothing mutates during the read). On a plain data hit within reach record
-        // (depth, slot, receiver shape, holder shape); a non-plain level or accessor defers to
-        // full `[[Get]]`.
+        // `o`, nothing mutates during the read). On an ordinary descriptor within reach record
+        // (depth, slot, receiver shape, holder shape); a non-plain level defers to full
+        // `[[Get]]`. An ordinary accessor is invoked only after this lookup returns.
         let recv_shape = unsafe { (*head).borrow().props.shape() };
         let mut cur: *const ObjCell = head;
         // The depth-1 hop's shape, recorded when that hop is a plain (non-array) ordinary object:
@@ -6198,10 +6400,13 @@ impl Interp {
                 absent_ok = absent_ok && matches!(b.exotic, Exotic::None);
                 if let Some(slot) = b.props.slot_of(name) {
                     let p = b.props.property_at(slot).unwrap();
-                    if p.accessor() {
-                        return None; // getter — must run through [[Get]]
-                    }
-                    let v = p.value();
+                    let v = self.snapshot_cached_get(
+                        p,
+                        name,
+                        b.props.shape(),
+                        depth,
+                        matches!(b.exotic, Exotic::Array),
+                    )?;
                     // An Array HOLDER's slot can't be trusted by shape alone: element entries
                     // occupy slots without transitioning the shape, so two same-shape arrays
                     // map the name at DIFFERENT slots. Cache it as a key-checked entry
@@ -6224,6 +6429,11 @@ impl Interp {
                     // thrashing a single cell.
                     let st = IcState {
                         depth: depth
+                            | if p.accessor() {
+                                crate::bytecode::IC_ACCESSOR
+                            } else {
+                                0
+                            }
                             | if keychk {
                                 crate::bytecode::IC_ARR_KEYCHK
                             } else {
@@ -6274,7 +6484,7 @@ impl Interp {
                             if stable_name {
                                 self.stub_cache_set(recv_shape, name, st);
                             }
-                            return Some(Value::Undefined);
+                            return Some(CachedGet::undefined());
                         }
                         return None;
                     }
@@ -6626,7 +6836,7 @@ impl Interp {
             return Ok(None);
         }
         let getter = properties.getter.clone();
-        self.call(
+        self.call_callback(
             getter,
             Value::Obj(object.clone()),
             &[Value::Num(index as f64)],
@@ -6860,7 +7070,7 @@ impl Interp {
                         if !trap.is_callable() {
                             return Err(self.throw("TypeError", "proxy 'get' trap is not callable"));
                         }
-                        let res = self.call(
+                        let res = self.call_callback(
                             trap,
                             handler,
                             &[
@@ -6997,7 +7207,7 @@ impl Interp {
                 if !trap.is_callable() {
                     return Err(self.throw("TypeError", "proxy 'get' trap is not callable"));
                 }
-                let res = self.call(
+                let res = self.call_callback(
                     trap,
                     handler,
                     &[
@@ -7020,142 +7230,118 @@ impl Interp {
                 }
                 return Ok(value);
             }
-            // Clone only the fields the branches read (value / accessor-get), not the whole
-            // Property — data reads are the hot path and were paying for three Rc bumps.
-            let prop = {
+            // OrdinaryGet (ECMA-262): a data descriptor returns its owned value directly.
+            // Only getters need a snapshot across the author-code boundary. Keeping data out
+            // of that snapshot also avoids copying an optional descriptor/trace tuple.
+            let getter = {
                 let b = obj.borrow();
-                if trace.is_some() {
-                    b.props.get_with_slot(key).map(|(p, slot)| {
-                        if p.accessor() {
-                            (
-                                slot.map(|slot| slot as u32),
-                                b.props.shape(),
-                                true,
-                                p.getter().cloned(),
-                                Value::Undefined,
-                            )
-                        } else {
-                            (
-                                slot.map(|slot| slot as u32),
-                                b.props.shape(),
-                                false,
+                if let Some(trace) = trace.as_deref_mut() {
+                    match b.props.get_with_slot(key) {
+                        Some((p, slot)) => {
+                            let holder_shape = b.props.shape();
+                            if !p.accessor() {
+                                let slot = slot.map(|slot| slot as u32);
+                                let value = p.value();
+                                drop(b);
+                                trace.record(
+                                    crate::feedback::PropertyOutcome::Data,
+                                    Some(holder_shape),
+                                    depth,
+                                    slot,
+                                );
+                                return Ok(value);
+                            }
+                            let getter = p.getter().cloned();
+                            drop(b);
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Accessor,
+                                Some(holder_shape),
+                                depth,
                                 None,
-                                p.value(),
-                            )
+                            );
+                            Some(getter)
                         }
-                    })
+                        None => None,
+                    }
                 } else {
                     // `Props::get` is the semantic lookup and also covers dense/indexed storage;
-                    // `slot_of` above is used only by the named-field profiling adapter.
-                    b.props.get(key).map(|p| {
-                        if p.accessor() {
-                            (
-                                None,
-                                b.props.shape(),
-                                true,
-                                p.getter().cloned(),
-                                Value::Undefined,
-                            )
-                        } else {
-                            (None, b.props.shape(), false, None, p.value())
-                        }
-                    })
+                    // an untraced data read needs neither the named slot nor the holder shape.
+                    match b.props.get(key) {
+                        Some(p) if !p.accessor() => return Ok(p.value()),
+                        Some(p) => Some(p.getter().cloned()),
+                        None => None,
+                    }
                 }
             };
-            if let Some((slot, holder_shape, accessor, getter, value)) = prop {
-                let p = PropRead {
-                    accessor,
-                    get: getter,
-                    value,
-                };
-                if p.accessor {
-                    if let Some(trace) = trace.as_deref_mut() {
-                        trace.record(
-                            crate::feedback::PropertyOutcome::Accessor,
-                            Some(holder_shape),
-                            depth,
-                            None,
-                        );
-                    }
-                    // Legacy `fn.caller` / `fn.arguments`: reading the poisoned
-                    // %Function.prototype% accessor through an ordinary sloppy function
-                    // yields undefined instead of throwing.
-                    if matches!(key, "caller" | "arguments")
-                        && self.is_throw_type_error(&p.get)
-                        && !Rc::ptr_eq(
-                            &obj,
-                            match receiver {
-                                Value::Obj(r) => r,
-                                _ => &obj,
-                            },
-                        )
-                    {
-                        if let Value::Obj(r) = receiver {
-                            let plain = match &r.borrow().call {
-                                Callable::User(user) => {
-                                    !user.func.is_strict
-                                        && !user.func.is_arrow
-                                        && !user.func.is_generator
-                                        && !user.func.is_async
-                                        && !user.func.is_method
-                                }
-                                _ => false,
-                            };
-                            if plain {
-                                // Legacy SpiderMonkey reflection: the youngest activation's
-                                // arguments object / calling function (null when inactive; a
-                                // strict caller is censored to null). Eval runs inline, so eval
-                                // frames are naturally skipped.
-                                let rptr = Rc::as_ptr(r) as usize;
-                                let top = self.fn_frames.iter().rposition(|fr| fr.fn_ptr == rptr);
-                                trace_legacy_reflection(key, top.map(|k| &self.fn_frames[k]));
-                                return Ok(match (key, top) {
-                                    (_, None) => Value::Null,
-                                    ("arguments", Some(k)) => {
-                                        // The activation skipped building its arguments object
-                                        // (the body never names it) — conjure it now.
-                                        let lazy = match self.fn_frames[k].extra.as_deref() {
-                                            Some(x) if matches!(x.args_obj, Value::Null) => {
-                                                x.lazy.clone()
-                                            }
-                                            _ => None,
-                                        };
-                                        if let Some((func, args, scope)) = lazy {
-                                            let ao =
-                                                self.make_arguments_object(&func, &args, &scope, r);
-                                            if let Some(x) = self.fn_frames[k].extra.as_deref_mut()
-                                            {
-                                                x.args_obj = Value::Obj(ao);
-                                            }
+            if let Some(getter) = getter {
+                // Legacy `fn.caller` / `fn.arguments`: reading the poisoned
+                // %Function.prototype% accessor through an ordinary sloppy function
+                // yields undefined instead of throwing.
+                if matches!(key, "caller" | "arguments")
+                    && self.is_throw_type_error(&getter)
+                    && !Rc::ptr_eq(
+                        &obj,
+                        match receiver {
+                            Value::Obj(r) => r,
+                            _ => &obj,
+                        },
+                    )
+                {
+                    if let Value::Obj(r) = receiver {
+                        let plain = match &r.borrow().call {
+                            Callable::User(user) => {
+                                !user.func.is_strict
+                                    && !user.func.is_arrow
+                                    && !user.func.is_generator
+                                    && !user.func.is_async
+                                    && !user.func.is_method
+                            }
+                            _ => false,
+                        };
+                        if plain {
+                            // Legacy SpiderMonkey reflection: the youngest activation's
+                            // arguments object / calling function (null when inactive; a
+                            // strict caller is censored to null). Eval runs inline, so eval
+                            // frames are naturally skipped.
+                            let rptr = Rc::as_ptr(r) as usize;
+                            let top = self.fn_frames.iter().rposition(|fr| fr.fn_ptr == rptr);
+                            trace_legacy_reflection(key, top.map(|k| &self.fn_frames[k]));
+                            return Ok(match (key, top) {
+                                (_, None) => Value::Null,
+                                ("arguments", Some(k)) => {
+                                    // The activation skipped building its arguments object
+                                    // (the body never names it) — conjure it now.
+                                    let lazy = match self.fn_frames[k].extra.as_deref() {
+                                        Some(x) if matches!(x.args_obj, Value::Null) => {
+                                            x.lazy.clone()
                                         }
-                                        match self.fn_frames[k].extra.as_deref() {
-                                            Some(x) => x.args_obj.clone(),
-                                            None => Value::Null,
+                                        _ => None,
+                                    };
+                                    if let Some((func, args, scope)) = lazy {
+                                        let ao =
+                                            self.make_arguments_object(&func, &args, &scope, r);
+                                        if let Some(x) = self.fn_frames[k].extra.as_deref_mut() {
+                                            x.args_obj = Value::Obj(ao);
                                         }
                                     }
-                                    (_, Some(k)) => match self.fn_frames[..k].last() {
+                                    match self.fn_frames[k].extra.as_deref() {
+                                        Some(x) => x.args_obj.clone(),
                                         None => Value::Null,
-                                        Some(fr) if fr.strict => Value::Null,
-                                        Some(fr) => Value::Obj(fr.callee()),
-                                    },
-                                });
-                            }
+                                    }
+                                }
+                                (_, Some(k)) => match self.fn_frames[..k].last() {
+                                    None => Value::Null,
+                                    Some(fr) if fr.strict => Value::Null,
+                                    Some(fr) => Value::Obj(fr.callee()),
+                                },
+                            });
                         }
                     }
-                    return match p.get {
-                        Some(getter) => self.call(getter, receiver.clone(), &[]),
-                        None => Ok(Value::Undefined),
-                    };
                 }
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record(
-                        crate::feedback::PropertyOutcome::Data,
-                        Some(holder_shape),
-                        depth,
-                        slot,
-                    );
-                }
-                return Ok(p.value);
+                return match getter {
+                    Some(getter) => self.call_callback(getter, receiver.clone(), &[]),
+                    None => Ok(Value::Undefined),
+                };
             }
             cur = obj.borrow().proto.clone();
             depth = depth.saturating_add(1);
@@ -7386,7 +7572,7 @@ impl Interp {
                             }
                             return match p.setter().cloned() {
                                 Some(setter) => {
-                                    self.call(setter, receiver.clone(), &[value])?;
+                                    self.call_callback(setter, receiver.clone(), &[value])?;
                                     Ok(true)
                                 }
                                 None => {
@@ -7471,7 +7657,7 @@ impl Interp {
                 if !trap.is_callable() {
                     return Err(self.throw("TypeError", "proxy 'set' trap is not callable"));
                 }
-                let ok = self.call(
+                let ok = self.call_callback(
                     trap,
                     handler,
                     &[
@@ -7546,7 +7732,7 @@ impl Interp {
                 if !trap.is_callable() {
                     return Err(self.throw("TypeError", "proxy 'set' trap is not callable"));
                 }
-                let ok = self.call(
+                let ok = self.call_callback(
                     trap,
                     handler,
                     &[
@@ -7643,7 +7829,7 @@ impl Interp {
                     }
                     return match p.setter().cloned() {
                         Some(setter) => {
-                            self.call(setter, receiver.clone(), &[value])?;
+                            self.call_callback(setter, receiver.clone(), &[value])?;
                             Ok(true)
                         }
                         None => {
@@ -7750,6 +7936,26 @@ impl Interp {
                         Ok(b) => Ok(b),
                         Err(v) => Err(Abrupt::Throw(v)),
                     };
+                }
+                // OrdinarySetWithOwnDescriptor checks a distinct receiver's existing own
+                // descriptor before calling its [[DefineOwnProperty]]. In particular, an
+                // Array's read-only length rejects *before* either length conversion.
+                let rejected_array_descriptor = {
+                    let receiver = r.borrow();
+                    matches!(receiver.exotic, Exotic::Array)
+                        && receiver
+                            .props
+                            .get(key)
+                            .is_some_and(|p| p.accessor() || !p.writable())
+                };
+                if rejected_array_descriptor {
+                    if self.strict {
+                        return Err(self.throw(
+                            "TypeError",
+                            format!("cannot assign to read-only property '{key}'"),
+                        ));
+                    }
+                    return Ok(false);
                 }
                 r.clone()
             }
@@ -7858,72 +8064,11 @@ impl Interp {
 
     fn array_set(&mut self, obj: &Gc, key: &str, value: Value) -> Result<bool, Abrupt> {
         if key == "length" {
-            // ArraySetLength coerces twice (ToUint32 then ToNumber, both observable) and
-            // RangeErrors on a mismatch before any writability check.
-            let n1 = self.to_number(&value)?;
-            let new_u: u32 = if n1.is_nan() || n1.is_infinite() || n1 == 0.0 {
-                0
-            } else {
-                (n1.trunc() as i64 as u64 & 0xFFFF_FFFF) as u32
-            };
-            let n = self.to_number(&value)?;
-            let same = if n == 0.0 {
-                new_u == 0
-            } else {
-                (new_u as f64) == n
-            };
-            if !same {
-                return Err(self.throw("RangeError", "Invalid array length"));
+            let success = crate::builtins::array_set_length_value(self, obj, value)?;
+            if !success && self.strict {
+                return Err(self.throw("TypeError", "cannot assign array length"));
             }
-            // A non-writable `length` (frozen/sealed array) rejects the change — re-read after
-            // the coercions, which may have frozen it.
-            let len_writable = obj
-                .borrow()
-                .props
-                .get("length")
-                .map(|p| p.writable())
-                .unwrap_or(true);
-            if !len_writable {
-                if self.strict {
-                    return Err(
-                        self.throw("TypeError", "cannot assign to read-only property 'length'")
-                    );
-                }
-                return Ok(false);
-            }
-            let new_len = n as usize;
-            let old_len = self.array_length(obj);
-            if new_len < old_len {
-                // ArraySetLength deletes out-of-range indices from the top down, stopping at a
-                // non-configurable one. Equivalent bulk form: everything above the *highest*
-                // non-configurable out-of-range index (all necessarily configurable) is removed
-                // in one O(n) compaction; length settles just past the blocker (strict throws).
-                let blocker = obj.borrow().props.highest_nonconfig_index_from(new_len);
-                match blocker {
-                    None => obj.borrow_mut().props.remove_indices_from(new_len),
-                    Some(b) => {
-                        let mut ob = obj.borrow_mut();
-                        ob.props.remove_indices_from(b + 1);
-                        ob.props.insert(
-                            "length",
-                            Property::data(Value::Num((b + 1) as f64), true, false, false),
-                        );
-                        drop(ob);
-                        if self.strict {
-                            return Err(self.throw(
-                                "TypeError",
-                                "cannot delete non-configurable array element via length",
-                            ));
-                        }
-                        return Ok(false);
-                    }
-                }
-            }
-            obj.borrow_mut().props.insert(
-                "length",
-                Property::data(Value::Num(new_len as f64), true, false, false),
-            );
-            return Ok(true);
+            return Ok(success);
         }
         // Adding a new index to a non-extensible (sealed/frozen) array is rejected.
         if !obj.borrow().props.contains(key) && !obj.borrow().extensible {
@@ -7935,7 +8080,7 @@ impl Interp {
             return Ok(false);
         }
         // Appending past a non-writable `length` is rejected.
-        if let Some(idx) = key.parse::<u64>().ok().filter(|&i| i < 4294967295) {
+        if let Some(idx) = crate::value::canonical_index(key) {
             let len = self.array_length(obj);
             let len_writable = obj
                 .borrow()
@@ -7963,7 +8108,7 @@ impl Interp {
         }
         // Only a canonical array index (< 2^32 - 1) updates `length`; larger numeric keys are
         // ordinary properties.
-        if let Some(i) = key.parse::<u64>().ok().filter(|&i| i < 4294967295) {
+        if let Some(i) = crate::value::canonical_index(key) {
             let i = i as usize;
             let len = self.array_length(obj);
             if i >= len {
@@ -8173,6 +8318,7 @@ impl Interp {
         if self.gc_suppressed != 0 {
             return Ok(());
         }
+        self.gc_weak_metadata_safepoint(false);
         // Scope churn is tracked separately: call-heavy code can retire millions of scopes while
         // allocating few objects, and each dead weak registry entry pins its allocation.
         if crate::value::gc_scope_registry_len(&self.gc_heap) > self.scope_gc_next {
@@ -8198,8 +8344,15 @@ impl Interp {
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
         // Re-arm: collect again once live doubles, clamped to [GC_TRIGGER, MAX_LIVE].
-        self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
+        self.gc_next = crate::gc_generational::next_threshold(live);
         Ok(())
+    }
+
+    /// ClearKeptObjects and host-owned temporary native roots share a job boundary. Neither may
+    /// run during an active synchronous evaluation (ECMA-262 #sec-weakref-invariants).
+    pub(crate) fn clear_kept_objects(&mut self) {
+        self.kept_alive.clear();
+        self.host_state.end_job();
     }
 
     /// Collect after a high-pressure host task, when temporary roots from that task have gone away.
@@ -8211,7 +8364,8 @@ impl Interp {
         }
         // ClearKeptObjects (ECMA-262 §9.10): the synchronous job that established WeakRef
         // read consistency has ended before a host task-boundary collection may run.
-        self.kept_alive.clear();
+        self.clear_kept_objects();
+        self.gc_weak_metadata_safepoint(true);
         let allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         let churn = allocated.wrapping_sub(self.gc_task_allocated);
         self.gc_task_allocated = allocated;
@@ -8249,7 +8403,7 @@ impl Interp {
                 self.generators.len()
             );
         }
-        self.gc_next = (live.saturating_mul(2)).clamp(GC_TRIGGER, MAX_LIVE);
+        self.gc_next = crate::gc_generational::next_threshold(live);
         before.saturating_sub(live)
     }
 
@@ -8354,6 +8508,7 @@ impl Interp {
             class_info,
             module_ns,
             map_data,
+            collection_iterators,
             ta_buffer,
             proxies,
             host_indexed,
@@ -8392,6 +8547,7 @@ impl Interp {
             class_info,
             module_ns,
             map_data,
+            collection_iterators,
             ta_buffer,
             proxies,
             host_indexed,
@@ -8403,7 +8559,7 @@ impl Interp {
         )
     }
 
-    fn obj_refs_into(&self, o: &Gc, refs: &mut Vec<Gc>) {
+    pub(crate) fn obj_refs_into(&self, o: &Gc, refs: &mut Vec<Gc>) {
         refs.clear();
         let b = o.borrow();
         if let Some(p) = &b.proto {
@@ -8471,9 +8627,14 @@ impl Interp {
             }
         }
         if let Some(entries) = self.map_data.get(&ptr) {
-            for (key, value) in entries {
+            for (key, value) in entries.iter() {
                 Self::push_value_object(key, refs);
                 Self::push_value_object(value, refs);
+            }
+        }
+        if let Some(iterator) = self.collection_iterators.get(&ptr) {
+            if let Some(target) = &iterator.target {
+                refs.push(target.clone());
             }
         }
         if let Some(value) = self.ta_buffer.get(&ptr) {
@@ -8521,7 +8682,7 @@ impl Interp {
             if let Some(global) = &registry.cleanup_callback.script_caller {
                 refs.push(global.clone());
             }
-            for cell in &registry.cells {
+            for cell in registry.cells.iter() {
                 Self::push_value_object(&cell.held_value, refs);
             }
         }
@@ -8534,7 +8695,7 @@ impl Interp {
     /// This needs no root enumeration, so it is safe to run in the middle of evaluation.
     /// The scopes `o` refers to: a user function's closure environment, a mapped `arguments`
     /// object's aliased parameter scope, and a class constructor's field-initializer environment.
-    fn obj_scope_refs_into(&self, o: &Gc, out: &mut Vec<Env>) {
+    pub(crate) fn obj_scope_refs_into(&self, o: &Gc, out: &mut Vec<Env>) {
         out.clear();
         if let Callable::User(user) = &o.borrow().call {
             out.push(user.env.clone());
@@ -8555,11 +8716,99 @@ impl Interp {
         }
     }
 
+    /// Sweep one already-proven non-live set. Full and nursery collectors share atomic weak
+    /// clearing and internal-slot eviction (ECMA-262 #sec-weakref-execution).
+    pub(crate) fn gc_sweep_dead_objects(
+        &mut self,
+        garbage_objects: &crate::fasthash::FastSet<usize>,
+        native: &crate::gc_native::NativeGcGraph,
+    ) {
+        self.host_state.sweep_gc_with_native(
+            &|value| match value {
+                Value::Obj(object) => !garbage_objects.contains(&(Rc::as_ptr(object) as usize)),
+                _ => true,
+            },
+            &|id| native.is_live(id),
+        );
+
+        // Drop template entries owned by a dead Realm before the sweep releases its global.
+        // Checking the Realm table as well as the garbage set handles stale pointer-keyed entries
+        // without allowing an address-reused global to inherit an old template object.
+        self.template_cache.retain(|(realm_key, _), value| {
+            self.realms.contains_key(realm_key)
+                && !garbage_objects.contains(realm_key)
+                && match value {
+                    Value::Obj(object) => !garbage_objects.contains(&(Rc::as_ptr(object) as usize)),
+                    _ => true,
+                }
+        });
+
+        // ECMA-262 §9.9 performs all weak-target clearing atomically for the chosen non-live set.
+        // Do this before any strong side-table edge is released, while every identity is stable.
+        self.gc_clear_weak_targets(garbage_objects);
+        self.gc_forget_weak_owners(garbage_objects);
+        self.gc_drain_weak_deaths();
+        self.gc_schedule_finalization_cleanup(garbage_objects);
+
+        // Sweep: clear unmarked (garbage) objects to break their cycles; once `live` drops, their
+        // refcounts hit zero and they are freed. Also evict them from pointer-keyed side tables so a
+        // future object reusing the address can't inherit stale metadata.
+        self.native_function_realms.get_mut().retain(|_, (pin, _)| {
+            pin.upgrade().is_some_and(|function| {
+                !garbage_objects.contains(&(Rc::as_ptr(&function) as usize))
+            })
+        });
+        // Evict the chosen dead set in batches. Probing all internal-slot tables for each
+        // ordinary function/prototype makes closure churn pay for unrelated platform state.
+        // Small dead sets keep directed removal; dense churn scans each table only once.
+        // The heap/scope snapshots keep identities alive, and weak targets were cleared above.
+        crate::gc_sweep::map(&mut self.class_info, &garbage_objects);
+        crate::gc_sweep::set(&mut self.eval_realm_fns, &garbage_objects);
+        crate::gc_sweep::map(&mut self.module_ns, &garbage_objects);
+        crate::gc_sweep::map(&mut self.realms, &garbage_objects);
+        crate::gc_sweep::map(&mut self.map_data, &garbage_objects);
+        crate::gc_sweep::map(&mut self.collection_iterators, &garbage_objects);
+        crate::gc_sweep::map(&mut self.typed_arrays, &garbage_objects);
+        crate::gc_sweep::map(&mut self.data_views, &garbage_objects);
+        crate::gc_sweep::map(&mut self.regexps, &garbage_objects);
+        crate::gc_sweep::map(&mut self.proxies, &garbage_objects);
+        crate::gc_sweep::map(&mut self.host_indexed, &garbage_objects);
+        crate::gc_sweep::map(&mut self.promises, &garbage_objects);
+        crate::gc_sweep::map(&mut self.temporal, &garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffers, &garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffer_versions, &garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, &garbage_objects);
+        crate::gc_sweep::map(&mut self.ta_buffer, &garbage_objects);
+        crate::gc_sweep::map(&mut self.shadow_realms, &garbage_objects);
+        crate::gc_sweep::map(&mut self.shared_buffers, &garbage_objects);
+        crate::gc_sweep::set(&mut self.immutable_buffers, &garbage_objects);
+        crate::gc_sweep::set(&mut self.host_keyed_buffers, &garbage_objects);
+        crate::gc_sweep::map(&mut self.generators, &garbage_objects);
+        crate::gc_sweep::set(&mut self.async_gens, &garbage_objects);
+        crate::gc_sweep::set(&mut self.async_gen_busy, &garbage_objects);
+        crate::gc_sweep::map(&mut self.async_gen_queue, &garbage_objects);
+        crate::gc_sweep::map(&mut self.mapped_arguments, &garbage_objects);
+        crate::gc_sweep::map(&mut self.deferred_ns, &garbage_objects);
+        crate::gc_sweep::map(&mut self.promise_forward, &garbage_objects);
+        crate::gc_sweep::map(&mut self.temporal_cal, &garbage_objects);
+        crate::gc_sweep::map(&mut self.gc_pins, &garbage_objects);
+    }
+
     pub(crate) fn gc_collect(&mut self) {
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
     }
 
     fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
+        // Explicit/idle/task collections still revisit the complete graph. Allocation pressure
+        // usually visits only newly allocated objects, with bounded major-collection debt.
+        if matches!(cause, crate::value::GcCause::AllocationThreshold)
+            && crate::gc_generational::enabled()
+            && crate::value::heap_live_objects(&self.gc_heap) < MAX_LIVE
+            && !crate::value::gc_major_due(&self.gc_heap, GC_TRIGGER)
+        {
+            self.gc_collect_young(cause);
+            return;
+        }
         self.gc_collect_with_edge_budget(cause, crate::gc_edges::EDGE_CACHE_BYTES);
     }
 
@@ -8728,8 +8977,24 @@ impl Interp {
         struct AuxiliaryEdges {
             edges: crate::fasthash::FastMap<usize, Vec<usize>>,
             roots: Vec<usize>,
+            native: crate::gc_native::NativeGcGraph,
         }
         impl crate::host::HostGcVisitor for AuxiliaryEdges {
+            fn supports_native(&self) -> bool {
+                true
+            }
+            fn native_edge(&mut self, from: crate::host::NativeGcId, to: crate::host::NativeGcId) {
+                self.native.native_edge(from, to);
+            }
+            fn js_to_native(&mut self, owner: &Value, to: crate::host::NativeGcId) {
+                self.native.js_to_native(owner, to);
+            }
+            fn native_to_js(&mut self, from: crate::host::NativeGcId, value: &Value) {
+                self.native.native_to_js(from, value);
+            }
+            fn native_root(&mut self, id: crate::host::NativeGcId) {
+                self.native.native_root(id);
+            }
             fn internal(&mut self, value: &Value) {
                 if let Value::Obj(object) = value {
                     let b = object.borrow();
@@ -8752,6 +9017,7 @@ impl Interp {
         }
         let mut auxiliary_edges = AuxiliaryEdges::default();
         self.host_state.trace_gc(&mut auxiliary_edges);
+        crate::native_captures::NativeCaptureSnapshot::new(&live).trace(&mut auxiliary_edges);
         // A continuation owns its stored values/environments on behalf of its generator
         // or result promise. Count the actual payloads once, instead of probing this table
         // for every ordinary object. The existing auxiliary-owner lookup also dispatches
@@ -8790,6 +9056,21 @@ impl Interp {
                 s_mark[k] = true;
                 sstack.push(e.clone());
             }
+        }
+        auxiliary_edges
+            .native
+            .trace_roots(&mut auxiliary_edges.roots);
+        // A JS owner in another heap is outside this collection's non-live candidate set.
+        // Preserve its native graph just as we preserve its ordinary outgoing strong edges.
+        let foreign_native_owners: Vec<_> = auxiliary_edges
+            .native
+            .js_owners()
+            .filter(|owner| !live_index.contains_key(owner))
+            .collect();
+        for owner in foreign_native_owners {
+            auxiliary_edges
+                .native
+                .trace_js(owner, &mut auxiliary_edges.roots);
         }
         for ptr in &auxiliary_edges.roots {
             if let Some(&index) = live_index.get(ptr) {
@@ -8892,6 +9173,11 @@ impl Interp {
                     + self.native_arg_pool.iter().map(Vec::len).sum::<usize>(),
             );
             eprintln!("[gc-dump-stack] {}", self.capture_stack());
+            let root_limit = std::env::var("LUMEN_GC_DUMP_ROOT_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(60)
+                .clamp(1, 16_384);
             let mut shown = 0;
             for o in &live {
                 let b = o.borrow();
@@ -8901,9 +9187,28 @@ impl Interp {
                 let internal = b.gc_internal.get() as usize;
                 let strong = Rc::strong_count(o);
                 let keys: Vec<&str> = b.props.iter().take(4).map(|(k, _)| &**k).collect();
-                eprintln!("[gc-dump] root strong={strong} internal={internal} props={keys:?}");
+                // Both the heap snapshot and the already classified mark stack
+                // hold one temporary reference here. Zero external references
+                // identifies a root reached only through the native host graph.
+                let external = strong.saturating_sub(internal + 2);
+                let identity = Rc::as_ptr(o) as usize;
+                let node = b
+                    .props
+                    .get("__id")
+                    .and_then(|property| property.value().as_num_opt());
+                let mut prototype = b.proto.clone();
+                let mut prototype_realm = None;
+                for _ in 0..32 {
+                    let Some(object) = prototype else { break };
+                    if let Some(realm) = realm_members.get(&(Rc::as_ptr(&object) as usize)) {
+                        prototype_realm = Some(*realm);
+                        break;
+                    }
+                    prototype = object.borrow().proto.clone();
+                }
+                eprintln!("[gc-dump] root id={identity:x} strong={strong} internal={internal} external={external} node={node:?} prototype_realm={prototype_realm:x?} pinned={} weakref={} finalizer={} props={keys:?}", self.gc_pins.contains_key(&identity), self.weak_refs.contains_key(&identity), self.finalization_registries.contains_key(&identity));
                 shown += 1;
-                if shown >= 60 {
+                if shown >= root_limit {
                     break;
                 }
             }
@@ -8953,6 +9258,24 @@ impl Interp {
             realm_groups.insert(*realm_key, (objects, realm.global_env.clone()));
         }
         let mut activated_realms: crate::fasthash::FastSet<usize> = Default::default();
+
+        if std::env::var_os("LUMEN_GC_RETAINING_PATHS").is_some()
+            && (15_000..=500_000).contains(&live.len())
+        {
+            crate::gc_diagnostics::Snapshot {
+                objects: &live,
+                scopes: &scopes,
+                object_roots: &stack,
+                scope_roots: &sstack,
+                native: &auxiliary_edges.native,
+                host_edges: &auxiliary_edges.edges,
+                realm_members: &realm_members,
+                realm_scope_members: &realm_scope_members,
+                realm_groups: &realm_groups,
+                templates: &template_cache_members,
+            }
+            .dump_realm_paths(self);
+        }
 
         // Index the two-input ephemeron condition in both directions. When either an owner or an
         // object key is marked, the second condition is one O(1) mark-bit test; every WeakMap edge
@@ -9030,6 +9353,19 @@ impl Interp {
                 }
 
                 let ptr = Rc::as_ptr(&o) as usize;
+                auxiliary_edges.roots.clear();
+                auxiliary_edges
+                    .native
+                    .trace_js(ptr, &mut auxiliary_edges.roots);
+                for target in &auxiliary_edges.roots {
+                    if let Some(&index) = live_index.get(target) {
+                        let object = &live[index];
+                        if !object.borrow().gc_mark.get() {
+                            object.borrow().gc_mark.set(true);
+                            stack.push(object.clone());
+                        }
+                    }
+                }
                 if let Some(targets) = auxiliary_edges.edges.get(&ptr) {
                     for target in targets {
                         if let Some(&index) = live_index.get(target) {
@@ -9179,124 +9515,7 @@ impl Interp {
             .map(|object| Rc::as_ptr(object) as usize)
             .collect();
 
-        self.host_state.sweep_gc(&|value| match value {
-            Value::Obj(object) => !garbage_objects.contains(&(Rc::as_ptr(object) as usize)),
-            _ => true,
-        });
-
-        // Drop template entries owned by a dead Realm before the sweep releases its global.
-        // Checking the Realm table as well as the garbage set handles stale pointer-keyed entries
-        // without allowing an address-reused global to inherit an old template object.
-        self.template_cache.retain(|(realm_key, _), value| {
-            self.realms.contains_key(realm_key)
-                && !garbage_objects.contains(realm_key)
-                && match value {
-                    Value::Obj(object) => !garbage_objects.contains(&(Rc::as_ptr(object) as usize)),
-                    _ => true,
-                }
-        });
-
-        // ECMA-262 §9.9 performs all weak-target clearing atomically for the chosen non-live set.
-        // Do this before any strong side-table edge is released, while every identity is stable.
-        for target in self.weak_refs.values_mut() {
-            let clear = target.as_ref().is_some_and(|target| {
-                target.object_is_in(&garbage_objects) || target.upgrade().is_none()
-            });
-            if clear {
-                *target = None;
-            }
-        }
-
-        // Dead weak-collection keys and their ephemeron values disappear together. Rebuild the
-        // parallel identity index after compaction so pointer lookup remains O(1).
-        for (owner, entries) in &mut self.weak_collection_data {
-            entries.retain(|(target, _)| {
-                !target.object_is_in(&garbage_objects) && target.upgrade().is_some()
-            });
-            let index = self.weak_collection_index.entry(*owner).or_default();
-            index.clear();
-            index.extend(
-                entries
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, (target, _))| (target.key(), offset)),
-            );
-        }
-
-        let mut cleanup_jobs = Vec::new();
-        for (owner, registry) in &mut self.finalization_registries {
-            for cell in &mut registry.cells {
-                let clear = cell.target.as_ref().is_some_and(|target| {
-                    target.object_is_in(&garbage_objects) || target.upgrade().is_none()
-                });
-                if clear {
-                    cell.target = None;
-                }
-            }
-            let owner_live = self
-                .gc_pins
-                .get(owner)
-                .is_some_and(|object| object.borrow().gc_mark.get());
-            if owner_live
-                && !registry.cleanup_scheduled
-                && registry.cells.iter().any(|cell| cell.target.is_none())
-            {
-                registry.cleanup_scheduled = true;
-                cleanup_jobs.push(*owner);
-            }
-        }
-        for owner in cleanup_jobs {
-            if let Some(registry) = self.gc_pins.get(&owner) {
-                self.pending_finalization_cleanup
-                    .push_back(Value::Obj(registry.clone()));
-            }
-        }
-
-        // Sweep: clear unmarked (garbage) objects to break their cycles; once `live` drops, their
-        // refcounts hit zero and they are freed. Also evict them from pointer-keyed side tables so a
-        // future object reusing the address can't inherit stale metadata.
-        self.native_function_realms.get_mut().retain(|_, (pin, _)| {
-            pin.upgrade()
-                .is_some_and(|function| function.borrow().gc_mark.get())
-        });
-        // Evict the chosen dead set in batches. Probing all internal-slot tables for each
-        // ordinary function/prototype makes closure churn pay for unrelated platform state.
-        // Small dead sets keep directed removal; dense churn scans each table only once.
-        // The heap/scope snapshots keep identities alive, and weak targets were cleared above.
-        crate::gc_sweep::map(&mut self.class_info, &garbage_objects);
-        crate::gc_sweep::set(&mut self.eval_realm_fns, &garbage_objects);
-        crate::gc_sweep::map(&mut self.module_ns, &garbage_objects);
-        crate::gc_sweep::map(&mut self.realms, &garbage_objects);
-        crate::gc_sweep::map(&mut self.map_data, &garbage_objects);
-        crate::gc_sweep::map(&mut self.collection_index, &garbage_objects);
-        crate::gc_sweep::map(&mut self.weak_collection_data, &garbage_objects);
-        crate::gc_sweep::map(&mut self.weak_collection_index, &garbage_objects);
-        crate::gc_sweep::map(&mut self.typed_arrays, &garbage_objects);
-        crate::gc_sweep::map(&mut self.data_views, &garbage_objects);
-        crate::gc_sweep::map(&mut self.regexps, &garbage_objects);
-        crate::gc_sweep::map(&mut self.proxies, &garbage_objects);
-        crate::gc_sweep::map(&mut self.host_indexed, &garbage_objects);
-        crate::gc_sweep::map(&mut self.promises, &garbage_objects);
-        crate::gc_sweep::map(&mut self.temporal, &garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffers, &garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffer_versions, &garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, &garbage_objects);
-        crate::gc_sweep::map(&mut self.ta_buffer, &garbage_objects);
-        crate::gc_sweep::map(&mut self.shadow_realms, &garbage_objects);
-        crate::gc_sweep::map(&mut self.shared_buffers, &garbage_objects);
-        crate::gc_sweep::set(&mut self.immutable_buffers, &garbage_objects);
-        crate::gc_sweep::set(&mut self.host_keyed_buffers, &garbage_objects);
-        crate::gc_sweep::map(&mut self.generators, &garbage_objects);
-        crate::gc_sweep::set(&mut self.async_gens, &garbage_objects);
-        crate::gc_sweep::set(&mut self.async_gen_busy, &garbage_objects);
-        crate::gc_sweep::map(&mut self.async_gen_queue, &garbage_objects);
-        crate::gc_sweep::map(&mut self.mapped_arguments, &garbage_objects);
-        crate::gc_sweep::map(&mut self.deferred_ns, &garbage_objects);
-        crate::gc_sweep::map(&mut self.promise_forward, &garbage_objects);
-        crate::gc_sweep::map(&mut self.temporal_cal, &garbage_objects);
-        crate::gc_sweep::map(&mut self.weak_refs, &garbage_objects);
-        crate::gc_sweep::map(&mut self.finalization_registries, &garbage_objects);
-        crate::gc_sweep::map(&mut self.gc_pins, &garbage_objects);
+        self.gc_sweep_dead_objects(&garbage_objects, &auxiliary_edges.native);
         #[cfg(not(target_arch = "wasm32"))]
         let mut garbage = 0usize;
         for o in &live {
@@ -9328,6 +9547,9 @@ impl Interp {
         self.construct_ics
             .retain(|_, entry| entry.pin.strong_count() != 0);
         self.call_overflow.prune_dead();
+        if let Some(cache) = &self.native_callback_cache {
+            cache.prune_dead();
+        }
         self.construct_capacity_hints
             .retain(|_, (pin, _)| pin.strong_count() != 0);
         self.global_env_pins.retain(|pin| pin.strong_count() != 0);
@@ -9344,6 +9566,9 @@ impl Interp {
         drop(realm_groups);
         drop(live);
         drop(scopes);
+        self.gc_drain_weak_deaths();
+        self.gc_schedule_finalization_cleanup(&garbage_objects);
+        crate::value::gc_finish_generation(&self.gc_heap, true);
         self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_task_pending = false;
         #[cfg(not(target_arch = "wasm32"))]
@@ -9360,6 +9585,7 @@ impl Interp {
                 performance_scopes_before,
                 scopes_after,
                 cause,
+                None,
             );
             // One Agent snapshot must observe every ShadowRealm after collection, not a freshly
             // swept root mixed with stale sub-heaps. Ownership is a tree, so children recursively
@@ -9377,6 +9603,28 @@ impl Interp {
     }
 
     // ----- calling ----------------------------------------------------------------------------
+
+    /// Call an already-selected callback. ECMA-262 OrdinaryGet/OrdinarySet and proxy [[Get]],
+    /// [[Set]], [[Call]] still perform every descriptor/trap lookup before entering here. Only
+    /// the immutable function identity/code proof is reusable; replacement/revocation, realm
+    /// switching and parameter-instantiation fallbacks remain in the ordinary Call machinery.
+    pub(crate) fn call_callback(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
+        if self.tier != crate::bytecode::Tier::Jit
+            || !matches!(&callee, Value::Obj(o) if matches!(&o.borrow().call, Callable::User(_)))
+        {
+            return self.call(callee, this, args);
+        }
+        let cache = self
+            .native_callback_cache
+            .get_or_insert_with(|| Rc::new(crate::callback::CallbackCache::new()))
+            .clone();
+        cache.call_values(self, &callee, this, args)
+    }
 
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
         self.depth += 1;
@@ -9412,7 +9660,10 @@ impl Interp {
     /// proxies (a revoked proxy is a TypeError). `None` means the active realm.
     pub(crate) fn get_function_realm_global(&mut self, obj: &Gc) -> Result<Option<usize>, Abrupt> {
         let mut cur = obj.clone();
-        for _ in 0..64 {
+        // ECMA-262 #sec-getfunctionrealm has no depth cutoff. Immutable bound
+        // and proxy target links always lead toward an already-created object,
+        // so this iterative traversal cannot form a target cycle.
+        loop {
             if let Some((target, handler)) = self.proxies.get(&(Rc::as_ptr(&cur) as usize)) {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "proxy has been revoked"));
@@ -9434,7 +9685,6 @@ impl Interp {
                 None => return Ok(self.callee_realm_global(&cur)),
             }
         }
-        Ok(None)
     }
 
     /// Resume a proper tail call at the existing logical depth, but re-enter
@@ -9597,7 +9847,7 @@ impl Interp {
                     return Err(self.throw("TypeError", "proxy 'apply' trap is not callable"));
                 }
                 let arr = self.make_array(args.to_vec());
-                return self.call(trap, handler, &[target, this, arr]);
+                return self.call_callback(trap, handler, &[target, this, arr]);
             }
         }
         // An indirect call to another realm's `eval` runs in that realm's global scope. (A direct
@@ -10157,14 +10407,18 @@ impl Interp {
             self.in_field_init_code = false;
             self.in_async_gen_body = false;
         }
-        // Supported code can wait for executable capacity without being marked
-        // permanently unsupported. No eviction or mutation of live machine code:
-        // cached pointers remain stable, and a deferred body uses the checked VM.
+        // Capacity pressure is retryable. Reclamation invalidates raw ICs first
+        // and preserves every active native frame and owned Rust code lease.
         let mut jit_code = None;
         if matches!(self.tier, crate::bytecode::Tier::Jit) {
-            if chunk.jit.get().is_none()
-                && crate::jit::executable_code_can_fit(chunk.jit_budget_wait_bytes.get())
+            let permit = if chunk.jit.ready_to_compile()
+                && crate::jit::ensure_executable_capacity(chunk.jit_budget_wait_bytes.get())
             {
+                chunk.jit.begin_compile()
+            } else {
+                None
+            };
+            if let Some(permit) = permit {
                 let layout = *self
                     .jit_layout
                     .get_or_init(|| crate::value::jit_layout(&self.object_proto));
@@ -10175,18 +10429,18 @@ impl Interp {
                 match crate::jit::compile_profiled(chunk, &layout, &self.interp_layout.get()) {
                     crate::jit::JitCompileOutcome::Compiled(code) => {
                         chunk.jit_budget_wait_bytes.set(0);
-                        let _ = chunk.jit.set(Some(std::rc::Rc::new(code)));
+                        permit.commit(Some(std::rc::Rc::new(code)));
                     }
                     crate::jit::JitCompileOutcome::Deferred { required_bytes } => {
                         chunk.jit_budget_wait_bytes.set(required_bytes);
                     }
                     crate::jit::JitCompileOutcome::Unavailable => {
-                        let _ = chunk.jit.set(None);
+                        permit.commit(None);
                     }
                 }
             }
             if let Some(Some(code)) = chunk.jit.get() {
-                jit_code = Some(code.clone());
+                jit_code = Some(code);
             }
         }
         let r = match jit_code {
@@ -10222,6 +10476,7 @@ impl Interp {
                     strict_immutable: false,
                     initialized: true,
                     import_ref: None,
+                    imported: false,
                     deletable: false,
                 },
             );
@@ -10233,6 +10488,7 @@ impl Interp {
                     strict_immutable: true,
                     initialized: false,
                     import_ref: None,
+                    imported: false,
                     deletable: false,
                 },
             );
@@ -10378,8 +10634,8 @@ impl Interp {
         &mut self,
         site: &crate::bytecode::CallSite,
         callee: &Value,
-        this_slot: *const Value,
-        args: *mut Value,
+        this_slot: *const crate::value::PackedValue,
+        args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
         let Value::Obj(o) = callee else { return None };
@@ -10388,6 +10644,9 @@ impl Interp {
         // Probe the identity fields through the Cell without copying whole entries; only the
         // hit is copied out (nothing re-entrant runs between the probe and the copy).
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if epoch == u32::MAX {
+            return None;
+        }
         let mut hit = None;
         for e in &site.entries {
             let p = e.as_ptr();
@@ -10426,7 +10685,6 @@ impl Interp {
                     // of user mutations to the function object's prototype chain.
                     Callable::User(user)
                         if object.ic_plain.get()
-                            && !user.func.is_arrow
                             && user.realm == Rc::as_ptr(&self.global) as usize
                             && !user.env.borrow().under_with =>
                     {
@@ -10464,17 +10722,18 @@ impl Interp {
             let nf: crate::value::NativeFn = unsafe { std::mem::transmute(ic.native) };
             return Some(unsafe { self.call_native_committed(nf, this_slot, args, argc) });
         }
+        let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
         // Inline-recompile trigger: a chunk that keeps running in machine code gets one shot at
         // splicing its own hot monomorphic callees (see `bytecode::plan_inlines`).
         {
             let chunk_ref = unsafe { &**ic.chunk };
-            let runs = chunk_ref.jit_runs.get().wrapping_add(1);
+            let runs = chunk_ref.jit_runs.get().saturating_add(1);
             chunk_ref.jit_runs.set(runs);
-            if runs == crate::bytecode::inline_recompile_at() {
+            if chunk_ref.inline_retry_due(runs) {
                 self.try_inline_recompile(ic.func, chunk_ref, ic.env);
             }
         }
-        Some(unsafe { self.call_jit_committed(ic, this_slot, args, argc) })
+        Some(unsafe { self.call_jit_committed(ic, &code, this_slot, args, argc) })
     }
 
     /// A needs-env IC hit ([`crate::bytecode::CALL_IC_NEEDS_ENV`]): same guards and frame
@@ -10487,9 +10746,10 @@ impl Interp {
     pub(crate) unsafe fn call_jit_env_committed(
         &mut self,
         ic: crate::bytecode::CallIc,
+        code: &crate::jit::JitCode,
         env_ptr: *const RefCell<Scope>,
-        this_slot: *const Value,
-        args: *mut Value,
+        this_slot: *const crate::value::PackedValue,
+        args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Result<Value, Abrupt> {
         let drop_args = || unsafe {
@@ -10501,17 +10761,23 @@ impl Interp {
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             drop_args();
-            unsafe { std::ptr::drop_in_place(this_slot as *mut Value) };
+            unsafe { std::ptr::drop_in_place(this_slot.cast_mut()) };
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
         if let Err(e) = self.gc_check_amortized() {
             self.depth -= 1;
             drop_args();
-            unsafe { std::ptr::drop_in_place(this_slot as *mut Value) };
+            unsafe { std::ptr::drop_in_place(this_slot.cast_mut()) };
             return Err(e);
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+        // ECMA-262 OrdinaryCallBindThis / arrow FunctionDeclarationInstantiation:
+        // lexical calls do not introduce this/new.target bindings of their own.
+        let saved_nt = if ic.direct & crate::bytecode::CALL_IC_LEXICAL_THIS != 0 {
+            self.new_target.clone()
+        } else {
+            std::mem::replace(&mut self.new_target, Value::Undefined)
+        };
         self.fn_frames.push(FnFrame {
             fn_ptr: ic.callee,
             coro: self.cur_coro,
@@ -10524,8 +10790,7 @@ impl Interp {
         // belongs to whichever closure instance filled the entry).
         let env = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(env_ptr) });
         let chunk = unsafe { &*ic.chunk };
-        let code = unsafe { &*ic.code };
-        let this_read = unsafe { this_slot.read() };
+        let this_read = unsafe { this_slot.read() }.into_value();
         let this_val = if !ic.uses_this {
             drop(this_read);
             Value::Undefined
@@ -10582,15 +10847,15 @@ impl Interp {
     pub(crate) unsafe fn call_native_committed(
         &mut self,
         nf: crate::value::NativeFn,
-        this_slot: *const Value,
-        args: *mut Value,
+        this_slot: *const crate::value::PackedValue,
+        args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Result<Value, Abrupt> {
         let drop_operands = || unsafe {
             for k in 0..argc {
                 std::ptr::drop_in_place(args.add(k));
             }
-            std::ptr::drop_in_place(this_slot as *mut Value);
+            std::ptr::drop_in_place(this_slot.cast_mut());
         };
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
@@ -10609,7 +10874,9 @@ impl Interp {
         let native_result = match self.interrupt_poll_force() {
             Ok(()) => with_execution_stack(self.depth, || {
                 let perf_started = crate::jit::perf_stage_start();
-                let result = nf(self, unsafe { &*this_slot }.clone(), args_ref);
+                let result = PackedValue::with_values(args_ref, |arguments| {
+                    nf(self, unsafe { &*this_slot }.unpack(), arguments)
+                });
                 crate::jit::perf_native_end(
                     perf_started,
                     result.is_ok(),
@@ -10656,16 +10923,18 @@ impl Interp {
     /// # Safety
     /// `ic` must be a hit validated THIS turn (callee identity + epoch + realm), with the callee
     /// object alive in the caller's hands; `args..args+argc` and `*this_slot` are live
-    /// operand-stack values the caller forgets.
+    /// operand-stack values the caller forgets. `code` is the owned lease of
+    /// `ic.code`, acquired immediately after validation and retained by the caller.
     pub(crate) unsafe fn call_jit_committed(
         &mut self,
         ic: crate::bytecode::CallIc,
-        this_slot: *const Value,
-        args: *mut Value,
+        code: &crate::jit::JitCode,
+        this_slot: *const crate::value::PackedValue,
+        args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Result<Value, Abrupt> {
         if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
-            return unsafe { self.call_jit_env_committed(ic, ic.env, this_slot, args, argc) };
+            return unsafe { self.call_jit_env_committed(ic, code, ic.env, this_slot, args, argc) };
         }
         // --- committed: identical to call_jit_fast's committed path ---
         self.depth += 1;
@@ -10675,7 +10944,7 @@ impl Interp {
                 for k in 0..argc {
                     std::ptr::drop_in_place(args.add(k));
                 }
-                std::ptr::drop_in_place(this_slot as *mut Value);
+                std::ptr::drop_in_place(this_slot.cast_mut());
             }
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
@@ -10685,12 +10954,16 @@ impl Interp {
                 for k in 0..argc {
                     std::ptr::drop_in_place(args.add(k));
                 }
-                std::ptr::drop_in_place(this_slot as *mut Value);
+                std::ptr::drop_in_place(this_slot.cast_mut());
             }
             return Err(e);
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+        let saved_nt = if ic.direct & crate::bytecode::CALL_IC_LEXICAL_THIS != 0 {
+            self.new_target.clone()
+        } else {
+            std::mem::replace(&mut self.new_target, Value::Undefined)
+        };
         self.fn_frames.push(FnFrame {
             fn_ptr: ic.callee,
             coro: self.cur_coro,
@@ -10703,10 +10976,9 @@ impl Interp {
         // `&Env` fabricated from the raw pointer; nothing below moves it out.
         let env = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(ic.env) });
         let chunk = unsafe { &*ic.chunk };
-        let code = unsafe { &*ic.code };
         // OrdinaryCallBindThis on the moved `this` (bind_compiled_this, inlined over `ic.strict`
         // and the fill-time `uses_this`).
-        let this_read = unsafe { this_slot.read() };
+        let this_read = unsafe { this_slot.read() }.into_value();
         let this_val = if !ic.uses_this {
             drop(this_read);
             Value::Undefined
@@ -10752,7 +11024,7 @@ impl Interp {
         r
     }
 
-    /// One-shot second-stage compile of a hot chunk's function with its monomorphic callees
+    /// Bounded, feedback-adaptive second-stage compile of a hot chunk's function with its callees
     /// spliced inline. On success the new chunk lands in `Function::code2` and the global call-IC
     /// epoch bumps, so every cached caller re-resolves and picks it up; the old chunk stays
     /// alive (and correct) beneath any pointers already handed out.
@@ -10766,7 +11038,7 @@ impl Interp {
             crate::jit::perf_inline_suppressed();
             return;
         }
-        if chunk.inline_attempted.replace(true) {
+        if !chunk.advance_inline_feedback() {
             crate::jit::perf_inline_suppressed();
             return;
         }
@@ -10774,6 +11046,7 @@ impl Interp {
         // never reassigned (the same argument that makes the rest of the IC readable).
         let func = unsafe { &*func };
         if func.code2.get().is_some() {
+            chunk.inline_retry_at.set(0);
             crate::jit::perf_inline_suppressed();
             return;
         }
@@ -10802,7 +11075,8 @@ impl Interp {
                 );
             }
             let _ = func.code2.set(Some(chunk2));
-            crate::bytecode::CALL_IC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            chunk.inline_retry_at.set(0);
+            crate::bytecode::invalidate_call_caches();
         } else {
             crate::jit::perf_inline_failure();
         }
@@ -10865,7 +11139,7 @@ impl Interp {
         chunk: &crate::bytecode::Chunk,
         this: &Gc,
         this_val: &Value,
-        args: *mut Value,
+        args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
         let (initializer_name, initializer_cache, apply_cache) =
@@ -10874,14 +11148,18 @@ impl Interp {
         // walks prototype links by borrowed raw pointer, validates every live shape/descriptor,
         // and clones only the final value. A miss re-derives the same side-effect-free ordinary
         // data-property proof; accessors/exotics still decline before anything is consumed.
-        let initializer = self.try_ic_get(this, initializer_name, initializer_cache, true)?;
+        let initializer = self
+            .try_ic_get(this, initializer_name, initializer_cache, true)?
+            .data()?;
         let Value::Obj(initializer_obj) = &initializer else {
             return None;
         };
         // Reuse the body's own `GetMethod("apply")` feedback too. Its shape guards prove there
         // is no own shadow, validate the live prototype link, and read the inherited slot by
         // index; an override/prototype swap/accessor/exotic still declines before arguments move.
-        let apply = self.try_ic_get(initializer_obj, "apply", apply_cache, true)?;
+        let apply = self
+            .try_ic_get(initializer_obj, "apply", apply_cache, true)?
+            .data()?;
         let Value::Obj(apply_obj) = &apply else {
             return None;
         };
@@ -10943,7 +11221,10 @@ impl Interp {
                             .or_else(|| user.func.code.get())
                             .and_then(Option::as_ref)
                             .filter(|initializer_chunk| {
-                                initializer_chunk.jit.get().is_some_and(Option::is_some)
+                                initializer_chunk
+                                    .jit
+                                    .get()
+                                    .is_some_and(|code| code.is_some())
                                     && initializer_chunk.jit_no_activation()
                                     && initializer_chunk.jit_initializer_plan().is_some()
                             })
@@ -10974,7 +11255,7 @@ impl Interp {
                 .map_or(0, |proto| Rc::as_ptr(proto) as usize);
             let start_shape = object.props.shape();
             drop(object);
-            if epoch == u32::MAX {
+            if epoch == u32::MAX || !crate::value::is_cacheable_shape(start_shape) {
                 return None;
             }
             if let Some(shapes) = plan.cached_shapes(epoch, proto_ptr, start_shape) {
@@ -10987,6 +11268,7 @@ impl Interp {
                 let transition = (0..crate::bytecode::PROP_IC_WAYS).find_map(|way| {
                     let state = self.ic_way(cache, way).get();
                     (state.depth == crate::bytecode::IC_CREATE
+                        && state.has_cacheable_shapes()
                         && state.recv_shape == shape
                         && state.mid_shape == epoch
                         && (((state.mid2_shape as u64) << 32) | state.slot as u64) as usize
@@ -11041,26 +11323,31 @@ impl Interp {
                 let (slot, default, name, _) = initializer_chunk.jit_initializer_field(plan, field);
                 let value = if slot < argc {
                     let arg = unsafe { args.add(slot) };
-                    if let Some(default) = default.filter(|_| !self.to_boolean(unsafe { &*arg })) {
-                        default.clone()
+                    if let Some(default) =
+                        default.filter(|_| !self.to_boolean(&unsafe { &*arg }.unpack()))
+                    {
+                        PackedValue::pack(default.clone())
                     } else {
-                        let value = unsafe { arg.read() };
-                        unsafe { arg.write(Value::Undefined) };
-                        value
+                        // The plan proves each parameter is consumed at most once. Move the
+                        // canonical owner directly; OrdinarySet's guards above already prove
+                        // a fresh writable data field, so no public Value boundary remains.
+                        unsafe { arg.replace(PackedValue::pack(Value::Undefined)) }
                     }
                 } else {
-                    default.cloned().unwrap_or(Value::Undefined)
+                    PackedValue::pack(default.cloned().unwrap_or(Value::Undefined))
                 };
                 if initialized_layout {
                     object
                         .props
-                        .append_initialized_field(name, Property::plain(value));
+                        .append_initialized_field(name, Property::plain_packed(value));
                 } else {
                     object
                         .props
-                        .append_proven_plain(name, Property::plain(value));
+                        .append_proven_plain(name, Property::plain_packed(value));
                 }
             }
+            #[cfg(test)]
+            constructor_transfer_tests::record_forwarded();
             object
                 .props
                 .finish_proven_plain_shape(shapes[plan.len() - 1]);
@@ -11093,11 +11380,11 @@ impl Interp {
             return Some(Err(e));
         }
 
-        let mut forwarded_this = std::mem::ManuallyDrop::new(this_val.clone());
+        let mut forwarded_this = std::mem::ManuallyDrop::new(PackedValue::pack(this_val.clone()));
         let fast = unsafe {
             self.call_jit_fast(
                 &initializer,
-                &*forwarded_this as *const Value,
+                &*forwarded_this as *const PackedValue,
                 args,
                 argc,
                 None,
@@ -11108,7 +11395,9 @@ impl Interp {
             None => {
                 unsafe { std::mem::ManuallyDrop::drop(&mut forwarded_this) };
                 let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
-                let r = self.call(initializer, this_val.clone(), args_ref);
+                let r = PackedValue::with_values(args_ref, |arguments| {
+                    self.call(initializer, this_val.clone(), arguments)
+                });
                 drop_args();
                 r
             }
@@ -11120,7 +11409,7 @@ impl Interp {
     pub(crate) unsafe fn construct_jit_fast(
         &mut self,
         callee: &Value,
-        args: *mut Value,
+        args: *mut crate::value::PackedValue,
         argc: usize,
         caller_ctx: Option<*mut crate::jit::JitCtx>,
         site: Option<(&crate::bytecode::Chunk, u32)>,
@@ -11128,6 +11417,9 @@ impl Interp {
         let Value::Obj(o) = callee else { return None };
         let key = Rc::as_ptr(o) as usize;
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if epoch == u32::MAX {
+            return None;
+        }
         let genv = Rc::as_ptr(&self.global_env) as usize;
         // A live site entry can only have been installed by `construct_ic_fill`, hence it is
         // already known to be a same-realm ordinary user constructor. Probe it before classifying
@@ -11178,7 +11470,9 @@ impl Interp {
             let saved_nt = std::mem::replace(&mut self.new_target, callee.clone());
             let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
             let r = with_execution_stack(self.depth, || {
-                self.dispatch_native(&call, Value::Undefined, args_ref)
+                PackedValue::with_values(args_ref, |arguments| {
+                    self.dispatch_native(&call, Value::Undefined, arguments)
+                })
             });
             self.constructing = saved_ctor;
             self.new_target = saved_nt;
@@ -11213,6 +11507,9 @@ impl Interp {
                 _ => self.construct_ic_fill(o, key, epoch, genv)?,
             },
         };
+        // Before GC, instance preparation or a forwarding initializer can
+        // compile/reclaim code, turn the validated raw pointer into a lease.
+        let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
         if cached_site.is_none() {
             if let Some((chunk, cache)) = site {
                 chunk.fill_construct_cache(
@@ -11317,6 +11614,7 @@ impl Interp {
                     let transition = (0..crate::bytecode::PROP_IC_WAYS).find_map(|way| {
                         let state = self.ic_way(cache, way).get();
                         (state.depth == crate::bytecode::IC_CREATE
+                            && state.has_cacheable_shapes()
                             && state.recv_shape == shape
                             && state.mid_shape == epoch
                             && (((state.mid2_shape as u64) << 32) | state.slot as u64) as usize
@@ -11353,22 +11651,24 @@ impl Interp {
                     let (slot, name, _) = simple.field(field);
                     let value = if slot < argc {
                         let arg = unsafe { args.add(slot) };
-                        let value = unsafe { arg.read() };
-                        unsafe { arg.write(Value::Undefined) };
-                        value
+                        // Unique parameter uses let [[Construct]] transfer the owned packed
+                        // word straight to the proven ordinary data field, without widening.
+                        unsafe { arg.replace(PackedValue::pack(Value::Undefined)) }
                     } else {
-                        Value::Undefined
+                        PackedValue::pack(Value::Undefined)
                     };
                     if initialized_layout {
                         object
                             .props
-                            .append_initialized_field(name, Property::plain(value));
+                            .append_initialized_field(name, Property::plain_packed(value));
                     } else {
                         object
                             .props
-                            .append_proven_plain(name, Property::plain(value));
+                            .append_proven_plain(name, Property::plain_packed(value));
                     }
                 }
+                #[cfg(test)]
+                constructor_transfer_tests::record_simple();
                 object
                     .props
                     .finish_proven_plain_shape(shapes[simple.len() - 1]);
@@ -11396,7 +11696,6 @@ impl Interp {
             extra: None,
         });
         let env = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(ic.env) });
-        let code = unsafe { &*ic.code };
         let tv = if ic.uses_this {
             this_val.clone()
         } else {
@@ -11415,7 +11714,7 @@ impl Interp {
                     crate::jit::run_moved_env(
                         self,
                         chunk,
-                        code,
+                        &code,
                         &*env as *const Env,
                         tv,
                         args,
@@ -11430,7 +11729,7 @@ impl Interp {
                             self,
                             &mut *caller_ctx,
                             chunk,
-                            code,
+                            &code,
                             &*env as *const Env,
                             tv,
                             args,
@@ -11442,7 +11741,7 @@ impl Interp {
                         crate::jit::run_moved(
                             self,
                             chunk,
-                            code,
+                            &code,
                             &*env as *const Env,
                             tv,
                             args,
@@ -11492,7 +11791,11 @@ impl Interp {
     ) -> Option<(crate::bytecode::CallIc, u32, u32, bool)> {
         let object = o.borrow();
         let (func, env) = match &object.call {
-            Callable::User(user) if object.ic_plain.get() => (user.func.clone(), user.env.clone()),
+            Callable::User(user)
+                if object.ic_plain.get() && user.realm == Rc::as_ptr(&self.global) as usize =>
+            {
+                (user.func.clone(), user.env.clone())
+            }
             _ => return None,
         };
         drop(object);
@@ -11502,30 +11805,14 @@ impl Interp {
         if env.borrow().under_with {
             return None;
         }
-        if self.multi_realm() {
-            type ScopeCell = RefCell<Scope>;
-            let mut cur: *const ScopeCell = Rc::as_ptr(&env);
-            let root_is_active = 'walk: {
-                for _ in 0..8 {
-                    if cur == Rc::as_ptr(&self.global_env) {
-                        break 'walk true;
-                    }
-                    match unsafe { (*cur).borrow().parent.as_ref().map(Rc::as_ptr) } {
-                        Some(p) => cur = p,
-                        None => break 'walk false,
-                    }
-                }
-                false
-            };
-            if !root_is_active {
-                return None;
-            }
-        }
         if !self.class_info.is_empty() && self.class_info.contains_key(&key) {
             return None;
         }
         let (prototype_shape, prototype_slot) = {
             let b = o.borrow();
+            if !crate::value::is_cacheable_shape(b.props.shape()) {
+                return None;
+            }
             let slot = b.props.slot_of("prototype")?;
             let property = b.props.property_at(slot)?;
             if property.accessor() || !matches!(property.value(), Value::Obj(_)) {
@@ -11569,7 +11856,7 @@ impl Interp {
             callee: key,
             env: Rc::as_ptr(&env),
             chunk: chunk as *const Rc<crate::bytecode::Chunk>,
-            code: Rc::as_ptr(code),
+            code: Rc::as_ptr(&code),
             global_env: genv,
             strict: func.is_strict,
             uses_this: chunk.needs_frame_this(),
@@ -11578,7 +11865,7 @@ impl Interp {
             direct: if needs_env {
                 crate::bytecode::CALL_IC_NEEDS_ENV
             } else {
-                chunk.jit_direct_flags(code)
+                chunk.jit_direct_flags(&code)
                     | (((chunk.inline_attempted.get() || func.code2.get().is_some()) as u8) << 2)
             },
             func: Rc::as_ptr(&func),
@@ -11610,8 +11897,8 @@ impl Interp {
     pub(crate) unsafe fn call_jit_fast(
         &mut self,
         callee: &Value,
-        this_slot: *const Value,
-        args: *mut Value,
+        this_slot: *const crate::value::PackedValue,
+        args: *mut crate::value::PackedValue,
         argc: usize,
         // The caller's per-site cache + pin map: filled once the full guard set passes, so
         // subsequent calls take [`Interp::call_jit_cached`]'s pointer-compare path.
@@ -11631,10 +11918,6 @@ impl Interp {
             _ => return None,
         };
         drop(object);
-        // Arrows inherit new.target lexically (the generic path skips the clear for them).
-        if func.is_arrow {
-            return None;
-        }
         // A closure under a `with` scope stays on the tree-walker (see `Scope::under_with`):
         // the VM's free-name ops re-resolve at execution time, which is observably wrong when
         // a with-object binding changes between the spec's reference resolution and its use.
@@ -11664,8 +11947,8 @@ impl Interp {
             return None;
         }
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
-        // The chunk and code stay borrowed through `func` (both OnceCells are set exactly once,
-        // and the held `func` clone keeps them alive across the run) — no Rc round-trips.
+        // Function's chunk handles remain set-once, but native residency is
+        // reclaimable. Hold the owned code lease through GC and the whole call.
         let chunk = match func.code2.get().or_else(|| func.code.get()) {
             Some(Some(c)) => c,
             _ => return None,
@@ -11676,7 +11959,7 @@ impl Interp {
         };
         // A prepared body must first run FunctionDeclarationInstantiation. Its environment is
         // not the closure environment supplied by this moved-frame shortcut.
-        if chunk.prepared_entry {
+        if chunk.prepared_entry || chunk.jit_is_resumable() {
             return None;
         }
         // A callee that needs an activation env (captured locals / lexical this) is cacheable
@@ -11712,19 +11995,23 @@ impl Interp {
                             callee: key,
                             env: Rc::as_ptr(&env),
                             chunk: chunk as *const Rc<crate::bytecode::Chunk>,
-                            code: Rc::as_ptr(code),
+                            code: Rc::as_ptr(&code),
                             global_env: Rc::as_ptr(&self.global_env) as usize,
                             strict: func.is_strict,
                             uses_this: chunk.needs_frame_this(),
                             n_params: n_params as u16,
                             n_slots: n_slots as u16,
-                            direct: if needs_env {
+                            direct: (if needs_env {
                                 crate::bytecode::CALL_IC_NEEDS_ENV
                             } else {
-                                chunk.jit_direct_flags(code)
+                                chunk.jit_direct_flags(&code)
                                     | (((chunk.inline_attempted.get() || func.code2.get().is_some())
                                         as u8)
                                         << 2)
+                            }) | if func.is_arrow {
+                                crate::bytecode::CALL_IC_LEXICAL_THIS
+                            } else {
+                                0
                             },
                             func: Rc::as_ptr(&func),
                             epoch: crate::bytecode::CALL_IC_EPOCH
@@ -11753,7 +12040,7 @@ impl Interp {
                 for k in 0..argc {
                     std::ptr::drop_in_place(args.add(k));
                 }
-                std::ptr::drop_in_place(this_slot as *mut Value);
+                std::ptr::drop_in_place(this_slot.cast_mut());
             }
             return Some(Err(
                 self.throw("RangeError", "Maximum call stack size exceeded")
@@ -11765,26 +12052,35 @@ impl Interp {
                 for k in 0..argc {
                     std::ptr::drop_in_place(args.add(k));
                 }
-                std::ptr::drop_in_place(this_slot as *mut Value);
+                std::ptr::drop_in_place(this_slot.cast_mut());
             }
             return Some(Err(e));
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+        let saved_nt = if func.is_arrow {
+            self.new_target.clone()
+        } else {
+            std::mem::replace(&mut self.new_target, Value::Undefined)
+        };
         self.fn_frames.push(FnFrame {
             fn_ptr: Rc::as_ptr(o) as usize,
             coro: self.cur_coro,
             strict: func.is_strict,
             extra: None,
         });
-        let this_val = self.bind_compiled_this(&func, chunk, unsafe { this_slot.read() }, false);
+        let this_val = self.bind_compiled_this(
+            &func,
+            chunk,
+            unsafe { this_slot.read() }.into_value(),
+            false,
+        );
         let mut r = with_execution_stack(self.depth, || {
             if needs_env {
                 unsafe {
                     crate::jit::run_moved_env(
                         self,
                         chunk,
-                        code,
+                        &code,
                         &env as *const Env,
                         this_val,
                         args,
@@ -11797,7 +12093,7 @@ impl Interp {
                     crate::jit::run_moved(
                         self,
                         chunk,
-                        code,
+                        &code,
                         &env as *const Env,
                         this_val,
                         args,
@@ -11998,6 +12294,7 @@ impl Interp {
                         strict_immutable: false,
                         initialized: true,
                         import_ref: None,
+                        imported: false,
                         deletable: false,
                     },
                 );
@@ -12034,6 +12331,7 @@ impl Interp {
                         strict_immutable: true,
                         initialized: !derived_tdz,
                         import_ref: None,
+                        imported: false,
                         deletable: false,
                     },
                 );
@@ -12065,6 +12363,7 @@ impl Interp {
                         strict_immutable: false,
                         initialized: true,
                         import_ref: None,
+                        imported: false,
                         deletable: false,
                     },
                 );
@@ -13170,6 +13469,49 @@ impl Interp {
         // Top-level `let`/`const` are pre-declared in their temporal dead zone.
         self.declare_block_lexicals(body, &self.global_env.clone(), false);
         let env = self.global_env.clone();
+        // Cold Script bodies retain the cheap reference path, including short/zero loops.
+        // Settled hot AST loop backedges admit a borrowed fragment, then that exact VM frame
+        // may enter native code. Threshold zero deliberately forces whole-Script coverage.
+        let forced_tier = self.tier_threshold == 0;
+        if !matches!(self.tier, crate::bytecode::Tier::Interp) && forced_tier {
+            if let Some(chunk) = crate::bytecode::compile_script(body, self.strict) {
+                // ScriptEvaluation has already installed the Script/Realm context and completed
+                // GDI. Enter the exact global Environment Record, without a Function frame or
+                // FunctionDeclarationInstantiation. A failed compile falls back before any body
+                // operation executes; a runtime abrupt completion is never replayed.
+                let mut code = None;
+                if forced_tier && matches!(self.tier, crate::bytecode::Tier::Jit) {
+                    let layout = *self
+                        .jit_layout
+                        .get_or_init(|| crate::value::jit_layout(&self.object_proto));
+                    if !self.interp_layout.get().valid {
+                        let interp_offsets = interp_layout(self);
+                        self.interp_layout.set(interp_offsets);
+                    }
+                    if let crate::jit::JitCompileOutcome::Compiled(native) =
+                        crate::jit::compile_profiled(&chunk, &layout, &self.interp_layout.get())
+                    {
+                        code = Some(Rc::new(native));
+                    }
+                }
+                // The Environment Record owns [[GlobalThisValue]], which an embedder may
+                // distinguish from the object backing global properties (for example a proxy).
+                let this = self.get_var("this", &env)?;
+                #[cfg(test)]
+                crate::bytecode::TEST_SCRIPT_ENTRIES.with(|counts| {
+                    let (vm, native) = counts.get();
+                    counts.set((
+                        vm + usize::from(code.is_none()),
+                        native + usize::from(code.is_some()),
+                    ));
+                });
+                return if let Some(code) = code {
+                    crate::jit::run(self, &chunk, &code, &env, this, &[])
+                } else {
+                    crate::bytecode::run(self, &chunk, &env, this, &[])
+                };
+            }
+        }
         let mut last = Value::Undefined;
         for stmt in body {
             match self.exec_stmt(stmt, &env) {
@@ -13246,6 +13588,7 @@ impl Interp {
                             strict_immutable: false,
                             initialized: true,
                             import_ref: None,
+                            imported: false,
                             deletable: false,
                         },
                     );
@@ -13265,14 +13608,6 @@ impl Interp {
     }
 }
 
-/// The slice of a [`Property`] a prototype-chain read needs — cloned out instead of the whole
-/// Property so hot data reads pay for one Rc bump, not three.
-struct PropRead {
-    accessor: bool,
-    get: Option<Value>,
-    value: Value,
-}
-
 /// The undefined, mutable, function-scoped binding hoisting creates for a `var` name.
 fn undef_var_binding() -> Binding {
     Binding {
@@ -13281,6 +13616,7 @@ fn undef_var_binding() -> Binding {
         strict_immutable: false,
         initialized: true,
         import_ref: None,
+        imported: false,
         deletable: false,
     }
 }
@@ -13394,10 +13730,8 @@ fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
                 collect_hoist_stmt(s, out);
             }
         }
-        Stmt::While { body, .. }
-        | Stmt::DoWhile { body, .. }
-        | Stmt::Labeled { body, .. }
-        | Stmt::With { body, .. } => collect_hoist_stmt(body, out),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_hoist_stmt(body, out),
+        Stmt::Labeled { body, .. } | Stmt::With { body, .. } => collect_hoist_stmt(body, out),
         Stmt::For { init, body, .. } => {
             if let Some(init) = init {
                 if let ForInit::VarDecl {

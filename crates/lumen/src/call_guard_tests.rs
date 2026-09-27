@@ -41,7 +41,7 @@ fn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {
         .expect("compiled caller")
         .clone();
     assert!(
-        chunk.jit.get().is_some_and(Option::is_some),
+        chunk.jit.get().is_some_and(|code| code.is_some()),
         "{name} was not native"
     );
     chunk

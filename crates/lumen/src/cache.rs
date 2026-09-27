@@ -259,14 +259,20 @@ where
     where
         V: Clone,
     {
+        self.get_mapped(key, Clone::clone)
+    }
+
+    /// Refresh recency but copy only the caller-selected result, not ownership pins or other
+    /// metadata retained by the entry. The projection cannot borrow beyond this lookup.
+    pub(crate) fn get_mapped<R>(&mut self, key: &K, project: impl FnOnce(&V) -> R) -> Option<R> {
         let entry = self.entries.get(key)?;
         if entry.generation == self.generation {
-            return Some(entry.value.clone());
+            return Some(project(&entry.value));
         }
         let generation = self.next_generation();
         let entry = self.entries.get_mut(key).expect("LRU hit remains live");
         entry.generation = generation;
-        let value = entry.value.clone();
+        let value = project(&entry.value);
         self.order.push_back((key.clone(), generation));
         self.compact_order_if_needed();
         Some(value)
@@ -387,6 +393,63 @@ where
 mod tests {
     use super::ByteLru;
     use std::rc::Rc;
+
+    #[test]
+    fn mapped_hits_do_not_clone_pins_and_stale_generations_do_not_evict_reused_keys() {
+        struct Pinned {
+            _pin: Rc<()>,
+            result: usize,
+        }
+        let pin = Rc::new(());
+        let weak = Rc::downgrade(&pin);
+        let mut cache = ByteLru::new(2, 2);
+        cache.insert(
+            1,
+            Pinned {
+                _pin: pin,
+                result: 10,
+            },
+            1,
+        );
+        cache.insert(
+            2,
+            Pinned {
+                _pin: Rc::new(()),
+                result: 20,
+            },
+            1,
+        );
+        assert_eq!(cache.get_mapped(&1, |entry| entry.result), Some(10));
+        assert_eq!(weak.strong_count(), 1);
+        assert_eq!(cache.get_mapped(&2, |entry| entry.result), Some(20));
+        cache.remove(&1);
+        assert!(
+            weak.upgrade().is_none(),
+            "stale recency key must not own entry's pins"
+        );
+        // Reused pointer-like identity with a different allocation and generation.
+        cache.insert(
+            1,
+            Pinned {
+                _pin: Rc::new(()),
+                result: 30,
+            },
+            1,
+        );
+        cache.insert(
+            3,
+            Pinned {
+                _pin: Rc::new(()),
+                result: 40,
+            },
+            1,
+        );
+        assert_eq!(cache.get_mapped(&1, |entry| entry.result), Some(30));
+        assert!(cache.get_mapped(&2, |entry| entry.result).is_none());
+        cache.generation = u64::MAX;
+        assert_eq!(cache.get_mapped(&3, |entry| entry.result), Some(40));
+        assert_eq!(cache.get_mapped(&1, |entry| entry.result), Some(30));
+    }
 
     #[test]
     fn evicts_by_bytes_then_recency_and_skips_oversized_entries() {

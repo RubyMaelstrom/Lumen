@@ -6,12 +6,81 @@ use crate::interpreter::*;
 use crate::value::*;
 use std::rc::Rc;
 
-/// A complete small ordinary prototype chain, including each level's live enumerable flags.
-/// Contains no object identities or roots; following current prototypes also detects swaps.
+/// Complete ordinary-chain proof: key-layout allocation, live prefix and enumerable flags.
+/// A live cache entry pins every nonempty layout, preventing pointer ABA. Stale LRU records
+/// contain only these numbers; the LRU's generation check disambiguates reused addresses.
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(crate) struct EnumerationShape {
-    levels: [(u32, u64); 6],
+    levels: [(usize, u8, u64); 6],
     depth: u8,
+}
+
+type EnumerationLayouts = [Option<PropertyLayout>; 6];
+
+/// Only key strings are pinned: never a receiver, prototype, Realm, descriptor or JS value.
+/// NamedEntries detaches on mutation with Rc::make_mut, so pins also make key identity immutable.
+pub(crate) struct CachedForInKeys {
+    keys: ForInKeys,
+    layouts: EnumerationLayouts,
+}
+
+impl CachedForInKeys {
+    fn retained_layout_bytes(&self) -> usize {
+        self.layouts.iter().flatten().fold(0usize, |bytes, layout| {
+            // Conservatively charge duplicates and unused predicted suffixes. The census below
+            // instead de-duplicates shared allocations across objects, hints and cache entries.
+            let storage = std::mem::size_of::<Vec<Rc<str>>>()
+                + 2 * std::mem::size_of::<usize>()
+                + layout.capacity() * std::mem::size_of::<Rc<str>>();
+            layout
+                .iter()
+                .fold(bytes.saturating_add(storage), |bytes, key| {
+                    // Rc<str>'s two-word header plus at most one word of alignment padding.
+                    bytes.saturating_add(key.len().saturating_add(3 * std::mem::size_of::<usize>()))
+                })
+        })
+    }
+
+    pub(crate) fn scan_retained_layouts(&self, visitor: &mut crate::memory::Visitor) {
+        for layout in self.layouts.iter().flatten() {
+            visitor.property_layout(layout);
+        }
+    }
+}
+
+/// Immutable, private backing for EnumerateObjectProperties candidate keys. The object has no
+/// prototype or author values, and is never exposed to JavaScript. Only the backing is shared:
+/// each AST/VM activation owns its cursor and source, so reentrancy and suspension are independent.
+/// ECMA-262 §14.7.5.9 explicitly permits an implementation-defined inaccessible iterator.
+#[derive(Clone)]
+pub(crate) struct ForInKeys(Gc);
+
+impl ForInKeys {
+    fn new(keys: Vec<String>) -> (Self, usize) {
+        // Include the Rc/RefCell header and conservatively charge string headers/index keys.
+        // Unlike a normal Array, this backing cannot retain %Array.prototype% or its realm.
+        let mut bytes =
+            std::mem::size_of::<std::cell::RefCell<Object>>() + 2 * std::mem::size_of::<usize>();
+        let mut props = Props::new();
+        props.reserve_dense_exact(keys.len(), false);
+        for key in keys {
+            bytes = bytes.saturating_add(key.len().saturating_add(64));
+            props.push_dense(Property::data(Value::Str(key.into()), false, false, false));
+        }
+        bytes = bytes.saturating_add(props.retained_requested_storage_bytes().0);
+        let object = Object::new_with_parts(None, props, Exotic::None);
+        object.borrow_mut().extensible = false;
+        (Self(object), bytes)
+    }
+
+    fn key(&self, index: u32) -> Option<Value> {
+        self.0.borrow().props.get_index(index).map(Property::value)
+    }
+
+    /// Only internal compiler temporaries may contain this value; it has no JavaScript owner.
+    pub(crate) fn into_value(self) -> Value {
+        Value::Obj(self.0)
+    }
 }
 
 /// Partially evaluated ClassDefinitionEvaluation retained by a heap VM continuation while a
@@ -169,6 +238,10 @@ impl Interp {
                                 }
                             }
                             ArrayPatElem::Elem { pattern, default } => {
+                                // IteratorBindingInitialization resolves a SingleNameBinding
+                                // before stepping. Keep that Reference across user next/default
+                                // callbacks; nested patterns instead resolve when entered.
+                                let reference = me.prepare_binding_reference(pattern, env, mode)?;
                                 let mut v = if done {
                                     Value::Undefined
                                 } else {
@@ -190,18 +263,13 @@ impl Interp {
                                         }
                                     }
                                 }
-                                me.bind_pattern(pattern, v, env, mode)?;
+                                me.finish_binding_reference(reference, pattern, v, env, mode)?;
                             }
                             ArrayPatElem::Rest(pattern) => {
-                                let mut rest = Vec::new();
-                                while !done {
-                                    match step!() {
-                                        Some(x) => rest.push(x),
-                                        None => done = true,
-                                    }
-                                }
+                                let reference = me.prepare_binding_reference(pattern, env, mode)?;
+                                let rest = me.drain_iterator_rest(&iter, &next, &mut done)?;
                                 let arr = me.make_array(rest);
-                                me.bind_pattern(pattern, arr, env, mode)?;
+                                me.finish_binding_reference(reference, pattern, arr, env, mode)?;
                             }
                         }
                     }
@@ -216,6 +284,9 @@ impl Interp {
                         Ok(())
                     }
                     Err(e) => {
+                        if matches!(e, Abrupt::Interrupt(_)) {
+                            return Err(e);
+                        }
                         if !done {
                             if matches!(e, Abrupt::Throw(_)) {
                                 self.iterator_close(&iter);
@@ -239,16 +310,7 @@ impl Interp {
                     used.push(key.to_string());
                     // KeyedBindingInitialization order for a var-mode identifier target:
                     // ResolveBinding *before* GetV (observable through a `with` env's has trap).
-                    let var_ref = if matches!(mode, BindMode::Var) {
-                        if let Pattern::Ident(name) = &prop.value {
-                            let e = Expr::Ident(name.clone());
-                            Some(self.resolve_reference(&e, env)?)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                    let reference = self.prepare_binding_reference(&prop.value, env, mode)?;
                     let mut v = self.get_member(&value, &key)?;
                     if matches!(v, Value::Undefined) {
                         if let Some(d) = &prop.default {
@@ -258,24 +320,47 @@ impl Interp {
                             }
                         }
                     }
-                    match var_ref {
-                        Some(mut r) => self.put_reference(&mut r, v)?,
-                        None => self.bind_pattern(&prop.value, v, env, mode)?,
-                    }
+                    self.finish_binding_reference(reference, &prop.value, v, env, mode)?;
                 }
                 if let Some(rest_name) = &objpat.rest {
+                    let pattern = Pattern::Ident(rest_name.clone());
+                    // RestBindingInitialization resolves before CopyDataProperties, whose
+                    // ownKeys/getOwnPropertyDescriptor/get operations may change the scope.
+                    let reference = self.prepare_binding_reference(&pattern, env, mode)?;
                     let obj = self.copy_data_properties(&value, &used)?;
-                    self.bind_pattern(
-                        &Pattern::Ident(rest_name.clone()),
-                        Value::Obj(obj),
-                        env,
-                        mode,
-                    )?;
+                    self.finish_binding_reference(reference, &pattern, Value::Obj(obj), env, mode)?;
                 }
                 Ok(())
             }
             // A member target (`o.p`/`o[k]`): assign to it (never a declaration).
             Pattern::Member(target) => self.assign_to_target(target, value, env),
+        }
+    }
+
+    fn prepare_binding_reference(
+        &mut self,
+        pattern: &Pattern,
+        env: &Env,
+        mode: BindMode,
+    ) -> Result<Option<PreparedReference>, Abrupt> {
+        if let (BindMode::Var, Pattern::Ident(name)) = (mode, pattern) {
+            return self.prepare_name_reference(name, env).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn finish_binding_reference(
+        &mut self,
+        reference: Option<PreparedReference>,
+        pattern: &Pattern,
+        value: Value,
+        env: &Env,
+        mode: BindMode,
+    ) -> Result<(), Abrupt> {
+        if let Some(mut reference) = reference {
+            self.write_prepared_reference(&mut reference, value)
+        } else {
+            self.bind_pattern(pattern, value, env, mode)
         }
     }
 
@@ -611,6 +696,7 @@ impl Interp {
                                     strict_immutable: immutable,
                                     initialized: false,
                                     import_ref: None,
+                                    imported: false,
                                     deletable: false,
                                 },
                             );
@@ -628,6 +714,7 @@ impl Interp {
                                 strict_immutable: false,
                                 initialized: true,
                                 import_ref: None,
+                                imported: false,
                                 deletable: false,
                             },
                         );
@@ -645,6 +732,7 @@ impl Interp {
                                 strict_immutable: false,
                                 initialized: false,
                                 import_ref: None,
+                                imported: false,
                                 deletable: false,
                             },
                         );
@@ -796,14 +884,15 @@ impl Interp {
                     Err(e) => Err(crate::interpreter::update_abrupt_empty(e, Value::Undefined)),
                 }
             }
-            Stmt::While { test, body } => self.exec_while(test, body, env, &[]),
-            Stmt::DoWhile { body, test } => self.exec_do_while(body, test, env, &[]),
+            Stmt::While { test, body } => self.exec_while(&body.site, test, body, env, &[]),
+            Stmt::DoWhile { body, test } => self.exec_do_while(&body.site, body, test, env, &[]),
             Stmt::For {
                 init,
                 test,
                 update,
                 body,
-            } => self.exec_for(init, test, update, body, env, &[]),
+                ..
+            } => self.exec_for(&body.site, init, test, update, body, env, &[]),
             Stmt::ForInOf {
                 decl,
                 left,
@@ -811,7 +900,18 @@ impl Interp {
                 of,
                 is_await,
                 body,
-            } => self.exec_for_in_of(*decl, left, right, *of, *is_await, body, env, &[]),
+                ..
+            } => self.exec_for_in_of(
+                &body.site,
+                *decl,
+                left,
+                right,
+                *of,
+                *is_await,
+                body,
+                env,
+                &[],
+            ),
             Stmt::Break(label) => Err(Abrupt::Break(label.clone(), Value::Empty)),
             Stmt::Continue(label) => Err(Abrupt::Continue(label.clone(), Value::Empty)),
             Stmt::Try {
@@ -901,7 +1001,8 @@ impl Interp {
                 test,
                 update,
                 body,
-            } => self.exec_for(init, test, update, body, env, &labels),
+                ..
+            } => self.exec_for(&body.site, init, test, update, body, env, &labels),
             Stmt::ForInOf {
                 decl,
                 left,
@@ -909,9 +1010,14 @@ impl Interp {
                 of,
                 is_await,
                 body,
-            } => self.exec_for_in_of(*decl, left, right, *of, *is_await, body, env, &labels),
-            Stmt::While { test, body } => self.exec_while(test, body, env, &labels),
-            Stmt::DoWhile { body, test } => self.exec_do_while(body, test, env, &labels),
+                ..
+            } => self.exec_for_in_of(
+                &body.site, *decl, left, right, *of, *is_await, body, env, &labels,
+            ),
+            Stmt::While { test, body } => self.exec_while(&body.site, test, body, env, &labels),
+            Stmt::DoWhile { body, test } => {
+                self.exec_do_while(&body.site, body, test, env, &labels)
+            }
             // A non-loop labelled statement (e.g. `a: { … break a; }`): the loop helpers can't catch
             // the break, so it unwinds to the post-match below. Labels also can't be nested here
             // because the `while let` above already peeled the whole chain.
@@ -923,8 +1029,30 @@ impl Interp {
         }
     }
 
-    fn exec_while(&mut self, test: &Expr, body: &Stmt, env: &Env, labels: &[&str]) -> Completion {
-        self.run_loop(labels, env, |me, env| {
+    fn exec_while(
+        &mut self,
+        site: &LoopSite,
+        test: &Expr,
+        body: &Stmt,
+        env: &Env,
+        labels: &[&str],
+    ) -> Completion {
+        use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
+        let mut admission = Admission::new(self);
+        self.run_loop(labels, env, |me, env, completion| {
+            if admission.ready() {
+                if let Some(result) = enter(
+                    me,
+                    site,
+                    Source::While(test, body),
+                    labels,
+                    env,
+                    completion,
+                    Seed::None,
+                )? {
+                    return Ok(LoopStep::Transferred(result));
+                }
+            }
             let t = me.eval(test, env)?;
             if !me.to_boolean(&t) {
                 return Ok(LoopStep::Done(Value::Empty));
@@ -936,13 +1064,20 @@ impl Interp {
 
     fn exec_do_while(
         &mut self,
+        site: &LoopSite,
         body: &Stmt,
         test: &Expr,
         env: &Env,
         labels: &[&str],
     ) -> Completion {
+        use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
         let mut first = true;
-        self.run_loop(labels, env, |me, env| {
+        let mut admission = Admission::new(self);
+        self.run_loop(labels, env, |me, env, completion| {
+            // DoWhileLoopEvaluation evaluates the condition exactly once after a body that
+            // completes normally or continues this loop. run_loop handles both completions
+            // and retains their UpdateEmpty value; enter their shared condition phase here.
+            // A break/return/throw escapes without another condition. ECMA-262 §14.7.2.2.
             if !first {
                 let t = me.eval(test, env)?;
                 if !me.to_boolean(&t) {
@@ -950,13 +1085,23 @@ impl Interp {
                 }
             }
             first = false;
-            let bv = me.exec_stmt(body, env)?;
-            let t = me.eval(test, env)?;
-            if !me.to_boolean(&t) {
-                Ok(LoopStep::Done(bv))
-            } else {
-                Ok(LoopStep::Continue(bv))
+            // The preceding condition has already completed true. The fragment begins with
+            // the body, never with a second evaluation of that condition.
+            if admission.ready() {
+                if let Some(result) = enter(
+                    me,
+                    site,
+                    Source::DoWhile(body, test),
+                    labels,
+                    env,
+                    completion,
+                    Seed::None,
+                )? {
+                    return Ok(LoopStep::Transferred(result));
+                }
             }
+            let bv = me.exec_stmt(body, env)?;
+            Ok(LoopStep::Continue(bv))
         })
     }
 
@@ -964,7 +1109,7 @@ impl Interp {
         &mut self,
         labels: &[&str],
         env: &Env,
-        mut step: impl FnMut(&mut Interp, &Env) -> Result<LoopStep, Abrupt>,
+        mut step: impl FnMut(&mut Interp, &Env, &Value) -> Result<LoopStep, Abrupt>,
     ) -> Completion {
         // The loop's completion value: the most recent non-EMPTY body completion (UpdateEmpty);
         // V starts at undefined per ForBodyEvaluation, so a value-less loop completes undefined.
@@ -979,7 +1124,8 @@ impl Interp {
             // loops (`for(;;){ x = {}; }`) that never call a function.
             self.interrupt_poll()?;
             self.gc_check()?;
-            match step(self, env) {
+            match step(self, env, &v) {
+                Ok(LoopStep::Transferred(result)) => return result,
                 Ok(LoopStep::Continue(bv)) => keep(bv, &mut v),
                 Ok(LoopStep::Done(bv)) => {
                     keep(bv, &mut v);
@@ -1003,8 +1149,10 @@ impl Interp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn exec_for(
         &mut self,
+        site: &LoopSite,
         init: &Option<Box<ForInit>>,
         test: &Option<Expr>,
         update: &Option<Expr>,
@@ -1029,7 +1177,7 @@ impl Interp {
         if dispose_async.is_some() {
             self.using_stack.push(Vec::new());
         }
-        let result = self.exec_c_for_body(init, test, update, body, &loop_env, labels);
+        let result = self.exec_c_for_body(site, init, test, update, body, &loop_env, labels);
         if let Some(is_async) = dispose_async {
             let frame = self.using_stack.pop().unwrap_or_default();
             return self.dispose_frame_maybe_async(frame, result, is_async);
@@ -1040,6 +1188,7 @@ impl Interp {
     #[allow(clippy::too_many_arguments)]
     fn exec_c_for_body(
         &mut self,
+        site: &LoopSite,
         init: &Option<Box<ForInit>>,
         test: &Option<Expr>,
         update: &Option<Expr>,
@@ -1066,6 +1215,7 @@ impl Interp {
                                         strict_immutable: false,
                                         initialized: false,
                                         import_ref: None,
+                                        imported: false,
                                         deletable: false,
                                     },
                                 );
@@ -1085,6 +1235,25 @@ impl Interp {
                         // declaration without an initializer performs no assignment. In
                         // particular, `for (var parameter; ... )` preserves the parameter.
                         if matches!(kind, DeclKind::Var) && e.is_none() {
+                            continue;
+                        }
+                        // ForLoopEvaluation evaluates VariableDeclarationList by its ordinary
+                        // algorithm: ResolveBinding precedes the initializer. Retain that exact
+                        // with/global base even when evaluation deletes or changes the property.
+                        if let (DeclKind::Var, Pattern::Ident(name), Some(initializer)) =
+                            (kind, pat, e)
+                        {
+                            if matches!(initializer, Expr::Class(class) if class.name.is_none()) {
+                                self.pending_fn_name = Some(name.clone());
+                            }
+                            let mut reference =
+                                self.resolve_reference(&Expr::Ident(name.clone()), loop_env)?;
+                            let value = self.eval(initializer, loop_env)?;
+                            self.pending_fn_name = None;
+                            if is_anonymous_fn(initializer) {
+                                self.set_fn_name(&value, name);
+                            }
+                            self.put_reference(&mut reference, value)?;
                             continue;
                         }
                         let v = match e {
@@ -1133,7 +1302,9 @@ impl Interp {
             copy_env(loop_env)
         };
         let mut first = true;
-        self.run_loop(labels, loop_env, |me, _env| {
+        use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
+        let mut admission = Admission::new(self);
+        self.run_loop(labels, loop_env, |me, _env, completion| {
             if !first {
                 if !per_iter.is_empty() {
                     cur_env = copy_env(&cur_env);
@@ -1143,6 +1314,21 @@ impl Interp {
                 }
             }
             first = false;
+            // CreatePerIterationEnvironment and increment have completed. The fragment starts
+            // at the test with this exact live record and takes over subsequent copies.
+            if admission.ready() {
+                if let Some(result) = enter(
+                    me,
+                    site,
+                    Source::For(init.as_deref(), test.as_ref(), update.as_ref(), body),
+                    labels,
+                    &cur_env,
+                    completion,
+                    Seed::None,
+                )? {
+                    return Ok(LoopStep::Transferred(result));
+                }
+            }
             if let Some(t) = test {
                 let tv = me.eval(t, &cur_env)?;
                 if !me.to_boolean(&tv) {
@@ -1157,6 +1343,7 @@ impl Interp {
     #[allow(clippy::too_many_arguments)]
     fn exec_for_in_of(
         &mut self,
+        site: &LoopSite,
         decl: Option<DeclKind>,
         left: &Pattern,
         right: &Expr,
@@ -1184,6 +1371,7 @@ impl Interp {
                         strict_immutable: false,
                         initialized: false,
                         import_ref: None,
+                        imported: false,
                         deletable: false,
                     },
                 );
@@ -1233,7 +1421,7 @@ impl Interp {
             // A failure in the iteration step itself marks the iterator done — only abrupt
             // completions from the loop body (or an early break/return) close it afterwards.
             let (mut exhausted, mut step_failed) = (false, false);
-            let result = self.run_loop(labels, env, |me, env| {
+            let result = self.run_loop(labels, env, |me, env, _completion| {
                 step_failed = true;
                 let res = me.call(next.clone(), iter.clone(), &[])?;
                 // Await the step result by parking the coroutine (real microtask ticks).
@@ -1295,6 +1483,7 @@ impl Interp {
             return result;
         }
         if of {
+            use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
             // Step the iterator lazily; close it if the loop exits early (break/return/throw).
             let (iter, next) = self.get_iterator(&rhs)?;
             let iter_close = iter.clone();
@@ -1302,7 +1491,23 @@ impl Interp {
             // A failure in the iteration step itself (next throwing, a non-object result, or a
             // `value` getter throwing) marks the iterator done: it is NOT closed.
             let mut step_failed = false;
-            let result = self.run_loop(labels, env, |me, env| {
+            let mut transferred = false;
+            let mut admission = Admission::new(self);
+            let result = self.run_loop(labels, env, |me, env, completion| {
+                if admission.ready() {
+                    if let Some(result) = enter(
+                        me,
+                        site,
+                        Source::ForInOf(decl, left, body, true),
+                        labels,
+                        env,
+                        completion,
+                        Seed::ForOf(&iter, &next),
+                    )? {
+                        transferred = true;
+                        return Ok(LoopStep::Transferred(result));
+                    }
+                }
                 step_failed = true;
                 let v = match me.iterator_step(&iter, &next)? {
                     Some(x) => x,
@@ -1316,7 +1521,7 @@ impl Interp {
                 let bv = me.for_of_iteration(left, v, mode, body, &iter_env, dispose)?;
                 Ok(LoopStep::Continue(bv))
             });
-            if !(exhausted || step_failed && result.is_err()) {
+            if !(transferred || exhausted || step_failed && result.is_err()) {
                 match &result {
                     // A throw completion swallows close errors; every other completion (normal,
                     // break, return) propagates them and requires an Object result.
@@ -1326,19 +1531,29 @@ impl Interp {
             }
             return result;
         }
-        let items: Vec<Value> = self
-            .for_in_keys(&rhs)?
-            .into_iter()
-            .map(Value::Str)
-            .collect();
+        let items = self.for_in_keys(&rhs)?;
         let mut idx = 0;
-        self.run_loop(labels, env, |me, env| {
+        use crate::bytecode::loop_fragment::{enter, Admission, Seed, Source};
+        let mut admission = Admission::new(self);
+        self.run_loop(labels, env, |me, env, completion| {
+            if admission.ready() {
+                if let Some(result) = enter(
+                    me,
+                    site,
+                    Source::ForInOf(decl, left, body, false),
+                    labels,
+                    env,
+                    completion,
+                    Seed::ForIn(&rhs, &items, idx),
+                )? {
+                    return Ok(LoopStep::Transferred(result));
+                }
+            }
             // A property deleted while the enumeration is under way is not visited.
             let v = loop {
-                if idx >= items.len() {
+                let Some(v) = items.key(idx) else {
                     return Ok(LoopStep::Done(Value::Empty));
-                }
-                let v = items[idx].clone();
+                };
                 idx += 1;
                 if let Value::Str(k) = &v {
                     // (A string-primitive RHS's index keys are always present.)
@@ -1821,18 +2036,25 @@ impl Interp {
 
     /// Snapshot the candidate keys for EnumerateObjectProperties. Each prototype level's
     /// [[OwnPropertyKeys]] is consulted once; the loop rechecks deletion before yielding a key.
-    pub(crate) fn for_in_keys(&mut self, v: &Value) -> Result<Vec<crate::lstr::LStr>, Abrupt> {
+    pub(crate) fn for_in_keys(&mut self, v: &Value) -> Result<ForInKeys, Abrupt> {
         // EnumerateObjectProperties / CreateForInIterator, ECMA-262 snapshot e28783d5fc9d.
-        // Reuse candidate strings only when the complete live ordinary chain proves the same
+        // Reuse immutable backing only when the complete live ordinary chain proves the same
         // ordered keys, shadowing and enumerable flags. Exotics use their internal methods;
         // the loop still checks deletion immediately before yielding each candidate.
-        let shape = self.enumeration_shape(v);
-        if let Some(keys) = shape
-            .as_ref()
-            .and_then(|shape| self.enumeration_keys.get_cloned(shape))
-        {
+        let shape = self.enumeration_shape(v, None);
+        if let Some(keys) = shape.as_ref().and_then(|shape| {
+            self.enumeration_keys
+                .get_mapped(shape, |entry| entry.keys.clone())
+        }) {
             return Ok(keys);
         }
+        // A miss pins the exact layouts before building candidates. Both walks run no author
+        // code, GC callback or mutation; a complete ordinary-chain proof excludes exotics.
+        // Rechecking also fails closed if a future proof extension cannot pin the same chain.
+        let mut layouts: EnumerationLayouts = std::array::from_fn(|_| None);
+        let pinned = shape.as_ref().is_some_and(|expected| {
+            self.enumeration_shape(v, Some(&mut layouts)).as_ref() == Some(expected)
+        });
         let keys = self.enum_keys(v)?;
         // A module namespace's [[GetOwnProperty]] runs during enumeration, so an uninitialized
         // export makes the loop throw before any iteration.
@@ -1846,19 +2068,26 @@ impl Interp {
                 }
             }
         }
-        let keys: Vec<crate::lstr::LStr> = keys.into_iter().map(Into::into).collect();
-        if let Some(shape) = shape {
-            let bytes = keys.iter().map(|key| key.len() + 32).sum::<usize>()
-                + keys.capacity() * std::mem::size_of::<crate::lstr::LStr>();
-            self.enumeration_keys.insert(shape, keys.clone(), bytes);
+        let (keys, bytes) = ForInKeys::new(keys);
+        if let Some(shape) = shape.filter(|_| pinned) {
+            let entry = CachedForInKeys {
+                keys: keys.clone(),
+                layouts,
+            };
+            let bytes = bytes.saturating_add(entry.retained_layout_bytes());
+            self.enumeration_keys.insert(shape, entry, bytes);
         }
         Ok(keys)
     }
 
-    fn enumeration_shape(&self, value: &Value) -> Option<EnumerationShape> {
+    fn enumeration_shape(
+        &self,
+        value: &Value,
+        mut pins: Option<&mut EnumerationLayouts>,
+    ) -> Option<EnumerationShape> {
         let mut current = Rc::as_ptr(value.as_obj()?);
         let mut shape = EnumerationShape {
-            levels: [(0, 0); 6],
+            levels: [(0, 0, 0); 6],
             depth: 0,
         };
         loop {
@@ -1870,7 +2099,16 @@ impl Interp {
             if !object.ic_plain.get() || !matches!(object.exotic, Exotic::None) {
                 return None;
             }
-            shape.levels[shape.depth as usize] = object.props.enumeration_shape()?;
+            let (layout, prefix, enumerable) = object.props.enumeration_layout()?;
+            let index = shape.depth as usize;
+            shape.levels[index] = (
+                layout.map_or(0, |keys| Rc::as_ptr(keys) as usize),
+                prefix,
+                enumerable,
+            );
+            if let Some(pins) = pins.as_mut() {
+                pins[index] = layout.cloned();
+            }
             shape.depth += 1;
             match object.proto.as_ref() {
                 Some(parent) => current = Rc::as_ptr(parent),
@@ -2107,6 +2345,7 @@ impl Interp {
                 strict_immutable: is_const,
                 initialized: true,
                 import_ref: None,
+                imported: false,
                 deletable: false,
             },
         );
@@ -2384,7 +2623,7 @@ impl Interp {
     /// Annex B.3.3 sync step: copy the block-scope binding of `name` (or a freshly-made function
     /// for a bare `if (x) function f(){}` position) into the nearest variable environment's
     /// binding — or the global object's property for global code.
-    fn annexb_fn_sync_eval(&mut self, name: &str, func: &Rc<Function>, env: &Env) {
+    pub(crate) fn annexb_fn_sync_eval(&mut self, name: &str, func: &Rc<Function>, env: &Env) {
         // The value: the block's own binding of the name (instantiated at block entry). A bare
         // `if (x) function f(){}` position has no block scope — per B.3.4 it acts as an implicit
         // block, so a fresh function is made here. Only the *immediate* scope counts: an ancestor
@@ -2686,6 +2925,30 @@ impl Interp {
 
     // ----- expressions ------------------------------------------------------------------------
 
+    /// ECMA-262 GetThisEnvironment / ResolveThisBinding (§§9.4.3–4). Object Environment
+    /// Records (including `with`) never supply the keyword's this binding; ordinary name
+    /// resolution must not consult their author-controlled property named "this".
+    pub(crate) fn resolve_this_binding(&mut self, env: &Env) -> Result<Value, Abrupt> {
+        let mut current = Some(env.clone());
+        while let Some(scope) = current {
+            let parent = {
+                let record = scope.borrow();
+                if let Some(binding) = record.vars.get("this") {
+                    if binding.initialized && binding.import_ref.is_none() {
+                        return Ok(binding.value.clone());
+                    }
+                    drop(record);
+                    // Use the selected record, not the original chain, for its TDZ/import
+                    // error path. A nearer with object cannot hide an uninitialized binding.
+                    return self.get_var("this", &scope);
+                }
+                record.parent.clone()
+            };
+            current = parent;
+        }
+        Ok(Value::Undefined)
+    }
+
     pub(crate) fn eval(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
@@ -2699,27 +2962,7 @@ impl Interp {
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
             Expr::Ident(name) => self.get_var(name, env),
-            Expr::This => {
-                // A TDZ read (derived constructor before super()) must surface as a
-                // ReferenceError; only a genuinely absent binding reads undefined. Single walk:
-                // the binding is read where it is found (get_var would walk a second time).
-                let mut cur = Some(env.clone());
-                while let Some(scope) = cur {
-                    let parent = {
-                        let b = scope.borrow();
-                        if let Some(bd) = b.vars.get("this") {
-                            if bd.initialized && bd.import_ref.is_none() {
-                                return Ok(bd.value.clone());
-                            }
-                            drop(b);
-                            return self.get_var("this", env);
-                        }
-                        b.parent.clone()
-                    };
-                    cur = parent;
-                }
-                Ok(Value::Undefined)
-            }
+            Expr::This => self.resolve_this_binding(env),
             Expr::Regex { body, flags } => self.make_regexp(body, flags),
             Expr::Array(elems) => self.eval_array(elems, env),
             Expr::Object(props) => self.eval_object(props, env),
@@ -3088,31 +3331,21 @@ impl Interp {
         // Elements are created as own data properties (CreateDataProperty), so accessors on
         // Array.prototype are never consulted.
         let arr = self.make_array(Vec::new());
-        let Value::Obj(ao) = &arr else { unreachable!() };
-        let mut idx: usize = 0;
         for e in elems {
             match e {
                 ArrayElem::Item(e) => {
                     let v = self.eval(e, env)?;
-                    ao.borrow_mut()
-                        .props
-                        .insert(idx.to_string(), crate::value::Property::plain(v));
-                    idx += 1;
+                    self.append_array_literal(&arr, Some(v))?;
                 }
-                ArrayElem::Hole => idx += 1,
+                ArrayElem::Hole => self.append_array_literal(&arr, None)?,
                 ArrayElem::Spread(e) => {
                     let v = self.eval(e, env)?;
-                    for item in self.iterate(&v)? {
-                        ao.borrow_mut()
-                            .props
-                            .insert(idx.to_string(), crate::value::Property::plain(item));
-                        idx += 1;
-                    }
+                    let prefix = self.array_length(arr.as_obj().expect("array literal"));
+                    self.expand_spread(&v, prefix, |i, value| {
+                        i.append_array_literal(&arr, Some(value))
+                    })?;
                 }
             }
-        }
-        if let Some(pr) = ao.borrow_mut().props.get_mut("length") {
-            pr.set_value(Value::Num(idx as f64));
         }
         Ok(arr)
     }
@@ -3264,12 +3497,15 @@ impl Interp {
         let mut out = Vec::new();
         for a in args {
             match a {
-                ArrayElem::Item(e) => out.push(self.eval(e, env)?),
+                ArrayElem::Item(e) => {
+                    let value = self.eval(e, env)?;
+                    self.append_argument(&mut out, value)?;
+                }
                 ArrayElem::Spread(e) => {
                     let v = self.eval(e, env)?;
-                    out.extend(self.iterate(&v)?);
+                    self.append_spread_arguments(&v, &mut out)?;
                 }
-                ArrayElem::Hole => out.push(Value::Undefined),
+                ArrayElem::Hole => self.append_argument(&mut out, Value::Undefined)?,
             }
         }
         Ok(out)
@@ -3297,27 +3533,9 @@ impl Interp {
         subs: &[Expr],
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        // Evaluate the tag callee, capturing `this` for method tags (`obj.tag\`...\``).
-        let (func, this) = match tag {
-            Expr::Member { obj, prop, .. } => {
-                let base = self.eval(obj, env)?;
-                let f = self.get_member(&base, prop)?;
-                (f, base)
-            }
-            Expr::Index { obj, index, .. } => {
-                let base = self.eval(obj, env)?;
-                let idx = self.eval(index, env)?;
-                let key = self.ref_prop_key(&base, &mut RefKey::Raw(idx))?;
-                let f = self.get_member(&base, &key)?;
-                (f, base)
-            }
-            _ => (self.eval(tag, env)?, Value::Undefined),
-        };
-        if !func.is_callable() {
-            return Err(self.throw("TypeError", "tag is not a function"));
-        }
-        // Tagged-template evaluation obtains the per-Realm TemplateMap entry only after the tag
-        // reference is evaluated and validated (ECMA-262 Tagged Templates evaluation order).
+        let (func, this) = self.eval_callee_reference(tag, env)?;
+        // TaggedTemplate delegates to EvaluateCall: GetValue precedes ArgumentListEvaluation,
+        // but IsCallable follows every substitution (§§13.3.11.1, 13.3.6.2).
         let strings = self.template_object(site_id, quasis)?;
         let mut argv = vec![strings];
         for s in subs {
@@ -3442,41 +3660,17 @@ impl Interp {
         else {
             return Ok(None);
         };
-        let (func, this) = match &**callee {
-            // A direct `eval`, `super(...)`, private-name or super-property callee stays on the
-            // normal path.
-            Expr::Ident(name) => {
-                if name == "eval" {
-                    return Ok(None); // handled without a second lookup by eval_return_expr
-                }
-                // A callee resolved through a `with (obj)` environment gets `obj` as `this`.
-                let (f, recv) = self.get_var_with(name, env)?;
-                (f, recv.unwrap_or(Value::Undefined))
-            }
-            Expr::Member { obj, prop, .. }
-                if !matches!(**obj, Expr::Super) && !prop.starts_with('#') =>
-            {
-                let base = self.eval(obj, env)?;
-                if matches!(base, Value::Undefined | Value::Null) {
-                    return Ok(None);
-                }
-                let f = self.get_member(&base, prop)?;
-                (f, base)
-            }
-            // A call-expression callee (`return getF()(n)`) evaluates generically.
-            c @ Expr::Call { .. } => {
-                let f = self.eval(c, env)?;
-                if self.short_circuit {
-                    return Ok(None);
-                }
-                (f, Value::Undefined)
-            }
-            _ => return Ok(None),
-        };
-        if !func.is_callable() {
+        if matches!(&**callee, Expr::Super)
+            || matches!(&**callee, Expr::Ident(name) if name == "eval")
+        {
+            // Constructor continuation and direct eval retain their dedicated evaluation.
             return Ok(None);
         }
+        let (func, this) = self.eval_callee_reference(callee, env)?;
         let argv = self.eval_args(args, env)?;
+        if !func.is_callable() {
+            return Err(self.throw("TypeError", "callee is not a function"));
+        }
         Ok(Some((func, this, argv)))
     }
 
@@ -3496,25 +3690,14 @@ impl Interp {
         else {
             return Ok(None);
         };
-        let (func, this) = match &**tag {
-            Expr::Ident(_) | Expr::Call { .. } => (self.eval(tag, env)?, Value::Undefined),
-            Expr::Member { obj, prop, .. } if !matches!(**obj, Expr::Super) => {
-                let base = self.eval(obj, env)?;
-                if matches!(base, Value::Undefined | Value::Null) {
-                    return Ok(None);
-                }
-                let f = self.get_member(&base, prop)?;
-                (f, base)
-            }
-            _ => return Ok(None),
-        };
-        if !func.is_callable() {
-            return Ok(None);
-        }
+        let (func, this) = self.eval_callee_reference(tag, env)?;
         let strings = self.template_object(*site, quasis)?;
         let mut argv = vec![strings];
         for s in subs {
             argv.push(self.eval(s, env)?);
+        }
+        if !func.is_callable() {
+            return Err(self.throw("TypeError", "tag is not a function"));
         }
         Ok(Some((func, this, argv)))
     }
@@ -3659,44 +3842,45 @@ impl Interp {
             };
             return self.finish_super_call(new_target, super_constructor, &argv, env);
         }
-        // `super.m(...)` / `super[k](...)`: method on the super prototype, called with current `this`.
-        if let Expr::Member { obj, prop, .. } = callee {
-            if matches!(**obj, Expr::Super) {
-                let home = self.super_base(env)?;
-                let f = self.get_member(&home, prop)?;
-                let this = self.get_var("this", env)?;
-                let argv = self.eval_args(args, env)?;
-                return self.call(f, this, &argv);
-            }
+        let (func, this) = self.eval_callee_reference(callee, env)?;
+        if self.short_circuit {
+            return Ok(Value::Undefined);
         }
-        if let Expr::Index { obj, index, .. } = callee {
-            if matches!(**obj, Expr::Super) {
-                let home = self.super_base(env)?;
-                let idx = self.eval(index, env)?;
-                let key = self.to_property_key(&idx)?;
-                let f = self.get_member(&home, &key)?;
-                let this = self.get_var("this", env)?;
-                let argv = self.eval_args(args, env)?;
-                return self.call(f, this, &argv);
-            }
+        // `f?.()` short-circuits the whole chain when the callee is nullish.
+        if optional && matches!(func, Value::Undefined | Value::Null) {
+            self.short_circuit = true;
+            return Ok(Value::Undefined);
         }
-        // A parenthesized optional chain as the callee still resolves like the chain (the
-        // method receiver is preserved), but a short-circuited chain yields undefined and
-        // calling it throws.
-        if let Expr::OptionalChain(inner) = callee {
-            let saved = self.short_circuit;
-            self.short_circuit = false;
-            let r = self.eval_call(inner, args, optional, env);
-            let short = std::mem::replace(&mut self.short_circuit, saved);
-            if short && r.is_ok() {
-                self.eval_args(args, env)?;
-                return Err(self.throw("TypeError", "callee is not a function"));
-            }
-            return r;
+        let argv = self.eval_args(args, env)?;
+        if !func.is_callable() {
+            let desc = describe_callee(callee);
+            return Err(self.throw("TypeError", format!("{desc} is not a function")));
         }
-        // Determine `this` for method calls (`obj.m()` → this = obj); a callee resolved
-        // through a `with (obj)` environment is called with `this` = obj.
-        let (func, this) = match callee {
+        self.call(func, this, &argv)
+    }
+
+    /// Evaluate a callee once while retaining GetThisValue/WithBaseObject. Parentheses retain
+    /// References; an OptionalChain boundary only contains its own short-circuit, not the
+    /// enclosing call's argument evaluation. Shared by ordinary and tail calls and templates.
+    fn eval_callee_reference(
+        &mut self,
+        callee: &Expr,
+        env: &Env,
+    ) -> Result<(Value, Value), Abrupt> {
+        let reference = match callee {
+            Expr::Paren(inner) => return self.eval_callee_reference(inner, env),
+            Expr::OptionalChain(inner) => {
+                let saved = std::mem::replace(&mut self.short_circuit, false);
+                let result = self.eval_callee_reference(inner, env);
+                let short = std::mem::replace(&mut self.short_circuit, saved);
+                return result.map(|reference| {
+                    if short {
+                        (Value::Undefined, Value::Undefined)
+                    } else {
+                        reference
+                    }
+                });
+            }
             Expr::Ident(name) => {
                 let (f, recv) = self.get_var_with(name, env)?;
                 (f, recv.unwrap_or(Value::Undefined))
@@ -3706,13 +3890,23 @@ impl Interp {
                 prop,
                 optional,
             } => {
+                if matches!(**obj, Expr::Super) {
+                    let receiver = self.get_var("this", env)?;
+                    let proto = self.super_base(env)?;
+                    let value = self.get_reference(&mut Reference::Super {
+                        proto,
+                        receiver: receiver.clone(),
+                        key: RefKey::Static(prop.clone()),
+                    })?;
+                    return Ok((value, receiver));
+                }
                 let base = self.eval(obj, env)?;
                 if self.short_circuit {
-                    return Ok(Value::Undefined);
+                    return Ok((Value::Undefined, Value::Undefined));
                 }
                 if *optional && matches!(base, Value::Undefined | Value::Null) {
                     self.short_circuit = true;
-                    return Ok(Value::Undefined);
+                    return Ok((Value::Undefined, Value::Undefined));
                 }
                 let f = if prop.starts_with('#') {
                     let k = self.resolve_private(prop, env);
@@ -3727,13 +3921,24 @@ impl Interp {
                 index,
                 optional,
             } => {
+                if matches!(**obj, Expr::Super) {
+                    let receiver = self.get_var("this", env)?;
+                    let index = self.eval(index, env)?;
+                    let proto = self.super_base(env)?;
+                    let value = self.get_reference(&mut Reference::Super {
+                        proto,
+                        receiver: receiver.clone(),
+                        key: RefKey::Raw(index),
+                    })?;
+                    return Ok((value, receiver));
+                }
                 let base = self.eval(obj, env)?;
                 if self.short_circuit {
-                    return Ok(Value::Undefined);
+                    return Ok((Value::Undefined, Value::Undefined));
                 }
                 if *optional && matches!(base, Value::Undefined | Value::Null) {
                     self.short_circuit = true;
-                    return Ok(Value::Undefined);
+                    return Ok((Value::Undefined, Value::Undefined));
                 }
                 let idx = self.eval(index, env)?;
                 // GetValue checks ToObject(base) before coercing a computed method key,
@@ -3746,22 +3951,12 @@ impl Interp {
             _ => {
                 let f = self.eval(callee, env)?;
                 if self.short_circuit {
-                    return Ok(Value::Undefined);
+                    return Ok((Value::Undefined, Value::Undefined));
                 }
                 (f, Value::Undefined)
             }
         };
-        // `f?.()` short-circuits the whole chain when the callee is nullish.
-        if optional && matches!(func, Value::Undefined | Value::Null) {
-            self.short_circuit = true;
-            return Ok(Value::Undefined);
-        }
-        let argv = self.eval_args(args, env)?;
-        if !func.is_callable() {
-            let desc = describe_callee(callee);
-            return Err(self.throw("TypeError", format!("{desc} is not a function")));
-        }
-        self.call(func, this, &argv)
+        Ok(reference)
     }
 
     /// `await v`: if `v` is a promise, drain microtasks to settle it, then return its value (or
@@ -4079,10 +4274,10 @@ impl Interp {
             });
             for f in due {
                 if let Err(Abrupt::Interrupt(reason)) = self.call(f, Value::Undefined, &[]) {
-                    self.kept_alive.clear();
+                    self.clear_kept_objects();
                     return Err(reason);
                 }
-                self.kept_alive.clear();
+                self.clear_kept_objects();
                 resolved_any = true;
             }
             if resolved_any {
@@ -4107,7 +4302,7 @@ impl Interp {
     pub(crate) fn drain_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
         let mut budget = 100_000u32;
         // The script/callback that preceded this checkpoint is a completed synchronous job.
-        self.kept_alive.clear();
+        self.clear_kept_objects();
         loop {
             let Some(job) = self.microtasks.pop_front() else {
                 let Some(registry) = self.pending_finalization_cleanup.pop_front() else {
@@ -4118,7 +4313,7 @@ impl Interp {
             };
             if let Err(abrupt) = self.interrupt_poll_force() {
                 self.microtasks.clear();
-                self.kept_alive.clear();
+                self.clear_kept_objects();
                 let Abrupt::Interrupt(reason) = abrupt else {
                     unreachable!("a host-control poll only produces Interrupt")
                 };
@@ -4127,15 +4322,15 @@ impl Interp {
             budget -= 1;
             if budget == 0 {
                 self.microtasks.clear();
-                self.kept_alive.clear();
+                self.clear_kept_objects();
                 break;
             }
             if let Err(reason) = self.run_job_interruptible(job) {
                 self.microtasks.clear();
-                self.kept_alive.clear();
+                self.clear_kept_objects();
                 return Err(reason);
             }
-            self.kept_alive.clear();
+            self.clear_kept_objects();
         }
         Ok(())
     }
@@ -4153,18 +4348,30 @@ impl Interp {
         if let Some(state) = self.finalization_registries.get_mut(&ptr) {
             state.cleanup_scheduled = false;
         }
+        self.weak_metadata.ready_registries.remove(&ptr);
         loop {
             let next = self
                 .finalization_registries
                 .get_mut(&ptr)
                 .and_then(|state| {
-                    let index = state.cells.iter().position(|cell| cell.target.is_none())?;
-                    let cell = state.cells.remove(index);
+                    let cell = state.cells.pop_ready()?;
                     Some((state.cleanup_callback.clone(), cell.held_value))
                 });
             let Some((callback, held_value)) = next else {
+                self.weak_metadata.ready_registries.remove(&ptr);
                 return Ok(());
             };
+            if self
+                .finalization_registries
+                .get(&ptr)
+                .is_some_and(|state| state.cells.has_ready())
+            {
+                // A callback may throw/interrupt or collect reentrantly. Preserve rescheduling
+                // without making the next GC scan every registry and every live target.
+                self.weak_metadata.ready_registries.insert(ptr);
+            } else {
+                self.weak_metadata.ready_registries.remove(&ptr);
+            }
             match self.call_job_callback(&callback, Value::Undefined, &[held_value]) {
                 Ok(_) => {}
                 // CleanupFinalizationRegistry uses `?`: the first callback throw ends this job.
@@ -4175,11 +4382,11 @@ impl Interp {
                 | Err(Abrupt::Break(_, _))
                 | Err(Abrupt::Continue(_, _)) => return Ok(()),
                 Err(Abrupt::Interrupt(reason)) => {
-                    self.kept_alive.clear();
+                    self.clear_kept_objects();
                     return Err(reason);
                 }
             }
-            self.kept_alive.clear();
+            self.clear_kept_objects();
         }
     }
 
@@ -4806,6 +5013,7 @@ impl Interp {
                     strict_immutable: true,
                     initialized: false,
                     import_ref: None,
+                    imported: false,
                     deletable: false,
                 },
             );
@@ -5781,19 +5989,10 @@ impl Interp {
                             self.map_data.insert(dp, v);
                             moved_collection = true;
                         }
-                        if let Some(v) = self.collection_index.remove(&sp) {
-                            self.collection_index.insert(dp, v);
-                        }
                         // WeakMap/WeakSet's [[WeakMapData]]/[[WeakSetData]] and its acceleration
                         // index are one internal slot implementation and must move together to the
                         // subclass instance created by super() (ECMA-262 §§24.3.1, 24.4.1).
-                        if let Some(v) = self.weak_collection_data.remove(&sp) {
-                            self.weak_collection_data.insert(dp, v);
-                            moved_collection = true;
-                        }
-                        if let Some(v) = self.weak_collection_index.remove(&sp) {
-                            self.weak_collection_index.insert(dp, v);
-                        }
+                        moved_collection |= self.move_weak_slots(sp, dp);
                         if moved_collection {
                             // The temporary object returned by the native constructor no longer
                             // owns side-table state; the actual subclass instance is pinned above.
@@ -6103,12 +6302,12 @@ impl Interp {
     /// stack (moved; the caller forgets them) — no intermediate `Vec` per instantiation.
     ///
     /// # Safety
-    /// `base..base+count` must be initialized `Value`s the caller relinquishes.
+    /// `base..base+count` must be initialized `PackedValue`s the caller relinquishes.
     pub(crate) unsafe fn make_plain_object_templated_from(
         &mut self,
         tmpl: &std::cell::OnceCell<crate::value::Props>,
         keys: &[std::rc::Rc<str>],
-        base: *const Value,
+        base: *const PackedValue,
         count: usize,
     ) -> Value {
         let map = tmpl.get_or_init(|| {
@@ -6118,7 +6317,8 @@ impl Interp {
             }
             p
         });
-        let props = map.instantiate_plain((0..count).map(|slot| unsafe { base.add(slot).read() }));
+        let props =
+            map.instantiate_plain_packed((0..count).map(|slot| unsafe { base.add(slot).read() }));
         let obj = crate::value::Object::new_with_parts(
             Some(self.object_proto.clone()),
             props,
@@ -6630,6 +6830,7 @@ impl Interp {
         if op != "=" && !matches!(op, "&&=" | "||=" | "??=") {
             if let Expr::Ident(name) = target {
                 if let Some(scope) = self.plain_binding_scope(name, env) {
+                    let strict = self.strict;
                     let old = scope
                         .borrow()
                         .vars
@@ -6638,13 +6839,20 @@ impl Interp {
                         .unwrap_or(Value::Undefined);
                     let rhs = self.eval(value, env)?;
                     let result = self.binary(&op[..op.len() - 1], old, rhs)?;
-                    match scope.borrow_mut().vars.get_mut(name) {
-                        Some(bd) if bd.mutable => bd.value = result.clone(),
-                        _ => {
-                            let mut lref =
-                                Reference::Var(RefBase::Scope(scope.clone()), name.clone());
-                            self.put_reference(&mut lref, result.clone())?;
+                    let stored = {
+                        let mut record = scope.borrow_mut();
+                        match record.vars.get_mut(name) {
+                            Some(bd) if bd.mutable && bd.initialized && bd.import_ref.is_none() => {
+                                bd.value = result.clone();
+                                true
+                            }
+                            _ => false,
                         }
+                    };
+                    if !stored {
+                        let mut reference =
+                            PreparedReference::scope(Rc::from(name.as_str()), scope, strict);
+                        self.write_prepared_reference(&mut reference, result.clone())?;
                     }
                     return Ok(result);
                 }
@@ -6792,24 +7000,12 @@ impl Interp {
                                 // A non-literal rest target's Reference is evaluated BEFORE the
                                 // iterator is drained (AssignmentRestElement step 1).
                                 if matches!(t, Expr::Array(_) | Expr::Object(_)) {
-                                    let mut rest = Vec::new();
-                                    while !done {
-                                        match step!() {
-                                            Some(x) => rest.push(x),
-                                            None => done = true,
-                                        }
-                                    }
+                                    let rest = me.drain_iterator_rest(&iter, &next, &mut done)?;
                                     let arr = me.make_array(rest);
                                     me.assign_to_target(t, arr, env)?;
                                 } else {
                                     let mut lref = me.resolve_reference(t, env)?;
-                                    let mut rest = Vec::new();
-                                    while !done {
-                                        match step!() {
-                                            Some(x) => rest.push(x),
-                                            None => done = true,
-                                        }
-                                    }
+                                    let rest = me.drain_iterator_rest(&iter, &next, &mut done)?;
                                     let arr = me.make_array(rest);
                                     me.put_reference(&mut lref, arr)?;
                                 }
@@ -6863,6 +7059,9 @@ impl Interp {
                         Ok(())
                     }
                     Err(e) => {
+                        if matches!(e, Abrupt::Interrupt(_)) {
+                            return Err(e);
+                        }
                         if !done {
                             if matches!(e, Abrupt::Throw(_)) {
                                 self.iterator_close(&iter_close);
@@ -7432,6 +7631,7 @@ impl Interp {
                 if b.is_constructor
                     && matches!(b.exotic, Exotic::None)
                     && b.ic_plain.get()
+                    && crate::value::is_cacheable_shape(b.props.shape())
                     && b.proto
                         .as_ref()
                         .is_some_and(|p| Rc::ptr_eq(p, &self.function_proto))
@@ -7867,6 +8067,8 @@ pub enum Hint {
 }
 
 enum LoopStep {
+    /// A borrowed fragment already completed LoopEvaluation, including all local cleanup.
+    Transferred(Completion),
     /// Keep looping; the value is this iteration's body completion value (for the loop's own
     /// completion value, per UpdateEmpty in ForBodyEvaluation).
     Continue(Value),
@@ -7884,6 +8086,7 @@ pub(crate) fn bind(env: &Env, name: &str, value: Value) {
             strict_immutable: false,
             initialized: true,
             import_ref: None,
+            imported: false,
             deletable: false,
         },
     );
@@ -7972,7 +8175,7 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
                 || alt.as_deref().is_some_and(|s| stmt_contains(s, pred))
         }
         Stmt::Block(b) => stmts_contain(b, pred),
-        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+        Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
             e(test) || stmt_contains(body, pred)
         }
         Stmt::For {
@@ -7980,6 +8183,7 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
             test,
             update,
             body,
+            ..
         } => {
             init.as_deref().is_some_and(|i| match i {
                 ForInit::Expr(x) => e(x),
@@ -8015,13 +8219,33 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
 }
 
 pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
+    expr_contains_impl(x, pred, true)
+}
+
+/// Suspension belongs to the executing expression, never to a newly created function's body
+/// (including arrows). Keep this separate from lexical Contains queries such as arguments/super.
+pub(crate) fn expr_has_own_suspension(x: &Expr) -> bool {
+    expr_contains_impl(
+        x,
+        |expr| matches!(expr, Expr::Yield { .. } | Expr::Await(_)),
+        false,
+    )
+}
+
+fn expr_contains_impl(x: &Expr, pred: fn(&Expr) -> bool, descend_arrows: bool) -> bool {
     if pred(x) {
         return true;
     }
-    let e = |x: &Expr| expr_contains(x, pred);
+    let e = |x: &Expr| expr_contains_impl(x, pred, descend_arrows);
+    let array = |elements: &[ArrayElem]| {
+        elements.iter().any(|element| match element {
+            ArrayElem::Item(value) | ArrayElem::Spread(value) => e(value),
+            ArrayElem::Hole => false,
+        })
+    };
     match x {
-        Expr::Call { callee, args, .. } => e(callee) || call_args_contain(args, pred),
-        Expr::New { callee, args } => e(callee) || call_args_contain(args, pred),
+        Expr::Call { callee, args, .. } => e(callee) || array(args),
+        Expr::New { callee, args } => e(callee) || array(args),
         Expr::Unary { arg, .. }
         | Expr::Update { arg, .. }
         | Expr::Await(arg)
@@ -8033,7 +8257,7 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
         Expr::Member { obj, .. } | Expr::OptionalChain(obj) => e(obj),
         Expr::Index { obj, index, .. } => e(obj) || e(index),
         Expr::Seq(v) => v.iter().any(e),
-        Expr::Array(elems) => arr_elems_contain(elems, pred),
+        Expr::Array(elems) => array(elems),
         Expr::Yield { arg, .. } => arg.as_deref().is_some_and(e),
         Expr::ImportCall { spec, options, .. } => e(spec) || options.as_deref().is_some_and(e),
         Expr::PrivateIn { obj, .. } => e(obj),
@@ -8057,7 +8281,7 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
                 })
         }
         // `Contains` descends into arrow functions; an ordinary function/class does not.
-        Expr::Func(f) if f.is_arrow => {
+        Expr::Func(f) if descend_arrows && f.is_arrow => {
             f.params.iter().any(|p| p.default.as_ref().is_some_and(&e))
                 || stmts_contain(&f.body, pred)
         }
@@ -8083,17 +8307,6 @@ fn stmts_have_super_prop(stmts: &[Stmt]) -> bool {
 /// ContainsArguments: an `arguments` identifier reference (arrow-descending, like `Contains`).
 fn stmts_have_arguments_ref(stmts: &[Stmt]) -> bool {
     stmts_contain(stmts, |e| matches!(e, Expr::Ident(n) if n == "arguments"))
-}
-
-fn call_args_contain(args: &[ArrayElem], pred: fn(&Expr) -> bool) -> bool {
-    arr_elems_contain(args, pred)
-}
-
-fn arr_elems_contain(elems: &[ArrayElem], pred: fn(&Expr) -> bool) -> bool {
-    elems.iter().any(|el| match el {
-        ArrayElem::Item(e) | ArrayElem::Spread(e) => expr_contains(e, pred),
-        ArrayElem::Hole => false,
-    })
 }
 
 /// A class field initializer (or computed field name) may not contain `arguments` or a `super(...)`
@@ -8218,7 +8431,7 @@ fn fi_stmt(s: &Stmt, args: bool) -> Option<&'static str> {
             .or_else(|| fi_stmt(cons, args))
             .or_else(|| alt.as_deref().and_then(|s| fi_stmt(s, args))),
         Stmt::Block(b) => fi_stmts(b, args),
-        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+        Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
             fi_expr(test, args).or_else(|| fi_stmt(body, args))
         }
         Stmt::For {
@@ -8226,6 +8439,7 @@ fn fi_stmt(s: &Stmt, args: bool) -> Option<&'static str> {
             test,
             update,
             body,
+            ..
         } => init
             .as_deref()
             .and_then(|i| match i {
@@ -8448,34 +8662,21 @@ fn is_decimal_literal(s: &str) -> bool {
     i == b.len()
 }
 
-/// Where an identifier `Reference`'s binding lives, resolved exactly once.
-enum RefBase {
-    /// A binding in this environment's `vars`.
-    Scope(Env),
-    /// A `with (obj)` object environment record that has the name.
-    With(Value),
-    /// A property of the global object.
-    Global,
-    /// Not found anywhere: GetValue throws ReferenceError; PutValue creates a global (sloppy).
-    Unresolvable,
-}
+#[path = "eval_prepared_reference.rs"]
+mod prepared_reference;
+pub(crate) use prepared_reference::{PreparedReference, PreparedReferenceSlot};
 
-/// A member reference's property key. For a computed `base[expr]` the key stays a `Raw` value
-/// until the first GetValue/PutValue, so `ToPropertyKey` runs *after* the base's
-/// RequireObjectCoercible check (a null base throws before the key's `toString` runs) and only once.
+/// A member reference's key is coerced once, at GetValue/PutValue, after its base check.
 enum RefKey {
     Static(String),
     Coerced(crate::value::PropertyKey),
     Raw(Value),
 }
 
-/// A resolved reference — computed once so a compound/logical assignment reuses the same base
-/// for both GetValue and PutValue (matching spec Reference semantics), rather than re-resolving.
+/// The base and strictness of an identifier reference are captured before evaluating its RHS.
 enum Reference {
-    Var(RefBase, String),
-    /// `base.key` (Static) or `base[expr]` (Raw, coerced lazily).
+    Var(PreparedReference),
     Prop(Value, RefKey),
-    /// `super.key`: reads through `proto` with `receiver` as the this-value, writes to `receiver`.
     Super {
         proto: Value,
         receiver: Value,
@@ -8483,139 +8684,12 @@ enum Reference {
     },
 }
 
-/// Opaque Environment/Property Reference retained by a heap VM continuation across an
-/// intervening `yield`/`await`. Keeping this wrapper private-fielded prevents bytecode from
-/// reimplementing GetValue/PutValue details while still preserving the spec's resolve-once rule.
-pub(crate) struct PreparedReference(Reference);
-
-impl PreparedReference {
-    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-        fn key(key: &RefKey, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-            if let RefKey::Raw(value) = key {
-                edges.value(value);
-            }
-        }
-        match &self.0 {
-            Reference::Var(base, _) => match base {
-                RefBase::Scope(scope) => edges.scope(scope),
-                RefBase::With(value) => edges.value(value),
-                RefBase::Global | RefBase::Unresolvable => {}
-            },
-            Reference::Prop(object, property) => {
-                edges.value(object);
-                key(property, edges);
-            }
-            Reference::Super {
-                proto,
-                receiver,
-                key: property,
-            } => {
-                edges.value(proto);
-                edges.value(receiver);
-                key(property, edges);
-            }
-        }
-    }
-
-    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
-        fn base(base: &RefBase, visitor: &mut crate::memory::Visitor) {
-            if let RefBase::With(value) = base {
-                visitor.value(value);
-            }
-        }
-        fn key(key: &RefKey, visitor: &mut crate::memory::Visitor) -> usize {
-            match key {
-                RefKey::Static(value) => value.capacity(),
-                RefKey::Coerced(value) => value.scan_retained_memory(visitor),
-                RefKey::Raw(value) => {
-                    visitor.value(value);
-                    0
-                }
-            }
-        }
-
-        match &self.0 {
-            Reference::Var(reference_base, name) => {
-                base(reference_base, visitor);
-                name.capacity()
-            }
-            Reference::Prop(object, property) => {
-                visitor.value(object);
-                key(property, visitor)
-            }
-            Reference::Super {
-                proto,
-                receiver,
-                key: property,
-            } => {
-                visitor.value(proto);
-                visitor.value(receiver);
-                key(property, visitor)
-            }
-        }
-    }
-}
-
 impl Interp {
-    pub(crate) fn prepare_name_reference(
-        &mut self,
-        name: &str,
-        env: &Env,
-    ) -> Result<PreparedReference, Abrupt> {
-        let mut cur = Some(env.clone());
-        while let Some(scope) = cur {
-            let (has_binding, with_obj, parent) = {
-                let binding = scope.borrow();
-                (
-                    binding.vars.contains_key(name),
-                    binding.with_obj.clone(),
-                    binding.parent.clone(),
-                )
-            };
-            if has_binding {
-                return Ok(PreparedReference(Reference::Var(
-                    RefBase::Scope(scope),
-                    name.to_string(),
-                )));
-            }
-            if let Some(object @ Value::Obj(_)) = &with_obj {
-                if self.with_has_binding(object, name)? {
-                    return Ok(PreparedReference(Reference::Var(
-                        RefBase::With(object.clone()),
-                        name.to_string(),
-                    )));
-                }
-            }
-            cur = parent;
-        }
-        let base = if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
-            RefBase::Global
-        } else {
-            RefBase::Unresolvable
-        };
-        Ok(PreparedReference(Reference::Var(base, name.to_string())))
-    }
-
-    pub(crate) fn read_prepared_reference(
-        &mut self,
-        reference: &mut PreparedReference,
-    ) -> Result<Value, Abrupt> {
-        self.get_reference(&mut reference.0)
-    }
-
-    pub(crate) fn write_prepared_reference(
-        &mut self,
-        reference: &mut PreparedReference,
-        value: Value,
-    ) -> Result<(), Abrupt> {
-        self.put_reference(&mut reference.0, value)
-    }
-
     /// Evaluate `target` to a `Reference` exactly once (its base object/binding location and,
     /// for member/index targets, its property key).
     fn resolve_reference(&mut self, target: &Expr, env: &Env) -> Result<Reference, Abrupt> {
         match target {
-            Expr::Ident(name) => Ok(self.prepare_name_reference(name, env)?.0),
+            Expr::Ident(name) => self.prepare_name_reference(name, env).map(Reference::Var),
             Expr::Member { obj, prop, .. } => {
                 if matches!(**obj, Expr::Super) {
                     let proto = self.super_base(env)?;
@@ -8691,44 +8765,7 @@ impl Interp {
     /// GetValue on a resolved reference.
     fn get_reference(&mut self, r: &mut Reference) -> Result<Value, Abrupt> {
         match r {
-            Reference::Var(base, name) => match base {
-                RefBase::Scope(s) => {
-                    let (initialized, value, import) = {
-                        let b = s.borrow();
-                        match b.vars.get(name.as_str()) {
-                            Some(bd) => (bd.initialized, bd.value.clone(), bd.import_ref.clone()),
-                            None => return self.get_var(name, s),
-                        }
-                    };
-                    if !initialized {
-                        return Err(self.throw(
-                            "ReferenceError",
-                            format!("cannot access '{name}' before initialization"),
-                        ));
-                    }
-                    if let Some((src_env, local)) = import {
-                        return self.get_var(&local, &src_env);
-                    }
-                    Ok(value)
-                }
-                RefBase::With(obj) => {
-                    // GetBindingValue: HasProperty runs again before the Get.
-                    let obj = obj.clone();
-                    if !self.js_has_property(&obj, name)? {
-                        if self.strict {
-                            return Err(
-                                self.throw("ReferenceError", format!("{name} is not defined"))
-                            );
-                        }
-                        return Ok(Value::Undefined);
-                    }
-                    self.get_member(&obj, name)
-                }
-                RefBase::Global => self.get_member(&Value::Obj(self.global.clone()), name),
-                RefBase::Unresolvable => {
-                    Err(self.throw("ReferenceError", format!("{name} is not defined")))
-                }
-            },
+            Reference::Var(reference) => self.read_prepared_reference(reference),
             Reference::Prop(base, key) => {
                 if let (Value::Obj(o), RefKey::Raw(Value::Num(n))) = (&*base, &*key) {
                     let (o, n) = (o.clone(), *n);
@@ -8763,79 +8800,7 @@ impl Interp {
     /// PutValue on a resolved reference.
     fn put_reference(&mut self, r: &mut Reference, value: Value) -> Result<(), Abrupt> {
         match r {
-            Reference::Var(base, name) => match base {
-                RefBase::Scope(s) => {
-                    let found = {
-                        let mut b = s.borrow_mut();
-                        match b.vars.get_mut(name) {
-                            Some(bd) => {
-                                if bd.import_ref.is_some() {
-                                    // An import binding is immutable: reads are live through the
-                                    // exporting module, but assignment is always a TypeError.
-                                    return Err(self.throw(
-                                        "TypeError",
-                                        format!("assignment to import binding '{name}'"),
-                                    ));
-                                }
-                                // A let/const still in its temporal dead zone: assigning to it
-                                // is a ReferenceError (this path is assignment, never the
-                                // declaration's own initialization).
-                                if !bd.initialized {
-                                    return Err(self.throw(
-                                        "ReferenceError",
-                                        format!("cannot access '{name}' before initialization"),
-                                    ));
-                                }
-                                if !bd.mutable {
-                                    // A const (strict immutable) always throws; a named
-                                    // function-expression's own name (non-strict immutable)
-                                    // is a silent no-op in sloppy code, a throw under strict.
-                                    if bd.strict_immutable || self.strict {
-                                        return Err(self.throw(
-                                            "TypeError",
-                                            format!("assignment to constant '{name}'"),
-                                        ));
-                                    }
-                                    return Ok(());
-                                }
-                                bd.value = value.clone();
-                                bd.initialized = true;
-                                true
-                            }
-                            None => false,
-                        }
-                    };
-                    if found {
-                        Ok(())
-                    } else {
-                        self.assign_var(name, value, s)
-                    }
-                }
-                RefBase::With(obj) => {
-                    // Object env record SetMutableBinding: HasProperty runs again before the Set
-                    // (strict code throws if the property vanished).
-                    let obj = obj.clone();
-                    if !self.js_has_property(&obj, name)? && self.strict {
-                        return Err(self.throw("ReferenceError", format!("{name} is not defined")));
-                    }
-                    self.set_member(&obj, name, value)
-                }
-                RefBase::Global => {
-                    let g = Value::Obj(self.global.clone());
-                    // SetMutableBinding re-checks HasProperty — trap-aware, the global's proto
-                    // chain may contain a proxy.
-                    if self.strict && !self.js_has_property(&g, name)? {
-                        return Err(self.throw("ReferenceError", format!("{name} is not defined")));
-                    }
-                    self.set_member(&g, name, value)
-                }
-                RefBase::Unresolvable => {
-                    if self.strict {
-                        return Err(self.throw("ReferenceError", format!("{name} is not defined")));
-                    }
-                    self.set_member(&Value::Obj(self.global.clone()), name, value)
-                }
-            },
+            Reference::Var(reference) => self.write_prepared_reference(reference, value),
             Reference::Prop(base, key) => {
                 let mut value = value;
                 if let (Value::Obj(o), RefKey::Raw(Value::Num(n))) = (&*base, &*key) {

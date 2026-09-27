@@ -22,13 +22,19 @@
 
 mod ast;
 mod bigint;
+#[cfg(test)]
+mod binding_reference_tests;
 mod builtins;
 pub mod bytecode;
 mod cache;
+mod callback;
+#[cfg(test)]
+mod computed_reference_tests;
 mod coroutine;
 #[cfg(test)]
 mod dense_slot_tests;
 mod eval;
+mod execution_storage;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
 /// per JS object/scope) run 15-30% faster than on the system allocator. NOT registered here: a
 /// library must not preempt an embedder's `#[global_allocator]` (the test262 runner caps
@@ -38,7 +44,13 @@ mod eval;
 pub mod fastalloc;
 mod fasthash;
 mod feedback;
+mod finalization_cells;
+#[cfg(test)]
+mod for_in_cache_tests;
+mod gc_diagnostics;
 mod gc_edges;
+mod gc_generational;
+mod gc_native;
 mod gc_sweep;
 mod heap;
 mod host;
@@ -50,13 +62,23 @@ mod jit;
 mod jit_ir;
 mod jstr;
 mod lexer;
+#[cfg(test)]
+mod loop_completion_tests;
+#[cfg(test)]
+mod loop_fragment_tests;
 mod lstr;
 mod memory;
 mod modules;
+mod native_captures;
+#[cfg(all(test, feature = "embed"))]
+mod native_constructor_tests;
 #[cfg(feature = "intl")]
 mod numbering;
 #[cfg(test)]
 mod object_literal_jit_tests;
+mod ordered_collection;
+#[cfg(test)]
+mod ordered_collection_tests;
 mod parser;
 mod regex;
 mod regex_emoji;
@@ -64,18 +86,27 @@ mod regex_fold;
 #[cfg(all(test, feature = "embed"))]
 mod script_caller_tests;
 #[cfg(test)]
+mod script_entry_tests;
+#[cfg(test)]
+mod script_scope_tests;
+#[cfg(test)]
+mod script_tiering_tests;
+#[cfg(test)]
 mod shared_layout_tests;
 mod snapshot;
+mod spread;
 #[cfg(test)]
 mod string_concat_tests;
 mod tagged;
 mod temporal;
+mod tiering;
 mod token;
 #[cfg(test)]
 mod typedarray_allocation_tests;
 #[cfg(test)]
 mod typedarray_search_tests;
 mod tz;
+mod weak_metadata;
 #[rustfmt::skip]
 mod tzdata;
 #[rustfmt::skip]
@@ -762,8 +793,9 @@ impl Engine {
 #[cfg(feature = "embed")]
 pub mod embed {
     pub use crate::host::{
-        HostGc, HostGcVisitor, HostRetainedMemoryVisitor, OpState, ResourceId, ResourceTable,
-        RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory, RetainedMemory,
+        HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeGcId, OpState, ResourceId,
+        ResourceTable, RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory,
+        RetainedMemory,
     };
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
@@ -773,10 +805,12 @@ pub mod embed {
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
     /// [`Ctx::new_native_fn`] when the host function must capture state, or with
     /// [`Ctx::new_native_fn_with_retained_memory`] when that state must participate in managed
-    /// memory diagnostics.
+    /// memory diagnostics. For JavaScript captures, prefer
+    /// [`Ctx::new_native_fn_with_captures`]: memory reporting alone does not make
+    /// opaque Rust captures collectable cycles.
     pub use crate::value::{
-        NativeCallableRetained, NativeClosure, NativeFn, NativeRetainedMemoryVisitor,
-        RetainedManagedAllocation, Value,
+        NativeCallableRetained, NativeCaptureFn, NativeClosure, NativeFn,
+        NativeRetainedMemoryVisitor, RetainedManagedAllocation, Value,
     };
 
     /// Non-parse failure from an interrupt-aware embedding entry point.
@@ -996,7 +1030,7 @@ impl Engine {
         };
         // This embedding entry runs one synchronous ECMAScript job. Promise jobs, if any, are
         // deliberately owned by the caller and begin with a fresh [[KeptAlive]] list.
-        self.interp.kept_alive.clear();
+        self.interp.clear_kept_objects();
         Ok(result)
     }
 
@@ -1011,7 +1045,7 @@ impl Engine {
         if matches!(&result, Err(embed::EvalError::Interrupted(_))) {
             self.interp.gc_task_boundary();
         }
-        self.interp.kept_alive.clear();
+        self.interp.clear_kept_objects();
         Ok(result)
     }
 
@@ -1090,13 +1124,15 @@ impl Engine {
         }
         let result = self
             .interp
-            .with_callback_script_caller(script_caller, |ctx| ctx.call(func.clone(), this, args))
+            .with_callback_script_caller(script_caller, |ctx| {
+                ctx.call_callback(func.clone(), this, args)
+            })
             .map_err(|abrupt| match abrupt {
                 interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
                 interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
                 _ => embed::EvalError::Throw(Value::Undefined),
             });
-        self.interp.kept_alive.clear();
+        self.interp.clear_kept_objects();
         if matches!(result, Err(embed::EvalError::Interrupted(_))) {
             self.interp.gc_task_boundary();
         }
@@ -1193,7 +1229,7 @@ impl Engine {
         match self.interp.microtasks.pop_front() {
             Some(job) => {
                 self.interp.run_job_interruptible(job)?;
-                self.interp.kept_alive.clear();
+                self.interp.clear_kept_objects();
                 Ok(true)
             }
             None => match self.interp.pending_finalization_cleanup.pop_front() {

@@ -52,7 +52,7 @@ fn check(source: &str, expected: &str, prepared: &[&str], native: bool) {
                 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
             {
                 assert!(
-                    chunk.jit.get().is_some_and(Option::is_some),
+                    chunk.jit.get().is_some_and(|code| code.is_some()),
                     "{name} stayed in bytecode"
                 );
             }

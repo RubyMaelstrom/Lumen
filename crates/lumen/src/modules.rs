@@ -728,6 +728,7 @@ impl Interp {
                         strict_immutable: true,
                         initialized: false,
                         import_ref: None,
+                        imported: false,
                         deletable: false,
                     },
                 );
@@ -787,6 +788,7 @@ impl Interp {
                         strict_immutable: true,
                         initialized: true,
                         import_ref: Some((src_env, src_local)),
+                        imported: true,
                         deletable: false,
                     },
                 );
@@ -2019,12 +2021,15 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
                 expr(test) || stmt(cons) || alt.as_ref().map(|a| stmt(a)).unwrap_or(false)
             }
             Stmt::Block(b) => b.iter().any(stmt),
-            Stmt::While { test, body } | Stmt::DoWhile { body, test } => expr(test) || stmt(body),
+            Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
+                expr(test) || stmt(body)
+            }
             Stmt::For {
                 init,
                 test,
                 update,
                 body,
+                ..
             } => {
                 init.as_ref()
                     .map(|i| match i.as_ref() {

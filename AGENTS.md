@@ -59,6 +59,11 @@ The default tier is JIT. Useful diagnostic controls:
 - `LUMEN_JIT_NO_DIRECT_CALLS=1` disables ARM64 shared-context direct calls while
   retaining ordinary JIT calls.
 - `LUMEN_TIER_LOG=1` helps diagnose compilation bailouts.
+- On GNU/Linux, `LUMEN_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
+  registers live generated-code symbols with the already-loaded gprofng collector.
+  Labels show the chunk's first local names, not source function names. This is
+  optional compile/drop metadata; it neither instruments native instructions nor
+  loads a profiler library. Keep it disabled for uninstrumented timing comparisons.
 
 The standalone engine shell accepts `--tier=interp|bytecode|jit`. The runtime CLI's
 current argument parser only accepts `--tier=interp|bytecode`; use `LUMEN_TIER=jit`

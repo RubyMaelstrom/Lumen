@@ -1,11 +1,11 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
-use std::hash::{Hash, Hasher};
+use crate::ordered_collection::{
+    key_hash as collection_key_hash, CollectionKind, OrderedCollection,
+};
 
 pub(super) fn install_collections(it: &mut Interp) {
-    // A unique private object used as the deleted-entry tombstone key (see map_tombstone).
-    it.extra_protos.insert("%MapTombstone%", Object::new(None));
     // %MapIteratorPrototype% / %SetIteratorPrototype%: distinct iterator prototypes (proto is
     // %IteratorPrototype%) with the right @@toStringTag and a live `next`.
     for (key, tag) in [
@@ -14,7 +14,12 @@ pub(super) fn install_collections(it: &mut Interp) {
     ] {
         let proto = Object::new(it.extra_protos.get("%IteratorPrototype%").cloned());
         set_to_string_tag(it, &proto, tag);
-        it.def_method(&proto, "next", 0, map_set_iter_next);
+        let next: NativeFn = if tag == "Set Iterator" {
+            |i, this, _| map_set_iter_next(i, this, CollectionKind::Set)
+        } else {
+            |i, this, _| map_set_iter_next(i, this, CollectionKind::Map)
+        };
+        it.def_method(&proto, "next", 0, next);
         it.extra_protos.insert(key, proto);
     }
     install_map_like(it, "Map", false, map_ctor);
@@ -61,12 +66,7 @@ fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
     // Requires a real Set [[SetData]] slot — a Map (which shares the map_data table) is rejected.
     let p = coll_ptr_kind(i, this, Some("Set"))?;
     let mut values = Vec::with_capacity(coll_live_len(i, p));
-    values.extend(
-        i.map_data[&p]
-            .iter()
-            .filter(|(key, _)| !is_tombstone(i, key))
-            .map(|(key, _)| key.clone()),
-    );
+    values.extend(i.map_data[&p].iter().map(|(key, _)| key.clone()));
     Ok(values)
 }
 
@@ -148,20 +148,19 @@ fn option_result_index_remove(
 
 /// Build a fresh Set from `values` (deduped via SameValueZero).
 fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
-    let obj =
-        new_from_ctor(i, "Set").unwrap_or_else(|_| Object::new(i.extra_protos.get("Set").cloned()));
+    // The Set algebra algorithms use OrdinaryObjectCreate(%Set.prototype%), not species or the
+    // currently active new.target (which may belong to an unrelated enclosing constructor).
+    let obj = Object::new(i.extra_protos.get("Set").cloned());
     let ptr = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.map_data.insert(ptr, Vec::with_capacity(values.len()));
-    i.collection_index.insert(
+    i.map_data.insert(
         ptr,
-        crate::fasthash::FastMap::with_capacity_and_hasher(values.len(), Default::default()),
+        OrderedCollection::with_capacity(CollectionKind::Set, values.len()),
     );
     for value in values {
         let value = canonicalize_map_key(value);
         collection_set(i, ptr, value.clone(), value);
     }
-    set_internal(&obj, "__ck", Value::str("Set"));
     Value::Obj(obj)
 }
 /// GetSetRecord: a set-like `other` exposes a numeric `size`, and callable `has` and `keys`.
@@ -201,10 +200,11 @@ fn set_like_has(i: &mut Interp, has: &Value, other: &Value, v: &Value) -> Result
 /// Open a set-like's keys iterator record: `(iterator, nextMethod)`.
 fn set_like_open(i: &mut Interp, keys: &Value, other: &Value) -> Result<(Value, Value), Value> {
     let iter = ab(i.call(keys.clone(), other.clone(), &[]))?;
-    let next = ab(i.get_member(&iter, "next"))?;
-    if !next.is_callable() {
-        return Err(i.make_error("TypeError", "set-like keys iterator has no next method"));
+    if !matches!(iter, Value::Obj(_)) {
+        return Err(i.make_error("TypeError", "set-like keys did not return an object"));
     }
+    let next = ab(i.get_member(&iter, "next"))?;
+    // GetIteratorDirect reads next without checking callability. IteratorNext performs Call.
     Ok((iter, next))
 }
 
@@ -220,38 +220,6 @@ fn set_like_next(i: &mut Interp, iter: &Value, next: &Value) -> Result<Option<Va
     } else {
         Ok(Some(canonicalize_map_key(ab(i.get_member(&r, "value"))?)))
     }
-}
-
-/// IteratorClose a set-like keys iterator on early exit (swallowing errors).
-fn set_like_close(i: &mut Interp, iter: &Value) {
-    if let Ok(ret) = i.get_member(iter, "return") {
-        if ret.is_callable() {
-            let _ = i.call(ret, iter.clone(), &[]);
-        }
-    }
-}
-
-fn set_like_keys(i: &mut Interp, keys: &Value, other: &Value) -> Result<Vec<Value>, Value> {
-    // `keys` returns an iterator *record*: step its `next` directly rather than calling GetIterator
-    // (the result need not be iterable itself).
-    let iter = ab(i.call(keys.clone(), other.clone(), &[]))?;
-    let next = ab(i.get_member(&iter, "next"))?;
-    if !next.is_callable() {
-        return Err(i.make_error("TypeError", "set-like keys iterator has no next method"));
-    }
-    let mut out = Vec::new();
-    loop {
-        let r = ab(i.call(next.clone(), iter.clone(), &[]))?;
-        if !matches!(r, Value::Obj(_)) {
-            return Err(i.make_error("TypeError", "iterator result is not an object"));
-        }
-        let done = ab(i.get_member(&r, "done"))?;
-        if i.to_boolean(&done) {
-            break;
-        }
-        out.push(ab(i.get_member(&r, "value"))?);
-    }
-    Ok(out)
 }
 
 /// SetDataHas against the LIVE backing data (skipping tombstones) — set-like callbacks may have
@@ -289,19 +257,10 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         let mut out = Vec::new();
         let mut result_index = crate::fasthash::FastMap::default();
         if (coll_live_len(i, ptr) as f64) <= other_size {
-            // Walk this Set LIVE by index, probing the other's `has` — the callback may delete
+            // Walk this Set LIVE, probing the other's `has` — the callback may delete
             // and re-append entries, and the walk observes that (appended entries are visited).
-            let mut idx = 0usize;
-            loop {
-                let entry = i.map_data.get(&ptr).and_then(|e| e.get(idx).cloned());
-                idx += 1;
-                let (k, _) = match entry {
-                    Some(kv) => kv,
-                    None => break,
-                };
-                if is_tombstone(i, &k) {
-                    continue;
-                }
+            let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
+            while let Some((k, _)) = i.map_data[&ptr].next(&cursor) {
                 if set_like_has(i, &has, &arg(a, 0), &k)? {
                     result_index_insert(&mut out, &mut result_index, k);
                 }
@@ -331,12 +290,20 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             }
             Ok(new_set(i, out))
         } else {
-            // Start from this Set and remove each of the other's keys.
-            let mut out = vals;
-            for k in set_like_keys(i, &keys, &arg(a, 0))? {
-                out.retain(|v| !same_value_zero(v, &k));
+            // Remove through the same collision-safe index as ordinary Sets, not one full result
+            // scan per key. The result snapshot precedes GetIteratorFromMethod, per the standard.
+            let mut result = OrderedCollection::with_capacity(CollectionKind::Set, vals.len());
+            for value in vals {
+                result.insert(value.clone(), value);
             }
-            Ok(new_set(i, out))
+            let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
+            while let Some(key) = set_like_next(i, &iter, &next)? {
+                result.delete(&key);
+            }
+            Ok(new_set(
+                i,
+                result.iter().map(|(key, _)| key.clone()).collect(),
+            ))
         }
     });
     it.def_method(&sp, "symmetricDifference", 1, |i, this, a| {
@@ -378,17 +345,8 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         if (coll_live_len(i, ptr) as f64) > other_size {
             return Ok(Value::Bool(false));
         }
-        let mut idx = 0usize;
-        loop {
-            let entry = i.map_data.get(&ptr).and_then(|e| e.get(idx).cloned());
-            idx += 1;
-            let (k, _) = match entry {
-                Some(kv) => kv,
-                None => break,
-            };
-            if is_tombstone(i, &k) {
-                continue;
-            }
+        let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
+        while let Some((k, _)) = i.map_data[&ptr].next(&cursor) {
             if !set_like_has(i, &has, &arg(a, 0), &k)? {
                 return Ok(Value::Bool(false));
             }
@@ -407,7 +365,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
         while let Some(k) = set_like_next(i, &iter, &next)? {
             if !set_data_has(i, ptr, &k) {
-                set_like_close(i, &iter);
+                ab(i.iterator_close_normal(&iter))?;
                 return Ok(Value::Bool(false));
             }
         }
@@ -418,17 +376,8 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
         if (coll_live_len(i, ptr) as f64) <= other_size {
             // Walk this Set LIVE by index (the `has` callback may mutate it), probing the other.
-            let mut idx = 0usize;
-            loop {
-                let entry = i.map_data.get(&ptr).and_then(|e| e.get(idx).cloned());
-                idx += 1;
-                let (k, _) = match entry {
-                    Some(kv) => kv,
-                    None => break,
-                };
-                if is_tombstone(i, &k) {
-                    continue;
-                }
+            let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
+            while let Some((k, _)) = i.map_data[&ptr].next(&cursor) {
                 if set_like_has(i, &has, &arg(a, 0), &k)? {
                     return Ok(Value::Bool(false));
                 }
@@ -440,7 +389,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
                 // SetDataHas is deliberately live: the arbitrary other's iterator can mutate the
                 // receiver between steps (ECMA-262 §24.2.4.10).
                 if set_data_has(i, ptr, &k) {
-                    set_like_close(i, &iter);
+                    ab(i.iterator_close_normal(&iter))?;
                     return Ok(Value::Bool(false));
                 }
             }
@@ -475,15 +424,18 @@ fn collection_ctor(
     let obj = new_from_ctor(i, name)?;
     let ptr = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
+    let kind = if is_set {
+        CollectionKind::Set
+    } else {
+        CollectionKind::Map
+    };
     if name.starts_with("Weak") {
         i.weak_collection_data.insert(ptr, Vec::new());
-        i.weak_collection_index.insert(ptr, Default::default());
+        i.weak_collection_index
+            .insert(ptr, crate::weak_metadata::WeakCollectionIndex::new(kind));
     } else {
-        i.map_data.insert(ptr, Vec::new());
-        i.collection_index.insert(ptr, Default::default());
+        i.map_data.insert(ptr, OrderedCollection::new(kind));
     }
-    // Brand the instance so prototype methods can reject cross-collection receivers.
-    set_internal(&obj, "__ck", Value::str(name));
     let mv = Value::Obj(obj);
     if let Some(src) = args.first() {
         if !matches!(src, Value::Undefined | Value::Null) {
@@ -520,176 +472,35 @@ fn collection_ctor(
     Ok(mv)
 }
 
-/// The Map/Set tombstone sentinel key: a unique engine-private object placed at a deleted entry's
-/// slot so positions stay stable (live iteration observes additions and skips deletions, per spec).
-fn map_tombstone(i: &Interp) -> Value {
-    match i.extra_protos.get("%MapTombstone%") {
-        Some(o) => Value::Obj(o.clone()),
-        None => Value::Undefined,
-    }
-}
-
-/// Count the live (non-tombstone) entries of a collection.
+/// Count entries, not hash buckets: distinct SameValueZero keys may have the same hash.
 fn coll_live_len(i: &Interp, ptr: usize) -> usize {
-    i.collection_index
-        .get(&ptr)
-        .map_or(0, crate::fasthash::FastMap::len)
-}
-
-/// Locate a live ordered entry through the SameValueZero hash index.
-fn collection_entry_index(i: &Interp, ptr: usize, key: &Value) -> Option<usize> {
-    let hash = collection_key_hash(key);
-    let bucket = i.collection_index.get(&ptr)?.get(&hash)?;
-    let entries = i.map_data.get(&ptr)?;
-    let matches = |offset: usize| {
-        entries
-            .get(offset)
-            .is_some_and(|(candidate, _)| same_value_zero(candidate, key))
-    };
-    match bucket {
-        crate::interpreter::CollectionBucket::One(offset) => matches(*offset).then_some(*offset),
-        crate::interpreter::CollectionBucket::Many(offsets) => {
-            offsets.iter().copied().find(|offset| matches(*offset))
-        }
-    }
+    i.map_data.get(&ptr).map_or(0, OrderedCollection::len)
 }
 
 fn collection_get(i: &Interp, ptr: usize, key: &Value) -> Option<Value> {
-    let index = collection_entry_index(i, ptr, key)?;
-    i.map_data
-        .get(&ptr)?
-        .get(index)
-        .map(|(_, value)| value.clone())
+    i.map_data.get(&ptr)?.get(key).cloned()
 }
 
 fn collection_has(i: &Interp, ptr: usize, key: &Value) -> bool {
-    collection_entry_index(i, ptr, key).is_some()
+    i.map_data.get(&ptr).is_some_and(|data| data.has(key))
 }
 
-/// Set an existing ordered entry or append a new one. Deleted slots are never reused: delete then
-/// reinsert must move the key to the end, and live iterators must observe that append.
 fn collection_set(i: &mut Interp, ptr: usize, key: Value, value: Value) {
-    let key = canonicalize_map_key(key);
-    if let Some(index) = collection_entry_index(i, ptr, &key) {
-        if let Some(entry) = i
-            .map_data
-            .get_mut(&ptr)
-            .and_then(|entries| entries.get_mut(index))
-        {
-            entry.1 = value;
-        }
-        return;
-    }
-    let entries = i.map_data.entry(ptr).or_default();
-    let index = entries.len();
-    entries.push((key, value));
-    let hash = collection_key_hash(&entries[index].0);
-    use crate::interpreter::CollectionBucket;
-    match i.collection_index.entry(ptr).or_default().entry(hash) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(CollectionBucket::One(index));
-        }
-        std::collections::hash_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-            CollectionBucket::One(previous) => {
-                *entry.get_mut() = CollectionBucket::Many(vec![*previous, index]);
-            }
-            CollectionBucket::Many(offsets) => offsets.push(index),
-        },
-    }
+    i.map_data
+        .get_mut(&ptr)
+        .expect("collection internal slot")
+        .insert(key, value);
 }
 
 fn collection_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
-    let Some(index) = collection_entry_index(i, ptr, key) else {
-        return false;
-    };
-    let hash = collection_key_hash(key);
-    let mut remove_bucket = false;
-    if let Some(bucket) = i
-        .collection_index
+    i.map_data
         .get_mut(&ptr)
-        .and_then(|collection| collection.get_mut(&hash))
-    {
-        match bucket {
-            crate::interpreter::CollectionBucket::One(_) => remove_bucket = true,
-            crate::interpreter::CollectionBucket::Many(offsets) => {
-                offsets.retain(|offset| *offset != index);
-                if offsets.len() == 1 {
-                    *bucket = crate::interpreter::CollectionBucket::One(offsets[0]);
-                }
-            }
-        }
-    }
-    if remove_bucket {
-        if let Some(collection) = i.collection_index.get_mut(&ptr) {
-            collection.remove(&hash);
-        }
-    }
-    let tombstone = map_tombstone(i);
-    if let Some(entry) = i
-        .map_data
-        .get_mut(&ptr)
-        .and_then(|entries| entries.get_mut(index))
-    {
-        entry.0 = tombstone;
-        entry.1 = Value::Undefined;
-    }
-    true
-}
-
-/// Hash a Map/Set key according to SameValueZero. A bucket hit is always checked with the full
-/// equality relation, so ordinary hash collisions cannot alias distinct JavaScript keys. Keeping
-/// only the hash in the parallel index also avoids retaining a second String/BigInt owner.
-fn collection_key_hash(value: &Value) -> u64 {
-    let mut state = crate::fasthash::FxHasher::default();
-    match value {
-        Value::Undefined => state.write_u8(0),
-        Value::Empty => state.write_u8(1),
-        Value::Null => state.write_u8(2),
-        Value::Bool(value) => {
-            state.write_u8(3);
-            value.hash(&mut state);
-        }
-        Value::Num(value) => {
-            state.write_u8(4);
-            let bits = if *value == 0.0 {
-                0.0f64.to_bits()
-            } else if value.is_nan() {
-                f64::NAN.to_bits()
-            } else {
-                value.to_bits()
-            };
-            state.write_u64(bits);
-        }
-        Value::BigInt(value) => {
-            state.write_u8(5);
-            value.hash(&mut state);
-        }
-        Value::Str(value) => {
-            state.write_u8(6);
-            value.hash(&mut state);
-        }
-        Value::Sym(value) => {
-            state.write_u8(7);
-            state.write_u64(value.id);
-        }
-        Value::Obj(value) => {
-            state.write_u8(8);
-            state.write_usize(Rc::as_ptr(value) as usize);
-        }
-    }
-    state.finish()
+        .is_some_and(|data| data.delete(key))
 }
 
 fn collection_clear(i: &mut Interp, ptr: usize) {
-    let tombstone = map_tombstone(i);
-    if let Some(entries) = i.map_data.get_mut(&ptr) {
-        for entry in entries {
-            entry.0 = tombstone.clone();
-            entry.1 = Value::Undefined;
-        }
-    }
-    if let Some(index) = i.collection_index.get_mut(&ptr) {
-        index.clear();
+    if let Some(data) = i.map_data.get_mut(&ptr) {
+        data.clear();
     }
 }
 
@@ -903,13 +714,12 @@ pub(super) fn install_map_like(
             let m = Object::new(i.extra_protos.get("Map").cloned());
             let ptr = Rc::as_ptr(&m) as usize;
             i.gc_pin(&m);
-            i.map_data.insert(ptr, Vec::new());
-            i.collection_index.insert(ptr, Default::default());
+            i.map_data
+                .insert(ptr, OrderedCollection::new(CollectionKind::Map));
             for (key, values) in groups {
                 let values = i.make_array(values);
                 collection_set(i, ptr, key, values);
             }
-            set_internal(&m, "__ck", Value::str("Map"));
             Ok(Value::Obj(m))
         });
     }
@@ -921,34 +731,31 @@ pub(super) fn install_map_like(
 /// WeakMap/WeakSet: like Map/Set but keys must be objects or unregistered symbols and there is no
 /// iteration/size. ECMA-262 requires average sublinear access, so all operations use the parallel
 /// identity index instead of scanning the specification's conceptual List.
-/// Resolve the backing-store pointer for a weak-collection receiver, enforcing its brand: `want` is
-/// the exact kind ("WeakMap"/"WeakSet") for kind-specific methods, or "Weak" to accept either for
-/// the methods (has/delete) shared by both.
-fn weak_brand_ptr(i: &mut Interp, this: &Value, want: &str) -> Result<usize, Value> {
+/// RequireInternalSlot checks the exact internal kind, including has/delete. No property lookup
+/// or Proxy operation participates in the brand check (ECMA-262 #sec-weakmap.prototype.has and
+/// #sec-weakset.prototype.has).
+fn weak_brand_ptr(i: &mut Interp, this: &Value, want: CollectionKind) -> Result<usize, Value> {
     let ptr = map_ptr(this)
-        .filter(|p| i.weak_collection_data.contains_key(p))
+        .filter(|p| {
+            i.weak_collection_index
+                .get(p)
+                .is_some_and(|index| index.kind == want)
+        })
         .ok_or_else(|| i.make_error("TypeError", "method called on incompatible receiver"))?;
-    let kind = this
-        .as_obj()
-        .and_then(|o| o.borrow().props.get("__ck").map(|p| p.value()));
-    let ok = match &kind {
-        Some(Value::Str(s)) if want == "Weak" => s.starts_with("Weak"),
-        Some(Value::Str(s)) => &**s == want,
-        _ => false,
-    };
-    if !ok {
-        return Err(i.make_error("TypeError", "method called on incompatible receiver"));
-    }
     Ok(ptr)
 }
 
 fn weak_entry_index(i: &Interp, ptr: usize, key: &Value) -> Option<usize> {
     let identity = crate::interpreter::WeakKey::of(key)?;
-    i.weak_collection_index.get(&ptr)?.get(&identity).copied()
+    i.weak_collection_index
+        .get(&ptr)?
+        .entries
+        .get(&identity)
+        .copied()
 }
 
 pub(crate) fn weak_map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<Value, Value> {
-    let ptr = weak_brand_ptr(i, map, "WeakMap")?;
+    let ptr = weak_brand_ptr(i, map, CollectionKind::Map)?;
     Ok(weak_entry_index(i, ptr, key)
         .and_then(|index| i.weak_collection_data.get(&ptr)?.get(index))
         .map(|(_, value)| value.clone())
@@ -956,13 +763,14 @@ pub(crate) fn weak_map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<V
 }
 
 fn weak_insert(i: &mut Interp, ptr: usize, key: Value, value: Value) {
+    i.gc_weak_metadata_safepoint(false);
     let target = crate::interpreter::WeakTarget::of(&key)
         .expect("WeakMap and WeakSet entries have weakly holdable keys");
     let identity = target.key();
     if let Some(index) = i
         .weak_collection_index
         .get(&ptr)
-        .and_then(|index| index.get(&identity))
+        .and_then(|index| index.entries.get(&identity))
         .copied()
     {
         i.weak_collection_data
@@ -971,6 +779,10 @@ fn weak_insert(i: &mut Interp, ptr: usize, key: Value, value: Value) {
             .1 = value;
         return;
     }
+    i.weak_metadata.subscribe(
+        target.clone(),
+        crate::weak_metadata::Subscriber::Collection(ptr),
+    );
     let entries = i
         .weak_collection_data
         .get_mut(&ptr)
@@ -978,8 +790,9 @@ fn weak_insert(i: &mut Interp, ptr: usize, key: Value, value: Value) {
     let index = entries.len();
     entries.push((target, value));
     i.weak_collection_index
-        .entry(ptr)
-        .or_default()
+        .get_mut(&ptr)
+        .expect("a weak collection has a branded index")
+        .entries
         .insert(identity, index);
 }
 
@@ -987,28 +800,7 @@ fn weak_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
     let Some(identity) = crate::interpreter::WeakKey::of(key) else {
         return false;
     };
-    let Some(index) = i
-        .weak_collection_index
-        .get_mut(&ptr)
-        .and_then(|entries| entries.remove(&identity))
-    else {
-        return false;
-    };
-    // Weak collection order cannot be observed, so compact immediately. Repair the moved entry's
-    // offset after swap_remove to keep all subsequent operations constant-time.
-    let entries = i
-        .weak_collection_data
-        .get_mut(&ptr)
-        .expect("a weak collection has backing data");
-    entries.swap_remove(index);
-    if let Some((moved_key, _)) = entries.get(index) {
-        let moved_identity = moved_key.key();
-        i.weak_collection_index
-            .get_mut(&ptr)
-            .expect("a weak collection has an identity index")
-            .insert(moved_identity, index);
-    }
-    true
+    i.weak_collection_remove(ptr, identity)
 }
 
 pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ctor_fn: NativeFn) {
@@ -1016,19 +808,22 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
     it.extra_protos.insert(name, proto.clone());
     let adder: NativeFn = if is_set {
         |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, "WeakSet")?;
+            let ptr = weak_brand_ptr(i, &this, CollectionKind::Set)?;
             let key = arg(a, 0);
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used in weak set"));
             }
             if weak_entry_index(i, ptr, &key).is_none() {
-                weak_insert(i, ptr, key.clone(), key);
+                // ECMA-262 #sec-weakset.prototype.add stores only weak membership, unlike a
+                // WeakMap's ephemeron value. A strong dummy copy would keep acyclic symbols
+                // alive and make an old WeakSet conservatively root young objects in a minor GC.
+                weak_insert(i, ptr, key, Value::Undefined);
             }
             Ok(this)
         }
     } else {
         |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, "WeakMap")?;
+            let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
             let (key, val) = (arg(a, 0), arg(a, 1));
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
@@ -1049,7 +844,7 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
         });
         // Upsert proposal: getOrInsert(key, value) / getOrInsertComputed(key, callbackfn).
         it.def_method(&proto, "getOrInsert", 2, |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, "WeakMap")?;
+            let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
             let key = arg(a, 0);
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
@@ -1062,7 +857,7 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             Ok(value)
         });
         it.def_method(&proto, "getOrInsertComputed", 2, |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, "WeakMap")?;
+            let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
             let key = arg(a, 0);
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
@@ -1080,16 +875,18 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             Ok(value)
         });
     }
-    it.def_method(&proto, "has", 1, |i, this, a| {
-        let ptr = weak_brand_ptr(i, &this, "Weak")?;
-        let key = arg(a, 0);
-        Ok(Value::Bool(weak_entry_index(i, ptr, &key).is_some()))
-    });
-    it.def_method(&proto, "delete", 1, |i, this, a| {
-        let ptr = weak_brand_ptr(i, &this, "Weak")?;
-        let key = arg(a, 0);
-        Ok(Value::Bool(weak_delete(i, ptr, &key)))
-    });
+    let has: NativeFn = if is_set {
+        |i, this, a| weak_has(i, this, a, CollectionKind::Set)
+    } else {
+        |i, this, a| weak_has(i, this, a, CollectionKind::Map)
+    };
+    let delete: NativeFn = if is_set {
+        |i, this, a| weak_remove(i, this, a, CollectionKind::Set)
+    } else {
+        |i, this, a| weak_remove(i, this, a, CollectionKind::Map)
+    };
+    it.def_method(&proto, "has", 1, has);
+    it.def_method(&proto, "delete", 1, delete);
     let ctor = it.make_native(name, 0, ctor_fn);
     ctor.borrow_mut().props.insert(
         "prototype",
@@ -1101,4 +898,26 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
     set_to_string_tag(it, &proto, name);
     set_builtin(&it.global, name, Value::Obj(ctor));
+}
+
+fn weak_has(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+    kind: CollectionKind,
+) -> Result<Value, Value> {
+    let ptr = weak_brand_ptr(i, &this, kind)?;
+    Ok(Value::Bool(
+        weak_entry_index(i, ptr, &arg(args, 0)).is_some(),
+    ))
+}
+
+fn weak_remove(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+    kind: CollectionKind,
+) -> Result<Value, Value> {
+    let ptr = weak_brand_ptr(i, &this, kind)?;
+    Ok(Value::Bool(weak_delete(i, ptr, &arg(args, 0))))
 }

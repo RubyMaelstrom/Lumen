@@ -108,6 +108,12 @@ pub(crate) struct Cfg {
     dominators: Vec<Vec<u64>>,
     loops: Vec<NaturalLoop>,
     handler_roots: Vec<HandlerRoot>,
+    /// Normal resumptions are independent graph entries, not ordinary dominance edges.
+    /// Their settled stack includes the value injected by Await/GeneratorResume.
+    resume_roots: Vec<HandlerRoot>,
+    /// Independent VM-to-native entries. These participate in dominance before region selection;
+    /// a preheader reached only by fresh execution cannot justify facts at an OSR header.
+    osr_entries: Vec<Option<usize>>,
     max_settled_stack: usize,
 }
 
@@ -116,7 +122,7 @@ pub(crate) struct ValueId(u32);
 
 impl ValueId {
     #[inline]
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -223,7 +229,7 @@ pub(crate) enum IrError {
     InvalidDeoptRecord,
 }
 
-/// Stack/local SSA for one natural loop.  It is deliberately architecture-neutral and keeps
+/// Stack/local SSA for one bounded single-entry region. It is architecture-neutral and keeps
 /// ownership semantics explicit in `Clone`/`Dup` instructions.  Lowerers may borrow an object
 /// value while its owning frame location stays live, but side-exit reconstruction must clone
 /// every duplicate logical location rather than treating SSA aliasing as Rust ownership.
@@ -237,17 +243,189 @@ pub(crate) struct RegionIr {
     pub(crate) n_slots: usize,
 }
 
+/// One function-wide budget, including rejected candidates. Dense loop membership is built
+/// once; nested-loop metadata and repeated unsuccessful frontiers cannot cause quadratic
+/// unbounded work. Running out retains the complete baseline templates.
+pub(crate) struct AcyclicBudget {
+    loop_member: Vec<bool>,
+    work: usize,
+    ops: usize,
+    attempts: usize,
+}
+
+impl AcyclicBudget {
+    pub(crate) fn new(cfg: &Cfg, op_count: usize) -> Self {
+        let mut budget = Self {
+            loop_member: vec![false; cfg.blocks.len()],
+            work: 16_384,
+            ops: op_count.min(2048),
+            attempts: 32,
+        };
+        for lp in &cfg.loops {
+            if !budget.spend(lp.blocks.len()) {
+                budget.loop_member.fill(true);
+                break;
+            }
+            for block in &lp.blocks {
+                budget.loop_member[block.index()] = true;
+            }
+        }
+        budget
+    }
+
+    fn spend(&mut self, amount: usize) -> bool {
+        if amount > self.work {
+            self.work = 0;
+            false
+        } else {
+            self.work -= amount;
+            true
+        }
+    }
+}
+
 impl RegionIr {
     pub(crate) fn build_loop(chunk: &Chunk, cfg: &Cfg, head: usize) -> Result<Self, IrError> {
         let lp = cfg.loop_at_header(head).ok_or(IrError::NoLoop)?;
+        Self::build_selected(chunk, cfg, lp.header, &lp.blocks)
+    }
+
+    /// Forward, dominance-closed region. A second entry (including handler, resume or OSR
+    /// roots) is never silently treated as a predecessor carrying our private register state.
+    /// Natural-loop members keep their loop lowering, including its backedge safepoints.
+    pub(crate) fn build_acyclic(
+        chunk: &Chunk,
+        cfg: &Cfg,
+        head: usize,
+        budget: &mut AcyclicBudget,
+    ) -> Result<Self, IrError> {
+        let header = cfg.block_at(head).ok_or(IrError::NoLoop)?;
+        if cfg.blocks[header.index()].start != head || budget.loop_member[header.index()] {
+            return Err(IrError::NoLoop);
+        }
+        let (_, slots) = chunk.jit_frame();
+        if slots > 512 {
+            return Err(IrError::FrameTooLarge);
+        }
+        if budget.attempts == 0 || budget.ops == 0 || !budget.spend(1) {
+            return Err(IrError::TooLarge);
+        }
+        budget.attempts -= 1;
+        let ops = chunk.jit_ops();
+        let eligible = |id: BlockId, budget: &mut AcyclicBudget| {
+            let block = &cfg.blocks[id.index()];
+            budget.spend(block.end - block.start + block.successors.len() + 1)
+                && block.stack_in.is_some()
+                && cfg.dominates(header, id)
+                && !budget.loop_member[id.index()]
+                && block
+                    .successors
+                    .iter()
+                    .all(|next| cfg.blocks[next.index()].start > block.start)
+                && !ops[block.start..block.end].iter().any(|op| {
+                    matches!(
+                        op,
+                        Op::PushHandler(_)
+                            | Op::PushFinally(..)
+                            | Op::PushIterator(..)
+                            | Op::PopHandler
+                    ) || (crate::bytecode::jit_slice_exit_op(op)
+                        && !matches!(
+                            op,
+                            Op::Return | Op::ReturnBare | Op::ReturnUndef | Op::Throw
+                        ))
+                })
+        };
+        if !eligible(header, budget) {
+            return Err(IrError::NoLoop);
+        }
+        let mut selected = Vec::new();
+        let mut pending = vec![header];
+        let mut count = 0;
+        while let Some(id) = pending.pop() {
+            if !budget.spend(selected.len() + 1) {
+                return Err(IrError::TooLarge);
+            }
+            if selected.contains(&id) || !eligible(id, budget) {
+                continue;
+            }
+            let block = &cfg.blocks[id.index()];
+            let size = block.end - block.start;
+            if selected.len() >= 64 || count + size > 256.min(budget.ops) {
+                continue;
+            }
+            selected.push(id);
+            count += size;
+            for &successor in &block.successors {
+                if cfg.blocks[successor.index()].start > block.start {
+                    pending.push(successor);
+                }
+            }
+        }
+        // A bounded selection may omit a predecessor at its frontier. Remove its join and
+        // transitively dependent blocks rather than importing an unproved incoming frame.
+        loop {
+            let comparisons = selected
+                .iter()
+                .map(|id| {
+                    cfg.blocks[id.index()]
+                        .predecessors
+                        .len()
+                        .saturating_mul(selected.len())
+                })
+                .sum::<usize>();
+            if !budget.spend(comparisons + selected.len()) {
+                return Err(IrError::TooLarge);
+            }
+            let before = selected.len();
+            let retained: Vec<_> = selected
+                .iter()
+                .copied()
+                .filter(|id| {
+                    *id == header
+                        || cfg.blocks[id.index()].predecessors.iter().all(|pred| {
+                            cfg.blocks[pred.index()].stack_in.is_none() || selected.contains(pred)
+                        })
+                })
+                .collect();
+            selected = retained;
+            if before == selected.len() {
+                break;
+            }
+        }
+        if !selected.contains(&header) {
+            return Err(IrError::TooLarge);
+        }
+        selected.sort_unstable();
+        budget.ops -= count;
+        // The shared SSA verifier/trivial-parameter pass visits predecessor maps for
+        // each frame parameter. Charge its conservative bound too, not just CFG search.
+        let parameters = slots + cfg.blocks[header.index()].stack_in.unwrap_or(0) + 1;
+        let ssa_work = parameters.saturating_mul(selected.len().saturating_pow(3));
+        if !budget.spend(ssa_work) {
+            return Err(IrError::TooLarge);
+        }
+        Self::build_selected(chunk, cfg, header, &selected)
+    }
+
+    fn build_selected(
+        chunk: &Chunk,
+        cfg: &Cfg,
+        header: BlockId,
+        blocks: &[BlockId],
+    ) -> Result<Self, IrError> {
         let (_, n_slots) = chunk.jit_frame();
         Self::build_with(
             chunk.jit_ops(),
             cfg,
-            lp,
+            header,
+            blocks,
             n_slots,
             |pc| chunk.jit_stack_effect(pc),
-            |target| chunk.jit_inline_target(target).argc as usize,
+            |target| {
+                let guard = chunk.jit_inline_target(target);
+                guard.argc as usize + 1 + usize::from(guard.check_this)
+            },
             |k| {
                 if chunk.jit_const_num(k).is_some() {
                     Rep::F64
@@ -261,15 +439,15 @@ impl RegionIr {
     fn build_with(
         ops: &[Op],
         cfg: &Cfg,
-        lp: &NaturalLoop,
+        header: BlockId,
+        selected_blocks: &[BlockId],
         n_slots: usize,
         mut effect: impl FnMut(usize) -> Option<(usize, usize)>,
-        mut inline_argc: impl FnMut(u32) -> usize,
+        mut inline_width: impl FnMut(u32) -> usize,
         mut const_rep: impl FnMut(u32) -> Rep,
     ) -> Result<Self, IrError> {
-        if lp.blocks.len() > 128
-            || lp
-                .blocks
+        if selected_blocks.len() > 128
+            || selected_blocks
                 .iter()
                 .map(|id| {
                     let b = &cfg.blocks[id.index()];
@@ -280,21 +458,29 @@ impl RegionIr {
         {
             return Err(IrError::TooLarge);
         }
-        if ops
-            .iter()
-            .any(|op| matches!(op, Op::PushHandler(_) | Op::PopHandler))
-        {
-            // Until exceptional SSA exists, even a syntactically outside try region is kept on
-            // the baseline tier.  This is intentionally conservative and easy to relax later.
+        if selected_blocks.iter().any(|id| {
+            let block = &cfg.blocks[id.index()];
+            ops[block.start..block.end].iter().any(|op| {
+                matches!(
+                    op,
+                    Op::PushHandler(_)
+                        | Op::PushFinally(..)
+                        | Op::PushIterator(..)
+                        | Op::PopHandler
+                )
+            })
+        }) {
+            // Helpers can unwind through an ambient handler after materialization. Changes
+            // to protected regions themselves still require exceptional SSA edge parameters.
             return Err(IrError::Handler);
         }
 
         let mut values = Vec::new();
         let this_value = push_value(&mut values, ValueDef::This, Rep::Tagged);
 
-        let selected = |id: BlockId| lp.blocks.contains(&id);
-        for &id in &lp.blocks {
-            if id != lp.header
+        let selected = |id: BlockId| selected_blocks.contains(&id);
+        for &id in selected_blocks {
+            if id != header
                 && cfg.blocks[id.index()]
                     .predecessors
                     .iter()
@@ -308,14 +494,14 @@ impl RegionIr {
         // refer to header parameters without iterative graph construction.  Trivial parameters
         // are canonicalized after all incoming edge arguments are known.
         let mut block_params: Vec<Option<Vec<(FrameLoc, ValueId)>>> = vec![None; cfg.blocks.len()];
-        for &id in &lp.blocks {
+        for &id in selected_blocks {
             let depth = cfg.blocks[id.index()]
                 .stack_in
                 .ok_or(IrError::StackMismatch { block: id })?;
             let mut params = Vec::with_capacity(n_slots + depth);
             for slot in 0..n_slots {
                 let loc = FrameLoc::Local(slot as u16);
-                let def = if id == lp.header {
+                let def = if id == header {
                     ValueDef::RegionInput(loc)
                 } else {
                     ValueDef::BlockParam { block: id, loc }
@@ -324,7 +510,7 @@ impl RegionIr {
             }
             for pos in 0..depth {
                 let loc = FrameLoc::Stack(pos as u16);
-                let def = if id == lp.header {
+                let def = if id == header {
                     ValueDef::RegionInput(loc)
                 } else {
                     ValueDef::BlockParam { block: id, loc }
@@ -339,12 +525,12 @@ impl RegionIr {
             stack: Vec<ValueId>,
         }
         let mut end_states: Vec<Option<EndState>> = (0..cfg.blocks.len()).map(|_| None).collect();
-        let mut ir_blocks = Vec::with_capacity(lp.blocks.len());
+        let mut ir_blocks = Vec::with_capacity(selected_blocks.len());
 
         // Stable RPO makes dumps deterministic.  Natural-loop membership, not numeric block-id
         // order, decides inclusion (nested blocks can be interleaved in bytecode order).
         let mut order: Vec<BlockId> = cfg.rpo.iter().copied().filter(|id| selected(*id)).collect();
-        for &id in &lp.blocks {
+        for &id in selected_blocks {
             if !order.contains(&id) {
                 order.push(id);
             }
@@ -504,7 +690,7 @@ impl RegionIr {
                         });
                     }
                     Op::InlineGuard(target, _) => {
-                        let width = inline_argc(target) + 2;
+                        let width = inline_width(target);
                         let at = stack
                             .len()
                             .checked_sub(width)
@@ -646,7 +832,7 @@ impl RegionIr {
         }
 
         let mut ir = RegionIr {
-            header: lp.header,
+            header,
             blocks: ir_blocks,
             values,
             exits,
@@ -656,6 +842,46 @@ impl RegionIr {
         ir.remove_trivial_params();
         ir.verify(cfg)?;
         Ok(ir)
+    }
+
+    /// Entry locals whose *old values* can reach an actual instruction input. All locals
+    /// appear in edge maps for precise bailout, but that does not make dead initial values
+    /// semantic inputs. In particular fresh inlined parameters are assigned before use.
+    pub(crate) fn live_entry_locals(&self) -> Vec<bool> {
+        let mut live = vec![false; self.n_slots];
+        let mut visited = vec![false; self.values.len()];
+        let mut work: Vec<_> = self
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .flat_map(|inst| inst.inputs.iter().copied())
+            .collect();
+        while let Some(value) = work.pop() {
+            if std::mem::replace(&mut visited[value.index()], true) {
+                continue;
+            }
+            match self.values[value.index()].def {
+                ValueDef::RegionInput(FrameLoc::Local(slot)) => live[slot as usize] = true,
+                ValueDef::BlockParam { block, loc } => {
+                    let Some(target) = self.blocks.iter().find(|b| b.cfg_block == block) else {
+                        continue;
+                    };
+                    let Some(index) = target.params.iter().position(|(home, _)| *home == loc)
+                    else {
+                        continue;
+                    };
+                    work.extend(
+                        self.blocks
+                            .iter()
+                            .flat_map(|b| &b.successors)
+                            .filter(|edge| edge.target == block)
+                            .map(|edge| edge.args[index]),
+                    );
+                }
+                _ => {}
+            }
+        }
+        live
     }
 
     fn remove_trivial_params(&mut self) {
@@ -826,6 +1052,57 @@ impl Cfg {
         Self::build_with(ops, |pc| chunk.jit_stack_effect(pc))
     }
 
+    pub(crate) fn build_osr(chunk: &Chunk) -> Result<Cfg, BuildError> {
+        let mut graph =
+            Self::build_with(chunk.jit_ops(), |pc| chunk.jit_borrowed_stack_effect(pc))?;
+        graph.add_osr_entries(chunk.jit_ops());
+        Ok(graph)
+    }
+
+    fn add_osr_entries(&mut self, ops: &[Op]) {
+        self.osr_entries = vec![None; ops.len()];
+        let mut roots = graph_roots(&self.blocks, &self.handler_roots, self.pc_block[0]);
+        for root in &self.resume_roots {
+            if !roots.contains(&root.target) {
+                roots.push(root.target);
+            }
+        }
+        for (pc, op) in ops.iter().enumerate() {
+            let target = match op {
+                Op::Jump(target)
+                | Op::AbruptJump(target, _)
+                | Op::JumpIfFalse(target)
+                | Op::JumpIfFalsePeek(target)
+                | Op::JumpIfTruePeek(target)
+                | Op::JumpIfNotNullishPeek(target)
+                    if (*target as usize) <= pc =>
+                {
+                    *target as usize
+                }
+                _ => continue,
+            };
+            let (Some(block), Some(depth)) = (self.block_at(target), self.stack_depth_at(target))
+            else {
+                continue;
+            };
+            // Every admitted address is an explicit branch-target block boundary, never a
+            // fused instruction interior. Runtime admission additionally requires depth ==
+            // actual_depth: handler-root depths can otherwise be only upper bounds.
+            debug_assert_eq!(self.blocks[block.index()].start, target);
+            self.osr_entries[target] = Some(depth);
+            if !roots.contains(&block) {
+                roots.push(block);
+            }
+        }
+        self.rpo = reverse_postorder(&self.blocks, &roots);
+        self.dominators = compute_dominators(&self.blocks, &self.rpo, &roots);
+        self.loops = discover_loops(&self.blocks, &self.rpo, &self.dominators);
+    }
+
+    pub(crate) fn osr_entry_depth(&self, pc: usize) -> Option<usize> {
+        self.osr_entries.get(pc).copied().flatten()
+    }
+
     fn build_with(
         ops: &[Op],
         mut effect: impl FnMut(usize) -> Option<(usize, usize)>,
@@ -843,11 +1120,23 @@ impl Cfg {
         leader[0] = true;
         leader[ops.len()] = true;
         for (pc, op) in ops.iter().enumerate() {
+            for (target, _) in handler_targets(op) {
+                validate_target(ops.len(), pc, target)?;
+                leader[target] = true;
+            }
             if let Some(target) = jump_target(op) {
                 validate_target(ops.len(), pc, target)?;
                 leader[target] = true;
             }
-            if ends_block(op) || matches!(op, Op::PushHandler(_) | Op::PopHandler) {
+            if ends_block(op)
+                || matches!(
+                    op,
+                    Op::PushHandler(_)
+                        | Op::PushFinally(..)
+                        | Op::PushIterator(..)
+                        | Op::PopHandler
+                )
+            {
                 leader[pc + 1] = true;
             }
         }
@@ -926,7 +1215,26 @@ impl Cfg {
             })
             .collect::<Vec<_>>();
 
-        let roots = graph_roots(&blocks, &handler_roots, pc_block[0]);
+        let resume_roots = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| {
+                if !crate::bytecode::jit_resume_after(op) {
+                    return None;
+                }
+                Some(HandlerRoot {
+                    push_pc: pc,
+                    target: pc_block[pc + 1]?,
+                    stack_depth: pc_depth[pc + 1]?,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut roots = graph_roots(&blocks, &handler_roots, pc_block[0]);
+        for root in &resume_roots {
+            if !roots.contains(&root.target) {
+                roots.push(root.target);
+            }
+        }
         let rpo = reverse_postorder(&blocks, &roots);
         let dominators = compute_dominators(&blocks, &rpo, &roots);
         let loops = discover_loops(&blocks, &rpo, &dominators);
@@ -939,6 +1247,8 @@ impl Cfg {
             dominators,
             loops,
             handler_roots,
+            resume_roots,
+            osr_entries: Vec::new(),
             max_settled_stack,
         })
     }
@@ -994,7 +1304,12 @@ impl Cfg {
         if self.blocks[block.index()].start != pc {
             return None;
         }
-        self.loops.iter().find(|lp| lp.header == block)
+        // discover_loops publishes ascending header PCs. Every emitted region may ask
+        // about bounded member blocks, so don't scan all unrelated loops for each query.
+        self.loops
+            .binary_search_by_key(&pc, |lp| self.blocks[lp.header.index()].start)
+            .ok()
+            .map(|index| &self.loops[index])
     }
 
     /// Return the unique unconditional backedge pc for the old branch-free loop emitter.
@@ -1048,6 +1363,7 @@ fn validate_target(len: usize, pc: usize, target: usize) -> Result<(), BuildErro
 pub(crate) fn jump_target(op: &Op) -> Option<usize> {
     match op {
         Op::Jump(t)
+        | Op::AbruptJump(t, _)
         | Op::JumpIfFalse(t)
         | Op::JumpIfFalsePeek(t)
         | Op::JumpIfTruePeek(t)
@@ -1059,25 +1375,33 @@ pub(crate) fn jump_target(op: &Op) -> Option<usize> {
 }
 
 fn ends_block(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Jump(_)
-            | Op::JumpIfFalse(_)
-            | Op::JumpIfFalsePeek(_)
-            | Op::JumpIfTruePeek(_)
-            | Op::JumpIfNotNullishPeek(_)
-            | Op::InlineGuard(..)
-            | Op::Return
-            | Op::ReturnUndef
-            | Op::Throw
-            | Op::IterAbortL(_)
-            | Op::Await
-    )
+    crate::bytecode::jit_slice_exit_op(op)
+        || matches!(
+            op,
+            Op::Jump(_)
+                | Op::AbruptJump(..)
+                | Op::JumpIfFalse(_)
+                | Op::JumpIfFalsePeek(_)
+                | Op::JumpIfTruePeek(_)
+                | Op::JumpIfNotNullishPeek(_)
+                | Op::InlineGuard(..)
+                | Op::Return
+                | Op::ReturnBare
+                | Op::ResumeReturn
+                | Op::ResumeJump
+                | Op::ReturnUndef
+                | Op::Throw
+                | Op::IterAbortL(_)
+                | Op::Await
+        )
 }
 
 fn normal_successor_pcs(op: &Op, pc: usize, len: usize, out: &mut Vec<usize>) {
+    if crate::bytecode::jit_resume_after(op) {
+        return;
+    }
     match op {
-        Op::Jump(t) => out.push(*t as usize),
+        Op::Jump(t) | Op::AbruptJump(t, _) => out.push(*t as usize),
         Op::JumpIfFalse(t)
         | Op::JumpIfFalsePeek(t)
         | Op::JumpIfTruePeek(t)
@@ -1088,13 +1412,33 @@ fn normal_successor_pcs(op: &Op, pc: usize, len: usize, out: &mut Vec<usize>) {
                 out.push(pc + 1);
             }
         }
-        Op::Return | Op::ReturnUndef | Op::Throw | Op::IterAbortL(_) | Op::Await => {}
+        op if crate::bytecode::jit_slice_exit_op(op) => {}
         _ if pc < len => out.push(pc + 1),
         _ => {}
     }
 }
 
 type HandlerDepth = (usize, usize, usize); // push pc, target pc, catch-entry depth
+
+fn handler_targets(op: &Op) -> Vec<(usize, usize)> {
+    match *op {
+        Op::PushHandler(t) => vec![(t as usize, 1)],
+        Op::PushFinally(t, r, b, s, j) => vec![
+            (t as usize, 1),
+            (r as usize, 1),
+            (b as usize, 0),
+            (s as usize, 1),
+            (j as usize, 2),
+        ],
+        Op::PushIterator(t, r, b, s) => vec![
+            (t as usize, 1),
+            (r as usize, 1),
+            (b as usize, 0),
+            (s as usize, 1),
+        ],
+        _ => Vec::new(),
+    }
+}
 
 fn analyze_stack(
     ops: &[Op],
@@ -1131,8 +1475,14 @@ fn analyze_stack(
         }
         let next = incoming - pops + pushes;
         max = max.max(next);
+        if crate::bytecode::jit_resume_after(&ops[pc]) {
+            // The native slice has consumed the awaited/yielded input. The shared driver
+            // later supplies exactly the settled stack described by jit_stack_effect.
+            work.push((pc + 1, next));
+            continue;
+        }
         match &ops[pc] {
-            Op::Jump(t) => {
+            Op::Jump(t) | Op::AbruptJump(t, _) => {
                 let target = *t as usize;
                 validate_target(ops.len(), pc, target)?;
                 work.push((target, next));
@@ -1147,14 +1497,15 @@ fn analyze_stack(
                 work.push((target, next));
                 work.push((pc + 1, next));
             }
-            Op::Return | Op::ReturnUndef | Op::Throw | Op::IterAbortL(_) | Op::Await => {}
-            Op::PushHandler(t) => {
-                let target = *t as usize;
-                validate_target(ops.len(), pc, target)?;
-                let catch_depth = incoming + 1;
-                max = max.max(catch_depth);
-                handlers.push((pc, target, catch_depth));
-                work.push((target, catch_depth));
+            op if crate::bytecode::jit_slice_exit_op(op) => {}
+            Op::PushHandler(..) | Op::PushFinally(..) | Op::PushIterator(..) => {
+                for (target, pushed) in handler_targets(&ops[pc]) {
+                    validate_target(ops.len(), pc, target)?;
+                    let catch_depth = incoming + pushed;
+                    max = max.max(catch_depth);
+                    handlers.push((pc, target, catch_depth));
+                    work.push((target, catch_depth));
+                }
                 work.push((pc + 1, next));
             }
             _ => work.push((pc + 1, next)),
@@ -1344,12 +1695,100 @@ mod tests {
             Op::JumpIfFalse(_) => (1, 0),
             Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
             Op::ReturnUndef => (0, 0),
+            Op::Await | Op::Yield | Op::YieldStar => (1, 1),
             _ => return None,
         })
     }
 
     fn cfg(ops: &[Op]) -> Result<Cfg, BuildError> {
         Cfg::build_with(ops, |pc| effect(&ops[pc]))
+    }
+
+    #[test]
+    fn cfg_osr_headers_are_independent_roots_with_exact_nonzero_entry_depth() {
+        let ops = [
+            Op::Undef,
+            Op::Const(0),
+            Op::StoreLocal(0),
+            Op::LoadLocal(0),
+            Op::Const(1),
+            Op::Lt,
+            Op::JumpIfFalse(12),
+            Op::LoadLocal(0),
+            Op::Const(1),
+            Op::Add,
+            Op::StoreLocal(0),
+            Op::Jump(3),
+            Op::Return,
+        ];
+        let mut graph = cfg(&ops).unwrap();
+        let entry = graph.block_at(0).unwrap();
+        let header = graph.block_at(3).unwrap();
+        assert!(graph.dominates(entry, header));
+        graph.add_osr_entries(&ops);
+        assert_eq!(graph.osr_entry_depth(3), Some(1));
+        assert_eq!(
+            graph.osr_entry_depth(4),
+            None,
+            "no instruction-interior entry"
+        );
+        assert_eq!(
+            graph.osr_entry_depth(0),
+            None,
+            "no replay of preheader initialization"
+        );
+        assert!(
+            !graph.dominates(entry, header),
+            "OSR cannot inherit preheader facts"
+        );
+        assert!(
+            graph.loop_at_header(3).is_some(),
+            "the loop itself remains optimizable"
+        );
+    }
+
+    #[test]
+    fn cfg_osr_conditional_backedge_uses_consumed_condition_depth() {
+        let ops = [
+            Op::Undef,
+            Op::Undef,
+            Op::JumpIfFalse(1),
+            Op::Pop,
+            Op::ReturnUndef,
+        ];
+        let mut graph = cfg(&ops).unwrap();
+        graph.add_osr_entries(&ops);
+        assert_eq!(graph.osr_entry_depth(1), Some(1));
+        assert_eq!(graph.stack_depth_at(2), Some(2));
+        assert_eq!(graph.osr_entry_depth(2), None);
+    }
+
+    #[test]
+    fn cfg_suspensions_create_independent_resume_roots_and_size_later_stack() {
+        let graph = cfg(&[
+            Op::Undef,
+            Op::Await,
+            Op::Pop,
+            Op::Undef,
+            Op::Undef,
+            Op::Undef,
+            Op::Yield,
+            Op::Pop,
+            Op::Pop,
+            Op::Return,
+        ])
+        .unwrap();
+        assert_eq!(graph.resume_roots.len(), 2);
+        assert_eq!(graph.stack_depth_at(2), Some(1));
+        assert_eq!(graph.stack_depth_at(7), Some(3));
+        assert_eq!(graph.max_settled_stack(), 3);
+        let entry = graph.block_at(0).unwrap();
+        let resumed = graph.block_at(2).unwrap();
+        assert!(
+            !graph.dominates(entry, resumed),
+            "native registers die at suspension"
+        );
+        assert!(graph.blocks[entry.index()].successors.is_empty());
     }
 
     #[test]
@@ -1496,6 +1935,91 @@ mod tests {
     }
 
     #[test]
+    fn ssa_inline_guard_plain_call_has_no_fictitious_receiver() {
+        let ops = [
+            Op::Undef,
+            Op::InlineGuard(0, 3),
+            Op::Jump(3),
+            Op::Pop,
+            Op::ReturnUndef,
+        ];
+        let g = cfg(&ops).unwrap();
+        let blocks: Vec<_> = (0..g.blocks.len()).map(|n| BlockId(n as u32)).collect();
+        let ir = RegionIr::build_with(
+            &ops,
+            &g,
+            blocks[0],
+            &blocks,
+            0,
+            |pc| effect(&ops[pc]),
+            |_| 1,
+            |_| Rep::F64,
+        )
+        .unwrap();
+        let guard = ir
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| matches!(i.kind, InstKind::InlineGuard))
+            .unwrap();
+        assert_eq!(guard.inputs.len(), 1);
+        ir.verify(&g).unwrap();
+    }
+
+    #[test]
+    fn ssa_entry_liveness_excludes_overwritten_inline_temporary() {
+        let ops = [
+            Op::LoadLocal(0),
+            Op::StoreLocal(1),
+            Op::LoadLocal(1),
+            Op::Return,
+        ];
+        let g = cfg(&ops).unwrap();
+        let ir = RegionIr::build_with(
+            &ops,
+            &g,
+            BlockId(0),
+            &[BlockId(0)],
+            2,
+            |pc| effect(&ops[pc]),
+            |_| 1,
+            |_| Rep::F64,
+        )
+        .unwrap();
+        assert_eq!(ir.live_entry_locals(), [true, false]);
+    }
+
+    #[test]
+    fn acyclic_search_has_a_shared_budget_including_unsuccessful_heads() {
+        let mut source = String::from("function f(x){");
+        for _ in 0..160 {
+            source.push_str("if(x){x=x+1;}else{x=x-1;}");
+        }
+        source.push_str("return x;}");
+        let statements = crate::parser::parse_script(&source, false).ok().unwrap();
+        let crate::ast::Stmt::FuncDecl(function) = &statements[0] else {
+            panic!("function");
+        };
+        let chunk = crate::bytecode::compile(function).unwrap();
+        let cfg = Cfg::build(&chunk).unwrap();
+        let mut budget = AcyclicBudget::new(&cfg, chunk.jit_ops().len());
+        let initial_ops = budget.ops;
+        let mut admitted = 0;
+        for block in cfg.blocks() {
+            if let Ok(ir) = RegionIr::build_acyclic(&chunk, &cfg, block.start, &mut budget) {
+                admitted += ir.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+            }
+        }
+        assert!(admitted <= initial_ops);
+        assert!(budget.attempts == 0 || budget.work == 0 || budget.ops == 0);
+        let frozen = (budget.attempts, budget.work, budget.ops);
+        for _ in 0..100 {
+            assert!(RegionIr::build_acyclic(&chunk, &cfg, 0, &mut budget).is_err());
+        }
+        assert_eq!((budget.attempts, budget.work, budget.ops), frozen);
+    }
+
+    #[test]
     fn cfg_catch_is_an_independent_root_with_exception_depth() {
         let ops = [
             Op::PushHandler(4),
@@ -1521,10 +2045,11 @@ mod tests {
         let ir = RegionIr::build_with(
             ops,
             &g,
-            lp,
+            lp.header,
+            &lp.blocks,
             n_slots,
             |pc| effect(&ops[pc]),
-            |_| 0,
+            |_| 2,
             |_| Rep::F64,
         )
         .unwrap();

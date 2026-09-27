@@ -5,6 +5,65 @@ use std::rc::Rc;
 
 pub type P<T> = Box<T>;
 
+/// Optimization identity owned by one immutable loop syntax node. Cold sites allocate nothing.
+/// A deep AST clone is a new site; Rc<Function> sharing naturally preserves the original site.
+/// Snapshot codecs deliberately omit this execution-only state.
+#[derive(Debug, Default)]
+pub struct LoopSite {
+    token: std::cell::OnceCell<Rc<LoopSiteToken>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LoopSiteToken {
+    _identity: u8,
+}
+
+impl Clone for LoopSite {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl LoopSite {
+    pub(crate) fn token(&self) -> &Rc<LoopSiteToken> {
+        self.token.get_or_init(|| Rc::new(LoopSiteToken::default()))
+    }
+
+    pub(crate) fn retained_token(&self) -> Option<&Rc<LoopSiteToken>> {
+        self.token.get()
+    }
+}
+
+/// A loop already owns a boxed body. Store its lazy optimization cell in that allocation,
+/// rather than enlarging every Stmt (including non-loop statements) by one pointer.
+#[derive(Debug, Clone)]
+pub struct LoopBody {
+    pub site: LoopSite,
+    pub statement: Stmt,
+}
+
+impl LoopBody {
+    pub fn new(statement: Stmt) -> Self {
+        Self {
+            site: LoopSite::default(),
+            statement,
+        }
+    }
+}
+
+impl std::ops::Deref for LoopBody {
+    type Target = Stmt;
+    fn deref(&self) -> &Stmt {
+        &self.statement
+    }
+}
+
+impl std::ops::DerefMut for LoopBody {
+    fn deref_mut(&mut self) -> &mut Stmt {
+        &mut self.statement
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Expr(Expr),
@@ -23,10 +82,10 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     While {
         test: Expr,
-        body: P<Stmt>,
+        body: P<LoopBody>,
     },
     DoWhile {
-        body: P<Stmt>,
+        body: P<LoopBody>,
         test: Expr,
     },
     /// C-style `for (init; test; update) body`.
@@ -34,7 +93,7 @@ pub enum Stmt {
         init: Option<P<ForInit>>,
         test: Option<Expr>,
         update: Option<Expr>,
-        body: P<Stmt>,
+        body: P<LoopBody>,
     },
     /// `for (left in right) body` / `for (left of right) body` (`is_await` for `for await … of`).
     ForInOf {
@@ -43,7 +102,7 @@ pub enum Stmt {
         right: Expr,
         of: bool,
         is_await: bool,
-        body: P<Stmt>,
+        body: P<LoopBody>,
     },
     Break(Option<String>),
     Continue(Option<String>),
@@ -85,6 +144,18 @@ pub enum Stmt {
         source: Rc<str>,
         exported: Option<String>,
     },
+}
+
+impl Stmt {
+    pub(crate) fn loop_body(&self) -> Option<&LoopBody> {
+        match self {
+            Self::While { body, .. }
+            | Self::DoWhile { body, .. }
+            | Self::For { body, .. }
+            | Self::ForInOf { body, .. } => Some(body),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +574,12 @@ impl RetainedAst<'_> {
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
+        if let Some(body) = stmt.loop_body() {
+            self.add(std::mem::size_of::<LoopBody>() - std::mem::size_of::<Stmt>());
+            if let Some(token) = body.site.retained_token() {
+                self.visitor.loop_site_token(token);
+            }
+        }
         match stmt {
             Stmt::Expr(expr) | Stmt::Throw(expr) => self.expr(expr),
             Stmt::VarDecl { kind: _, decls } => self.decls(decls),
@@ -520,11 +597,11 @@ impl RetainedAst<'_> {
                 }
             }
             Stmt::Block(body) => self.stmt_vec(body),
-            Stmt::While { test, body } => {
+            Stmt::While { test, body, .. } => {
                 self.expr(test);
                 self.boxed_stmt(body);
             }
-            Stmt::DoWhile { body, test } => {
+            Stmt::DoWhile { body, test, .. } => {
                 self.boxed_stmt(body);
                 self.expr(test);
             }
@@ -533,6 +610,7 @@ impl RetainedAst<'_> {
                 test,
                 update,
                 body,
+                ..
             } => {
                 if let Some(init) = init {
                     self.add(std::mem::size_of::<ForInit>());
@@ -553,6 +631,7 @@ impl RetainedAst<'_> {
                 of: _,
                 is_await: _,
                 body,
+                ..
             } => {
                 self.pattern(left);
                 self.expr(right);
@@ -951,6 +1030,74 @@ pub const SCAN_THIS: u8 = 8;
 /// the hottest code on the tree-walker.
 pub const SCAN_HAS_LOOP: u8 = 16;
 
+/// Does this statement list itself own a loop? Nested functions and class static
+/// blocks execute through separate entries and must not make a cold Script hot.
+/// Borrow existing nodes; flat bundles allocate nothing and nested controls use
+/// an explicit worklist rather than adding recursive native-stack consumption.
+#[cfg(test)]
+pub(crate) fn statement_list_has_own_loop(body: &[Stmt]) -> bool {
+    let mut current = body;
+    let mut pending: Vec<&[Stmt]> = Vec::new();
+    loop {
+        for statement in current {
+            match statement {
+                Stmt::While { .. }
+                | Stmt::DoWhile { .. }
+                | Stmt::For { .. }
+                | Stmt::ForInOf { .. } => return true,
+                Stmt::Block(body) => pending.push(body),
+                Stmt::If { cons, alt, .. } => {
+                    pending.push(std::slice::from_ref(cons.as_ref()));
+                    if let Some(alt) = alt {
+                        pending.push(std::slice::from_ref(alt.as_ref()));
+                    }
+                }
+                Stmt::Try {
+                    block,
+                    handler,
+                    finalizer,
+                } => {
+                    pending.push(block);
+                    if let Some((_, body)) = handler {
+                        pending.push(body);
+                    }
+                    if let Some(body) = finalizer {
+                        pending.push(body);
+                    }
+                }
+                Stmt::Switch { cases, .. } => {
+                    for case in cases {
+                        pending.push(&case.body);
+                    }
+                }
+                Stmt::Labeled { body, .. }
+                | Stmt::With { body, .. }
+                | Stmt::ExportDecl(body)
+                | Stmt::ExportDefault(body) => {
+                    pending.push(std::slice::from_ref(body.as_ref()));
+                }
+                Stmt::Expr(_)
+                | Stmt::VarDecl { .. }
+                | Stmt::FuncDecl(_)
+                | Stmt::Return(_)
+                | Stmt::Break(_)
+                | Stmt::Continue(_)
+                | Stmt::Throw(_)
+                | Stmt::ClassDecl(_)
+                | Stmt::Empty
+                | Stmt::Debugger
+                | Stmt::Import(_)
+                | Stmt::ExportNamed { .. }
+                | Stmt::ExportAll { .. } => {}
+            }
+        }
+        let Some(next) = pending.pop() else {
+            return false;
+        };
+        current = next;
+    }
+}
+
 impl Function {
     /// What this function's own activation must provide: whether the body (or a nested arrow, or a
     /// possible direct `eval`) can observe `arguments`, `new.target`, or `this`. Ordinary nested
@@ -1011,7 +1158,7 @@ fn scan_stmt(s: &Stmt, flags: &mut u8) {
             }
         }
         Stmt::Block(b) => scan_stmts(b, flags),
-        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+        Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
             *flags |= SCAN_HAS_LOOP;
             scan_expr(test, flags);
             scan_stmt(body, flags);
@@ -1021,6 +1168,7 @@ fn scan_stmt(s: &Stmt, flags: &mut u8) {
             test,
             update,
             body,
+            ..
         } => {
             *flags |= SCAN_HAS_LOOP;
             match init.as_deref() {
@@ -1050,6 +1198,7 @@ fn scan_stmt(s: &Stmt, flags: &mut u8) {
             of: _,
             is_await: _,
             body,
+            ..
         } => {
             *flags |= SCAN_HAS_LOOP;
             scan_pattern(left, flags);

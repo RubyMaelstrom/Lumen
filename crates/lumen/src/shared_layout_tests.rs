@@ -38,6 +38,31 @@ fn check(source: &str, expected: &str) {
     }
 }
 
+/// Creation ICs intentionally share a process-global prototype epoch. Other Rust tests may
+/// invalidate it between warming and the measured store, which correctly takes a helper and
+/// says nothing about this test's native path. Accept only a stable-epoch trial; retain the
+/// exact helper-count assertion and fail explicitly if contention never permits one.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn measured_creation_write(engine: &mut Engine, target: &Gc, fresh: impl Fn() -> Props) -> usize {
+    for _ in 0..256 {
+        let epoch = crate::value::proto_epoch();
+        target.borrow_mut().props = fresh();
+        eval(engine, "write()");
+        target.borrow_mut().props = fresh();
+        crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|count| count.set(0));
+        eval(engine, "write()");
+        let helpers = crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|count| count.get());
+        if crate::value::proto_epoch() == epoch {
+            return helpers;
+        }
+        std::thread::yield_now();
+    }
+    panic!("prototype epoch changed during all 256 native creation trials");
+}
+
 #[test]
 fn templates_share_keys_but_not_values_or_descriptors() {
     let mut template = Props::new();
@@ -180,7 +205,7 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
                 .unwrap()
                 .jit
                 .get()
-                .is_some_and(Option::is_some));
+                .is_some_and(|code| code.is_some()));
         }
         assert_eq!(eval(&mut engine, "Object.defineProperty(a,'x',{writable:false}); b.x=9; delete a.y; a.z=7; [a.x,b.x,b.y,Object.keys(a)].join('|')"), "1|9|3|x,z");
     }
@@ -268,11 +293,10 @@ fn native_creation_accepts_equal_keys_from_distinct_allocations() {
         target.borrow_mut().props = Props::with_layout(2, Some(layout.clone()));
         eval(&mut engine, "write()");
     }
-    target.borrow_mut().props = Props::with_layout(2, Some(layout.clone()));
-    crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|count| count.set(0));
-    eval(&mut engine, "write()");
     assert_eq!(
-        crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|count| count.get()),
+        measured_creation_write(&mut engine, &target, || {
+            Props::with_layout(2, Some(layout.clone()))
+        }),
         0,
         "warmed stores must create fields in native code, not just produce correct fallback values"
     );
@@ -346,15 +370,14 @@ fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
     }
     for shared in [false, true] {
         let previous = Rc::new(vec![Rc::from("wrong"), Rc::from("unused")]);
-        target.borrow_mut().props = if shared {
-            Props::with_layout(3, Some(previous.clone()))
-        } else {
-            Props::with_capacity(3)
-        };
-        crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|n| n.set(0));
-        eval(&mut engine, "write()");
         assert_eq!(
-            crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|n| n.get()),
+            measured_creation_write(&mut engine, &target, || {
+                if shared {
+                    Props::with_layout(3, Some(previous.clone()))
+                } else {
+                    Props::with_capacity(3)
+                }
+            }),
             0
         );
         assert_eq!(
@@ -370,11 +393,10 @@ fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
             "7|8|alpha,beta"
         );
     }
-    target.borrow_mut().props = Props::with_layout(3, Some(Rc::new(vec![Rc::from("private")])));
-    crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|n| n.set(0));
-    eval(&mut engine, "write()");
     assert!(
-        crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(|n| n.get()) > 0,
+        measured_creation_write(&mut engine, &target, || {
+            Props::with_layout(3, Some(Rc::new(vec![Rc::from("private")])))
+        }) > 0,
         "Rust must release a last-owned old layout"
     );
     assert_eq!(

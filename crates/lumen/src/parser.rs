@@ -1255,11 +1255,11 @@ impl Parser {
     }
 
     /// Parse a loop body inside an iteration context (so `break`/`continue` are legal).
-    fn parse_loop_body(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_loop_body(&mut self) -> Result<LoopBody, ParseError> {
         self.iter_depth += 1;
         let r = self.parse_substatement(false);
         self.iter_depth -= 1;
-        r
+        r.map(LoopBody::new)
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
@@ -4436,7 +4436,7 @@ fn pn_stmt(stmt: &Stmt, st: &mut Vec<Vec<String>>) -> Result<(), String> {
             }
         }
         Stmt::Block(b) => pn_stmts(b, st)?,
-        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+        Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
             pn_expr(test, st)?;
             pn_stmt(body, st)?;
         }
@@ -4445,6 +4445,7 @@ fn pn_stmt(stmt: &Stmt, st: &mut Vec<Vec<String>>) -> Result<(), String> {
             test,
             update,
             body,
+            ..
         } => {
             if let Some(fi) = init {
                 match &**fi {

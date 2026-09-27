@@ -214,7 +214,7 @@ mod tests {
             let mut scope = middle.borrow_mut();
             let binding = scope.vars.get_mut("value").unwrap();
             binding.initialized = true;
-            binding.import_ref = Some((outer, "value".into()));
+            binding.set_import_reference(Some((outer, "value".into())));
         }
         assert_eq!(classify_name(&inner, "value"), (NamePath::Import, 1));
         inner

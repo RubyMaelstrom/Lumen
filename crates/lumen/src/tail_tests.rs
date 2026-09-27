@@ -34,7 +34,7 @@ fn assert_compiled(engine: &mut Engine, name: &str, native: bool) {
     assert!(chunk.has_tail_calls(), "{name} did not lower its tail call");
     if native && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
         assert!(
-            chunk.jit.get().is_some_and(Option::is_some),
+            chunk.jit.get().is_some_and(|code| code.is_some()),
             "{name} stayed in bytecode"
         );
     }
