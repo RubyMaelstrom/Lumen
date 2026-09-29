@@ -1,0 +1,231 @@
+Fresh-session handoff — 2026-09-28, 06:29 UTC
+===========================================
+
+Read this as evidence and unfinished work, NOT as an instruction to continue the
+same implementation strategy. The user is considering a fresh session explicitly
+to obtain new architectural insights. An independent review should challenge the
+current approach before adding more optimizer mechanisms.
+
+User objective and constraints
+------------------------------
+The objective is a major, standards-preserving improvement in real browser
+workloads, toward the user's roughly 60x target. Use full Speedometer 3.1 and
+broad applications, not a favorable numerical kernel. Retain visuals and
+functionality. No claim of reaching that target is justified by the evidence.
+
+Read the current AGENTS.md in both repositories. README.md is user-owned.
+Use the web-standards-skill and read relevant local normative clauses before
+implementation. Do not spawn subagents without explicit authorization. Use
+apply_patch for source edits; use Bash's time, never /usr/bin/time. Preserve
+unrelated changes and the user's desktop sessions. Do not install or push.
+
+The previous permission interruption is RESOLVED: /big/Code/Lumen was verified
+writable at 06:25 UTC. No run0 or escalation is needed. Do not repeat the old
+request to add a writable workspace.
+
+Repository/artifact identity
+----------------------------
+TRust HEAD: 5fa5a3031df744b108d0c9b6efd726f410ab4f3a
+Lumen HEAD: 91da1ade662d5a3e8dcdb2a2def189529575d945
+Both trees are dirty. No commit, install or push was done in this last segment.
+TRust changes remain src/dom.rs and src/dom/invalidation.rs; this segment did
+not edit them. Lumen has extensive opt-in optimizer work, including untracked
+source files. Do not discard it blindly; exact snapshots preserve comparisons.
+
+Use these aliases when reading paths below:
+N = /big/Code/TRust/target/architecture-next-20260927-IddksuBs
+P = /big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk
+
+N/source-values15, N/source-heap16, N/source-creation17 contain immutable source
+snapshots, changed files, HEADs and hashes. The scripts freeze-creation17.mjs,
+run-creation17-x64.mjs, run-creation17-conformance.mjs and logs live under N.
+Do not overwrite frozen artifacts or failed-run evidence.
+
+Current experimental tier
+-------------------------
+Cranelift 0.135.2 is optional; BOTH the optimizing-jit feature and the runtime
+switch remain OFF by default. LUMEN_OPT_JIT=1 forces eligible compilation;
+LUMEN_OPT_JIT=hot uses size-weighted entry counts (base 512 by default).
+No optimizing OSR. Canonical frames and Rc ownership remain authoritative.
+Default Lumen still uses the established template JIT. The experimental backend
+is not a production-ready optimizing JavaScript compiler or an accepted speedup.
+
+Read docs/optimizing-tier.txt and the actual source. In particular:
+- jit_optimizing.rs: admission, lowering, effects/publication boundaries.
+- jit_optimizing_values.rs: category analysis, not speculative runtime types.
+- jit_optimizing_{frame,stack,stack_lowering,effects}.rs: canonical owners/SSA.
+- jit_optimizing_{property,elements,stores,creation,ownership}.rs: native heap
+  operations with live guards and checked fallback.
+- bytecode_native_deopt.rs and corresponding tests: VM continuation contracts.
+- jit_call_stub.rs: guarded shared-context call integration.
+
+Strongest controlled result — still REJECTED
+-------------------------------------------
+N/values15-fourway/{manifest,complete,analysis}.json: 16 fresh processes, four
+balanced cycles, full official 20-suite/58-step Speedometer 3.1, one iteration
+per process, CPU 5, private caches. No owned build/test/profile overlapped.
+Unrelated user background applications remained; not an exclusive-machine claim.
+
+Compared with the SAME binary with optimizing tier OFF, hot optimizing mode with
+local effects and value facts ON had a score ratio of 0.673473435: approximately
+32.65% LOWER score, and a paired wall-time ratio of 1.327144252. Every one of the
+20 suite-median durations regressed. Median scores: baseline 0.335995641 versus
+candidate 0.226284171. This is not a V8 comparison and does not establish a 60x
+gap for the current tree.
+
+Value facts recovered about 3.84% relative to the preceding experimental mode;
+that did NOT turn the candidate into an improvement over the production tier.
+An earlier baseline-inlining-disabled ablation was near wall-time parity and
+does not explain the large optimizing-tier regression. Do not rerun that as a
+new discovery or promote the small recovery as a win.
+
+A sampled VALUES15 full-workload profile heuristically attributed 24.78% to
+runtime, 21.42% to DOM, 18.20% to compiler/register allocation, 7.78% to allocator,
+4.99% to generated JS, 3.32% to layout, and 2.53% to text/rendering. Attribution
+and unwinding have limits; it overlapped validation work and is NOT a timing
+comparison, a precise exclusive breakdown, or an Amdahl bound.
+See N/values15-sampling-profile* for raw evidence.
+
+What changed after that measurement
+----------------------------------
+HEAP16 added native existing own-element reads/overwrites and own-data writes,
+with descriptor/exotic guards, packed/dense representations, alias-aware owner
+transactions and numeric-mirror maintenance. LUMEN_OPT_JIT_HEAP_OPS=0 disables it.
+
+CREATION17 adds native cached named-field creation in already reserved small
+ordinary-object storage. It validates prototype identity/epoch, extensibility,
+shape/key-layout ownership and capacity before the ownership/field transaction.
+Allocation, computed non-index creation, storage growth, prototype invalidation
+and last-owner layout destruction remain checked. LUMEN_OPT_JIT_CREATION=0
+separately disables this path; HEAP_OPS=0 disables it too.
+
+Neither change has a controlled whole-application timing result yet. Do not
+assume it fixes the 32.65% regression or closes the user target.
+
+Important architectural observations to re-examine
+-------------------------------------------------
+Root category-analysis inputs are ANY; property reads generally produce unknown
+categories. Hot admission does not feed argument-type feedback into compilation.
+compile_for_optimizer currently uses an empty inliner plan; the optimizer's
+InlineGuard executes the original fallback call. True speculative inlining needs
+logical-frame reconstruction, arguments/caller/completion and GC contracts.
+
+MakeObject and MakeArray ALREADY use dedicated helpers with direct moves from
+canonical slots; they do not generally round-trip via the generic opcode helper
+or temporary Vecs. Do not propose merely adding the helpers that already exist.
+Investigate actual allocation/representation and specialization costs.
+
+Cranelift memory alias-region changes require consistent tagging of ALL matching
+loads/stores; an unregioned load is not safely invalidated by a differently
+classified store. trusted is not equivalent to freely movable. No alias-region
+change has been implemented here.
+
+The user linked https://perryts.com/en/blog/cranelift-to-llvm/ as inspiration,
+NOT a request to adopt LLVM. It was already read. The useful lesson is the
+front-end/IR and opaque-helper work needed to benefit from a code generator.
+Its corrected September numbers retract the older 24.6x Node claim (93/95 ms
+tie). It concerns AOT TypeScript, not full dynamic JavaScript.
+
+Current correctness evidence
+----------------------------
+HEAP16: debug and release full engine suites 1671/1671 passed. 96 optimizer
+tests, numeric-mirror/ownership cases, bailout sweeps, x64 QEMU optimizer bodies,
+and full forced+bailout functional Speedometer runs completed. Those browser
+runs overlapped tests and are NOT timing evidence.
+
+HEAP16 forced Test262 finished at 06:18:53 UTC: 53572 pass, 2 fail, 4 skip,
+53578 total. all_executed_passed=false. Its complete report is byte-identical
+to VALUES15. SHA256 ed3407449599727ca94b0a1ec7fe98f77180da9c7304092272f7e75a0325dbcf.
+The two failures are staging/sm/extensions/arguments-property-access-in-function.js
+and staging/sm/extensions/function-properties.js. The four skip paths/reasons are
+in the uncapped report; these are NOT zero-failure conformance results.
+The HEAP16 bailout full Test262 run is still active as of 06:28 UTC.
+
+CREATION17: full DEBUG 1682 passed, zero failed/ignored (465.75 s, uncontrolled).
+Ten new focused creation tests passed; creation-disabled ablation also passed.
+Forced native helper-coverage assertions pass. A new bailout sweep passed with
+60 compiled boundaries, 56 reached. x64 QEMU creation 10 and heap 17 passed;
+the rest of x64 validation is still running. Release full suite/ablations,
+Clippy, full Test262 and browser functional validation are NOT yet complete.
+
+The HEAP16 HEAP_OPS=0 numeric-mirror test initially failed because the checked
+string SetElem path legitimately invalidates the optional mirror. CREATION17
+corrected that test while retaining canonical-value and native mirror assertions.
+Another early creation test compiled bracket names to SetElem; a static Member
+AST fixture now explicitly tests SetProp lowering, NOT general frontend key
+folding. The failed attempts and logs remain. Do not claim those gaps vanished.
+
+Frozen CREATION17 release artifacts (06:27 UTC)
+----------------------------------------------
+N/trust-headless-opt-creation17
+  df2d51a67d13dbd8a8acd00fad4ae7e0aa0f70ad1911ef6afb6b3a9dc341b2c2
+N/lumen-opt-creation17
+  ecf827bc7796181fa0635e9be6d672b234611b55abfe58b20f8bb96fcc35256e
+N/test262-opt-creation17
+  3616a763033442e53ccd8c8cee9e3c273c42b7ff93af2cd1f73dd411d2ac110f
+N/lumen-creation17-x64-tests
+  eb5be364de4735f3af3be57a4cd08ccc179fb4a54f1f7f258a25fed995795ec9
+
+Running jobs and immediate resumption precautions
+-------------------------------------------------
+PIDs/session IDs below are observations, not authority to signal a reused PID.
+Recheck command lines and ownership before doing anything to a process.
+
+1. HEAP16 Test262 controller PID 1884421; runner PID 1910412; bailout run.
+   N/heap16-conformance-controller.log and
+   N/test262-heap16-bailout-results/test262-report/summary.json (when complete).
+   Inspect full counts/failure/skip metadata, NOT just process exit 0.
+2. CREATION17 x64 controller PID 1922923; tool session 3467.
+   N/creation17-x64-results/report.json, N/creation17-x64-controller.log.
+   Expected optimizer coverage: 103 non-wrapper tests plus 4 explicit child
+   bodies; 107 total. Emulation establishes correctness, never native timing.
+3. CREATION17 release unit-test build is running, tool session 43027.
+   N/creation17-release-unit-build.log. On success, identify the NEW test binary
+   before running it. Expected full count 1682; optimizer count 107.
+4. Fixture server was absent after the environment transition. It was restarted
+   as PID 1924950, tool session 26513, serving P/speedometer-official on
+   127.0.0.1:8931. The old verification helper hardcodes DEAD PID 2541530;
+   update/copy that diagnostic with actual verified server identity before use.
+
+No timed benchmark is currently running. Do not time while these validation
+jobs are active, and do not touch the user's browser sessions.
+
+Two attempted validations at 06:27 did NOT test the candidate:
+- N/creation17-forced-functional exited immediately: fixture connection refused.
+  P/measure-browser-creation.mjs is ready, but use a NEW output directory on retry.
+- run-creation17-conformance.mjs was refused by the runner's singleton guard
+  because HEAP16 Test262 is active. Do NOT bypass that guard. Wait for completion;
+  preserve the failed creation17 manifest/directory and use distinct retry names.
+  The script currently uses exclusive-create paths, so blindly rerunning fails.
+
+Use a new uncontrolled functional Speedometer run with all 20 suites/58 steps,
+forced tier and then bailout-at-7, before controlled acceptance timing. The
+creation harness supports explicit --heap-ops and --creation ablations and
+clears inherited LUMEN/TRUST flags. Do not modify the pinned official fixture.
+
+Standards/suite provenance
+-------------------------
+ECMA-262 local editor's draft: /big/web-standards/repositories/tc39/ecma262/spec.html,
+revision e28783d5fc9dc12b3de905961e2c71410b38a202, fetched 2026-09-06; NOT freshly
+verified upstream. Read OrdinarySet/SetWithOwnDescriptor, ValidateAndApplyProperty-
+Descriptor, OwnPropertyKeys, Proxy [[Set]], property-key evaluation/PutValue,
+execution contexts, numeric semantics, and WeakRef liveness as applicable.
+Test262: d86b2294eb0a17eaa281ff12c73c473ec864c72f.
+Official Speedometer fixture: 1386415be8fef2f6b6bbdbe1828872471c5d802a.
+
+Other open gates (do not silently lose them)
+--------------------------------------------
+Prior CSS WPT: 170 pass, 38 fail, zero incomplete. Steam menu actor checks improved
+but complete visual/scroll acceptance remains unfinished. Map/set string kernels
+had roughly 3.15–3.64% regressions needing resolution. Earlier shared-browser
+release tests had one idle-callback failure, followed by a quiet full pass; its
+root cause was not proven. See the larger optimizing-tier document and raw logs.
+
+Recommended fresh-session posture
+----------------------------------
+Retain the measurements and correctness contracts, but independently reassess
+where time and allocation go, why hot Cranelift loses to the template JIT, and
+what a mature optimizing front-end/heap architecture would need. Do not equate
+finishing another native opcode with making architectural progress. A plan
+should predict a material broad-workload gain, then be tested against that
+prediction. Neither perfection nor a 60x speedup has been established.

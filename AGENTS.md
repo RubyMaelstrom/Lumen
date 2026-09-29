@@ -65,6 +65,92 @@ The default tier is JIT. Useful diagnostic controls:
   optional compile/drop metadata; it neither instruments native instructions nor
   loads a profiler library. Keep it disabled for uninstrumented timing comparisons.
 
+The optional `optimizing-jit` feature adds an in-development whole-function Cranelift backend
+on native ARM64/x86-64. It uses Cranelift 0.135.2, matching TRust's owned Wasmi integration,
+and requires Rust 1.95 or newer when enabled. `LUMEN_OPT_JIT=1` explicitly selects this
+development backend for eligible ordinary functions; unsupported entries retain the template
+JIT/VM. `LUMEN_OPT_JIT=hot` instead starts with template code and admits frequently called
+ordinary functions using four bounded entry samples, guarded Number/Boolean input facts,
+numeric own-data field results, and an estimated compilation/removed-check work budget.
+Field sampling only inspects an already warmed ordinary descriptor; it invokes no getter,
+proxy or conversion. Native reads guard live receiver/descriptor/value state on each access
+and resume before that access on a miss. Generic bodies, environment-homed inputs and
+bodies above 256 bytecodes remain on the established tier. `LUMEN_OPT_JIT_HOT_AT`
+overrides the admission distance for diagnostics; it does not waive positive semantic benefit
+or the IR budget. A candidate must compile successfully before second-stage publication and
+call-cache invalidation. Hot mode preserves the established bytecode inliner for unadmitted
+functions. Both transformations check the same second-stage slot; a published inlined body
+is outside the optimizer's single-frame recovery contract and stays on the template tier.
+This whole-function policy does not migrate active frames. The separate opt-in
+loop-continuation experiment below handles a restricted active-frame case.
+Eight specialization misses retire that version: future dispatch stops publishing its address,
+active native frames and Rust leases finish before reclamation, and later calls use the template
+tier. Successful native entries gain no retirement counter. This is a bounded one-version
+policy, not adaptive reoptimization.
+Its cost estimate and real application repayment still require validation. The feature and runtime switch
+are both off by default. `LUMEN_OPT_JIT_LOG=1` reports
+declines, and `LUMEN_OPT_JIT_DUMP=1` prints bytecode/CLIF for diagnosis. Do not equate this
+backend integration with a completed JavaScript optimizing tier or a performance acceptance.
+See `docs/optimizing-tier.txt` for its contracts, remaining work and real-application gates.
+With the optional feature compiled, `LUMEN_OPT_JIT_OSR=1` separately enables
+guarded continuations at hot loop headers. It continues the existing invocation,
+without repeating parameter binding or prefix effects. `LUMEN_OPT_JIT_OSR_AT=N`
+sets the header-visit threshold (default 65,536, minimum 2). Eligible bodies have
+at most 512 operations and at most eight tracked headers; unsupported frames,
+detailed-feedback bodies and whole-function optimized bodies keep their existing
+execution. Canonical owners remain live across entry, callbacks and recovery.
+Effect-scoped Number fields can remain in registers between observers; changed
+proofs recover at the correct before- or after-effect bytecode boundary. Eight
+entry misses retire that continuation without replacing the primary body.
+This experiment is off by default and has not improved measured application
+performance. Its isolated numeric-loop gain does not justify enabling it.
+`LUMEN_OPT_JIT_DIAGNOSTICS=1` adds bounded per-native-body compilation, entry,
+helper, heap-guard, owner-transfer, frame-publication and specialization-bailout observations. It emits
+compiler/drop records and includes live records in performance metrics. Disabled
+emission adds no native instructions. `LUMEN_OPT_JIT_DIAGNOSTICS=compile` records
+compilation/static counts and emits the ordinary uninstrumented body. Instrumented
+IR is larger and still subject
+to the same compiler limits; diagnostic runs cannot be acceptance timings.
+The separate `architecture-diagnostics` feature records allocation sites/lifetimes
+in the live Rc heap and call-cache epoch/refill traffic. It adds no object owners;
+site and registry-slot limits report untracked allocations. Initial exotic family
+is recorded at allocation, before later function/exotic initialization. Lifetimes
+use heap allocation ordinals and completed collections, not elapsed time. Live
+families at collection are a separate population sample. These probes compile out
+of ordinary builds; use them only for diagnostics, never performance acceptance.
+`LUMEN_OPT_JIT_DEOPT_AT=N` is a development stress hook: an eligible optimized function
+exits to its ordinary VM continuation when it reaches bytecode boundary N, before that operation.
+It is unset by default, is not a type-specialization policy, and must be absent during
+performance measurements. Suspended or baseline-inlined frames are not admitted by this hook.
+The experimental ARM64 call-stub integration reuses the template tier's guarded shared-frame
+calls. `LUMEN_OPT_JIT_CALL_STUBS=0` is its diagnostic ablation switch; it retains checked calls,
+not a different JavaScript behavior. Stubs are weak-directory cached and pinned by referring
+native bodies; all platforms retain the checked path when no supported stub can be emitted.
+`LUMEN_OPT_JIT_SPARSE_RELOADS=0` is a compiler-emission diagnostic ablation: reload all
+tracked local register copies after observers instead of the bounded liveness plan. It does
+not remove canonical frame owners, change GC roots, or disable state publication. Keep the
+setting explicit in measurement manifests; the optimizing tier itself remains opt-in.
+`LUMEN_OPT_JIT_LOCAL_EFFECTS=0` retains the all-clobber helper analysis for a diagnostic
+comparison. The development default separates canonical publication from private-slot
+write effects: preserved register words do not imply immutable objects or environments.
+Full-reload mode (`LUMEN_OPT_JIT_SPARSE_RELOADS=0`) still forces all tracked reloads.
+`LUMEN_OPT_JIT_VALUE_FACTS=0` disables the experimental whole-function value-category
+analysis and its guard/owner-check elisions. The analysis proves normal-result categories,
+not immutable heap contents or numeric ranges; unknown effects and completion landings
+retain dynamic checks. Budget exhaustion also retains those checks. This switch skips
+analysis itself, unlike the reload-emission-only ablation above.
+`LUMEN_OPT_JIT_HEAP_OPS=0` disables the experimental native own-element reads/overwrites
+and ordinary own-data property writes, retaining their checked helpers. The native path
+keeps live descriptor/exotic guards, canonical numeric mirrors and alias-aware owner
+transfers; exotic/observable slow paths still execute the full runtime algorithm.
+This is an emission diagnostic within the opt-in tier, not a production default change.
+`LUMEN_OPT_JIT_CREATION=0` separately disables the native named-field creation path while
+retaining the other heap operations. With creation enabled, a live creation-cache proof can
+append into a small ordinary receiver's reserved field storage, retaining its shared key
+layout. Extensibility/prototype changes, exotics, storage growth, sidecar maintenance and
+last-owned layout destruction stay checked. Computed non-index creation and object allocation
+are not covered by this path. `LUMEN_OPT_JIT_HEAP_OPS=0` also disables creation.
+
 The standalone engine shell accepts `--tier=interp|bytecode|jit`. The runtime CLI's
 current argument parser only accepts `--tier=interp|bytecode`; use `LUMEN_TIER=jit`
 or the default for runtime JIT execution.
@@ -158,8 +244,11 @@ LUMEN_TIER=jit scripts/run-test262.sh .
 
 Without arguments the runner covers only language expressions and statements;
 `.` selects the full test directory. Paths are relative to `test262/test`.
-The runner writes `test262-report/summary.json`. Check its source for current
-worker controls and limits before a broad run.
+The runner writes `test262-report/summary.json`, including uncapped failure and
+skip paths/reasons independently of optional console samples. Preserve the full
+report. The process can exit successfully despite test failures; inspect the
+totals and `all_executed_passed`, not just its exit status. Check its source for
+current worker controls and limits before a broad run.
 
 The old README recorded 53,574 passes, zero failures, and four skips on the default
 JIT tier on 2026-08-26, against Test262 revision
