@@ -663,7 +663,7 @@ fn report_results(results: &[(String, Outcome)], targets: &[String]) {
         }
     }
 
-    if let Err(e) = report::write(&by_cat, total, targets) {
+    if let Err(e) = report::write(&by_cat, total, targets, results) {
         eprintln!("warning: could not write report: {e}");
     }
 }
