@@ -3543,6 +3543,65 @@ impl Props {
         self.entries.layout.as_ref()
     }
 
+    /// No indexed/Symbol/private storage or filtered/accessor descriptors: insertion order is
+    /// [[OwnPropertyKeys]] order and every Get observes an own data value without author code.
+    pub(crate) fn named_data_keys(&self) -> Option<&[Rc<str>]> {
+        if self.elems.len() != 0
+            || self.elems.packed_is_some()
+            || self.elem_mode.get()
+            || self.has_far.get()
+            || self.entries.iter().any(|(key, property)| {
+                !property.enumerable()
+                    || property.accessor()
+                    || crate::interpreter::Interp::is_private_key(key)
+                    || crate::interpreter::Interp::is_sym_key(key)
+            })
+        {
+            return None;
+        }
+        Some(self.entries.keys())
+    }
+
+    /// CopyDataProperties for an ordinary named data record. Validate every descriptor before
+    /// writing: an enumerable getter would make later descriptor reads observable. The caller
+    /// proves ordinary internal methods and distinct source/target Objects.
+    pub(crate) fn try_copy_named_data_from(&mut self, source: &Props) -> bool {
+        if source.named_data_keys().is_none() {
+            return false;
+        }
+        if source.entries.is_empty() {
+            return true;
+        }
+        if self.entries.is_empty() && self.elems.0.is_none() && !self.elem_mode.get() {
+            // Shapes encode keys, not attributes. Share the complete live key prefix and shape,
+            // but create independently owned values with CreateDataProperty's default flags.
+            // In particular a frozen source must not produce frozen copied properties.
+            self.note_structural();
+            self.entries.layout = source.entries.layout.clone();
+            self.entries.fields.extend(
+                source
+                    .entries
+                    .fields
+                    .iter()
+                    .map(|property| Property::plain_packed(property.clone_value_packed())),
+            );
+            self.shape = source.shape;
+            self.len_slot.set(source.len_slot.get());
+            self.proto_slot.set(source.proto_slot.get());
+            if self.entries.len() > INDEX_THRESHOLD {
+                self.build_index();
+            }
+        } else {
+            for (key, property) in source.entries.iter() {
+                self.insert(
+                    key.clone(),
+                    Property::plain_packed(property.clone_value_packed()),
+                );
+            }
+        }
+        true
+    }
+
     /// Supply keys to a fresh, still-empty receiver after its initializer plan is validated.
     /// The existing field capacity remains usable; no predicted property becomes observable.
     pub(crate) fn predict_empty_layout(&mut self, layout: &PropertyLayout) {

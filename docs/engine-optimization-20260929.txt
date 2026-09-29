@@ -1,0 +1,121 @@
+Engine optimization audit — 29 September 2026
+============================================
+
+The request was to find substantial engine improvements on application code,
+with implementation taking priority over an extended benchmark campaign.
+Starting revision: c8af769dd19b2abc8bbec540e6cdc7c544899080.
+The measured candidate is that revision plus the source inventory retained in
+benchmark-results/engine-optimization-20260929/source-inventory.json.
+
+Selected changes
+----------------
+
+1. Cache immutable bytecode properties at compiler finalization.
+
+   jit_needs_activation_state previously scanned the entire operation stream
+   whenever queried. ARM64 template/region and x64 emission query it at captured
+   accesses, so emitting a body with many captures could perform quadratic work.
+   Shared-call eligibility queried it too. has_tail_calls also scanned the body
+   during invocation/constructor eligibility. The compiler now records both
+   answers after all transformations, and consumers read the stored booleans.
+   This caches no environment, feedback, object or descriptor state.
+
+   In a baseline gprofng run of the actual yt-dlp/ejs YouTube solver,
+   jit_bridge_op accounted for 1.438 of 10.383 sampled CPU seconds, the largest
+   individual named Rust function. That run overlapped compilation and is
+   diagnostic evidence only. Inclusive times are not summed as exclusive work.
+
+2. Copy ordinary named data records using packed owners and shared key layouts.
+
+   Spread and rest with no exclusions can copy a closed ordinary record without
+   allocating a key snapshot, repeating property lookup or rebuilding each shape
+   transition. A fresh receiver shares the immutable layout, owns separate
+   descriptors/values, normalizes attributes to CreateDataProperty defaults and
+   builds a wide lookup index once. Other receivers use existing insertion.
+   Indexed, private, Symbol, non-enumerable, accessor and exotic cases fall back.
+   Descriptor proofs use the live source on every copy, not shape alone.
+
+   Object.assign reuses the path only for an empty ordinary extensible target
+   whose ordinary prototype chain contains none of the copied keys. Its Set
+   semantics therefore preserve inherited setters, read-only properties and
+   __proto__; observable source/target algorithms keep their ordered paths.
+
+3. Preserve numeric indices through Array result construction.
+
+   map/filter/slice/concat/splice/flat/flatMap/from/fromAsync no longer format and
+   parse a decimal key for an absent dense result element. The helper uses the
+   existing owning packed/dense insertion machinery. It checks the live result's
+   internal-method eligibility, extensibility and writable own Array length after
+   callbacks and awaits. Existing descriptors, large/sparse keys, species proxies
+   and exotic results execute the full CreateDataPropertyOrThrow algorithm.
+
+Audit context and larger remaining targets
+-----------------------------------------
+
+Prior work already shares immutable activation plans, optimizes append strings,
+uses dense packed arrays, consumes closed native iterators without result objects,
+and caches calls. Adding duplicates of those mechanisms is not a new target.
+The optional whole-function compiler has a documented negative full-application
+screen; changing its default is unsupported by that evidence.
+
+The solver profile also exposes packed value ownership, object creation and GC,
+alongside generated parser code. These remain candidates for connected changes
+to invocation/ownership and native operation coverage. A compiler replacement
+alone does not remove helper work or produce the live proofs needed for dynamic
+JavaScript. This patch removes concrete repeated work in the established tiers;
+it does not establish a general 8–10x gain or parity with Node.
+
+Standards and validation
+------------------------
+
+ECMA-262 local snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:
+CopyDataProperties, Object.assign, CreateDataPropertyOrThrow, ArraySpeciesCreate,
+Array [[DefineOwnProperty]] and the relevant Array algorithms. The local snapshot
+was consulted; current upstream revision was not verified.
+
+Eight new regressions cover independent copy owners/layouts, frozen attributes,
+wide records, live getter/descriptor mutation, key snapshots, Symbol/indexed
+fallbacks, inherited setters, read-only prototypes, __proto__, proxy effect order,
+species mutation and Array length failures. JS cases run in interpreter, bytecode
+and JIT modes with collection afterwards. Default engine tests pass 1,557/1,557;
+strict Clippy and workspace/all-target checks pass. Two optimizer OSR fixture
+tests pass with the optional feature compiled. An initial test filter selected
+zero tests; the corrected module filter is retained separately in the evidence.
+This is native ARM64 validation, not fresh x64/wasm or full Test262 evidence.
+
+Application comparisons and exact artifacts are recorded in
+../benchmarks/engine-optimization-2026-09-29.json. Local complete stdout/stderr,
+source copies, scripts, profiles and resource observations are retained under
+benchmark-results/engine-optimization-20260929. Measurement preceded the cycle's
+commit. No installed executable was replaced and no artifact was promoted.
+
+Results
+-------
+
+Four balanced fresh-process pairs on crystal, native ARM64, CPU 5, ordinary
+release/JIT, identical build options and exact output checks:
+
+  Workload                         Baseline median   Candidate median
+  React reducer measured workflow        143 ms             115 ms
+  Complete yt-dlp/ejs solver           10.560 s            8.777 s
+  Djot document conversion                808 ms           814.5 ms
+  Vue reactivity control                 779.5 ms            779 ms
+
+The reducer takes 19.58% less measured time; its paired candidate/baseline
+duration ratio is 0.80594, 95% log-t interval 0.80041–0.81151. Complete solver
+process time falls 16.88%; paired ratio 0.83150, interval 0.82780–0.83522.
+Reducer process time separately falls 17.33%. Djot and Vue control timing
+intervals include parity; no speedup claim for those components.
+
+Separate four-pair Linux wait4 process peaks replace incomplete sampled lower
+bounds. React, Djot and solver peak-memory intervals include parity. Vue's
+paired peak ratio is 1.0187, interval 1.0007–1.0370: about 2% higher observed
+peak, below the repository's provisional 3% median-loss gate. No timing or
+memory component crosses that gate. Post-GC retained memory was not measured.
+The candidate binary is 1,232 bytes larger. No owned build, test or profiler
+overlapped the application timings; user desktop applications remained active.
+
+These are narrower component/application results, not full Speedometer or a
+general engine speedup. The single Node observation per workload is a reference,
+not a distribution. The reported 8–10x gap has not been closed by this patch.

@@ -6076,6 +6076,26 @@ impl Interp {
         excluded: &[String],
     ) -> Result<(), Abrupt> {
         let is_excluded = |k: &str| excluded.iter().any(|x| x == k);
+        // ECMA-262 CopyDataProperties: a closed ordinary data record has no observable
+        // OwnPropertyKeys/GetOwnProperty/Get work. Keep its shared layout and copy the owning
+        // packed values directly instead of rebuilding keys, lookups and shape transitions.
+        if excluded.is_empty() {
+            if let Value::Obj(source) = value {
+                if !Rc::ptr_eq(source, rest) {
+                    let source = source.borrow();
+                    if source.ic_plain.get() && matches!(source.exotic, Exotic::None) {
+                        let mut target = rest.borrow_mut();
+                        if target.ic_plain.get()
+                            && matches!(target.exotic, Exotic::None)
+                            && target.extensible
+                            && target.props.try_copy_named_data_from(&source.props)
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
         if let Some((t, h)) = crate::builtins::proxy_pair(self, value) {
             let keys = crate::builtins::proxy_own_keys(self, &t, &h).map_err(Abrupt::Throw)?;
             for k in keys {

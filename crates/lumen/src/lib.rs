@@ -32,6 +32,8 @@ mod callback;
 mod computed_reference_tests;
 mod coroutine;
 #[cfg(test)]
+mod data_copy_tests;
+#[cfg(test)]
 mod dense_slot_tests;
 mod eval;
 mod execution_storage;

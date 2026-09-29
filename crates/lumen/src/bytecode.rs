@@ -1828,6 +1828,11 @@ pub struct Chunk {
     pub(crate) prepared_entry: bool,
     // (fields below; Debug is manual — `consts` holds engine Values)
     ops: Vec<Op>,
+    /// Derived after all bytecode transformations. Emission queries this for each captured
+    /// access; rescanning the body at every query makes compilation quadratic in body size.
+    jit_needs_activation_state: bool,
+    /// Shared call/constructor eligibility also depends on this immutable body property.
+    has_tail_calls: bool,
     consts: Vec<Value>,
     names: Vec<Rc<str>>,
     n_slots: usize,
@@ -2009,9 +2014,7 @@ pub(crate) const SPECIALIZATION_MISS_LIMIT: u8 = 8;
 
 impl Chunk {
     pub(crate) fn has_tail_calls(&self) -> bool {
-        self.ops
-            .iter()
-            .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray))
+        self.has_tail_calls
     }
     /// Scan the directly-owned bytecode/feedback payload. Shared AST nodes, Functions, strings,
     /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
@@ -6142,9 +6145,18 @@ fn finish_chunk(
                 .collect(),
         )
     });
+    // The final operation stream includes inlining, fragments and prepared/coroutine entries.
+    // Cache only facts about that immutable stream, never runtime environments or IC state.
+    let jit_needs_activation_state = c.ops.iter().any(jit_bridge_op);
+    let has_tail_calls = c
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray));
     Some(Rc::new(Chunk {
         prepared_entry,
         ops: c.ops,
+        jit_needs_activation_state,
+        has_tail_calls,
         consts: c.consts,
         names: c.names,
         n_slots: c.slot_names.len(),
@@ -17699,7 +17711,7 @@ impl Chunk {
     }
 
     pub(crate) fn jit_needs_activation_state(&self) -> bool {
-        self.ops.iter().any(jit_bridge_op)
+        self.jit_needs_activation_state
     }
     /// Whether const `k` is a trivially-copyable value the JIT may materialize inline.
     pub(crate) fn jit_const_copyable(&self, k: u32) -> bool {

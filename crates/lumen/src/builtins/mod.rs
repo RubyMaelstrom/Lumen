@@ -3884,6 +3884,52 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
     }
     Ok(Value::Undefined)
 }
+/// Object.assign uses Set, unlike spread's CreateDataProperty. A fresh ordinary target can
+/// reuse the data-record copy only after proving that no prototype supplies any copied key.
+/// This live walk keeps inherited setters (including __proto__) and non-writable properties
+/// on the ordered checked path. No getter, trap or conversion runs while a borrow is held.
+fn try_assign_named_data(target: &Value, source: &Value) -> bool {
+    let (Value::Obj(target), Value::Obj(source)) = (target, source) else {
+        return false;
+    };
+    if Rc::ptr_eq(target, source) {
+        return false;
+    }
+    let source = source.borrow();
+    if !source.ic_plain.get() || !matches!(source.exotic, Exotic::None) {
+        return false;
+    }
+    let Some(keys) = source.props.named_data_keys() else {
+        return false;
+    };
+    if keys.is_empty() {
+        return true;
+    }
+    let mut target = target.borrow_mut();
+    if !target.ic_plain.get()
+        || !matches!(target.exotic, Exotic::None)
+        || !target.extensible
+        || !target
+            .props
+            .named_data_keys()
+            .is_some_and(|keys| keys.is_empty())
+    {
+        return false;
+    }
+    let mut prototype = target.proto.clone();
+    while let Some(parent) = prototype {
+        let parent = parent.borrow();
+        if !parent.ic_plain.get()
+            || !matches!(parent.exotic, Exotic::None)
+            || keys.iter().any(|key| parent.props.contains(key))
+        {
+            return false;
+        }
+        prototype = parent.proto.clone();
+    }
+    target.props.try_copy_named_data_from(&source.props)
+}
+
 fn install_object(it: &mut Interp) {
     let op = it.object_proto.clone();
     it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
@@ -4503,6 +4549,9 @@ fn install_object(it: &mut Interp) {
                 continue;
             }
             let from = Value::Obj(to_object_arg(i, src.clone(), "Object.assign")?);
+            if try_assign_named_data(&to_val, &from) {
+                continue;
+            }
             if let Some((t, h)) = proxy_pair(i, &from) {
                 // Proxy source: enumerate all own keys (string + symbol) via the traps, copying each
                 // enumerable one.
@@ -5671,7 +5720,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         while k < end {
             // Preserve holes: only copy indices the source actually has (HasProperty).
             if let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? {
-                cdp_or_throw(i, &result, &to.to_string(), v)?;
+                cdp_index_or_throw(i, &result, to as u64, v)?;
             }
             k += 1;
             to += 1;
@@ -5809,7 +5858,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         unreachable!("spreadable values are objects")
                     };
                     if let Some(elem) = array_get_present_index(i, object, v, k as usize)? {
-                        cdp_or_throw(i, &result, &n.to_string(), elem)?;
+                        cdp_index_or_throw(i, &result, n, elem)?;
                     }
                     n += 1; // increment for holes too, preserving their position
                 }
@@ -5817,7 +5866,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 if n >= 9007199254740991 {
                     return Err(i.make_error("TypeError", "concat result is too long"));
                 }
-                cdp_or_throw(i, &result, &n.to_string(), v.clone())?;
+                cdp_index_or_throw(i, &result, n, v.clone())?;
                 n += 1;
             }
         }
@@ -5861,11 +5910,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 continue; // holes stay holes in the result
             };
             let mapped = ab(cb.call(i, cb_this.clone(), [v, Value::Num(k as f64), ov.clone()]))?;
-            let key = k.to_string();
             // ECMA-262 §23.1.3.21 step 6.3: CreateDataPropertyOrThrow.  The
             // trap-aware helper keeps the ordinary fresh-array fast path while
             // preserving species/proxy/exotic fallbacks.
-            cdp_or_throw(i, &result, &key, mapped)?;
+            cdp_index_or_throw(i, &result, k as u64, mapped)?;
         }
         Ok(result)
     });
@@ -5895,7 +5943,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             ))?;
             if i.to_boolean(&keep) {
                 // ECMA-262 §23.1.3.8 step 6.3.1: CreateDataPropertyOrThrow.
-                cdp_or_throw(i, &result, &to.to_string(), v)?;
+                cdp_index_or_throw(i, &result, to as u64, v)?;
                 to += 1;
             }
         }
@@ -6553,7 +6601,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                     } else {
                         raw
                     };
-                    cdp_or_throw(i, &arr, &k.to_string(), v)
+                    cdp_index_or_throw(i, &arr, k, v)
                 })(i);
                 if let Err(e) = step {
                     i.iterator_close(&iter);
@@ -6584,7 +6632,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             } else {
                 raw
             };
-            cdp_or_throw(i, &arr, &k.to_string(), v)?;
+            cdp_index_or_throw(i, &arr, k as u64, v)?;
         }
         set_length_throw(i, &arr, len as f64)?;
         Ok(arr)
@@ -6814,7 +6862,7 @@ fn flatten_into(
                             i.make_error("TypeError", "flattened array length exceeds 2^53 - 1")
                         );
                     }
-                    cdp_or_throw(i, target, &target_index.to_string(), element)?;
+                    cdp_index_or_throw(i, target, target_index as u64, element)?;
                     target_index += 1;
                 }
             }
@@ -6856,7 +6904,7 @@ fn flatten_into(
             if target_index as u64 >= 9_007_199_254_740_991 {
                 return Err(i.make_error("TypeError", "flattened array length exceeds 2^53 - 1"));
             }
-            cdp_or_throw(i, target, &target_index.to_string(), element)?;
+            cdp_index_or_throw(i, target, target_index as u64, element)?;
             target_index += 1;
         }
     }
@@ -6901,7 +6949,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
         let from = (start + k).to_string();
         if ab(i.js_has_property(&ov, &from))? {
             let v = array_get_index_after_has(i, &o, &ov, (start + k) as usize, &from)?;
-            cdp_or_throw(i, &removed, &k.to_string(), v)?;
+            cdp_index_or_throw(i, &removed, k as u64, v)?;
         }
     }
     ab(i.set_member(&removed, "length", Value::Num(delete_count as f64)))?;
@@ -7980,9 +8028,7 @@ impl FromAsyncCoro {
                         self.stage = FromAsyncStage::IteratorMapped(state);
                         return Suspend::Await(mapped);
                     }
-                    if let Err(error) =
-                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
-                    {
+                    if let Err(error) = cdp_index_or_throw(i, &state.array, state.index, value) {
                         return self.close_after_error(i, state, error);
                     }
                     state.index += 1;
@@ -7994,9 +8040,7 @@ impl FromAsyncCoro {
                         Resume::Throw(error) => return self.close_after_error(i, state, error),
                         Resume::Terminate => unreachable!(),
                     };
-                    if let Err(error) =
-                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
-                    {
+                    if let Err(error) = cdp_index_or_throw(i, &state.array, state.index, value) {
                         return self.close_after_error(i, state, error);
                     }
                     state.index += 1;
@@ -8042,7 +8086,7 @@ impl FromAsyncCoro {
                         return Suspend::Await(mapped);
                     }
                     if let Err(error) =
-                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
+                        cdp_index_or_throw(i, &state.array, state.index as u64, value)
                     {
                         return self.finish(Suspend::Throw(error));
                     }
@@ -8056,7 +8100,7 @@ impl FromAsyncCoro {
                         Resume::Terminate => unreachable!(),
                     };
                     if let Err(error) =
-                        cdp_or_throw(i, &state.array, &state.index.to_string(), value)
+                        cdp_index_or_throw(i, &state.array, state.index as u64, value)
                     {
                         return self.finish(Suspend::Throw(error));
                     }
@@ -8295,6 +8339,53 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
         );
     }
     Ok(promise)
+}
+
+/// Numeric CreateDataPropertyOrThrow for Array-producing algorithms. Recheck the live receiver
+/// after every callback/await: a species result may escape, become non-extensible, freeze its
+/// length, or gain a descriptor before the next write. An absent dense index needs no decimal
+/// key or temporary descriptor object; prototypes do not participate in [[DefineOwnProperty]].
+fn cdp_index_or_throw(
+    i: &mut Interp,
+    target: &Value,
+    index: u64,
+    mut value: Value,
+) -> Result<(), Value> {
+    if index < u32::MAX as u64 {
+        if let Value::Obj(object) = target {
+            let mut object = object.borrow_mut();
+            if object.ic_plain.get() && matches!(object.exotic, Exotic::Array) && object.extensible
+            {
+                let length = object.props.length_property().and_then(|property| {
+                    if !property.accessor() && property.writable() {
+                        if let Value::Num(length) = property.value() {
+                            return Some(length as u32);
+                        }
+                    }
+                    None
+                });
+                if let Some(length) = length {
+                    match object
+                        .props
+                        .try_define_dense_element(index as u32, Property::plain(value))
+                    {
+                        Ok(()) => {
+                            if index >= u64::from(length) {
+                                object
+                                    .props
+                                    .get_mut("length")
+                                    .expect("validated Array length")
+                                    .set_value(Value::Num((index + 1) as f64));
+                            }
+                            return Ok(());
+                        }
+                        Err(property) => value = property.into_value(),
+                    }
+                }
+            }
+        }
+    }
+    cdp_or_throw(i, target, &index.to_string(), value)
 }
 
 /// CreateDataPropertyOrThrow (trap-aware for proxy targets).

@@ -33,6 +33,10 @@ fn operand_owner_loop(i: &mut Interp) -> (Rc<Chunk>, Value) {
         Op::Jump(3),
         Op::Return,
     ];
+    // This fixture replaces the completed operation stream rather than using the compiler's
+    // finalization path. Keep its derived immutable-body facts consistent with that replacement.
+    raw.jit_needs_activation_state = raw.ops.iter().any(jit_bridge_op);
+    raw.has_tail_calls = false;
     (chunk, owner)
 }
 

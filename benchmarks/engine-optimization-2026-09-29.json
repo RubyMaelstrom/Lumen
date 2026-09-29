@@ -1,0 +1,1465 @@
+{
+  "schema_version": 1,
+  "recorded": "2026-09-29T20:43:34.111Z",
+  "scope": "Native ARM64 engine audit and default-tier implementation. Four balanced application timing pairs and separate four-pair process peak-memory observations. Not a general engine, full browser or official Speedometer score.",
+  "regression_gate": "benchmarks/README.md: provisional regression when the paired 95% interval excludes parity in the slower direction and median loss exceeds 3%; no measured component crosses this gate. Vue process peak has a roughly 2% higher estimate, explicitly retained.",
+  "base_revision": "c8af769dd19b2abc8bbec540e6cdc7c544899080",
+  "candidate_source": {
+    "head": "c8af769dd19b2abc8bbec540e6cdc7c544899080",
+    "files": [
+      {
+        "path": "crates/lumen/src/builtins/mod.rs",
+        "sha256": "821ee41168d4097b6baf26560247a02071aac820eb9b23a2594da44cab0ac143"
+      },
+      {
+        "path": "crates/lumen/src/bytecode.rs",
+        "sha256": "bd54b51acc6152a2bc2d0c48d420005069905a5550affa3dba710378b0d58349"
+      },
+      {
+        "path": "crates/lumen/src/bytecode_osr_tests.rs",
+        "sha256": "86eba5b29e755772c4a34d31cee3d615c8b6904aa3bee04f205a024962c3e46a"
+      },
+      {
+        "path": "crates/lumen/src/eval.rs",
+        "sha256": "1ec9fc48a708fa7db93d6ea9569866f1155aa2dc11aa1e755fffbb1e230efa0a"
+      },
+      {
+        "path": "crates/lumen/src/lib.rs",
+        "sha256": "8c7d293455e879c6d11de0c627daf5dd49498f092ad23c69d9a585c0748415d7"
+      },
+      {
+        "path": "crates/lumen/src/value.rs",
+        "sha256": "f9fa560ca1cb26c2c32fde141264ce07c7383ad000dd6d028ded70b110e25a94"
+      },
+      {
+        "path": "crates/lumen/src/data_copy_tests.rs",
+        "sha256": "ed77c91669c7adb764f1f4d85e929f94616ab5341719dbe3260591c5af2477c1"
+      }
+    ],
+    "patch_sha256": "71597dfdf49b244d55e30d820979e84f9cfa73d376a6ddb024329fe965ed6275",
+    "note": "Patch excludes the new regression test; its exact content is retained with all modified sources."
+  },
+  "machine": {
+    "hostname": "crystal",
+    "arch": "arm64",
+    "release": "7.2.7-crystal",
+    "cpu": "unknown",
+    "affinity": 5
+  },
+  "environment": {
+    "affinity_cpu": 5,
+    "build": "cargo build --release -p lumen --bin lumen; workspace opt-level=3, fat LTO, codegen-units=1, panic=abort",
+    "tier": "jit",
+    "features": [
+      "default",
+      "intl"
+    ],
+    "optimizing_jit": false,
+    "architecture_diagnostics": false,
+    "inherited_runtime_controls": "LUMEN_*, TRUST_* and LD_PRELOAD removed",
+    "background": "User desktop applications remained active; no exclusive-machine claim. No owned compilation, unit tests or profiler overlapped the application timing comparison."
+  },
+  "changes": [
+    "Cache final immutable activation-state/tail-call bytecode facts instead of rescanning at emission and invocation.",
+    "Copy ordinary named data records with independent packed values, normalized descriptors and shared key layouts; guarded fresh-target Object.assign path.",
+    "Keep indices numeric through dense Array result creation, with live species/descriptor/length checks and full fallbacks."
+  ],
+  "artifacts": {
+    "baseline": {
+      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/lumen-baseline",
+      "sha256": "5f3d090a977c5efcc07b5c7c20069458730a9e09f93982c5bf2ba7a165b5075f",
+      "bytes": 25114800
+    },
+    "candidate": {
+      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/lumen-candidate",
+      "sha256": "3172804cd1782441cfb664990fc28a786f323961d6aa24bf132dc42fc3b5aa76",
+      "bytes": 25116032
+    },
+    "node": {
+      "file": "/usr/bin/node",
+      "sha256": "f73c94d413747fc9f2ee5e667f8372851c85ad49670047552b9743efeb41c771",
+      "bytes": 122578104
+    }
+  },
+  "node_reference": {
+    "version": "v24.21.0",
+    "v8": "13.6.233.17-node.53",
+    "scope": "One reference sample per workload. No paired Node distribution or precise general Node-gap claim."
+  },
+  "workloads": {
+    "react": {
+      "scope": "Unchanged Speedometer React TodoMVC reducer with a deterministic state-update replay; 20 measured passes after 2 warm passes. Application reducer only, not full UI/browser timing.",
+      "upstream_file": "/big/Code/TRust/target/reboot-rescue-2026-09-01/speedometer-3.1-audit/resources/todomvc/architecture-examples/react/src/todo/reducer.js",
+      "adaptation": "Only the module export token is removed; existing replay driver is appended.",
+      "expected_checksum": 2124760
+    },
+    "djot": {
+      "scope": "Unchanged @djot/djot 0.3.2 UMD parser/renderHTML; actual AGENTS.md input. One warm conversion then ten measured conversions; complete HTML compared across engines.",
+      "input": "AGENTS.md",
+      "input_sha256": "990a7cbb5b806ae254ca4cceb2aad9498a1399f6b218dac86e2c663da230faa2",
+      "package_version": "0.3.2"
+    },
+    "ejs": {
+      "scope": "Exact 3 MB issue-12 reproducer: yt-dlp/ejs with meriyah, astring, embedded YouTube player and two challenges. Complete solved response JSON must match.",
+      "fetch": "examples/ejs/fetch.sh"
+    },
+    "vue": {
+      "scope": "Pinned Speedometer Vue vendor and existing reactivity replay as a library control. Not full Vue UI or browser timing.",
+      "asset_manifest": "benchmarks/browser-replay-assets.json",
+      "expected_observed": 30016,
+      "expected_invocations": 12359
+    }
+  },
+  "sources": {
+    "react": {
+      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/react.js",
+      "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
+    },
+    "djot": {
+      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/djot.js",
+      "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
+    },
+    "ejs": {
+      "file": "/big/Code/Lumen/examples/ejs/code.js",
+      "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c"
+    },
+    "vue": {
+      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/vue.js",
+      "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
+    }
+  },
+  "timing": {
+    "method": "Paired log-ratio Student-t interval; four balanced process pairs. Node is a single reference observation.",
+    "samples": [
+      {
+        "round": 0,
+        "workload": "react",
+        "engine": "baseline",
+        "wall_ms": 182.37908799999997,
+        "elapsed_ms": 143,
+        "cpu": {
+          "wall_s": 0.172,
+          "user_s": 0.162,
+          "system_s": 0.009
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 0,
+        "workload": "react",
+        "engine": "candidate",
+        "wall_ms": 151.51326499999993,
+        "elapsed_ms": 116,
+        "cpu": {
+          "wall_s": 0.144,
+          "user_s": 0.134,
+          "system_s": 0.01
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 0,
+        "workload": "react",
+        "engine": "node",
+        "wall_ms": 84.70242599999995,
+        "elapsed_ms": 19,
+        "cpu": {
+          "wall_s": 0.077,
+          "user_s": 0.067,
+          "system_s": 0.01
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 0,
+        "workload": "djot",
+        "engine": "baseline",
+        "wall_ms": 978.57503,
+        "elapsed_ms": 806,
+        "cpu": {
+          "wall_s": 0.972,
+          "user_s": 0.943,
+          "system_s": 0.028
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 0,
+        "workload": "djot",
+        "engine": "candidate",
+        "wall_ms": 1025.763484,
+        "elapsed_ms": 855,
+        "cpu": {
+          "wall_s": 1.02,
+          "user_s": 0.994,
+          "system_s": 0.025
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 0,
+        "workload": "djot",
+        "engine": "node",
+        "wall_ms": 138.9907079999998,
+        "elapsed_ms": 51,
+        "cpu": {
+          "wall_s": 0.133,
+          "user_s": 0.113,
+          "system_s": 0.019
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 0,
+        "workload": "ejs",
+        "engine": "baseline",
+        "wall_ms": 10556.341084,
+        "cpu": {
+          "wall_s": 10.55,
+          "user_s": 10.404,
+          "system_s": 0.142
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 0,
+        "workload": "ejs",
+        "engine": "candidate",
+        "wall_ms": 8776.211061999998,
+        "cpu": {
+          "wall_s": 8.77,
+          "user_s": 8.615,
+          "system_s": 0.15
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 0,
+        "workload": "ejs",
+        "engine": "node",
+        "wall_ms": 1510.7981569999974,
+        "cpu": {
+          "wall_s": 1.504,
+          "user_s": 1.312,
+          "system_s": 0.191
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 0,
+        "workload": "vue",
+        "engine": "baseline",
+        "wall_ms": 920.3878259999983,
+        "elapsed_ms": 778,
+        "cpu": {
+          "wall_s": 0.914,
+          "user_s": 0.896,
+          "system_s": 0.017
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 0,
+        "workload": "vue",
+        "engine": "candidate",
+        "wall_ms": 918.2707569999984,
+        "elapsed_ms": 776,
+        "cpu": {
+          "wall_s": 0.911,
+          "user_s": 0.897,
+          "system_s": 0.014
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 0,
+        "workload": "vue",
+        "engine": "node",
+        "wall_ms": 193.70076600000175,
+        "elapsed_ms": 118,
+        "cpu": {
+          "wall_s": 0.187,
+          "user_s": 0.171,
+          "system_s": 0.016
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 1,
+        "workload": "vue",
+        "engine": "candidate",
+        "wall_ms": 926.2785039999981,
+        "elapsed_ms": 783,
+        "cpu": {
+          "wall_s": 0.919,
+          "user_s": 0.903,
+          "system_s": 0.015
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 1,
+        "workload": "vue",
+        "engine": "baseline",
+        "wall_ms": 923.356157000002,
+        "elapsed_ms": 779,
+        "cpu": {
+          "wall_s": 0.916,
+          "user_s": 0.9,
+          "system_s": 0.016
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 1,
+        "workload": "ejs",
+        "engine": "candidate",
+        "wall_ms": 8777.895456999999,
+        "cpu": {
+          "wall_s": 8.771,
+          "user_s": 8.605,
+          "system_s": 0.161
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 1,
+        "workload": "ejs",
+        "engine": "baseline",
+        "wall_ms": 10563.427690000004,
+        "cpu": {
+          "wall_s": 10.556,
+          "user_s": 10.4,
+          "system_s": 0.152
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 1,
+        "workload": "djot",
+        "engine": "candidate",
+        "wall_ms": 987.1305839999986,
+        "elapsed_ms": 815,
+        "cpu": {
+          "wall_s": 0.98,
+          "user_s": 0.951,
+          "system_s": 0.029
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 1,
+        "workload": "djot",
+        "engine": "baseline",
+        "wall_ms": 981.7868490000037,
+        "elapsed_ms": 810,
+        "cpu": {
+          "wall_s": 0.975,
+          "user_s": 0.943,
+          "system_s": 0.032
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 1,
+        "workload": "react",
+        "engine": "candidate",
+        "wall_ms": 147.93010199999844,
+        "elapsed_ms": 115,
+        "cpu": {
+          "wall_s": 0.141,
+          "user_s": 0.134,
+          "system_s": 0.007
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 1,
+        "workload": "react",
+        "engine": "baseline",
+        "wall_ms": 178.25771800000075,
+        "elapsed_ms": 143,
+        "cpu": {
+          "wall_s": 0.171,
+          "user_s": 0.163,
+          "system_s": 0.008
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 2,
+        "workload": "react",
+        "engine": "baseline",
+        "wall_ms": 180.13129900000058,
+        "elapsed_ms": 143,
+        "cpu": {
+          "wall_s": 0.173,
+          "user_s": 0.165,
+          "system_s": 0.007
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 2,
+        "workload": "react",
+        "engine": "candidate",
+        "wall_ms": 148.34870899999805,
+        "elapsed_ms": 115,
+        "cpu": {
+          "wall_s": 0.141,
+          "user_s": 0.131,
+          "system_s": 0.01
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 2,
+        "workload": "djot",
+        "engine": "baseline",
+        "wall_ms": 1028.685894000002,
+        "elapsed_ms": 858,
+        "cpu": {
+          "wall_s": 1.021,
+          "user_s": 0.999,
+          "system_s": 0.022
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 2,
+        "workload": "djot",
+        "engine": "candidate",
+        "wall_ms": 988.1197339999999,
+        "elapsed_ms": 814,
+        "cpu": {
+          "wall_s": 0.981,
+          "user_s": 0.947,
+          "system_s": 0.034
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 2,
+        "workload": "ejs",
+        "engine": "baseline",
+        "wall_ms": 10599.864254,
+        "cpu": {
+          "wall_s": 10.593,
+          "user_s": 10.433,
+          "system_s": 0.156
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 2,
+        "workload": "ejs",
+        "engine": "candidate",
+        "wall_ms": 8787.540492,
+        "cpu": {
+          "wall_s": 8.781,
+          "user_s": 8.619,
+          "system_s": 0.159
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 2,
+        "workload": "vue",
+        "engine": "baseline",
+        "wall_ms": 923.9283320000104,
+        "elapsed_ms": 780,
+        "cpu": {
+          "wall_s": 0.917,
+          "user_s": 0.904,
+          "system_s": 0.013
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 2,
+        "workload": "vue",
+        "engine": "candidate",
+        "wall_ms": 921.3353269999934,
+        "elapsed_ms": 779,
+        "cpu": {
+          "wall_s": 0.914,
+          "user_s": 0.904,
+          "system_s": 0.009
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 3,
+        "workload": "vue",
+        "engine": "candidate",
+        "wall_ms": 921.1752160000033,
+        "elapsed_ms": 779,
+        "cpu": {
+          "wall_s": 0.914,
+          "user_s": 0.9,
+          "system_s": 0.014
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 3,
+        "workload": "vue",
+        "engine": "baseline",
+        "wall_ms": 923.9614509999956,
+        "elapsed_ms": 782,
+        "cpu": {
+          "wall_s": 0.917,
+          "user_s": 0.897,
+          "system_s": 0.019
+        },
+        "status": 0,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31"
+      },
+      {
+        "round": 3,
+        "workload": "ejs",
+        "engine": "candidate",
+        "wall_ms": 8697.579417,
+        "cpu": {
+          "wall_s": 8.691,
+          "user_s": 8.539,
+          "system_s": 0.149
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 3,
+        "workload": "ejs",
+        "engine": "baseline",
+        "wall_ms": 10420.62552300001,
+        "cpu": {
+          "wall_s": 10.415,
+          "user_s": 10.277,
+          "system_s": 0.135
+        },
+        "status": 0,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f"
+      },
+      {
+        "round": 3,
+        "workload": "djot",
+        "engine": "candidate",
+        "wall_ms": 967.4560549999878,
+        "elapsed_ms": 800,
+        "cpu": {
+          "wall_s": 0.961,
+          "user_s": 0.931,
+          "system_s": 0.029
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 3,
+        "workload": "djot",
+        "engine": "baseline",
+        "wall_ms": 967.8117809999967,
+        "elapsed_ms": 798,
+        "cpu": {
+          "wall_s": 0.961,
+          "user_s": 0.936,
+          "system_s": 0.024
+        },
+        "status": 0,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442"
+      },
+      {
+        "round": 3,
+        "workload": "react",
+        "engine": "candidate",
+        "wall_ms": 146.63415199999872,
+        "elapsed_ms": 115,
+        "cpu": {
+          "wall_s": 0.141,
+          "user_s": 0.132,
+          "system_s": 0.008
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      },
+      {
+        "round": 3,
+        "workload": "react",
+        "engine": "baseline",
+        "wall_ms": 177.68445499999507,
+        "elapsed_ms": 143,
+        "cpu": {
+          "wall_s": 0.172,
+          "user_s": 0.161,
+          "system_s": 0.01
+        },
+        "status": 0,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807"
+      }
+    ],
+    "summaries": [
+      {
+        "workload": "react",
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "metrics": {
+          "elapsed_ms": {
+            "baseline_median": 143,
+            "candidate_median": 115,
+            "paired_candidate_over_baseline": 0.8059383838685904,
+            "paired_log_t_95_interval": [
+              0.8004057910072828,
+              0.8115092193114894
+            ],
+            "paired_ratios": [
+              0.8111888111888111,
+              0.8041958041958042,
+              0.8041958041958042,
+              0.8041958041958042
+            ],
+            "median_time_reduction_pct": 19.580419580419584,
+            "provisional_regression": false,
+            "node_reference": [
+              19
+            ]
+          },
+          "wall_ms": {
+            "baseline_median": 179.19450850000067,
+            "candidate_median": 148.13940549999825,
+            "paired_candidate_over_baseline": 0.8273533501926932,
+            "paired_log_t_95_interval": [
+              0.8218024663834614,
+              0.8329417275752884
+            ],
+            "paired_ratios": [
+              0.8307600759578311,
+              0.8298664633415638,
+              0.8235587586585803,
+              0.8252503124147962
+            ],
+            "median_time_reduction_pct": 17.330387666429136,
+            "provisional_regression": false,
+            "node_reference": [
+              84.70242599999995
+            ]
+          },
+          "cpu_ms": {
+            "baseline_median": 171,
+            "candidate_median": 141,
+            "paired_candidate_over_baseline": 0.8262338692549921,
+            "paired_log_t_95_interval": [
+              0.8092442204687127,
+              0.8435802066138682
+            ],
+            "paired_ratios": [
+              0.8421052631578949,
+              0.8245614035087719,
+              0.8197674418604651,
+              0.8187134502923976
+            ],
+            "median_time_reduction_pct": 17.543859649122805,
+            "provisional_regression": false,
+            "node_reference": [
+              77
+            ]
+          }
+        }
+      },
+      {
+        "workload": "djot",
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "metrics": {
+          "elapsed_ms": {
+            "baseline_median": 808,
+            "candidate_median": 814.5,
+            "paired_candidate_over_baseline": 1.003764816368214,
+            "paired_log_t_95_interval": [
+              0.9334896066350798,
+              1.0793305028971618
+            ],
+            "paired_ratios": [
+              1.0607940446650124,
+              1.0061728395061729,
+              0.9487179487179487,
+              1.0025062656641603
+            ],
+            "median_time_reduction_pct": -0.8044554455445496,
+            "provisional_regression": false,
+            "node_reference": [
+              51
+            ]
+          },
+          "wall_ms": {
+            "baseline_median": 980.1809395000018,
+            "candidate_median": 987.6251589999993,
+            "paired_candidate_over_baseline": 1.0029849312219907,
+            "paired_log_t_95_interval": [
+              0.94754561061815,
+              1.0616679144364474
+            ],
+            "paired_ratios": [
+              1.0482216003406506,
+              1.0054428667540594,
+              0.960565066327232,
+              0.9996324429946065
+            ],
+            "median_time_reduction_pct": -0.7594740113794574,
+            "provisional_regression": false,
+            "node_reference": [
+              138.9907079999998
+            ]
+          },
+          "cpu_ms": {
+            "baseline_median": 973,
+            "candidate_median": 980.5,
+            "paired_candidate_over_baseline": 1.0033556945284097,
+            "paired_log_t_95_interval": [
+              0.9473648832415866,
+              1.0626556541740253
+            ],
+            "paired_ratios": [
+              1.0494335736354272,
+              1.005128205128205,
+              0.9608227228207641,
+              1
+            ],
+            "median_time_reduction_pct": -0.770811921891057,
+            "provisional_regression": false,
+            "node_reference": [
+              132
+            ]
+          }
+        }
+      },
+      {
+        "workload": "ejs",
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "metrics": {
+          "wall_ms": {
+            "baseline_median": 10559.884387000002,
+            "candidate_median": 8777.053259499999,
+            "paired_candidate_over_baseline": 0.831500871370776,
+            "paired_log_t_95_interval": [
+              0.827796090730038,
+              0.8352222326643458
+            ],
+            "paired_ratios": [
+              0.8313686524682209,
+              0.8309703738787079,
+              0.829023870629655,
+              0.8346504149681834
+            ],
+            "median_time_reduction_pct": 16.88305536464775,
+            "provisional_regression": false,
+            "node_reference": [
+              1510.7981569999974
+            ]
+          },
+          "cpu_ms": {
+            "baseline_median": 10549,
+            "candidate_median": 8765.5,
+            "paired_candidate_over_baseline": 0.8313124401866516,
+            "paired_log_t_95_interval": [
+              0.8277057589342988,
+              0.8349348373495387
+            ],
+            "paired_ratios": [
+              0.8311208040963398,
+              0.8307429871114481,
+              0.8289734630276703,
+              0.8344218209757971
+            ],
+            "median_time_reduction_pct": 16.906815811925302,
+            "provisional_regression": false,
+            "node_reference": [
+              1503
+            ]
+          }
+        }
+      },
+      {
+        "workload": "vue",
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "metrics": {
+          "elapsed_ms": {
+            "baseline_median": 779.5,
+            "candidate_median": 779,
+            "paired_candidate_over_baseline": 0.9993554772034653,
+            "paired_log_t_95_interval": [
+              0.9930403624920757,
+              1.0057107520889266
+            ],
+            "paired_ratios": [
+              0.9974293059125964,
+              1.0051347881899872,
+              0.9987179487179487,
+              0.9961636828644501
+            ],
+            "median_time_reduction_pct": 0.06414368184733954,
+            "provisional_regression": false,
+            "node_reference": [
+              118
+            ]
+          },
+          "wall_ms": {
+            "baseline_median": 923.6422445000062,
+            "candidate_median": 921.2552714999983,
+            "paired_candidate_over_baseline": 0.9987574090583164,
+            "paired_log_t_95_interval": [
+              0.9940786545559884,
+              1.0034581846991053
+            ],
+            "paired_ratios": [
+              0.9976998076895468,
+              1.0031649185179972,
+              0.9971934998525221,
+              0.9969844683487857
+            ],
+            "median_time_reduction_pct": 0.25843047069593617,
+            "provisional_regression": false,
+            "node_reference": [
+              193.70076600000175
+            ]
+          },
+          "cpu_ms": {
+            "baseline_median": 916,
+            "candidate_median": 913.5,
+            "paired_candidate_over_baseline": 0.9983590123275269,
+            "paired_log_t_95_interval": [
+              0.9940019841013492,
+              1.0027351388002548
+            ],
+            "paired_ratios": [
+              0.9978094194961665,
+              1.002183406113537,
+              0.9956379498364231,
+              0.9978165938864629
+            ],
+            "median_time_reduction_pct": 0.27292576419214454,
+            "provisional_regression": false,
+            "node_reference": [
+              187
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "memory": {
+    "method": "Linux os.wait4 ru_maxrss in KiB; four fresh balanced pairs per workload, separate from application timings. No post-GC retained-memory claim.",
+    "samples": [
+      {
+        "cycle": 0,
+        "workload": "react",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 22044,
+        "user_s": 0.162373,
+        "system_s": 0.00902,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      },
+      {
+        "cycle": 0,
+        "workload": "react",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 22516,
+        "user_s": 0.13255999999999998,
+        "system_s": 0.009966,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      },
+      {
+        "cycle": 0,
+        "workload": "djot",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 90704,
+        "user_s": 0.936488,
+        "system_s": 0.019989,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 0,
+        "workload": "djot",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 90920,
+        "user_s": 0.928928,
+        "system_s": 0.026997,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 0,
+        "workload": "ejs",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 640936,
+        "user_s": 10.288539,
+        "system_s": 0.13998,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 0,
+        "workload": "ejs",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 638492,
+        "user_s": 8.459184,
+        "system_s": 0.159984,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 0,
+        "workload": "vue",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 42892,
+        "user_s": 0.908113,
+        "system_s": 0.015000999999999999,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 0,
+        "workload": "vue",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 44288,
+        "user_s": 0.890925,
+        "system_s": 0.014998,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "vue",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 43748,
+        "user_s": 0.89116,
+        "system_s": 0.019003,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "vue",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 43472,
+        "user_s": 0.9025839999999999,
+        "system_s": 0.012007,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "ejs",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 642764,
+        "user_s": 8.50195,
+        "system_s": 0.152981,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "ejs",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 635764,
+        "user_s": 10.284202,
+        "system_s": 0.129989,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "djot",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 89240,
+        "user_s": 0.936341,
+        "system_s": 0.018986,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "djot",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 89624,
+        "user_s": 0.943643,
+        "system_s": 0.021013999999999998,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "react",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 22320,
+        "user_s": 0.135588,
+        "system_s": 0.005020999999999999,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      },
+      {
+        "cycle": 1,
+        "workload": "react",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 23132,
+        "user_s": 0.16503099999999998,
+        "system_s": 0.006000999999999999,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "react",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 22300,
+        "user_s": 0.165618,
+        "system_s": 0.007025999999999999,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "react",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 22892,
+        "user_s": 0.132352,
+        "system_s": 0.008956,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "djot",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 88596,
+        "user_s": 0.9340219999999999,
+        "system_s": 0.033999999999999996,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "djot",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 88812,
+        "user_s": 0.980899,
+        "system_s": 0.022997,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "ejs",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 640220,
+        "user_s": 10.329704,
+        "system_s": 0.165979,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "ejs",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 640332,
+        "user_s": 8.621463,
+        "system_s": 0.150973,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "vue",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 42576,
+        "user_s": 0.907998,
+        "system_s": 0.012999,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 2,
+        "workload": "vue",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 43544,
+        "user_s": 0.900063,
+        "system_s": 0.018001,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "vue",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 44892,
+        "user_s": 0.8968809999999999,
+        "system_s": 0.018997,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "vue",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 44308,
+        "user_s": 0.901697,
+        "system_s": 0.016994,
+        "output_sha256": "3bb2e6882ee3c2ad7505207fb5f553ce38db7aed9b06a323bdbd559692b08b31",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "ejs",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 639400,
+        "user_s": 8.63693,
+        "system_s": 0.164979,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "ejs",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 640428,
+        "user_s": 10.383173,
+        "system_s": 0.149973,
+        "output_sha256": "f22a3fcd4b6fd10364f72a293250d85402f9f6b42f11e975ed9d7d897b69c00f",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "djot",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 89548,
+        "user_s": 0.995095,
+        "system_s": 0.021002,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "djot",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 90224,
+        "user_s": 0.957942,
+        "system_s": 0.01798,
+        "output_sha256": "76cfaa462381c3f9e5abab5d851b32118cb6673c1c43fd1cd1eb5a29cbbfc442",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "react",
+        "engine": "candidate",
+        "status": 0,
+        "max_rss_kib": 23856,
+        "user_s": 0.133429,
+        "system_s": 0.009028999999999999,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      },
+      {
+        "cycle": 3,
+        "workload": "react",
+        "engine": "baseline",
+        "status": 0,
+        "max_rss_kib": 22640,
+        "user_s": 0.16425599999999999,
+        "system_s": 0.006967999999999999,
+        "output_sha256": "b891ce683dac39c791ff49b334360866d81213efbf3076e238a52607c2880807",
+        "stderr": ""
+      }
+    ],
+    "summaries": [
+      {
+        "workload": "react",
+        "baseline_median_kib": 22470.0,
+        "candidate_median_kib": 22704.0,
+        "paired_candidate_over_baseline": 1.016121125326578,
+        "paired_log_t_95_interval": [
+          0.9578914272433355,
+          1.0778905750376468
+        ],
+        "paired_ratios": [
+          1.0214117220105243,
+          0.9648971122254885,
+          1.0265470852017937,
+          1.0537102473498232
+        ],
+        "provisional_regression": false
+      },
+      {
+        "workload": "djot",
+        "baseline_median_kib": 89924.0,
+        "candidate_median_kib": 89394.0,
+        "paired_candidate_over_baseline": 0.9982513215103387,
+        "paired_log_t_95_interval": [
+          0.9903758465085748,
+          1.0061894223391783
+        ],
+        "paired_ratios": [
+          1.0023813723760804,
+          0.9957154333660626,
+          1.0024380333197886,
+          0.9925075367973045
+        ],
+        "provisional_regression": false
+      },
+      {
+        "workload": "ejs",
+        "baseline_median_kib": 640324.0,
+        "candidate_median_kib": 639866.0,
+        "paired_candidate_over_baseline": 1.0014255647673886,
+        "paired_log_t_95_interval": [
+          0.9910307957027734,
+          1.0119293629604378
+        ],
+        "paired_ratios": [
+          0.9961868267658549,
+          1.0110103749189951,
+          1.0001749398644215,
+          0.99839482346181
+        ],
+        "provisional_regression": false
+      },
+      {
+        "workload": "vue",
+        "baseline_median_kib": 43182.0,
+        "candidate_median_kib": 44018.0,
+        "paired_candidate_over_baseline": 1.018655082016549,
+        "paired_log_t_95_interval": [
+          1.0006639729748266,
+          1.0369696562906499
+        ],
+        "paired_ratios": [
+          1.0325468618856664,
+          1.006348914243651,
+          1.0227358136039082,
+          1.0131804640245554
+        ],
+        "provisional_regression": false
+      }
+    ],
+    "initial_sampled_observations": [
+      {
+        "workload": "react",
+        "engine": "baseline",
+        "sampled_peak_hwm_kib": 21428
+      },
+      {
+        "workload": "react",
+        "engine": "candidate",
+        "sampled_peak_hwm_kib": 22452
+      },
+      {
+        "workload": "djot",
+        "engine": "baseline",
+        "sampled_peak_hwm_kib": 86076
+      },
+      {
+        "workload": "djot",
+        "engine": "candidate",
+        "sampled_peak_hwm_kib": 91320
+      },
+      {
+        "workload": "ejs",
+        "engine": "baseline",
+        "sampled_peak_hwm_kib": 640280
+      },
+      {
+        "workload": "ejs",
+        "engine": "candidate",
+        "sampled_peak_hwm_kib": 641280
+      },
+      {
+        "workload": "vue",
+        "engine": "baseline",
+        "sampled_peak_hwm_kib": 43384
+      },
+      {
+        "workload": "vue",
+        "engine": "candidate",
+        "sampled_peak_hwm_kib": 44480
+      }
+    ],
+    "investigation": "Initial polling on short workloads gave different observed lower bounds, including a roughly 6% Djot increase. Followed with full Linux wait4 process high-water marks in four balanced pairs; use those distributions, not the initial incomplete peaks."
+  },
+  "validation": {
+    "default_engine_unit_tests": {
+      "command": "cargo test -p lumen --lib --quiet",
+      "passed": 1557,
+      "failed": 0,
+      "new_regressions": 8,
+      "tiers_in_new_JS_regressions": [
+        "interp",
+        "bytecode",
+        "jit"
+      ]
+    },
+    "clippy": "cargo clippy -p lumen --all-targets -- -D warnings passed",
+    "workspace": "cargo check --workspace --all-targets passed",
+    "osr_fixture": {
+      "command": "cargo test -p lumen --lib --features optimizing-jit bytecode::osr_tests --quiet",
+      "passed": 2,
+      "failed": 0,
+      "earlier_attempt": "bytecode_osr_tests filter selected zero; separate corrected log retained"
+    },
+    "format": "cargo fmt --all -- --check; git diff --check passed",
+    "real_workloads": "Every timing/resource result exited successfully and matched output hashes across original build, candidate and Node (Node timing references only).",
+    "not_run": [
+      "Fresh full Test262",
+      "Fresh x86-64 or wasm execution",
+      "Full browser/Speedometer",
+      "Post-GC retained-memory comparison"
+    ]
+  },
+  "diagnostic_profile": {
+    "artifact": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/ejs-audit.er",
+    "binary": "baseline",
+    "workload": "ejs",
+    "sampled_cpu_seconds": 10.383,
+    "jit_bridge_op_exclusive_sampled_cpu_seconds": 1.438,
+    "limitation": "Overlapped owned compilation; attribution only, no acceptance timing or exact exclusive component decomposition."
+  },
+  "standards": {
+    "local_ecma262_revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "local_source": "/big/web-standards/repositories/tc39/ecma262/spec.html",
+    "clauses": [
+      "CopyDataProperties",
+      "Object.assign",
+      "CreateDataPropertyOrThrow",
+      "ArraySpeciesCreate",
+      "Array exotic [[DefineOwnProperty]]",
+      "Affected Array algorithms"
+    ],
+    "upstream_verified": false
+  },
+  "local_evidence": [
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/comparison.json",
+      "sha256": "0d90b60382f318a2bb14ee251de8f7209802806cb52968a7580aa10ec71c3f11"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/analysis.json",
+      "sha256": "71e24c4e9d822f71217f3729fb82a84bc270eb195996c53c11ed27b6fabb583a"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/resources.json",
+      "sha256": "f9334b7f3477630b56518c164f4e00c1c5cd17bf3e070e41134e21139a81e20c"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/memory.json",
+      "sha256": "df24f2c200d349d48cfb248febae1df3339ee330619952ec702002e9c915dad7"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/measure.mjs",
+      "sha256": "def57cddf039bf56783162ee4ed305996bcccd2a5595fee92287d901f7a7217d"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/analyze.mjs",
+      "sha256": "49824f18cd351918617df10206f5a623010c05a03ea0323e584beec5da107c34"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/resources.mjs",
+      "sha256": "6d9ec438bfc5b17d6b2cbf6d4228549a16a00be17795e8ec8e7cfe2e8cf2bae3"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/memory.py",
+      "sha256": "f279f649f44fcd5d1cb3410f4c1f12b69fcd638891b6b5b76af22caf74832518"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/source-inventory.json",
+      "sha256": "4d2c8d8e266ab8268161b1ee6bc290cba7fd56c897d6c1b97fcb6b467de922c6"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/source.patch",
+      "sha256": "71597dfdf49b244d55e30d820979e84f9cfa73d376a6ddb024329fe965ed6275"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/unit-tests-final.log",
+      "sha256": "0d00aeb0b24742a10fe0afc5ae08b7ee7642d4890204fadbca8cfec8212a2b42"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/workspace-check.log",
+      "sha256": "8563c1955bf3bb0830ca44c5511a2098de00896d7fb4d6b4fafddb00abae3609"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/osr-tests.log",
+      "sha256": "5b35e1723113b9df94334b29154bab35d3ae643a9e3823e9ae5ea6757c3f161a"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/osr-tests-corrected.log",
+      "sha256": "7a48d23b4c38a11286c1f947d8469a128c622e8efc16375708e4581982d6d87e"
+    },
+    {
+      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/ejs-cpu.txt",
+      "sha256": "22d875bef2ca5b4008d413a628db18cbc8cb8fd31eea1d2009abd9e488631ead"
+    }
+  ],
+  "limitations": [
+    "The supported gains are roughly 20% on the reducer workflow and 17% on the full solver; Djot and Vue control timing intervals include parity.",
+    "A four-pair native-engine screen is not a broad production acceptance or a solution to the reported 8\u201310x Node gap.",
+    "Original and candidate builds contain identical standard release options; compilation elapsed time overlapped other work and is not compared.",
+    "Measurement preceded the cycle's commit. Artifacts remain local; no installation, external publication or artifact promotion."
+  ]
+}
