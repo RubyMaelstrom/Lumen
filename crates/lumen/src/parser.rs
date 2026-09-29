@@ -3400,6 +3400,16 @@ impl Parser {
     }
 
     fn parse_class(&mut self) -> Result<Class, ParseError> {
+        // ClassExpression/ClassTail do not carry the containing expression's [In]
+        // parameter. This includes method defaults/bodies, fields and static blocks
+        // nested in a for initializer (ECMA-262 §15.7, Class Definitions).
+        let saved_no_in = std::mem::replace(&mut self.no_in, false);
+        let result = self.parse_class_inner();
+        self.no_in = saved_no_in;
+        result
+    }
+
+    fn parse_class_inner(&mut self) -> Result<Class, ParseError> {
         let class_start = self.cur_start();
         let decorators = self.parse_decorators()?;
         self.eat_kw("class");
@@ -3738,10 +3748,14 @@ impl Parser {
 
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
         self.expect_punct("(")?;
+        // FormalParameters has no [In] parameter; binding initializers use [+In]
+        // even when an arrow's enclosing expression uses [~In] (§§14.3.3, 15.1).
+        let saved_no_in = std::mem::replace(&mut self.no_in, false);
         let saved_in_params = self.in_params;
         self.in_params = true;
         let result = self.parse_params_inner();
         self.in_params = saved_in_params;
+        self.no_in = saved_no_in;
         result
     }
 
@@ -3809,7 +3823,11 @@ impl Parser {
         self.iter_depth = 0;
         self.switch_depth = 0;
         self.next_scope_is_fn_boundary = true;
+        // FunctionBody does not inherit [In]. In particular, an arrow's block
+        // body resets [~In], while its expression body must retain it (§15.3).
+        let saved_no_in = std::mem::replace(&mut self.no_in, false);
         let body = self.parse_block_body();
+        self.no_in = saved_no_in;
         self.fn_depth -= 1;
         if !is_arrow {
             self.nonarrow_fn_depth -= 1;

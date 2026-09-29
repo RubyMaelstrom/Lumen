@@ -11902,6 +11902,88 @@ fn for_head_no_in() {
 }
 
 #[test]
+fn for_head_no_in_function_boundaries_parse() {
+    // ECMA-262 §§14.7.4, 15.1–15.4, 15.7 and 15.9: [~In] belongs to
+    // the outer initializer and arrow expression bodies, not class code,
+    // formal parameters or function/block-arrow bodies.
+    let valid = [
+        "for (let C = class { m(o) { return 'x' in o; } }; false;) {}",
+        "for (let C = class { m(x = 'x' in {}) { return x; } }; false;) {}",
+        "for (let C = class { *m(o) { yield 'x' in o; } }; false;) {}",
+        "for (let C = class { async m(o) { return 'x' in o; } }; false;) {}",
+        "for (let C = class { async *m(o) { yield 'x' in o; } }; false;) {}",
+        "for (let C = class { get x() { return 'x' in {}; } set x(v) { 'x' in v; } }; false;) {}",
+        "for (let C = class { x = 'x' in {}; static y = 'y' in {}; static { 'z' in {}; } }; false;) {}",
+        "for (let C = class extends ('x' in {} ? Array : Object) { ['x' in {}]() {} }; false;) {}",
+        "for (let f = o => { return 'x' in o; }; false;) {}",
+        "for (let f = async o => { return 'x' in o; }; false;) {}",
+        "for (let f = (x = 'x' in {}) => x; false;) {}",
+        "for (let f = async ({x = 'x' in {}} = {}) => x; false;) {}",
+        "for (let f = o => ('x' in o); false;) {}",
+        "for (let C = class { m() { for (let f = o => { return 'x' in o; }; false;) {} } }; false;) {}",
+    ];
+    for source in valid {
+        for strict in [false, true] {
+            if let Err(error) = crate::parser::parse_script(source, strict) {
+                panic!("strict={strict}: {} in {source}", error.message);
+            }
+        }
+        if let Err(error) = crate::parser::parse_module(source) {
+            panic!("module: {} in {source}", error.message);
+        }
+    }
+    for source in [
+        "for (let f = o => 'x' in o; false;) {}",
+        "for (let f = async o => 'x' in o; false;) {}",
+        "for (let f = (x = 'x' in {}) => x in {}; false;) {}",
+        "for (let C = class { m() { return 'x' in {}; } }, x = 'x' in {}; false;) {}",
+        "for (let f = o => { return 'x' in o; }, x = 'x' in {}; false;) {}",
+    ] {
+        assert!(
+            crate::parser::parse_script(source, false).is_err(),
+            "{source}"
+        );
+        assert!(crate::parser::parse_module(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn for_head_no_in_function_boundaries_execute() {
+    use crate::bytecode::Tier;
+
+    let source = r#"
+        var out = [], C, f, g;
+        for (C = class {
+            field = 'x' in {x: 1};
+            static field = 'x' in {x: 1};
+            static { out.push('x' in {x: 1}); }
+            m(x = 'x' in {x: 1}) { return x && 'y' in {y: 1}; }
+            *g() { yield 'x' in {x: 1}; }
+            get x() { return 'x' in {x: 1}; }
+            set x(o) { out.push('x' in o); }
+        }, f = (x = 'x' in {x: 1}) => { return x && 'y' in {y: 1}; },
+        g = (x = 'x' in {x: 1}) => x; false;) {}
+        var instance = new C();
+        instance.x = {x: 1};
+        out.push(C.field, instance.field, instance.m(), instance.g().next().value,
+                 instance.x, f(), g());
+        out.length === 9 && out.every(x => x === true);
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(1);
+        match engine
+            .eval(source, false)
+            .expect("function boundaries parse")
+        {
+            Completion::Value(value) => assert_eq!(value, "true", "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+#[test]
 fn non_decimal_number_literals_are_not_machine_word_bounded() {
     // ECMA-262 §12.9.3 computes the mathematical value without a u64-sized
     // ceiling, then rounds it to Number. Steam ships the first literal below.
