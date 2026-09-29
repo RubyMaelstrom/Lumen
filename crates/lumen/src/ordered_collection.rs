@@ -165,7 +165,7 @@ impl OrderedCollection {
         // BigInt again, or probing the table again, has no semantic purpose. The ordered
         // entries and live cursors remain authoritative (ECMA-262 §24.1.3.9 / §24.2.4.1).
         let key = match key {
-            Value::Num(n) if n == 0.0 => Value::Num(0.0),
+            Value::Num(n) => Value::Num(if n == 0.0 { 0.0 } else { n }),
             key => key,
         };
         let hash = key_hash(&key);
@@ -366,6 +366,13 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
         Value::Str(value) => {
             state.write_u8(6);
             value.hash(&mut state);
+            // Fx's byte loop still leaves clustered low bits for fixed-width suffixes.
+            // Fold the high half into the low half before and after an odd multiply.
+            // This bijection retains collisions among strings while using one multiply
+            // for a digest that already accumulated all string bytes and its delimiter.
+            let hash = state.finish();
+            let hash = (hash ^ (hash >> 32)).wrapping_mul(0xd6e8_feb8_6659_fd93);
+            return hash ^ (hash >> 32);
         }
         Value::Sym(value) => {
             state.write_u8(7);
@@ -377,10 +384,10 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
         }
     }
     // The table masks the LOW hash bits to choose its initial bucket. Fx's
-    // multiply/rotate accumulation (and the index's second multiplication)
-    // does not move the high bits of a final word down: thousands of ordinary
+    // multiply/rotate accumulation does not move the high bits of a final word
+    // down: thousands of ordinary
     // integer-valued f64 keys otherwise all start at the same table bucket.
-    // Avalanche the complete tagged digest so every input bit reaches both
+    // Avalanche fixed-width/BigInt tagged digests so every input bit reaches both
     // bucket selection and the high-bit control-byte fingerprint. This
     // bijective 64-bit finalizer changes neither equality nor true collisions;
     // Bucket::find still proves SameValueZero, and ordered entries/cursors are
@@ -451,6 +458,38 @@ mod tests {
                         "count={count} scale={scale} sign={sign}: {occupied} occupied buckets, largest={longest}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_collection_string_hash_distributes_common_prefixes_and_suffixes() {
+        use std::hash::BuildHasher;
+
+        // Check the actual bucket mapping: retaining the byte-hash path must not
+        // trade string lookup cost for the numeric clustering defect repaired above.
+        let data = OrderedCollection::new(CollectionKind::Map);
+        for count in [128usize, 1024, 4096] {
+            for family in 0..4 {
+                let mut occupancy = vec![0usize; count * 2];
+                for index in 0..count {
+                    let text = match family {
+                        0 => format!("key-{index:08}"),
+                        1 => format!("common prefix for a collection key {index:08}"),
+                        2 => format!("{index:08} common suffix for a collection key"),
+                        _ => format!("é中🦀-{index:08}-é中🦀"),
+                    };
+                    let hash = key_hash(&Value::from_string(text));
+                    let bucket =
+                        data.index.hasher().hash_one(hash) as usize & (occupancy.len() - 1);
+                    occupancy[bucket] += 1;
+                }
+                let occupied = occupancy.iter().filter(|&&length| length != 0).count();
+                let longest = occupancy.iter().copied().max().unwrap();
+                assert!(
+                    occupied > count / 2 && longest < 16,
+                    "count={count} family={family}: {occupied} occupied buckets, largest={longest}"
+                );
             }
         }
     }

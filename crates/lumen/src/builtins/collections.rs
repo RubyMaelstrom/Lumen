@@ -15,9 +15,9 @@ pub(super) fn install_collections(it: &mut Interp) {
         let proto = Object::new(it.extra_protos.get("%IteratorPrototype%").cloned());
         set_to_string_tag(it, &proto, tag);
         let next: NativeFn = if tag == "Set Iterator" {
-            |i, this, _| map_set_iter_next(i, this, CollectionKind::Set)
+            set_iter_next
         } else {
-            |i, this, _| map_set_iter_next(i, this, CollectionKind::Map)
+            map_iter_next
         };
         it.def_method(&proto, "next", 0, next);
         it.extra_protos.insert(key, proto);

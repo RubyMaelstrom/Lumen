@@ -298,6 +298,7 @@ fn prepared_reference_own_exotic_host_and_exhausted_shapes_withdraw_hints() {
         crate::interpreter::HostIndexedProperties {
             length: 0,
             getter: Value::Undefined,
+            live: None,
         },
     );
     assert!(!engine

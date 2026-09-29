@@ -22,10 +22,14 @@ fn assert_published_registration_invariant() {
         for _ in 0..MAX_RESIDENT_ENTRIES {
             if let Some(index) = directory.inspect(&mut cursor) {
                 if let Some(state) = directory.get(index).upgrade() {
-                    assert!(matches!(
+                    let registered = matches!(
                         *state.code.borrow(),
                         CodeState::Pending | CodeState::Resident(_)
-                    ));
+                    );
+                    #[cfg(feature = "optimizing-jit")]
+                    let registered =
+                        registered || matches!(*state.code.borrow(), CodeState::Retiring(_));
+                    assert!(registered);
                     assert_eq!(state.registration.get(), index as u32);
                 }
                 seen += 1;
@@ -260,6 +264,8 @@ fn dead_weak_backing_is_censused_and_retires_only_outside_the_borrow() {
     drop(state);
     let census = shared_metadata_json();
     assert!(census.contains("\"dead_entries\":1"));
+    assert!(census.contains("\"scope\":\"current_thread_shared_cache\""));
+    assert!(census.contains("\"evictions\":0"));
     assert!(census.contains(&format!(
         "\"dead_slot_value_payload_bytes\":{}",
         std::mem::size_of::<SlotState>()
@@ -307,7 +313,104 @@ fn code(referenced: bool) -> Rc<JitCode> {
             active: Cell::new(0),
             referenced: Cell::new(u8::from(referenced)),
         }),
+        #[cfg(feature = "optimizing-jit")]
+        call_stubs: Vec::new(),
+        #[cfg(feature = "optimizing-jit")]
+        optimizing_diagnostics: None,
     })
+}
+
+#[cfg(all(
+    feature = "optimizing-jit",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[test]
+fn shared_call_code_is_credited_only_when_its_last_owner_retires() {
+    let mut engine = crate::Engine::new();
+    let body = crate::parser::parse_script("function subject(f){return f(1);}", false)
+        .ok()
+        .unwrap();
+    let crate::ast::Stmt::FuncDecl(function) = &body[0] else {
+        panic!("function")
+    };
+    let chunk = crate::bytecode::compile(function).unwrap();
+    let values = crate::value::jit_layout(&engine.interp.object_proto);
+    let interp = crate::interpreter::interp_layout(&mut engine.interp);
+    let stub = super::super::call_stub::prepare(&chunk, &values, &interp)
+        .pop()
+        .expect("ARM64 stub");
+    let shared_bytes = stub.executable_bytes();
+    let weak = Rc::downgrade(&stub);
+    let mut first = code(false);
+    let mut second = code(false);
+    Rc::get_mut(&mut first)
+        .unwrap()
+        .call_stubs
+        .push(stub.clone());
+    Rc::get_mut(&mut second).unwrap().call_stubs.push(stub);
+    let first_bytes = first.len;
+    let second_bytes = second.len;
+    let mut retired = Retirement::default();
+    assert_eq!(retired.push_code(first), first_bytes);
+    assert_eq!(retired.push_code(second), second_bytes + shared_bytes);
+    assert!(
+        weak.upgrade().is_some(),
+        "retirement cannot unmap inside the registry borrow"
+    );
+    retired.finish();
+    assert!(
+        weak.upgrade().is_none(),
+        "weak directory does not retain executable storage"
+    );
+}
+
+#[cfg(all(
+    feature = "optimizing-jit",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[test]
+fn shared_stub_reclamation_does_not_evict_an_unneeded_body() {
+    let _registry = IsolatedRegistry::new(3);
+    let mut engine = crate::Engine::new();
+    let body = crate::parser::parse_script("function subject(f){return f(1);}", false)
+        .ok()
+        .unwrap();
+    let crate::ast::Stmt::FuncDecl(function) = &body[0] else {
+        panic!("function")
+    };
+    let chunk = crate::bytecode::compile(function).unwrap();
+    let values = crate::value::jit_layout(&engine.interp.object_proto);
+    let interp = crate::interpreter::interp_layout(&mut engine.interp);
+    let stub = super::super::call_stub::prepare(&chunk, &values, &interp)
+        .pop()
+        .unwrap();
+    let shared_bytes = stub.executable_bytes();
+    let weak = Rc::downgrade(&stub);
+    let first = NativeCodeSlot::new();
+    let second = NativeCodeSlot::new();
+    let spare = NativeCodeSlot::new();
+    let mut first_code = code(false);
+    let mut second_code = code(false);
+    let required = first_code.len + second_code.len + shared_bytes;
+    Rc::get_mut(&mut first_code)
+        .unwrap()
+        .call_stubs
+        .push(stub.clone());
+    Rc::get_mut(&mut second_code).unwrap().call_stubs.push(stub);
+    first.begin_compile().unwrap().commit(Some(first_code));
+    second.begin_compile().unwrap().commit(Some(second_code));
+    spare.begin_compile().unwrap().commit(Some(code(false)));
+    REGISTRY.with(|registry| registry.borrow_mut().cursor = 0);
+    reclaim(required);
+    assert!(first.get().is_none());
+    assert!(second.get().is_none());
+    assert!(
+        spare.get().flatten().is_some(),
+        "the last shared owner already satisfies the byte request"
+    );
+    assert!(weak.upgrade().is_none());
 }
 
 #[cfg(all(
@@ -472,7 +575,7 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
     use crate::{Completion, Engine};
     use std::sync::atomic::Ordering::Relaxed;
     fn eval(e: &mut Engine, source: &str) -> String {
-        match e.eval(source, false).ok().expect("fixture parses") {
+        match e.eval(source, false).expect("fixture parses") {
             Completion::Value(value) => value,
             Completion::Throw { name, message } => panic!("{name}: {message}"),
         }

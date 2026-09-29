@@ -293,3 +293,93 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
         );
     }
 }
+
+#[test]
+fn named_expression_unused_self_environment_is_elided_without_changing_identity() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(evaluate(&mut engine,
+            "var named=function unused(value){return value+1};[named.name,named.length,named(3)].join('|')"),
+            "unused|1|4");
+        let env = engine.interp.global_env.clone();
+        let value = engine
+            .interp
+            .get_var("named", &env)
+            .unwrap_or_else(|_| panic!("named"));
+        let object = value.as_obj().unwrap();
+        let weak = std::rc::Rc::downgrade(object);
+        let enabled = std::env::var("LUMEN_ELIDE_SELF_ENV").as_deref() != Ok("0");
+        {
+            let borrowed = object.borrow();
+            let crate::value::Callable::User(user) = &borrowed.call else {
+                panic!("user function")
+            };
+            assert_eq!(user.env.borrow().vars.get("unused").is_none(), enabled);
+            // Activation scans run after creation; their cache must not erase the self query.
+            user.func.scan_flags();
+            assert_eq!(user.func.needs_self_environment(), !enabled);
+        }
+        drop(value);
+        evaluate(&mut engine, "named=null;");
+        if enabled {
+            assert!(
+                weak.upgrade().is_none(),
+                "unused self binding kept a cycle alive"
+            );
+        }
+        engine.interp.gc_collect();
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
+fn named_expression_self_environment_keeps_nested_patterns_eval_and_classes() {
+    let source = r#"
+        var recursive=function Self(n){return n?Self(n-1):Self};
+        var parameter=function Self([x=Self]=[]){return x};
+        var key=function Self({[Self.name]:x}={Self:7}){return x};
+        var nested=function Self(){return function(){return Self}};
+        var arrow=function Self(){return ()=>Self};
+        var evaluated=function Self(){return function(){return (eval)('Self')}};
+        var withEnv=function Self(){with({})return eval('Self')};
+        var klass=function Self(){return class{field=Self;get value(){return Self}}};
+        var C=klass(),instance=new C;
+        [recursive(3)===recursive,parameter()===parameter,key(),nested()()===nested,
+         arrow()()===arrow,evaluated()()===evaluated,withEnv()===withEnv,
+         instance.field===klass,instance.value===klass].join('|')
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(&mut engine, source),
+            "true|true|7|true|true|true|true|true|true",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
+fn named_expression_self_environment_elision_preserves_outer_closure_and_constructor() {
+    let source = r#"
+        function make(value){return function Unused(delta){return value+delta}}
+        var one=make(10),two=make(20);
+        var C=function Named(value){this.value=value};
+        var a=new C(7),b=new C(8);
+        [one(1),two(1),one!==two,a.value,b.value,a instanceof C,b instanceof C,
+         C.prototype.constructor===C,one.name,two.name].join('|')
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(&mut engine, source),
+            "11|21|true|7|8|true|true|true|Unused|Unused",
+            "{tier:?}"
+        );
+    }
+}

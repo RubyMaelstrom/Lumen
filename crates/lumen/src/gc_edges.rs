@@ -390,6 +390,7 @@ mod tests {
             HostIndexedProperties {
                 length: 0,
                 getter: Value::Undefined,
+                live: None,
             },
         );
         engine

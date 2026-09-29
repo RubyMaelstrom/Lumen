@@ -457,13 +457,13 @@ fn json_str(
                         .collect(),
                     None => {
                         let mut keys = Vec::new();
-                        let own_keys = ordinary_own_keys_ordered(i, o);
+                        let own_keys = ordinary_own_keys_ordered(i, o)?;
                         for key in own_keys
                             .into_iter()
                             .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
                         {
                             let enumerable = if ab(i.host_indexed_own_value(o, &key))?.is_some() {
-                                true
+                                crate::value::canonical_index(&key).is_some()
                             } else {
                                 o.borrow()
                                     .props

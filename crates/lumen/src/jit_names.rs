@@ -97,7 +97,10 @@ fn emit_deep_name_target_ptr(
     a.bind(holder_slot);
     if layout.scope_small_valid {
         a.ldrb_imm(13, 9, layout.scope_small_tag as u32);
-        a.cbnz(13, false, slow);
+        a.cmp_imm_w(13, 1);
+        a.b_cond(C_EQ, slow);
+        a.cmp_imm_w(13, 2);
+        a.b_cond(C_HI, slow);
         a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
         a.ldr_imm(14, 9, (layout.scope_small_vec + layout.vec_len_off) as u32);
         a.cmp_reg_x(13, 14);

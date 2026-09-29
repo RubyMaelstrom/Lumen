@@ -126,7 +126,12 @@ pub(super) fn install_reflect(it: &mut Interp) {
         if let Some(value) = ab(i.host_indexed_own_value(&o, &key))? {
             return Ok(descriptor_from_prop(
                 i,
-                Property::data(value, false, true, true),
+                Property::data(
+                    value,
+                    false,
+                    crate::value::canonical_index(&key).is_some(),
+                    true,
+                ),
             ));
         }
         // A proxy's [[GetOwnProperty]] goes through its getOwnPropertyDescriptor trap.
@@ -164,6 +169,9 @@ pub(super) fn install_reflect(it: &mut Interp) {
                     .is_some_and(|index| index < i.host_indexed_len(&o).unwrap_or(0));
                 return Ok(Value::Bool(!supported));
             }
+            if ab(i.host_named_visible(&o, &key))? {
+                return Ok(Value::Bool(false));
+            }
             let configurable = o
                 .borrow()
                 .props
@@ -198,7 +206,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         };
         // Spec [[OwnPropertyKeys]] order: array-index keys ascending, then string keys (insertion
         // order), then symbol keys (insertion order) — exactly what `ordered_keys` produces.
-        let ordered = ordinary_own_keys_ordered(i, &o);
+        let ordered = ordinary_own_keys_ordered(i, &o)?;
         for k in ordered {
             if Interp::is_sym_key(&k) {
                 if let Some(s) = i.sym_from_key(&k) {

@@ -426,7 +426,10 @@ pub(crate) struct Visitor {
     classes: HashSet<usize>,
     chunks: HashSet<usize>,
     jit_codes: HashSet<usize>,
+    #[cfg(feature = "optimizing-jit")]
+    jit_call_stubs: HashSet<usize>,
     hoist_plans: HashSet<usize>,
+    binding_layouts: HashSet<usize>,
     stmt_bodies: HashSet<usize>,
     global_var_name_sets: HashSet<usize>,
     re_texts: HashSet<usize>,
@@ -824,7 +827,23 @@ impl Visitor {
                 self.props(prototype_map);
             }
         }
+        if let Some(layouts) = function.env_layouts.get() {
+            bytes = bytes.saturating_add(size_of::<
+                [std::cell::OnceCell<Rc<crate::interpreter::BindingLayout>>; 2],
+            >());
+            for layout in layouts.iter().filter_map(std::cell::OnceCell::get) {
+                self.binding_layout(layout);
+            }
+        }
         self.add_function_bytecode_bytes(bytes);
+    }
+
+    pub(crate) fn binding_layout(&mut self, layout: &Rc<crate::interpreter::BindingLayout>) {
+        if self.binding_layouts.insert(Rc::as_ptr(layout) as usize) {
+            let bytes = layout.retained_memory(self);
+            self.add_function_bytecode_bytes(bytes);
+            self.function_bytecode_opaque_storage = true;
+        }
     }
 
     pub(crate) fn class(&mut self, class: &Rc<crate::ast::Class>) {
@@ -883,6 +902,12 @@ impl Visitor {
         let identity = Rc::as_ptr(code) as usize;
         if self.jit_codes.insert(identity) {
             self.add_jit_heap_metadata_bytes(code.retained_heap_metadata_bytes());
+            #[cfg(feature = "optimizing-jit")]
+            for (identity, bytes) in code.shared_call_metadata() {
+                if self.jit_call_stubs.insert(identity) {
+                    self.add_jit_heap_metadata_bytes(bytes);
+                }
+            }
         }
     }
 
@@ -944,21 +969,36 @@ impl Visitor {
             }
         }
         self.callable(&object.call);
+        let mut internal_bytes = 0;
         match &object.exotic {
             Exotic::StrWrap(value) => self.value(&Value::Str((**value).clone())),
             Exotic::SymWrap(value) => self.symbol(value),
             Exotic::BigIntWrap(value) => self.value(&Value::BigInt((**value).clone())),
             Exotic::Error(value) => self.rc_str(value),
+            Exotic::ArrayIterator(state) => {
+                internal_bytes = std::mem::size_of_val(&**state);
+                self.value(&state.target);
+            }
+            Exotic::StringIterator(state) => {
+                internal_bytes = std::mem::size_of_val(&**state);
+                if let Some(string) = &state.string {
+                    self.value(&Value::Str(string.clone()));
+                }
+            }
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
             | Exotic::NumWrap(_)
             | Exotic::Arguments => {}
         }
-        object.props.retained_requested_storage_bytes()
+        let (bytes, exact) = object.props.retained_requested_storage_bytes();
+        (bytes.saturating_add(internal_bytes), exact)
     }
 
     fn scope(&mut self, scope: &Scope) -> (usize, bool) {
+        if let Some(layout) = scope.vars.shared_layout() {
+            self.binding_layout(layout);
+        }
         let (mut bytes, exact) = scope.vars.retained_requested_storage_bytes();
         bytes = bytes.saturating_add(scope.lexical_names.retained_requested_storage_bytes());
         for (name, binding) in scope.vars.iter() {
@@ -1738,6 +1778,15 @@ fn scan_realm(
     }
     for properties in interp.host_indexed.values() {
         visitor.value(&properties.getter);
+        if let Some(live) = &properties.live {
+            totals
+                .interpreter_side_tables
+                .add(size_of::<crate::interpreter::HostIndexedLive>() + 2 * size_of::<usize>());
+            visitor.value(&live.state);
+            if let Some(getter) = &live.named_getter {
+                visitor.value(getter);
+            }
+        }
     }
     for value in interp.template_cache.values() {
         visitor.value(value);
@@ -3216,6 +3265,7 @@ mod tests {
             crate::interpreter::HostIndexedProperties {
                 length: 1,
                 getter: Value::str("host indexed getter payload"),
+                live: None,
             },
         );
         engine
@@ -3522,5 +3572,77 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(chunk);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[cfg(all(
+        feature = "optimizing-jit",
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    #[test]
+    fn shared_native_call_metadata_is_counted_once_across_bodies() {
+        const CHILD: &str = "LUMEN_TEST_SHARED_STUB_MEMORY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory::tests::shared_native_call_metadata_is_counted_once_across_bodies",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LUMEN_OPT_JIT", "1")
+                .env_remove("LUMEN_JIT_NO_DIRECT_CALLS")
+                .env_remove("LUMEN_OPT_JIT_CALL_STUBS")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut engine = crate::Engine::new();
+        let body = crate::parser::parse_script("function subject(f){return f(1);}", false)
+            .ok()
+            .unwrap();
+        let crate::ast::Stmt::FuncDecl(function) = &body[0] else {
+            panic!("function")
+        };
+        let chunk = crate::bytecode::compile(function).unwrap();
+        let values = crate::value::jit_layout(&engine.interp.object_proto);
+        let interp = crate::interpreter::interp_layout(&mut engine.interp);
+        let compile = || {
+            let crate::jit::JitCompileOutcome::Compiled(code) =
+                crate::jit::compile_profiled(&chunk, &values, &interp)
+            else {
+                panic!("optimizing body");
+            };
+            Rc::new(code)
+        };
+        let first = compile();
+        let second = compile();
+        let first_shared: Vec<_> = first.shared_call_metadata().collect();
+        let second_shared: Vec<_> = second.shared_call_metadata().collect();
+        assert_eq!(first_shared.len(), 1);
+        assert_eq!(
+            first_shared, second_shared,
+            "identical emitted contracts share one allocation"
+        );
+        let mut visitor = Visitor::default();
+        visitor.jit_code(&first);
+        visitor.jit_code(&second);
+        let expected = first.retained_heap_metadata_bytes()
+            + second.retained_heap_metadata_bytes()
+            + first_shared[0].1;
+        assert_eq!(visitor.jit_heap_metadata, expected);
+        assert_eq!(visitor.jit_call_stubs.len(), 1);
+        visitor.jit_code(&first);
+        visitor.jit_code(&second);
+        assert_eq!(
+            visitor.jit_heap_metadata, expected,
+            "revisits must not double-charge code or its stubs"
+        );
     }
 }

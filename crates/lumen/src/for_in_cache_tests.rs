@@ -24,7 +24,6 @@ fn backing(engine: &mut Engine, source: &Value) -> Value {
 fn owned_value(engine: &mut Engine, source: &str) -> Value {
     engine
         .eval_value(source)
-        .ok()
         .expect("parse")
         .ok()
         .expect("evaluate")

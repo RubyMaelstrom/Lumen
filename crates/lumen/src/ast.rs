@@ -508,6 +508,10 @@ pub struct Function {
     /// per closure instance instead of rebuilt insert by insert, so key hashing and shape
     /// transitions are paid once per FUNCTION rather than once per closure.
     pub fn_maps: std::cell::OnceCell<(crate::value::Props, Option<crate::value::Props>)>,
+    /// Actual parameter/body key layouts observed before tier-up. Each cache is
+    /// bounded to one layout; eval-dependent alternatives keep dynamic storage.
+    pub(crate) env_layouts:
+        std::cell::OnceCell<Box<[std::cell::OnceCell<Rc<crate::interpreter::BindingLayout>>; 2]>>,
 }
 
 /// One pre-scanned hoisting action for a statement list, replayed against a scope at function
@@ -1029,6 +1033,8 @@ pub const SCAN_THIS: u8 = 8;
 /// (a benchmark driver's `while (elapsed < 1000)`), so waiting for a call-count threshold leaves
 /// the hottest code on the tree-walker.
 pub const SCAN_HAS_LOOP: u8 = 16;
+const SCAN_SELF_DONE: u8 = 32;
+const SCAN_SELF_NEEDED: u8 = 64;
 
 /// Does this statement list itself own a loop? Nested functions and class static
 /// blocks execute through separate entries and must not make a cold Script hot.
@@ -1099,6 +1105,30 @@ pub(crate) fn statement_list_has_own_loop(body: &[Stmt]) -> bool {
 }
 
 impl Function {
+    /// Select code for a new invocation; live activations retain their own chunk.
+    /// ECMA-262 e28783d5, Execution Contexts / PrepareForOrdinaryCall: changing a
+    /// later entry must not replace an existing invocation's evaluation state.
+    /// A failed specialization reuses the already warmed primary template. Its
+    /// immutable second-stage slot still prevents repeated speculative attempts.
+    #[inline]
+    pub(crate) fn execution_code(&self) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
+        let upgraded = self.code2.get();
+        #[cfg(feature = "optimizing-jit")]
+        if let Some(Some(chunk)) = upgraded {
+            if chunk.optimizing_candidate
+                && chunk.optimizing_misses.get() >= crate::bytecode::SPECIALIZATION_MISS_LIMIT
+                && self.code.get().is_some_and(Option::is_some)
+            {
+                // Dispatch selects the warmed primary without polling or dismantling the
+                // retired mapping. Its bytes remain charged to the bounded executable cache;
+                // pressure or destruction reclaims it after active frames and leases finish.
+                // This keeps native lifetime maintenance out of every later function call.
+                return self.code.get();
+            }
+        }
+        upgraded.or_else(|| self.code.get())
+    }
+
     /// What this function's own activation must provide: whether the body (or a nested arrow, or a
     /// possible direct `eval`) can observe `arguments`, `new.target`, or `this`. Ordinary nested
     /// functions are opaque (they get their own); arrows are transparent. Conservative on the
@@ -1116,8 +1146,29 @@ impl Function {
             }
         }
         scan_stmts(&self.body, &mut flags);
-        self.scan.set(flags);
+        self.scan
+            .set(flags | (cached & (SCAN_SELF_DONE | SCAN_SELF_NEEDED)));
         flags
+    }
+
+    /// Cache the conservative self-binding query on shared source, never per
+    /// closure. The analysis has a finite syntax budget and retains on doubt.
+    pub(crate) fn needs_self_environment(&self) -> bool {
+        if !self.is_fn_expr || self.name.is_none() {
+            return false;
+        }
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("LUMEN_ELIDE_SELF_ENV").as_deref() != Ok("0")) {
+            return true;
+        }
+        let cached = self.scan.get();
+        if cached & SCAN_SELF_DONE != 0 {
+            return cached & SCAN_SELF_NEEDED != 0;
+        }
+        let needed = crate::bytecode::named_self_binding_may_be_observed(self);
+        self.scan
+            .set(cached | SCAN_SELF_DONE | if needed { SCAN_SELF_NEEDED } else { 0 });
+        needed
     }
 }
 

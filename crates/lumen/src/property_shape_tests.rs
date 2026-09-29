@@ -8,7 +8,6 @@ use crate::{bytecode::Tier, Completion, Engine};
 fn value(engine: &mut Engine, source: &str) -> Value {
     engine
         .eval_value(source)
-        .ok()
         .expect("parse")
         .ok()
         .expect("evaluate")
@@ -153,7 +152,13 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
     props.elem_mode.set(true);
     props.insert("length", Property::plain(Value::Num(12.0)));
     for index in 0..12 {
-        props.insert(index.to_string(), Property::plain(Value::Num(index as f64)));
+        // Keep the original classic-storage regression covered when the normal
+        // array builder now selects keyless elements.
+        let slot = props.entries.len();
+        props
+            .entries
+            .push((index_key(index), Property::plain(Value::Num(index as f64))));
+        props.note_inserted(slot);
     }
     props.insert("named", Property::plain(Value::Num(37.0)));
     assert!(props.entries.len() > INDEX_THRESHOLD);

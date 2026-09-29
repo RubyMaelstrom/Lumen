@@ -4,15 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# A from-scratch JavaScript engine. The implementation is std-only except for native segmented
-# stack switching: ordinary ECMAScript execution contexts must not be limited by the Rust thread
-# stack. The engine is exercised by the Test262 runner and exposes an optional embedding API for
+# A from-scratch JavaScript engine. Native segmented stack switching keeps ordinary ECMAScript
+# execution contexts independent of the Rust thread stack. The optional whole-function backend
+# uses Cranelift, at the same revision as TRust's WebAssembly backend. The engine is exercised by
+# the Test262 runner and exposes an optional embedding API for
 # independent runtimes; it does not assume a particular downstream JavaScript host.
 
 [dependencies]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 stacker = "0.1.24"
+
+[target.'cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
+# Keep these in lockstep with TRust/vendor/wasmi-1.1.0. This opt-in feature requires Rust 1.95;
+# it does not add a Wasmtime runtime or replace Lumen's GC, JS semantics, or W^X code ownership.
+cranelift-codegen = { version = "=0.135.2", optional = true }
+cranelift-frontend = { version = "=0.135.2", optional = true }
+cranelift-native = { version = "=0.135.2", optional = true }
 
 [features]
 default = ["intl"]
@@ -28,10 +36,16 @@ embed = []
 # Exposes internal compilation stages (`lumen::bench_api`) for the `internals` benchmark. Not a
 # stability commitment — for measurement only.
 bench = []
+# Allocation/call-cache observations compiled out of ordinary engine builds.
+architecture-diagnostics = []
 # Opt-in central-heap handle bridge used by migration tests. It records one checked handle per
 # live object while the existing `Rc<RefCell<Object>>` graph remains authoritative; never enabled
 # by the default production build until relocation and differential gates are complete.
 heap-bridge = []
+# Under development: explicit opt-in for whole-function code generation and conformance work.
+# Runtime activation additionally requires LUMEN_OPT_JIT=1. Not a production tier-selection
+# default until JS specialization, deoptimization, and application-level regression gates pass.
+optimizing-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-native"]
 
 [lints]
 workspace = true

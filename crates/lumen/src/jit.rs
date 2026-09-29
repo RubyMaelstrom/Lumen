@@ -47,6 +47,22 @@ mod names;
 #[path = "jit_profiler.rs"]
 mod profiler;
 
+#[cfg(feature = "optimizing-jit")]
+#[path = "jit_call_stub.rs"]
+mod call_stub;
+
+#[cfg(feature = "optimizing-jit")]
+#[path = "jit_optimizing_diagnostics.rs"]
+mod optimizing_diagnostics;
+
+#[cfg(all(
+    feature = "optimizing-jit",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "jit_optimizing.rs"]
+mod optimizing;
+
 #[path = "jit_cache.rs"]
 pub(crate) mod cache;
 
@@ -112,6 +128,13 @@ mod loop_latch_tests;
 ))]
 #[path = "jit_regions.rs"]
 mod regions;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_operations.rs"]
+mod operations;
 
 #[cfg(all(
     target_arch = "aarch64",
@@ -810,8 +833,23 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     let (code_used, code_limit, code_denials) = executable_code_stats();
     let workload_metrics = crate::workload_metrics::json_fields();
     let cache_metadata = cache::shared_metadata_json();
+    // Read an existing counter only when diagnostics are requested; no extra per-call work.
+    // This epoch is process-wide, unlike the thread-owned native residency registry.
+    let call_ic_epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
+    #[cfg(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    let optimizing_metrics = optimizing::metrics_json();
+    #[cfg(not(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
+    let optimizing_metrics = "null";
     let code_metrics = format!(
-        "\"executable_code_live_bytes\":{code_used},\"executable_code_limit_bytes\":{code_limit},\"executable_code_budget_denials\":{code_denials},\"native_cache_thread_metadata\":{cache_metadata},{workload_metrics}"
+        "\"executable_code_live_bytes\":{code_used},\"executable_code_limit_bytes\":{code_limit},\"executable_code_budget_denials\":{code_denials},\"call_ic_process_epoch\":{call_ic_epoch},\"native_cache_thread_metadata\":{cache_metadata},\"optimizing_jit\":{optimizing_metrics},{workload_metrics}"
     );
     Some(format!(
         "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},{code_metrics},\"managed_memory\":{managed_memory},\"native_by_operation\":{native_by_op}}}",
@@ -1433,6 +1471,9 @@ impl Drop for ExecutableBuffer {
 pub(crate) enum NativeEntryKind {
     FreshFrame,
     BorrowedFrame,
+    /// Continues a current ordinary native invocation at one guarded boundary.
+    #[cfg(feature = "optimizing-jit")]
+    OptimizingContinuation,
 }
 
 /// A finished JIT compilation and validated bytecode-to-machine landing maps.
@@ -1464,6 +1505,14 @@ pub struct JitCode {
     /// Stable native-entry counter and CLOCK reference bit. The code embeds its
     /// address; keep the allocation alive until after the mapping is unmapped.
     residency: Box<cache::CodeResidency>,
+    /// Shared native call machinery is pinned by every referring body. An active body cannot
+    /// be reclaimed, so no return PC in an outlined call stub can outlive its executable owner.
+    #[cfg(feature = "optimizing-jit")]
+    call_stubs: Vec<Rc<call_stub::SharedCallStub>>,
+    /// Optional diagnostic counters outlive every native instruction referring to them.
+    /// The diagnostic directory is weak and cannot extend this code's residency.
+    #[cfg(feature = "optimizing-jit")]
+    optimizing_diagnostics: Option<Rc<optimizing_diagnostics::Code>>,
 }
 
 impl Drop for JitCode {
@@ -1482,7 +1531,7 @@ impl JitCode {
     /// Heap-requested metadata only. The executable mapping is intentionally excluded and remains
     /// visible through the independent generated-code byte metric.
     pub(crate) fn retained_heap_metadata_bytes(&self) -> usize {
-        std::mem::size_of::<JitCode>()
+        let bytes = std::mem::size_of::<JitCode>()
             .saturating_add(std::mem::size_of::<cache::CodeResidency>())
             .saturating_add(
                 self.pc_offsets
@@ -1490,7 +1539,25 @@ impl JitCode {
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(self.resume_depths.capacity() * std::mem::size_of::<Option<usize>>())
-            .saturating_add(self.osr_entry_depths.capacity() * std::mem::size_of::<Option<usize>>())
+            .saturating_add(
+                self.osr_entry_depths.capacity() * std::mem::size_of::<Option<usize>>(),
+            );
+        #[cfg(feature = "optimizing-jit")]
+        let bytes = bytes.saturating_add(
+            self.call_stubs.capacity() * std::mem::size_of::<Rc<call_stub::SharedCallStub>>(),
+        );
+        #[cfg(feature = "optimizing-jit")]
+        let bytes = bytes.saturating_add(self.optimizing_diagnostics.as_ref().map_or(0, |_| {
+            std::mem::size_of::<optimizing_diagnostics::Code>() + 2 * std::mem::size_of::<usize>()
+        }));
+        bytes
+    }
+
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) fn shared_call_metadata(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.call_stubs
+            .iter()
+            .map(|stub| (Rc::as_ptr(stub) as usize, stub.retained_metadata_bytes()))
     }
 
     /// The machine-code entry address (for CallIc fills — the direct-call sequence branches
@@ -1668,6 +1735,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_complete as *const () as usize,
         crate::bytecode::jit_slice_op as *const () as usize,
         crate::bytecode::jit_reference_op as *const () as usize,
+        optimizing_loop_enter as *const () as usize,
     ]
 }
 
@@ -1782,7 +1850,9 @@ pub const H_GET_ELEM: usize = H_GET_METHOD_ELEM;
 pub const H_COMPLETE: usize = 29;
 pub const H_SLICE_OP: usize = 30;
 pub const H_REFERENCE_OP: usize = 31;
-pub const N_HELPERS: usize = 32;
+#[cfg(feature = "optimizing-jit")]
+pub const H_OPT_LOOP: usize = 32;
+pub const N_HELPERS: usize = 33;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -1820,6 +1890,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "complete",
     "slice_op",
     "reference_op",
+    "optimizing_loop",
 ];
 
 #[inline]
@@ -2026,6 +2097,11 @@ pub const COND_PEEK_TRUTHY: u32 = 1;
 #[cfg_attr(all(test, not(target_arch = "x86_64")), allow(dead_code))]
 #[cfg(any(
     test,
+    all(
+        feature = "optimizing-jit",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ),
     all(
         target_arch = "x86_64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -3356,6 +3432,28 @@ fn compile_entry(
         a.movz(9, u32::from(chunk.jit_is_strict()), 0);
         a.strb_imm(9, strict_base, strict_off);
     }
+    #[cfg(feature = "optimizing-jit")]
+    if !borrowed_entry {
+        if let Some(counter) = optimizing::hot_counter(chunk) {
+            let done = a.new_label();
+            a.mov_imm64(9, counter as usize as u64);
+            a.ldr_w_imm(10, 9, 0);
+            a.cbz(10, false, done);
+            a.sub_imm(10, 10, 1);
+            a.str_w_imm(10, 9, 0);
+            a.cbnz(10, false, done);
+            // Fresh entry owns canonical locals and an empty operand stack. Compilation may
+            // reclaim other mappings, but the residency mark above protects this invocation.
+            a.str_imm(20, 19, std::mem::offset_of!(JitCtx, final_sp) as u32);
+            a.mov(0, 19);
+            a.mov_imm64(
+                16,
+                optimizing::request_hot_upgrade as *const () as usize as u64,
+            );
+            a.blr(16);
+            a.bind(done);
+        }
+    }
     if borrowed_entry {
         // The Rust entry validates the bytecode PC and its settled stack before dispatch.
         a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, resume_pc) as u32);
@@ -3445,6 +3543,24 @@ fn compile_entry(
         a.bind(pc_labels[pc]);
         if interrupt_targets[pc] {
             emit_interrupt_poll(&mut a, ilayout, l_unwind);
+            #[cfg(feature = "optimizing-jit")]
+            if !borrowed_entry {
+                if let Some(counter) = optimizing::loop_entry::counter(chunk, pc) {
+                    let done = a.new_label();
+                    a.mov_imm64(9, counter as usize as u64);
+                    a.ldr_w_imm(10, 9, 0);
+                    a.cbz(10, false, done);
+                    a.sub_imm(10, 10, 1);
+                    a.str_w_imm(10, 9, 0);
+                    a.cbnz(10, false, done);
+                    emit_helper(&mut a, H_OPT_LOOP, pc as u32);
+                    a.cbz(1, true, done);
+                    a.cmp_imm_x(1, 1);
+                    a.b_cond(C_EQ, l_ret_ok);
+                    a.b(l_ret_throw);
+                    a.bind(done);
+                }
+            }
         }
         if skip > 0 {
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
@@ -3602,6 +3718,7 @@ fn compile_entry(
                         function_call_intrinsic_on,
                         l_unwind,
                         l_direct_finish,
+                        entry_kind,
                     );
                     if emission.profitable() && emission.bytes <= 128 * 1024 - region_copy_bytes {
                         region_copy_bytes += emission.bytes;
@@ -3640,6 +3757,7 @@ fn compile_entry(
                     function_call_intrinsic_on,
                     l_unwind,
                     l_direct_finish,
+                    entry_kind,
                 );
                 let added = emission.bytes;
                 if !emission.profitable() || added > 128 * 1024 - region_copy_bytes {
@@ -3865,6 +3983,20 @@ fn compile_entry(
                 continue;
             }
         }
+        if operations::emit(
+            &mut a,
+            chunk,
+            layout,
+            ilayout,
+            pc,
+            fast,
+            array_intrinsics_on,
+            function_call_intrinsic_on,
+            l_unwind,
+            l_direct_finish,
+        ) {
+            continue;
+        }
         match op {
             Op::Jump(t) => {
                 if chunk.jit_detailed_feedback_enabled() && (*t as usize) <= pc {
@@ -3954,15 +4086,6 @@ fn compile_entry(
             | Op::DisposeJump => {
                 unreachable!("resource-disposal ops are rejected before JIT emission")
             }
-            Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_) => {
-                if fast & 8192 == 0
-                    || !names::emit_reference_op(
-                        &mut a, layout, ilayout, chunk, op, pc as u32, l_unwind,
-                    )
-                {
-                    emit_op_helper(&mut a, H_REFERENCE_OP, pc as u32, l_unwind);
-                }
-            }
             Op::PushWith | Op::PopEnv => {
                 emit_exec(&mut a, pc as u32, l_unwind);
             }
@@ -3975,318 +4098,6 @@ fn compile_entry(
             }
             Op::Await | Op::Yield | Op::YieldStar => {
                 unreachable!("suspending chunks are rejected above")
-            }
-            // ---- inline property cache: shape-validated read (`this.x`, proto constants) ----
-            Op::GetProp(n, cache) if fast & 256 != 0 && get_method_inlinable(layout) => {
-                let arr_ok = !chunk
-                    .jit_name(*n)
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|b| b.is_ascii_digit());
-                emit_prop_load_inline(
-                    &mut a,
-                    layout,
-                    ilayout,
-                    chunk.jit_cache_ptr(*cache),
-                    chunk.jit_cache_preferred(*cache),
-                    chunk.jit_name(*n),
-                    pc as u32,
-                    l_unwind,
-                    false,
-                    arr_ok,
-                    PropRecv::Stack,
-                );
-            }
-            // Receiver-direct reads (`this.x`, `slotlocal.x`): the receiver never crosses the
-            // operand stack and needs no refcounting (the frame owns it).
-            Op::GetPropThis(n, cache) if fast & 256 != 0 && get_method_inlinable(layout) => {
-                let arr_ok = !chunk
-                    .jit_name(*n)
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|b| b.is_ascii_digit());
-                emit_prop_load_inline(
-                    &mut a,
-                    layout,
-                    ilayout,
-                    chunk.jit_cache_ptr(*cache),
-                    chunk.jit_cache_preferred(*cache),
-                    chunk.jit_name(*n),
-                    pc as u32,
-                    l_unwind,
-                    false,
-                    arr_ok,
-                    PropRecv::This,
-                );
-            }
-            Op::GetPropLocal(s, n, cache)
-                if fast & 256 != 0
-                    && get_method_inlinable(layout)
-                    && (*s as u32) * 8 + 8 < 4096 =>
-            {
-                let arr_ok = !chunk
-                    .jit_name(*n)
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|b| b.is_ascii_digit());
-                emit_prop_load_inline(
-                    &mut a,
-                    layout,
-                    ilayout,
-                    chunk.jit_cache_ptr(*cache),
-                    chunk.jit_cache_preferred(*cache),
-                    chunk.jit_name(*n),
-                    pc as u32,
-                    l_unwind,
-                    false,
-                    arr_ok,
-                    PropRecv::Slot(*s as u32 * 8),
-                );
-            }
-            Op::ToPropKey | Op::ToPropKeyLocal(_) if fast & 64 != 0 => {
-                // A Num or Str key passes through untouched (the overwhelmingly common case);
-                // anything else — real coercion plus the nullish-base check — takes the helper.
-                let slow = a.new_label();
-                let done = a.new_label();
-                let not_number = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -8);
-                emit_exec_number_guard(&mut a, 9, 0, 10, not_number);
-                a.b(done);
-                a.bind(not_number);
-                emit_exec_tag_guard(&mut a, 9, crate::value::PACK_STR, 10, slow);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::Dup if fast & 64 != 0 && rc_ok => {
-                // Copy the top value; refcounted payloads bump inline, BigInt takes the helper.
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -8);
-                emit_exec_clone(&mut a, layout, 9, 10, 11, slow);
-                emit_exec_word_store(&mut a, 9, 20, 0);
-                a.add_imm(20, 20, 8);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::LoadThis if fast & 32768 != 0 && rc_ok => {
-                // `this_raw` is deliberately a wide host-boundary Value; encode before
-                // acquiring the compact operand owner. BigInt uses the checked helper.
-                let slow = a.new_label();
-                let done = a.new_label();
-                a.ldr_imm(9, 19, 48); // ctx.this_raw
-                a.ldr_imm(10, 9, 0);
-                a.ldr_imm(11, 9, 8);
-                emit_exec_encode_wide(&mut a, 10, 11, 12, 13, 14, 0, slow);
-                emit_exec_clone(&mut a, layout, 12, 13, 14, slow);
-                emit_exec_word_store(&mut a, 12, 20, 0);
-                a.add_imm(20, 20, 8);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            // ---- inline free-name cache (`width` in a hot loop body) ----
-            Op::LoadName(_, cache) if fast & 8192 != 0 && load_name_inlinable(layout) => {
-                emit_load_name_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_name_cache_ptr(*cache),
-                    chunk.jit_name_number(*cache),
-                    pc as u32,
-                    l_unwind,
-                    false,
-                );
-            }
-            Op::LoadNameForCall(_, cache) if fast & 8192 != 0 && load_name_inlinable(layout) => {
-                emit_load_name_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_name_cache_ptr(*cache),
-                    chunk.jit_name_number(*cache),
-                    pc as u32,
-                    l_unwind,
-                    true,
-                );
-            }
-            Op::UpdateNameCached(_, cache, kind)
-                if fast & 8192 != 0 && update_name_inlinable(layout) =>
-            {
-                emit_update_name_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_name_cache_ptr(*cache),
-                    *kind,
-                    pc as u32,
-                    l_unwind,
-                );
-            }
-            Op::StoreNameCached(_, cache) if fast & 8192 != 0 && update_name_inlinable(layout) => {
-                emit_store_name_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_name_cache_ptr(*cache),
-                    pc as u32,
-                    l_unwind,
-                );
-            }
-            // Captured bindings use the same guarded scope-entry cache as free names, but are
-            // keyed by interned name because resolution is always in the current activation.
-            // Fresh/recursive activations miss the raw env comparison once and refill safely.
-            Op::LoadCap(name)
-                if fast & 8192 != 0
-                    && load_name_inlinable(layout)
-                    && !chunk.jit_needs_activation_state() =>
-            {
-                emit_load_name_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_cap_cache_ptr(*name),
-                    None,
-                    pc as u32,
-                    l_unwind,
-                    false,
-                );
-            }
-            Op::StoreCap(name)
-                if fast & 8192 != 0
-                    && update_name_inlinable(layout)
-                    && !chunk.jit_needs_activation_state() =>
-            {
-                emit_store_name_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_cap_cache_ptr(*name),
-                    pc as u32,
-                    l_unwind,
-                );
-            }
-            Op::MakeRegExp(..) => {
-                emit_op_helper(&mut a, H_MAKE_REGEXP, pc as u32, l_unwind);
-            }
-            // ---- inline dense-element fast paths (`a[i]` on plain objects/arrays) ----
-            Op::GetElem if fast & 1024 != 0 && get_elem_inlinable(layout) => {
-                emit_get_elem_inline(&mut a, layout, pc as u32, l_unwind);
-            }
-            Op::SetElemDrop if fast & 2048 != 0 && elem_inlinable(layout) => {
-                emit_set_elem_inline(&mut a, layout, pc as u32, l_unwind, false);
-            }
-            Op::SetElem if fast & 4096 != 0 && elem_inlinable(layout) => {
-                emit_set_elem_inline(&mut a, layout, pc as u32, l_unwind, true);
-            }
-            // ---- fused parameter-slot element ops (no receiver stack traffic or refcounting) ----
-            Op::GetElemLocal(slot)
-                if fast & 1024 != 0
-                    && get_elem_inlinable(layout)
-                    && (*slot as u32) * 8 + 8 < 4096 =>
-            {
-                emit_elem_local_inline(
-                    &mut a,
-                    layout,
-                    *slot as u32 * 8,
-                    pc as u32,
-                    l_unwind,
-                    ElemLocalKind::Get,
-                );
-            }
-            Op::SetElemLocalDrop(slot)
-                if fast & 2048 != 0
-                    && elem_inlinable(layout)
-                    // Packed local stores are enabled with the complete numeric-loop pipeline.
-                    // In reduced diagnostic masks, mixing this baseline store with helper-side
-                    // name/element state can violate Navier's aliasing checksum; the old wide
-                    // property layout remains independently safe.
-                    && (layout.entry_accessor != layout.entry_value + 8
-                        || fast & (1024 | 8192 | 32768 | 262144)
-                            == (1024 | 8192 | 32768 | 262144))
-                    && (*slot as u32) * 8 + 8 < 4096 =>
-            {
-                emit_elem_local_inline(
-                    &mut a,
-                    layout,
-                    *slot as u32 * 8,
-                    pc as u32,
-                    l_unwind,
-                    ElemLocalKind::SetDrop,
-                );
-            }
-            Op::SetElemLocal(slot)
-                if fast & 4096 != 0 && elem_inlinable(layout) && (*slot as u32) * 8 + 8 < 4096 =>
-            {
-                emit_elem_local_inline(
-                    &mut a,
-                    layout,
-                    *slot as u32 * 8,
-                    pc as u32,
-                    l_unwind,
-                    ElemLocalKind::SetKeep,
-                );
-            }
-            // ---- inline property cache: method load (`obj.m(...)`) ----
-            Op::GetMethod(n, cache) if fast & 512 != 0 && get_method_inlinable(layout) => {
-                let arr_ok = !chunk
-                    .jit_name(*n)
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|b| b.is_ascii_digit());
-                emit_prop_load_inline(
-                    &mut a,
-                    layout,
-                    ilayout,
-                    chunk.jit_cache_ptr(*cache),
-                    chunk.jit_cache_preferred(*cache),
-                    chunk.jit_name(*n),
-                    pc as u32,
-                    l_unwind,
-                    true,
-                    arr_ok,
-                    PropRecv::Stack,
-                );
-            }
-            // ---- inline compact execution-word fast paths ----
-            Op::Add if fast & 1 != 0 => {
-                let strings = a.new_label();
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -16);
-                emit_exec_word_load(&mut a, 10, 20, -8);
-                emit_exec_number_guard(&mut a, 9, 0, 11, strings);
-                emit_exec_number_guard(&mut a, 10, 1, 11, slow);
-                a.f_arith(0, 0, 0, 1);
-                emit_exec_number_store(&mut a, 0, 20, -16, 11);
-                a.sub_imm(20, 20, 8);
-                a.b(done);
-                a.bind(strings);
-                emit_exec_tag_guard(&mut a, 9, crate::value::PACK_STR, 11, slow);
-                emit_exec_tag_guard(&mut a, 10, crate::value::PACK_STR, 11, slow);
-                emit_op_helper(&mut a, H_ADD_STRINGS, pc as u32, l_unwind);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::Sub | Op::Mul | Op::Div if fast & 1 != 0 => {
-                let f_op = match op {
-                    Op::Sub => 1,
-                    Op::Mul => 2,
-                    _ => 3,
-                };
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -16);
-                emit_exec_word_load(&mut a, 10, 20, -8);
-                emit_exec_number_guard(&mut a, 9, 0, 11, slow);
-                emit_exec_number_guard(&mut a, 10, 1, 11, slow);
-                a.f_arith(f_op, 0, 0, 1);
-                emit_exec_number_store(&mut a, 0, 20, -16, 11);
-                a.sub_imm(20, 20, 8);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
             }
             // Int32 ops on primitive numbers/booleans: ToInt32 = truncate + wrap to 32 bits.
             // ECMA-262 ToNumeric/ToNumber maps primitive false/true to 0/1 without user code.
@@ -4342,281 +4153,6 @@ fn compile_entry(
                 emit_exec(&mut a, pc as u32, l_unwind);
                 a.bind(done);
             }
-            // Unary ToInt32 + complement. Keep the same exactness/saturation proof as the
-            // binary int templates: fcvtzs gives us the modulo source only when its i64 result
-            // round-trips to the truncated input. NaN, infinities, huge numbers, objects and
-            // BigInts retain the generic coercion/throw path.
-            Op::BitNot if fast & 1 != 0 => {
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -8);
-                emit_exec_number_guard(&mut a, 9, 0, 10, slow);
-                a.fcvtzs_x_d(9, 0);
-                a.scvtf_d_x(1, 9);
-                a.frintz(2, 0);
-                a.fcmp(1, 2);
-                a.b_cond(C_NE, slow);
-                a.cmn_imm_x(9, 1);
-                a.b_cond(C_VS, slow);
-                a.mvn_w(10, 9);
-                a.scvtf_d_w(0, 10);
-                a.stur_d(0, 20, -8);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq
-                if fast & 2 != 0 && eq_inlinable(layout) =>
-            {
-                emit_eq_inline(
-                    &mut a,
-                    layout,
-                    pc as u32,
-                    l_unwind,
-                    matches!(op, Op::StrictEq | Op::StrictNotEq),
-                    matches!(op, Op::NotEq | Op::StrictNotEq),
-                    None,
-                );
-            }
-            Op::InstanceOf(cache) if rc_ok && instanceof_inlinable(layout, ilayout) => {
-                emit_instanceof_inline(
-                    &mut a,
-                    layout,
-                    ilayout,
-                    chunk.jit_cache_ptr(*cache),
-                    pc as u32,
-                    l_unwind,
-                );
-            }
-            Op::Not if fast & 131072 != 0 && eq_inlinable(layout) => {
-                emit_not_inline(&mut a, layout, pc as u32, l_unwind);
-            }
-            Op::SetPropDrop(_, cache)
-                if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
-            {
-                emit_set_prop_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_cache_ptr(*cache),
-                    chunk.jit_name(match op {
-                        Op::SetPropDrop(n, _) => *n,
-                        _ => unreachable!(),
-                    }),
-                    pc as u32,
-                    l_unwind,
-                    PropRecv::Stack,
-                );
-            }
-            // Receiver-direct stores (`this.x = v`, `slotlocal.x = v`): the receiver never
-            // crosses the operand stack and needs no refcounting (the frame owns it).
-            Op::SetPropThisDrop(_, cache)
-                if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
-            {
-                emit_set_prop_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_cache_ptr(*cache),
-                    chunk.jit_name(match op {
-                        Op::SetPropThisDrop(n, _) => *n,
-                        _ => unreachable!(),
-                    }),
-                    pc as u32,
-                    l_unwind,
-                    PropRecv::This,
-                );
-            }
-            Op::SetPropLocalDrop(s, _, cache)
-                if fast & 65536 != 0
-                    && rc_ok
-                    && set_prop_inlinable(layout)
-                    && (*s as u32) * 8 + 8 < 4096 =>
-            {
-                emit_set_prop_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_cache_ptr(*cache),
-                    chunk.jit_name(match op {
-                        Op::SetPropLocalDrop(_, n, _) => *n,
-                        _ => unreachable!(),
-                    }),
-                    pc as u32,
-                    l_unwind,
-                    PropRecv::Slot(*s as u32 * 8),
-                );
-            }
-            Op::UpdateProp(_, cache, kind)
-                if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
-            {
-                emit_update_prop_inline(
-                    &mut a,
-                    layout,
-                    chunk.jit_cache_ptr(*cache),
-                    *kind,
-                    pc as u32,
-                    l_unwind,
-                );
-            }
-            Op::Lt
-            | Op::Gt
-            | Op::Le
-            | Op::Ge
-            | Op::StrictEq
-            | Op::StrictNotEq
-            | Op::EqEq
-            | Op::NotEq
-                if fast & 2 != 0 =>
-            {
-                // Number-number compare: FCMP + CSET with IEEE-correct conditions (unordered
-                // yields false for the ordered relations, true only for !=).
-                let cond = match op {
-                    Op::Lt => C_MI,
-                    Op::Gt => C_GT,
-                    Op::Le => C_LS,
-                    Op::Ge => C_GE,
-                    Op::StrictEq | Op::EqEq => C_EQ,
-                    _ => C_NE,
-                };
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -16);
-                emit_exec_word_load(&mut a, 10, 20, -8);
-                emit_exec_number_guard(&mut a, 9, 0, 11, slow);
-                emit_exec_number_guard(&mut a, 10, 1, 11, slow);
-                a.fcmp(0, 1);
-                a.cset_w(9, cond);
-                a.mov_imm64(10, crate::value::PACK_BOOL);
-                a.logic_x(1, 9, 9, 10);
-                emit_exec_word_store(&mut a, 9, 20, -16);
-                a.sub_imm(20, 20, 8);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::LoadLocal(slot) if fast & 8 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
-                let off = *slot as i32 * 8;
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 22, off);
-                a.mov_imm64(10, crate::value::PACK_EMPTY);
-                a.cmp_reg_x(9, 10); // Empty = TDZ throw → slow
-                a.b_cond(C_EQ, slow);
-                emit_exec_clone(&mut a, layout, 9, 10, 11, slow);
-                emit_exec_word_store(&mut a, 9, 20, 0);
-                a.add_imm(20, 20, 8);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::StoreLocal(slot) if fast & 16 != 0 && (*slot as u32) * 8 + 8 < 4096 => {
-                emit_store_local(
-                    &mut a,
-                    layout,
-                    *slot as u32 * 8,
-                    &[pc as u32],
-                    l_unwind,
-                    false,
-                    rc_ok,
-                );
-            }
-            Op::UpdateLocal(slot, kind) if fast & 32 != 0 && (*slot as u32) * 8 + 8 < 4096 => {
-                emit_update_local(&mut a, *slot, *kind, pc as u32, l_unwind);
-            }
-            Op::Pop if fast & 64 != 0 && rc_ok => {
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -8);
-                emit_exec_drop_shared(&mut a, layout, 9, 10, 11, slow);
-                a.sub_imm(20, 20, 8);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::Undef if fast & 128 != 0 => {
-                a.mov_imm64(9, crate::value::PACK_UNDEFINED);
-                emit_exec_word_store(&mut a, 9, 20, 0);
-                a.add_imm(20, 20, 8);
-            }
-            Op::Const(k) if fast & 128 != 0 && chunk.jit_const_copyable(*k) => {
-                a.mov_imm64(9, chunk.jit_const_packed_bits(*k)?);
-                emit_exec_word_store(&mut a, 9, 20, 0);
-                a.add_imm(20, 20, 8);
-            }
-            // String consts: copy the 16-byte Value from its stable chunk slot and bump the
-            // LStr strong count — parser-shaped code pushes literal strings millions of times
-            // (meriyah's token kinds, astring's syntax fragments).
-            Op::Const(k)
-                if fast & 128 != 0
-                    && rc_ok
-                    && layout.rc_strong_off == 0
-                    && chunk.jit_const_is_str(*k) =>
-            {
-                a.mov_imm64(9, chunk.jit_const_ptr(*k) as u64);
-                a.ldr_imm(11, 9, 8);
-                a.mov_imm64(10, crate::value::PACK_STR);
-                a.logic_x(1, 10, 10, 11);
-                emit_exec_word_store(&mut a, 10, 20, 0);
-                a.ldur(13, 11, 0); // strong (payload+0)
-                a.add_imm(13, 13, 1);
-                a.stur(13, 11, 0);
-                a.add_imm(20, 20, 8);
-            }
-            // TDZ entry: the slot becomes `Empty` (tag 1). The old value drops in place —
-            // trivially for tags < 5, by a bare shared-reference decrement for refcounted
-            // tags; a BigInt or a last reference re-runs the (idempotent) op via the helper.
-            // Destructuring nullish guard: a pure peek — tag not Undefined(0)/Null(2) falls
-            // through with no stack traffic; nullish re-runs the op via the helper, which
-            // throws the TypeError. Three instructions instead of 3.5M helper trips on
-            // destructuring-heavy parses.
-            Op::DestructureGuard => {
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 20, -8);
-                a.mov_imm64(10, crate::value::PACK_UNDEFINED);
-                a.cmp_reg_x(9, 10);
-                a.b_cond(C_EQ, slow);
-                a.mov_imm64(10, crate::value::PACK_NULL);
-                a.cmp_reg_x(9, 10);
-                a.b_cond(C_NE, done); // anything but Null
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            Op::Tdz(slot) if fast & 16 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
-                let off = *slot as i32 * 8;
-                let slow = a.new_label();
-                let done = a.new_label();
-                emit_exec_word_load(&mut a, 9, 22, off);
-                emit_exec_drop_shared(&mut a, layout, 9, 10, 11, slow);
-                a.mov_imm64(9, crate::value::PACK_EMPTY);
-                emit_exec_word_store(&mut a, 9, 22, off);
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
-            // Fused slot resets (spliced-callee var hoisting): plain tags overwrite in place
-            // with a single byte store; refcounted values (the receiver-array vars of a spliced
-            // bignum kernel, typically) decrement inline while shared. Only a last-reference
-            // drop (or a string-ish tag 5) re-runs the whole (idempotent) op via the helper.
-            Op::ResetSlots(start, count) if rc_ok && (*start as u32 + *count as u32) * 8 < 4096 => {
-                let slow = a.new_label();
-                let done = a.new_label();
-                for k in *start..*start + *count {
-                    let off = k as i32 * 8;
-                    emit_exec_word_load(&mut a, 9, 22, off);
-                    emit_exec_drop_shared(&mut a, layout, 9, 10, 11, slow);
-                    a.mov_imm64(9, crate::value::PACK_UNDEFINED);
-                    emit_exec_word_store(&mut a, 9, 22, off);
-                }
-                a.b(done);
-                a.bind(slow);
-                emit_exec(&mut a, pc as u32, l_unwind);
-                a.bind(done);
-            }
             // Speculative-inline guard: the callee (argc+1 deep) must be the pinned function —
             // a tag compare and a pointer compare; mismatch branches to the generic call.
             Op::InlineGuard(t, target) => {
@@ -4659,65 +4195,6 @@ fn compile_entry(
                         }
                     }
                 }
-            }
-            // Calls take the dedicated helper: same contract as the generic one, minus the full
-            // op dispatch (they dominate helper traffic in call-heavy code). With bit 524288,
-            // the way-1 identity probe runs inline first — callee payload vs the cached
-            // pointer, fill epoch vs the live CALL_IC_EPOCH, fill realm vs the activation's
-            // global root — and a hit takes the H_CALL_HIT helper, which skips the probe loop
-            // and op decode. Any mismatch (incl. an empty way: callee 0 matches no payload)
-            // falls to the full helper.
-            Op::Call(..) | Op::CallWithThis(..) => {
-                emit_call_inline(
-                    &mut a,
-                    chunk,
-                    layout,
-                    ilayout,
-                    pc,
-                    fast,
-                    array_intrinsics_on,
-                    function_call_intrinsic_on,
-                    l_unwind,
-                    l_direct_finish,
-                );
-            }
-            Op::MakeObject(..) => {
-                emit_op_helper(&mut a, H_MAKE_OBJECT, pc as u32, l_unwind);
-            }
-            Op::MakeArray(..) => {
-                emit_op_helper(&mut a, H_MAKE_ARRAY, pc as u32, l_unwind);
-            }
-            Op::New(argc, _) => {
-                // H_NEW needs only the pc for optional diagnostics and the statically encoded
-                // arity. Pack both so the million-call constructor path does not reload/decode
-                // its bytecode op in Rust.
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, *argc as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_NEW * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-            }
-            Op::SetProp(..)
-            | Op::SetPropDrop(..)
-            | Op::SetPropThisDrop(..)
-            | Op::SetPropLocalDrop(..) => {
-                emit_op_helper(&mut a, H_SET_PROP, pc as u32, l_unwind);
-            }
-            Op::GetProp(..) | Op::GetPropThis(..) | Op::GetPropLocal(..) | Op::GetMethod(..) => {
-                emit_op_helper(&mut a, H_GET_PROP, pc as u32, l_unwind);
-            }
-            Op::GetMethodElem => {
-                if fast & 1024 != 0 && get_method_inlinable(layout) && ilayout.valid {
-                    emit_computed_method_inline(&mut a, layout, ilayout, pc as u32, l_unwind);
-                } else {
-                    emit_op_helper(&mut a, H_GET_METHOD_ELEM, pc as u32, l_unwind);
-                }
-            }
-            Op::GetElem | Op::GetElemLocal(_) => {
-                emit_op_helper(&mut a, H_GET_ELEM, pc as u32, l_unwind);
             }
             _ => {
                 emit_exec(&mut a, pc as u32, l_unwind);
@@ -4906,6 +4383,10 @@ fn compile_entry(
             max_stack,
             executable,
             residency,
+            #[cfg(feature = "optimizing-jit")]
+            call_stubs: Vec::new(),
+            #[cfg(feature = "optimizing-jit")]
+            optimizing_diagnostics: None,
         })
     }
 }
@@ -5033,7 +4514,42 @@ pub(crate) fn compile_profiled(
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
 ) -> JitCompileOutcome {
-    compile_profiled_with(chunk, || compile(chunk, layout, ilayout))
+    compile_profiled_with(chunk, || {
+        #[cfg(all(
+            feature = "optimizing-jit",
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        ))]
+        if optimizing::selected(chunk) {
+            if let Some(code) = optimizing::compile(chunk, layout, ilayout) {
+                return Some(code);
+            }
+        }
+        compile(chunk, layout, ilayout)
+    })
+}
+
+/// Zero means no entry instrumentation. Sampled, benefit-based admission remains opt-in and
+/// never changes the production template tier when the feature or mode is disabled.
+#[cfg(feature = "optimizing-jit")]
+pub(crate) fn optimizing_hot_threshold(op_count: usize) -> u32 {
+    #[cfg(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    {
+        optimizing::hot_threshold(op_count)
+    }
+    #[cfg(not(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
+    {
+        let _ = op_count;
+        0
+    }
 }
 
 pub(crate) fn compile_borrowed_profiled(
@@ -5047,6 +4563,32 @@ pub(crate) fn compile_borrowed_profiled(
     compile_profiled_with(chunk, || {
         compile_entry(chunk, layout, ilayout, NativeEntryKind::BorrowedFrame)
     })
+}
+
+/// The flag is a continuation result, not the checked-helper throw flag:
+/// 0 keeps executing the template, 1/2 finish this invocation successfully/abruptly.
+unsafe extern "C" fn optimizing_loop_enter(
+    ctx: *mut JitCtx,
+    pc: u32,
+    sp: *mut PackedValue,
+) -> SpFlag {
+    #[cfg(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    {
+        optimizing::loop_entry::enter(ctx, pc, sp)
+    }
+    #[cfg(not(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
+    {
+        let _ = (ctx, pc);
+        SpFlag { sp, flag: 0 }
+    }
 }
 
 fn compile_profiled_with(
@@ -9467,6 +9009,8 @@ fn emit_name_ic_value_ptr(
     a.ldr_imm(10, 12, NAME_IC_OFF_ENV);
     let deep = a.new_label();
     let have = a.new_label();
+    let fixed_scope = a.new_label();
+    let binding_ready = a.new_label();
     // Classify the cache mode before choosing which scope's generation `gen` describes.
     a.ldr_w_imm(11, 9, sg);
     a.ldr_w_imm(13, 12, NAME_IC_OFF_GEN);
@@ -9520,11 +9064,38 @@ fn emit_name_ic_value_ptr(
     // checks live with/import/TDZ state; only mode dispatch has moved (ECMA-262 sec-getvalue,
     // sec-getidentifierreference). Empty or stale unrelated identities cannot reach it.
     a.bind(deep);
+    a.cmp_imm_x(10, crate::bytecode::FIXED_NAME_IC as u32);
+    a.b_cond(C_EQ, fixed_scope);
     a.cmp_imm_x(10, crate::bytecode::lexical_cache::DEEP_NAME_IC as u32);
     a.b_cond(C_NE, slow);
     a.ldr_imm(12, 12, NAME_IC_OFF_BINDING);
     names::emit_deep_name_value_ptr(a, layout, slow, packed_ok);
     a.b(have);
+    // Same published ordered layout, different activation allocation. Derive
+    // this invocation's Binding address; no previous invocation is retained.
+    a.bind(fixed_scope);
+    if layout.scope_small_valid {
+        a.cbz(13, false, slow); // layout ID zero never proves a slot
+        a.ldr_w_imm(11, 9, layout.scope_layout as u32);
+        a.cmp_reg_w(11, 13);
+        a.b_cond(C_NE, slow);
+        a.ldrb_imm(11, 9, layout.scope_small_tag as u32);
+        a.cmp_imm_w(11, 1); // reject Large; Small(0) and Indexed(2) share the probed vector
+        a.b_cond(C_EQ, slow);
+        a.cmp_imm_w(11, 2);
+        a.b_cond(C_HI, slow);
+        a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
+        a.ldr_imm(11, 9, (layout.scope_small_vec + layout.vec_len_off) as u32);
+        a.cmp_reg_x(14, 11);
+        a.b_cond(C_HS, slow);
+        a.ldr_imm(11, 9, (layout.scope_small_vec + layout.vec_ptr_off) as u32);
+        a.mov_imm64(15, layout.scope_binding_stride as u64);
+        a.madd(14, 14, 15, 11);
+        a.add_imm(14, 14, layout.scope_binding_offset as u32);
+        a.b(binding_ready);
+    } else {
+        a.b(slow);
+    }
     // --- direct scope mode: `gen` belongs to the current env ---
     a.bind(direct_scope);
     a.cmp_reg_w(11, 13);
@@ -9571,6 +9142,7 @@ fn emit_name_ic_value_ptr(
     // --- scope mode: binding initialized (TDZ) ---
     a.bind(scope);
     a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
+    a.bind(binding_ready);
     a.ldrb_imm(9, 14, bi);
     a.cbz(9, false, slow);
     a.ldrb_imm(9, 14, layout.binding_import as u32);

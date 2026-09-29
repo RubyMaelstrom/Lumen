@@ -680,6 +680,34 @@ pub(super) fn compile_entry(
         a.code.push(u8::from(chunk.jit_is_strict()));
     }
 
+    #[cfg(feature = "optimizing-jit")]
+    if !borrowed_entry {
+        if let Some(counter) = super::optimizing::hot_counter(chunk) {
+            let done = a.label();
+            a.bytes(&[0x48, 0xb8]); // movabs rax,counter
+            a.bytes(&(counter as usize as u64).to_le_bytes());
+            a.bytes(&[0x83, 0x38, 0x00]); // cmp dword [rax],0
+            a.jcc(0x84, done);
+            a.bytes(&[0x83, 0x28, 0x01]); // sub dword [rax],1
+            a.jcc(0x85, done);
+            a.bytes(&[0x4d, 0x89, 0xac, 0x24]); // ctx.final_sp = r13
+            a.bytes(&(std::mem::offset_of!(super::JitCtx, final_sp) as i32).to_le_bytes());
+            #[cfg(not(target_os = "windows"))]
+            a.bytes(&[0x4c, 0x89, 0xe7]); // rdi=ctx
+            #[cfg(target_os = "windows")]
+            a.bytes(&[0x48, 0x83, 0xec, 0x20, 0x4c, 0x89, 0xe1]); // shadow area; rcx=ctx
+            a.bytes(&[0x48, 0xb8]);
+            a.bytes(
+                &(super::optimizing::request_hot_upgrade as *const () as usize as u64)
+                    .to_le_bytes(),
+            );
+            a.bytes(&[0xff, 0xd0]); // call rax (void scalar C ABI)
+            #[cfg(target_os = "windows")]
+            a.bytes(&[0x48, 0x83, 0xc4, 0x20]);
+            a.bind(done);
+        }
+    }
+
     if borrowed_entry {
         // The shared slice entry validates resume_pc before exposing canonical storage to
         // machine code. Every x64 bytecode PC has an explicit label (no fused-away targets).
@@ -700,6 +728,25 @@ pub(super) fn compile_entry(
         pc_offsets.push(a.code.len() as u32);
         if interrupt_targets[pc] {
             a.interrupt_poll(interrupt_offset, unwind);
+            #[cfg(feature = "optimizing-jit")]
+            if !borrowed_entry {
+                if let Some(counter) = super::optimizing::loop_entry::counter(chunk, pc) {
+                    let done = a.label();
+                    a.mov_word_imm(counter as usize as u64);
+                    a.bytes(&[0x83, 0x38, 0x00]); // cmp dword [rax],0
+                    a.jcc(0x84, done);
+                    a.bytes(&[0xff, 0x08]); // dec dword [rax]
+                    a.jcc(0x85, done);
+                    a.call_helper_pair(super::H_OPT_LOOP, pc as u32);
+                    a.bytes(&[0x49, 0x89, 0xc5]); // r13=returned canonical sp
+                    a.bytes(&[0x48, 0x85, 0xd2]); // test rdx,rdx
+                    a.jcc(0x84, done);
+                    a.bytes(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx,1
+                    a.jcc(0x84, ret_ok);
+                    a.jmp(ret_throw);
+                    a.bind(done);
+                }
+            }
         }
         if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) {
             a.helper_spflag(H_SLICE_OP, pc as u32, ret_throw);
@@ -1081,9 +1128,7 @@ pub(super) fn compile_entry(
     epilogue(&mut a, false);
 
     let code = a.finish();
-    let Some(executable) = crate::jit::ExecutableBuffer::from_bytes(&code) else {
-        return None;
-    };
+    let executable = crate::jit::ExecutableBuffer::from_bytes(&code)?;
     let mem = executable.as_ptr() as *mut u8;
     let len = executable.len();
     Some(JitCode {
@@ -1107,6 +1152,10 @@ pub(super) fn compile_entry(
             .any(|o| matches!(o, Op::LoadName(..) | Op::LoadNameForCall(..))),
         executable,
         residency,
+        #[cfg(feature = "optimizing-jit")]
+        call_stubs: Vec::new(),
+        #[cfg(feature = "optimizing-jit")]
+        optimizing_diagnostics: None,
     })
 }
 

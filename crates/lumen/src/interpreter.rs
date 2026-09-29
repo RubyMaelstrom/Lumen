@@ -57,10 +57,12 @@ mod buffer_dirty_range_tests {
         record_buffer_write(&mut ranges, 5..7, 32);
         assert_eq!(ranges, [4..8, 12..16, 20..24]);
         record_buffer_write(&mut ranges, 8..20, 32);
-        assert_eq!(ranges, [4..24]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 4..24);
         record_buffer_write(&mut ranges, 0..4, 32);
         record_buffer_write(&mut ranges, 24..32, 32);
-        assert_eq!(ranges, [0..32]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..32);
     }
 
     #[test]
@@ -78,10 +80,12 @@ mod buffer_dirty_range_tests {
                 assert!(!dirty || ranges.iter().any(|range| range.contains(&byte)));
             }
         }
-        assert_eq!(ranges, [0..1024]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..1024);
         ranges.clear(); // Taking the dirty set restores exact tracking for the next batch.
         record_buffer_write(&mut ranges, 100..104, 1024);
-        assert_eq!(ranges, [100..104]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 100..104);
     }
 }
 
@@ -560,7 +564,7 @@ fn function_profile_enter(
             // In particular, do not call an author's getters or keep extra JS
             // roots alive. This distinguishes a slow caller from a callee whose
             // compiled entry is unavailable or ineligible for cached dispatch.
-            let compiled = func.code2.get().or_else(|| func.code.get());
+            let compiled = func.execution_code();
             let chunk = compiled.and_then(Option::as_ref);
             let code = chunk.and_then(|chunk| chunk.jit.get());
             let tier = match (compiled, chunk, code) {
@@ -670,6 +674,17 @@ pub struct AgentChannels {
 pub(crate) struct HostIndexedProperties {
     pub(crate) length: u32,
     pub(crate) getter: Value,
+    pub(crate) live: Option<Rc<HostIndexedLive>>,
+}
+
+/// Native membership queries are pure reads of host state: they must not run
+/// JavaScript, collect, or mutate the collection. The explicit state value is
+/// an ordinary traced edge, never an opaque Rust closure capturing JS roots.
+pub(crate) struct HostIndexedLive {
+    pub(crate) state: Value,
+    pub(crate) length: fn(&Interp, &Value) -> u32,
+    pub(crate) names: Option<fn(&Interp, &Value) -> Vec<String>>,
+    pub(crate) named_getter: Option<Value>,
 }
 
 /// Process-global backing store for SharedArrayBuffer memory, keyed by a unique id so it can be
@@ -1045,8 +1060,8 @@ impl Default for RegexpDependencyCache {
 pub struct VarMap {
     map: VarStorage,
     generation: std::cell::Cell<u32>,
-    /// Nonzero only after a fresh compiled activation publishes its fixed key
-    /// layout. Every structural mutation clears it, even replacement of a key.
+    /// Nonzero after a fully instantiated activation publishes its ordered key
+    /// layout. Changes to that key set or storage invalidate the proof.
     /// Binding values/TDZ flags remain live and are never part of this identity.
     layout_id: u32,
 }
@@ -1067,10 +1082,57 @@ fn allocate_binding_layout_id(next: &std::sync::atomic::AtomicU32) -> u32 {
 
 const SMALL_VAR_MAP_CAPACITY: usize = 8;
 
+pub(crate) fn indexed_activations_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LUMEN_INDEXED_ACTIVATIONS").as_deref() != Ok("0"))
+}
+
+/// Shared names and slot positions, with no binding values or environment owners.
+/// Created from a completed FunctionDeclarationInstantiation, so parameter eval
+/// and conditional constructor metadata cannot masquerade as a static key set.
+#[derive(Debug)]
+pub(crate) struct BindingLayout {
+    id: u32,
+    slots: crate::fasthash::FastMap<Rc<str>, usize>,
+}
+
+impl BindingLayout {
+    /// Reuse the instantiation plan's index instead of linearly scanning wide
+    /// activation vectors on checked/cold/reflective name reads. Values remain
+    /// private to each environment; only the immutable key-to-slot map is shared.
+    pub(crate) fn fixed(
+        id: u32,
+        slots: crate::fasthash::FastMap<Rc<str>, usize>,
+    ) -> Option<Rc<Self>> {
+        if id == 0 || slots.len() <= SMALL_VAR_MAP_CAPACITY || !indexed_activations_enabled() {
+            None
+        } else {
+            Some(Rc::new(Self { id, slots }))
+        }
+    }
+
+    pub(crate) fn retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        for name in self.slots.keys() {
+            visitor.rc_str(name);
+        }
+        // HashMap does not expose its bucket allocation; a lower bound.
+        std::mem::size_of::<Self>() + self.slots.len() * std::mem::size_of::<(Rc<str>, usize)>()
+    }
+}
+
+/// The vector is first so its native layout can share the Small storage path.
+/// The probe below verifies that fact against the actual Rust enum layout.
+#[repr(C)]
+struct IndexedBindings {
+    entries: Vec<(Rc<str>, Binding)>,
+    layout: Rc<BindingLayout>,
+}
+
 #[repr(u8)]
 enum VarStorage {
     Small(Vec<(std::rc::Rc<str>, Binding)>),
     Large(crate::fasthash::FastMap<std::rc::Rc<str>, Binding>),
+    Indexed(IndexedBindings),
 }
 
 impl Default for VarMap {
@@ -1129,12 +1191,111 @@ impl<'a> Iterator for VarValues<'a> {
 }
 
 impl VarMap {
+    /// Publish actual instantiated names, never assumptions about syntax. A
+    /// different eval-created key set retains the dynamic map. Moving entries
+    /// invalidates raw-pointer caches before any address can change.
+    pub(crate) fn share_layout(&mut self, cached: &std::cell::OnceCell<Rc<BindingLayout>>) {
+        if self.layout_id != 0 {
+            return;
+        }
+        let layout = cached.get_or_init(|| {
+            Rc::new(BindingLayout {
+                id: new_binding_layout_id(),
+                slots: self
+                    .keys()
+                    .enumerate()
+                    .map(|(slot, name)| (name.clone(), slot))
+                    .collect(),
+            })
+        });
+        if layout.id == 0
+            || self.keys().count() != layout.slots.len()
+            || self
+                .keys()
+                .any(|name| !layout.slots.contains_key(name.as_ref()))
+        {
+            return;
+        }
+        self.bump();
+        let mut entries = match std::mem::replace(&mut self.map, VarStorage::Small(Vec::new())) {
+            VarStorage::Small(entries) => entries,
+            VarStorage::Large(entries) => entries.into_iter().collect(),
+            VarStorage::Indexed(indexed) => indexed.entries,
+        };
+        // A linear permutation into the shared ordering, without cloning values
+        // or retaining an old activation. All names were validated above.
+        for slot in 0..entries.len() {
+            loop {
+                let target = layout.slots[entries[slot].0.as_ref()];
+                if target == slot {
+                    break;
+                }
+                entries.swap(slot, target);
+            }
+        }
+        self.map = VarStorage::Indexed(IndexedBindings {
+            entries,
+            layout: layout.clone(),
+        });
+        self.layout_id = layout.id;
+    }
+
+    pub(crate) fn shared_layout(&self) -> Option<&Rc<BindingLayout>> {
+        match &self.map {
+            VarStorage::Indexed(indexed) => Some(&indexed.layout),
+            _ => None,
+        }
+    }
+
+    /// A compiled activation has a complete ordered key set before execution.
+    /// Keep that set in stable slots even above the dynamic map's small-object
+    /// threshold. Structural writes still use `insert`/`remove` and invalidate
+    /// the published layout before changing or replacing this storage.
+    pub(crate) fn from_fixed_bindings(
+        entries: Vec<(Rc<str>, Binding)>,
+        layout: Option<&Rc<BindingLayout>>,
+    ) -> Self {
+        debug_assert!(entries
+            .iter()
+            .all(|(_, binding)| binding.import_ref.is_none()));
+        let map = if let Some(layout) = layout {
+            debug_assert_eq!(entries.len(), layout.slots.len());
+            debug_assert!(entries
+                .iter()
+                .enumerate()
+                .all(|(slot, (name, _))| layout.slots.get(name) == Some(&slot)));
+            VarStorage::Indexed(IndexedBindings {
+                entries,
+                layout: layout.clone(),
+            })
+        } else {
+            VarStorage::Small(entries)
+        };
+        Self {
+            map,
+            generation: std::cell::Cell::new(0),
+            layout_id: 0,
+        }
+    }
+
+    /// Before publication only: the initialization plan owns this exact slot.
+    pub(crate) fn initialize_fixed_value(&mut self, slot: usize, value: Value) {
+        debug_assert_eq!(self.layout_id, 0);
+        let entries = match &mut self.map {
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                entries
+            }
+            VarStorage::Large(_) => unreachable!("fresh compiled activation has fixed storage"),
+        };
+        entries[slot].1.value = value;
+    }
+
     /// Requested bytes owned directly by this binding map, plus whether the result is exact.
     /// `HashMap` bucket allocation sizes are intentionally reported as an incomplete lower bound
     /// because the standard library does not expose their requested layout.
     pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
         match &self.map {
-            VarStorage::Small(entries) => (
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => (
                 entries
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>()),
@@ -1191,44 +1352,76 @@ impl VarMap {
         self.layout_id
     }
 
-    /// Stable ordered slot within a small fixed-layout activation. A published layout proves
-    /// the ordered insertion plan; large hash maps deliberately use one final name lookup.
+    /// Stable ordered slot within an activation. A published layout proves its
+    /// ordered names; dynamic hash maps retain checked name lookup.
     pub(crate) fn binding_slot(&self, name: &str) -> Option<usize> {
         match &self.map {
             VarStorage::Small(entries) => entries.iter().position(|(key, _)| &**key == name),
             VarStorage::Large(_) => None,
+            VarStorage::Indexed(indexed) => indexed.layout.slots.get(name).copied(),
         }
     }
 
     pub(crate) fn binding_at(&self, slot: usize, name: &str) -> Option<&Binding> {
         match &self.map {
-            VarStorage::Small(entries) => entries
-                .get(slot)
-                .filter(|(key, _)| &**key == name)
-                .map(|(_, binding)| binding),
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                entries
+                    .get(slot)
+                    .filter(|(key, _)| &**key == name)
+                    .map(|(_, binding)| binding)
+            }
             VarStorage::Large(_) => None,
         }
     }
 
     pub(crate) fn binding_at_mut(&mut self, slot: usize, name: &str) -> Option<&mut Binding> {
         match &mut self.map {
-            VarStorage::Small(entries) => entries
-                .get_mut(slot)
-                .filter(|(key, _)| &**key == name)
-                .map(|(_, binding)| binding),
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                entries
+                    .get_mut(slot)
+                    .filter(|(key, _)| &**key == name)
+                    .map(|(_, binding)| binding)
+            }
             VarStorage::Large(_) => None,
         }
     }
 
-    /// Only the creator of a fresh, fully initialized fixed-key activation may
+    /// The caller has checked the same nonzero published ordered-layout ID.
+    pub(crate) fn fixed_binding_at(&self, slot: usize) -> Option<&Binding> {
+        match &self.map {
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                entries.get(slot).map(|(_, binding)| binding)
+            }
+            VarStorage::Large(_) => None,
+        }
+    }
+
+    pub(crate) fn fixed_binding_at_mut(&mut self, slot: usize) -> Option<&mut Binding> {
+        match &mut self.map {
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                entries.get_mut(slot).map(|(_, binding)| binding)
+            }
+            VarStorage::Large(_) => None,
+        }
+    }
+
+    /// Only the creator of a fresh, fully instantiated fixed-key activation may
     /// publish its plan's identity. Never publish on a reused/dynamic environment.
     pub(crate) fn publish_layout(&mut self, layout_id: u32) {
         self.layout_id = layout_id;
     }
     pub fn insert(&mut self, k: impl Into<std::rc::Rc<str>>, mut v: Binding) -> Option<Binding> {
         v.imported = v.import_ref.is_some();
-        self.bump();
         let k = k.into();
+        if let VarStorage::Indexed(indexed) = &mut self.map {
+            if let Some(&slot) = indexed.layout.slots.get(k.as_ref()) {
+                // InitializeBinding and same-name declaration replacement keep
+                // the key set and addresses. Native users read flags/values live.
+                self.generation.set(self.generation.get().saturating_add(1));
+                return Some(std::mem::replace(&mut indexed.entries[slot].1, v));
+            }
+        }
+        self.bump();
         match &mut self.map {
             VarStorage::Small(entries) => {
                 if let Some((_, old)) = entries.iter_mut().find(|(name, _)| **name == *k) {
@@ -1250,6 +1443,13 @@ impl VarMap {
                 old
             }
             VarStorage::Large(entries) => entries.insert(k, v),
+            VarStorage::Indexed(indexed) => {
+                let mut entries: crate::fasthash::FastMap<_, _> =
+                    std::mem::take(&mut indexed.entries).into_iter().collect();
+                let old = entries.insert(k, v);
+                self.map = VarStorage::Large(entries);
+                old
+            }
         }
     }
     pub fn remove(&mut self, k: &str) -> Option<Binding> {
@@ -1260,6 +1460,13 @@ impl VarMap {
                 .position(|(name, _)| &**name == k)
                 .map(|index| entries.swap_remove(index).1),
             VarStorage::Large(entries) => entries.remove(k),
+            VarStorage::Indexed(indexed) => {
+                let mut entries: crate::fasthash::FastMap<_, _> =
+                    std::mem::take(&mut indexed.entries).into_iter().collect();
+                let old = entries.remove(k);
+                self.map = VarStorage::Large(entries);
+                old
+            }
         }
     }
     pub fn clear(&mut self) {
@@ -1267,6 +1474,7 @@ impl VarMap {
         match &mut self.map {
             VarStorage::Small(entries) => entries.clear(),
             VarStorage::Large(entries) => entries.clear(),
+            VarStorage::Indexed(_) => self.map = VarStorage::Small(Vec::new()),
         }
     }
     /// In-place binding write: entries don't move, so the generation stays (see the type docs).
@@ -1277,6 +1485,10 @@ impl VarMap {
                 .find(|(name, _)| &**name == k)
                 .map(|(_, binding)| binding),
             VarStorage::Large(entries) => entries.get_mut(k),
+            VarStorage::Indexed(indexed) => {
+                let slot = *indexed.layout.slots.get(k)?;
+                Some(&mut indexed.entries[slot].1)
+            }
         }
     }
     pub fn get(&self, k: &str) -> Option<&Binding> {
@@ -1286,6 +1498,10 @@ impl VarMap {
                 .find(|(name, _)| &**name == k)
                 .map(|(_, binding)| binding),
             VarStorage::Large(entries) => entries.get(k),
+            VarStorage::Indexed(indexed) => {
+                let slot = *indexed.layout.slots.get(k)?;
+                Some(&indexed.entries[slot].1)
+            }
         }
     }
     pub fn contains_key(&self, k: &str) -> bool {
@@ -1293,19 +1509,25 @@ impl VarMap {
     }
     pub fn iter(&self) -> VarIter<'_> {
         match &self.map {
-            VarStorage::Small(entries) => VarIter::Small(entries.iter()),
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                VarIter::Small(entries.iter())
+            }
             VarStorage::Large(entries) => VarIter::Large(entries.iter()),
         }
     }
     pub fn keys(&self) -> VarKeys<'_> {
         match &self.map {
-            VarStorage::Small(entries) => VarKeys::Small(entries.iter()),
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                VarKeys::Small(entries.iter())
+            }
             VarStorage::Large(entries) => VarKeys::Large(entries.keys()),
         }
     }
     pub fn values(&self) -> VarValues<'_> {
         match &self.map {
-            VarStorage::Small(entries) => VarValues::Small(entries.iter()),
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                VarValues::Small(entries.iter())
+            }
             VarStorage::Large(entries) => VarValues::Large(entries.values()),
         }
     }
@@ -1337,6 +1559,18 @@ impl VarMap {
         let vector =
             entries as *const Vec<(Rc<str>, Binding)> as usize - &small as *const VarMap as usize;
         let binding = &entries[0].1 as *const Binding as usize - entries.as_ptr() as usize;
+        let mut indexed = Self::default();
+        indexed.insert("probe", Binding::data(Value::Num(7.0), true, true));
+        indexed.share_layout(&std::cell::OnceCell::new());
+        let indexed_tag = unsafe { *(&indexed.map as *const VarStorage as *const u8) };
+        let VarStorage::Indexed(indexed_bindings) = &indexed.map else {
+            return None;
+        };
+        let indexed_vector = &indexed_bindings.entries as *const Vec<(Rc<str>, Binding)> as usize
+            - &indexed as *const VarMap as usize;
+        if indexed_tag != 2 || indexed_vector != vector {
+            return None;
+        }
         Some((
             tag,
             vector,
@@ -1349,6 +1583,184 @@ impl VarMap {
 #[cfg(test)]
 mod binding_layout_tests {
     use super::*;
+
+    #[test]
+    fn cold_environment_layout_preserves_values_across_order_and_structural_changes() {
+        let cached = std::cell::OnceCell::new();
+        let mut first = VarMap::default();
+        let mut second = VarMap::default();
+        for n in 0..24 {
+            first.insert(
+                format!("v{n}"),
+                Binding::data(Value::Num(n as f64), true, true),
+            );
+            second.insert(
+                format!("v{}", 23 - n),
+                Binding::data(Value::Num((123 - n) as f64), true, true),
+            );
+        }
+        let before = first.generation();
+        first.share_layout(&cached);
+        second.share_layout(&cached);
+        assert!(
+            first.generation() > before,
+            "old raw pointers must fail before entries move"
+        );
+        let layout = first.layout_id();
+        assert_ne!(layout, 0);
+        assert_eq!(second.layout_id(), layout);
+        for n in 0..24 {
+            let name = format!("v{n}");
+            let slot = first.binding_slot(&name).unwrap();
+            assert_eq!(second.binding_slot(&name), Some(slot));
+            assert!(
+                matches!(second.fixed_binding_at(slot).unwrap().value, Value::Num(v) if v == (100+n) as f64)
+            );
+        }
+        let slot = first.binding_slot("v23").unwrap();
+        first.insert("v23", Binding::data(Value::Num(999.), false, false));
+        assert_eq!(
+            first.layout_id(),
+            layout,
+            "same names preserve the key proof"
+        );
+        let binding = first.fixed_binding_at(slot).unwrap();
+        assert!(!binding.mutable && !binding.initialized);
+        assert!(matches!(binding.value, Value::Num(999.)));
+        first.insert("dynamic", Binding::data(Value::Num(7.), true, true));
+        assert_eq!(first.layout_id(), 0);
+        first.share_layout(&cached);
+        assert_eq!(
+            first.layout_id(),
+            0,
+            "a different key set must not adopt the layout"
+        );
+        assert!(first.get("v23").is_some());
+        assert!(second.remove("v0").is_some());
+        assert_eq!(second.layout_id(), 0);
+        assert!(second.get("v0").is_none());
+        second.clear();
+        assert_eq!(second.keys().count(), 0);
+    }
+
+    fn evaluate(engine: &mut crate::Engine, source: &str) -> String {
+        match engine
+            .eval(source, false)
+            .expect("environment fixture parses")
+        {
+            crate::Completion::Value(value) => value,
+            crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+
+    fn closure_env(engine: &mut crate::Engine, name: &str) -> Env {
+        let global = engine.interp.global_env.clone();
+        let Value::Obj(object) = engine
+            .interp
+            .get_var(name, &global)
+            .ok()
+            .expect("closure exists")
+        else {
+            panic!("expected function object");
+        };
+        let result = match &object.borrow().call {
+            crate::value::Callable::User(user) => user.env.clone(),
+            _ => panic!("expected user closure"),
+        };
+        result
+    }
+
+    #[test]
+    fn cold_environment_closures_compile_later_without_recreating_bindings() {
+        for tier in [
+            crate::bytecode::Tier::Interp,
+            crate::bytecode::Tier::Bytecode,
+            crate::bytecode::Tier::Jit,
+        ] {
+            let mut engine = crate::Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(u32::MAX);
+            assert_eq!(
+                evaluate(
+                    &mut engine,
+                    r#"
+                function make(seed) {
+                    let a=seed,b=seed+1,c=seed+2,d=seed+3,e=seed+4,f=seed+5;
+                    let g=seed+6,h=seed+7,j=seed+8,k=seed+9,l=seed+10,m=seed+11;
+                    return {read:()=>a+b+c+d+e+f+g+h+j+k+l+m,write:()=>++a};
+                }
+                var first=make(1),second=make(10),one=first.read,two=second.read;
+                one()===78 && two()===186
+            "#
+                ),
+                "true"
+            );
+            let first = closure_env(&mut engine, "one");
+            let second = closure_env(&mut engine, "two");
+            if cold_environment_layouts_enabled() {
+                assert_ne!(first.borrow().vars.layout_id(), 0);
+                assert_eq!(
+                    first.borrow().vars.layout_id(),
+                    second.borrow().vars.layout_id()
+                );
+                assert!(first.borrow().vars.binding_slot("m").is_some());
+            }
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                evaluate(
+                    &mut engine,
+                    r#"
+                for(let n=0;n<40;n++) if((n&1?one:two)()!==(n&1?78:186)) throw 'wrong instance';
+                first.write(); one()===79 && two()===186
+            "#
+                ),
+                "true"
+            );
+            assert!(Rc::ptr_eq(&first, &closure_env(&mut engine, "one")));
+            first
+                .borrow_mut()
+                .vars
+                .insert("injected", Binding::data(Value::Num(7.), true, true));
+            assert_eq!(first.borrow().vars.layout_id(), 0);
+            assert_eq!(evaluate(&mut engine, "one()===79 && two()===186"), "true");
+            first.borrow_mut().vars.get_mut("m").unwrap().initialized = false;
+            assert_eq!(
+                evaluate(&mut engine, "try {one(); 'bad'} catch(e) {e.name}"),
+                "ReferenceError"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_environment_layouts_preserve_parameter_eval_arguments_and_tdz() {
+        for tier in [
+            crate::bytecode::Tier::Interp,
+            crate::bytecode::Tier::Bytecode,
+            crate::bytecode::Tier::Jit,
+        ] {
+            let mut engine = crate::Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                evaluate(
+                    &mut engine,
+                    r#"
+                function defaults(a, read=()=>a) { var a=9; return [read,()=>a]; }
+                function mapped(a) { var get=()=>a; arguments[0]=7; return [get,()=>++a,arguments]; }
+                function dynamic(a) { var get=()=>a+extra; eval('var extra=5'); return [get,()=>eval('extra=8')]; }
+                function early() { var read=()=>late; try { read(); } catch(e) { return e.name; } let late=1; }
+                function immutable() { const value=3; return ()=>{try {value=4} catch(e) {return e.name;}}; }
+                var d=defaults(2),m=mapped(1),e=dynamic(4),trace=[d[0](),d[1](),m[0]()];
+                m[1](); trace.push(m[2][0],e[0]()); e[1](); trace.push(e[0](),early(),immutable()());
+                var obj={x:5},read; with(obj) {read=()=>x;} obj.x=6; trace.push(read());
+                trace.join('|')
+            "#
+                ),
+                "2|9|7|8|9|12|ReferenceError|TypeError|6",
+                "{tier:?}"
+            );
+        }
+    }
 
     #[test]
     fn binding_layout_invalidates_every_structural_mutation_but_not_live_writes() {
@@ -1534,9 +1946,13 @@ pub fn new_var_scope(parent: Option<Env>) -> Env {
 }
 
 pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) -> Env {
+    new_var_scope_with_bindings(parent, VarMap::with_capacity(capacity))
+}
+
+pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
     let e = Rc::new(RefCell::new(Scope {
-        vars: VarMap::with_capacity(capacity),
+        vars,
         parent,
         with_obj: None,
         under_with,
@@ -3246,6 +3662,13 @@ impl Interp {
             .retain(|key, _| crate::modules::module_map_context(key) != context);
         self.module_recs
             .retain(|key, _| crate::modules::module_map_context(key) != context);
+        // HTML #discard-a-document releases settings/module roots independently
+        // of allocation pressure. Revisit that graph at the next safe boundary,
+        // rather than charging its eventual destruction to unrelated new work.
+        // ECMA-262 #sec-liveness / #sec-weakref-invariants still protect retained
+        // objects and the current job: this only coalesces a collection request,
+        // honoring the host's existing task deferral and ClearKeptObjects order.
+        self.gc_task_pending = true;
         true
     }
 
@@ -4771,8 +5194,52 @@ impl Interp {
         }
         self.gc_pin(&object);
         object.borrow().ic_plain.set(false);
+        self.host_indexed.insert(
+            ptr,
+            HostIndexedProperties {
+                length,
+                getter,
+                live: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Install a live Web IDL collection. Membership comes directly from a
+    /// native view, while values use the ordinary callable/realm/GC boundary.
+    /// Optional named properties are read-only and unenumerable, with ordinary
+    /// prototype/expando precedence (no LegacyOverrideBuiltIns).
+    ///
+    /// The membership functions must perform native reads only: no JavaScript
+    /// calls, JS allocations, collection, or observable state changes.
+    pub fn install_live_readonly_indexed_properties(
+        &mut self,
+        target: &Value,
+        state: Value,
+        length: fn(&Interp, &Value) -> u32,
+        getter: Value,
+        named: Option<(fn(&Interp, &Value) -> Vec<String>, Value)>,
+    ) -> Result<(), Value> {
+        if named
+            .as_ref()
+            .is_some_and(|(_, getter)| !getter.is_callable())
+        {
+            return Err(self.make_error("TypeError", "named-property getter must be callable"));
+        }
+        self.install_readonly_indexed_properties(target, 0, getter)?;
+        let (names, named_getter) = match named {
+            Some((names, getter)) => (Some(names), Some(getter)),
+            None => (None, None),
+        };
         self.host_indexed
-            .insert(ptr, HostIndexedProperties { length, getter });
+            .get_mut(&(Rc::as_ptr(target.as_obj().unwrap()) as usize))
+            .unwrap()
+            .live = Some(Rc::new(HostIndexedLive {
+            state,
+            length,
+            names,
+            named_getter,
+        }));
         Ok(())
     }
 
@@ -4845,6 +5312,13 @@ impl Interp {
     }
 
     pub fn make_array(&self, items: Vec<Value>) -> Value {
+        if items.len() <= 32 || crate::value::dense_elements_enabled() {
+            return Value::Obj(Object::new_with_parts(
+                Some(self.array_proto.clone()),
+                Props::packed_array_from_values(items),
+                Exotic::Array,
+            ));
+        }
         let obj = Object::new(Some(self.array_proto.clone()));
         let len = items.len();
         let numeric = items.iter().all(|v| matches!(v, Value::Num(_)));
@@ -4922,7 +5396,7 @@ impl Interp {
     /// `items` must point to `len` live, non-overlapping `PackedValue`s. This method consumes every
     /// value exactly once; the caller must reset its stack pointer to `items` before returning.
     pub(crate) unsafe fn make_array_from_raw(&self, items: *mut PackedValue, len: usize) -> Value {
-        if len <= 32 {
+        if len <= 32 || crate::value::dense_elements_enabled() {
             let obj = Object::new_with_parts(
                 Some(self.array_proto.clone()),
                 unsafe { Props::packed_array_from_raw(items, len) },
@@ -5191,6 +5665,11 @@ impl Interp {
     /// Shorthand for `op_state().get_mut::<T>()`.
     pub fn host_mut<T: std::any::Any>(&mut self) -> Option<&mut T> {
         self.host_state.get_mut()
+    }
+
+    /// Read-only native state access for non-reentrant platform membership queries.
+    pub fn host<T: std::any::Any>(&self) -> Option<&T> {
+        self.host_state.get()
     }
 
     /// Shorthand for `op_state().resources`.
@@ -5637,7 +6116,7 @@ impl Interp {
         // self-name environment ONCE, outside the activation, when the closure is created.
         // Retain it in [[Environment]] so all execution tiers and recursive calls share the
         // correct binding without allocating an extra scope on every call.
-        let self_env = if func.is_fn_expr && func.name.is_some() {
+        let self_env = if func.needs_self_environment() {
             Some(new_scope(Some(env.clone())))
         } else {
             None
@@ -5831,10 +6310,9 @@ impl Interp {
             return ok;
         }
         let no_index_keys = |g: &Gc| {
-            g.borrow().props.iter().all(|(k, _)| {
-                !k.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
-                    || crate::value::canonical_index(k).is_none()
-            })
+            // OrdinarySet must observe inherited indexed setters/data descriptors
+            // whether that prototype uses named entries or contiguous elements.
+            g.borrow().props.indexed_properties().next().is_none()
         };
         let ap = &self.array_proto;
         let op = &self.object_proto;
@@ -6803,7 +7281,12 @@ impl Interp {
         }
         self.host_indexed
             .get(&(Rc::as_ptr(object) as usize))
-            .map(|properties| properties.length)
+            .map(|properties| {
+                properties
+                    .live
+                    .as_ref()
+                    .map_or(properties.length, |live| (live.length)(self, &live.state))
+            })
     }
 
     /// Whether `key` is one of Web IDL's array-index property names on an indexed host object.
@@ -6825,14 +7308,20 @@ impl Interp {
         object: &Gc,
         key: &str,
     ) -> Result<Option<Value>, Abrupt> {
-        let Some(index) = crate::value::canonical_index(key) else {
+        // Installing platform-object internal methods clears this one-way
+        // ordinary-object proof. Avoid side-table/name probes for ordinary
+        // receivers, including every hop of their common property paths.
+        if object.borrow().ic_plain.get() {
             return Ok(None);
+        }
+        let Some(index) = crate::value::canonical_index(key) else {
+            return self.host_named_own_value(object, key);
         };
         let ptr = Rc::as_ptr(object) as usize;
         let Some(properties) = self.host_indexed.get(&ptr) else {
             return Ok(None);
         };
-        if index >= properties.length {
+        if index >= self.host_indexed_len(object).unwrap_or(0) {
             return Ok(None);
         }
         let getter = properties.getter.clone();
@@ -7003,7 +7492,11 @@ impl Interp {
                     }
                 }
                 // String wrapper (`new String(...)`/`Object("...")`): own indexed chars + `length`.
-                if let Exotic::StrWrap(s) = o.borrow().exotic.clone() {
+                let wrapped_string = match &o.borrow().exotic {
+                    Exotic::StrWrap(s) => Some((**s).clone()),
+                    _ => None,
+                };
+                if let Some(s) = wrapped_string {
                     if key == "length" {
                         if let Some(trace) = trace.as_deref_mut() {
                             trace.record(
@@ -7964,7 +8457,7 @@ impl Interp {
         // OrdinarySet ultimately creates an own property through the receiver's
         // [[DefineOwnProperty]]. A read-only Web IDL collection rejects every array-index key,
         // including currently unsupported indices.
-        if self.host_indexed_array_key(&obj, key) {
+        if self.host_indexed_array_key(&obj, key) || self.host_named_reject_define(&obj, key) {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.record(
                     crate::feedback::PropertyOutcome::Exotic,
@@ -8576,6 +9069,11 @@ impl Interp {
                 refs.push(p.clone());
             }
         }
+        // [[IteratedArrayLike]] is a graph edge owned by the iterator, even
+        // though it is deliberately absent from the ordinary property map.
+        if let Exotic::ArrayIterator(state) = &b.exotic {
+            Self::push_value_object(&state.target, refs);
+        }
         match &b.call {
             Callable::Bound(bound) => {
                 refs.push(bound.target.clone());
@@ -8646,6 +9144,12 @@ impl Interp {
         }
         if let Some(properties) = self.host_indexed.get(&ptr) {
             Self::push_value_object(&properties.getter, refs);
+            if let Some(live) = &properties.live {
+                Self::push_value_object(&live.state, refs);
+                if let Some(getter) = &live.named_getter {
+                    Self::push_value_object(getter, refs);
+                }
+            }
         }
         if let Some(promise) = self.promises.get(&ptr) {
             Self::push_value_object(&promise.value, refs);
@@ -8762,36 +9266,36 @@ impl Interp {
         // ordinary function/prototype makes closure churn pay for unrelated platform state.
         // Small dead sets keep directed removal; dense churn scans each table only once.
         // The heap/scope snapshots keep identities alive, and weak targets were cleared above.
-        crate::gc_sweep::map(&mut self.class_info, &garbage_objects);
-        crate::gc_sweep::set(&mut self.eval_realm_fns, &garbage_objects);
-        crate::gc_sweep::map(&mut self.module_ns, &garbage_objects);
-        crate::gc_sweep::map(&mut self.realms, &garbage_objects);
-        crate::gc_sweep::map(&mut self.map_data, &garbage_objects);
-        crate::gc_sweep::map(&mut self.collection_iterators, &garbage_objects);
-        crate::gc_sweep::map(&mut self.typed_arrays, &garbage_objects);
-        crate::gc_sweep::map(&mut self.data_views, &garbage_objects);
-        crate::gc_sweep::map(&mut self.regexps, &garbage_objects);
-        crate::gc_sweep::map(&mut self.proxies, &garbage_objects);
-        crate::gc_sweep::map(&mut self.host_indexed, &garbage_objects);
-        crate::gc_sweep::map(&mut self.promises, &garbage_objects);
-        crate::gc_sweep::map(&mut self.temporal, &garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffers, &garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffer_versions, &garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, &garbage_objects);
-        crate::gc_sweep::map(&mut self.ta_buffer, &garbage_objects);
-        crate::gc_sweep::map(&mut self.shadow_realms, &garbage_objects);
-        crate::gc_sweep::map(&mut self.shared_buffers, &garbage_objects);
-        crate::gc_sweep::set(&mut self.immutable_buffers, &garbage_objects);
-        crate::gc_sweep::set(&mut self.host_keyed_buffers, &garbage_objects);
-        crate::gc_sweep::map(&mut self.generators, &garbage_objects);
-        crate::gc_sweep::set(&mut self.async_gens, &garbage_objects);
-        crate::gc_sweep::set(&mut self.async_gen_busy, &garbage_objects);
-        crate::gc_sweep::map(&mut self.async_gen_queue, &garbage_objects);
-        crate::gc_sweep::map(&mut self.mapped_arguments, &garbage_objects);
-        crate::gc_sweep::map(&mut self.deferred_ns, &garbage_objects);
-        crate::gc_sweep::map(&mut self.promise_forward, &garbage_objects);
-        crate::gc_sweep::map(&mut self.temporal_cal, &garbage_objects);
-        crate::gc_sweep::map(&mut self.gc_pins, &garbage_objects);
+        crate::gc_sweep::map(&mut self.class_info, garbage_objects);
+        crate::gc_sweep::set(&mut self.eval_realm_fns, garbage_objects);
+        crate::gc_sweep::map(&mut self.module_ns, garbage_objects);
+        crate::gc_sweep::map(&mut self.realms, garbage_objects);
+        crate::gc_sweep::map(&mut self.map_data, garbage_objects);
+        crate::gc_sweep::map(&mut self.collection_iterators, garbage_objects);
+        crate::gc_sweep::map(&mut self.typed_arrays, garbage_objects);
+        crate::gc_sweep::map(&mut self.data_views, garbage_objects);
+        crate::gc_sweep::map(&mut self.regexps, garbage_objects);
+        crate::gc_sweep::map(&mut self.proxies, garbage_objects);
+        crate::gc_sweep::map(&mut self.host_indexed, garbage_objects);
+        crate::gc_sweep::map(&mut self.promises, garbage_objects);
+        crate::gc_sweep::map(&mut self.temporal, garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffers, garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffer_versions, garbage_objects);
+        crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, garbage_objects);
+        crate::gc_sweep::map(&mut self.ta_buffer, garbage_objects);
+        crate::gc_sweep::map(&mut self.shadow_realms, garbage_objects);
+        crate::gc_sweep::map(&mut self.shared_buffers, garbage_objects);
+        crate::gc_sweep::set(&mut self.immutable_buffers, garbage_objects);
+        crate::gc_sweep::set(&mut self.host_keyed_buffers, garbage_objects);
+        crate::gc_sweep::map(&mut self.generators, garbage_objects);
+        crate::gc_sweep::set(&mut self.async_gens, garbage_objects);
+        crate::gc_sweep::set(&mut self.async_gen_busy, garbage_objects);
+        crate::gc_sweep::map(&mut self.async_gen_queue, garbage_objects);
+        crate::gc_sweep::map(&mut self.mapped_arguments, garbage_objects);
+        crate::gc_sweep::map(&mut self.deferred_ns, garbage_objects);
+        crate::gc_sweep::map(&mut self.promise_forward, garbage_objects);
+        crate::gc_sweep::map(&mut self.temporal_cal, garbage_objects);
+        crate::gc_sweep::map(&mut self.gc_pins, garbage_objects);
     }
 
     pub(crate) fn gc_collect(&mut self) {
@@ -9624,6 +10128,64 @@ impl Interp {
             .get_or_insert_with(|| Rc::new(crate::callback::CallbackCache::new()))
             .clone();
         cache.call_values(self, &callee, this, args)
+    }
+
+    /// Closed intrinsic iterator bodies cannot produce a proper-tail transfer of
+    /// their own; any user getter they invoke goes through call() and drains it.
+    /// Preserve the ordinary native-call activation, GC/interrupt and depth guards
+    /// while returning the unmaterialized IteratorStepValue continuation directly.
+    pub(crate) fn try_intrinsic_iterator_step(
+        &mut self,
+        iterator: &Value,
+        next: &Value,
+    ) -> Option<Result<Option<Value>, Abrupt>> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("LUMEN_ITERATOR_RESULTS").as_deref() != Ok("0"))
+            || self.pending_tail.is_some()
+        {
+            return None;
+        }
+        let object = next.as_obj()?;
+        if self.proxies.contains_key(&(Rc::as_ptr(object) as usize))
+            || (self.multi_realm() && self.callee_realm_global(object).is_some())
+        {
+            return None;
+        }
+        let native = match object.borrow().call {
+            Callable::Native(native) => native,
+            _ => return None,
+        };
+        let step = crate::builtins::intrinsic_iterator_step(native)?;
+        self.depth += 1;
+        if execution_stack_exhausted(self.depth) {
+            self.depth -= 1;
+            return Some(Err(
+                self.throw("RangeError", "Maximum call stack size exceeded")
+            ));
+        }
+        if let Err(error) = self.gc_check_amortized() {
+            self.depth -= 1;
+            return Some(Err(error));
+        }
+        let saved_ctor = std::mem::replace(&mut self.constructing, false);
+        let saved_target = std::mem::replace(&mut self.new_target, Value::Undefined);
+        let result = with_execution_stack(self.depth, || {
+            self.interrupt_poll_force()?;
+            let started = crate::jit::perf_stage_start();
+            let result = step(self, iterator.clone());
+            crate::jit::perf_native_end(
+                started,
+                result.is_ok(),
+                crate::jit::NativeLabelSrc::Addr(native as usize),
+            );
+            self.interrupt_poll_force()?;
+            result.map_err(Abrupt::Throw)
+        });
+        self.constructing = saved_ctor;
+        self.new_target = saved_target;
+        self.depth -= 1;
+        debug_assert!(self.pending_tail.is_none());
+        Some(result)
     }
 
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
@@ -10638,6 +11200,8 @@ impl Interp {
         args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
+        #[cfg(feature = "architecture-diagnostics")]
+        crate::bytecode::call_cache_diagnostics::probe(site, callee);
         let Value::Obj(o) = callee else { return None };
         let key = Rc::as_ptr(o) as usize;
         let genv = Rc::as_ptr(&self.global_env) as usize;
@@ -11216,9 +11780,7 @@ impl Interp {
                     if same_realm {
                         let runtime = user
                             .func
-                            .code2
-                            .get()
-                            .or_else(|| user.func.code.get())
+                            .execution_code()
                             .and_then(Option::as_ref)
                             .filter(|initializer_chunk| {
                                 initializer_chunk
@@ -11820,7 +12382,7 @@ impl Interp {
             }
             (b.props.shape(), slot as u32)
         };
-        let chunk = match func.code2.get().or_else(|| func.code.get()) {
+        let chunk = match func.execution_code() {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -11949,7 +12511,7 @@ impl Interp {
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
         // Function's chunk handles remain set-once, but native residency is
         // reclaimable. Hold the owned code lease through GC and the whole call.
-        let chunk = match func.code2.get().or_else(|| func.code.get()) {
+        let chunk = match func.execution_code() {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -12181,9 +12743,7 @@ impl Interp {
                 }
             }
             if let Some(chunk) = func
-                .code2
-                .get()
-                .or_else(|| func.code.get())
+                .execution_code()
                 .and_then(Option::as_ref)
                 .filter(|chunk| !chunk.prepared_entry && (!is_construct || !chunk.has_tail_calls()))
             {
@@ -12459,6 +13019,18 @@ impl Interp {
         // Pre-declare body-level `let`/`const` in their temporal dead zone.
         self.declare_block_lexicals(&func.body, &body, false);
 
+        // ECMA-262 #sec-functiondeclarationinstantiation: only representation
+        // changes here. Default expressions/hoisting/TDZ creation ran exactly
+        // once; closure objects and mapped arguments keep these same Envs.
+        // Sharing applies before tier-up as well as to prepared compiled bodies.
+        if cold_environment_layouts_enabled() && !body.borrow().under_with {
+            let layouts = func.env_layouts.get_or_init(Box::default);
+            if has_param_exprs {
+                scope.borrow_mut().vars.share_layout(&layouts[0]);
+            }
+            body.borrow_mut().vars.share_layout(&layouts[1]);
+        }
+
         // The general compiled entry shares the normative prologue above with the interpreter:
         // parameters/defaults/destructuring, mapped arguments, self-name and hoisted closures
         // execute once. Only body evaluation changes tier. Its chunk reuses these live bindings
@@ -12663,7 +13235,7 @@ impl Interp {
             func.calls.set(n);
             let _ = func.code.set(crate::bytecode::compile(func));
         }
-        match func.code2.get().or_else(|| func.code.get()) {
+        match func.execution_code() {
             Some(Some(chunk)) => Some(chunk.clone()),
             _ => None,
         }
@@ -13274,9 +13846,14 @@ impl Interp {
                 let ordinary = t.borrow().props.get(key).cloned();
                 match ordinary {
                     some @ Some(_) => some,
-                    None => self
-                        .host_indexed_own_value(t, key)?
-                        .map(|value| Property::data(value, false, true, true)),
+                    None => self.host_indexed_own_value(t, key)?.map(|value| {
+                        Property::data(
+                            value,
+                            false,
+                            crate::value::canonical_index(key).is_some(),
+                            true,
+                        )
+                    }),
                 }
             }
             _ => None,
@@ -13609,6 +14186,11 @@ impl Interp {
 }
 
 /// The undefined, mutable, function-scoped binding hoisting creates for a `var` name.
+fn cold_environment_layouts_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LUMEN_COLD_ENV_LAYOUTS").as_deref() != Ok("0"))
+}
+
 fn undef_var_binding() -> Binding {
     Binding {
         value: Value::Undefined,

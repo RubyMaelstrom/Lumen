@@ -163,9 +163,11 @@ impl Interp {
             // Prove those effects absent before rejecting from the initial length alone.
             let inert_elements = exceeds
                 && self.array_append_unshadowed(array)
-                && array.borrow().props.iter().all(|(key, property)| {
-                    crate::value::canonical_index(key).is_none() || !property.accessor()
-                });
+                && array
+                    .borrow()
+                    .props
+                    .indexed_properties()
+                    .all(|property| !property.accessor());
             if inert_elements {
                 return Err(self.throw("RangeError", "spread exceeds engine allocation limit"));
             }

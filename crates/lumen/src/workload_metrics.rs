@@ -24,6 +24,7 @@ const FUNCTION_KINDS: [&str; 8] = [
 static FUNCTIONS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static PROTOTYPES: AtomicU64 = AtomicU64::new(0);
 static SELF_SCOPES: AtomicU64 = AtomicU64::new(0);
+static ELIDED_SELF_SCOPES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -94,8 +95,10 @@ fn record_function(function: &Function, has_prototype: bool) {
     if has_prototype {
         PROTOTYPES.fetch_add(1, Relaxed);
     }
-    if function.is_fn_expr && function.name.is_some() {
+    if function.needs_self_environment() {
         SELF_SCOPES.fetch_add(1, Relaxed);
+    } else if function.is_fn_expr && function.name.is_some() {
+        ELIDED_SELF_SCOPES.fetch_add(1, Relaxed);
     }
 }
 
@@ -162,8 +165,8 @@ pub(crate) fn json_fields() -> String {
         }
     }
     format!(
-        "\"user_function_creations\":{{{functions}}},\"function_prototype_creations\":{},\"function_self_scope_creations\":{},\"uncached_name_depth_max\":{},\"uncached_name_paths\":[{}]",
-        PROTOTYPES.load(Relaxed), SELF_SCOPES.load(Relaxed), DEPTH_BUCKETS - 1, names.join(",")
+        "\"user_function_creations\":{{{functions}}},\"function_prototype_creations\":{},\"function_self_scope_creations\":{},\"function_self_scope_elisions\":{},\"uncached_name_depth_max\":{},\"uncached_name_paths\":[{}]",
+        PROTOTYPES.load(Relaxed), SELF_SCOPES.load(Relaxed), ELIDED_SELF_SCOPES.load(Relaxed), DEPTH_BUCKETS - 1, names.join(",")
     )
 }
 

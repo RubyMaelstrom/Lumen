@@ -43,6 +43,20 @@ impl Callback {
     ) -> Result<Value, Abrupt> {
         self.cache.call(interp, &self.callee, this, args)
     }
+
+    /// IteratorStepValue can consume a closed native iterator without materializing
+    /// its result object. Custom next methods retain their ordinary callback cache.
+    pub(crate) fn iterator_step(
+        &self,
+        interp: &mut Interp,
+        iterator: &Value,
+    ) -> Result<Option<Value>, Abrupt> {
+        if let Some(result) = interp.try_intrinsic_iterator_step(iterator, &self.callee) {
+            return result;
+        }
+        let result = self.call(interp, iterator.clone(), [])?;
+        interp.iterator_result_value(result)
+    }
 }
 
 impl CallbackCache {

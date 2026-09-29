@@ -20,7 +20,13 @@ fn array(values: Vec<Value>, packed: bool, reverse: bool, named_tail: bool) -> P
             entries.reverse();
         }
         for (index, value) in entries {
-            props.insert(index.to_string(), Property::plain(value));
+            // Exercise the retained classic fallback explicitly: ordinary array
+            // insertion now chooses contiguous elements for this fixture too.
+            let slot = props.entries.len();
+            props
+                .entries
+                .push((index_key(index), Property::plain(value)));
+            props.note_inserted(slot);
         }
         props
     };

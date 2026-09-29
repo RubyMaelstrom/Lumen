@@ -148,6 +148,93 @@ fn name_dispatch_cmn32_max_predicate_preserves_source_and_ignores_upper_bits() {
 }
 
 #[test]
+fn name_dispatch_fixed_layout_uses_current_wide_activation_and_live_flags() {
+    use crate::interpreter::VarMap;
+    let engine = crate::Engine::new();
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    assert!(layout.scope_small_valid);
+    for indexed in [false, true] {
+        let identity = new_binding_layout_id();
+        let shared = std::cell::OnceCell::new();
+        let make = || {
+            let env = new_scope(None);
+            env.borrow_mut().vars = VarMap::from_fixed_bindings(
+                (0..24)
+                    .map(|n| {
+                        (
+                            Rc::<str>::from(format!("v{n}")),
+                            Binding::data(Value::Num(n as f64), true, true),
+                        )
+                    })
+                    .collect(),
+                None,
+            );
+            if indexed {
+                env.borrow_mut().vars.share_layout(&shared);
+            }
+            env.borrow_mut().vars.publish_layout(identity);
+            env
+        };
+        let first = make();
+        let second = make();
+        let cache = Cell::new(NameIc {
+            env: crate::bytecode::FIXED_NAME_IC,
+            binding: 23,
+            gen: identity,
+            act_gen: 0,
+        });
+        let code = native_probe(&layout, &cache, true);
+        for env in [&first, &second] {
+            let expected = &env.borrow().vars.get("v23").unwrap().value as *const Value as usize;
+            assert_eq!(
+                probe(&code, &ProbeContext::new(&engine, env)),
+                ProbeResult {
+                    address: expected,
+                    packed: 0
+                }
+            );
+        }
+        let context = ProbeContext::new(&engine, &second);
+        second.borrow_mut().vars.get_mut("v23").unwrap().initialized = false;
+        assert_eq!(probe(&code, &context).address, 0);
+        second.borrow_mut().vars.get_mut("v23").unwrap().initialized = true;
+        second
+            .borrow_mut()
+            .vars
+            .get_mut("v23")
+            .unwrap()
+            .set_import_reference(Some((first.clone(), "v23".into())));
+        assert_eq!(probe(&code, &context).address, 0);
+        second
+            .borrow_mut()
+            .vars
+            .get_mut("v23")
+            .unwrap()
+            .set_import_reference(None);
+        cache.set(NameIc {
+            binding: 24,
+            ..cache.get()
+        });
+        assert_eq!(probe(&code, &context).address, 0);
+        cache.set(NameIc {
+            binding: 23,
+            gen: 0,
+            ..cache.get()
+        });
+        assert_eq!(probe(&code, &context).address, 0);
+        cache.set(NameIc {
+            gen: identity,
+            ..cache.get()
+        });
+        second.borrow_mut().with_obj = Some(Value::Obj(engine.interp.global.clone()));
+        assert_eq!(probe(&code, &context).address, 0);
+        second.borrow_mut().with_obj = None;
+        second.borrow_mut().vars.remove("v0");
+        assert_eq!(probe(&code, &context).address, 0);
+    }
+}
+
+#[test]
 fn name_dispatch_emission_places_deep_island_after_ordinary_mode_proofs() {
     let engine = crate::Engine::new();
     let layout = crate::value::jit_layout(&engine.interp.object_proto);

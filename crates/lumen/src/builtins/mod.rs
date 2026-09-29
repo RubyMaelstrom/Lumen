@@ -342,7 +342,7 @@ pub(crate) fn proxy_own_keys(
             Value::Obj(t) => {
                 // OrdinaryOwnPropertyKeys order: array-index keys ascending, then other string keys in
                 // insertion order, then symbol keys (as their Symbol values) in insertion order.
-                ordinary_own_keys_ordered(i, t)
+                ordinary_own_keys_ordered(i, t)?
                     .into_iter()
                     .map(|k| i.sym_from_key(&k).unwrap_or_else(|| Value::from_string(k)))
                     .collect()
@@ -378,7 +378,7 @@ pub(crate) fn proxy_own_keys(
         // Invariants relative to the target's own keys / extensibility.
         if let Value::Obj(t) = target {
             let extensible = t.borrow().extensible;
-            let target_keys: Vec<(String, bool)> = ordinary_own_keys_ordered(i, t)
+            let target_keys: Vec<(String, bool)> = ordinary_own_keys_ordered(i, t)?
                 .into_iter()
                 .map(|k| {
                     let conf = t
@@ -769,7 +769,12 @@ pub(crate) fn proxy_gopd_value(
             if let Some(value) = ab(i.host_indexed_own_value(t, key))? {
                 return Ok(descriptor_from_prop(
                     i,
-                    Property::data(value, false, true, true),
+                    Property::data(
+                        value,
+                        false,
+                        crate::value::canonical_index(key).is_some(),
+                        true,
+                    ),
                 ));
             }
             let prop = t.borrow().props.get(key).cloned();
@@ -792,8 +797,14 @@ pub(crate) fn proxy_gopd_value(
     // Proxy [[GetOwnProperty]] always obtains the target's descriptor after the trap. For a Web
     // IDL indexed property that step invokes the target's platform getter.
     let host_target_prop = if let Value::Obj(target_object) = target {
-        ab(i.host_indexed_own_value(target_object, key))?
-            .map(|value| Property::data(value, false, true, true))
+        ab(i.host_indexed_own_value(target_object, key))?.map(|value| {
+            Property::data(
+                value,
+                false,
+                crate::value::canonical_index(key).is_some(),
+                true,
+            )
+        })
     } else {
         None
     };
@@ -962,7 +973,7 @@ fn proxy_key_enumerable(
         proxy_key_enumerable(i, &t2, &h2, key)
     } else if let Value::Obj(t) = target {
         if ab(i.host_indexed_own_value(t, key))?.is_some() {
-            return Ok(true);
+            return Ok(crate::value::canonical_index(key).is_some());
         }
         Ok(t.borrow()
             .props
@@ -1031,9 +1042,14 @@ fn proxy_define_property(
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
     if let Value::Obj(t) = target {
-        let host_property = i
-            .host_indexed_own_value(t, key)?
-            .map(|value| Property::data(value, false, true, true));
+        let host_property = i.host_indexed_own_value(t, key)?.map(|value| {
+            Property::data(
+                value,
+                false,
+                crate::value::canonical_index(key).is_some(),
+                true,
+            )
+        });
         let tprop = t.borrow().props.get(key).cloned().or(host_property);
         let extensible = t.borrow().extensible;
         match tprop {
@@ -1232,7 +1248,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             .map(|length| (object.clone(), length))
     }) {
         debug_assert_eq!(i.host_indexed_len(&object), Some(length));
-        let keys = ordinary_own_keys_ordered(i, &object);
+        let keys = ordinary_own_keys_ordered(i, &object)?;
         for key in keys
             .into_iter()
             .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
@@ -1241,7 +1257,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             // descriptor and performs a separate Get. An earlier indexed getter can therefore
             // delete or change a later expando, but cannot add it to the snapshot.
             let enumerable = if ab(i.host_indexed_own_value(&object, &key))?.is_some() {
-                true
+                crate::value::canonical_index(&key).is_some()
             } else {
                 object
                     .borrow()
@@ -1492,7 +1508,7 @@ pub(crate) fn reflect_define_on_receiver(
             };
         }
     }
-    if i.host_indexed_array_key(&ro, key) {
+    if i.host_indexed_array_key(&ro, key) || i.host_named_reject_define(&ro, key) {
         return Ok(false);
     }
     let existing = ro.borrow().props.get(key).cloned();
@@ -1611,6 +1627,9 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
                 return Err(i.make_error("TypeError", format!("Cannot delete property '{key}'")));
             }
             return Ok(());
+        }
+        if ab(i.host_named_visible(o, key))? {
+            return Err(i.make_error("TypeError", format!("Cannot delete named property '{key}'")));
         }
         let present = o.borrow().props.contains(key);
         if !present {
@@ -1872,7 +1891,7 @@ fn object_define_properties(
         }
         ks
     } else {
-        ordinary_own_keys_ordered(i, props.as_obj().unwrap())
+        ordinary_own_keys_ordered(i, props.as_obj().unwrap())?
             .into_iter()
             .filter(|k| !Interp::is_private_key(k))
             .map(crate::value::PropertyKey::string)
@@ -1893,7 +1912,7 @@ fn object_define_properties(
         } else {
             let object = props.as_obj().unwrap();
             if ab(i.host_indexed_own_value(object, &key))?.is_some() {
-                true
+                crate::value::canonical_index(&key).is_some()
             } else {
                 object
                     .borrow()
@@ -3312,11 +3331,11 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
 }
 
 /// ECMA-262 GeneratorValidate checks the exact native iterator brand, even after exhaustion.
-fn map_set_iter_next(
+fn map_set_iter_step(
     i: &mut Interp,
     this: Value,
     brand: crate::ordered_collection::CollectionKind,
-) -> Result<Value, Value> {
+) -> Result<Option<Value>, Value> {
     let ptr = map_ptr(&this).ok_or_else(|| i.make_error("TypeError", "not a Map/Set Iterator"))?;
     let state = i
         .collection_iterators
@@ -3337,12 +3356,57 @@ fn map_set_iter_next(
             2 => i.make_array(vec![key, value]),
             _ => value,
         };
-        Ok(iter_result(i, value, false))
+        Ok(Some(value))
     } else {
         let state = i.collection_iterators.get_mut(&ptr).unwrap();
         state.target = None;
         state.cursor = None;
-        Ok(iter_result(i, Value::Undefined, true))
+        Ok(None)
+    }
+}
+
+fn map_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> {
+    map_set_iter_step(i, this, crate::ordered_collection::CollectionKind::Map)
+}
+
+fn set_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> {
+    map_set_iter_step(i, this, crate::ordered_collection::CollectionKind::Set)
+}
+
+fn map_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let step = map_iter_step(i, this)?;
+    Ok(materialize_iterator_step(i, step))
+}
+
+fn set_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let step = set_iter_step(i, this)?;
+    Ok(materialize_iterator_step(i, step))
+}
+
+/// IteratorStepValue immediately consumes the intrinsic's fresh result object.
+/// This entry returns the same state transition/value without materializing that
+/// unobservable wrapper. Public next() calls still allocate distinct result objects.
+/// ECMA-262 IteratorNext / IteratorStepValue / CreateIteratorResultObject, e28783d5.
+pub(crate) type IntrinsicIteratorStep = fn(&mut Interp, Value) -> Result<Option<Value>, Value>;
+
+pub(crate) fn intrinsic_iterator_step(native: NativeFn) -> Option<IntrinsicIteratorStep> {
+    if std::ptr::fn_addr_eq(native, array_iter_next as NativeFn) {
+        Some(array_iter_step)
+    } else if std::ptr::fn_addr_eq(native, string_iter_next as NativeFn) {
+        Some(string_iter_step)
+    } else if std::ptr::fn_addr_eq(native, map_iter_next as NativeFn) {
+        Some(map_iter_step)
+    } else if std::ptr::fn_addr_eq(native, set_iter_next as NativeFn) {
+        Some(set_iter_step)
+    } else {
+        None
+    }
+}
+
+fn materialize_iterator_step(i: &mut Interp, step: Option<Value>) -> Value {
+    match step {
+        Some(value) => iter_result(i, value, false),
+        None => iter_result(i, Value::Undefined, true),
     }
 }
 
@@ -3599,8 +3663,8 @@ fn promise_keyed_combinator(
                 // Enumerable own keys — strings AND symbols, in [[OwnPropertyKeys]] order.
                 let mut strs: Vec<String> = Vec::new();
                 let mut syms: Vec<String> = Vec::new();
-                for k in ordinary_own_keys_ordered(i, o) {
-                    let indexed = ab(i.host_indexed_own_value(o, &k))?.is_some();
+                for k in ordinary_own_keys_ordered(i, o)? {
+                    let indexed = ab(i.host_platform_enumerable(o, &k))?.unwrap_or(false);
                     let enumerable = indexed
                         || o.borrow()
                             .props
@@ -3957,7 +4021,7 @@ fn install_object(it: &mut Interp) {
             return Ok(Value::Bool(e));
         }
         if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
-            return Ok(Value::Bool(true));
+            return Ok(Value::Bool(crate::value::canonical_index(&key).is_some()));
         }
         let e = o
             .borrow()
@@ -4117,7 +4181,7 @@ fn install_object(it: &mut Interp) {
             return Ok(i.make_array(keys));
         }
         if let Some(length) = i.host_indexed_len(&o) {
-            let own_keys = ordinary_own_keys_ordered(i, &o);
+            let own_keys = ordinary_own_keys_ordered(i, &o)?;
             let mut keys = Vec::with_capacity(own_keys.len().max(length as usize));
             // EnumerableOwnProperties asks [[GetOwnProperty]] for each key. For a Web IDL
             // indexed property that operation invokes the platform getter even though
@@ -4127,7 +4191,7 @@ fn install_object(it: &mut Interp) {
                 .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
             {
                 let enumerable = if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
-                    true
+                    crate::value::canonical_index(&key).is_some()
                 } else {
                     o.borrow()
                         .props
@@ -4192,7 +4256,7 @@ fn install_object(it: &mut Interp) {
             return Ok(i.make_array(keys));
         }
         // Spec order: array-index keys ascending, then other string keys in insertion order.
-        let keys: Vec<Value> = ordinary_own_keys_ordered(i, &o)
+        let keys: Vec<Value> = ordinary_own_keys_ordered(i, &o)?
             .into_iter()
             .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
             .map(Value::from_string)
@@ -4212,10 +4276,7 @@ fn install_object(it: &mut Interp) {
                 .collect();
             return Ok(i.make_array(syms));
         }
-        let syms: Vec<Value> = o
-            .borrow()
-            .props
-            .ordered_keys()
+        let syms: Vec<Value> = ordinary_own_keys_ordered(i, &o)?
             .into_iter()
             .filter(|k| Interp::is_sym_key(k))
             .filter_map(|k| i.sym_from_key(&k))
@@ -4345,7 +4406,12 @@ fn install_object(it: &mut Interp) {
         if let Some(value) = ab(i.host_indexed_own_value(&o, &key))? {
             return Ok(descriptor_from_prop(
                 i,
-                Property::data(value, false, true, true),
+                Property::data(
+                    value,
+                    false,
+                    crate::value::canonical_index(&key).is_some(),
+                    true,
+                ),
             ));
         }
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
@@ -4382,13 +4448,18 @@ fn install_object(it: &mut Interp) {
             }
             return Ok(Value::Obj(result));
         }
-        let keys = ordinary_own_keys_ordered(i, &o);
+        let keys = ordinary_own_keys_ordered(i, &o)?;
         for key in keys {
             if Interp::is_private_key(&key) {
                 continue;
             }
             let prop = match ab(i.host_indexed_own_value(&o, &key))? {
-                Some(value) => Some(Property::data(value, false, true, true)),
+                Some(value) => Some(Property::data(
+                    value,
+                    false,
+                    crate::value::canonical_index(&key).is_some(),
+                    true,
+                )),
                 None => o.borrow().props.get(&key).cloned(),
             };
             if let Some(p) = prop {
@@ -4445,13 +4516,13 @@ fn install_object(it: &mut Interp) {
                 continue;
             }
             let o = from.as_obj().unwrap();
-            let keys = ordinary_own_keys_ordered(i, o);
+            let keys = ordinary_own_keys_ordered(i, o)?;
             for k in keys {
                 if Interp::is_private_key(&k) {
                     continue;
                 }
                 let enumerable = if ab(i.host_indexed_own_value(o, &k))?.is_some() {
-                    true
+                    crate::value::canonical_index(&k).is_some()
                 } else {
                     o.borrow()
                         .props
@@ -4859,7 +4930,7 @@ fn define_own_property_ordinary(
     }
     // Web IDL legacy platform object [[DefineOwnProperty]] rejects every array-index key when
     // the interface has an indexed getter but no indexed setter, supported or not.
-    if i.host_indexed_array_key(o, key) {
+    if i.host_indexed_array_key(o, key) || i.host_named_reject_define(o, key) {
         return Ok(false);
     }
     let is_array = matches!(o.borrow().exotic, crate::value::Exotic::Array);
@@ -5210,7 +5281,7 @@ pub(crate) fn intrinsic_array_iterator_is_unmodified(i: &Interp) -> bool {
 
 /// Cardinality of an already-open Array iterator only when its captured next method and every
 /// indexed Get/state transition are inert. Used solely to reject impossible bounded rest drains;
-/// custom next methods, state accessors and length-changing element getters must run normally.
+/// custom next methods and length-changing element getters must run normally.
 pub(crate) fn inert_array_iterator_remaining(
     i: &Interp,
     iterator: &Value,
@@ -5223,41 +5294,23 @@ pub(crate) fn inert_array_iterator_remaining(
     if !i.ordinary_get_ptr(Rc::as_ptr(object) as usize) {
         return None;
     }
-    let state = object.borrow();
-    let plain = |name| {
-        state
-            .props
-            .get(name)
-            .filter(|p| !p.accessor() && p.writable())
-            .map(|p| p.value())
-    };
-    let target = plain("__ai_target")?;
-    let Value::Num(index) = plain("__ai_index")? else {
+    let object = object.borrow();
+    let Exotic::ArrayIterator(state) = &object.exotic else {
         return None;
     };
-    let Value::Num(kind) = plain("__ai_kind")? else {
-        return None;
-    };
-    if !index.is_finite()
-        || index < 0.0
-        || index.fract() != 0.0
-        || (kind != 0.0 && kind != 1.0 && kind != 2.0)
-    {
-        return None;
-    }
-    let target = target.as_obj()?;
+    let target = state.target.as_obj()?;
     if !matches!(target.borrow().exotic, Exotic::Array)
         || !i.ordinary_get_ptr(Rc::as_ptr(target) as usize)
         || !i.array_append_unshadowed(target)
         || target
             .borrow()
             .props
-            .iter()
-            .any(|(key, p)| crate::value::canonical_index(key).is_some() && p.accessor())
+            .indexed_properties()
+            .any(|property| property.accessor())
     {
         return None;
     }
-    Some(i.array_length(target).saturating_sub(index as usize))
+    Some(i.array_length(target).saturating_sub(state.index))
 }
 
 /// Whether an array can use the allocation-free iterator snapshot in `Interp::iterate`.
@@ -6035,6 +6088,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 let object = o.borrow();
                 object.extensible
                     && object.props.iter().count() == 1
+                    && object.props.indexed_properties().next().is_none()
                     && object.props.get("length").is_some_and(|length| {
                         !length.accessor()
                             && length.writable()
@@ -6490,15 +6544,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let next = crate::callback::Callback::new(ab(i.get_member(&iter, "next"))?);
             let mut k = 0u64;
             loop {
-                let res = ab(next.call(i, iter.clone(), []))?;
-                if !matches!(res, Value::Obj(_)) {
-                    return Err(i.make_error("TypeError", "iterator result is not an object"));
-                }
-                let done = ab(i.get_member(&res, "done"))?;
-                if i.to_boolean(&done) {
+                let Some(raw) = ab(next.iterator_step(i, &iter))? else {
                     break;
-                }
-                let raw = ab(i.get_member(&res, "value"))?;
+                };
                 let step = (|i: &mut Interp| -> Result<(), Value> {
                     let v = if let Some(mapfn) = &mapfn {
                         ab(mapfn.call(i, this_arg.clone(), [raw, Value::Num(k as f64)]))?
@@ -8433,16 +8481,7 @@ fn step_iter_with(i: &mut Interp, src: &Value, next: &Value) -> Result<Option<Va
     if !next.is_callable() {
         return Err(i.make_error("TypeError", "iterator.next is not a function"));
     }
-    let res = ab(i.call(next.clone(), src.clone(), &[]))?;
-    if !matches!(res, Value::Obj(_)) {
-        return Err(i.make_error("TypeError", "iterator result is not an object"));
-    }
-    let done = ab(i.get_member(&res, "done"))?;
-    if i.to_boolean(&done) {
-        Ok(None)
-    } else {
-        Ok(Some(ab(i.get_member(&res, "value"))?))
-    }
+    ab(i.iterator_step(src, next))
 }
 
 /// Build a lazy iterator-helper (map/filter/take/drop/flatMap) wrapping `source`.
@@ -8697,7 +8736,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             ks
         } else {
             let o = input.as_obj().unwrap();
-            ordinary_own_keys_ordered(i, o)
+            ordinary_own_keys_ordered(i, o)?
                 .into_iter()
                 .map(crate::value::PropertyKey::string)
                 .collect()
@@ -8719,7 +8758,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             } else {
                 let object = input.as_obj().unwrap();
                 if ab(i.host_indexed_own_value(object, &k))?.is_some() {
-                    true
+                    crate::value::canonical_index(&k).is_some()
                 } else {
                     object
                         .borrow()
@@ -8880,12 +8919,13 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
 
 /// OrdinaryOwnPropertyKeys as internal key strings: array indices ascending, then other string
 /// keys in insertion order, then symbol keys in insertion order.
-fn ordinary_own_keys_ordered(i: &Interp, o: &Gc) -> Vec<String> {
-    let all = o.borrow().props.ordered_keys();
+pub(crate) fn ordinary_own_keys_ordered(i: &mut Interp, o: &Gc) -> Result<Vec<String>, Value> {
     let mut indices: Vec<u32> = i
         .host_indexed_len(o)
         .map(|length| (0..length).collect())
         .unwrap_or_default();
+    let names = ab(i.host_named_keys(o))?;
+    let all = o.borrow().props.ordered_keys();
     let mut strings: Vec<String> = Vec::new();
     let mut symbols: Vec<String> = Vec::new();
     for k in all {
@@ -8904,9 +8944,10 @@ fn ordinary_own_keys_ordered(i: &Interp, o: &Gc) -> Vec<String> {
     indices.sort_unstable();
     indices.dedup();
     let mut out: Vec<String> = indices.into_iter().map(|n| n.to_string()).collect();
+    out.extend(names);
     out.extend(strings);
     out.extend(symbols);
-    out
+    Ok(out)
 }
 
 /// IteratorCloseAll over the zip iterator's still-open inputs, in reverse order. With a pending
@@ -9480,73 +9521,79 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
 }
 
 /// Build an Array Iterator over `target`. `kind`: 0 = values, 1 = keys, 2 = [key, value] entries.
-/// State lives in non-enumerable internal slots so `next` can advance it.
+/// ECMA-262 e28783d5, CreateArrayIterator: private slots, independent of own properties.
 fn make_array_iterator(i: &mut Interp, target: Value, kind: u8) -> Value {
     let proto = i
         .extra_protos
         .get("%ArrayIteratorPrototype%")
         .cloned()
         .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned());
-    let obj = Object::new(proto);
-    set_internal(&obj, "__ai_target", target);
-    set_internal(&obj, "__ai_index", Value::Num(0.0));
-    set_internal(&obj, "__ai_kind", Value::Num(kind as f64));
+    let obj = Object::new_with_parts(
+        proto,
+        crate::value::Props::new(),
+        Exotic::ArrayIterator(Box::new(crate::value::ArrayIteratorState {
+            target,
+            index: 0,
+            kind,
+        })),
+    );
     Value::Obj(obj)
 }
 
-/// `next()` for a String Iterator: advance one code point through the iterated string. The
-/// `__si_str` slot doubles as the brand check.
+/// `next()` for a String Iterator: advance one code point through the private closure state.
 fn string_iter_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = match &this {
-        Value::Obj(o) if o.borrow().props.contains("__si_str") => o.clone(),
-        _ => {
-            return Err(i.make_error(
-                "TypeError",
-                "String Iterator next called on an incompatible receiver",
-            ));
-        }
+    let step = string_iter_step(i, this)?;
+    Ok(materialize_iterator_step(i, step))
+}
+
+fn string_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> {
+    let Some(object) = this.as_obj() else {
+        return Err(i.make_error(
+            "TypeError",
+            "String Iterator next called on an incompatible receiver",
+        ));
     };
-    let s = match o.borrow().props.get("__si_str").map(|p| p.value()) {
-        Some(Value::Str(s)) => s,
-        _ => return Ok(i.iter_result_obj(Value::Undefined, true)),
+    let mut object = object.borrow_mut();
+    let Exotic::StringIterator(state) = &mut object.exotic else {
+        drop(object);
+        return Err(i.make_error(
+            "TypeError",
+            "String Iterator next called on an incompatible receiver",
+        ));
     };
-    let idx = match o.borrow().props.get("__si_index").map(|p| p.value()) {
-        Some(Value::Num(n)) => n as usize,
-        _ => 0,
+    let Some(s) = &state.string else {
+        return Ok(None);
     };
+    let idx = state.index;
     // An ASCII String has one UTF-16 code unit per byte.  Keep the iterator's observable
     // code-point semantics while avoiding UTF-8 char decoding and a fresh allocation for each
     // result; the shared single-unit strings are immutable and therefore valid String values.
     if s.ascii_hint() {
         let Some(&unit) = s.as_str().as_bytes().get(idx) else {
-            set_internal(&o, "__si_str", Value::Undefined);
-            return Ok(i.iter_result_obj(Value::Undefined, true));
+            state.string = None;
+            return Ok(None);
         };
-        set_internal(&o, "__si_index", Value::Num((idx + 1) as f64));
-        return Ok(i.iter_result_obj(Value::Str(crate::jstr::unit_lstr(unit as u16)), false));
+        state.index = idx + 1;
+        return Ok(Some(Value::Str(crate::jstr::unit_lstr(unit as u16))));
     }
     let mut rest = s[idx.min(s.len())..].chars();
     let Some(ch) = rest.next() else {
         // Exhausted: clear the string so the iterator stays done.
-        set_internal(&o, "__si_str", Value::Undefined);
-        return Ok(i.iter_result_obj(Value::Undefined, true));
+        state.string = None;
+        return Ok(None);
     };
     // A smuggled surrogate pair is one code point: yield both scalars together.
     if let Some(next) = rest.next() {
         if crate::jstr::paired_char(ch, next).is_some() {
-            set_internal(
-                &o,
-                "__si_index",
-                Value::Num((idx + ch.len_utf8() + next.len_utf8()) as f64),
-            );
+            state.index = idx + ch.len_utf8() + next.len_utf8();
             let mut both = String::new();
             both.push(ch);
             both.push(next);
-            return Ok(i.iter_result_obj(Value::from_string(both), false));
+            return Ok(Some(Value::from_string(both)));
         }
     }
-    set_internal(&o, "__si_index", Value::Num((idx + ch.len_utf8()) as f64));
-    Ok(i.iter_result_obj(Value::from_string(ch.to_string()), false))
+    state.index = idx + ch.len_utf8();
+    Ok(Some(Value::from_string(ch.to_string())))
 }
 
 /// `next()` for a generator object built by `make_generator`: walk the buffered values, then throw
@@ -9755,25 +9802,33 @@ pub(crate) fn async_iterator_key(i: &Interp) -> Option<Rc<str>> {
 }
 
 fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
-    // Brand check: the receiver must carry the Array Iterator internal slots.
-    if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("__ai_kind")) {
+    let step = array_iter_step(i, this)?;
+    Ok(materialize_iterator_step(i, step))
+}
+
+fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> {
+    let Some(object) = this.as_obj() else {
         return Err(i.make_error(
             "TypeError",
             "Array Iterator next called on an incompatible receiver",
         ));
-    }
-    let target = ab(i.get_member(&this, "__ai_target"))?;
+    };
+    // Release this borrow before LengthOfArrayLike or indexed Get can reenter
+    // JavaScript. The index snapshot and update order follow the native slots.
+    let (target, idx, kind) = {
+        let object = object.borrow();
+        let Exotic::ArrayIterator(state) = &object.exotic else {
+            return Err(i.make_error(
+                "TypeError",
+                "Array Iterator next called on an incompatible receiver",
+            ));
+        };
+        (state.target.clone(), state.index, state.kind)
+    };
     // An exhausted iterator clears its target so it stays done even if the source later grows.
     if matches!(target, Value::Undefined) {
-        let result = i.new_object();
-        set_data(&result, "value", Value::Undefined);
-        set_data(&result, "done", Value::Bool(true));
-        return Ok(Value::Obj(result));
+        return Ok(None);
     }
-    let idx_v = ab(i.get_member(&this, "__ai_index"))?;
-    let idx = ab(i.to_number(&idx_v))? as usize;
-    let kind_v = ab(i.get_member(&this, "__ai_kind"))?;
-    let kind = ab(i.to_number(&kind_v))? as u8;
     // A TypedArray target re-derives its length each step; an out-of-bounds (detached/shrunk-past)
     // view throws TypeError.
     let typed_info = map_ptr(&target).and_then(|p| i.typed_arrays.get(&p).copied());
@@ -9808,14 +9863,26 @@ fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
             _ => 0,
         }
     };
-    let result = i.new_object();
     if idx >= len {
-        ab(i.set_member(&this, "__ai_target", Value::Undefined))?;
-        set_data(&result, "value", Value::Undefined);
-        set_data(&result, "done", Value::Bool(true));
-        return Ok(Value::Obj(result));
+        let mut object = object.borrow_mut();
+        let Exotic::ArrayIterator(state) = &mut object.exotic else {
+            unreachable!()
+        };
+        state.target = Value::Undefined;
+        return Ok(None);
     }
-    ab(i.set_member(&this, "__ai_index", Value::Num((idx + 1) as f64)))?;
+    {
+        let mut object = object.borrow_mut();
+        let Exotic::ArrayIterator(state) = &mut object.exotic else {
+            unreachable!()
+        };
+        state.index = idx + 1;
+    }
+    // %ArrayIteratorPrototype%.next requests indexed Get only for values/entries.
+    // A keys iterator must not invoke a getter at the corresponding array index.
+    if kind == 1 {
+        return Ok(Some(Value::Num(idx as f64)));
+    }
     // ArrayIteratorPrototype.next performs Get(array, ToString(index)). The ordinary dense
     // element helper is an exact result for own data entries and falls back for holes, accessors,
     // prototype properties, and exotics; this avoids the per-step index-string allocation in the
@@ -9835,13 +9902,10 @@ fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
         })?
     };
     let value = match kind {
-        1 => Value::Num(idx as f64),
         2 => i.make_array(vec![Value::Num(idx as f64), elem]),
         _ => elem,
     };
-    set_data(&result, "value", value);
-    set_data(&result, "done", Value::Bool(false));
-    Ok(Value::Obj(result))
+    Ok(Some(value))
 }
 
 fn norm_index(n: f64, len: i64) -> i64 {
@@ -10405,9 +10469,14 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
 /// the realm still exposes the exact intrinsic method after user code mutates prototypes.
 fn nf_string_iterator(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let s = this_string(i, &this)?;
-    let obj = Object::new(i.extra_protos.get("%StringIteratorPrototype%").cloned());
-    set_internal(&obj, "__si_str", Value::Str(s));
-    set_internal(&obj, "__si_index", Value::Num(0.0));
+    let obj = Object::new_with_parts(
+        i.extra_protos.get("%StringIteratorPrototype%").cloned(),
+        crate::value::Props::new(),
+        Exotic::StringIterator(Box::new(crate::value::StringIteratorState {
+            string: Some(s),
+            index: 0,
+        })),
+    );
     Ok(Value::Obj(obj))
 }
 

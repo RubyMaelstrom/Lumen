@@ -241,7 +241,7 @@ pub(crate) fn enter(
     let native = matches!(i.tier, Tier::Jit);
     let result = drive_vm(
         i,
-        &chunk,
+        chunk,
         &mut current_env,
         &cap_env,
         &mut references,

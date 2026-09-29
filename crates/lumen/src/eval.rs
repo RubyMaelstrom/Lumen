@@ -1863,19 +1863,28 @@ impl Interp {
     ) -> Result<Option<Value>, Abrupt> {
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<Option<Value>, Abrupt> = (|| {
+            if let Some(result) = self.try_intrinsic_iterator_step(iter, next) {
+                return result;
+            }
             let res = self.call(next.clone(), iter.clone(), &[])?;
-            if !matches!(res, Value::Obj(_)) {
-                return Err(self.throw("TypeError", "iterator result is not an object"));
-            }
-            let done = self.get_member(&res, "done")?;
-            if self.to_boolean(&done) {
-                Ok(None)
-            } else {
-                Ok(Some(self.get_member(&res, "value")?))
-            }
+            self.iterator_result_value(res)
         })();
         crate::jit::perf_iterator_step_end(perf_started, result.is_ok());
         result
+    }
+
+    /// IteratorComplete followed by IteratorValue only for a non-exhausted result.
+    /// Custom iterator getters remain observable in precisely this order.
+    pub(crate) fn iterator_result_value(&mut self, result: Value) -> Result<Option<Value>, Abrupt> {
+        if !matches!(result, Value::Obj(_)) {
+            return Err(self.throw("TypeError", "iterator result is not an object"));
+        }
+        let done = self.get_member(&result, "done")?;
+        if self.to_boolean(&done) {
+            Ok(None)
+        } else {
+            Ok(Some(self.get_member(&result, "value")?))
+        }
     }
     /// IteratorClose: call `return()` if present (swallowing its result/most errors).
     pub(crate) fn iterator_close(&mut self, iter: &Value) {
@@ -1998,17 +2007,7 @@ impl Interp {
             }
             let mut out = Vec::new();
             loop {
-                let step: Result<Option<Value>, Abrupt> = (|| {
-                    let res = self.call(next.clone(), iter.clone(), &[])?;
-                    if !matches!(res, Value::Obj(_)) {
-                        return Err(self.throw("TypeError", "iterator result is not an object"));
-                    }
-                    let done = self.get_member(&res, "done")?;
-                    if self.to_boolean(&done) {
-                        return Ok(None);
-                    }
-                    Ok(Some(self.get_member(&res, "value")?))
-                })();
+                let step = self.iterator_step(&iter, &next);
                 match step {
                     Ok(None) => break,
                     Ok(Some(value)) => {
@@ -2153,6 +2152,32 @@ impl Interp {
                 };
                 continue;
             }
+            if self.host_indexed_len(&o).is_some() {
+                // Snapshot platform keys once; test each current descriptor.
+                // Native named properties are unenumerable but still shadow.
+                let keys =
+                    crate::builtins::ordinary_own_keys_ordered(self, &o).map_err(Abrupt::Throw)?;
+                for key in keys {
+                    if Self::is_sym_key(&key) || Self::is_private_key(&key) {
+                        continue;
+                    }
+                    let enumerable = self
+                        .host_platform_enumerable(&o, &key)?
+                        .or_else(|| o.borrow().props.get(&key).map(|p| p.enumerable()));
+                    if let Some(enumerable) = enumerable {
+                        if seen.insert(key.clone()) && enumerable {
+                            out.push(key);
+                        }
+                    }
+                }
+                cur = match crate::builtins::js_get_prototype_of(self, &Value::Obj(o.clone()))
+                    .map_err(Abrupt::Throw)?
+                {
+                    Value::Obj(parent) => Some(parent),
+                    _ => None,
+                };
+                continue;
+            }
             // for-in visits own enumerable string keys in spec order, then up the prototype chain.
             // TypedArray elements enumerate first (they live outside the property map).
             let level_keys: Vec<String> = o
@@ -2163,15 +2188,6 @@ impl Interp {
                 .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
                 .map(|key| key.to_string())
                 .collect();
-            if let Some(length) = self.host_indexed_len(&o) {
-                for index in 0..length {
-                    let key = index.to_string();
-                    let _ = self.host_indexed_own_value(&o, &key)?;
-                    if seen.insert(key.clone()) {
-                        out.push(key);
-                    }
-                }
-            }
             if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(&o) as usize)).copied() {
                 for idx in 0..self.ta_len(&info).unwrap_or(0) {
                     let k = idx.to_string();
@@ -2583,29 +2599,21 @@ impl Interp {
             return Ok(ty);
         }
         let object = with.as_obj().unwrap().clone();
-        let mut keys: Vec<std::rc::Rc<str>> = self
-            .host_indexed_len(&object)
-            .map(|length| {
-                (0..length)
-                    .map(|index| std::rc::Rc::<str>::from(index.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        keys.extend(
-            object
-                .borrow()
-                .props
-                .ordered_keys()
-                .into_iter()
-                .filter(|key| !Interp::is_sym_key(key)),
-        );
+        let keys =
+            crate::builtins::ordinary_own_keys_ordered(self, &object).map_err(Abrupt::Throw)?;
         for k in keys {
-            let enumerable = self.host_indexed_own_value(&object, &k)?.is_some()
-                || object
-                    .borrow()
-                    .props
-                    .get(&k)
-                    .is_some_and(|property| property.enumerable());
+            if Self::is_sym_key(&k) || Self::is_private_key(&k) {
+                continue;
+            }
+            let enumerable = self
+                .host_platform_enumerable(&object, &k)?
+                .unwrap_or_else(|| {
+                    object
+                        .borrow()
+                        .props
+                        .get(&k)
+                        .is_some_and(|property| property.enumerable())
+                });
             if !enumerable {
                 continue;
             }
@@ -2874,9 +2882,14 @@ impl Interp {
                     let ordinary = t.borrow().props.get(key).cloned();
                     let p = match ordinary {
                         some @ Some(_) => some,
-                        None => self
-                            .host_indexed_own_value(t, key)?
-                            .map(|value| crate::value::Property::data(value, false, true, true)),
+                        None => self.host_indexed_own_value(t, key)?.map(|value| {
+                            crate::value::Property::data(
+                                value,
+                                false,
+                                crate::value::canonical_index(key).is_some(),
+                                true,
+                            )
+                        }),
                     };
                     if let Some(p) = p {
                         if !p.configurable() || !t.borrow().extensible {
@@ -2903,12 +2916,12 @@ impl Interp {
             return Ok(true);
         }
         // A String wrapper's `length` and in-range indices are own exotic properties.
-        if let crate::value::Exotic::StrWrap(s) = o.borrow().exotic.clone() {
+        if let crate::value::Exotic::StrWrap(s) = &o.borrow().exotic {
             if key == "length" {
                 return Ok(true);
             }
             if let Ok(idx) = key.parse::<usize>() {
-                if idx < crate::jstr::unit_len(&s) {
+                if idx < crate::jstr::unit_len(s) {
                     return Ok(true);
                 }
             }
@@ -6082,20 +6095,31 @@ impl Interp {
                 // CopyDataProperties snapshots [[OwnPropertyKeys]] before any descriptor getter
                 // runs. Indexed platform getters may mutate expandos, but cannot add newly-created
                 // keys to this operation's snapshot.
-                let keys = src.borrow().props.ordered_keys();
-                if let Some(length) = self.host_indexed_len(src) {
-                    for index in 0..length {
-                        let key = index.to_string();
-                        if is_excluded(&key) {
+                if self.host_indexed_len(src).is_some() {
+                    let keys = crate::builtins::ordinary_own_keys_ordered(self, src)
+                        .map_err(Abrupt::Throw)?;
+                    for key in keys {
+                        if is_excluded(&key) || Self::is_private_key(&key) {
                             continue;
                         }
-                        let _ = self.host_indexed_own_value(src, &key)?;
-                        let property_value = self.get_member(value, &key)?;
-                        rest.borrow_mut()
-                            .props
-                            .insert(key.as_str(), crate::value::Property::plain(property_value));
+                        let enumerable =
+                            self.host_platform_enumerable(src, &key)?
+                                .unwrap_or_else(|| {
+                                    src.borrow()
+                                        .props
+                                        .get(&key)
+                                        .is_some_and(|property| property.enumerable())
+                                });
+                        if enumerable {
+                            let value = self.get_member(value, &key)?;
+                            rest.borrow_mut()
+                                .props
+                                .insert(key, crate::value::Property::plain(value));
+                        }
                     }
+                    return Ok(());
                 }
+                let keys = src.borrow().props.ordered_keys();
                 for k in keys {
                     if is_excluded(&k) {
                         continue;
@@ -6563,6 +6587,12 @@ impl Interp {
                         }
                         return Ok(Value::Bool(ok));
                     }
+                    if self.host_named_visible(o, prop)? {
+                        if strict {
+                            return Err(self.throw("TypeError", "cannot delete named property"));
+                        }
+                        return Ok(Value::Bool(false));
+                    }
                     let configurable = o
                         .borrow()
                         .props
@@ -6632,6 +6662,9 @@ impl Interp {
                         // an inherited one is untouched and reports true per OrdinaryDelete).
                         let (wobj, o) = (wobj.clone(), o.clone());
                         if self.with_has_binding(&wobj, name)? {
+                            if self.host_named_visible(&o, name)? {
+                                return Ok(Value::Bool(false));
+                            }
                             let configurable = o
                                 .borrow()
                                 .props
@@ -6685,6 +6718,9 @@ impl Interp {
                         .is_some_and(|index| index < self.host_indexed_len(t).unwrap_or(0));
                     return Ok(!supported);
                 }
+                if self.host_named_visible(t, key)? {
+                    return Ok(false);
+                }
                 let configurable = t
                     .borrow()
                     .props
@@ -6715,9 +6751,14 @@ impl Interp {
             let ordinary = t.borrow().props.get(key).cloned();
             let p = match ordinary {
                 some @ Some(_) => some,
-                None => self
-                    .host_indexed_own_value(t, key)?
-                    .map(|value| crate::value::Property::data(value, false, true, true)),
+                None => self.host_indexed_own_value(t, key)?.map(|value| {
+                    crate::value::Property::data(
+                        value,
+                        false,
+                        crate::value::canonical_index(key).is_some(),
+                        true,
+                    )
+                }),
             };
             if let Some(p) = p {
                 if !p.configurable() {
@@ -8127,6 +8168,7 @@ fn default_constructor(derived: bool) -> Function {
         code: std::cell::OnceCell::new(),
         code2: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
+        env_layouts: std::cell::OnceCell::new(),
         name: None,
         params,
         body,

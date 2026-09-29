@@ -1372,6 +1372,7 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         code: OnceCell::new(),
         code2: OnceCell::new(),
         fn_maps: OnceCell::new(),
+        env_layouts: OnceCell::new(),
     })
 }
 

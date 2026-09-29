@@ -253,7 +253,9 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.bind(fresh);
     if l.scope_small_valid {
         a.nr_load8(AX, R9, l.scope_small_tag);
-        a.nr_test(AX);
+        a.nr_imm(DX, 2);
+        a.nr_reg(0x09, AX, DX); // tag | 2 == 2 accepts Small(0) and Indexed(2)
+        a.nr_cmp(AX, DX);
         a.jcc(NE, slow);
         a.nr_load(DX, R8, offset_of!(NativeNameDescriptor, slot));
         a.nr_load(CX, R9, l.scope_small_vec + l.vec_len_off);

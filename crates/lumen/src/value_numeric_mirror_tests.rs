@@ -86,6 +86,12 @@ fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
         let mut props = packed(3);
         assert!(props.prepare_packed_numeric_mirror());
         edit(&mut props);
+        if dense_elements_enabled() && matches!(name, "append" | "push") {
+            assert_eq!(props.mirror_get(0), Some(0.0), "{name}");
+            assert_eq!(props.mirror_get(3), Some(8.0), "{name}");
+            assert_eq!(props.get_index(3).unwrap().number_value(), Some(8.0));
+            continue;
+        }
         assert_eq!(props.mirror_flags & MIRROR_OK, 0, "{name}");
         assert!(props.mirror_get(0).is_none(), "{name}");
     }

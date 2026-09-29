@@ -56,52 +56,66 @@ fn dense_numeric_typedarray_copy_keeps_holes_accessors_and_conversion_order() {
 
 #[test]
 fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
-    let mut props = Props::new();
-    props.mark_array();
-    props.insert(
-        "length",
-        Property::data(Value::Num(4096.0), true, false, false),
-    );
-    for n in 0..4096 {
-        props.insert(n.to_string(), Property::plain(Value::Num(n as f64)));
-    }
-    props.insert("named", Property::plain(Value::Num(-1.0)));
-    for n in (0..4096).step_by(3) {
-        props
-            .get_mut(&n.to_string())
-            .unwrap()
-            .set_value(Value::Num(-(n as f64)));
-    }
-    for n in (0..4096).step_by(5) {
-        assert!(props.remove(&n.to_string()));
-        assert!(props.get_mut(&n.to_string()).is_none());
-        assert!(props.slot_of(&n.to_string()).is_none());
-        assert!(!props.remove(&n.to_string()));
-    }
-    for n in 0..4096 {
-        if n % 5 == 0 {
-            props.insert(n.to_string(), Property::plain(Value::Num(999.0)));
+    for force_classic in [false, true] {
+        let mut props = Props::new();
+        props.mark_array();
+        props.insert(
+            "length",
+            Property::data(Value::Num(4096.0), true, false, false),
+        );
+        // A first far index selects classic keyed storage; ascending first writes
+        // exercise packed storage when enabled. Both must preserve identical properties.
+        if force_classic {
+            props.insert("4095", Property::plain(Value::Num(4095.0)));
         }
-        let key = n.to_string();
-        let expected = if n % 5 == 0 {
-            999.0
-        } else if n % 3 == 0 {
-            -(n as f64)
-        } else {
-            n as f64
-        };
-        assert_eq!(number(props.get(&key)), expected);
-        assert_eq!(number(props.get_index(n)), expected);
-        let (entry_key, entry) = props.entry_at(props.slot_of(&key).unwrap()).unwrap();
-        assert_eq!(&**entry_key, key);
-        assert_eq!(number(Some(entry)), expected);
+        let packed = !force_classic && crate::value::dense_elements_enabled();
+        for n in 0..4096 {
+            props.insert(n.to_string(), Property::plain(Value::Num(n as f64)));
+        }
+        props.insert("named", Property::plain(Value::Num(-1.0)));
+        for n in (0..4096).step_by(3) {
+            props
+                .get_mut(&n.to_string())
+                .unwrap()
+                .set_value(Value::Num(-(n as f64)));
+        }
+        for n in (0..4096).step_by(5) {
+            assert!(props.remove(&n.to_string()));
+            assert!(props.get_mut(&n.to_string()).is_none());
+            assert!(props.slot_of(&n.to_string()).is_none());
+            assert!(!props.remove(&n.to_string()));
+        }
+        for n in 0..4096 {
+            if n % 5 == 0 {
+                props.insert(n.to_string(), Property::plain(Value::Num(999.0)));
+            }
+            let key = n.to_string();
+            let expected = if n % 5 == 0 {
+                999.0
+            } else if n % 3 == 0 {
+                -(n as f64)
+            } else {
+                n as f64
+            };
+            assert_eq!(number(props.get(&key)), expected);
+            assert_eq!(number(props.get_index(n)), expected);
+            if packed {
+                // Packed indices have no named entry slot; the general and indexed
+                // property reads above must still agree after every structural edit.
+                assert!(props.slot_of(&key).is_none());
+            } else {
+                let (entry_key, entry) = props.entry_at(props.slot_of(&key).unwrap()).unwrap();
+                assert_eq!(&**entry_key, key);
+                assert_eq!(number(Some(entry)), expected);
+            }
+        }
+        assert_eq!(number(props.length_property()), 4096.0);
+        assert_eq!(number(props.get("named")), -1.0);
+        props.remove_indices_from(100);
+        assert!(props.get_mut("100").is_none());
+        props.insert("101", Property::plain(Value::Num(101.0)));
+        assert_eq!(number(props.get_index(101)), 101.0);
     }
-    assert_eq!(number(props.length_property()), 4096.0);
-    assert_eq!(number(props.get("named")), -1.0);
-    props.remove_indices_from(100);
-    assert!(props.get_mut("100").is_none());
-    props.insert("101", Property::plain(Value::Num(101.0)));
-    assert_eq!(number(props.get_index(101)), 101.0);
 }
 
 #[test]

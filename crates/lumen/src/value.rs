@@ -6,6 +6,9 @@ use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+#[cfg(feature = "architecture-diagnostics")]
+#[path = "allocation_diagnostics.rs"]
+mod allocation_diagnostics;
 
 #[path = "property_shapes.rs"]
 mod property_shapes;
@@ -157,6 +160,15 @@ pub(crate) const PACK_CANON_NAN: u64 = 0x7ff8_0000_0000_0000;
 mod lazy_function_prototype;
 use lazy_function_prototype::LazyFunctionPrototype;
 
+#[cfg(feature = "optimizing-jit")]
+#[path = "packed_owner_layout.rs"]
+mod packed_owner_layout;
+
+#[cfg(feature = "optimizing-jit")]
+pub(crate) fn jit_packed_owners_supported(layout: &JitLayout) -> bool {
+    packed_owner_layout::supported(layout)
+}
+
 impl PackedValue {
     /// Borrow the encoded bits without transferring their reference ownership. Generated code
     /// may copy this word only after applying the matching clone/move ownership operation.
@@ -194,6 +206,20 @@ impl PackedValue {
     #[inline]
     pub(crate) fn is_undefined(&self) -> bool {
         self.0.get() == PACK_UNDEFINED
+    }
+
+    /// A non-owning class observation; does not unpack a heap owner or lazy value.
+    #[cfg(feature = "optimizing-jit")]
+    #[inline]
+    pub(crate) fn is_boolean(&self) -> bool {
+        self.tag() == PACK_BOOL
+    }
+
+    /// A bounded feedback checkpoint may temporarily retain an already materialized object.
+    /// Unlike unpack/object this never observes or materializes a deferred prototype.
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) fn sampled_object(&self) -> Option<Gc> {
+        (self.tag() == PACK_OBJ).then(|| unsafe { self.clone_word() })
     }
 
     /// Inspect a Number without manufacturing an owning Value. In particular, rejecting a
@@ -869,6 +895,9 @@ pub struct JitLayout {
     pub obj_is_constructor: usize,
     pub obj_extensible: usize,
     pub props_shape: usize,
+    /// Validated named-entry memo for the own `length` key, or NO_SLOT.
+    #[cfg(feature = "optimizing-jit")]
+    pub props_len_slot: usize,
     pub props_proto_flag: usize,
     /// The contiguous instance-field `Vec<Property>` within `Props`.
     pub props_entries: usize,
@@ -1177,6 +1206,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         obj_is_constructor: offset_of!(Object, is_constructor),
         obj_extensible: offset_of!(Object, extensible),
         props_shape: offset_of!(Props, shape),
+        #[cfg(feature = "optimizing-jit")]
+        props_len_slot: offset_of!(Props, len_slot),
         props_proto_flag: offset_of!(Props, proto_flag),
         props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, fields),
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
@@ -1400,6 +1431,23 @@ impl Callable {
     }
 }
 
+/// ECMA-262 CreateArrayIterator's private slots. They are not own properties:
+/// Reflect.ownKeys, assignment and Object.freeze cannot observe or alter them.
+#[derive(Clone)]
+pub struct ArrayIteratorState {
+    pub(crate) target: Value,
+    pub(crate) index: usize,
+    pub(crate) kind: u8,
+}
+
+/// String iterator closure state. `index` is a byte boundary in Lumen's string
+/// representation; each transition consumes exactly one ECMAScript code point.
+#[derive(Clone)]
+pub struct StringIteratorState {
+    pub(crate) string: Option<crate::lstr::LStr>,
+    pub(crate) index: usize,
+}
+
 /// Exotic internal data for built-in object kinds (arrays, primitive wrappers). The wrapper
 /// variants are read by the `this_*` coercion helpers but not yet constructed (`new String()` etc.
 /// still return primitives — boxing is the next built-ins milestone).
@@ -1422,6 +1470,8 @@ pub enum Exotic {
     /// An `arguments` exotic object (mapped index/parameter aliasing lives in
     /// `Interp::mapped_arguments`).
     Arguments,
+    ArrayIterator(Box<ArrayIteratorState>),
+    StringIterator(Box<StringIteratorState>),
 }
 
 impl Exotic {
@@ -1469,6 +1519,7 @@ pub struct Object {
 }
 
 impl Object {
+    #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new(proto: Option<Gc>) -> Gc {
         Self::new_with_capacity(proto, 0)
     }
@@ -1476,6 +1527,7 @@ impl Object {
     /// Allocate an ordinary object's named-property vector at its known final size. Constructor
     /// chunks derive a conservative straight-line field count, replacing the usual 1 → 2 → 4
     /// growth sequence with one exact allocation. The hint lives on shared code, not instances.
+    #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_capacity(proto: Option<Gc>, property_capacity: usize) -> Gc {
         Self::new_with_parts(proto, Props::with_capacity(property_capacity), Exotic::None)
     }
@@ -1483,6 +1535,7 @@ impl Object {
     /// Allocate an object around an already-finalized property map. Literal fast paths can build
     /// the map from moved stack values before allocation, avoiding an empty map plus RefCell
     /// replacement on every object.
+    #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
         let heap = proto
             .as_ref()
@@ -1502,6 +1555,13 @@ impl Object {
                 }
             };
             let slot_u32: u32 = slot.try_into().expect("object registry exceeded u32 slots");
+            #[cfg(feature = "architecture-diagnostics")]
+            heap.diagnostics.borrow_mut().born(
+                slot,
+                std::panic::Location::caller(),
+                &exotic,
+                props.entries.capacity(),
+            );
             #[cfg(feature = "heap-bridge")]
             let central_ref = heap
                 .central
@@ -1541,6 +1601,8 @@ impl Drop for Object {
         // is O(1), does not touch another (possibly borrowed) object, and bounds registry memory
         // by peak simultaneously-live objects instead of cumulative allocation count.
         let slot = self.gc_internal.get() as usize;
+        #[cfg(feature = "architecture-diagnostics")]
+        self.gc_heap.diagnostics.borrow_mut().died(slot);
         let mut reg = self.gc_heap.registry.borrow_mut();
         if slot < reg.entries.len() && reg.entries[slot].take().is_some() {
             let position = reg.young_positions[slot];
@@ -1589,6 +1651,8 @@ struct GcRegistry {
 
 pub(crate) struct GcState {
     heap_id: u64,
+    #[cfg(feature = "architecture-diagnostics")]
+    diagnostics: RefCell<allocation_diagnostics::State>,
     registry: RefCell<GcRegistry>,
     weak_observers: RefCell<crate::fasthash::FastMap<usize, crate::weak_metadata::DeathObservers>>,
     scope_registry: RefCell<Vec<Weak<RefCell<crate::interpreter::Scope>>>>,
@@ -1919,6 +1983,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     Rc::new(GcState {
         heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "architecture-diagnostics")]
+        diagnostics: RefCell::new(allocation_diagnostics::State::default()),
         registry: RefCell::new(GcRegistry {
             entries: Vec::new(),
             free: Vec::new(),
@@ -2158,6 +2224,12 @@ pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
 /// Promote survivors in one pass over the nursery, not the retained old heap. A periodic major
 /// collection revisits inter-generational cycles and conservatively retained ephemeron values.
 pub(crate) fn gc_finish_generation(heap: &GcHeap, major: bool) {
+    #[cfg(feature = "architecture-diagnostics")]
+    {
+        heap.diagnostics.borrow_mut().finish_generation();
+        allocation_diagnostics::report(heap);
+        crate::bytecode::call_cache_diagnostics::report();
+    }
     let mut registry = heap.registry.borrow_mut();
     while let Some(slot) = registry.young_slots.pop() {
         registry.young_positions[slot] = usize::MAX;
@@ -2738,13 +2810,13 @@ impl InlinePacked {
         slots: [const { std::mem::MaybeUninit::uninit() }; INLINE_PACKED_CAPACITY],
     };
 
-    unsafe fn from_raw(items: *mut PackedValue, len: usize) -> InlinePacked {
-        debug_assert!(len <= INLINE_PACKED_CAPACITY);
+    fn from_properties(items: impl ExactSizeIterator<Item = Property>) -> InlinePacked {
+        debug_assert!(items.len() <= INLINE_PACKED_CAPACITY);
         let mut packed = InlinePacked::default();
-        for index in 0..len {
-            packed.slots[index].write(Property::plain_packed(unsafe { items.add(index).read() }));
+        for property in items {
+            packed.slots[packed.len as usize].write(property);
+            packed.len += 1;
         }
-        packed.len = len as u8;
         packed
     }
 
@@ -2878,6 +2950,34 @@ impl DenseStorage {
             dense.packed = Some(Box::new(dense.inline_packed.into_vec()));
         }
         dense.packed.as_deref_mut()
+    }
+    fn packed_slice_mut(&mut self) -> Option<&mut [Property]> {
+        let dense = self.0.as_deref_mut()?;
+        match dense.packed.as_deref_mut() {
+            Some(packed) => Some(packed.as_mut_slice()),
+            None if dense.inline_packed.len != 0 => Some(unsafe {
+                // The same initialized prefix as InlinePacked::as_slice. A mutable
+                // element access does not require promoting the backing storage.
+                std::slice::from_raw_parts_mut(
+                    dense.inline_packed.slots.as_mut_ptr().cast::<Property>(),
+                    dense.inline_packed.len as usize,
+                )
+            }),
+            None => None,
+        }
+    }
+    fn push_packed(&mut self, property: Property) {
+        let dense = self.buffers_mut();
+        if let Some(packed) = dense.packed.as_deref_mut() {
+            packed.push(property);
+        } else if (dense.inline_packed.len as usize) < INLINE_PACKED_CAPACITY {
+            dense.inline_packed.slots[dense.inline_packed.len as usize].write(property);
+            dense.inline_packed.len += 1;
+        } else {
+            let mut packed = dense.inline_packed.into_vec();
+            packed.push(property);
+            dense.packed = Some(Box::new(packed));
+        }
     }
     fn packed_ref(&self) -> Option<&[Property]> {
         let dense = self.0.as_deref()?;
@@ -3194,6 +3294,13 @@ pub(crate) fn f64_exact_i32(f: f64) -> bool {
 /// `elems` hole marker (also caps how many entries dense slots can address).
 const NO_SLOT: u32 = u32::MAX;
 
+/// Prototype ablation: retain the previous creation/growth policy in the same binary.
+/// The canonical descriptor and sparse-property implementations are shared in both modes.
+pub(crate) fn dense_elements_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LUMEN_DENSE_ELEMENTS").as_deref() != Ok("0"))
+}
+
 /// The empty-object shape: every `Props` starts here and all empty objects share it, so adding
 /// the same first key to two of them lands on the same child shape.
 const SHAPE_EMPTY: u32 = 0;
@@ -3335,7 +3442,7 @@ fn shape_fresh() -> u32 {
 /// Entry count up to which a `Props` runs without a hash index (linear-scan lookups, no hash
 /// allocation or rehash on insert). Most objects — instance fields, cons cells, literals — stay
 /// under it for their whole life.
-const INDEX_THRESHOLD: usize = 8;
+pub(crate) const INDEX_THRESHOLD: usize = 8;
 
 thread_local! {
     /// Interned key strings for small array indices — every dense array element key "0".."63"
@@ -3510,22 +3617,34 @@ impl Props {
         }
     }
 
-    /// Construct a small dense array map directly from moved JIT stack values.
+    /// Construct a dense array map directly from moved JIT stack values.
     ///
     /// # Safety
     /// `items..items+len` contains initialized `PackedValue`s relinquished by the caller.
     pub(crate) unsafe fn packed_array_from_raw(items: *mut PackedValue, len: usize) -> Props {
-        debug_assert!(len <= 32);
+        Self::packed_array_properties(
+            (0..len).map(|index| Property::plain_packed(unsafe { items.add(index).read() })),
+        )
+    }
+
+    /// CreateArrayFromList / ArrayCreate (ECMA-262 e28783d5). Host/runtime lists
+    /// use the same canonical contiguous storage as literal operands. Values
+    /// move into plain own properties; no getters, conversions or species run.
+    pub(crate) fn packed_array_from_values(items: Vec<Value>) -> Props {
+        Self::packed_array_properties(items.into_iter().map(Property::plain))
+    }
+
+    fn packed_array_properties(items: impl ExactSizeIterator<Item = Property>) -> Props {
+        let len = items.len();
         let inline = len <= INLINE_PACKED_CAPACITY;
-        let mut packed = Vec::with_capacity(if inline { 0 } else { len });
-        if !inline {
-            for index in 0..len {
-                packed.push(Property::plain_packed(unsafe { items.add(index).read() }));
-            }
-        }
+        let (inline_packed, packed) = if inline {
+            (InlinePacked::from_properties(items), None)
+        } else {
+            (InlinePacked::default(), Some(Box::new(items.collect())))
+        };
         let length_key = fn_key(0);
         let shape = array_length_shape(&length_key);
-        Props {
+        let mut props = Props {
             entries: NamedEntries {
                 fields: vec![Property::data(Value::Num(len as f64), true, false, false)],
                 layout: Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone)),
@@ -3539,12 +3658,8 @@ impl Props {
             } else {
                 DenseStorage(Some(Box::new(DenseBuffers {
                     index: None,
-                    packed: (!inline).then(|| Box::new(packed)),
-                    inline_packed: if inline {
-                        unsafe { InlinePacked::from_raw(items, len) }
-                    } else {
-                        InlinePacked::default()
-                    },
+                    packed,
+                    inline_packed,
                     elems: Vec::new(),
                     mirror: Vec::new(),
                     symbols: None,
@@ -3561,7 +3676,14 @@ impl Props {
             elem_mode: Cell::new(true),
             proto_slot: Cell::new(NO_SLOT),
             len_slot: Cell::new(0),
+        };
+        // Previously large numeric lists built a mirror while constructing decimal
+        // property keys. Preserve native numeric-region access without those keys.
+        // This is an allocation boundary, unlike bounded non-safepoint hot preparation.
+        if len > 32 {
+            props.initialize_packed_numeric_mirror();
         }
+        props
     }
 
     /// Instantiate a compiler-proved plain-data object template with its final values.
@@ -3618,17 +3740,22 @@ impl Props {
         }
     }
 
-    /// Reserve the exact backing storage for a dense array whose initial length is known.
-    /// `entries` needs one additional slot for the array's own `length` property. Small literals
-    /// use the keyless packed representation: it avoids allocating/cloning one decimal string key
-    /// per element, while all indexed/reflection paths already understand packed properties.
-    /// Larger numeric arrays retain the raw-f64 mirror used by numeric JIT regions.
+    /// Reserve contiguous elements for a fresh dense array of known size. The
+    /// named-property vector needs only `length`; numeric arrays also retain the
+    /// coherent f64 view used by native loops. The ablation keeps the old split.
     pub(crate) fn reserve_dense_exact(&mut self, len: usize, numeric: bool) {
-        if (1..=32).contains(&len) {
+        if (1..=32).contains(&len) || (len != 0 && dense_elements_enabled()) {
             self.entries.reserve_exact(1); // own `length`
             self.elems
                 .set_packed(Some(Box::new(Vec::with_capacity(len))));
-            self.mirror_flags = 0;
+            self.mirror_flags = if numeric && dense_elements_enabled() {
+                MIRROR_OK | MIRROR_PACKED | MIRROR_ALL_I32 | MIRROR_NO_HOLES
+            } else {
+                0
+            };
+            if numeric && dense_elements_enabled() {
+                self.elems.mirror_reserve_exact(len);
+            }
         } else {
             self.entries.reserve_exact(len.saturating_add(1));
             self.elems.reserve_exact(len);
@@ -3740,6 +3867,79 @@ impl Props {
         self.mirror_flags =
             MIRROR_OK | MIRROR_PACKED | MIRROR_NO_HOLES | if all_i32 { MIRROR_ALL_I32 } else { 0 };
         true
+    }
+
+    fn initialize_packed_numeric_mirror(&mut self) {
+        let Some(packed) = self.elems.packed_ref() else {
+            return;
+        };
+        let mut all_i32 = true;
+        for property in packed {
+            let Some(number) = property.number_value() else {
+                return;
+            };
+            if property.accessor() || !property.writable() || number.to_bits() == MIRROR_HOLE {
+                return;
+            }
+            all_i32 &= f64_exact_i32(number);
+        }
+        let mirror = packed.iter().map(|p| p.number_value().unwrap()).collect();
+        self.elems.buffers_mut().mirror = mirror;
+        self.mirror_holes = 0;
+        self.mirror_flags =
+            MIRROR_OK | MIRROR_PACKED | MIRROR_NO_HOLES | if all_i32 { MIRROR_ALL_I32 } else { 0 };
+    }
+
+    /// Append one owning descriptor, with no decimal key or index-to-field map.
+    /// Array exotic validation (length, extensibility and prototype setters) stays
+    /// at the caller. ECMA-262 Array [[DefineOwnProperty]] / OrdinarySet, e28783d5.
+    fn push_packed_property(&mut self, property: Property) {
+        let old_len = self.elems.packed_ref().map_or(0, <[Property]>::len);
+        if dense_elements_enabled()
+            && self.mirror_flags & MIRROR_OK != 0
+            && self.elems.mirror_len() == old_len
+            && (old_len == 0 || self.mirror_flags & MIRROR_PACKED != 0)
+        {
+            match property.number_value() {
+                Some(number)
+                    if !property.accessor()
+                        && property.writable()
+                        && number.to_bits() != MIRROR_HOLE =>
+                {
+                    self.mirror_flags |= MIRROR_PACKED;
+                    if !f64_exact_i32(number) {
+                        self.mirror_flags &= !MIRROR_ALL_I32;
+                    }
+                    self.elems.mirror_push(number);
+                }
+                _ => self.mirror_invalidate(),
+            }
+        } else {
+            self.mirror_invalidate();
+        }
+        self.elems.push_packed(property);
+    }
+
+    fn can_start_packed_elements(&self, index: usize) -> bool {
+        dense_elements_enabled()
+            && self.elem_mode.get()
+            && !self.has_far.get()
+            && self.elems.len() == 0
+            && !self.elems.packed_is_some()
+            && index <= 256
+    }
+
+    /// Create a bounded absent prefix on the first indexed write, never in response
+    /// to the array's logical length. new Array(2**32-1) remains a small object.
+    fn start_packed_elements(&mut self, index: usize, property: Property) {
+        debug_assert!(self.can_start_packed_elements(index));
+        if index != 0 {
+            self.mirror_invalidate();
+            for _ in 0..index {
+                self.elems.push_packed(Property::plain(Value::Empty));
+            }
+        }
+        self.push_packed_property(property);
     }
 
     /// Mark this map as an array's (see `elem_mode`). One-way, set when the owning object
@@ -3930,7 +4130,7 @@ impl Props {
             if self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
                 self.mirror_invalidate();
             }
-            let packed = self.elems.packed_mut().unwrap();
+            let packed = self.elems.packed_slice_mut().unwrap();
             let Some(p) = packed.get_mut(n as usize) else {
                 return Err(v);
             };
@@ -4049,13 +4249,17 @@ impl Props {
     /// (`elem_mode`) maps only: the shape is untouched. Returns `false` (nothing changed) when
     /// the gates don't hold; the caller runs the generic path.
     pub(crate) fn try_append_element(&mut self, n: u32, prop: Property) -> Result<(), Property> {
+        if n == 0 && self.can_start_packed_elements(0) {
+            self.note_structural();
+            self.start_packed_elements(0, prop);
+            return Ok(());
+        }
         if let Some(packed) = self.elems.packed_ref() {
             if self.has_far.get() || !self.elem_mode.get() || n as usize != packed.len() {
                 return Err(prop);
             }
             self.note_structural();
-            self.mirror_invalidate();
-            self.elems.packed_mut().unwrap().push(prop);
+            self.push_packed_property(prop);
             return Ok(());
         }
         if self.has_far.get() || !self.elem_mode.get() || n as usize != self.elems.len() {
@@ -4083,6 +4287,38 @@ impl Props {
         n: u32,
         prop: Property,
     ) -> Result<(), Property> {
+        if self.can_start_packed_elements(n as usize) {
+            self.note_structural();
+            self.start_packed_elements(n as usize, prop);
+            return Ok(());
+        }
+        if dense_elements_enabled() && self.elem_mode.get() && !self.has_far.get() {
+            if let Some(packed) = self.elems.packed_ref() {
+                let index = n as usize;
+                let len = packed.len();
+                if packed
+                    .get(index)
+                    .is_some_and(|property| !property.is_empty())
+                    || index > len + 256
+                {
+                    return Err(prop);
+                }
+                self.note_structural();
+                if index == len {
+                    self.push_packed_property(prop);
+                } else {
+                    self.mirror_invalidate();
+                    let packed = self.elems.packed_mut().unwrap();
+                    if index < packed.len() {
+                        packed[index] = prop;
+                    } else {
+                        packed.resize_with(index, || Property::plain(Value::Empty));
+                        packed.push(prop);
+                    }
+                }
+                return Ok(());
+            }
+        }
         if self.elems.packed_is_some() || self.has_far.get() || !self.elem_mode.get() {
             return Err(prop);
         }
@@ -4420,7 +4656,10 @@ impl Props {
                 .is_some_and(|p| !p.is_empty())
             {
                 self.mirror_invalidate();
-                return self.elems.packed_mut().and_then(|p| p.get_mut(n as usize));
+                return self
+                    .elems
+                    .packed_slice_mut()
+                    .and_then(|p| p.get_mut(n as usize));
             }
         }
         if key.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
@@ -4481,11 +4720,8 @@ impl Props {
     /// key-string allocation. Only valid on a Props whose entries so far are exactly the dense
     /// elements 0..len.
     pub(crate) fn push_dense(&mut self, prop: Property) {
-        if self.elems.packed_is_some() {
-            self.mirror_invalidate();
-        }
-        if let Some(packed) = self.elems.packed_mut() {
-            packed.push(prop);
+        if self.elems.packed_is_some() || self.can_start_packed_elements(0) {
+            self.push_packed_property(prop);
             return;
         }
         let slot = self.entries.len();
@@ -4563,16 +4799,28 @@ impl Props {
     pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
         let key = key.into();
         self.elems.retain_symbol_key(&key);
+        if let Some(n) = canonical_index(&key) {
+            if self.can_start_packed_elements(n as usize) {
+                self.note_structural();
+                self.start_packed_elements(n as usize, prop);
+                return;
+            }
+        }
         if let (Some(n), Some(packed)) = (canonical_index(&key), self.elems.packed_ref()) {
             let n = n as usize;
             if n < packed.len() {
                 self.note_structural();
                 self.mirror_invalidate();
-                self.elems.packed_mut().unwrap()[n] = prop;
+                self.elems.packed_slice_mut().unwrap()[n] = prop;
                 return;
             }
             if !self.has_far.get() && n <= packed.len() + 256 {
+                let len = packed.len();
                 self.note_structural();
+                if dense_elements_enabled() && n == len {
+                    self.push_packed_property(prop);
+                    return;
+                }
                 self.mirror_invalidate();
                 let packed = self.elems.packed_mut().unwrap();
                 packed.resize_with(n, || Property::plain(Value::Empty));
@@ -4672,7 +4920,7 @@ impl Props {
             if packed.get(n as usize).is_some_and(|p| !p.is_empty()) {
                 self.note_structural();
                 self.mirror_invalidate();
-                self.elems.packed_mut().unwrap()[n as usize] = Property::plain(Value::Empty);
+                self.elems.packed_slice_mut().unwrap()[n as usize] = Property::plain(Value::Empty);
                 return true;
             }
         }
@@ -4794,6 +5042,17 @@ impl Props {
             .filter(|property| !property.is_empty())
     }
 
+    /// All own array-index descriptors, independent of physical storage. Guards
+    /// for OrdinarySet / indexed Get must not mistake a packed descriptor for
+    /// an absent property. Named iteration intentionally excludes packed elements.
+    pub(crate) fn indexed_properties(&self) -> impl Iterator<Item = &Property> {
+        self.packed_values().chain(
+            self.entries
+                .iter()
+                .filter_map(|(key, property)| canonical_index(key).map(|_| property)),
+        )
+    }
+
     pub(crate) fn highest_nonconfig_index_from(&self, from: usize) -> Option<usize> {
         let packed = self
             .elems
@@ -4832,6 +5091,13 @@ mod numeric_mirror_tests;
 #[cfg(test)]
 #[path = "value_array_shift_tests.rs"]
 mod array_shift_tests;
+#[cfg(test)]
+#[path = "value_host_array_tests.rs"]
+mod host_array_tests;
+
+#[cfg(test)]
+#[path = "value_dense_elements_tests.rs"]
+mod dense_elements_tests;
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).
 #[inline(always)]

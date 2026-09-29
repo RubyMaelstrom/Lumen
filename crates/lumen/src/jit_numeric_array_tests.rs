@@ -375,6 +375,9 @@ fn numeric_array_existing_hole_filling_region_maintains_classic_views() {
 }
 
 fn check_hole_filling_region_storage(packed: bool) {
+    // Ordinary cold literals now also use contiguous elements. The same test
+    // with LUMEN_DENSE_ELEMENTS=0 retains explicit coverage of the classic path.
+    let packed = packed || crate::value::dense_elements_enabled();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(if tier == Tier::Jit {

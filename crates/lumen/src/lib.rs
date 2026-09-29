@@ -54,6 +54,7 @@ mod gc_native;
 mod gc_sweep;
 mod heap;
 mod host;
+mod host_collections;
 mod interpreter;
 mod interrupt;
 #[cfg(feature = "intl")]
@@ -1251,6 +1252,9 @@ mod entry_tests;
 mod tail_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod iterator_result_tests;
 
 #[cfg(all(test, feature = "embed"))]
 mod module_host_context_tests {

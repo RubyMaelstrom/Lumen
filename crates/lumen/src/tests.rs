@@ -214,7 +214,8 @@ fn fragmented_array_buffer_writes_preserve_host_synchronization() {
         .ctx()
         .take_array_buffer_dirty_ranges(&buffer)
         .unwrap();
-    assert_eq!(ranges, [0..4096]);
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0], 0..4096);
     let mut mirror = vec![0; 4096];
     for range in ranges {
         assert!(engine.ctx().array_buffer_copy_range(
@@ -16996,6 +16997,55 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
     assert!(!engine.ctx().gc_pins.contains_key(&retired_namespace));
     engine.ctx().set_host_job_context(61);
     assert_eq!(engine.ctx().host_job_context, 0);
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn retired_settings_request_boundary_collection_without_allocation_pressure() {
+    // HTML #discard-a-document allows a destroyed Document/Window to remain
+    // reachable. Retirement requests a scan; it must not forcibly destroy a
+    // retained Realm or interrupt the synchronous job (ECMA-262 §9.9).
+    let mut engine = Engine::new();
+    let abandoned = engine.ctx().create_embed_realm();
+    let retained = engine.ctx().create_embed_realm();
+    let abandoned_ptr = engine.ctx().object_addr(&abandoned).unwrap();
+    let retained_ptr = engine.ctx().object_addr(&retained).unwrap();
+    for (realm, context) in [(&abandoned, 81), (&retained, 82)] {
+        assert!(engine
+            .ctx()
+            .with_embed_realm(realm, |ctx| ctx.set_host_job_context(context))
+            .is_ok());
+    }
+    // Reset allocation pressure while both Realms are explicitly rooted.
+    engine.collect_garbage_at_idle();
+    assert!(!engine.has_pending_task_garbage_collection());
+    assert!(!engine.ctx().release_host_job_context(0));
+    assert!(!engine.has_pending_task_garbage_collection());
+
+    engine.defer_task_garbage_collection(true);
+    assert!(engine.ctx().release_host_job_context(81));
+    assert!(engine.ctx().release_host_job_context(82));
+    drop(abandoned);
+    assert!(engine.has_pending_task_garbage_collection());
+    assert!(engine.ctx().realms.contains_key(&abandoned_ptr));
+    engine.run_microtasks();
+    assert!(engine.has_pending_task_garbage_collection());
+    assert!(engine.ctx().realms.contains_key(&abandoned_ptr));
+    assert_eq!(engine.collect_pending_task_garbage(), 0);
+
+    engine.defer_task_garbage_collection(false);
+    assert!(engine.collect_pending_task_garbage() > 0);
+    assert!(!engine.ctx().realms.contains_key(&abandoned_ptr));
+    assert!(engine.ctx().realms.contains_key(&retained_ptr));
+    assert!(!engine.has_pending_task_garbage_collection());
+    assert!(!engine.ctx().release_host_job_context(81));
+    assert!(!engine.ctx().release_host_job_context(82));
+    assert!(!engine.has_pending_task_garbage_collection());
+    assert_eq!(engine.collect_pending_task_garbage(), 0);
+
+    drop(retained);
+    engine.collect_garbage_at_idle();
+    assert!(!engine.ctx().realms.contains_key(&retained_ptr));
 }
 
 #[cfg(feature = "embed")]

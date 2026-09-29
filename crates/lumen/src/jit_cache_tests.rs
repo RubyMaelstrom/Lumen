@@ -80,6 +80,47 @@ fn inactive_code_reclaims_but_rust_leases_and_native_marks_do_not() {
     );
 }
 
+#[cfg(feature = "optimizing-jit")]
+#[test]
+fn explicit_retirement_invalidates_before_reuse_and_waits_for_frames_and_leases() {
+    let mut e = engine();
+    eval(&mut e, "function retiring(x){return x+2;}retiring(1);");
+    let c = chunk(&mut e.interp, "retiring");
+    let lease = c.jit.get().flatten().unwrap();
+    let weak = Rc::downgrade(&lease);
+    let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    lease.residency.active.set(1);
+    c.jit.request_retirement();
+    assert_ne!(
+        crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+        epoch
+    );
+    assert!(
+        c.jit.get().is_none(),
+        "a retiring address is never republished"
+    );
+    drop(lease);
+    cache::reclaim(usize::MAX);
+    assert!(c.jit.get().is_none());
+    let lease = weak.upgrade().expect("native return PC remains mapped");
+    lease.residency.active.set(0);
+    assert!(c.jit.get().is_none());
+    assert!(
+        !c.jit.ready_to_compile(),
+        "outstanding Rust lease is still protected"
+    );
+    drop(lease);
+    cache::reclaim(usize::MAX);
+    assert!(c.jit.get().is_none());
+    assert!(
+        weak.upgrade().is_none(),
+        "inactive unleased version is retired"
+    );
+    assert!(c.jit.ready_to_compile());
+    assert_eq!(eval(&mut e, "retiring(3)"), "5");
+    assert!(c.jit.get().flatten().is_some());
+}
+
 fn reclaim_from_native(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
     for name in ["activeParent", "activeLeaf"] {
         let c = chunk(i, name);
@@ -102,6 +143,35 @@ fn reclaim_from_native(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, V
 
 #[test]
 fn direct_return_and_throw_survive_reentrant_reclamation() {
+    const CHILD: &str = "LUMEN_TEST_DIRECT_RECLAIM_CHILD";
+    let Ok(mode) = std::env::var(CHILD) else {
+        // CALL_IC_EPOCH is process-wide: unrelated parallel tests can invalidate
+        // the sole normal-return probe between warming and entry. Isolate its
+        // coverage assertion, and separately require the SAME observable result
+        // when an explicit invalidation forces the checked-call fallback.
+        for mode in ["stable", "stale"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "jit::cache_tests::direct_return_and_throw_survive_reentrant_reclamation",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .env("LUMEN_OPT_JIT", "0")
+                .env("LUMEN_INLINE_AT", "100")
+                .env_remove("LUMEN_JIT_NO_DIRECT_CALLS")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    assert!(matches!(mode.as_str(), "stable" | "stale"));
     let mut e = engine();
     let global = e.interp.global.clone();
     e.interp
@@ -126,6 +196,9 @@ fn direct_return_and_throw_survive_reentrant_reclamation() {
     let before = cache::eviction_count();
     #[cfg(target_arch = "aarch64")]
     TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+    if mode == "stale" {
+        crate::bytecode::invalidate_call_caches();
+    }
     assert_eq!(
         eval(
             &mut e,
@@ -149,10 +222,17 @@ fn direct_return_and_throw_survive_reentrant_reclamation() {
         );
     }
     #[cfg(target_arch = "aarch64")]
-    assert!(
-        TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) > 0,
-        "must exercise a real direct native return, not only Rust-leased entries"
-    );
+    {
+        let returns = TEST_DIRECT_PACKED_RETURNS.with(|count| count.get());
+        if mode == "stable" {
+            assert!(
+                returns > 0,
+                "must exercise a real direct native return, not only Rust-leased entries"
+            );
+        } else {
+            assert_eq!(returns, 0, "stale call caches must use the checked path");
+        }
+    }
 }
 
 #[test]
