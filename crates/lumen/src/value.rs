@@ -955,6 +955,8 @@ pub struct JitLayout {
     pub exotic_strwrap_tag: u8,
     /// `ic_plain` byte within `Object` (the per-receiver "not in an exotic side table" flag).
     pub obj_ic_plain: usize,
+    /// Fail-closed probe for ordinary numeric typed-array backing storage.
+    pub native_typed_array: Option<crate::native_typed_array::Layout>,
     /// `Rc::as_ptr(env)` → the scope's `VarMap` generation counter (through the `RefCell`).
     pub scope_gen: usize,
     /// The live fixed-binding-layout identity, zero after structural mutation.
@@ -1201,6 +1203,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         rc_strong_off,
         obj_proto: offset_of!(Object, proto),
         obj_ic_plain: offset_of!(Object, ic_plain),
+        native_typed_array: crate::native_typed_array::probe_layout(offset_of!(
+            Object,
+            native_typed_array
+        )),
         obj_props: offset_of!(Object, props),
         obj_exotic: offset_of!(Object, exotic),
         obj_is_constructor: offset_of!(Object, is_constructor),
@@ -1504,6 +1510,7 @@ pub struct Object {
     /// clear, so ONE proxy existing somewhere no longer disables the caches for every plain
     /// object in the program (the old global `inline_ic_safe` latch).
     pub(crate) ic_plain: Cell<bool>,
+    pub(crate) native_typed_array: Option<Box<crate::native_typed_array::NativeTypedArray>>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
     /// GC scratch: internal-reference count during root classification, then snapshot index
@@ -1580,6 +1587,7 @@ impl Object {
                 call: Callable::None,
                 exotic,
                 ic_plain: Cell::new(true),
+                native_typed_array: None,
                 is_constructor: false,
                 gc_mark: Cell::new(false),
                 gc_weak_observed: Cell::new(false),
@@ -2275,6 +2283,7 @@ pub(crate) fn destroy_gc_heap(heap: &GcHeap) {
                 object.proto.take(),
                 std::mem::replace(&mut object.call, Callable::None),
                 std::mem::replace(&mut object.exotic, Exotic::None),
+                object.native_typed_array.take(),
             )
         };
         // Native captures may have Rust destructors. Release them outside the borrow.

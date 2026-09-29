@@ -441,6 +441,7 @@ pub(crate) struct Visitor {
     rc_u16_slices: HashSet<usize>,
     rc_value_slices: HashSet<usize>,
     array_buffers: HashMap<usize, usize>,
+    native_buffers: HashSet<usize>,
     shared_array_buffers: HashSet<u64>,
     shared_array_buffer_allocations: Vec<SharedBackingAllocation>,
     unavailable_shared_array_buffers: usize,
@@ -970,17 +971,21 @@ impl Visitor {
         }
         self.callable(&object.call);
         let mut internal_bytes = 0;
+        if let Some(view) = &object.native_typed_array {
+            internal_bytes += size_of::<crate::native_typed_array::NativeTypedArray>();
+            internal_bytes += self.native_buffer(&view.buffer);
+        }
         match &object.exotic {
             Exotic::StrWrap(value) => self.value(&Value::Str((**value).clone())),
             Exotic::SymWrap(value) => self.symbol(value),
             Exotic::BigIntWrap(value) => self.value(&Value::BigInt((**value).clone())),
             Exotic::Error(value) => self.rc_str(value),
             Exotic::ArrayIterator(state) => {
-                internal_bytes = std::mem::size_of_val(&**state);
+                internal_bytes += std::mem::size_of_val(&**state);
                 self.value(&state.target);
             }
             Exotic::StringIterator(state) => {
-                internal_bytes = std::mem::size_of_val(&**state);
+                internal_bytes += std::mem::size_of_val(&**state);
                 if let Some(string) = &state.string {
                     self.value(&Value::Str(string.clone()));
                 }
@@ -993,6 +998,22 @@ impl Visitor {
         }
         let (bytes, exact) = object.props.retained_requested_storage_bytes();
         (bytes.saturating_add(internal_bytes), exact)
+    }
+
+    fn native_buffer(
+        &mut self,
+        buffer: &std::rc::Rc<crate::native_typed_array::NativeBuffer>,
+    ) -> usize {
+        if !self
+            .native_buffers
+            .insert(std::rc::Rc::as_ptr(buffer) as usize)
+        {
+            return 0;
+        }
+        if let Some(storage) = buffer.storage.borrow().as_ref() {
+            self.array_buffer(storage);
+        }
+        size_of::<crate::native_typed_array::NativeBuffer>() + 2 * size_of::<usize>()
     }
 
     fn scope(&mut self, scope: &Scope) -> (usize, bool) {
@@ -2078,6 +2099,17 @@ fn scan_realm(
                 .capacity()
                 .saturating_mul(size_of::<std::ops::Range<usize>>()),
         );
+    }
+    totals
+        .interpreter_side_tables
+        .add(interp.native_buffers.len().saturating_mul(size_of::<(
+            usize,
+            std::rc::Rc<crate::native_typed_array::NativeBuffer>,
+        )>()));
+    for buffer in interp.native_buffers.values() {
+        totals
+            .interpreter_side_tables
+            .add(visitor.native_buffer(buffer));
     }
     for buffer in interp.ta_buffer.values() {
         visitor.value(buffer);

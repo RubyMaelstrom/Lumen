@@ -269,6 +269,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     };
     // Transfer ownership of the Vec rather than cloning it. This is the engine primitive behind
     // HTML structured transfer; same-length transfers must remain O(1) in backing-store bytes.
+    i.invalidate_native_buffer(ptr);
     let bytes = i
         .array_buffers
         .remove(&ptr)
@@ -1772,6 +1773,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
     // is kept in a side table, and BYTES_PER_ELEMENT lives on the prototype.
     let _ = es;
     i.ta_buffer.insert(p, buf_val);
+    i.register_native_typed_array(&obj, i.typed_arrays[&p]);
     Ok(Value::Obj(obj))
 }
 

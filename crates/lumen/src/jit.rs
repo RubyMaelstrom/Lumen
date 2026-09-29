@@ -44,6 +44,13 @@ use crate::value::{PackedValue, Value};
 #[path = "jit_names.rs"]
 mod names;
 
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "jit_typed_array.rs"]
+mod typed_array;
+
 #[path = "jit_profiler.rs"]
 mod profiler;
 
@@ -2406,6 +2413,26 @@ mod asm {
         pub fn ldr_w_imm(&mut self, rt: u32, rn: u32, imm_bytes: u32) {
             debug_assert!(imm_bytes.is_multiple_of(4) && imm_bytes / 4 < 4096);
             self.emit(0xB940_0000 | ((imm_bytes / 4) << 10) | (rn << 5) | rt);
+        }
+        /// LDRSB Wt / LDRSH Wt, [Xn]: packed integer reads, sign extended to 32 bits.
+        pub fn ldr_signed_packed(&mut self, rt: u32, rn: u32, half: bool) {
+            self.emit((if half { 0x79C0_0000 } else { 0x39C0_0000 }) | (rn << 5) | rt);
+        }
+        /// STRH Wt, [Xn].
+        pub fn strh(&mut self, rt: u32, rn: u32) {
+            self.emit(0x7900_0000 | (rn << 5) | rt);
+        }
+        /// LDR St / STR St, [Xn].
+        pub fn float32_memory(&mut self, rt: u32, rn: u32, store: bool) {
+            self.emit((if store { 0xBD00_0000 } else { 0xBD40_0000 }) | (rn << 5) | rt);
+        }
+        /// FCVT Sd, Dn / FCVT Dd, Sn. Narrowing uses FPCR's roundTiesToEven default.
+        pub fn fcvt_float_width(&mut self, rd: u32, rn: u32, narrow: bool) {
+            self.emit((if narrow { 0x1E62_4000 } else { 0x1E22_C000 }) | (rn << 5) | rd);
+        }
+        /// LSLV Xd, Xn, Xm.
+        pub fn lsl_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd);
         }
         /// madd xd, xn, xm, xa  (xd = xn*xm + xa)
         pub fn madd(&mut self, rd: u32, rn: u32, rm: u32, ra: u32) {
@@ -9265,6 +9292,8 @@ fn emit_get_elem_inline(
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
+    let typed = a.new_label();
+    let mirror_hit = a.new_label();
     // 1. stack: [obj @ -32, key @ -16] — receiver must be Obj, key must be Num
     emit_exec_word_load(a, 9, 20, -16);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
@@ -9292,11 +9321,11 @@ fn emit_get_elem_inline(
     a.b_cond(C_NE, slow);
     a.bind(ex_ok);
     a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, slow);
+    a.cbz(12, false, typed);
     // 5. mirror read: coherent + hole-free ⇒ bounds + one indexed load of a known Num — no
     // entry chase, no tag check, no refcount bump. A miss answers classically below.
     let classic = a.new_label();
-    let mirror_hit = a.new_label();
+
     let mf = (layout.obj_props + layout.props_mirror_flags) as u32;
     let mirror = el;
     a.ldrb_imm(12, 11, mf);
@@ -9378,6 +9407,8 @@ fn emit_get_elem_inline(
     emit_exec_word_store(a, 12, 20, -16);
     a.sub_imm(20, 20, 8);
     a.b(done);
+    a.bind(typed);
+    typed_array::emit(a, layout, None, mirror_hit, slow);
     a.bind(slow);
     emit_op_helper(a, H_GET_ELEM, pc, l_unwind);
     a.bind(done);
@@ -9546,6 +9577,7 @@ fn emit_set_elem_inline(
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
+    let typed = a.new_label();
     // 1. stack: [obj @ -48, key @ -32, v @ -16]
     emit_exec_word_load(a, 9, 20, -24);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
@@ -9573,7 +9605,7 @@ fn emit_set_elem_inline(
     a.b_cond(C_NE, slow);
     a.bind(ex_ok);
     a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, slow);
+    a.cbz(12, false, typed);
     // 5. dense bounds
     a.ldr_imm(12, 11, el);
     a.cbz(12, true, slow);
@@ -9643,6 +9675,27 @@ fn emit_set_elem_inline(
     a.stur(13, 10, strong);
     if keep {
         // [obj, key, v] → [v]: the result lands at the obj slot
+        emit_exec_word_load(a, 14, 20, -8);
+        emit_exec_word_store(a, 14, 20, -24);
+        a.sub_imm(20, 20, 16);
+    } else {
+        a.sub_imm(20, 20, 24);
+    }
+    a.b(done);
+    a.bind(typed);
+    let typed_hit = a.new_label();
+    typed_array::emit(
+        a,
+        layout,
+        Some(typed_array::WriteValue::Stack),
+        typed_hit,
+        slow,
+    );
+    a.bind(typed_hit);
+    a.ldur(9, 10, strong);
+    a.sub_imm(9, 9, 1);
+    a.stur(9, 10, strong);
+    if keep {
         emit_exec_word_load(a, 14, 20, -8);
         emit_exec_word_store(a, 14, 20, -24);
         a.sub_imm(20, 20, 16);
@@ -9855,6 +9908,8 @@ fn emit_elem_local_keyed(
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
+    let typed = a.new_label();
+    let mirror_hit = a.new_label();
     // 1. slot holds an Obj; key (from its source) is a Num, loaded into d0
     emit_exec_word_load(a, 9, 22, slot_off as i32);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
@@ -9893,8 +9948,8 @@ fn emit_elem_local_keyed(
     a.b_cond(C_NE, slow);
     a.bind(ex_ok);
     a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, slow);
-    let mirror_hit = a.new_label();
+    a.cbz(12, false, typed);
+
     let classic = a.new_label();
     if get {
         // 5. mirror read: bounds + one indexed load of a known Num (see emit_get_elem_inline).
@@ -10028,6 +10083,28 @@ fn emit_elem_local_keyed(
         }
     }
     a.b(done);
+    a.bind(typed);
+    if get {
+        typed_array::emit(a, layout, None, mirror_hit, slow);
+    } else {
+        let typed_hit = a.new_label();
+        typed_array::emit(
+            a,
+            layout,
+            Some(typed_array::WriteValue::Stack),
+            typed_hit,
+            slow,
+        );
+        a.bind(typed_hit);
+        if kind == ElemLocalKind::SetKeep {
+            emit_exec_word_load(a, 14, 20, -8);
+            emit_exec_word_store(a, 14, 20, -16);
+            a.sub_imm(20, 20, 8);
+        } else {
+            a.sub_imm(20, 20, 16);
+        }
+        a.b(done);
+    }
     a.bind(slow);
     for (index, &p) in pcs.iter().enumerate() {
         if index + 1 == pcs.len() {
@@ -11223,14 +11300,25 @@ fn emit_chain(
                 a.fcmp(dk, 0);
                 a.b_cond(C_NE, guard!());
                 let packed_done = a.new_label();
+                let typed = a.new_label();
+                let typed_hit = a.new_label();
                 let cached = rcache.iter().position(|c| c.off == xoff);
                 let mode: Option<(u32, u32)> = match cached {
                     Some(k) => {
                         let ent = &rcache[k];
                         a.mov(11, ent.base);
                         match ent.mode {
-                            RcMode::Mirror { mpreg, mlreg } => Some((mpreg, mlreg)),
-                            RcMode::Classic => None,
+                            RcMode::Mirror { mpreg, mlreg } => {
+                                // A negative length is the typed-view marker, never an array length.
+                                a.cmp_imm_x(mlreg, 0);
+                                a.b_cond(C_MI, typed);
+                                Some((mpreg, mlreg))
+                            }
+                            RcMode::Classic => {
+                                a.ldrb_imm(12, 11, plain);
+                                a.cbz(12, false, typed);
+                                None
+                            }
                         }
                     }
                     None => {
@@ -11247,7 +11335,7 @@ fn emit_chain(
                         a.b_cond(C_NE, guard!());
                         a.bind(ex_ok);
                         a.ldrb_imm(12, 11, plain); // no side-table behavior
-                        a.cbz(12, false, guard!());
+                        a.cbz(12, false, typed);
                         if rfree.len() >= 3 {
                             // Retain the existing numeric-kernel optimization when a mirror
                             // is coherent. Its absence selects native element access below,
@@ -11562,6 +11650,28 @@ fn emit_chain(
                     a.ldur_d(dk, 15, ev + 8); // reuse the key's register for the element
                     a.bind(mirror_done);
                     vregs.push((dk, false));
+                }
+                a.b(packed_done);
+                a.bind(typed);
+                if cached.is_none() {
+                    if let Some(entry) = rcache.iter().find(|entry| entry.off == xoff) {
+                        a.mov(entry.base, 11);
+                        if let RcMode::Mirror { mpreg, mlreg } = entry.mode {
+                            a.movz(mpreg, 0, 0);
+                            a.mov_imm64(mlreg, usize::MAX as u64);
+                        }
+                    }
+                }
+                typed_array::emit(
+                    a,
+                    layout,
+                    is_set.then_some(typed_array::WriteValue::Register(dv)),
+                    typed_hit,
+                    guard!(),
+                );
+                a.bind(typed_hit);
+                if !is_set {
+                    a.fmov_d_d(dk, 1);
                 }
                 a.bind(packed_done);
             }

@@ -35,6 +35,75 @@ fn arithmetic() {
 }
 
 #[test]
+fn integer_switch_dispatch_preserves_case_block_semantics_in_all_tiers() {
+    // ECMA-262 CaseBlockEvaluation, CaseClauseIsSelected and strict equality,
+    // snapshot e28783d5fc9d. Include defaults before later matches and duplicate ±0.
+    let source = r#"
+        function check(ok, message) {if (!ok) throw new Error(message);}
+        function select(v) {
+            var out = '';
+            switch (v) {
+                case -2147483648: return 'min';
+                case -3: return 'minus';
+                case -0: out += 'zero'; break;
+                case 0: return 'duplicate';
+                case 1: out += 'one';
+                default: out += 'default';
+                case 7: out += 'seven'; break;
+                case 12: return 'twelve';
+                case 101: return 'hundred';
+                case 4096: return 'large';
+                case 2147483647: return 'max';
+            }
+            return out;
+        }
+        var conversions = 0;
+        var object = {valueOf() {conversions++; return 7;}};
+        for (var warm = 0; warm < 50; ++warm) {
+            check(select(0) === 'zero' && select(-0) === 'zero', 'first duplicate');
+            check(select(1) === 'onedefaultseven', 'source order fallthrough');
+            check(select(7) === 'seven', 'match after default');
+            check(select(-3) === 'minus' && select(12) === 'twelve', 'sparse integers');
+            check(select(-2147483648) === 'min' && select(2147483647) === 'max', 'boundaries');
+        }
+        for (var v of [NaN, Infinity, -Infinity, 0.5, -1, 102, '7', true,
+                        undefined, null, 7n, Symbol(), object])
+            check(select(v) === 'defaultseven', 'strict equality and misses');
+        check(conversions === 0, 'no discriminant coercion');
+        function lexical(v) {
+            switch (v) {
+                case 1: return later();
+                case 2: case 3: case 4: case 5: case 6: case 7: case 8: return 0;
+                default: function later() {return 42;}
+            }
+        }
+        check(lexical(1) === 42, 'shared lexical instantiation');
+        var trace = [];
+        function test(v) {trace.push(v); return v;}
+        function dynamic(v) {
+            switch (v) {
+                case test(0): case test(1): return 'before';
+                default: return 'default';
+                case test(2): return 'after';
+                case test(3): return 'last';
+            }
+        }
+        check(dynamic(2) === 'after' && trace.join() === '0,1,2', 'ordered dynamic tests');
+        'ok'
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), "ok", "tier {tier:?}");
+    }
+}
+
+#[test]
 fn boolean_bitwise_fast_paths_preserve_numbers_and_coercion_in_all_tiers() {
     // Validate the wide Value layout used by both native boolean templates against live fields.
     // Do not read padding: Bool's byte is next to its tag, unlike Number's aligned double.
@@ -117,6 +186,14 @@ fn numeric_typed_array_access_preserves_exotic_semantics_in_all_tiers() {
             for (let warm = 0; warm < 120; ++warm) {
                 check(set(a, 1, 42) === 42 && get(a, 1) === 42, 'read/write');
                 check(inc(a, 1) === 42 && get(a, 1) === 43, 'update');
+            }
+            for (const v of [-2147483649, -2147483648, -65537, -129, -1, -0,
+                             0.5, 1.5, 2.5, 127, 128, 255, 256, 65535, 65536,
+                             2147483647, 2147483648, 4294967295, 4294967296,
+                             1e100, NaN, Infinity, -Infinity, 1 + 2 ** -24]) {
+                const expected = new C([v])[0];
+                check(Object.is(set(a, 1, v), v), 'assignment keeps original Number');
+                check(Object.is(get(a, 1), expected), 'element conversion ' + C.name);
             }
             set(a, -0, 7);
             check(get(a, 0) === 7 && get(a, -0) === 7, 'numeric negative zero');

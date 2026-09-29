@@ -59,7 +59,9 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         if let Value::Obj(o) = arg(args, 0) {
             let p = Rc::as_ptr(&o) as usize;
             // Truly detach: drop the backing store (so views see it as detached) and zero the views.
+            i.invalidate_native_buffer(p);
             i.array_buffers.remove(&p);
+            i.array_buffer_versions.remove(&p);
             i.array_buffer_dirty_ranges.remove(&p);
             let views: Vec<usize> = i
                 .typed_arrays

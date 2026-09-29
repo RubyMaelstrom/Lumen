@@ -6014,6 +6014,8 @@ impl Interp {
                         if let Some(v) = self.typed_arrays.remove(&sp) {
                             dst.borrow().ic_plain.set(false);
                             self.typed_arrays.insert(dp, v);
+                            dst.borrow_mut().native_typed_array =
+                                src.borrow_mut().native_typed_array.take();
                         }
                         // The TypedArray's `buffer` slot lives in a parallel side table keyed by the
                         // view's pointer, so it must move to `this` alongside its TaInfo.
@@ -6025,6 +6027,12 @@ impl Interp {
                         }
                         if let Some(v) = self.array_buffers.remove(&sp) {
                             self.array_buffers.insert(dp, v);
+                        }
+                        if let Some(v) = self.native_buffers.remove(&sp) {
+                            self.native_buffers.insert(dp, v);
+                        }
+                        if let Some(v) = self.array_buffer_versions.remove(&sp) {
+                            self.array_buffer_versions.insert(dp, v);
                         }
                         if let Some(v) = self.array_buffer_dirty_ranges.remove(&sp) {
                             self.array_buffer_dirty_ranges.insert(dp, v);

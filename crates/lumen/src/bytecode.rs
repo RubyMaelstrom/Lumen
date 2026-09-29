@@ -6636,6 +6636,34 @@ mod compiler_name_tests {
     }
 }
 
+/// A bounded selector set keeps pathological source from expanding compiler work. Unary signs
+/// and parentheses over numeric literals are pure; identifiers and other expressions are not.
+fn integer_switch_cases(cases: &[SwitchCase]) -> Option<Vec<(i32, usize)>> {
+    fn literal(expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::Num(value) => Some(*value),
+            Expr::Paren(inner) => literal(inner),
+            Expr::Unary { op: "+", arg } => literal(arg),
+            Expr::Unary { op: "-", arg } => literal(arg).map(|value| -value),
+            _ => None,
+        }
+    }
+    if cases.len() < 8 || cases.len() > 1024 {
+        return None;
+    }
+    let mut values = std::collections::BTreeMap::new();
+    for (index, case) in cases.iter().enumerate() {
+        if let Some(test) = &case.test {
+            let value = literal(test)?;
+            if value < i32::MIN as f64 || value > i32::MAX as f64 || value.fract() != 0.0 {
+                return None;
+            }
+            values.entry(value as i32).or_insert(index);
+        }
+    }
+    (values.len() >= 8).then(|| values.into_iter().collect())
+}
+
 #[derive(Default)]
 struct Compiler {
     /// Borrow the already-instantiated AST environment and return exact source completions.
@@ -10258,17 +10286,37 @@ impl Compiler {
             }
         }
 
-        // Phase 1: the test chain. Each match jumps to its (not yet emitted) body.
+        // ECMA-262 CaseBlockEvaluation / CaseClauseIsSelected (snapshot e28783d5fc9d):
+        // selectors use strict equality and the first duplicate wins. Literal integer selectors
+        // have no observable evaluation, so a Number-only balanced tree can replace the linear
+        // search. Bodies and their shared lexical environment remain in source order below.
         let mut body_jumps: Vec<(usize, usize)> = Vec::new();
-        for (case_index, case) in cases.iter().enumerate() {
-            if let Some(test) = &case.test {
-                self.emit(Op::LoadLocal(discriminant));
-                self.expr(test)?;
-                self.emit(Op::StrictEq);
-                let no_match = self.emit(Op::JumpIfFalse(0));
-                let body = self.emit(Op::Jump(0));
-                body_jumps.push((case_index, body));
-                self.patch(no_match);
+        let integer_cases = integer_switch_cases(cases);
+        if let Some(integer_cases) = integer_cases {
+            // Relational comparison would coerce strings, objects and BigInts. Guard the type
+            // once before entering the tree; none of those values can strictly match a Number.
+            self.emit(Op::LoadLocal(discriminant));
+            self.emit(Op::Typeof);
+            let number = self.const_idx(Value::Str("number".into()));
+            self.emit(Op::Const(number));
+            self.emit(Op::StrictEq);
+            let mut misses = vec![self.emit(Op::JumpIfFalse(0))];
+            self.integer_switch_tree(&integer_cases, discriminant, &mut body_jumps, &mut misses);
+            for miss in misses {
+                self.patch(miss);
+            }
+        } else {
+            // Dynamic selectors retain their ordered evaluation and abrupt completions.
+            for (case_index, case) in cases.iter().enumerate() {
+                if let Some(test) = &case.test {
+                    self.emit(Op::LoadLocal(discriminant));
+                    self.expr(test)?;
+                    self.emit(Op::StrictEq);
+                    let no_match = self.emit(Op::JumpIfFalse(0));
+                    let body = self.emit(Op::Jump(0));
+                    body_jumps.push((case_index, body));
+                    self.patch(no_match);
+                }
             }
         }
         let default_jump = self.emit(Op::Jump(0));
@@ -10310,6 +10358,37 @@ impl Compiler {
             self.patch(jump);
         }
         Ok(())
+    }
+
+    fn integer_switch_tree(
+        &mut self,
+        cases: &[(i32, usize)],
+        discriminant: u16,
+        bodies: &mut Vec<(usize, usize)>,
+        misses: &mut Vec<usize>,
+    ) {
+        if cases.len() <= 3 {
+            for &(value, case_index) in cases {
+                self.emit(Op::LoadLocal(discriminant));
+                let constant = self.const_idx(Value::Num(value as f64));
+                self.emit(Op::Const(constant));
+                self.emit(Op::StrictEq);
+                let next = self.emit(Op::JumpIfFalse(0));
+                bodies.push((case_index, self.emit(Op::Jump(0))));
+                self.patch(next);
+            }
+            misses.push(self.emit(Op::Jump(0)));
+            return;
+        }
+        let middle = cases.len() / 2;
+        self.emit(Op::LoadLocal(discriminant));
+        let pivot = self.const_idx(Value::Num(cases[middle].0 as f64));
+        self.emit(Op::Const(pivot));
+        self.emit(Op::Lt);
+        let right = self.emit(Op::JumpIfFalse(0));
+        self.integer_switch_tree(&cases[..middle], discriminant, bodies, misses);
+        self.patch(right);
+        self.integer_switch_tree(&cases[middle..], discriminant, bodies, misses);
     }
 
     /// Lower CatchClauseEvaluation (ECMA-262 §14.15.2). A parameterized catch creates every

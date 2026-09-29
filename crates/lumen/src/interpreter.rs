@@ -21,7 +21,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 /// a scan/memmove across hundreds of thousands of ranges. Precision resets on the next take.
 const MAX_BUFFER_DIRTY_RANGES: usize = 64;
 
-fn record_buffer_write(ranges: &mut Vec<Range<usize>>, mut write: Range<usize>, buffer_len: usize) {
+pub(crate) fn record_buffer_write(
+    ranges: &mut Vec<Range<usize>>,
+    mut write: Range<usize>,
+    buffer_len: usize,
+) {
     let first = ranges.partition_point(|range| range.end < write.start);
     if let Some(range) = ranges.get(first) {
         if range.start <= write.start && write.end <= range.end {
@@ -2753,6 +2757,8 @@ pub struct Interp {
     /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer. The indirection lets an
     /// embedder identify the same Data Block with an external resource such as wasm linear memory.
     pub(crate) array_buffers: crate::fasthash::FastMap<usize, ArrayBufferBytes>,
+    pub(crate) native_buffers:
+        crate::fasthash::FastMap<usize, Rc<crate::native_typed_array::NativeBuffer>>,
     /// Monotonic mutation generations for ArrayBuffer byte storage. Host embedders use these
     /// generations to avoid copying an unchanged external mirror across a synchronous boundary.
     pub(crate) array_buffer_versions: crate::fasthash::FastMap<usize, u64>,
@@ -3072,6 +3078,7 @@ interp_memory_inventory! {
     weak_collection_index => "measured",
     extra_protos => "measured",
     array_buffers => "external",
+    native_buffers => "measured",
     array_buffer_versions => "measured",
     array_buffer_dirty_ranges => "measured",
     shared_buffers => "measured",
@@ -3168,7 +3175,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 146);
+    assert_eq!(names.len(), 147);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4001,6 +4008,7 @@ impl Interp {
             weak_collection_index: Default::default(),
             extra_protos: Default::default(),
             array_buffers: Default::default(),
+            native_buffers: Default::default(),
             array_buffer_versions: Default::default(),
             array_buffer_dirty_ranges: Default::default(),
             shared_buffers: Default::default(),
@@ -5875,6 +5883,9 @@ impl Interp {
             return Err(self.make_error("TypeError", "ArrayBuffer construction failed"));
         };
         let ptr = Rc::as_ptr(obj) as usize;
+        // A replaced constructor can return a buffer whose views already exist. Those views
+        // must stop using the previous Data Block before the embedder installs this storage.
+        self.invalidate_native_buffer(ptr);
         self.array_buffers.insert(ptr, storage);
         self.host_keyed_buffers.insert(ptr);
         Ok(buffer)
@@ -5957,6 +5968,7 @@ impl Interp {
     /// to modify the mirror. Taking the ranges does not change the mutation generation.
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
         let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
+        self.flush_native_buffer_writes(ptr);
         self.array_buffers.contains_key(&ptr).then(|| {
             self.array_buffer_dirty_ranges
                 .remove(&ptr)
@@ -5969,9 +5981,17 @@ impl Interp {
     /// observable JavaScript value and may wrap after `u64::MAX` mutations.
     pub fn array_buffer_version(&self, v: &Value) -> Option<u64> {
         let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
-        self.array_buffers
-            .contains_key(&ptr)
-            .then_some(self.array_buffer_versions.get(&ptr).copied().unwrap_or(0))
+        self.array_buffers.contains_key(&ptr).then(|| {
+            self.array_buffer_versions
+                .get(&ptr)
+                .copied()
+                .unwrap_or(0)
+                .wrapping_add(
+                    self.native_buffers
+                        .get(&ptr)
+                        .map_or(0, |buffer| buffer.writes.get()),
+                )
+        })
     }
 
     /// Marks bytes in an ArrayBuffer as changed by an engine-owned view or host pointer. This is
@@ -6014,6 +6034,7 @@ impl Interp {
         };
         let ptr = Rc::as_ptr(obj) as usize;
         self.host_keyed_buffers.remove(&ptr);
+        self.invalidate_native_buffer(ptr);
         let removed = self.array_buffers.remove(&ptr).is_some();
         self.array_buffer_versions.remove(&ptr);
         self.array_buffer_dirty_ranges.remove(&ptr);
@@ -9280,6 +9301,7 @@ impl Interp {
         crate::gc_sweep::map(&mut self.promises, garbage_objects);
         crate::gc_sweep::map(&mut self.temporal, garbage_objects);
         crate::gc_sweep::map(&mut self.array_buffers, garbage_objects);
+        crate::gc_sweep::map(&mut self.native_buffers, garbage_objects);
         crate::gc_sweep::map(&mut self.array_buffer_versions, garbage_objects);
         crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, garbage_objects);
         crate::gc_sweep::map(&mut self.ta_buffer, garbage_objects);
@@ -10033,6 +10055,7 @@ impl Interp {
                 b.proto = None;
                 b.call = Callable::None;
                 b.exotic = Exotic::None;
+                b.native_typed_array = None;
             }
         }
         // Sweep garbage scopes the same way: emptying them breaks env-involving cycles.

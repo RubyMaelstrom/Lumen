@@ -73,6 +73,7 @@ mod modules;
 mod native_captures;
 #[cfg(all(test, feature = "embed"))]
 mod native_constructor_tests;
+mod native_typed_array;
 #[cfg(feature = "intl")]
 mod numbering;
 #[cfg(test)]
