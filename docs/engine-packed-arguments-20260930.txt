@@ -1,0 +1,42 @@
+Packed activation arguments — 30 September 2026
+==============================================
+
+The activation-aware native entry previously decoded/cloned the entire argument
+list before seeding captured parameters, then dropped those temporary owners
+before moving the original packed words into the ordinary frame. A diagnostic
+run of the unchanged yt-dlp/ejs solver observed 279,736 such entries.
+
+CallArgs now borrows either a public Value list or the caller's initialized packed
+owners. Activation initialization reads only captured parameters. Full owning
+decoding waits until an arguments object needs it. Original words remain live
+through environment/function creation and then move through the existing frame
+entry. No native layout, call-cache guard or GC boundary changes in this cycle.
+
+The consulted local ECMA-262 snapshot is e28783d5fc9dc12b3de905961e2c71410b38a202:
+/big/web-standards/repositories/tc39/ecma262/spec.html:14247 and :15059.
+Official clauses: https://tc39.es/ecma262/#sec-functiondeclarationinstantiation
+and https://tc39.es/ecma262/#sec-createunmappedargumentsobject. Parameter values,
+missing/surplus arguments, duplicate-name mapping and per-call closure ownership
+remain authoritative. This is not a verified current upstream snapshot.
+
+All six focused activation tests pass, including two new cross-tier regressions
+for escaping captured owners, collection, high arity, missing/surplus arguments,
+strict unmapped arguments and duplicate-parameter mapping. The native fixture
+asserts entry into the affected moved activation path. Strict all-target Clippy
+passes. No fresh full-suite, workspace, x64, wasm or Test262 result is claimed for
+this small cycle.
+
+Four balanced unchanged-application pairs show a small solver gain: median whole
+process time 8825.98 -> 8798.32 ms, 0.31% less. The paired ratio is 0.99582 with a
+95% interval 0.99214–0.99952. Other measured timing intervals include parity.
+Separate wait4 peak-memory intervals all include parity; React's median peak is
+2.55% higher, below the provisional 3% loss gate. No component crosses that gate.
+The binary grows 1824 bytes. This is a bounded removal of redundant ownership
+work, not an additional major application speedup or a Node-parity claim.
+
+Exact sources, artifacts, outputs and paired observations are recorded in
+../benchmarks/engine-packed-arguments-2026-09-30.json and locally under
+benchmark-results/engine-cycle5-20260930. Baseline includes the completed earlier
+cycles; HEAD alone cannot reproduce it while repository metadata is read-only.
+No owned build/test/profile overlapped these observations. User desktop apps
+remained active. No installed binary or accepted artifact was replaced.

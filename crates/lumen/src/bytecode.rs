@@ -23,7 +23,7 @@
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::execution_storage::{DecodedArgs, SlotAccess, StoredValue, ValueStack};
+use crate::execution_storage::{CallArgs, DecodedArgs, SlotAccess, StoredValue, ValueStack};
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::{PackedValue, Value};
 
@@ -2491,6 +2491,16 @@ impl Chunk {
     /// `MakeClosure` environments route through the result. Returns `env` untouched when nothing
     /// needs seeding.
     fn make_run_env(&self, i: &mut Interp, env: &Env, this_val: &Value, args: &[Value]) -> Env {
+        self.make_run_env_from(i, env, this_val, CallArgs::Values(args))
+    }
+
+    fn make_run_env_from(
+        &self,
+        i: &mut Interp,
+        env: &Env,
+        this_val: &Value,
+        args: CallArgs<'_>,
+    ) -> Env {
         if self.prepared_entry {
             return env.clone();
         }
@@ -2524,7 +2534,7 @@ impl Chunk {
                         b.vars.insert(
                             name.clone(),
                             crate::interpreter::Binding {
-                                value: args.get(*k as usize).cloned().unwrap_or(Value::Undefined),
+                                value: args.read(*k as usize),
                                 mutable: true,
                                 strict_immutable: false,
                                 initialized: true,
@@ -2602,7 +2612,8 @@ impl Chunk {
             );
         }
         if self.env_arguments {
-            let arguments = Value::Obj(i.make_compiled_arguments_object(args, &act));
+            let arguments =
+                args.with_values(|args| Value::Obj(i.make_compiled_arguments_object(args, &act)));
             act.borrow_mut().vars.insert(
                 "arguments".to_string(),
                 crate::interpreter::Binding::data(arguments, true, true),
@@ -17761,6 +17772,18 @@ impl Chunk {
         args: &[Value],
     ) -> Env {
         self.make_run_env(i, env, this_val, args)
+    }
+
+    /// Seed captured owners directly from the still-live caller operand list. The ordinary
+    /// frame subsequently consumes those words; the environment owns only its captured copies.
+    pub(crate) fn jit_make_run_env_packed(
+        &self,
+        i: &mut Interp,
+        env: &Env,
+        this_val: &Value,
+        args: &[PackedValue],
+    ) -> Env {
+        self.make_run_env_from(i, env, this_val, CallArgs::Packed(args))
     }
     /// (pops, pushes) of the op at `pc`, for the static stack-depth analysis. `None` = an op the
     /// JIT can't account for (which refuses compilation).

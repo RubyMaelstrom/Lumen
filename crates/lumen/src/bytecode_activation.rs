@@ -7,6 +7,7 @@
 //! instantiation path. Structural eval mutations invalidate VarMap's layout proof.
 
 use super::{CapInit, Chunk};
+use crate::execution_storage::CallArgs;
 use crate::interpreter::{
     new_var_scope_with_bindings, Binding, BindingLayout, Env, Interp, VarMap,
 };
@@ -136,17 +137,11 @@ impl ActivationPlan {
         interp: &mut Interp,
         parent: &Env,
         this_value: &Value,
-        arguments: &[Value],
+        arguments: CallArgs<'_>,
     ) -> Env {
         let mut vars = VarMap::from_fixed_bindings(self.bindings.clone(), self.layout.as_ref());
         for &(slot, parameter) in &self.parameters {
-            vars.initialize_fixed_value(
-                slot,
-                arguments
-                    .get(usize::from(parameter))
-                    .cloned()
-                    .unwrap_or(Value::Undefined),
-            );
+            vars.initialize_fixed_value(slot, arguments.read(usize::from(parameter)));
         }
         if let Some(slot) = self.this_slot {
             vars.initialize_fixed_value(slot, this_value.clone());
@@ -171,7 +166,9 @@ impl ActivationPlan {
                 .initialize_fixed_value(slot, value);
         }
         if let Some(slot) = self.arguments_slot {
-            let value = Value::Obj(interp.make_compiled_arguments_object(arguments, &activation));
+            let value = arguments.with_values(|arguments| {
+                Value::Obj(interp.make_compiled_arguments_object(arguments, &activation))
+            });
             activation
                 .borrow_mut()
                 .vars
@@ -214,6 +211,96 @@ mod tests {
         {
             Completion::Value(value) => value,
             Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+
+    #[test]
+    fn packed_activation_calls_keep_escaped_parameter_owners_across_collection() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            crate::jit::TEST_PACKED_ENV_ENTRIES.with(|entries| entries.set(0));
+            assert_eq!(
+                evaluate(
+                    &mut engine,
+                    r#"
+                var effects=0,escaped=[];
+                function argument(n){effects++;return {n:n};}
+                function capture(a,b,c,d,e,f){
+                    b.n+=10;
+                    return function(){return [a.n,f===undefined?'missing':f.n,b.n].join(':');};
+                }
+                function dispatch(n){return capture(argument(n),argument(n+1),
+                    argument(n+2),'unused',false,argument(n+5),argument(n+6));}
+                for(var n=0;n<30;n++)escaped.push(dispatch(n));
+                var missing=capture(argument(50),argument(51));
+                [effects,escaped[0](),escaped[29](),missing()].join('|');
+            "#,
+                ),
+                "152|0:5:11|29:34:40|50:missing:61",
+                "{tier:?}"
+            );
+            engine.interp.gc_collect();
+            assert_eq!(
+                evaluate(
+                    &mut engine,
+                    "[escaped[0](),escaped[29](),missing()].join('|')"
+                ),
+                "0:5:11|29:34:40|50:missing:61",
+                "{tier:?}"
+            );
+            #[cfg(all(
+                any(target_arch = "aarch64", target_arch = "x86_64"),
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
+            if tier == Tier::Jit {
+                assert!(crate::jit::TEST_PACKED_ENV_ENTRIES.with(|entries| entries.get()) > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_activation_arguments_keep_surplus_values_and_parameter_alias_rules() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                evaluate(
+                    &mut engine,
+                    r#"
+                function unmapped(a,b,c,d,e,f){
+                    'use strict';
+                    var read=()=>[a.n,f.n,arguments[6].n,arguments.length].join(':');
+                    arguments[0]={n:99};
+                    return read;
+                }
+                function mapped(a,a,b,c,d,e){
+                    var read=()=>[a.n,arguments[0].n,arguments[1].n,arguments[6].n].join(':');
+                    arguments[0]={n:10};arguments[1]={n:20};
+                    return read;
+                }
+                function dispatch(fn){return fn({n:1},{n:2},null,undefined,false,{n:6},{n:7});}
+                var strictReads=[],mappedReads=[];
+                for(var n=0;n<30;n++){
+                    strictReads.push(dispatch(unmapped));mappedReads.push(dispatch(mapped));
+                }
+                [strictReads[0](),strictReads[29](),mappedReads[0](),mappedReads[29]()].join('|');
+            "#,
+                ),
+                "1:6:7:7|1:6:7:7|20:10:20:7|20:10:20:7",
+                "{tier:?}"
+            );
+            engine.interp.gc_collect();
+            assert_eq!(
+                evaluate(
+                    &mut engine,
+                    "[strictReads[29](),mappedReads[0]()].join('|')"
+                ),
+                "1:6:7:7|20:10:20:7",
+                "{tier:?}"
+            );
         }
     }
 

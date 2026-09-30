@@ -162,6 +162,32 @@ impl<S: StoredValue> ValueStack<S> {
 
 pub(crate) type CompactFrame = (Vec<PackedValue>, ValueStack<PackedValue>);
 
+/// Borrow an actual call's owners while seeding an activation. Only captured parameters need
+/// decoding; an arguments object can still request the complete, owning public Value list.
+/// The caller keeps every input initialized and rooted until instantiation finishes.
+#[derive(Clone, Copy)]
+pub(crate) enum CallArgs<'a> {
+    Values(&'a [Value]),
+    Packed(&'a [PackedValue]),
+}
+
+impl CallArgs<'_> {
+    pub(crate) fn read(&self, index: usize) -> Value {
+        match self {
+            Self::Values(values) => values.get(index).cloned(),
+            Self::Packed(values) => values.get(index).map(PackedValue::unpack),
+        }
+        .unwrap_or(Value::Undefined)
+    }
+
+    pub(crate) fn with_values<R>(&self, f: impl FnOnce(&[Value]) -> R) -> R {
+        match self {
+            Self::Values(values) => f(values),
+            Self::Packed(values) => PackedValue::with_values(values, f),
+        }
+    }
+}
+
 /// A bounded argument-boundary decode, never an activation conversion. Most JS/native calls
 /// fit four arguments and need no heap allocation; all temporary handles remain rooted until
 /// the called operation returns or throws.

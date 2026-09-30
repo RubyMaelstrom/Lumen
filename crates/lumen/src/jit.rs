@@ -15799,10 +15799,17 @@ pub(crate) unsafe fn run_moved_shared(
     result
 }
 
-/// Moved-frame entry for a callee that needs a real activation environment. Captured parameter
-/// values are cloned exactly once into that environment; the call's owned argument values still
-/// move into the fixed frame buffer, avoiding the second full clone and both growable `Vec`s used
-/// by [`run`]. An `arguments` exotic is materialized before the move and installed into its slot.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_PACKED_ENV_ENTRIES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Moved-frame entry for a callee that needs a real activation environment. Decode/clone only
+/// captured parameters into that environment, then move the call's owned arguments into the
+/// fixed frame buffer. A complete Value list is needed only to materialize an `arguments` exotic
+/// before the move; ordinary captured calls require no temporary argument owners or Vec.
 #[cfg(any(
     all(
         target_arch = "aarch64",
@@ -15823,18 +15830,19 @@ pub(crate) unsafe fn run_moved_env(
     argc: usize,
     frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
-    let args_values = crate::execution_storage::DecodedArgs::new(unsafe {
-        std::slice::from_raw_parts(args, argc)
-    });
-    let args_ref = &args_values;
-    let activation = chunk.jit_make_run_env(i, unsafe { &*definition_env }, &this_val, args_ref);
+    #[cfg(test)]
+    TEST_PACKED_ENV_ENTRIES.with(|entries| entries.set(entries.get() + 1));
+    let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
+    let activation =
+        chunk.jit_make_run_env_packed(i, unsafe { &*definition_env }, &this_val, args_ref);
     let arguments = chunk.jit_arguments_slot().map(|slot| {
         (
             slot as usize,
-            Value::Obj(i.make_compiled_arguments_object(args_ref, &activation)),
+            crate::execution_storage::CallArgs::Packed(args_ref).with_values(|values| {
+                Value::Obj(i.make_compiled_arguments_object(values, &activation))
+            }),
         )
     });
-    drop(args_values);
     unsafe {
         run_moved_inner(
             i,
