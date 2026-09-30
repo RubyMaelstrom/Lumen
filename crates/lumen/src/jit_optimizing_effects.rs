@@ -137,6 +137,7 @@ pub(super) fn checked_writes(op: &Op) -> SlotWrites {
         | Op::Not
         | Op::BitNot
         | Op::Typeof
+        | Op::TypeofIs(..)
         | Op::TypeofName(_)
         | Op::Void
         | Op::GetIter
@@ -202,6 +203,7 @@ pub(super) fn checked_heap_write(op: &Op) -> bool {
             | Op::NewTarget
             | Op::Not
             | Op::Typeof
+            | Op::TypeofIs(..)
             | Op::Void
             | Op::Jump(_)
             | Op::JumpIfFalse(_)

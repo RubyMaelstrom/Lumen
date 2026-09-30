@@ -7994,6 +7994,30 @@ impl Interp {
         }
     }
 
+    /// Both operands of a literal typeof comparison are strings. Their equality
+    /// needs no conversion, callback or allocated typeof result.
+    pub(crate) fn typeof_matches(&self, value: &Value, test: crate::value::TypeofTest) -> bool {
+        use crate::value::TypeofTest;
+        if self.is_htmldda(value) {
+            return test == TypeofTest::Undefined;
+        }
+        match test {
+            TypeofTest::Undefined => matches!(value, Value::Undefined | Value::Empty),
+            TypeofTest::Boolean => matches!(value, Value::Bool(_)),
+            TypeofTest::Number => matches!(value, Value::Num(_)),
+            TypeofTest::BigInt => matches!(value, Value::BigInt(_)),
+            TypeofTest::String => matches!(value, Value::Str(_)),
+            TypeofTest::Symbol => matches!(value, Value::Sym(_)),
+            TypeofTest::Object => match value {
+                Value::Null => true,
+                Value::Obj(object) => matches!(object.borrow().call, Callable::None),
+                _ => false,
+            },
+            TypeofTest::Function => value.is_callable(),
+            TypeofTest::Never => false,
+        }
+    }
+
     /// Whether `getter` is the %ThrowTypeError% intrinsic.
     fn is_throw_type_error(&self, getter: &Option<Value>) -> bool {
         match (getter, self.extra_protos.get("%ThrowTypeError%")) {

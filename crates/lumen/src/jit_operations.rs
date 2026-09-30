@@ -28,6 +28,39 @@ pub(super) fn emit(
     let rc_ok = layout.valid && layout.rc_strong_off < 256;
     let op = &chunk.jit_ops()[pc];
     match op {
+        Op::TypeofIs(test, negate) if fast & 2 != 0 && rc_ok && layout.rc_strong_off == 0 => {
+            use crate::value::TypeofTest;
+            let slow = a.new_label();
+            let done = a.new_label();
+            emit_exec_word_load(a, 12, 20, -8);
+            emit_exec_kind(a, 12, 9, 14, slow);
+            a.cmp_imm_w(9, 1);
+            a.b_cond(C_EQ, slow);
+            if matches!(
+                test,
+                TypeofTest::Undefined | TypeofTest::Object | TypeofTest::Function
+            ) {
+                a.cmp_imm_w(9, 8);
+                a.b_cond(C_EQ, slow); // live [[Call]] / [[IsHTMLDDA]] checks
+            }
+            let kind = if *test == TypeofTest::Object {
+                2 // null's typeof is "object"; object inputs took the checked path
+            } else {
+                *test as u32
+            };
+            a.cmp_imm_w(9, kind);
+            a.cset_w(11, if *negate { C_NE } else { C_EQ });
+            // Every declining owner guard precedes the decrement. Last owners and
+            // BigInt retain the real destructor through the checked operation.
+            emit_exec_drop_shared(a, layout, 12, 13, 14, slow);
+            a.mov_imm64(9, crate::value::PACK_BOOL);
+            a.logic_x(1, 9, 9, 11);
+            emit_exec_word_store(a, 9, 20, -8);
+            a.b(done);
+            a.bind(slow);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
+        }
         Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_) => {
             if fast & 8192 == 0
                 || !names::emit_reference_op(a, layout, ilayout, chunk, op, pc as u32, unwind)

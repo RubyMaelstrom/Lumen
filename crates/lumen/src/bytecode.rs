@@ -1597,6 +1597,8 @@ pub enum Op {
     Not,
     BitNot,
     Typeof,
+    /// Compare typeof with a string literal, returning Bool without a result string.
+    TypeofIs(crate::value::TypeofTest, bool),
     /// `typeof freeName`: absent bindings yield "undefined", while lexical TDZ still throws.
     TypeofName(u32),
     Void,
@@ -6378,6 +6380,7 @@ fn inline_capability(op: &Op) -> InlineCapability {
         | Op::Not
         | Op::BitNot
         | Op::Typeof
+        | Op::TypeofIs(..)
         | Op::Void
         | Op::Jump(_)
         | Op::JumpIfFalse(_)
@@ -10319,10 +10322,7 @@ impl Compiler {
             // Relational comparison would coerce strings, objects and BigInts. Guard the type
             // once before entering the tree; none of those values can strictly match a Number.
             self.emit(Op::LoadLocal(discriminant));
-            self.emit(Op::Typeof);
-            let number = self.const_idx(Value::Str("number".into()));
-            self.emit(Op::Const(number));
-            self.emit(Op::StrictEq);
+            self.emit(Op::TypeofIs(crate::value::TypeofTest::Number, false));
             let mut misses = vec![self.emit(Op::JumpIfFalse(0))];
             self.integer_switch_tree(&integer_cases, discriminant, &mut body_jumps, &mut misses);
             for miss in misses {
@@ -11577,6 +11577,27 @@ impl Compiler {
                 Ok(())
             }
             Expr::Binary { op, left, right } => {
+                if matches!(*op, "==" | "!=" | "===" | "!==") {
+                    let pair = match (&**left, &**right) {
+                        (Expr::Unary { op: "typeof", arg }, Expr::Str(literal))
+                        | (Expr::Str(literal), Expr::Unary { op: "typeof", arg }) => {
+                            Some((arg, literal))
+                        }
+                        _ => None,
+                    };
+                    if let Some((argument, literal)) = pair {
+                        // An unknown identifier needs typeof's unresolvable-reference
+                        // exception. Its existing TypeofName operation remains authoritative.
+                        if !matches!(&**argument, Expr::Ident(name) if self.home(name).is_none()) {
+                            self.expr(argument)?;
+                            self.emit(Op::TypeofIs(
+                                crate::value::TypeofTest::from_literal(literal),
+                                matches!(*op, "!=" | "!=="),
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
                 self.expr(left)?;
                 self.expr(right)?;
                 let bop = match *op {
@@ -14357,6 +14378,10 @@ fn run_vm_inner<S: StoredValue>(
                 let a = pop!();
                 let v = i.eval_unary_vm("typeof", a)?;
                 stack.push(v);
+            }
+            Op::TypeofIs(test, negate) => {
+                let value = pop!();
+                stack.push(Value::Bool(i.typeof_matches(&value, test) ^ negate));
             }
             Op::TypeofName(n) => {
                 stack.push(i.typeof_name_vm(&chunk.names[n as usize], env)?);
@@ -18016,7 +18041,13 @@ impl Chunk {
             | Op::StrictNotEq
             | Op::InstanceOf(_)
             | Op::GenBin(_) => (2, 1),
-            Op::Neg | Op::Plus | Op::Not | Op::BitNot | Op::Typeof | Op::Void => (1, 1),
+            Op::Neg
+            | Op::Plus
+            | Op::Not
+            | Op::BitNot
+            | Op::Typeof
+            | Op::TypeofIs(..)
+            | Op::Void => (1, 1),
             Op::TypeofName(_) => (0, 1),
             Op::Jump(_) | Op::AbruptJump(..) => (0, 0),
             Op::InlineGuard(..) => (0, 0),
@@ -19653,6 +19684,12 @@ thread_local! {
         std::cell::Cell::new(0)
     };
     pub(crate) static TEST_JIT_EXEC_ELEMENT_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static TEST_JIT_TYPEOF_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static TEST_JIT_TYPEOF_IS_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     /// Actual compact checked reads, indexed by stack/local/method operand shape.
@@ -21417,12 +21454,20 @@ unsafe fn jit_exec_inner(
             push!(v);
         }
         Op::Typeof => {
+            #[cfg(test)]
+            TEST_JIT_TYPEOF_HELPERS.with(|count| count.set(count.get() + 1));
             let a = pop!();
             let v = i.eval_unary_vm("typeof", a)?;
             push!(v);
         }
         Op::TypeofName(n) => {
             push!(i.typeof_name_vm(&chunk.names[n as usize], env)?);
+        }
+        Op::TypeofIs(test, negate) => {
+            #[cfg(test)]
+            TEST_JIT_TYPEOF_IS_HELPERS.with(|count| count.set(count.get() + 1));
+            let value = pop!();
+            push!(Value::Bool(i.typeof_matches(&value, test) ^ negate));
         }
         Op::Void => {
             pop!();

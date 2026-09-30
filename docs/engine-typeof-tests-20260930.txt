@@ -1,0 +1,73 @@
+Direct typeof literal tests — 30 September 2026
+=============================================
+
+The solver's diagnostic helper trace showed 1,225,799 executions of one typeof
+site. It was a compiler-generated Number guard before an integer switch tree:
+LoadLocal, Typeof, Const("number"), StrictEq. The typeof operation allocated a
+string just to compare its category. That guard now uses TypeofIs(Number).
+Literal comparisons with typeof also use TypeofIs, in either operand order,
+for ==, !=, === and !==. Both comparison operands are strings, so loose equality
+needs no conversion. Unknown literals still evaluate the operand and preserve
+its effects/errors before returning the comparison result.
+
+The VM and checked native helper return Boolean directly. The shared ARM64
+operation emitter classifies scalar execution words and releases non-final
+owners without allocating a result string. Object tests needing [[Call]] or
+[[IsHTMLDDA]], BigInt owners and last-owned references retain checked handling.
+Unresolved identifier comparisons retain TypeofName; local reads preserve TDZ.
+The optional optimizer records the Boolean category and preserved-local effect.
+Unsupported native platforms keep the checked operation.
+
+An earlier span-only draft missed copies of operations emitted inside SSA
+regions. Its native-helper assertion failed; that draft is preserved locally
+as v1-native-span.patch and was not measured or committed. Making the operation
+explicit in bytecode lets baseline and region emission use the same lowering.
+
+Validation: all 1,578 engine library tests pass, including native-helper counts,
+scalar categories, NaN/signed zero/infinities, unknown literals, getter throws,
+operand reversal, revoked callable proxies, HTMLDDA and TDZ in all three tiers.
+The existing integer-switch regression covers non-coercion, strict misses,
+duplicates, fallthrough, defaults and lexical instantiation in all tiers.
+Workspace all-target checking, strict engine all-target Clippy and optional
+optimizing-jit all-target checking pass. No x64 execution, wasm build, new
+Test262 or optional-backend execution result is claimed.
+
+Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202:
+/big/web-standards/repositories/tc39/ecma262/spec.html:20631 (typeof),
+:6145 (IsLooselyEqual), :6183 (IsStrictlyEqual), :23498 (CaseBlockEvaluation)
+and :23565 (CaseClauseIsSelected). The unresolved-reference exception belongs
+to typeof; GetValue and abrupt completions remain ordered before classification.
+Switch selection uses strict equality and cannot coerce an object discriminant.
+Official clauses:
+https://tc39.es/ecma262/#sec-typeof-operator-runtime-semantics-evaluation
+https://tc39.es/ecma262/#sec-islooselyequal
+https://tc39.es/ecma262/#sec-isstrictlyequal
+https://tc39.es/ecma262/#sec-runtime-semantics-caseblockevaluation
+https://tc39.es/ecma262/#sec-runtime-semantics-caseclauseisselected
+This identifies the consulted snapshot, not verified current upstream text.
+
+Four balanced fresh-process application pairs, pinned to CPU 5 on crystal ARM64,
+use ordinary release template JIT with default Intl and no optimizer/diagnostic
+feature. Vue's measured median falls 3.88% (785.5 to 755 ms; paired ratio interval
+0.94989–0.97380). Djot falls 1.18% (339 to 335 ms; 0.98165–0.99934).
+React's median rises 0.43%, with its interval spanning parity. Solver process
+median rises 1.29% (10330.20 to 10463.08 ms), while its paired interval
+0.94196–1.04738 is inconclusive. All complete outputs match the baseline and
+one Node reference per application. These are scoped driver results, not full
+browser benchmarks or an established major solver improvement.
+
+Separate four-pair Linux wait4 peak-memory observations all span parity.
+Median peaks change -1.89% React, +0.16% Djot, +0.50% solver and -0.29% Vue.
+No timing or peak component meets the combined greater-than-3% median loss and
+slower-direction interval gate. No post-GC retained-memory claim is made.
+The executable grows 4,176 bytes; release compilation completes in 3m35s.
+No independent JIT compilation-time or generated-code-size distribution was
+collected. Whole-process application timings include startup/compilation work.
+
+The prior tail-transfer allocation experiment is excluded: baseline is the
+cycle7 artifact f8682253, production-equivalent to e10deaa. Source hashes,
+artifact hashes, workload identities, complete timing/peak samples and controls
+are recorded in ../benchmarks/engine-typeof-tests-2026-09-30.json. Raw outputs,
+logs and exact source copies remain in benchmark-results/engine-cycle9-20260930.
+No owned build/test/profile overlaps acceptance timing or peak runs. Desktop
+applications remain active. Installed/accepted artifacts are not replaced.

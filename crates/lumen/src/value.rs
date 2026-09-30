@@ -1333,6 +1333,39 @@ impl Value {
     }
 }
 
+/// The literal result category of a typeof comparison. Scalar discriminants
+/// match the existing native Value-kind decoder; objects need live call/HTMLDDA
+/// checks. Unknown literals never match any typeof result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TypeofTest {
+    Undefined = 0,
+    Boolean = 3,
+    Number = 4,
+    BigInt = 5,
+    String = 6,
+    Symbol = 7,
+    Object = 8,
+    Function = 9,
+    Never = 255,
+}
+
+impl TypeofTest {
+    pub(crate) fn from_literal(name: &str) -> Self {
+        match name {
+            "undefined" => Self::Undefined,
+            "boolean" => Self::Boolean,
+            "number" => Self::Number,
+            "bigint" => Self::BigInt,
+            "string" => Self::String,
+            "symbol" => Self::Symbol,
+            "object" => Self::Object,
+            "function" => Self::Function,
+            _ => Self::Never,
+        }
+    }
+}
+
 /// How an object can be called. Most objects are not callable (`None`).
 #[derive(Clone)]
 pub enum Callable {

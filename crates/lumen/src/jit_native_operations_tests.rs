@@ -27,6 +27,114 @@ fn prepared(tier: Tier, source: &str) -> Engine {
 }
 
 #[test]
+fn local_typeof_literals_avoid_strings_and_use_native_scalar_classification() {
+    let mut engine = prepared(
+        Tier::Jit,
+        r#"
+        function scalarTypes(v){
+            return [typeof v==='number',typeof v!=='string',typeof v=='boolean',
+                typeof v!='symbol',typeof v==='bigint',typeof v==='other'].join(',');
+        }
+        scalarTypes(7);
+    "#,
+    );
+    evaluate(&mut engine, "for(var warm=0;warm<64;warm++)scalarTypes(7);");
+    let env = engine.interp.global_env.clone();
+    let function = engine
+        .interp
+        .get_var("scalarTypes", &env)
+        .unwrap_or_else(|_| panic!("fixture binding exists"));
+    let crate::value::Value::Obj(object) = function else {
+        panic!("fixture is callable")
+    };
+    let object = object.borrow();
+    let crate::value::Callable::User(user) = &object.call else {
+        panic!("fixture is an ordinary function")
+    };
+    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
+    drop(object);
+    let before = crate::bytecode::TEST_JIT_TYPEOF_HELPERS.with(std::cell::Cell::get);
+    let checked = crate::bytecode::TEST_JIT_TYPEOF_IS_HELPERS.with(std::cell::Cell::get);
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            r#"
+            var values=[undefined,null,false,7,NaN,-0,Infinity,-Infinity,'é',Symbol(),1n,{},function(){}];
+            var names=['undefined','object','boolean','number','number','number','number','number',
+                'string','symbol','bigint','object','function'];
+            var ok=true;
+            for(var k=0;k<values.length;k++){
+                var type=names[k];
+                var expected=[type==='number',type!=='string',type==='boolean',
+                    type!=='symbol',type==='bigint',false].join(',');
+                ok=ok && scalarTypes(values[k])===expected;
+            }
+            ok
+        "#,
+        ),
+        "true"
+    );
+    assert_eq!(
+        crate::bytecode::TEST_JIT_TYPEOF_HELPERS.with(std::cell::Cell::get),
+        before,
+        "the executing native body consumes no typeof result strings"
+    );
+    assert!(
+        crate::bytecode::TEST_JIT_TYPEOF_IS_HELPERS.with(std::cell::Cell::get) - checked <= 6,
+        "scalar tests use native classification; only BigInt destruction stays checked"
+    );
+}
+
+#[test]
+fn local_typeof_tests_preserve_tdz_htmldda_and_effect_order() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = prepared(
+            tier,
+            r#"
+            function numeric(v){if(typeof v==='number')return 1;return 2;}
+            function defined(v){if(typeof v!='undefined')return 3;return 4;}
+            function reverse(v){return ['number'==typeof v,'object'==typeof v,
+                'function'==typeof v].join(',');}
+            function uninitialized(){try{if(typeof hidden==='number')return 1;}
+                catch(e){return e.name;}let hidden=7;return 0;}
+            for(var warm=0;warm<64;warm++){numeric(7);defined(null);uninitialized();}
+        "#,
+        );
+        let dda = engine.interp.make_html_dda();
+        engine
+            .interp
+            .global
+            .borrow_mut()
+            .props
+            .insert("dda", crate::value::Property::plain(dda));
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+                var trace='',value={get n(){trace+='g';return NaN}};
+                var revoked=Proxy.revocable(function(){},{});revoked.revoke();
+                [numeric(value.n),trace,numeric(revoked.proxy),defined(dda),defined({}),
+                    defined(undefined),uninitialized(),typeof absentTypeofGlobal,
+                    reverse(null),reverse(revoked.proxy),reverse(dda)].join('|')
+            "#,
+            ),
+            "1|g|2|4|3|4|ReferenceError|undefined|false,true,false|false,false,true|false,false,false",
+            "{tier:?}"
+        );
+        engine.interp.gc_collect();
+        assert_eq!(
+            evaluate(&mut engine, "numeric(dda)+'|'+defined(dda)"),
+            "2|4"
+        );
+        assert_eq!(
+            evaluate(&mut engine, "var marker={},trace='',same=false;try{typeof {get fail(){trace+='g';throw marker}}.fail==='unknown';}catch(e){same=e===marker;}same+'|'+trace"),
+            "true|g"
+        );
+    }
+}
+
+#[test]
 fn native_operations55_regions_keep_native_lexical_initialization() {
     let mut engine = prepared(
         Tier::Jit,

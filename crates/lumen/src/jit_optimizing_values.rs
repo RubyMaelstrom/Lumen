@@ -230,6 +230,7 @@ fn transfer(
         | Op::StrictEq
         | Op::StrictNotEq
         | Op::Not
+        | Op::TypeofIs(..)
         | Op::DeleteProp(..)
         | Op::DeleteElem(_)
         | Op::DeleteName(_) => results[0] = Types::BOOLEAN,
