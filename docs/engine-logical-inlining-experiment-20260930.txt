@@ -1,0 +1,104 @@
+Strict large-caller inlining — application comparison, 30 September 2026
+======================================================================
+
+The old whole-body 320-source-operation allowance rejects small callees in
+large callers. The solver lexer is an application target. This experiment
+adds at most 64 callee source operations to strict ordinary callers above
+320 and at most 4096 original operations. Explicit LUMEN_INLINE_BUDGET keeps
+its previous diagnostic meaning. Callees retain the existing size, private
+binding, closure-name, identity, receiver and operation allowlist proofs;
+this expanded path additionally requires strict ordinary non-suspending
+callees. The older small/sloppy inline path is unchanged. This experiment
+does not establish that its pre-existing omitted frames are correct.
+
+Expanded splices now bracket parameter binding and every source return with
+logical call operations. An owned per-interpreter state stack pins each live
+callee and temporarily clears/restores construction and new.target state.
+FnFrame uses one existing padding byte to mark logical frames without
+growing its 24-byte layout. ARM64 physical native pushes initialize that byte
+with the existing strict-field store. Both native checked operations and VM
+fallbacks implement entry/leave. Native/VM exception routing removes only
+this activation's logical frames; an entry watermark protects reentrant
+scripts, and physical FnFrame boundaries protect shared-context direct calls.
+These bodies still exclude handlers, direct eval, closure creation, private
+names, super, new.target and suspension needing an unremapped activation.
+
+Logical calls contribute JS depth and GC cadence. Native execution-stack
+checkpoints instead use physical depth. This distinction is necessary:
+three inline frames per recurring physical call otherwise advance logical
+depth by four and can miss all modulo-eight native-stack checkpoints. Saved
+callee/new.target owners and state Vec capacity are included in retained
+memory accounting. No strong GC graph edge or allocation identity is replaced
+by an unowned pointer.
+
+Consulted local official ECMA-262 snapshot
+ e28783d5fc9dc12b3de905961e2c71410b38a202,
+ /big/web-standards/repositories/tc39/ecma262/spec.html:13860
+ (PrepareForOrdinaryCall), :19922 (EvaluateCall), :12900 (Liveness), and
+ :13010 (AddToKeptObjects). Ordinary calls create a callee execution context;
+ the splice must preserve its observable context and permitted weak liveness.
+ Error.stack and legacy caller are Lumen extensions covered by tier agreement.
+ https://tc39.es/ecma262/#sec-prepareforordinarycall
+ https://tc39.es/ecma262/#sec-evaluatecall
+ https://tc39.es/ecma262/#sec-liveness
+ https://tc39.es/ecma262/#sec-addtokeptobjects
+ This is the consulted snapshot, not verified current upstream text.
+
+Three focused regressions pass. They verify actual expanded native publication,
+nested stack traces, getter/throw/replacement fallback, last global callee
+owners surviving collection, construction state, reentrant caught/uncaught
+script exceptions, and three logical frames in physical recursion through
+resource exhaustion and recovery. The constructor fixture initially included
+new.target, which the ordinary function compiler declines; the repaired
+supported fixture observes saved new.target from a host callback inside the
+published splice. Failed fixture/check logs are preserved. The old prototype
+without logical frames is documented in engine-inline-growth-experiment.
+
+All 1594 default engine library tests, strict all-target engine Clippy,
+optimizing-jit all-target compilation, workspace all-target compilation,
+format and diff checks pass. This is native ARM64 execution plus compilation
+of the optional backend. No fresh Test262, x64/wasm execution, or optional
+optimizer execution result is claimed.
+
+Base production engine: 74df1bb. Source HEAD d5b1d6e changes only the two
+preceding benchmark patch-identity fields; every cycle18 engine inventoried
+file matches that HEAD. Candidate patch SHA256:
+ ace36c0ddb7f915e4fbe12c28c1d56aa9449e132b9ca4bc97d086e548335fb92
+Candidate release SHA256:
+ 7920398460d996369f483c7bd8e0e3101f17c02a551642e44ea833dff21d3727
+25,111,912 bytes, 2064 above baseline; build 3m46s.
+Baseline release SHA256:
+ 3ea7f67ecd934d13fce51500c35c8829fb7a5ab9af08f3fd62fe714d3c18b30f
+25,109,848 bytes. Full source inventories/snapshots and exact staged patch
+are preserved under benchmark-results/engine-cycle19-20260930.
+
+Measurements: crystal Linux ARM64, CPU affinity 5, release opt-level=3,
+fat LTO, codegen-units=1, panic=abort, default Intl, ordinary template JIT.
+Node reference v24.21.0 / V8 13.6.233.17-node.53. LUMEN_*, TRUST_* and
+LD_PRELOAD are removed. Four fresh balanced baseline/candidate pairs use
+unchanged pinned Djot@0.3.2 rendering, complete examples/ejs/code.js solver,
+Speedometer React TodoMVC reducer and Vue reactivity drivers. React/Vue
+are component drivers, not complete browser application scores. Exact
+normalized outputs must agree. Student-t 95% intervals use paired log
+ratios. Desktop applications remain active; no owned build/test/profile
+work overlaps application timing or separate Linux wait4 peak comparisons.
+One Node observation per application supplies a reference, not a Node
+comparison distribution. Peak RSS is separate from post-GC retained memory,
+which is unmeasured; pause and native compilation costs are not isolated.
+
+react: 115.50 -> 116.00ms; -0.433% lower; paired ratio interval 0.99640-1.01231.
+
+djot: 288.00 -> 292.50ms; -1.562% lower; paired ratio interval 0.99174-1.04344.
+
+ejs: 8261.42 -> 8232.38ms; +0.352% lower; paired ratio interval 0.98937-1.00061.
+
+vue: 749.00 -> 746.00ms; +0.401% lower; paired ratio interval 0.99302-0.99898.
+
+Djot system CPU 21.5 -> 27.0ms, +25.58%, paired ratio interval 1.05831-1.40011. This exceeds the independent 3%/95% regression gate. Djot process wall is also 1.37% higher with interval 1.00081-1.02936, below the median-loss gate. All normalized outputs match.
+
+Separate peak medians in KiB: react 23174->22752, djot 54456->54760, ejs 637890->642340, vue 43858->44540. All peak intervals span parity; no peak gate.
+
+After both exclusive measurement sets ended, one instrumented diagnostic per binary/workload recorded 3,172,414 InlineEnter and 3,172,414 InlineLeave helper calls in the solver, plus 12,572 each in Djot. These counts show new helper traffic, not its causal time fraction. Solver generated native bytes were 59,435,336 baseline and 61,315,568 candidate in those diagnostics. Compile seconds were .43298 and .44147; a single instrumented observation does not establish a compilation regression. Both exact normalized outputs still match.
+
+Decision: reject and restore all prototype production code and its new tests. The small primary changes do not establish a major benefit, and Djot system CPU crosses the regression gate. Entry/exit helpers and larger native output supply follow-up hypotheses, not measured remedies. The frame/owner/entry-watermark/physical-depth source remains archived for a future native context design. Existing small inlining is unchanged; the experiment supplies no new global correctness claim for it. No user exception to the regression policy was requested.
+No installed or accepted release artifact is replaced. The workspace engine shell is restored to the pinned baseline after parking the prototype; subsequent source builds detect the restored sources.
