@@ -10809,9 +10809,9 @@ fn install_string(it: &mut Interp) {
         if a > b {
             std::mem::swap(&mut a, &mut b);
         }
-        Ok(Value::from_string(crate::jstr::from_units(
-            &chars[a as usize..b as usize],
-        )))
+        Ok(Value::Str(
+            i.slice_units(&s, &chars, a as usize, b as usize),
+        ))
     });
     // Annex B B.2.3.1 String.prototype.substr(start, length).
     it.def_method(&sp, "substr", 2, |i, this, args| {
@@ -10875,8 +10875,11 @@ fn install_string(it: &mut Interp) {
         if start < 0 {
             start = 0;
         }
-        Ok(Value::from_string(crate::jstr::from_units(
-            &chars[start as usize..(start + count) as usize],
+        Ok(Value::Str(i.slice_units(
+            &s,
+            &chars,
+            start as usize,
+            (start + count) as usize,
         )))
     });
     // Annex B B.2.3 HTML-wrapper methods (CreateHTML): each wraps the string in a tag.
@@ -11579,11 +11582,11 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
         v => norm_index(ab(i.to_number(&v))?, len),
     };
     let out = if start < end {
-        crate::jstr::from_units(&chars[start as usize..end as usize])
+        i.slice_units(&s, &chars, start as usize, end as usize)
     } else {
-        String::new()
+        crate::lstr::LStr::from("")
     };
-    Ok(Value::from_string(out))
+    Ok(Value::Str(out))
 }
 
 /// Box a Number/String/Boolean primitive into a wrapper object (right prototype + exotic). Other

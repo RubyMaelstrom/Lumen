@@ -103,6 +103,88 @@ pub fn from_units(units: &[u16]) -> String {
     out
 }
 
+/// Sparse UTF-16-to-UTF-8 index for repeated substrings of an immutable engine string. ASCII
+/// runs need no entries: each entry records the cumulative extra bytes after a non-ASCII
+/// scalar. An index inside an astral pair maps to a continuation byte and is rejected, leaving
+/// the caller's code-unit reconstruction to produce the appropriate lone surrogate.
+pub(crate) struct Utf8Index {
+    changes: Vec<(u32, u32)>,
+    copy_safe: bool,
+}
+
+impl Utf8Index {
+    /// `max_bytes` is the remaining budget of the existing owning string cache. Keep a small
+    /// declined index on exhaustion so repeated slices do not retry an oversized index build.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn new(s: &crate::lstr::LStr, max_bytes: usize) -> Self {
+        let mut index = Self {
+            changes: Vec::new(),
+            copy_safe: true,
+        };
+        let max_entries = max_bytes / std::mem::size_of::<(u32, u32)>();
+        let mut extra = 0;
+        let mut previous_high = false;
+        for (byte, c) in s.char_indices() {
+            if previous_high && smuggled_low(c).is_some() {
+                // Conservatively retain from_units canonicalization for smuggled pairs,
+                // including host-created non-canonical input.
+                index.copy_safe = false;
+                break;
+            }
+            previous_high = smuggled_high(c).is_some();
+            if c.is_ascii() {
+                continue;
+            }
+            let units = if smuggled(c).is_some() {
+                1
+            } else {
+                c.len_utf16()
+            };
+            extra += c.len_utf8() - units;
+            if index.changes.len() == max_entries {
+                index.copy_safe = false;
+                break;
+            }
+            if index.changes.len() == index.changes.capacity() {
+                let additional =
+                    (max_entries - index.changes.len()).min(index.changes.len().max(16));
+                index.changes.reserve_exact(additional);
+            }
+            let byte_end = byte + c.len_utf8();
+            // LStr's byte length and capacity fit below its u32 ASCII-hint bit.
+            index
+                .changes
+                .push(((byte_end - extra) as u32, extra as u32));
+        }
+        if !index.copy_safe {
+            index.changes = Vec::new();
+        }
+        index
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.changes.capacity() * std::mem::size_of::<(u32, u32)>()
+    }
+
+    /// Only copy complete UTF-8 scalars. Both offsets have already been clamped to the source's
+    /// UTF-16 length; checking Rust's boundaries also rejects an interior surrogate-pair index.
+    pub(crate) fn range<'a>(&self, s: &'a str, start: usize, end: usize) -> Option<&'a str> {
+        if !self.copy_safe {
+            return None;
+        }
+        let byte_offset = |unit| {
+            let past = self
+                .changes
+                .partition_point(|&(end, _)| end as usize <= unit);
+            unit + past
+                .checked_sub(1)
+                .map_or(0, |n| self.changes[n].1 as usize)
+        };
+        s.get(byte_offset(start)..byte_offset(end))
+    }
+}
+
 /// The single-unit string for one code unit.
 pub fn unit_str(unit: u16) -> String {
     from_units(&[unit])

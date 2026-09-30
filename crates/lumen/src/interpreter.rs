@@ -1011,14 +1011,26 @@ pub(crate) enum StrUnits {
     Units(Rc<[u16]>),
 }
 
-fn retained_str_units_bytes(s: &crate::lstr::LStr, units: &StrUnits) -> usize {
+const STR_UNIT_CACHE_BYTES: usize = 16 << 20;
+
+fn retained_str_units_bytes(
+    s: &crate::lstr::LStr,
+    units: &StrUnits,
+    index: Option<&crate::jstr::Utf8Index>,
+) -> usize {
     let materialized = match units {
         StrUnits::Ascii => 0,
         StrUnits::Units(units) => units.len().saturating_mul(std::mem::size_of::<u16>()),
     };
     s.len()
         .saturating_add(materialized)
-        .saturating_add(std::mem::size_of::<(usize, crate::lstr::LStr, StrUnits)>())
+        .saturating_add(index.map_or(0, crate::jstr::Utf8Index::heap_bytes))
+        .saturating_add(std::mem::size_of::<(
+            usize,
+            crate::lstr::LStr,
+            StrUnits,
+            Option<Rc<crate::jstr::Utf8Index>>,
+        )>())
 }
 
 /// Raw state of the last successful regex match, deferred for the legacy `RegExp.$1` statics.
@@ -2625,7 +2637,14 @@ pub struct Interp {
     /// Recently indexed strings' UTF-16 views, keyed by string identity (the held `Rc` pins the
     /// pointer) — see [`StrUnits`]. Bounded by retained bytes as well as entry count, so one large
     /// source cannot escape the cache budget.
-    pub(crate) str_units: crate::cache::ByteLru<usize, (crate::lstr::LStr, StrUnits)>,
+    pub(crate) str_units: crate::cache::ByteLru<
+        usize,
+        (
+            crate::lstr::LStr,
+            StrUnits,
+            Option<Rc<crate::jstr::Utf8Index>>,
+        ),
+    >,
     /// Prepared regex subjects keyed by string identity and Unicode mode. The retained `LStr`
     /// pins each pointer, making the integer key ABA-safe. This cache is deliberately larger
     /// than the tiny UTF-16 indexing LRU: web workloads commonly prepare thousands of immutable
@@ -3997,7 +4016,7 @@ impl Interp {
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
             inline_ic_safe: std::cell::Cell::new(true),
-            str_units: crate::cache::ByteLru::new(16 << 20, 64),
+            str_units: crate::cache::ByteLru::new(STR_UNIT_CACHE_BYTES, 64),
             re_texts: crate::cache::ByteLru::new(32 << 20, 8_192),
             re_text_ascii_hot: None,
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
@@ -8761,8 +8780,10 @@ impl Interp {
             };
         }
         let key = s.as_ptr() as usize;
-        if let Some((cached, hit)) = self.str_units.get_cloned(&key) {
-            debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
+        if let Some(hit) = self.str_units.get_mapped(&key, |(cached, units, _)| {
+            debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
+            units.clone()
+        }) {
             return hit;
         }
         let u = if s.is_ascii() {
@@ -8770,8 +8791,9 @@ impl Interp {
         } else {
             StrUnits::Units(crate::jstr::units(s).into())
         };
-        let bytes = retained_str_units_bytes(s, &u);
-        self.str_units.insert(key, (s.clone(), u.clone()), bytes);
+        let bytes = retained_str_units_bytes(s, &u, None);
+        self.str_units
+            .insert(key, (s.clone(), u.clone(), None), bytes);
         u
     }
 
@@ -8790,22 +8812,74 @@ impl Interp {
             return crate::jstr::units(s).into();
         }
         let key = s.as_ptr() as usize;
-        if let Some((cached, hit)) = self.str_units.get_cloned(&key) {
-            debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
+        if let Some(hit) = self.str_units.get_mapped(&key, |(cached, units, _)| {
+            debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
+            units.clone()
+        }) {
             if let StrUnits::Units(u) = hit {
                 return u.clone();
             }
             let u: Rc<[u16]> = crate::jstr::units(s).into();
             let cached = StrUnits::Units(u.clone());
-            let bytes = retained_str_units_bytes(s, &cached);
-            self.str_units.insert(key, (s.clone(), cached), bytes);
+            let bytes = retained_str_units_bytes(s, &cached, None);
+            self.str_units.insert(key, (s.clone(), cached, None), bytes);
             return u;
         }
         let u: Rc<[u16]> = crate::jstr::units(s).into();
         let cached = StrUnits::Units(u.clone());
-        let bytes = retained_str_units_bytes(s, &cached);
-        self.str_units.insert(key, (s.clone(), cached), bytes);
+        let bytes = retained_str_units_bytes(s, &cached, None);
+        self.str_units.insert(key, (s.clone(), cached, None), bytes);
         u
+    }
+
+    /// Substrings of a cached Unicode string can usually copy UTF-8 directly. Preserve the
+    /// existing cache's byte/entry limits and owning identity pin; do not add a second cache or
+    /// alter LStr's native layout. Coercions have finished before the caller enters this helper.
+    #[inline(never)]
+    pub(crate) fn slice_units(
+        &mut self,
+        s: &crate::lstr::LStr,
+        units: &Rc<[u16]>,
+        start: usize,
+        end: usize,
+    ) -> crate::lstr::LStr {
+        if start == end {
+            return crate::lstr::LStr::from("");
+        }
+        if s.len() >= 64 {
+            let key = s.as_ptr() as usize;
+            // A conversion may have evicted this source. Oversized, uncached and short strings
+            // keep their established reconstruction; never repeatedly index an uncacheable body.
+            if let Some((cached, view, index)) = self.str_units.get_cloned(&key) {
+                debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
+                let index = if let Some(index) = index {
+                    index
+                } else {
+                    let base = retained_str_units_bytes(s, &view, None)
+                        .saturating_add(std::mem::size_of::<crate::jstr::Utf8Index>());
+                    if base > STR_UNIT_CACHE_BYTES {
+                        // Do not evict a valid units-only entry to charge even a declined index.
+                        return crate::jstr::from_units(&units[start..end]).into();
+                    }
+                    let index = Rc::new(crate::jstr::Utf8Index::new(
+                        s,
+                        STR_UNIT_CACHE_BYTES.saturating_sub(base),
+                    ));
+                    let bytes = retained_str_units_bytes(s, &view, Some(&index));
+                    self.str_units
+                        .insert(key, (cached, view, Some(index.clone())), bytes);
+                    index
+                };
+                if let Some(bytes) = index.range(s, start, end) {
+                    return if bytes.len() == s.len() {
+                        s.clone()
+                    } else {
+                        crate::lstr::LStr::from(bytes)
+                    };
+                }
+            }
+        }
+        crate::jstr::from_units(&units[start..end]).into()
     }
 
     /// `s.length` (UTF-16 units), through the cache.

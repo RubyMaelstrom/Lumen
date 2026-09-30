@@ -101,6 +101,8 @@ mod snapshot;
 mod spread;
 #[cfg(test)]
 mod string_concat_tests;
+#[cfg(test)]
+mod string_slice_tests;
 mod tagged;
 mod temporal;
 mod tiering;

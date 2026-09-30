@@ -439,6 +439,7 @@ pub(crate) struct Visitor {
     regexp_string_sets: HashSet<usize>,
     regexp_backref_groups: HashSet<usize>,
     rc_u16_slices: HashSet<usize>,
+    string_utf8_indexes: HashSet<usize>,
     rc_value_slices: HashSet<usize>,
     array_buffers: HashMap<usize, usize>,
     native_buffers: HashSet<usize>,
@@ -1193,10 +1194,22 @@ fn scan_realm(
             .engine_caches
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
-    let (bytes, exact) = interp.str_units.scan_retained_memory(|(string, units)| {
-        visitor.lstr(string);
-        visitor.str_units(units);
-    });
+    let (bytes, exact) = interp
+        .str_units
+        .scan_retained_memory(|(string, units, index)| {
+            visitor.lstr(string);
+            visitor.str_units(units);
+            if let Some(index) = index {
+                if visitor
+                    .string_utf8_indexes
+                    .insert(Rc::as_ptr(index) as usize)
+                {
+                    visitor.strings_symbols_bigints = visitor
+                        .strings_symbols_bigints
+                        .saturating_add(index.heap_bytes());
+                }
+            }
+        });
     totals.engine_caches.add(bytes);
     if !exact {
         totals

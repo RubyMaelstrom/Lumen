@@ -1,0 +1,72 @@
+Unicode slicing optimization — 30 September 2026
+================================================
+
+Base revision: d3dd5112ac335ec206a621bbef364287e02671ad. This continues
+the default-tier application audit described in engine-optimization-20260929.txt.
+
+Djot's actual parser repeatedly takes prefixes of its document and extracts
+captures. A diagnostic profile attributed 0.406 of 1.022 sampled CPU seconds
+to memcpy and 0.154 to jstr::from_units. These samples identify repeated string
+work; overlapping profiles are not acceptance timings or additive speedup claims.
+
+The established Unicode substring path rebuilt UTF-16 ranges into a Rust String,
+then copied them into LStr. The new path lazily indexes non-ASCII boundaries in
+the existing owning string-unit cache and copies complete UTF-8 ranges directly.
+ASCII runs require no index entries. Whole-source ranges can share the immutable
+source; other results own independent storage. LStr's native layout is unchanged.
+
+The cache retains its 64-entry and 16 MiB limits, charges index storage, and
+pins string identity. Short or uncacheable sources, coercion-driven eviction,
+index-budget exhaustion, surrogate splits and smuggled surrogate pairs retain
+code-unit reconstruction. The memory census visits each index payload once.
+Index construction is cold; the shared Unicode helper is emitted out of line.
+
+The local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202
+was consulted: /big/web-standards/repositories/tc39/ecma262/spec.html,
+String.prototype.slice:36827, substring:36924 and Annex B substr:54429.
+Official clauses: https://tc39.es/ecma262/#sec-string.prototype.slice,
+https://tc39.es/ecma262/#sec-string.prototype.substring and
+https://tc39.es/ecma262/#sec-string.prototype.substr. Boundaries remain UTF-16
+code-unit boundaries; receiver and argument coercions retain their ordered effects.
+This identifies the consulted snapshot, not a verified current upstream revision.
+
+Four focused regressions cover Unicode boundaries in all three tiers, lone and
+paired surrogates, private-plane encodings, coercion ordering and abrupt completion,
+cache eviction, immutable source sharing and index-budget exhaustion. Final default
+engine tests pass 1,561/1,561; strict Clippy passes. Workspace/all-target checks
+passed before the final code-placement-only attributes. No fresh x64/wasm or full
+Test262 result is claimed.
+
+Four balanced fresh-process pairs, crystal ARM64, CPU 5, ordinary release/template
+JIT with default Intl and identical build flags, compare unchanged application code:
+
+  Workload                          Baseline median  Candidate median
+  Djot AGENTS.md parse/render             812 ms          665.5 ms
+  Complete yt-dlp/ejs solver             8.772 s          8.787 s
+  React TodoMVC reducer replay          115.5 ms            116 ms
+  Vue reactivity control                  778 ms          773.5 ms
+
+Djot measured conversion takes 18.04% less time; paired candidate/baseline ratio
+0.81897, 95% log-t interval 0.81306–0.82492. Whole-process time falls 16.54%.
+The other timing intervals include parity. All exact results/checksums match.
+Reducer/library controls are not full UI, browser or official Speedometer scores.
+One Node observation per workload is only a reference. The general Node gap remains.
+
+The first build showed a provisional React peak-memory regression (+5.21% median,
+paired interval 1.02151–1.08757). It was reworked. Managed-heap and generated-code
+diagnostics matched; separate process mapping observations attributed most extra
+RSS to resident read-only executable pages. Those diagnostics added a post-output
+wait and are not acceptance timings. Both versions and their evidence remain local.
+
+Separate final four-pair wait4 peaks show Djot median RSS 4.94% lower (paired
+interval 0.92687–0.97892). React's median is 1.67% higher with interval including
+parity; solver and Vue intervals include parity. No final timing or peak component
+crosses the repository's provisional regression gate. Post-GC retained memory was
+not compared. The final binary is 4,408 bytes larger than baseline.
+
+Exact source/artifact hashes, raw numeric observations and scope are recorded in
+../benchmarks/engine-string-slicing-2026-09-30.json. Complete local output, scripts,
+sources, profiles, diagnostics and an initial EPERM launcher failure are retained
+under benchmark-results/engine-cycle2-20260929. No owned build/test/profiler overlapped
+final application observations; user desktop applications remained active. No
+installed executable was replaced and no binary was promoted.
