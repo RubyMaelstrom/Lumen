@@ -1,0 +1,33 @@
+Parked tail-transfer allocation experiment — 30 September 2026
+============================================================
+
+An EJS helper diagnostic counted 2,089,629 proper-tail transfers. The experiment
+put up to four fixed arguments inline and reused one emptied boxed transfer
+record. It preserved the native nullable-box guard, existing call dispatch,
+logical depth, frame retirement and GC owner boundaries. Large/spread arguments
+kept their vectors. Twelve tail tests and 43 memory tests passed; strict engine
+all-target Clippy and an optimizing-jit all-target check passed.
+
+Four balanced application pairs did not improve performance. Solver process
+median increased from 8713.04 to 8796.60 ms (0.96%); its paired ratio interval
+was 1.00552–1.01288. Vue measured median increased from 775 to 784 ms (1.16%);
+its interval was 1.00410–1.01852. React and Djot intervals included parity.
+These increases are below the repository's combined regression gate, but they
+do not justify keeping an allocation rewrite under the major-improvement goal.
+No separate peak comparison was run after the negative timing result.
+
+The production and test changes were restored exactly to committed cycle7.
+Complete candidate source, standalone patch, release binary, raw outputs and
+all pair analysis remain in benchmark-results/engine-cycle8-20260930. No build,
+test or diagnostic profile overlapped acceptance timings. The earlier broader
+tail rewrite in docs/architecture-work-plan-20260928.txt:653–658 was also flat
+on its browser application screen; this experiment kept dispatch unchanged and
+tested the allocation hypothesis on the complete solver workload.
+
+Normative snapshot: ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:19922 (EvaluateCall) and
+:26617 (PrepareForTailCall). Argument evaluation precedes callability checking;
+caller resources are released or reused before target execution. Official URLs:
+https://tc39.es/ecma262/#sec-evaluatecall
+https://tc39.es/ecma262/#sec-preparefortailcall.
+This consulted snapshot was not verified against current upstream text.
