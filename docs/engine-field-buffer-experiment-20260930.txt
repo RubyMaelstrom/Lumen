@@ -1,0 +1,62 @@
+Empty property-buffer reuse — parked 30 September 2026
+====================================================
+
+The solver's helper trace shows 2,318,159 MakeObject operations at fn() pc3.
+The bytecode dump contains two six-op getters with three GetPropThis reads,
+a three-field MakeObject and Return. Meriyah's token/current-location getters
+have that structure: numeric index, line and column snapshots. The raw label
+is not a source function name; the source attribution is an inference from
+the matching structure. The allocation site itself is a measured target.
+
+The prototype adds a small buffer directory to each GcState. Plain literal
+instantiation takes a matching empty Vec<Property>; NamedEntries destruction
+fully clears values/accessors before offering its buffer to the active heap.
+It retains at most one buffer per exact capacity 1..16, with no JS owners.
+It leaves object identities, descriptors and activation binding unchanged.
+Unavailable/busy TLS or directory borrows and larger capacities retain normal
+allocation/deallocation. The existing memory visitor counts the directory
+and cached buffer capacities. No object header or field-vector ABI is changed.
+
+Four focused regressions cover real literal instantiation and descriptor
+rebuilding, release of data/accessor owners, exact capacity bounds, memory
+reporting, and nested destruction during busy TLS/directory access. All 1,582
+engine library tests and strict all-target Clippy pass. All-target checking
+with optimizing-jit, heap-bridge and architecture-diagnostics also passes.
+No optional-feature execution, x64, wasm or Test262 result is claimed.
+
+Consulted ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:13553
+(OrdinaryObjectCreate), :19189 (object initializer evaluation) and :48651
+(WeakRef.prototype.deref). Reused empty storage must never share object
+identity, preserve old descriptors/values, or retain owners; current-job
+WeakRef protection remains in the existing collector. Official clauses:
+https://tc39.es/ecma262/#sec-ordinaryobjectcreate
+https://tc39.es/ecma262/#sec-object-initializer-runtime-semantics-evaluation
+https://tc39.es/ecma262/#sec-weak-ref.prototype.deref
+This is the consulted snapshot, not verified current upstream text.
+
+Four balanced fresh-process pairs on crystal ARM64 CPU5 use ordinary release
+template JIT, default Intl and cleared runtime/diagnostic switches. Baseline
+is production-equivalent to b1c975f; the preceding store experiment is excluded.
+Complete outputs match, including a single Node reference per application.
+React measured medians 116 -> 118ms (+1.72%; ratio interval 1.00823–1.02198)
+and Djot 332 -> 336ms (+1.20%; 1.00417–1.02321) are slower. Solver process
+9875.24 -> 10117.18ms (+2.45%; 0.97448–1.07924) and Vue 754 -> 757ms
+(+0.40%; 0.99416–1.02059) have intervals spanning parity. No component meets
+the combined >3% median loss and slower-direction interval gate, but none
+shows a benefit. Scoped drivers are not full browser benchmark results.
+
+The pool is parked and the code/tests fully restored. Its directory and
+destruction traffic do not repay the attempted allocation savings on these
+applications. No separate peak-memory run or cache-hit timing was collected
+after this negative screen. Release compilation finishes in 4m17s; that is
+not an isolated JIT cost comparison. A lifetime-specific mechanism would
+need new application evidence before reconsidering this approach.
+
+Exact source, patch, binaries, complete application outputs, four-pair timing
+observations, analysis and check logs remain in
+benchmark-results/engine-cycle11-20260930. No owned build/test/profile overlaps
+the comparison. Desktop applications remain active. target/release/lumen still
+contains the parked pool, so subsequent baselines use a pinned committed-cycle
+artifact. Installed/accepted artifacts are unchanged. Only this report is
+committed.
