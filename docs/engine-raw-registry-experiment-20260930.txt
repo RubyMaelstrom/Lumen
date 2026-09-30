@@ -1,0 +1,51 @@
+Raw object registry — unsafe at the embedding boundary, parked 30 September 2026
+=============================================================================
+
+An actual solver gprofng run against the pinned production engine records
+8.676 sampled CPU seconds, including Object::new_with_parts (0.100 exclusive)
+and Rc<Object>::drop_slow (0.150 exclusive / 0.240 inclusive). These sampled
+functions motivate allocation/destruction work; they do not establish a large
+removable cost or a performance result. No build/test overlaps this profile.
+
+The prototype replaces object registry Weak entries with non-owning NonNull
+addresses, relying on Object::drop to unregister before field destruction.
+Snapshots pin addresses before releasing the registry borrow. A separate
+stable u32 registry slot removes the major collector's full restoration pass
+and makes destruction independent of its scratch word. Scope registry entries
+and JavaScript WeakRef/WeakMap/finalization metadata retain their existing owners.
+Memory accounting and optional allocation diagnostics follow the new entries.
+
+Three focused tests cover snapshot rooting, nursery promotion, dead slot reuse,
+reentrant native capture destruction and interrupted collector scratch. All
+1,581 engine tests, strict engine all-target Clippy, workspace all-target checks
+and optional all-target checking with optimizing-jit, heap-bridge and
+architecture-diagnostics pass. The release shell builds in 3m29s. There is no
+fresh x64/wasm execution or Test262 claim.
+
+A later API audit rejects the non-moving-address invariant. embed::Value::Obj
+exposes Rc<RefCell<Object>> through its payload, even though object fields are
+private and documented as opaque. Safe Rust can infer the private type and
+std::mem::swap the contents of two borrowed cells. Dropping one cell then
+unregisters the other object's moved slot, leaving the freed cell's raw entry
+published. Reconstructing an Rc from that entry would be invalid. This is a
+counterexample from API/code inspection, not an executed undefined-behavior
+test. A private field or documented opaque-handle convention does not make a
+raw-pointer invariant enforceable through the exposed safe RefCell interface.
+The ordinary Weak registry does not reconstruct a freed allocation.
+
+Consulted local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:12900 (Liveness), :12940
+(WeakRef Execution) and :13010 (AddToKeptObjects). The relevant Rust lifetime
+counterexample is independent of JavaScript weak-liveness leeway. Official URLs:
+https://tc39.es/ecma262/#sec-liveness
+https://tc39.es/ecma262/#sec-weakref-execution
+https://tc39.es/ecma262/#sec-addtokeptobjects
+This is the consulted snapshot, not verified current upstream text.
+
+All prototype code/tests are restored. No paired throughput or peak-memory
+comparison follows the safety rejection. Source, exact patch, binaries, check
+logs and diagnostic profile remain in benchmark-results/engine-cycle13-20260930.
+Baseline production matches b1c975f; preceding HEAD is d8b675e. target/release/lumen
+still holds the parked prototype. Installed/accepted artifacts are unchanged.
+Only this report is committed. A raw registry requires an enforceable allocation
+identity/lifetime boundary, not another admission flag or additional unit tests.
