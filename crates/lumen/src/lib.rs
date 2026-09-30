@@ -29,6 +29,8 @@ pub mod bytecode;
 mod cache;
 mod callback;
 #[cfg(test)]
+mod code_point_intrinsic_tests;
+#[cfg(test)]
 mod computed_reference_tests;
 mod coroutine;
 #[cfg(test)]

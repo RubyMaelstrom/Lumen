@@ -1,0 +1,64 @@
+UTF-16 character reads — 30 September 2026
+==========================================
+
+The actual Djot diagnostic trace records 228,341 codePointAt calls through
+the generic native-call helper. Fully inlined intrinsics are outside that
+trace; it is attribution evidence, not timing acceptance. A named builtin
+identity now admits String/Number calls to the existing ARM64 compact
+intrinsic helper, guarded by live callee identity, epoch and realm. Numeric
+index normalization stays unchanged. Other receivers/indices use the full
+builtin, preserving receiver conversion before index conversion. The helper
+retains depth, GC, construction-state and operand-owner cleanup boundaries.
+x64 retains checked calls; no new opcode, call-frame policy or object layout
+is introduced, and the optional whole-function tier remains off.
+
+Short Unicode unit reads below the existing 64-byte cache threshold now walk
+a bounded allocation-free iterator, preserving both units of astral scalars
+and individual smuggled surrogates. This benefits charAt/charCodeAt too.
+codePointAt reads adjacent units together; its warm wide-string path borrows
+the cached UTF-16 representation without an Rc retain/drop. The existing
+owning cache and its quotas stay authoritative, with no additional cache.
+
+Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:36270 and :16721.
+String.prototype.codePointAt performs RequireObjectCoercible/ToString before
+ToIntegerOrInfinity; an absent position returns undefined, and a valid high/
+low pair is joined only when it starts at the specified UTF-16 position.
+Official clauses: https://tc39.es/ecma262/#sec-string.prototype.codepointat
+https://tc39.es/ecma262/#sec-codepointat
+This is the consulted snapshot, not verified current upstream text.
+
+Three focused regressions pass. They check short/warm wide reads, Unicode,
+lone surrogates, the private-use smuggle range, every surrogate position,
+signed/fractional/NaN/infinite/huge indices, coercion order, Symbol/BigInt
+errors, GC and method replacement across interpreter, bytecode and JIT.
+A native counter proves guarded intrinsic execution. All 1,584 engine tests,
+strict engine all-target Clippy and optional optimizing-jit all-target
+compilation pass. No fresh Test262, workspace check, x64/wasm execution or
+optional-backend execution is claimed.
+
+Four balanced fresh-process pairs on crystal ARM64 CPU5 use ordinary release
+JIT, default Intl, opt3/fat LTO/codegen-units1/panic-abort and cleared runtime
+switches. Baseline is committed cycle14, 4eb8e0a. Complete outputs match,
+including one Node v24.21.0 reference per workload. React's reducer workflow
+is 115.5 ->116ms (+0.43%; paired ratio interval .98666–1.02226). Djot document
+conversion is 303.5 ->290.5ms (4.28% lower; .92817–.97612). Complete solver
+process time is 8595.33 ->8615.14ms (+0.23%; .99606–1.00882). Vue reactivity
+is 747 ->747.5ms (+0.07%; .99258–1.01151). Djot's interval excludes parity;
+other timing intervals span it. These component drivers are not full browser
+benchmarks, and single Node references are not comparison distributions.
+This is a workload improvement, not closure of the reported 8–10x engine gap.
+
+Separate four balanced Linux wait4 peak pairs report React 23,618 ->23,146
+KiB (-2.00%; .93109–1.02799), Djot 55,318 ->54,734 KiB (-1.06%;
+.96160–1.02918), solver 638,950 ->638,956 KiB (+0.001%; .99538–1.00832)
+and Vue 43,908 ->44,294 KiB (+0.88%; .95777–1.05176). All peak intervals
+span parity; no memory benefit or post-GC retained-memory result is claimed.
+Every timing and peak output matches; no combined regression gate fails.
+
+Release build completes in 3m30s; binary grows by 4,304 bytes. No owned
+build/test/profile overlaps timing or peak runs; desktop applications remain
+active. Exact sources, patch, binaries, full outputs, checks and distributions
+are retained in benchmark-results/engine-cycle15-20260930. The tracked
+manifest records their hashes and condensed samples. Installed/accepted
+artifacts are unchanged.

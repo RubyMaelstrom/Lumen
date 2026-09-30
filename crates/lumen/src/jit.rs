@@ -5566,6 +5566,7 @@ fn emit_call_inline(
             if with_this && *argc == 1 && rc_ok && layout.rc_strong_off == 0 {
                 let char_at = a.new_label();
                 let char_code = a.new_label();
+                let code_point = a.new_label();
                 let sqrt = a.new_label();
                 let regexp_exec = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
                 let string_split = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
@@ -5576,6 +5577,8 @@ fn emit_call_inline(
                 a.b_cond(C_EQ, char_at);
                 a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32);
                 a.b_cond(C_EQ, char_code);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32);
+                a.b_cond(C_EQ, code_point);
                 a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
                 a.b_cond(C_EQ, sqrt);
                 if let Some(array_push) = array_push {
@@ -5603,6 +5606,24 @@ fn emit_call_inline(
                 a.mov(0, 19);
                 a.movz(1, pc as u32, 0);
                 a.movk(1, crate::bytecode::INTRINSIC_CHAR_AT as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+
+                // Exact builtin identity is proven by the live call IC. Numeric
+                // indices need no author conversion; all UTF-16 cases use the
+                // compact helper with the established native activation boundaries.
+                a.bind(code_point);
+                emit_exec_word_load(a, 9, 20, -24);
+                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32, 1);
                 a.mov(2, 20);
                 a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
                 a.blr(16);

@@ -66,6 +66,32 @@ pub fn unit_len(s: &str) -> usize {
         .sum()
 }
 
+/// Decode code units lazily for bounded character reads. Smuggled surrogates
+/// remain individual units; ordinary astral scalars yield their high/low pair.
+/// Unlike `units`, this view allocates no storage.
+pub(crate) fn unit_iter(s: &str) -> impl Iterator<Item = u16> + '_ {
+    s.chars().flat_map(|c| {
+        let mut buffer = [0u16; 2];
+        let len = match smuggled(c) {
+            Some(unit) => {
+                buffer[0] = unit;
+                1
+            }
+            None => c.encode_utf16(&mut buffer).len(),
+        };
+        buffer.into_iter().take(len)
+    })
+}
+
+pub(crate) fn code_point_from_pair(first: u16, second: Option<u16>) -> u32 {
+    if (0xD800..0xDC00).contains(&first) {
+        if let Some(second) = second.filter(|unit| (0xDC00..0xE000).contains(unit)) {
+            return 0x10000 + ((first as u32 - 0xD800) << 10) + (second as u32 - 0xDC00);
+        }
+    }
+    first as u32
+}
+
 /// Rebuild a string from code units: valid surrogate pairs combine into their code point, lone
 /// surrogates are smuggled.
 pub fn from_units(units: &[u16]) -> String {

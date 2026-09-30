@@ -864,6 +864,7 @@ pub const INTRINSIC_REGEXP_EXEC_DISCARD: u8 = 9;
 pub const INTRINSIC_STRING_REPLACE_DISCARD: u8 = 10;
 pub const INTRINSIC_STRING_SPLIT_DISCARD: u8 = 11;
 pub const INTRINSIC_CHAR_AT: u8 = 12;
+pub const INTRINSIC_CODE_POINT_AT: u8 = 13;
 
 impl CallIc {
     pub const EMPTY: CallIc = CallIc {
@@ -18656,6 +18657,13 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_JIT_CODE_POINT_INTRINSICS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// Hot native intrinsics after the machine-code call IC has already proved builtin identity.
 /// Emitted guards keep string/property intrinsics on non-coercing cases. Function#apply performs
 /// its own dense-list guards; Array push/pop transfer ownership directly between the operand
@@ -18671,9 +18679,9 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     let call_argc = (packed >> 24) as usize;
     let _pc = (packed & 0xffff) as usize;
     let width = match intrinsic {
-        INTRINSIC_CHAR_AT => 3,    // [receiver, callee, index]
-        INTRINSIC_ARRAY_PUSH => 3, // [receiver, callee, arg]
-        INTRINSIC_ARRAY_POP => 2,  // [receiver, callee]
+        INTRINSIC_CHAR_AT | INTRINSIC_CODE_POINT_AT => 3, // [receiver, callee, index]
+        INTRINSIC_ARRAY_PUSH => 3,                        // [receiver, callee, arg]
+        INTRINSIC_ARRAY_POP => 2,                         // [receiver, callee]
         INTRINSIC_FUNCTION_CALL => call_argc + 2,
         INTRINSIC_REGEXP_EXEC_DISCARD => 3,
         INTRINSIC_STRING_SPLIT_DISCARD => 3,
@@ -18711,6 +18719,23 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                                 Some(unit) => Value::Str(crate::jstr::unit_lstr(unit)),
                                 None => Value::str(""),
                             }
+                        })
+                    }
+                    INTRINSIC_CODE_POINT_AT => {
+                        #[cfg(test)]
+                        TEST_JIT_CODE_POINT_INTRINSICS.with(|count| count.set(count.get() + 1));
+                        let Value::Str(s) = &(*base).unpack() else {
+                            unreachable!("codePointAt intrinsic receiver guard")
+                        };
+                        let Value::Num(n) = &(*base.add(2)).unpack() else {
+                            unreachable!("codePointAt intrinsic index guard")
+                        };
+                        let idx = if n.is_nan() { 0.0 } else { n.trunc() };
+                        Ok(if idx < 0.0 || !idx.is_finite() {
+                            Value::Undefined
+                        } else {
+                            i.code_point_at(s, idx as usize)
+                                .map_or(Value::Undefined, |point| Value::Num(point as f64))
                         })
                     }
                     INTRINSIC_STRING_SLICE => {
@@ -20373,6 +20398,12 @@ unsafe fn jit_call_inner(
                                                 as usize =>
                                         {
                                             INTRINSIC_CHAR_CODE_AT
+                                        }
+                                        p if p
+                                            == crate::builtins::nf_code_point_at as *const ()
+                                                as usize =>
+                                        {
+                                            INTRINSIC_CODE_POINT_AT
                                         }
                                         p if p
                                             == crate::builtins::nf_char_at as *const ()

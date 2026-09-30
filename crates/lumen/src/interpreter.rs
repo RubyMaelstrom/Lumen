@@ -8906,10 +8906,46 @@ impl Interp {
 
     /// Code unit `idx` of `s`, through the cache. `None` = out of range.
     pub(crate) fn unit_at(&mut self, s: &crate::lstr::LStr, idx: usize) -> Option<u16> {
+        if s.ascii_hint() {
+            return s.as_bytes().get(idx).map(|&byte| byte as u16);
+        }
+        if s.len() < 64 {
+            return crate::jstr::unit_iter(s).nth(idx);
+        }
         match self.units_of(s) {
             StrUnits::Ascii => s.as_bytes().get(idx).map(|&b| b as u16),
             StrUnits::Units(u) => u.get(idx).copied(),
         }
+    }
+
+    /// CodePointAt after receiver/index coercions. Short Unicode strings use a
+    /// bounded iterator; warm Unicode entries project two units without cloning
+    /// cache ownership. This uses the existing owning cache and its byte budget.
+    pub(crate) fn code_point_at(&mut self, s: &crate::lstr::LStr, idx: usize) -> Option<u32> {
+        if s.ascii_hint() {
+            return s.as_bytes().get(idx).map(|&byte| byte as u32);
+        }
+        if s.len() < 64 {
+            let mut units = crate::jstr::unit_iter(s);
+            let first = units.nth(idx)?;
+            return Some(crate::jstr::code_point_from_pair(first, units.next()));
+        }
+        let read = |units: &StrUnits| match units {
+            StrUnits::Ascii => s.as_bytes().get(idx).map(|&byte| byte as u32),
+            StrUnits::Units(units) => units.get(idx).map(|&first| {
+                crate::jstr::code_point_from_pair(first, units.get(idx + 1).copied())
+            }),
+        };
+        if let Some(result) =
+            self.str_units
+                .get_mapped(&(s.as_ptr() as usize), |(cached, units, _)| {
+                    debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
+                    read(units)
+                })
+        {
+            return result;
+        }
+        read(&self.units_of(s))
     }
 
     /// The fully materialized unit vector (for range/search operations): an ASCII entry is
