@@ -779,9 +779,6 @@ fn re_sym_replace_impl(
 ) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.replace]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
-    // All positions are UTF-16 unit offsets.
-    let sunits: Vec<u16> = crate::jstr::units(&s);
-    let size = sunits.len();
     let repl = arg(a, 1);
     let functional = repl.is_callable();
     let repl_str = if functional {
@@ -903,6 +900,14 @@ fn re_sym_replace_impl(
             set_throw(i, &this, "lastIndex", Value::Num(next as f64))?;
         }
     }
+    // The immutable input's length/units have no observable effects. Defer materialization
+    // until matching succeeds; all replacement coercions, flag/exec Gets and lastIndex writes
+    // above still run on the no-match path (ECMA-262 RegExp.prototype [ %Symbol.replace% ]).
+    if results.is_empty() {
+        return Ok(Value::Str(s));
+    }
+    let sunits = i.units_full(&s);
+    let size = sunits.len();
     let mut accumulated = String::new();
     let mut next_pos = 0usize;
     for result in &results {

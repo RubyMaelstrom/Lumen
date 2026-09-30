@@ -237,3 +237,51 @@ fn prepared_windows_pin_shared_tables_and_map_astral_offsets() {
         assert!(ReText::window(window, &input, 0, 10).is_none());
     }
 }
+
+#[test]
+fn regexp_no_match_replace_keeps_coercion_and_exec_effects() {
+    check(
+        r#"
+        function run(){
+            var original='a'.repeat(96)+'é😀\ud800',source=original,log=[];
+            var receiver={toString(){log.push('source');return source}};
+            var replacement={toString(){log.push('replace');source+='changed';return 'X'}};
+            var re={get flags(){log.push('flags');return {toString(){log.push('flags-string');return 'g'}}},
+                set lastIndex(v){log.push('last:'+v)},
+                get exec(){log.push('exec');return function(s){log.push('call:'+s.length);return null}}};
+            var result=RegExp.prototype[Symbol.replace].call(re,receiver,replacement);
+            return [result===original,result.length,result.charCodeAt(99),log.join(','),source.length].join('|');
+        }run()
+        "#,
+        "true|100|55296|source,replace,flags,flags-string,last:0,exec,call:100|107",
+    );
+}
+
+#[test]
+fn regexp_no_match_replace_preserves_abrupt_state_and_static_observers() {
+    check(
+        r#"
+        function run(){
+            /é/u.exec('é');
+            var input='x'.repeat(300)+'é😀',called=0,re=/not-found/gu;
+            re.lastIndex=900;
+            var result=input.replace(re,function(){called++;throw 99});
+            var staticMatch=RegExp['$&'];
+            var readonly=/absent/g;
+            Object.defineProperty(readonly,'lastIndex',{writable:false});
+            var error;
+            try{input.replace(readonly,'!')}catch(e){error=e.name}
+            var log=[];
+            try{RegExp.prototype[Symbol.replace].call({
+                get flags(){log.push('flags');throw 7},
+                get exec(){log.push('unreached');return ()=>null}},
+                {toString(){log.push('source');return input}},
+                {toString(){log.push('replace');return '!'}})}catch(e){log.push(e)}
+            var alias=result;result+='!';
+            return [alias===input,called,re.lastIndex,staticMatch,error,log.join(','),
+                alias.length,result.length].join('|');
+        }run()
+        "#,
+        "true|0|0|é|TypeError|source,replace,flags,7|303|304",
+    );
+}

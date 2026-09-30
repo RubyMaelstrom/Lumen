@@ -1,0 +1,36 @@
+No-match replacement — 30 September 2026
+=======================================
+
+RegExp @@replace previously built the input's UTF-16 vector before coercing the
+replacement or reading flags, and rebuilt a new string even when exec returned
+null. The input is immutable; its internal length/units have no observable effects.
+Materialization now waits until matching succeeds. A no-match result shares the
+original input after all required replacement coercion, flags/exec accesses and
+lastIndex writes. Matched replacements use the existing owning unit cache.
+
+The local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:39817, was consulted.
+Official clause: https://tc39.es/ecma262/#sec-regexp.prototype-%symbol.replace%.
+The final empty-list case returns the original subject's full substring. This
+is the consulted snapshot, not a verified current upstream revision.
+
+Two new regressions cover ordered coercion/flags/exec effects, receiver snapshots,
+functional replacement suppression, read-only lastIndex, thrown getters, legacy
+statics and immutable aliases. They run in interpreter, bytecode and JIT modes.
+All 39 selected regexp and nine string tests pass; strict all-target Clippy passes.
+No fresh full-unit/workspace/x64/wasm/Test262 result is claimed in this small cycle.
+
+Four balanced real-application pairs and separate wait4 peaks are recorded in
+../benchmarks/engine-regexp-replace-2026-09-30.json. React, Djot and solver timing
+intervals include parity. Vue's measured median is 0.64% slower; Djot peak is about
+1% higher. Both are below the provisional 3% median-loss gate. No measured
+component crosses that gate. There is no additional demonstrated major gain on
+these fixtures; the preceding shared regex-table cycle supplies the large gain.
+Post-GC retained memory was not compared.
+
+Baseline includes the completed slicing and view/table cycles, with exact source
+and binary hashes pinned because .git remains explicitly read-only. Local complete
+output, source copies, scripts and artifacts remain in
+benchmark-results/engine-cycle4-20260930. No owned build/test/profile overlapped
+the comparisons, and user desktop applications remained active. No installed
+binary was replaced or release artifact promoted.
