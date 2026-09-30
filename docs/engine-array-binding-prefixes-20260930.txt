@@ -1,0 +1,156 @@
+Closed lexical Array binding prefixes — 30 September 2026
+=========================================================
+
+Decision: retain. The complete examples/ejs/code.js solver takes 0.95% less
+process wall time, with a paired 95% interval excluding parity. No independent
+application timing, CPU or peak-RSS regression gate is crossed. This is a small
+incremental gain; it does not establish a major engine-wide improvement or
+close the broader Node performance gap. This experiment completes the current
+optimization phase at the user's request.
+
+The solver repeatedly binds captured pairs from Object.entries using
+for (const [key, value] of ...). Its existing uncaptured-local DestructureArr
+shortcut does not cover these runtime lexical bindings. Baseline diagnostics
+record 244,063 pair bindings, 488,126 DestructureStepL helpers and 394,167
+GetIter helpers. Even when the established intrinsic step path avoids result
+objects, the generic opening still materializes an Array iterator.
+
+The compiler now emits TryArrayBinding and ArrayBindingStep for fresh let/const
+patterns containing at most eight flat identifiers or holes. Defaults, nested
+patterns and rest stay on the established protocol. Opening peeks the source
+and pushes a Boolean, with static stack effect (1,2); failure leaves the source
+and full original GetIterator/step/close/error-handler sequence untouched.
+Success retains the source and captured next function in the existing hidden
+slots, then reads and initializes each binding in original forward order.
+Uncaptured batching and interpreter parameter binding are unchanged.
+
+The live proof requires the current realm's ordinary Array, intrinsic values
+and next methods, enough own data indices for the entire prefix, and an ordinary
+return lookup chain ending in absence or a nullish plain value. Accessors,
+holes, exhaustion, customized iteration, proxies, host/typed/module/deferred
+exotics and cross-realm native calls fall back before effects. A bounded
+prototype walk also declines on uncertainty. Fresh binding initialization
+cannot invoke author code between these reads.
+
+Opening and steps preserve native-call depth, physical stack protection,
+amortized GC ticks, entry/exit interruption, constructing state and newTarget.
+A prefix that would cross the GC polling boundary, or has a pending proper-tail
+transfer, declines before effects. Source and next owners remain in the original
+hidden slots for frame lifetime. Retiring prior slot owners must be inert:
+final host-callable owners retain the original destruction boundary. An empty
+intrinsic iterator shell left by an earlier miss is accepted only when dropping
+its target/prototype edges cannot retire their last external owner. The proof
+counts shared target/prototype edges and aliases with the captured next slot.
+
+Both VM dispatch and native checked-helper dispatch implement the new operations.
+ARM64 and x64 retain their existing generic emission and recovery boundaries;
+no raw object layout, executable-memory policy or host dependency changes.
+The optional optimizing backend conservatively declines unsupported bodies;
+it remains disabled in performance runs.
+
+Consulted official local ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202:
+ /big/web-standards/repositories/tc39/ecma262/spec.html:7101 GetIteratorDirect,
+ :7116 GetIteratorFromMethod, :7132 GetIterator, :7276 IteratorClose,
+ :10139 IteratorBindingInitialization, :42008 CreateArrayIterator,
+ :42038 %ArrayIteratorPrototype%.next.
+ https://tc39.es/ecma262/#sec-getiterator
+ https://tc39.es/ecma262/#sec-iteratorclose
+ https://tc39.es/ecma262/#sec-runtime-semantics-iteratorbindinginitialization
+ https://tc39.es/ecma262/#sec-%arrayiteratorprototype%.next
+This is the consulted snapshot, not verified current upstream text.
+
+Five focused tests exercise interpreter, bytecode and native JIT behavior:
+captured closures and GC reachability; customized next/return and getters;
+holes, inherited reads, short/empty sources and default fallback; allocation,
+GC-tick and ownership-proof controls; and host destructor effects on the next
+source index. Compiled tiers require observed fast openings, and the native JIT
+test separately requires actual successful native-helper entries.
+
+Draft history is preserved rather than counted as final validation. The second
+focused build initially failed on three incorrect fixture API uses, then passed
+after correction. An early unmeasured draft's stack metadata was corrected to
+require its peeked input. The v2 release was built but never measured or accepted.
+Ownership review then identified shared-edge multiplicity and full property
+storage concerns. A direct guard regression failed that draft with "target and
+prototype owners can both be retired by one shell". The corresponding JS host
+alias fixture passed the prior draft; this was an observed internal proof
+failure, not a demonstrated application-result divergence. Final v3 counts
+all retiring edges and checks all stored properties. Earlier source/build
+snapshots and failed logs remain under v1-unmeasured and v2-unmeasured and in
+the evidence directory.
+
+The exact final v3 source passes all 1,601 engine library tests, strict engine
+all-target Clippy, optional optimizing-jit all-target compilation, workspace
+all-target compilation, formatting and diff checks. No fresh Test262, x64 or
+wasm execution, or optional-backend runtime validation is claimed.
+
+Base engine/source revision a27ccbc6961f00a9642c45b5961ba0e102b769ac.
+The baseline is the preserved preceding cycle21 release; all 236 inventoried
+baseline files match that revision. Candidate snapshots inventory 238 files.
+Final staged engine patch SHA256:
+ f6d26c5f333cdb1809792cd0575eedc6fd050d18584832a5374f276e386ea205
+Baseline release SHA256:
+ be117258c84d7de89846416994cc8a02040c7f512ea4125a1044678455923401
+25,112,992 bytes. Candidate release SHA256:
+ 166f1e1c431d795ae1501f3199c82c06efc15ef5adc5f9294efd7d49bef4077a
+25,127,576 bytes; build 223.09 seconds; binary grows 14,584 bytes. Source
+inventories, exact patch, binaries, logs, inputs and outputs remain under
+benchmark-results/engine-cycle22-20260930. No installed or accepted release
+artifact is promoted.
+
+Four balanced fresh-process pairs per application use crystal Linux
+7.2.7-crystal ARM64, CPU5, ordinary default-Intl release JIT, opt3/fat LTO/
+codegen-units1/panic-abort. LUMEN_*, TRUST_* and LD_PRELOAD are removed;
+optimizing-jit and architecture probes are off. Desktop applications remain
+active; no owned build, test or profiler overlaps timing or peak measurements.
+Node v24.21.0 / V8 13.6.233.17-node.53 supplies one output/time reference per
+workload, not a comparison distribution. Inputs are unchanged Djot@0.3.2
+rendering, the complete EJS solver, Speedometer React TodoMVC reducer and Vue
+reactivity drivers. React/Vue results are component work, not browser scores.
+
+Application medians and candidate/baseline paired-log Student-t 95% intervals
+(four pairs; t3=3.182446305):
+
+ react: 115.50 -> 116.00ms; reduction -0.43%; ratio 0.99349-1.01953.
+ djot: 287.50 -> 287.50ms; reduction +0.00%; ratio 0.95791-1.02284.
+ ejs: 8189.39 -> 8111.35ms; reduction +0.95%; ratio 0.98688-0.99629.
+ vue: 754.00 -> 747.50ms; reduction +0.86%; ratio 0.98341-1.00141.
+
+EJS uses complete process wall time; the other primaries are driver elapsed
+time. Other primary intervals include parity, so they establish no gain.
+Process wall and user/system CPU are checked independently. A regression gate
+requires median loss over 3% and a slower 95% interval excluding parity.
+None crosses that gate. These incremental comparisons use the immediate
+baseline and cannot be added to preceding session percentages.
+
+Separate Linux wait4 peak-RSS medians, KiB:
+
+ react: 23452 -> 22968; change -2.06%; ratio 0.90685-1.07023.
+ djot: 54718 -> 55734; change +1.86%; ratio 0.98621-1.04528.
+ ejs: 638494 -> 637872; change -0.10%; ratio 0.98798-1.01031.
+ vue: 44578 -> 44078; change -1.12%; ratio 0.97656-1.01103.
+
+Every peak interval includes parity; no memory improvement is established.
+All 36 timing/reference executions and 32 separate peak executions finish
+successfully with exact matching normalized outputs. No post-GC retained
+memory, pause distribution, isolated startup or compilation gain is claimed.
+
+One instrumented solver execution per artifact follows all timing/peak runs.
+TryArrayBinding executes 244,063 times and ArrayBindingStep 482,696 times.
+For this workload's two-element prefixes, these counts imply 241,348 admitted
+openings (98.89%) and 2,715 protocol fallbacks. GetIter helpers fall from
+394,167 to 152,819, exactly 241,348 fewer, supporting elimination of that many
+iterator allocations. Checked native-call bookkeeping remains: 394,184
+GetIterator stages, 820,125 step stages and 1,869,878 native calls on both
+artifacts. Close stages fall from 330,628 to 89,280. Opcode reports list only
+the most frequent helpers; an omitted opcode is not a measured zero.
+
+CallWithThis remains 918,724. Both diagnostics record 271 successful JIT
+compilations, 58 successful inline bodies, 143 inline plan sites and call-cache
+epoch 58. Generated code is 59,543,384 -> 59,543,792 bytes; largest body
+40,871,964 -> 40,871,912 bytes. Compilation takes 0.41412 -> 0.41804s.
+Both runs record 12 collections and identical object/collection totals, with
+pause totals 0.59421 -> 0.58366s. Single instrumented observations establish
+no compilation or pause improvement/regression. Native durations include
+callback/nested work and cannot be summed as exclusive costs. Both diagnostic
+outputs match the acceptance solver output.

@@ -20,6 +20,9 @@
 // realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
 #![allow(clippy::wrong_self_convention)]
 
+mod array_binding;
+#[cfg(test)]
+mod array_binding_tests;
 mod ast;
 mod bigint;
 #[cfg(test)]

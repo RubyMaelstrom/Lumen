@@ -1482,6 +1482,13 @@ pub enum Op {
     /// ident/hole elements only: a nested pattern's own reads would interleave with the
     /// iterator steps in the wrong order.
     DestructureArr(u16),
+    /// Peek the source and push a Boolean. On a closed dense Array prefix, retain the
+    /// source/next in the two hidden slots without allocating an iterator. Only emitted
+    /// for fresh, flat lexical bindings; false leaves the entire protocol untouched.
+    TryArrayBinding(u16, u16, u16),
+    /// A checked intrinsic native-call boundary and own indexed read in an admitted prefix.
+    /// The source stays owned by the hidden iterator slot for the ordinary frame lifetime.
+    ArrayBindingStep(u16, u16, u16),
     /// Destructuring-assignment loop head: pop one iteration value and run the retained
     /// AssignmentPattern from `Chunk::assignment_targets`. This deliberately shares the
     /// tree-walker's normative Reference/GetV/default/IteratorClose implementation rather than
@@ -7749,6 +7756,40 @@ impl Compiler {
         let iterator = self.fresh_slot("%binding-iterator%");
         let next = self.fresh_slot("%binding-next%");
         let done = self.fresh_slot("%binding-done%");
+        let closed_prefix = matches!(kind, DeclKind::Let | DeclKind::Const)
+            && elements.len() <= 8
+            && elements.iter().all(|element| {
+                matches!(
+                    element,
+                    ArrayPatElem::Hole
+                        | ArrayPatElem::Elem {
+                            pattern: Pattern::Ident(_),
+                            default: None,
+                        }
+                )
+            });
+        let fast_exit = if closed_prefix {
+            self.emit(Op::TryArrayBinding(iterator, next, elements.len() as u16));
+            let slow = self.emit(Op::JumpIfFalse(0));
+            self.emit(Op::Pop);
+            for (index, element) in elements.iter().enumerate() {
+                self.emit(Op::ArrayBindingStep(iterator, next, index as u16));
+                match element {
+                    ArrayPatElem::Hole => {
+                        self.emit(Op::Pop);
+                    }
+                    ArrayPatElem::Elem { pattern, .. } => {
+                        self.destructure_store(pattern, kind)?;
+                    }
+                    _ => unreachable!("closed binding prefix"),
+                }
+            }
+            let exit = self.emit(Op::Jump(0));
+            self.patch(slow);
+            Some(exit)
+        } else {
+            None
+        };
         self.emit(Op::GetIter);
         self.emit(Op::StoreLocal(next));
         self.emit(Op::StoreLocal(iterator));
@@ -7808,6 +7849,9 @@ impl Compiler {
             _ => unreachable!(),
         }
         self.patch(after_pads);
+        if let Some(exit) = fast_exit {
+            self.patch(exit);
+        }
         Ok(())
     }
 
@@ -13725,6 +13769,24 @@ fn run_vm_inner<S: StoredValue>(
                     i.iterator_close_normal(&it)?;
                 }
             }
+            Op::TryArrayBinding(iterator, next, count) => {
+                let source = stack.last().expect("binding source").clone();
+                let old_source = slots.read_value(iterator as usize);
+                let old_next = slots.read_value(next as usize);
+                let captured =
+                    i.try_array_binding(&source, count as usize, &old_source, &old_next)?;
+                let matched = captured.is_some();
+                if let Some(captured) = captured {
+                    slots.write_value(next as usize, captured);
+                    slots.write_value(iterator as usize, source);
+                }
+                stack.push(Value::Bool(matched));
+            }
+            Op::ArrayBindingStep(iterator, next, index) => {
+                let source = slots.read_value(iterator as usize);
+                let next = slots.read_value(next as usize);
+                stack.push(i.array_binding_step(&source, &next, index as usize)?);
+            }
             Op::AssignTarget(target) => {
                 let value = pop!();
                 assign_target_with_slots(
@@ -18069,6 +18131,8 @@ impl Chunk {
             Op::AppendProp(..) => (3, 0),
             Op::DestructureGuard => (1, 1),
             Op::DestructureArr(n) => (1, *n as usize),
+            Op::TryArrayBinding(..) => (1, 2),
+            Op::ArrayBindingStep(..) => (0, 1),
             Op::AssignTarget(_) => (1, 0),
             Op::EvalExpr(_) => (0, 1),
             Op::ClassStart(_, count) => (*count as usize * 2, 0),
@@ -21262,6 +21326,26 @@ unsafe fn jit_exec_inner(
             if !done {
                 i.iterator_close_normal(&it)?;
             }
+        }
+        Op::TryArrayBinding(iterator, next, count) => {
+            let source = (*sp.sub(1)).unpack();
+            let old_source = slots.read_value(iterator as usize);
+            let old_next = slots.read_value(next as usize);
+            let captured = i.try_array_binding(&source, count as usize, &old_source, &old_next)?;
+            let matched = captured.is_some();
+            if let Some(captured) = captured {
+                #[cfg(test)]
+                crate::array_binding::TEST_JIT_ARRAY_BINDING_OPENS
+                    .with(|count| count.set(count.get() + 1));
+                slots.write_value(next as usize, captured);
+                slots.write_value(iterator as usize, source);
+            }
+            push!(Value::Bool(matched));
+        }
+        Op::ArrayBindingStep(iterator, next, index) => {
+            let source = slots.read_value(iterator as usize);
+            let next = slots.read_value(next as usize);
+            push!(i.array_binding_step(&source, &next, index as usize)?);
         }
         Op::AssignTarget(target) => {
             let value = pop!();

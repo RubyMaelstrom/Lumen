@@ -5437,6 +5437,74 @@ pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> boo
     })
 }
 
+/// Closed, non-exhausting Array binding prefix. No lookup here may invoke author code.
+/// The caller preserves the captured next owner and native call boundaries, and only uses
+/// this proof between fresh lexical initializations (no defaults or old binding destructors).
+pub(crate) fn dense_array_binding_methods(
+    i: &Interp,
+    value: &Value,
+    count: usize,
+) -> Option<(Value, Value)> {
+    let object = value.as_obj()?;
+    if count > 8
+        || !array_iterator_fast_path_is_safe(i, value)
+        || !i.ordinary_get_ptr(Rc::as_ptr(&i.array_proto) as usize)
+        || i.array_length(object) < count
+    {
+        return None;
+    }
+    {
+        let object = object.borrow();
+        for index in 0..count {
+            if object.props.get_index(index as u32)?.accessor() {
+                return None;
+            }
+        }
+    }
+    let key = Interp::sym_key(i.iterator_sym.as_ref()?);
+    let method = i.array_proto.borrow().props.get(&key)?.value();
+    let prototype = i.extra_protos.get("%ArrayIteratorPrototype%")?;
+    if !i.ordinary_get_ptr(Rc::as_ptr(prototype) as usize) {
+        return None;
+    }
+    let next = prototype
+        .borrow()
+        .props
+        .get("next")
+        .filter(|property| !property.accessor())?
+        .value();
+    for function in [&method, &next] {
+        let function = function.as_obj()?;
+        if !i.ordinary_get_ptr(Rc::as_ptr(function) as usize)
+            || !i.native_call_in_current_realm(function)
+        {
+            return None;
+        }
+    }
+    // IteratorClose reads return at the end. With no observers in the admitted prefix,
+    // absence (or a nullish plain value) remains valid; a getter or proxy must run normally.
+    let mut current = Some(prototype.clone());
+    for _ in 0..64 {
+        let Some(object) = current else {
+            return Some((method, next));
+        };
+        if !i.ordinary_get_ptr(Rc::as_ptr(&object) as usize) {
+            return None;
+        }
+        let object = object.borrow();
+        if !matches!(object.exotic, Exotic::None) {
+            return None;
+        }
+        if let Some(property) = object.props.get("return") {
+            return (!property.accessor()
+                && matches!(property.value(), Value::Undefined | Value::Null))
+            .then_some((method, next));
+        }
+        current = object.proto.clone();
+    }
+    None
+}
+
 /// Snapshot an Array whose current iteration cannot execute ECMAScript code: every index below
 /// `length` is an own plain data property. Callers separately prove that the selected iterator is
 /// the intrinsic Array iterator. Holes and accessors deliberately miss so prototype lookup and
