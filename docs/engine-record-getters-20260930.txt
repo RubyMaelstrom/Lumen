@@ -1,0 +1,77 @@
+Closed numeric record getters — 30 September 2026
+================================================
+
+The complete EJS solver contains Meriyah's tokenStart/currentLocation getters,
+which return fresh three-field position records from receiver Number fields.
+The prior bounded solver trace records 2,318,159 MakeObject operations at a
+getter's first local-name label. Association with this source family is an
+inference from that trace and source inspection, not a new timing profile.
+
+After resolving and rooting the live getter and releasing descriptor borrows,
+the ordinary JIT property path can finish a closed, synchronous, same-realm
+getter directly. Its entire compiled body must be one to eight GetPropThis
+operations, one templated MakeObject and Return. Parameters, local slots,
+prepared bodies, arrows, generators, async functions and detailed feedback
+are excluded. A OnceCell stores the whole-body proof; negative proofs allocate
+no Box. Every entry validates an ordinary receiver and each live descriptor
+and Number value. Field IC shape/slot facts accelerate lookup, never prove
+immutable contents. Strings, inherited fields, accessors, proxies, replacement
+getters and unsupported bodies fall back before any getter-body effect.
+
+Only that closed non-observing body omits a logical function frame. The returned
+record remains a newly allocated canonical ordinary object, with current-realm
+prototype, independent fields and default literal descriptors. Due GC polls,
+allocation pressure, stack exhaustion and pending tail work retain normal
+Call. Successful specialization increments call depth and GC cadence and polls
+interrupts; there is no collection inside the proven numeric reads/allocation.
+The caller/receiver owners remain rooted. No broad AST inline admission or
+object/value representation changes. Unsupported bodies reject their cached
+negative proof before chunk-owner, receiver and resource-boundary work.
+
+Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:13388 and :13860.
+OrdinaryGet selects the live descriptor/getter and calls with the original
+receiver; PrepareForOrdinaryCall defines the execution context. The closed
+proof permits no author observer of an omitted frame. Guard misses preserve
+full calls, including Lumen's caller/Error.stack observations. Official clauses:
+https://tc39.es/ecma262/#sec-ordinaryget
+https://tc39.es/ecma262/#sec-prepareforordinarycall
+https://tc39.es/ecma262/#sec-ordinarycallbindthis
+The consulted local snapshot was not verified against current upstream text.
+
+Three new cross-tier regressions cover actual specialized execution, fresh
+records, live Number/signed-zero values, descriptor/getter replacement, GC,
+due polling, throwing/coercing field observers, caller/error-stack frames,
+proxy ordering, foreign-realm result prototypes, promises and class-constructor
+getters. All 1,590 engine library tests, strict engine all-target Clippy and
+optional optimizing-jit all-target compilation pass after the early-rejection
+rework. No fresh workspace-wide, Test262, x64/wasm or optional-backend execution
+is claimed. The common Rust path is compiled on this native ARM64 machine.
+
+Initial four-pair timing improved solver time 2.53% but slowed Vue reactivity
+1.94%. Its source/binaries/full observations remain in engine-cycle17-20260930.
+The early-rejection rework is frozen separately in engine-cycle17-v3-20260930.
+Four balanced fresh-process pairs on crystal ARM64 CPU5, ordinary release JIT,
+default Intl, opt3/fat LTO/codegen-units1/panic-abort and cleared runtime switches
+report React reducer 116 ->116ms (paired interval .98092–1.01512), Djot
+291 ->292ms (+0.34%; .97921–1.04738), complete solver process time
+8526.69 ->8342.76ms (2.16% lower; .97402–.98340), and Vue reactivity
+747.5 ->756ms (+1.14%; 1.00122–1.02231). Vue's measured slowdown excludes
+parity but is below the combined 3% median-loss gate. Djot user CPU is 1.73%
+higher with interval 1.00668–1.03075, also below that gate. All primary outputs
+match exactly, including a single Node reference per workload. React/Djot/Vue
+are scoped drivers, not full browser results. This remains a small solver gain;
+the reported general 8–10x Node gap is not closed.
+
+Separate four balanced Linux wait4 peak pairs report React 22,678 ->23,172
+KiB (+2.18%; .94681–1.08826), Djot 54,716 ->55,358 KiB (+1.17%;
+.97998–1.03706), solver 636,766 ->641,876 KiB (+0.80%; .99883–1.01548)
+and Vue 44,056 ->44,078 KiB (+0.05%; .97837–1.01504). Every peak interval
+spans parity. No peak or post-GC retained-memory benefit is claimed; no timing
+or peak component crosses the combined regression gate.
+
+The revised release build takes 3m30s and adds 8,408 binary bytes. Full source,
+patch, artifacts, outputs, distributions and validation logs remain under the
+two evidence directories above. No owned build/test/profile overlaps timing or
+peak comparisons. Subsequent dispatch changes are isolated from measured and
+staged getter sources. Installed/accepted artifacts remain unchanged.

@@ -49,6 +49,116 @@ fn check(source: &str, expected: &str) {
 }
 
 #[test]
+fn record_getter_specialization_returns_fresh_live_records() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let before = property_read::TEST_RECORD_GETTERS.with(Cell::get);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            function position(){return {index:this.index,line:this.line,column:this.column}}
+            function read(s){return s.state}
+            var source={index:4,line:8,column:-0},ok=true;
+            Object.defineProperty(source,'state',{get:position,configurable:true});
+            for(var n=0;n<160;n++){var r=read(source);ok=ok&&r.index===4&&r.line===8&&Object.is(r.column,-0)}
+            var a=read(source),b=read(source);a.index=99;source.index=7;
+            ok&&a!==b&&b.index===4&&read(source).index===7&&Object.getPrototypeOf(a)===Object.prototype
+        "#
+            ),
+            "true",
+            "{tier:?}"
+        );
+        let entries = property_read::TEST_RECORD_GETTERS.with(Cell::get) - before;
+        if tier == Tier::Jit {
+            assert!(
+                entries > 100,
+                "warm closed getters execute their structural plan"
+            );
+        } else {
+            assert_eq!(entries, 0);
+        }
+        engine.interp.gc_collect();
+        assert_eq!(evaluate(&mut engine, "read(source).index"), "7");
+        if tier == Tier::Jit {
+            let env = engine.interp.global_env.clone();
+            let source = engine
+                .interp
+                .get_var("source", &env)
+                .unwrap_or_else(|_| panic!("source binding"));
+            let before = property_read::TEST_RECORD_GETTERS.with(Cell::get);
+            engine.interp.gc_tick = GC_CALL_POLL_MASK;
+            let value = engine
+                .interp
+                .get_prop_ic(&source, "state", &Cell::new(IcState::EMPTY))
+                .unwrap_or_else(|_| panic!("maintenance getter"));
+            assert!(matches!(
+                engine.interp.get_member(&value, "index"),
+                Ok(Value::Num(7.))
+            ));
+            assert_eq!(
+                property_read::TEST_RECORD_GETTERS.with(Cell::get),
+                before,
+                "a due collection/metadata poll retains the ordinary Call boundary"
+            );
+        }
+        assert!(engine.interp.fn_frames.is_empty());
+    }
+}
+
+#[test]
+fn record_getter_guard_misses_preserve_observer_frames_and_changes() {
+    check(
+        r#"
+        function position(){return {index:this.index,line:this.line,column:this.column}}
+        function read(s){return s.state}
+        var source={index:4,line:8,column:9},trace='',caller=false,frames=false;
+        Object.defineProperty(source,'state',{get:position,configurable:true});
+        for(var warm=0;warm<160;warm++)read(source);
+        source.line='wide';var nonNumber=read(source).line;
+        Object.defineProperty(source,'line',{get:function lineObserver(){
+            trace+='l';caller=position.caller===read;
+            var stack=new Error().stack;frames=stack.includes('position')&&stack.includes('read')&&stack.includes('lineObserver');
+            return 21;
+        },configurable:true});
+        var observed=read(source).line;
+        Object.defineProperty(source,'column',{get(){trace+='c';throw new Error('bad')},configurable:true});
+        var thrown='';try{read(source)}catch(e){thrown=e.message}
+        Object.defineProperty(source,'state',{get(){trace+='r';return {index:42}}});
+        var replaced=read(source).index;
+        [nonNumber,observed,caller,frames,trace,thrown,replaced].join('|')
+    "#,
+        "wide|21|true|true|llcr|bad|42",
+    );
+}
+
+#[test]
+fn record_getter_specialization_retains_foreign_async_class_and_proxy_calls() {
+    check(
+        r#"
+        function position(){return {index:this.index}}
+        function read(s){return s.state}
+        var source={index:12};Object.defineProperty(source,'state',{get:position,configurable:true});
+        for(var warm=0;warm<160;warm++)read(source);
+        var trace='',proxy=new Proxy(source,{get(t,k,r){trace+=k+',';return Reflect.get(t,k,r)}});
+        var proxied=read(proxy).index;
+        var other=$262.createRealm(),foreign=other.evalScript('(function(){return {index:this.index}})');
+        Object.defineProperty(source,'state',{get:foreign,configurable:true});
+        for(var warm=0;warm<160;warm++)read(source);
+        var result=read(source),foreignProto=Object.getPrototypeOf(result)===other.global.Object.prototype;
+        Object.defineProperty(source,'state',{get:async function(){return {index:this.index}},configurable:true});
+        var promised=read(source) instanceof Promise;
+        Object.defineProperty(source,'state',{get:class Invalid{constructor(){return {index:this.index}}}});
+        var classError=false;try{read(source)}catch(e){classError=e instanceof TypeError}
+        [proxied,trace,result.index,foreignProto,promised,classError].join('|')
+    "#,
+        "12|state,index,|12|true|true|true",
+    );
+}
+
+#[test]
 fn getter_cache_owned_snapshot_stays_two_words_and_retains_exactly_one_owner() {
     assert_eq!(std::mem::size_of::<CachedGet>(), 16);
     assert_eq!(std::mem::size_of::<Option<CachedGet>>(), 16);

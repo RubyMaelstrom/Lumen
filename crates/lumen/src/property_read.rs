@@ -137,7 +137,89 @@ impl Interp {
         if read.kind == ReadKind::MissingGetter {
             Ok(Value::Undefined)
         } else {
-            self.call_callback(read.value.into_value(), receiver.clone(), &[])
+            let getter = read.value.into_value();
+            if let Some(result) = self.try_record_getter(&getter, receiver) {
+                return result;
+            }
+            self.call_callback(getter, receiver.clone(), &[])
         }
     }
+
+    /// Resolve the live getter first, then prove its complete body and every
+    /// receiver field. No observer can see an omitted logical frame on a hit;
+    /// getters, proxies, conversions, throws and all other bodies keep Call.
+    fn try_record_getter(
+        &mut self,
+        getter: &Value,
+        receiver: &Value,
+    ) -> Option<Result<Value, Abrupt>> {
+        use crate::interpreter::{
+            execution_stack_exhausted, with_execution_stack, GC_CALL_POLL_MASK,
+        };
+        use crate::value::{Callable, Exotic};
+        use std::rc::Rc;
+        if self.tier != crate::bytecode::Tier::Jit || self.pending_tail.is_some() {
+            return None;
+        }
+        let getter = getter.as_obj()?;
+        let receiver = receiver.as_obj()?;
+        let key = Rc::as_ptr(getter) as usize;
+        if !self.ordinary_get_ptr(key) {
+            return None;
+        }
+        let chunk = {
+            let getter = getter.borrow();
+            let Callable::User(user) = &getter.call else {
+                return None;
+            };
+            let f = &user.func;
+            if user.realm != Rc::as_ptr(&self.global) as usize
+                || !f.params.is_empty()
+                || f.is_arrow
+                || f.is_async
+                || f.is_generator
+            {
+                return None;
+            }
+            let chunk = f.code.get()?.as_ref()?;
+            // Most getters have another body. Reject the cached negative proof
+            // before acquiring a chunk owner or inspecting call/receiver state.
+            if !chunk.is_record_getter() {
+                return None;
+            }
+            chunk.clone()
+        };
+        if !self.ordinary_get_ptr(Rc::as_ptr(receiver) as usize)
+            || (!self.class_info.is_empty() && self.class_info.contains_key(&key))
+            || self.gc_tick.wrapping_add(1) & GC_CALL_POLL_MASK == 0
+            || crate::value::heap_live_objects(&self.gc_heap) > self.gc_next
+            || execution_stack_exhausted(self.depth + 1)
+        {
+            return None;
+        }
+        let values = {
+            let receiver = receiver.borrow();
+            if !receiver.ic_plain.get() || !matches!(receiver.exotic, Exotic::None) {
+                return None;
+            }
+            chunk.record_getter_values(&receiver.props)?
+        };
+        self.depth += 1;
+        self.gc_tick = self.gc_tick.wrapping_add(1);
+        let result = with_execution_stack(self.depth, || {
+            self.interrupt_poll_force()?;
+            #[cfg(test)]
+            TEST_RECORD_GETTERS.with(|count| count.set(count.get() + 1));
+            Ok(chunk.make_record_getter_result(self, values))
+        });
+        self.depth -= 1;
+        Some(result)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_RECORD_GETTERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }

@@ -1923,6 +1923,8 @@ pub struct Chunk {
     /// operand indexes this; `u32::MAX` = duplicate keys, take the insert path). Built on first
     /// execution, cloned per instance — key hashing and shape transitions paid once per SITE.
     obj_maps: Vec<std::cell::OnceCell<crate::value::Props>>,
+    /// A bounded structural plan, never a receiver/descriptor/value snapshot.
+    record_getter: std::cell::OnceCell<Option<Box<RecordGetterPlan>>>,
     /// One [`NameIc`] slot per free-name op (`LoadName`/`LoadNameForCall`), persisting across
     /// calls like `caches`.
     name_caches: Vec<std::cell::Cell<NameIc>>,
@@ -2015,7 +2017,109 @@ pub struct Chunk {
 #[cfg(feature = "optimizing-jit")]
 pub(crate) const SPECIALIZATION_MISS_LIMIT: u8 = 8;
 
+pub(crate) struct RecordGetterPlan {
+    fields: [(u32, u32); 8],
+    count: usize,
+    start: u32,
+    template: u32,
+}
+
 impl Chunk {
+    /// A whole getter body with no effect except reading Number-valued own data
+    /// fields and creating its returned record. A miss precedes every JS effect.
+    fn record_getter_plan(&self) -> Option<&RecordGetterPlan> {
+        self.record_getter
+            .get_or_init(|| {
+                if self.prepared_entry || self.n_params != 0 || self.n_slots != 0 {
+                    return None;
+                }
+                let count = self
+                    .ops
+                    .iter()
+                    .take_while(|op| matches!(op, Op::GetPropThis(..)))
+                    .count();
+                if !(1..=8).contains(&count) {
+                    return None;
+                }
+                let (start, template) = match &self.ops[count..] {
+                    [Op::MakeObject(start, fields, template), Op::Return, Op::ReturnUndef]
+                    | [Op::MakeObject(start, fields, template), Op::Return]
+                        if *fields as usize == count && *template != u32::MAX =>
+                    {
+                        (*start, *template)
+                    }
+                    _ => return None,
+                };
+                let mut fields = [(0, 0); 8];
+                for (slot, op) in self.ops[..count].iter().enumerate() {
+                    let Op::GetPropThis(name, cache) = op else {
+                        unreachable!()
+                    };
+                    fields[slot] = (*name, *cache);
+                }
+                Some(Box::new(RecordGetterPlan {
+                    fields,
+                    count,
+                    start,
+                    template,
+                }))
+            })
+            .as_deref()
+    }
+
+    pub(crate) fn is_record_getter(&self) -> bool {
+        self.record_getter_plan().is_some() && !self.feedback.detailed_enabled()
+    }
+
+    pub(crate) fn record_getter_values(&self, receiver: &crate::value::Props) -> Option<[f64; 8]> {
+        let plan = self.record_getter_plan()?;
+        if self.feedback.detailed_enabled() {
+            return None;
+        }
+        let mut values = [0.; 8];
+        for (slot, (name, cache)) in plan.fields[..plan.count].iter().enumerate() {
+            let name = &self.names[*name as usize];
+            if Interp::is_sym_key(name) || Interp::is_private_key(name) {
+                return None;
+            }
+            let ic = self.caches[*cache as usize].get();
+            let property = if ic.depth == 0
+                && crate::value::is_cacheable_shape(ic.recv_shape)
+                && ic.recv_shape == receiver.shape()
+            {
+                receiver.entry_at(ic.slot as usize)?.1
+            } else {
+                receiver.get(name)?
+            };
+            // Shape proves the slot/key only. The live descriptor and value must
+            // still be data/Number on every access, including after defineProperty.
+            values[slot] = property.number_value()?;
+        }
+        Some(values)
+    }
+
+    /// The preceding proof initialized exactly the plan's Number prefix. The
+    /// raw constructor consumes those owners once; unused MaybeUninit slots own nothing.
+    pub(crate) fn make_record_getter_result(&self, i: &mut Interp, values: [f64; 8]) -> Value {
+        let plan = self
+            .record_getter
+            .get()
+            .and_then(Option::as_deref)
+            .expect("record getter proof");
+        let mut packed = [const { std::mem::MaybeUninit::<PackedValue>::uninit() }; 8];
+        for slot in 0..plan.count {
+            packed[slot].write(PackedValue::pack(Value::Num(values[slot])));
+        }
+        unsafe {
+            i.make_plain_object_templated_from(
+                &self.obj_maps[plan.template as usize],
+                &self.names[plan.start as usize..plan.start as usize + plan.count],
+                packed.as_ptr().cast(),
+                plan.count,
+            )
+        }
+    }
+
     pub(crate) fn has_tail_calls(&self) -> bool {
         self.has_tail_calls
     }
@@ -2066,6 +2170,9 @@ impl Chunk {
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
+        if matches!(self.record_getter.get(), Some(Some(_))) {
+            bytes = bytes.saturating_add(std::mem::size_of::<RecordGetterPlan>());
+        }
         if let Some(plan) = self.activation_plan.get() {
             bytes = bytes.saturating_add(plan.scan_retained_memory(visitor));
         }
@@ -6205,6 +6312,7 @@ fn finish_chunk(
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),
+        record_getter: std::cell::OnceCell::new(),
         caches: c.caches,
         name_pins: std::cell::RefCell::new(c.name_pins),
         name_caches: c.name_caches,
