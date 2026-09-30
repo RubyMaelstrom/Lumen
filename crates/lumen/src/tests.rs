@@ -1550,6 +1550,216 @@ fn interruption_aborts_a_running_microtask_checkpoint() {
     );
 }
 
+/// HTML's microtask checkpoint runs until the queue is empty. A long await chain must settle
+/// instead of being truncated by an engine-side job budget.
+#[test]
+fn microtask_checkpoint_drains_long_await_chains_to_completion() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let completion = engine
+            .eval(
+                r#"
+                var settled = "pending";
+                async function chain(n) { var s = 0; for (var i = 0; i < n; i++) s += await i; return s; }
+                chain(250000).then(function (s) { settled = s; }, function (e) { settled = "rejected"; });
+                "#,
+                false,
+            )
+            .expect("parse");
+        assert!(matches!(completion, Completion::Value(_)));
+        assert_eq!(
+            match engine.eval("String(settled)", false).expect("parse") {
+                Completion::Value(value) => value,
+                Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+            },
+            "31249875000",
+            "{tier:?}"
+        );
+    }
+}
+
+/// Without a job budget, an endlessly self-re-enqueueing microtask loop must still be
+/// stoppable by the host, and the interrupted checkpoint discards the remaining jobs.
+#[test]
+fn interruption_stops_an_endless_microtask_chain() {
+    let mut engine = Engine::new();
+    let interrupt = engine.interrupt_handle();
+    interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(50),
+    ));
+    let started = std::time::Instant::now();
+    let outcome = engine
+        .eval_interruptible(
+            "var turns = 0; (function again() { turns++; Promise.resolve().then(again); })();",
+            false,
+        )
+        .expect("script parses");
+    assert!(matches!(
+        outcome,
+        ExecutionOutcome::Interrupted {
+            reason: InterruptReason::DeadlineExceeded
+        }
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    interrupt.set_deadline(None);
+    assert!(engine.interp.microtasks.is_empty());
+    match engine.eval("String(turns > 1)", false).expect("parse") {
+        Completion::Value(value) => assert_eq!(value, "true"),
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}
+
+/// ECMA-262 Await: the resumption job runs in FIFO order with other reactions, a rejected await
+/// throws at the await site, and an awaited thenable is adopted through its `then`.
+#[test]
+fn await_resumption_order_and_completions_follow_the_specification() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine
+            .eval(
+                r#"
+                var log = [];
+                async function a() { log.push("a1"); await undefined; log.push("a2"); await null; log.push("a3"); }
+                async function b() {
+                    try { await Promise.reject(new Error("boom")); } catch (e) { log.push("caught:" + e.message); }
+                    var v = await { then(r) { log.push("thenable"); r(7); } };
+                    log.push("v" + v);
+                    return "done";
+                }
+                a();
+                Promise.resolve().then(function () { log.push("p1"); }).then(function () { log.push("p2"); });
+                b().then(function (r) { log.push(r); });
+                log.push("sync");
+                "#,
+                false,
+            )
+            .expect("parse");
+        assert_eq!(
+            match engine.eval("log.join(',')", false).expect("parse") {
+                Completion::Value(value) => value,
+                Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+            },
+            "a1,sync,a2,p1,caught:boom,a3,p2,thenable,v7,done",
+            "{tier:?}"
+        );
+    }
+}
+
+/// Await's reaction steps are unobservable built-ins with no result capability. Suspending on an
+/// already-settled value allocates only the PromiseResolve wrapper, not reaction functions or a
+/// dependent promise.
+#[test]
+fn await_allocates_no_reaction_functions_or_result_promise() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "async function spin(n) { for (var i = 0; i < n; i++) await i; } spin(64);",
+            false,
+        )
+        .expect("parse");
+    let before = crate::value::heap_allocated_objects(&engine.interp.gc_heap);
+    engine.eval("spin(4000);", false).expect("parse");
+    let per_await =
+        (crate::value::heap_allocated_objects(&engine.interp.gc_heap) - before) as f64 / 4000.0;
+    assert!(per_await < 1.5, "{per_await} objects allocated per await");
+}
+
+/// The live-object ceiling is an engine setting: retention below it succeeds, retention above it
+/// still throws a catchable RangeError after a full collection, and the default never falls
+/// below the former fixed ceiling.
+#[test]
+fn live_object_limit_is_configurable_and_enforced() {
+    assert!(Engine::new().live_object_limit() >= crate::interpreter::MIN_LIVE_OBJECT_LIMIT as u64);
+    let retain = |limit: u64, count: u32| {
+        let mut engine = Engine::new();
+        engine.set_live_object_limit(limit);
+        let source = format!(
+            "var kept = [], outcome = 'ok'; try {{ for (var i = 0; i < {count}; i++) kept.push({{ i: i }}); }} \
+             catch (e) {{ outcome = e instanceof RangeError ? 'range:' + e.message : 'other'; }} kept = null; outcome"
+        );
+        match engine.eval(&source, false).expect("parse") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+        }
+    };
+    assert_eq!(retain(150_000, 140_000), "ok");
+    assert_eq!(retain(150_000, 250_000), "range:allocation limit exceeded");
+}
+
+/// Releasing the last reference to a long object chain must not recurse once per link. Each case
+/// runs on a deliberately small native stack, where per-link recursion overflowed at a few
+/// thousand links; the chains here are two orders of magnitude longer.
+#[test]
+fn releasing_long_object_chains_uses_bounded_native_stack() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "linked list",
+            "var h = null; for (var i = 0; i < 200000; i++) h = { next: h, v: i }; h = null;",
+        ),
+        (
+            "closure chain",
+            "var f = null; for (var i = 0; i < 100000; i++) f = (function (g) { return function () { return g; }; })(f); f = null;",
+        ),
+        (
+            "nested arrays",
+            "var a = []; for (var i = 0; i < 200000; i++) a = [a]; a = null;",
+        ),
+        (
+            "bound argument chain",
+            "var b = null; function f(x) { return x; } for (var i = 0; i < 100000; i++) b = f.bind(null, b); b = null;",
+        ),
+        (
+            "bound target chain",
+            "function C() { this.k = 1; } var b = C; for (var i = 0; i < 3000; i++) b = b.bind(null); if (new b().k !== 1) throw new Error('bound construct'); b = null;",
+        ),
+        (
+            "prototype chain",
+            "var p = {}; for (var i = 0; i < 100000; i++) p = Object.create(p); p = null;",
+        ),
+        (
+            "collected cycle",
+            "var c = { self: null }; c.self = c; for (var i = 0; i < 200000; i++) c = { next: c }; c = null;",
+        ),
+    ];
+    for &(name, source) in cases {
+        let source = source.to_owned();
+        let outcome = std::thread::Builder::new()
+            .name(format!("drop-{name}"))
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let mut engine = Engine::new();
+                let completion = engine.eval(&source, false).expect("parse");
+                if let Completion::Throw {
+                    name: error,
+                    message,
+                } = completion
+                {
+                    panic!("{name}: threw {error}: {message}");
+                }
+                engine.interp.gc_collect();
+                // The engine is still usable afterwards.
+                match engine.eval("String(1 + 1)", false).expect("parse") {
+                    Completion::Value(value) => assert_eq!(value, "2"),
+                    Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+                }
+            })
+            .expect("spawn")
+            .join();
+        assert!(outcome.is_ok(), "{name} panicked");
+    }
+}
+
 #[test]
 fn interruption_escapes_native_nested_evaluation_without_becoming_a_throw() {
     let mut engine = Engine::new();

@@ -2994,6 +2994,9 @@ pub struct Interp {
     pub(crate) generators: crate::fasthash::FastMap<usize, crate::coroutine::Coroutine>,
     /// Live-object count above which the next allocation safe point runs the cycle collector.
     pub(crate) gc_next: i64,
+    /// Live-object ceiling for this engine; see [`MIN_LIVE_OBJECT_LIMIT`]. Defaults to
+    /// [`default_live_object_limit`] and is configurable by the embedder.
+    pub(crate) live_object_limit: i64,
     /// Nonzero while an embedder performs an atomic bootstrap operation whose
     /// temporary VM values are still being published into a rooted object
     /// graph. Collection is deferred until the operation returns so active
@@ -3227,6 +3230,7 @@ interp_memory_inventory! {
     host_state => "external",
     generators => "measured",
     gc_next => "non_owning",
+    live_object_limit => "non_owning",
     gc_suppressed => "non_owning",
     gc_tick => "non_owning",
     gc_task_allocated => "non_owning",
@@ -3281,7 +3285,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 148);
+    assert_eq!(names.len(), 149);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3334,6 +3338,37 @@ pub struct Disposable {
 pub(crate) struct JobCallback {
     pub(crate) callback: Value,
     pub(crate) script_caller: Option<Gc>,
+    /// A reaction step the specification models as an unobservable built-in function. When set,
+    /// `callback` is not called; see [`InternalJob`].
+    pub(crate) internal: InternalJob,
+}
+
+/// Promise reaction steps that ECMA-262 defines as built-in functions no script can observe.
+/// Running them directly avoids allocating those function objects for every reaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InternalJob {
+    #[default]
+    None,
+    /// Await's onFulfilled (ECMA-262 `#await` steps 3-4, local snapshot e28783d5): resume the
+    /// suspended async function with a normal completion. The reaction's `callback` is that
+    /// function's result promise, which also keys its coroutine. `realm` is the Realm
+    /// CreateBuiltinFunction would have captured: the one running at the `await`.
+    AwaitFulfilled { realm: usize },
+    /// Await's onRejected (steps 5-6): resume the suspended async function with a throw
+    /// completion.
+    AwaitRejected { realm: usize },
+}
+
+impl InternalJob {
+    /// The Realm of the built-in function this step stands for.
+    pub(crate) fn realm(self) -> Option<usize> {
+        match self {
+            InternalJob::None => None,
+            InternalJob::AwaitFulfilled { realm } | InternalJob::AwaitRejected { realm } => {
+                Some(realm)
+            }
+        }
+    }
 }
 
 impl JobCallback {
@@ -3341,6 +3376,7 @@ impl JobCallback {
         Self {
             callback,
             script_caller: None,
+            internal: InternalJob::None,
         }
     }
 }
@@ -3539,10 +3575,33 @@ pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Live-object ceiling (≈ a few hundred MB). When a safe point sees this many *live* objects, the
+/// Smallest automatically derived live-object ceiling (the former fixed limit). When a safe point
+/// sees more *live* objects than the engine's ceiling (see [`Interp::live_object_limit`]), the
 /// cycle collector runs; if it can't get back under, a RangeError is thrown rather than exhausting
 /// RAM. This bounds genuine retention; transient cyclic garbage is reclaimed and doesn't count.
-pub const MAX_LIVE: i64 = 3_000_000;
+pub const MIN_LIVE_OBJECT_LIMIT: i64 = 3_000_000;
+/// Largest automatically derived ceiling. An embedder may configure a larger explicit value.
+const MAX_DEFAULT_LIVE_OBJECT_LIMIT: i64 = 1 << 28;
+/// Ceiling used where the platform cannot report its physical memory.
+const FALLBACK_LIVE_OBJECT_LIMIT: i64 = 16_000_000;
+/// Conservative retained cost of one ordinary object, including its property storage and
+/// collector bookkeeping, used only to translate a memory budget into an object ceiling.
+const ESTIMATED_LIVE_OBJECT_BYTES: u64 = 384;
+
+/// The default live-object ceiling: a quarter of the memory available to this process, as
+/// objects. Like other engines' default heap limits it scales with the machine instead of
+/// capping large applications at a fixed count; embedders override it per engine.
+pub(crate) fn default_live_object_limit() -> i64 {
+    static LIMIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| match crate::host_memory::physical_memory_bytes() {
+        Some(bytes) => {
+            let objects = bytes / 4 / ESTIMATED_LIVE_OBJECT_BYTES;
+            (objects.min(i64::MAX as u64) as i64)
+                .clamp(MIN_LIVE_OBJECT_LIMIT, MAX_DEFAULT_LIVE_OBJECT_LIMIT)
+        }
+        None => FALLBACK_LIVE_OBJECT_LIMIT,
+    })
+}
 
 /// Live-object count at which the collector first runs; the threshold then floats (see `gc_check`).
 pub const GC_TRIGGER: i64 = 100_000;
@@ -4158,6 +4217,7 @@ impl Interp {
             host_state: Default::default(),
             generators: Default::default(),
             gc_next: GC_TRIGGER,
+            live_object_limit: default_live_object_limit(),
             gc_suppressed: 0,
             gc_tick: 0,
             gc_task_allocated: crate::value::heap_allocated_objects(&gc_heap),
@@ -4979,6 +5039,35 @@ impl Interp {
         JobCallback {
             callback,
             script_caller,
+            internal: InternalJob::None,
+        }
+    }
+
+    /// HostMakeJobCallback for one of Await's built-in reaction steps (see [`InternalJob`]).
+    /// Those built-ins are callable, so the incumbent script caller is captured exactly as for
+    /// an author callback.
+    pub(crate) fn make_await_job_callback(
+        &self,
+        async_promise: Value,
+        fulfilled: bool,
+    ) -> JobCallback {
+        let script_caller = if self.capture_job_script_caller {
+            match self.script_caller_global() {
+                Value::Obj(global) => Some(global),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let realm = Rc::as_ptr(&self.global) as usize;
+        JobCallback {
+            callback: async_promise,
+            script_caller,
+            internal: if fulfilled {
+                InternalJob::AwaitFulfilled { realm }
+            } else {
+                InternalJob::AwaitRejected { realm }
+            },
         }
     }
 
@@ -5106,7 +5195,7 @@ impl Interp {
         let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
         let live = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_next = crate::gc_generational::next_threshold(live);
+        self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
         self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         before.saturating_sub(live)
     }
@@ -8922,7 +9011,8 @@ impl Interp {
     // ----- garbage collection -----------------------------------------------------------------
 
     /// Allocation safe point. When live objects pass the floating threshold, run the cycle
-    /// collector; if genuine retention still exceeds `MAX_LIVE`, throw rather than exhaust RAM.
+    /// collector; if genuine retention still exceeds the engine's live-object ceiling, throw
+    /// rather than exhaust RAM.
     /// The cached UTF-16 view of `s` (see [`StrUnits`]): first access per string is O(len),
     /// every later one O(1) — pointer-compared against a small LRU. Short strings skip the
     /// cache entirely (the O(len) walk is trivial; caching them would just churn the LRU under
@@ -9127,11 +9217,11 @@ impl Interp {
                 self.generators.len()
             );
         }
-        if live > MAX_LIVE {
+        if live > self.live_object_limit {
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
-        // Re-arm: collect again once live doubles, clamped to [GC_TRIGGER, MAX_LIVE].
-        self.gc_next = crate::gc_generational::next_threshold(live);
+        // Re-arm: collect again once live grows, clamped to [GC_TRIGGER, live_object_limit].
+        self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
         Ok(())
     }
 
@@ -9190,7 +9280,7 @@ impl Interp {
                 self.generators.len()
             );
         }
-        self.gc_next = crate::gc_generational::next_threshold(live);
+        self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
         before.saturating_sub(live)
     }
 
@@ -9622,7 +9712,7 @@ impl Interp {
         // usually visits only newly allocated objects, with bounded major-collection debt.
         if matches!(cause, crate::value::GcCause::AllocationThreshold)
             && crate::gc_generational::enabled()
-            && crate::value::heap_live_objects(&self.gc_heap) < MAX_LIVE
+            && crate::value::heap_live_objects(&self.gc_heap) < self.live_object_limit
             && !crate::value::gc_major_due(&self.gc_heap, GC_TRIGGER)
         {
             self.gc_collect_young(cause);
@@ -13634,9 +13724,7 @@ impl Interp {
                         return self.drive_async(key, promise, crate::coroutine::Resume::Throw(e))
                     }
                 };
-                let on_f = self.make_async_reaction(&promise, true);
-                let on_r = self.make_async_reaction(&promise, false);
-                self.promise_then(&px, on_f, on_r);
+                self.perform_await_then(&px, &promise);
             }
             Suspend::Yield(v) => self.resolve_promise(&promise, v),
             Suspend::Done(v) => self.resolve_promise(&promise, v),
@@ -13846,22 +13934,6 @@ impl Interp {
         let p = self.new_promise();
         self.resolve_promise(&p, v);
         Ok(p)
-    }
-
-    /// A bound reaction that re-drives the async coroutine when the awaited promise settles.
-    fn make_async_reaction(&mut self, promise: &Value, fulfil: bool) -> Value {
-        let target = self.make_native(
-            "",
-            1,
-            if fulfil {
-                crate::builtins::async_react_fulfil
-            } else {
-                crate::builtins::async_react_reject
-            },
-        );
-        let bound = Object::new(Some(self.function_proto.clone()));
-        bound.borrow_mut().call = Callable::bound(target, promise.clone(), vec![promise.clone()]);
-        Value::Obj(bound)
     }
 
     fn bind_params(&mut self, params: &[Param], args: &[Value], scope: &Env) -> Result<(), Abrupt> {

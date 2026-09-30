@@ -4147,7 +4147,7 @@ impl Interp {
         }
         for (on_f, on_r, result, host_context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
-            let (realm, host_context) = self.promise_job_target(&handler.callback, host_context);
+            let (realm, host_context) = self.reaction_job_target(&handler, host_context);
             self.microtasks.push_back(Job {
                 handler,
                 result,
@@ -4175,15 +4175,42 @@ impl Interp {
         on_r: Value,
         result: Value,
     ) {
+        if !matches!(promise, Value::Obj(_)) {
+            return;
+        }
+        // HostMakeJobCallback runs at registration, not settlement or job execution.
+        let on_f = self.make_job_callback(on_f);
+        let on_r = self.make_job_callback(on_r);
+        self.perform_promise_then(promise, on_f, on_r, result);
+    }
+
+    /// ECMA-262 Await steps 3-7: PerformPromiseThen(promise, onFulfilled, onRejected) with the
+    /// two unobservable built-in resumption steps and no result capability. `async_promise` is the
+    /// suspended async function's result promise (its coroutine key).
+    pub(crate) fn perform_await_then(&mut self, promise: &Value, async_promise: &Value) {
+        if !matches!(promise, Value::Obj(_)) {
+            return;
+        }
+        let on_f = self.make_await_job_callback(async_promise.clone(), true);
+        let on_r = self.make_await_job_callback(async_promise.clone(), false);
+        self.perform_promise_then(promise, on_f, on_r, Value::Undefined);
+    }
+
+    /// PerformPromiseThen (ECMA-262 `#sec-performpromisethen`) for already-made JobCallbacks.
+    /// `result` is the capability's promise, or `undefined` when there is no capability.
+    fn perform_promise_then(
+        &mut self,
+        promise: &Value,
+        on_f: crate::interpreter::JobCallback,
+        on_r: crate::interpreter::JobCallback,
+        result: Value,
+    ) {
         let ptr = match promise {
             Value::Obj(o) => Rc::as_ptr(o) as usize,
             _ => return,
         };
         let status = self.promises.get(&ptr).map(|s| s.status).unwrap_or(0);
         let host_context = self.host_job_context;
-        // HostMakeJobCallback runs at registration, not settlement or job execution.
-        let on_f = self.make_job_callback(on_f);
-        let on_r = self.make_job_callback(on_r);
         // Attaching a handler marks the rejection handled (HostPromiseRejectionTracker "handle").
         self.unhandled_rejections.remove(&ptr);
         match status {
@@ -4194,7 +4221,7 @@ impl Interp {
             }
             1 => {
                 let v = self.promises[&ptr].value.clone();
-                let (realm, host_context) = self.promise_job_target(&on_f.callback, host_context);
+                let (realm, host_context) = self.reaction_job_target(&on_f, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_f,
                     result: result.clone(),
@@ -4206,7 +4233,7 @@ impl Interp {
             }
             _ => {
                 let v = self.promises[&ptr].value.clone();
-                let (realm, host_context) = self.promise_job_target(&on_r.callback, host_context);
+                let (realm, host_context) = self.reaction_job_target(&on_r, host_context);
                 self.microtasks.push_back(Job {
                     handler: on_r,
                     result: result.clone(),
@@ -4217,6 +4244,26 @@ impl Interp {
                 });
             }
         }
+    }
+
+    /// HostEnqueuePromiseJob's Realm/settings for a reaction handler. An internal step stands for
+    /// a built-in function whose Realm was fixed when it was created.
+    fn reaction_job_target(
+        &mut self,
+        handler: &crate::interpreter::JobCallback,
+        same_realm_context: u64,
+    ) -> (Option<usize>, u64) {
+        let Some(realm) = handler.internal.realm() else {
+            return self.promise_job_target(&handler.callback, same_realm_context);
+        };
+        let host_context = if realm == Rc::as_ptr(&self.global) as usize {
+            same_realm_context
+        } else {
+            self.realms
+                .get(&realm)
+                .map_or(same_realm_context, |state| state.host_job_context)
+        };
+        (Some(realm), host_context)
     }
 
     /// Return the Realm/settings pair passed conceptually to HostEnqueuePromiseJob.
@@ -4313,8 +4360,12 @@ impl Interp {
         let _ = self.drain_microtasks_interruptible();
     }
 
+    /// HTML "perform a microtask checkpoint" (local snapshot e5071a20, `source`:123479): run
+    /// jobs *while the queue is not empty*. There is deliberately no job budget — discarding
+    /// queued PromiseReactionJobs would silently drop author continuations. Runaway loops are
+    /// the host's concern and are stopped through [`crate::RuntimeInterrupt`], polled before
+    /// every job below.
     pub(crate) fn drain_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
-        let mut budget = 100_000u32;
         // The script/callback that preceded this checkpoint is a completed synchronous job.
         self.clear_kept_objects();
         loop {
@@ -4332,12 +4383,6 @@ impl Interp {
                     unreachable!("a host-control poll only produces Interrupt")
                 };
                 return Err(reason);
-            }
-            budget -= 1;
-            if budget == 0 {
-                self.microtasks.clear();
-                self.clear_kept_objects();
-                break;
             }
             if let Err(reason) = self.run_job_interruptible(job) {
                 self.microtasks.clear();
@@ -4433,6 +4478,34 @@ impl Interp {
         self.run_job_in_active_realm(job)
     }
 
+    /// Run an [`InternalJob`] step with the same entry-Realm and incumbent script-caller context
+    /// that `call_job_callback` establishes around an ordinary handler.
+    fn run_internal_job(&mut self, handler: &crate::interpreter::JobCallback, value: Value) {
+        use crate::interpreter::InternalJob;
+        let signal = match handler.internal {
+            InternalJob::None => return,
+            InternalJob::AwaitFulfilled { .. } => crate::coroutine::Resume::Next(value),
+            InternalJob::AwaitRejected { .. } => crate::coroutine::Resume::Throw(value),
+        };
+        let Value::Obj(async_promise) = &handler.callback else {
+            return;
+        };
+        let key = Rc::as_ptr(async_promise) as usize;
+        let previous_entry = self.host_entry_realm;
+        if self.capture_job_script_caller {
+            self.host_entry_realm = handler.internal.realm();
+        }
+        let async_promise = handler.callback.clone();
+        if let Some(global) = &handler.script_caller {
+            self.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
+                ctx.drive_async(key, async_promise, signal)
+            });
+        } else {
+            self.drive_async(key, async_promise, signal);
+        }
+        self.host_entry_realm = previous_entry;
+    }
+
     fn run_job_in_active_realm(
         &mut self,
         job: crate::interpreter::Job,
@@ -4445,7 +4518,11 @@ impl Interp {
             }
             self.switch_host_job_context(job.host_context);
         }
-        if job.handler.callback.is_callable() {
+        if job.handler.internal != crate::interpreter::InternalJob::None {
+            // Await's reaction built-ins return undefined and have no result capability; the
+            // resumed function reports its own completion through its result promise.
+            self.run_internal_job(&job.handler, job.value);
+        } else if job.handler.callback.is_callable() {
             match self.call_job_callback(
                 &job.handler,
                 Value::Undefined,
@@ -8066,8 +8143,10 @@ impl Interp {
                         .map(|p| !p.accessor())
                         .unwrap_or(false)
             }
-            // A bound function constructs exactly when its target does.
-            Callable::Bound(bound) => self.value_is_constructor(&Value::Obj(bound.target.clone())),
+            // ECMA-262 BoundFunctionCreate step 5: [[Construct]] is installed at creation exactly
+            // when IsConstructor(targetFunc) held then; `bind` records that answer. Reading the
+            // record (instead of re-walking the target chain) keeps long bind chains O(1) here.
+            Callable::Bound(_) => b.is_constructor,
             _ => false,
         }
     }

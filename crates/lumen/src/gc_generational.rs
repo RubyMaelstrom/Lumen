@@ -23,13 +23,16 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("LUMEN_GC_GENERATIONAL").as_deref() != Ok("0"))
 }
 
-pub(crate) fn next_threshold(live: i64) -> i64 {
+pub(crate) fn next_threshold(live: i64, limit: i64) -> i64 {
     let next = if enabled() {
         live.saturating_add((live / 8).max(crate::interpreter::GC_TRIGGER))
     } else {
         live.saturating_mul(2)
     };
-    next.clamp(crate::interpreter::GC_TRIGGER, crate::interpreter::MAX_LIVE)
+    next.clamp(
+        crate::interpreter::GC_TRIGGER,
+        limit.max(crate::interpreter::GC_TRIGGER),
+    )
 }
 
 #[derive(Clone, Copy)]

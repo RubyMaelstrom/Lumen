@@ -1673,6 +1673,78 @@ impl Drop for Object {
             let _ = self.gc_heap.central.borrow_mut().free(reference);
         }
         self.gc_heap.live.set(self.gc_heap.live.get() - 1);
+        self.release_owned_references();
+    }
+}
+
+/// Owned references moved out of an object whose destruction was reached too deep inside
+/// another object's destruction. Dropping them later is unobservable: no author code runs
+/// during destruction, and weak observers were already notified above.
+struct DeferredObjectFields {
+    _proto: Option<Gc>,
+    _props: Props,
+    _call: Callable,
+    _exotic: Exotic,
+    _native_typed_array: Option<Box<crate::native_typed_array::NativeTypedArray>>,
+}
+
+struct ObjectDropState {
+    depth: Cell<u32>,
+    deferred: RefCell<Vec<DeferredObjectFields>>,
+}
+
+thread_local! {
+    static OBJECT_DROP_STATE: ObjectDropState = const {
+        ObjectDropState {
+            depth: Cell::new(0),
+            deferred: RefCell::new(Vec::new()),
+        }
+    };
+}
+
+/// Nested destruction depth before an object's children are queued instead of dropped in place.
+/// Each level costs a few hundred bytes of native stack, so this bounds destruction of arbitrarily
+/// long object chains (linked lists, closure chains, nested arrays) to a small constant stack.
+const OBJECT_DROP_DEPTH_LIMIT: u32 = 128;
+
+impl Object {
+    /// Release this object's owned references with bounded native recursion. Without this, the
+    /// compiler-generated field drop glue recursed once per link of a reachable chain and a
+    /// 50,000-node linked list overflowed the stack.
+    fn release_owned_references(&mut self) {
+        let mut fields = || DeferredObjectFields {
+            _proto: self.proto.take(),
+            _props: std::mem::take(&mut self.props),
+            _call: std::mem::replace(&mut self.call, Callable::None),
+            _exotic: std::mem::replace(&mut self.exotic, Exotic::None),
+            _native_typed_array: self.native_typed_array.take(),
+        };
+        let Ok(depth) = OBJECT_DROP_STATE.try_with(|state| state.depth.get()) else {
+            // Thread-local teardown: fall back to ordinary field drop order.
+            return;
+        };
+        if depth >= OBJECT_DROP_DEPTH_LIMIT {
+            let fields = fields();
+            // If the thread-local were already torn down, the closure (and `fields`) would simply
+            // drop in place; the successful access above makes that unreachable in practice.
+            let _ =
+                OBJECT_DROP_STATE.try_with(move |state| state.deferred.borrow_mut().push(fields));
+            return;
+        }
+        let _ = OBJECT_DROP_STATE.try_with(|state| state.depth.set(depth + 1));
+        drop(fields());
+        if depth == 0 {
+            // The outermost destruction drains everything queued below it. Each queued bundle is
+            // dropped at depth one, so its own chain may again descend to the limit and queue.
+            while let Some(next) = OBJECT_DROP_STATE
+                .try_with(|state| state.deferred.borrow_mut().pop())
+                .ok()
+                .flatten()
+            {
+                drop(next);
+            }
+        }
+        let _ = OBJECT_DROP_STATE.try_with(|state| state.depth.set(depth));
     }
 }
 

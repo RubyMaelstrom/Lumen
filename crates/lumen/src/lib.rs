@@ -62,6 +62,7 @@ mod gc_sweep;
 mod heap;
 mod host;
 mod host_collections;
+mod host_memory;
 mod interpreter;
 mod interrupt;
 #[cfg(feature = "intl")]
@@ -742,6 +743,20 @@ impl Engine {
     /// Calls before a function is considered for bytecode compilation (0 = immediately).
     pub fn set_tier_threshold(&mut self, threshold: u32) {
         self.interp.tier_threshold = threshold;
+    }
+
+    /// Set the ceiling on simultaneously live objects. An allocation safe point that still
+    /// exceeds it after a full collection throws a `RangeError` instead of exhausting memory.
+    /// The default scales with the memory available to the process (at least three million).
+    pub fn set_live_object_limit(&mut self, limit: u64) {
+        let limit = limit.clamp(interpreter::GC_TRIGGER as u64, i64::MAX as u64) as i64;
+        self.interp.live_object_limit = limit;
+        self.interp.gc_next = self.interp.gc_next.min(limit);
+    }
+
+    /// The engine's current live-object ceiling (see [`Engine::set_live_object_limit`]).
+    pub fn live_object_limit(&self) -> u64 {
+        self.interp.live_object_limit as u64
     }
 
     /// Drain anything written to `console.*` since the last call.

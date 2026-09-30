@@ -442,11 +442,24 @@ fn native_op_tables() -> std::sync::MutexGuard<'static, NativeOpTables> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Record a registration label for a bare native fn address. Cold path only
-/// (realm/extension setup); first registration wins, which is deterministic per binary because
-/// builtin installation order is fixed.
+/// Record a registration label for a bare native fn address. First registration wins, which is
+/// deterministic per binary because builtin installation order is fixed.
+///
+/// Runtime operations also create native functions (Promise resolving functions, iterator and
+/// generator helpers), so this is not only a setup path. Each thread remembers the addresses it
+/// has already registered and takes the process-wide lock only for a new one; later
+/// registrations of the same address could never change its first-wins label.
 pub(crate) fn perf_native_register(addr: usize, label: &str) {
-    register_native_name(&mut native_op_tables(), addr, label);
+    thread_local! {
+        static REGISTERED: std::cell::RefCell<crate::fasthash::FastSet<usize>> =
+            std::cell::RefCell::new(Default::default());
+    }
+    let first_on_thread = REGISTERED
+        .try_with(|registered| registered.borrow_mut().insert(addr))
+        .unwrap_or(true);
+    if first_on_thread {
+        register_native_name(&mut native_op_tables(), addr, label);
+    }
 }
 
 fn register_native_name(tables: &mut NativeOpTables, addr: usize, label: &str) {
