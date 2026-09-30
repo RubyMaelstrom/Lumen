@@ -1,0 +1,43 @@
+ASCII regex windows of Unicode strings — 30 September 2026
+=========================================================
+
+A prepared substring previously inherited its parent's wide subject shape even
+when all visible characters were ASCII. ReText::window now compares the already
+known byte length and exact UTF-16 span. Every non-ASCII scalar requires more
+UTF-8 bytes than UTF-16 units, so equality proves ASCII without another scan.
+Such windows select the existing byte matcher and need no parent element table
+owner. Wide windows retain their mapping. LStr view layout and native string
+byte-reader guards remain unchanged.
+
+Tests compare relative captures with the full backtracker over multiple flags,
+anchors, boundaries, lookarounds, named captures and start positions. Excluded
+prefix/tail characters remain invisible. Wide mappings and split-surrogate
+declines are checked separately. Forty regexp, 24 regex and nine string-slice
+tests pass; strict engine all-target Clippy passes. No new whole-suite, x64,
+wasm or Test262 result is claimed.
+
+The consulted local ECMA-262 snapshot is
+e28783d5fc9dc12b3de905961e2c71410b38a202:
+/big/web-standards/repositories/tc39/ecma262/spec.html:40110 (RegExpBuiltinExec)
+and :38095 (Pattern Semantics). Matching and captures must use the visible
+subject and its relative UTF-16 indexes. Official clauses:
+https://tc39.es/ecma262/#sec-regexpbuiltinexec
+https://tc39.es/ecma262/#sec-pattern-semantics.
+This is the consulted snapshot, not verified current upstream text.
+
+Four balanced application pairs show no clear timing gain: all comparison
+intervals include parity. Djot's median measured time is 302 vs 303 ms; solver
+process time is 8729.50 vs 8754.64 ms. React and Vue medians are slightly higher.
+Separate peak-memory intervals also include parity. Djot and Vue median peaks
+are 1.82% and 2.02% higher. No component meets the combined slower-direction
+interval and greater-than-3% median regression gate. This is a representation
+classification improvement, not an established major application speedup.
+
+Exact observations, artifact/source hashes and workload scopes are recorded in
+../benchmarks/engine-regex-ascii-windows-2026-09-30.json. Complete local outputs
+and source copies are under benchmark-results/engine-cycle7-20260930. Baseline
+is the compact-binding cycle, now committed as 7f2c4d5. The source snapshots
+were captured before the pending cycles could be committed; their original
+HEAD field is historical and content hashes identify the measured code.
+No owned build, test or profile overlapped acceptance observations. User desktop
+apps remained active. Installed/accepted artifacts were not replaced.

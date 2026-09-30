@@ -1916,12 +1916,20 @@ impl ReText {
         if parent.unit_index(first) != start || parent.unit_index(last) != end {
             return None;
         }
-        let ascii = parent.ascii_src.is_some();
+        // Every non-ASCII UTF-8 scalar needs more bytes than UTF-16 units, including
+        // astral characters and smuggled surrogates. Equality for this proven unit
+        // range therefore proves the visible source is ASCII without scanning it.
+        // A wide prefix/tail must not prevent the slice from using the byte matcher.
+        let ascii = source.len() == end - start;
         Some(Self {
             elems: Vec::new(),
             unit_of: None,
             n_elems: last - first,
-            subject_shape: parent.subject_shape,
+            subject_shape: if ascii {
+                SUBJECT_ASCII
+            } else {
+                parent.subject_shape
+            },
             unicode: parent.unicode,
             ascii_src: ascii.then(|| source.clone()),
             parent: (!ascii).then_some(parent),
@@ -5750,6 +5758,84 @@ fn class_set_to_node(mut set: ClassSet) -> Node {
 #[cfg(test)]
 mod internal_engine_diagnostics {
     include!("regex_native_generated.rs");
+
+    #[test]
+    fn ascii_windows_of_wide_roots_match_the_reference_with_relative_boundaries() {
+        use super::*;
+        let body = format!("x\nA1.z\n{}z", "a".repeat(1024));
+        let prefix = "😀é";
+        let root: crate::lstr::LStr = format!("{prefix}{body}é").into();
+        let source = root.slice_bytes(prefix.len(), prefix.len() + body.len());
+        assert!(source.view_range().is_some());
+        assert!(
+            !source.ascii_hint(),
+            "native string byte readers still decline views"
+        );
+        let control = crate::RuntimeInterrupt::default();
+        let wide: Vec<u32> = body.bytes().map(u32::from).collect();
+        for flags in ["", "g", "y", "i", "m", "u", "v", "iu", "duy"] {
+            let unicode = flags.contains('u') || flags.contains('v');
+            let parent = Rc::new(ReText::new_rc(unicode, &root));
+            let start = crate::jstr::unit_len(prefix);
+            let window =
+                ReText::window(parent.clone(), &source, start, start + body.len()).unwrap();
+            assert!(window.ascii_src.is_some());
+            assert_eq!(window.subject_shape(), SUBJECT_ASCII);
+            assert_eq!(
+                Rc::strong_count(&parent),
+                1,
+                "ASCII needs no parent table owner"
+            );
+            assert_eq!(window.slice(0, window.len()), body);
+            for pattern in [
+                "^x",
+                "^A\\d",
+                "\\bA\\d\\b",
+                "(?<=\\n)A\\d",
+                "(?<=é)x",
+                "(?<!é)x",
+                "(?<n>A\\d)",
+                "z$",
+                "z(?=é)",
+                "[a-z]+",
+                "[^a]+",
+            ] {
+                let mut re = Regex::new(pattern, flags).unwrap();
+                re.tier_up_at = 1;
+                for at in [0, 1, 2, 6, body.len() - 1, body.len(), body.len() + 1] {
+                    let actual = re
+                        .exec_text_shared(&window, at, &control)
+                        .unwrap()
+                        .map(|captures| captures.to_vec());
+                    let expected = re
+                        .exec_impl(&wide[..], at, &control)
+                        .unwrap()
+                        .map(|captures| captures.to_vec());
+                    assert_eq!(actual, expected, "/{pattern}/{flags}, start={at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_windows_keep_unit_mapping_and_surrogate_boundary_guards() {
+        use super::*;
+        let root: crate::lstr::LStr = format!("😀{}éz", "a".repeat(1024)).into();
+        let source = root.slice_bytes(4, root.len());
+        for unicode in [false, true] {
+            let parent = Rc::new(ReText::new_rc(unicode, &root));
+            let end = crate::jstr::unit_len(&root);
+            let window = ReText::window(parent.clone(), &source, 2, end).unwrap();
+            assert!(window.ascii_src.is_none());
+            assert!(window.parent.is_some());
+            assert_eq!(window.unit_index(window.len()), end - 2);
+            assert_eq!(window.slice(0, window.len()), source.as_str());
+            if unicode {
+                let empty = crate::lstr::LStr::from("");
+                assert!(ReText::window(parent, &empty, 1, 1).is_none());
+            }
+        }
+    }
 
     #[test]
     fn backtracking_exhaustion_is_distinct_from_no_match() {
