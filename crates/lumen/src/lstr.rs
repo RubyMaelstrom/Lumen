@@ -11,7 +11,9 @@
 //! JIT's inline templates already assume for refcounted payloads (`Rc`'s RcBox), so the machine
 //! code that bumps/decrements tag-6 values is unchanged. Logical content is always `len` bytes of
 //! valid UTF-8 (lone surrogates smuggled, as before — see [`crate::jstr`]); capacity beyond `len`
-//! is invisible to every reader because `Deref` slices to `len`.
+//! is invisible to every reader because `Deref` slices to `len`. Large substrings may instead
+//! hold a bounded view of a flat buffer. Their header has the same count/length offsets, but
+//! no ASCII hint: native byte readers must take their checked path for a view.
 //!
 //! Like `Rc`, `LStr` is neither `Send` nor `Sync` (non-atomic count; the engine is one thread
 //! per realm).
@@ -29,6 +31,13 @@ struct Header {
     // `cap` bytes of UTF-8 follow.
 }
 
+#[repr(C)]
+struct View {
+    header: Header,
+    owner: LStr,
+    offset: usize,
+}
+
 /// See the module docs. `repr(transparent)`-thin: one pointer.
 pub struct LStr {
     p: NonNull<Header>,
@@ -42,12 +51,19 @@ pub(crate) const LEN_OFF: usize = std::mem::offset_of!(Header, len);
 /// Byte offset of `cap` (which carries [`ASCII_HINT`] in its top bit) — the JIT's charCodeAt
 /// intrinsic tests the hint from machine code.
 pub(crate) const CAP_OFF: usize = std::mem::offset_of!(Header, cap);
-/// Byte offset of the first content byte.
+/// Byte offset of the first content byte in a flat buffer. Views require checked resolution.
 pub(crate) const DATA_OFF: usize = HDR;
 /// Top bit of `cap`: the content is KNOWN all-ASCII (byte index == UTF-16 unit index, and every
 /// byte IS its unit). Purely a hint — never set for non-ASCII content, may be clear for ASCII
 /// content. Maintained by every constructor/mutator; capacity readers mask it off.
 pub(crate) const ASCII_HINT: u32 = 1 << 31;
+
+// Reserve one capacity value, rather than changing the native count/length layout. A view is
+// never ASCII-hinted even when its bytes are ASCII. The optimizing tier's decimal-key reader
+// also rejects it by its <=10-byte length guard before accessing inline bytes.
+const VIEW_CAP: u32 = ASCII_HINT - 1;
+const MIN_VIEW_BYTES: usize = 256;
+const _: () = assert!(MIN_VIEW_BYTES > 10);
 
 fn layout(cap: u32) -> Layout {
     Layout::from_size_align(HDR + cap as usize, std::mem::align_of::<Header>())
@@ -64,7 +80,7 @@ impl LStr {
     /// hint is valid; never rescan a growing prefix just to rediscover that it is ASCII.
     fn alloc_with_hint(content: &str, cap: u32, ascii: bool) -> LStr {
         debug_assert!(content.len() <= cap as usize);
-        assert!(cap & ASCII_HINT == 0, "capacity claims the hint bit");
+        assert!(cap < VIEW_CAP, "capacity claims representation bits");
         debug_assert!(!ascii || content.is_ascii());
         unsafe {
             let p = alloc(layout(cap)) as *mut Header;
@@ -182,7 +198,59 @@ impl LStr {
 
     #[inline]
     fn data(&self) -> *const u8 {
-        unsafe { (self.p.as_ptr() as *const u8).add(HDR) }
+        unsafe {
+            if let Some(view) = self.view() {
+                // Views always own a flat buffer; nested slices flatten at construction.
+                (view.owner.p.as_ptr() as *const u8)
+                    .add(HDR)
+                    .add(view.offset)
+            } else {
+                (self.p.as_ptr() as *const u8).add(HDR)
+            }
+        }
+    }
+
+    #[inline]
+    fn view(&self) -> Option<&View> {
+        (self.hdr().cap.get() == VIEW_CAP).then(|| unsafe { &*self.p.as_ptr().cast::<View>() })
+    }
+
+    pub(crate) fn view_owner(&self) -> Option<&LStr> {
+        self.view().map(|view| &view.owner)
+    }
+
+    pub(crate) fn view_range(&self) -> Option<(&LStr, usize, usize)> {
+        self.view()
+            .map(|view| (&view.owner, view.offset, view.offset + self.len()))
+    }
+
+    /// Slice already-proven UTF-8 boundaries. Copy small tokens and ranges that would pin
+    /// more than twice their byte length; large nearby prefixes share a flat source owner.
+    pub(crate) fn slice_bytes(&self, start: usize, end: usize) -> LStr {
+        let bytes = &self.as_str()[start..end];
+        if start == 0 && end == self.len() {
+            return self.clone();
+        }
+        let (owner, offset) = self
+            .view()
+            .map_or((self, start), |view| (&view.owner, view.offset + start));
+        if bytes.len() < MIN_VIEW_BYTES
+            || owner.allocation_requested_bytes() > bytes.len().saturating_mul(2)
+        {
+            return LStr::from(bytes);
+        }
+        let view = Box::new(View {
+            header: Header {
+                strong: Cell::new(1),
+                len: Cell::new(bytes.len() as u32),
+                cap: Cell::new(VIEW_CAP),
+            },
+            owner: owner.clone(),
+            offset,
+        });
+        LStr {
+            p: unsafe { NonNull::new_unchecked(Box::into_raw(view).cast::<Header>()) },
+        }
     }
 
     #[inline]
@@ -215,7 +283,20 @@ impl LStr {
     /// byte capacity as one explicit allocation. It intentionally does not include allocator
     /// metadata outside that request.
     pub(crate) fn retained_requested_bytes(&self) -> usize {
-        HDR.saturating_add((self.hdr().cap.get() & !ASCII_HINT) as usize)
+        self.allocation_requested_bytes().saturating_add(
+            self.view_owner()
+                .map_or(0, LStr::allocation_requested_bytes),
+        )
+    }
+
+    /// This allocation alone. Memory census follows a view's owner separately to deduplicate
+    /// multiple views and other roots; cache admission charges the entire retained owner.
+    pub(crate) fn allocation_requested_bytes(&self) -> usize {
+        if self.view().is_some() {
+            std::mem::size_of::<View>()
+        } else {
+            HDR.saturating_add((self.hdr().cap.get() & !ASCII_HINT) as usize)
+        }
     }
 
     /// Append in place when this is the ONLY reference and capacity suffices. Returns false
@@ -228,7 +309,7 @@ impl LStr {
 
     fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
         let h = self.hdr();
-        if h.strong.get() != 1 {
+        if h.strong.get() != 1 || h.cap.get() == VIEW_CAP {
             return false;
         }
         let len = h.len.get() as usize;
@@ -252,11 +333,8 @@ impl LStr {
 
     fn grow_with_hint(&self, x: &str, ascii: bool) -> LStr {
         let need = self.len().checked_add(x.len()).expect("string too large");
-        assert!(need < ASCII_HINT as usize, "string too large");
-        let cap = need
-            .saturating_mul(2)
-            .max(32)
-            .min((ASCII_HINT - 1) as usize) as u32;
+        assert!(need < VIEW_CAP as usize, "string too large");
+        let cap = need.saturating_mul(2).max(32).min((VIEW_CAP - 1) as usize) as u32;
         let s = LStr::alloc_with_hint(self.as_str(), cap, self.ascii_hint());
         unsafe {
             let data = (s.p.as_ptr() as *mut u8).add(HDR);
@@ -396,8 +474,13 @@ impl Drop for LStr {
         let h = self.hdr();
         let s = h.strong.get();
         if s == 1 {
-            let cap = h.cap.get() & !ASCII_HINT;
-            unsafe { dealloc(self.p.as_ptr() as *mut u8, layout(cap)) };
+            if h.cap.get() == VIEW_CAP {
+                // Drops the one flat owner, then releases the view allocation.
+                unsafe { drop(Box::from_raw(self.p.as_ptr().cast::<View>())) };
+            } else {
+                let cap = h.cap.get() & !ASCII_HINT;
+                unsafe { dealloc(self.p.as_ptr() as *mut u8, layout(cap)) };
+            }
         } else {
             h.strong.set(s - 1);
         }
@@ -549,5 +632,53 @@ mod tests {
         assert_eq!(std::mem::size_of::<LStr>(), std::mem::size_of::<usize>());
         assert_eq!(LEN_OFF, std::mem::size_of::<usize>());
         assert_eq!(CAP_OFF, LEN_OFF + 4);
+    }
+
+    #[test]
+    fn bounded_views_flatten_and_preserve_root_immutability() {
+        let mut source = LStr::from("x".repeat(1024));
+        let mut prefix = source.slice_bytes(0, 900);
+        let nested = prefix.slice_bytes(100, 800);
+        assert!(LStr::ptr_eq(nested.view_owner().unwrap(), &source));
+        assert!(!prefix.ascii_hint());
+        assert_eq!(prefix.len(), 900);
+        assert_eq!(nested.as_str(), &source[100..800]);
+        assert!(!source.append_in_place("changed"));
+        assert!(!prefix.append_in_place("changed"));
+        let alias = prefix.clone();
+        let appended = prefix.concat_owned(&LStr::from("!"));
+        assert_eq!(appended.as_str(), format!("{}!", "x".repeat(900)));
+        assert_eq!(alias.len(), 900);
+        let count = source.strong_count();
+        let packed = crate::value::PackedValue::pack(crate::value::Value::Str(nested));
+        let cloned = packed.clone();
+        drop(packed);
+        drop(cloned);
+        assert_eq!(source.strong_count(), count - 1);
+        drop(alias);
+        assert_eq!(source.strong_count(), 1);
+        assert_eq!(std::mem::offset_of!(View, header), 0);
+    }
+
+    #[test]
+    fn small_or_disproportionate_slices_copy_and_release_source() {
+        let source = LStr::from("x".repeat(2048));
+        for (start, end) in [(0, 10), (0, 900), (1024, 1030)] {
+            let slice = source.slice_bytes(start, end);
+            assert!(slice.view_owner().is_none());
+            assert_eq!(slice.as_str(), &source[start..end]);
+            assert_eq!(source.strong_count(), 1);
+        }
+        let spare = source.concat_grown("x");
+        let slice = spare.slice_bytes(0, 1100);
+        assert!(
+            slice.view_owner().is_none(),
+            "charge spare capacity, not visible length"
+        );
+        let unicode = LStr::from(format!("{}😀é", "x".repeat(1024)));
+        let tail = unicode.slice_bytes(200, unicode.len());
+        drop(unicode);
+        assert_eq!(tail.as_str(), format!("{}😀é", "x".repeat(824)));
+        assert_eq!(tail.repeat_direct(2).len(), tail.len() * 2);
     }
 }

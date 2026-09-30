@@ -508,7 +508,10 @@ impl Visitor {
         if self.lstrs.insert(identity) {
             self.strings_symbols_bigints = self
                 .strings_symbols_bigints
-                .saturating_add(value.retained_requested_bytes());
+                .saturating_add(value.allocation_requested_bytes());
+            if let Some(owner) = value.view_owner() {
+                self.lstr(owner);
+            }
         }
     }
 
@@ -700,9 +703,8 @@ impl Visitor {
     pub(crate) fn re_text(&mut self, text: &Rc<crate::regex::ReText>) {
         let identity = Rc::as_ptr(text) as usize;
         if self.re_texts.insert(identity) {
-            self.regexp_metadata = self
-                .regexp_metadata
-                .saturating_add(text.scan_retained_memory(self));
+            let bytes = text.scan_retained_memory(self);
+            self.regexp_metadata = self.regexp_metadata.saturating_add(bytes);
         }
     }
 
@@ -2520,6 +2522,47 @@ mod tests {
         let json = unavailable_snapshot.json(1, 1);
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
         assert!(json.contains("reachable host owners lack complete retained-memory traversal"));
+    }
+
+    #[test]
+    fn string_view_census_deduplicates_flat_owner() {
+        let source: LStr = "x".repeat(1024).into();
+        let a = source.slice_bytes(0, 900);
+        let b = a.slice_bytes(20, 880);
+        let mut visitor = Visitor::default();
+        visitor.lstr(&a);
+        visitor.lstr(&b);
+        visitor.lstr(&source);
+        visitor.lstr(&a);
+        assert_eq!(
+            visitor.strings_symbols_bigints,
+            source.allocation_requested_bytes()
+                + a.allocation_requested_bytes()
+                + b.allocation_requested_bytes()
+        );
+        assert_eq!(
+            a.retained_requested_bytes(),
+            source.allocation_requested_bytes() + a.allocation_requested_bytes()
+        );
+    }
+
+    #[test]
+    fn prepared_window_census_retains_and_deduplicates_shared_tables() {
+        let source: LStr = format!("{}é😀", "x".repeat(1024)).into();
+        let parent = Rc::new(crate::regex::ReText::new_rc(true, &source));
+        let a = source.slice_bytes(100, source.len());
+        let b = source.slice_bytes(200, source.len());
+        let first = Rc::new(crate::regex::ReText::window(parent.clone(), &a, 100, 1027).unwrap());
+        let second = Rc::new(crate::regex::ReText::window(parent.clone(), &b, 200, 1027).unwrap());
+        let mut visitor = Visitor::default();
+        visitor.re_text(&first);
+        visitor.re_text(&second);
+        visitor.re_text(&parent);
+        visitor.re_text(&first);
+        assert_eq!(
+            visitor.regexp_metadata,
+            parent.heap_bytes() + 2 * size_of::<crate::regex::ReText>()
+        );
     }
 
     #[test]

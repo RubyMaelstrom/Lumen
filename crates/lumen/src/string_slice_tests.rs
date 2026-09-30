@@ -146,3 +146,94 @@ fn unicode_slice_index_stays_in_existing_cache_budget_and_pins_identity() {
         .slice_units(&original, &units, 128, units.len());
     assert!(matches!(Value::Str(copied), Value::Str(s) if s.as_str() == "é😀z"));
 }
+
+#[test]
+fn large_views_keep_native_reads_and_observers_correct() {
+    check(
+        r#"
+        function run(){
+            var source='abcdef'.repeat(200)+'é😀',alias=source;
+            var view=source.substring(60,source.length-1);
+            source+='changed';
+            var ascii=alias.slice(6,1100),other=ascii.substring(100,1000);
+            var equal='abcdef'.repeat(200).slice(6,1100);
+            var code=0;
+            for(var k=0;k<300;k++)code+=ascii.charCodeAt(k%ascii.length);
+            var obj={};obj[other]=7;
+            var out=[ascii===equal,ascii.length,ascii.charAt(2),ascii[3],code,
+                obj[other],other.startsWith('efab'),/abcdef/.exec(ascii)[0],
+                ascii.replace(/f/g,'F').slice(0,12),view.charCodeAt(view.length-1),
+                JSON.parse(JSON.stringify([other]))[0]===other,alias.length,source.length];
+            return out.join('|');
+        }run()
+        "#,
+        "true|1094|c|d|29850|7|true|abcdef|abcdeFabcdeF|55357|true|1203|1210",
+    );
+}
+
+#[test]
+fn prepared_regex_windows_preserve_slice_relative_anchors_and_indices() {
+    check(
+        r#"
+        function run(){
+            var source='prefix'+('abcé😀\ud800z').repeat(150)+'trailer';
+            var input=source.substring(6,source.length-7);
+            var re=/^(?<word>abcé😀)/dug, match=re.exec(input);
+            var tail=/z$/d.exec(input);
+            var sticky=/😀/duy;sticky.lastIndex=4;
+            var hit=sticky.exec(input);
+            var lookbehind=/(?<=prefix)a/du.exec(input);
+            var other=input.slice(8),begin=/^abcé😀/du.exec(other);
+            var empty=/^$/u.exec(other);
+            var replaced=input.replace(/^abcé😀/u,'!');
+            var legacy=RegExp['$&'];
+            return [match.index,match[0],match.groups.word,match.indices[0].join(','),
+                re.lastIndex,tail.index,tail.indices[0].join(','),hit.index,
+                sticky.lastIndex,lookbehind===null,begin.index,empty===null,
+                replaced.charCodeAt(1),legacy].join('|');
+        }run()
+        "#,
+        "0|abcé😀|abcé😀|0,6|6|1199|1199,1200|4|6|true|0|true|55296|abcé😀",
+    );
+}
+
+#[test]
+fn prepared_windows_pin_shared_tables_and_map_astral_offsets() {
+    use crate::regex::ReText;
+    use std::rc::Rc;
+    for unicode in [false, true] {
+        let source: crate::lstr::LStr = format!("é{}😀z", "x".repeat(1024)).into();
+        let mut engine = Engine::new();
+        let cached_parent = engine.interp.re_text(unicode, &source);
+        let parent = Rc::new(ReText::new_rc(unicode, &source));
+        let input = source.slice_bytes(102, source.len());
+        let cached_window = engine.interp.re_text(unicode, &input);
+        assert!(
+            Rc::strong_count(&cached_parent) >= 3,
+            "window shares the cached table"
+        );
+        assert_eq!(cached_window.slice(0, cached_window.len()), input.as_str());
+        let start = crate::jstr::unit_len(&source[..102]);
+        let window = ReText::window(parent.clone(), &input, start, 1028).unwrap();
+        assert_eq!(
+            window.unit_index(window.len()),
+            crate::jstr::unit_len(&input)
+        );
+        let reference = ReText::new_rc(unicode, &input);
+        for u in 0..=window.unit_index(window.len()) + 1 {
+            assert_eq!(window.elem_at_unit(u), reference.elem_at_unit(u));
+        }
+        for e in 0..=window.len() + 1 {
+            assert_eq!(window.unit_index(e), reference.unit_index(e));
+        }
+        assert_eq!(
+            window.slice(0, window.len()),
+            reference.slice(0, reference.len())
+        );
+        drop(parent);
+        drop(source);
+        assert_eq!(window.slice(window.len() - 1, window.len()), "z");
+        let window = Rc::new(window);
+        assert!(ReText::window(window, &input, 0, 10).is_none());
+    }
+}

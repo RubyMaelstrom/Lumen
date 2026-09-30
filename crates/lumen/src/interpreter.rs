@@ -1022,7 +1022,7 @@ fn retained_str_units_bytes(
         StrUnits::Ascii => 0,
         StrUnits::Units(units) => units.len().saturating_mul(std::mem::size_of::<u16>()),
     };
-    s.len()
+    s.retained_requested_bytes()
         .saturating_add(materialized)
         .saturating_add(index.map_or(0, crate::jstr::Utf8Index::heap_bytes))
         .saturating_add(std::mem::size_of::<(
@@ -8847,39 +8847,39 @@ impl Interp {
             return crate::lstr::LStr::from("");
         }
         if s.len() >= 64 {
-            let key = s.as_ptr() as usize;
             // A conversion may have evicted this source. Oversized, uncached and short strings
             // keep their established reconstruction; never repeatedly index an uncacheable body.
-            if let Some((cached, view, index)) = self.str_units.get_cloned(&key) {
-                debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
-                let index = if let Some(index) = index {
-                    index
-                } else {
-                    let base = retained_str_units_bytes(s, &view, None)
-                        .saturating_add(std::mem::size_of::<crate::jstr::Utf8Index>());
-                    if base > STR_UNIT_CACHE_BYTES {
-                        // Do not evict a valid units-only entry to charge even a declined index.
-                        return crate::jstr::from_units(&units[start..end]).into();
-                    }
-                    let index = Rc::new(crate::jstr::Utf8Index::new(
-                        s,
-                        STR_UNIT_CACHE_BYTES.saturating_sub(base),
-                    ));
-                    let bytes = retained_str_units_bytes(s, &view, Some(&index));
-                    self.str_units
-                        .insert(key, (cached, view, Some(index.clone())), bytes);
-                    index
-                };
+            if let Some(index) = self.cached_utf8_index(s) {
                 if let Some(bytes) = index.range(s, start, end) {
                     return if bytes.len() == s.len() {
                         s.clone()
                     } else {
-                        crate::lstr::LStr::from(bytes)
+                        let start_byte = bytes.as_ptr() as usize - s.as_str().as_ptr() as usize;
+                        s.slice_bytes(start_byte, start_byte + bytes.len())
                     };
                 }
             }
         }
         crate::jstr::from_units(&units[start..end]).into()
+    }
+
+    fn cached_utf8_index(&mut self, s: &crate::lstr::LStr) -> Option<Rc<crate::jstr::Utf8Index>> {
+        let key = s.as_ptr() as usize;
+        let (cached, view, index) = self.str_units.get_cloned(&key)?;
+        debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
+        if index.is_some() {
+            return index;
+        }
+        let base = retained_str_units_bytes(s, &view, None)
+            .saturating_add(std::mem::size_of::<crate::jstr::Utf8Index>());
+        if base > STR_UNIT_CACHE_BYTES {
+            return None;
+        }
+        let index = Rc::new(crate::jstr::Utf8Index::new(s, STR_UNIT_CACHE_BYTES - base));
+        let bytes = retained_str_units_bytes(s, &view, Some(&index));
+        self.str_units
+            .insert(key, (cached, view, Some(index.clone())), bytes);
+        Some(index)
     }
 
     /// `s.length` (UTF-16 units), through the cache.
@@ -9032,9 +9032,29 @@ impl Interp {
             debug_assert!(crate::lstr::LStr::ptr_eq(&cached, s));
             return text;
         }
-        let t = Rc::new(crate::regex::ReText::new_rc(unicode, s));
+        // A bounded string view can reuse its flat source's prepared elements. Construct the
+        // table only for small roots that fit comfortably in this cache; unbounded roots,
+        // declined indexes and Unicode boundaries without an exact element mapping fall back.
+        let prepared = s.view_range().and_then(|(owner, start, end)| {
+            if owner.retained_requested_bytes() > 1 << 20 {
+                return None;
+            }
+            let (start, end) = if owner.ascii_hint() {
+                (start, end)
+            } else {
+                self.units_full(owner);
+                let index = self.cached_utf8_index(owner)?;
+                (
+                    index.units_at_byte(owner, start)?,
+                    index.units_at_byte(owner, end)?,
+                )
+            };
+            let parent = self.re_text(unicode, owner);
+            crate::regex::ReText::window(parent, s, start, end)
+        });
+        let t = Rc::new(prepared.unwrap_or_else(|| crate::regex::ReText::new_rc(unicode, s)));
         let bytes = s
-            .len()
+            .retained_requested_bytes()
             .saturating_add(t.heap_bytes())
             .saturating_add(std::mem::size_of::<(
                 (usize, bool),

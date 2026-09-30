@@ -1,0 +1,112 @@
+Bounded string views and shared regex subjects — 30 September 2026
+================================================================
+
+The final candidate makes unchanged Djot document conversion 2.16 times as fast
+as the completed Unicode slicing cycle, and reduces process peak RSS by 36.97%.
+It changes the ordinary tiers; the experimental whole-function compiler stays off.
+Exact observations and source/artifact hashes are recorded in
+../benchmarks/engine-string-views-2026-09-30.json.
+
+Baseline identity
+-----------------
+
+HEAD is d3dd5112ac335ec206a621bbef364287e02671ad, but the measured baseline
+also includes the completed engine-string-slicing-20260930.txt changes. That
+cycle's binary and source inventory are pinned in the report. The environment
+explicitly makes .git read-only, preventing its authorized commit. HEAD alone
+therefore does not reproduce this comparison. Separate completed-cycle patches
+are preserved under benchmark-results; no metadata-write workaround was used.
+
+Implementation and contracts
+----------------------------
+
+Large UTF-8 slices can retain one flat immutable LStr owner. The thin header's
+native strong-count and byte-length offsets remain stable. A reserved capacity
+value marks a view whose payload contains the flat owner and byte offset.
+Nested slices flatten to that owner. Last-owner destruction drops the flat pin
+and then the view allocation. Appending to a view materializes ordinary storage;
+appending to a pinned source cannot modify bytes visible through another handle.
+
+Slices below 256 bytes copy. A view is also declined when its root allocation,
+including spare capacity, exceeds twice the visible slice length. Small tokens
+therefore do not pin large inputs. Every view has a conservative false ASCII
+hint, so template byte readers take checked paths. ARM64/x64 length/count paths
+were reviewed; the optional optimizer's inline decimal-key reader rejects every
+view with its existing ten-byte bound. The minimum view size is asserted against
+that bound. No new native raw-data assumption or executable-memory policy is added.
+
+Views alone reduced Djot's peak RSS about 9% but supplied no convincing timing
+gain. Regex preparation still allocated and filled full element/offset vectors
+for each distinct Unicode prefix. The connected change shares those tables:
+for a view's root below 1 MiB, a sparse byte/unit index maps its exact boundaries
+into one flat prepared subject. A window pins that table and supplies only its
+visible element span to every checked/native matcher. Anchors, lookbehind and
+word boundaries cannot inspect the excluded prefix or tail. Match positions,
+lastIndex and capture indices remain relative UTF-16 unit offsets. Unicode
+boundaries without exact element mapping retain ordinary subject preparation.
+
+No new cache is introduced. String-unit and regex caches retain their existing
+16 MiB/64-entry and 32 MiB/8,192-entry budgets, charging full retained allocations
+and prepared parents conservatively. Active local owners can finish after eviction.
+Memory census traverses flat owners and prepared parents with identity deduplication.
+Recursive parent attribution now finishes before adding the window's own bytes,
+so a nested visit cannot be overwritten by an earlier accumulator read.
+
+Standards and validation
+------------------------
+
+The local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202
+was consulted: /big/web-standards/repositories/tc39/ecma262/spec.html,
+String.prototype.slice:36827, substring:36924, Annex B substr:54429 and
+RegExpBuiltinExec:40110. Official clauses:
+https://tc39.es/ecma262/#sec-string.prototype.slice,
+https://tc39.es/ecma262/#sec-string.prototype.substring,
+https://tc39.es/ecma262/#sec-string.prototype.substr and
+https://tc39.es/ecma262/#sec-regexpbuiltinexec.
+The representation preserves immutable String values and matcher inputs made
+from the actual subject's code units/code points. This is the consulted local
+snapshot, not a verified current upstream revision.
+
+Seven additional regressions beyond the Unicode-only baseline cover flattened
+owners, copy thresholds and spare capacity, packed clone/drop, aliases/appends,
+native readers, relative anchors/lookbehind/sticky matching, named captures,
+UTF-16 capture indices, legacy statics, astral offset mapping, cached parent
+sharing and memory-census deduplication. Final default engine tests pass
+1,568/1,568. Strict Clippy and workspace/all-target checks pass. This is native
+ARM64 execution, not fresh x64/wasm, optional-optimizer or full Test262 evidence.
+
+Application observations
+------------------------
+
+Four balanced fresh-process pairs, crystal ARM64, CPU 5, ordinary release/JIT,
+default Intl, identical build options and exact output comparisons:
+
+  Workload                         Baseline median  Candidate median
+  Djot AGENTS.md parse/render           661.5 ms          306.5 ms
+  Complete yt-dlp/ejs solver            8.785 s           8.853 s
+  React TodoMVC reducer replay           117 ms            116 ms
+  Vue reactivity control                775.5 ms            786 ms
+
+Djot measured time falls 53.67%; paired candidate/baseline ratio 0.46285,
+95% log-t interval 0.46099–0.46471. Complete process time falls about 48%.
+Solver process time is 0.77% higher and Vue measured time 1.35% higher, with
+their paired intervals excluding parity in the slower direction. These small
+losses remain below the repository's provisional 3% median-loss gate; they
+are retained explicitly. The reducer's small measured gain is not a major
+application claim. All HTML, solved responses and replay checksums match.
+
+Separate four-pair wait4 peaks show Djot median 86,728 -> 54,666 KiB, 36.97%
+lower, paired ratio 0.62966 with interval 0.61011–0.64984. React and solver
+peak intervals include parity. Vue's peak median is 1.87% higher, also with
+interval including parity. No final timing or peak component crosses the
+provisional regression gate. Post-GC retained memory was not compared.
+The final executable is 43,016 bytes smaller than the pinned baseline.
+
+No owned builds/tests/profiles overlapped application timing or memory runs;
+desktop applications remained active. Node has one reference observation per
+workload. These comparisons do not establish full browser/Speedometer scores
+or a general engine speedup, and the broader Node gap remains. No installed
+executable was replaced or release artifact promoted.
+
+Complete local output, scripts, source copies, patches and both the views-only
+and combined versions are retained in benchmark-results/engine-cycle3-20260930.

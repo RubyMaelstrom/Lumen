@@ -1841,27 +1841,40 @@ fn elem_of_cp(cp: u32) -> char {
 }
 
 /// A subject string prepared for matching: its elements plus each element's unit offset.
-/// `unit_of` is `None` when element index == unit offset (always true in non-unicode mode, and in
-/// unicode mode for BMP-only subjects); otherwise `unit_of.len() == elems.len() + 1` with the last
-/// entry the total unit length. JS-visible indices (lastIndex, match.index) are unit offsets.
+/// A flat subject's `unit_of` is `None` when element index == unit offset; otherwise it records
+/// each element's offset and the final unit length. A window resolves both elements and offsets
+/// through one flat parent. JS-visible indices (lastIndex, match.index) remain relative units.
 pub struct ReText {
-    /// Wide elements — EMPTY for an ASCII subject, which matches over `ascii_src`'s bytes
-    /// directly (see `Regex::exec_text`) with no per-element materialization at all.
+    /// Flat wide elements — empty for ASCII subjects and windows. Matchers use `elements()`;
+    /// ASCII subjects match over `ascii_src`'s bytes with no element materialization.
     pub elems: Vec<u32>,
     pub unit_of: Option<Vec<usize>>,
-    /// Element count (== `ascii_src` byte length for ASCII, else `elems.len()`).
+    /// Visible element count, including windows with no privately owned elements.
     n_elems: usize,
     subject_shape: u8,
     unicode: bool,
     /// The source string when it is pure ASCII (element index == byte index): matching runs
     /// over its bytes and `slice` copies straight out of it.
     ascii_src: Option<crate::lstr::LStr>,
+    /// A window owns one flat prepared subject, never another window. Matcher input is sliced
+    /// before entry, so anchors, lookbehind and bounds cannot inspect the excluded prefix/tail.
+    parent: Option<std::rc::Rc<ReText>>,
+    elem_base: usize,
+    unit_base: usize,
 }
 
 impl ReText {
     /// Retained allocation size excluding the source string itself (the identity cache owns and
     /// accounts that allocation once alongside this prepared view).
     pub(crate) fn heap_bytes(&self) -> usize {
+        self.own_heap_bytes().saturating_add(
+            self.parent
+                .as_ref()
+                .map_or(0, |parent| parent.own_heap_bytes()),
+        )
+    }
+
+    fn own_heap_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(
                 self.elems
@@ -1880,7 +1893,49 @@ impl ReText {
         if let Some(source) = &self.ascii_src {
             visitor.lstr(source);
         }
-        self.heap_bytes()
+        if let Some(parent) = &self.parent {
+            visitor.re_text(parent);
+        }
+        self.own_heap_bytes()
+    }
+
+    /// The caller proves `source` is precisely the parent's unit range. Exact element
+    /// boundaries are checked here; roots and their tables remain immutable and pinned.
+    pub(crate) fn window(
+        parent: std::rc::Rc<ReText>,
+        source: &crate::lstr::LStr,
+        start: usize,
+        end: usize,
+    ) -> Option<Self> {
+        if parent.parent.is_some() || end > parent.unit_index(parent.len()) || start > end {
+            return None;
+        }
+        debug_assert_eq!(crate::jstr::unit_len(source), end - start);
+        let first = parent.elem_at_unit(start);
+        let last = parent.elem_at_unit(end);
+        if parent.unit_index(first) != start || parent.unit_index(last) != end {
+            return None;
+        }
+        let ascii = parent.ascii_src.is_some();
+        Some(Self {
+            elems: Vec::new(),
+            unit_of: None,
+            n_elems: last - first,
+            subject_shape: parent.subject_shape,
+            unicode: parent.unicode,
+            ascii_src: ascii.then(|| source.clone()),
+            parent: (!ascii).then_some(parent),
+            elem_base: first,
+            unit_base: start,
+        })
+    }
+
+    #[inline]
+    fn elements(&self) -> &[u32] {
+        match &self.parent {
+            Some(parent) => &parent.elems[self.elem_base..self.elem_base + self.n_elems],
+            None => &self.elems,
+        }
     }
 
     /// Prepare `s` for matching, keeping the caller's `Rc` for zero-copy ASCII slicing.
@@ -1897,6 +1952,9 @@ impl ReText {
                 subject_shape: SUBJECT_ASCII,
                 unicode,
                 ascii_src: Some(s.clone()),
+                parent: None,
+                elem_base: 0,
+                unit_base: 0,
             };
         }
         // Keep the engine string itself: `LStr::clone` is one refcount bump and its immutable
@@ -1914,6 +1972,9 @@ impl ReText {
                 subject_shape: SUBJECT_ASCII,
                 unicode,
                 ascii_src: Some(src.unwrap_or_else(|| crate::lstr::LStr::from(s))),
+                parent: None,
+                elem_base: 0,
+                unit_base: 0,
             };
         }
         if unicode {
@@ -1932,6 +1993,9 @@ impl ReText {
                     subject_shape,
                     unicode,
                     ascii_src: None,
+                    parent: None,
+                    elem_base: 0,
+                    unit_base: 0,
                 };
             }
             let mut unit_of = Vec::with_capacity(cps.len() + 1);
@@ -1948,6 +2012,9 @@ impl ReText {
                 subject_shape: SUBJECT_ASTRAL,
                 unicode,
                 ascii_src: None,
+                parent: None,
+                elem_base: 0,
+                unit_base: 0,
             }
         } else {
             let units = crate::jstr::units(s);
@@ -1962,6 +2029,9 @@ impl ReText {
                 },
                 unicode,
                 ascii_src: None,
+                parent: None,
+                elem_base: 0,
+                unit_base: 0,
             }
         }
     }
@@ -1972,6 +2042,10 @@ impl ReText {
 
     /// The element index containing unit offset `u` (== len when `u` is at/past the end).
     pub fn elem_at_unit(&self, u: usize) -> usize {
+        if let Some(parent) = &self.parent {
+            let u = u.min(self.unit_index(self.n_elems));
+            return parent.elem_at_unit(self.unit_base + u) - self.elem_base;
+        }
         match &self.unit_of {
             None => u.min(self.n_elems),
             Some(unit_of) => match unit_of.binary_search(&u) {
@@ -1983,6 +2057,9 @@ impl ReText {
 
     /// The unit offset of element `e`.
     pub fn unit_index(&self, e: usize) -> usize {
+        if let Some(parent) = &self.parent {
+            return parent.unit_index(self.elem_base + e.min(self.n_elems)) - self.unit_base;
+        }
         match &self.unit_of {
             None => e.min(self.n_elems),
             Some(unit_of) => unit_of[e.min(self.n_elems)],
@@ -2000,7 +2077,7 @@ impl ReText {
         if let Some(src) = &self.ascii_src {
             return src[a..b].to_string();
         }
-        let elems = &self.elems[a..b];
+        let elems = &self.elements()[a..b];
         // ASCII fast path: elements are the bytes.
         if elems.iter().all(|&e| e < 0x80) {
             let bytes: Vec<u8> = elems.iter().map(|&e| e as u8).collect();
@@ -2435,13 +2512,13 @@ impl Regex {
                 if let Some(native) = self.one_byte_native.borrow().as_ref() {
                     regexp_prof_native_exec();
                     Ok(native
-                        .find_one_byte(&text.elems[..], start, self.sticky, control)?
+                        .find_one_byte(text.elements(), start, self.sticky, control)?
                         .map(Captures::one))
                 } else {
-                    self.exec_impl(&text.elems[..], start, control)
+                    self.exec_impl(text.elements(), start, control)
                 }
             }
-            None => self.exec_impl(&text.elems[..], start, control),
+            None => self.exec_impl(text.elements(), start, control),
         }
     }
 
@@ -2479,12 +2556,12 @@ impl Regex {
             None if text.subject_shape() == SUBJECT_ONE_BYTE => {
                 if let Some(native) = self.one_byte_native.borrow().as_ref() {
                     regexp_prof_native_exec();
-                    native.find_one_byte(&text.elems[..], start, self.sticky, control)
+                    native.find_one_byte(text.elements(), start, self.sticky, control)
                 } else {
-                    self.find_impl(&text.elems[..], start, control)
+                    self.find_impl(text.elements(), start, control)
                 }
             }
-            None => self.find_impl(&text.elems[..], start, control),
+            None => self.find_impl(text.elements(), start, control),
         }
     }
 
@@ -6148,7 +6225,7 @@ mod internal_engine_diagnostics {
             let machine = re
                 .find_text_shared_entry_polled(&text, 0, &control)
                 .unwrap();
-            let reference = re.find_impl(&text.elems[..], 0, &control).unwrap();
+            let reference = re.find_impl(text.elements(), 0, &control).unwrap();
             assert_eq!(machine, expected);
             assert_eq!(machine, reference, "word-load machine/reference mismatch");
         }
@@ -6249,9 +6326,9 @@ mod internal_engine_diagnostics {
         assert_eq!(text.subject_shape(), super::SUBJECT_ONE_BYTE);
         let native = super::OneByteNativeProgram::compile(&re.prog, re.multiline)
             .expect("one-byte non-ASCII terminal Many must compile");
-        for start in 0..=text.elems.len() {
-            let fast = native.find(&text.elems[..], start, false, &control);
-            let reference = re.find_impl(&text.elems[..], start, &control);
+        for start in 0..=text.elements().len() {
+            let fast = native.find(text.elements(), start, false, &control);
+            let reference = re.find_impl(text.elements(), start, &control);
             assert_eq!(
                 fast, reference,
                 "non-ASCII terminal Many mismatch at {start}"

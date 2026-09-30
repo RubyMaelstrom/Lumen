@@ -167,6 +167,21 @@ impl Utf8Index {
         std::mem::size_of::<Self>() + self.changes.capacity() * std::mem::size_of::<(u32, u32)>()
     }
 
+    /// Invert the sparse boundary map for an already validated UTF-8 slice of the source.
+    pub(crate) fn units_at_byte(&self, s: &str, byte: usize) -> Option<usize> {
+        if !self.copy_safe || !s.is_char_boundary(byte) {
+            return None;
+        }
+        let past = self
+            .changes
+            .partition_point(|&(end, extra)| end as usize + extra as usize <= byte);
+        Some(
+            byte - past
+                .checked_sub(1)
+                .map_or(0, |n| self.changes[n].1 as usize),
+        )
+    }
+
     /// Only copy complete UTF-8 scalars. Both offsets have already been clamped to the source's
     /// UTF-16 length; checking Rust's boundaries also rejects an interior surrogate-pair index.
     pub(crate) fn range<'a>(&self, s: &'a str, start: usize, end: usize) -> Option<&'a str> {

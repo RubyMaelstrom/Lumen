@@ -10796,7 +10796,7 @@ fn install_string(it: &mut Interp) {
             if a > b {
                 std::mem::swap(&mut a, &mut b);
             }
-            return Ok(Value::str(&s[a as usize..b as usize]));
+            return Ok(Value::Str(s.slice_bytes(a as usize, b as usize)));
         }
         let chars = i.units_full(&s);
         let len = chars.len() as i64;
@@ -10845,7 +10845,9 @@ fn install_string(it: &mut Interp) {
             if start < 0 {
                 start = 0;
             }
-            return Ok(Value::str(&s[start as usize..(start + count) as usize]));
+            return Ok(Value::Str(
+                s.slice_bytes(start as usize, (start + count) as usize),
+            ));
         }
         let chars = i.units_full(&s);
         let size = chars.len() as i64;
@@ -11564,7 +11566,7 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
             v => norm_index(ab(i.to_number(&v))?, len),
         };
         return Ok(if start < end {
-            Value::str(&s[start as usize..end as usize])
+            Value::Str(s.slice_bytes(start as usize, end as usize))
         } else {
             Value::str("")
         });

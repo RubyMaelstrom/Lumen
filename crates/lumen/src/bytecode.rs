@@ -18692,7 +18692,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         };
                         let (start, end) = (norm(*start), norm(*end));
                         Ok(if start < end {
-                            Value::str(&s[start as usize..end as usize])
+                            Value::Str(s.slice_bytes(start as usize, end as usize))
                         } else {
                             Value::str("")
                         })
