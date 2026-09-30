@@ -2004,14 +2004,17 @@ impl Drop for Scope {
 #[derive(Default)]
 #[repr(transparent)]
 #[allow(clippy::box_collection)] // Keeps the common empty scope to one nullable pointer.
-pub struct ScopeNames(Option<Box<Vec<String>>>);
+pub struct ScopeNames(Option<Box<Vec<Rc<str>>>>);
 
 impl ScopeNames {
-    pub fn push(&mut self, name: String) {
-        self.0.get_or_insert_with(Default::default).push(name);
+    /// Record a lexically declared name. Compiled scopes share their chunk's name text.
+    pub fn push(&mut self, name: impl Into<Rc<str>>) {
+        self.0
+            .get_or_insert_with(Default::default)
+            .push(name.into());
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Rc<str>> {
         self.0.as_deref().map_or(&[][..], Vec::as_slice).iter()
     }
 
@@ -2019,16 +2022,16 @@ impl ScopeNames {
         let Some(names) = self.0.as_deref() else {
             return 0;
         };
-        std::mem::size_of::<Vec<String>>()
+        std::mem::size_of::<Vec<Rc<str>>>()
             .saturating_add(
                 names
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
+                    .saturating_mul(std::mem::size_of::<Rc<str>>()),
             )
             .saturating_add(
                 names
                     .iter()
-                    .map(|name| name.capacity())
+                    .map(|name| name.len())
                     .fold(0usize, usize::saturating_add),
             )
     }
@@ -11876,6 +11879,8 @@ impl Interp {
 
     /// The cache resolution of [`Interp::call_jit_cached`]: the entry that would run `callee`
     /// from `site` now, or `None` (with no side effects) when the site must revalidate.
+    /// Inlined so the hit's entry copy lands directly in the caller's frame.
+    #[inline(always)]
     fn resolve_cached_call(
         &self,
         site: &crate::bytecode::CallSite,

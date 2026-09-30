@@ -1688,6 +1688,20 @@ impl JitCtx {
 }
 
 #[inline]
+/// Whether generated code may use FJCVTZS (ARMv8.3 FEAT_JSCVT) for ECMAScript ToInt32
+/// (ECMA-262 §7.1.6). `LUMEN_JIT_NO_JSCVT` forces the portable guarded sequence.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn jscvt_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::arch::is_aarch64_feature_detected!("jsconv")
+            && std::env::var_os("LUMEN_JIT_NO_JSCVT").is_none()
+    })
+}
+
 fn jit_env_parent_raw(env: &Env) -> *const u8 {
     env.borrow()
         .parent
@@ -2535,6 +2549,12 @@ mod asm {
         /// fcvtzs wd, dn (float → signed 32-bit, round toward zero, saturating)
         pub fn fcvtzs_w_d(&mut self, rd: u32, rn: u32) {
             self.emit(0x1E78_0000 | (rn << 5) | rd);
+        }
+        /// fjcvtzs wd, dn (FEAT_JSCVT): ECMAScript ToInt32 of any double in one instruction —
+        /// truncate toward zero, keep the low 32 bits (mod 2^32), NaN and ±Infinity give 0.
+        /// Emit only when [`super::jscvt_available`].
+        pub fn fjcvtzs_w_d(&mut self, rd: u32, rn: u32) {
+            self.emit(0x1E7E_0000 | (rn << 5) | rd);
         }
         /// scvtf dd, xn (signed 64-bit → double, round to nearest)
         pub fn scvtf_d_x(&mut self, rd: u32, rn: u32) {
@@ -4163,22 +4183,28 @@ fn compile_entry(
                 emit_exec_word_load(&mut a, 10, 20, -8);
                 emit_exec_number_guard(&mut a, 9, 0, 11, primitives);
                 emit_exec_number_guard(&mut a, 10, 1, 11, primitives);
-                a.fcvtzs_x_d(9, 0);
-                a.scvtf_d_x(2, 9);
-                a.frintz(3, 0);
-                a.fcmp(2, 3);
-                a.b_cond(C_NE, slow);
-                // x == +2^63 exactly saturates yet passes the round-trip (2^63-1 re-rounds to
-                // 2^63): cmn #1 sets V only for i64::MAX — send it to the helper.
-                a.cmn_imm_x(9, 1);
-                a.b_cond(6, slow); // VS
-                a.fcvtzs_x_d(10, 1);
-                a.scvtf_d_x(2, 10);
-                a.frintz(3, 1);
-                a.fcmp(2, 3);
-                a.b_cond(C_NE, slow);
-                a.cmn_imm_x(10, 1);
-                a.b_cond(6, slow); // VS
+                if jscvt_available() {
+                    // Exact ToInt32 of every Number, so no operand needs the helper.
+                    a.fjcvtzs_w_d(9, 0);
+                    a.fjcvtzs_w_d(10, 1);
+                } else {
+                    a.fcvtzs_x_d(9, 0);
+                    a.scvtf_d_x(2, 9);
+                    a.frintz(3, 0);
+                    a.fcmp(2, 3);
+                    a.b_cond(C_NE, slow);
+                    // x == +2^63 exactly saturates yet passes the round-trip (2^63-1 re-rounds
+                    // to 2^63): cmn #1 sets V only for i64::MAX — send it to the helper.
+                    a.cmn_imm_x(9, 1);
+                    a.b_cond(6, slow); // VS
+                    a.fcvtzs_x_d(10, 1);
+                    a.scvtf_d_x(2, 10);
+                    a.frintz(3, 1);
+                    a.fcmp(2, 3);
+                    a.b_cond(C_NE, slow);
+                    a.cmn_imm_x(10, 1);
+                    a.b_cond(6, slow); // VS
+                }
                 a.bind(calculate);
                 match op {
                     Op::BitAnd => a.logic_w(0, 11, 9, 10),
@@ -4886,13 +4912,27 @@ fn emit_prop_load_inline(
     // state machine at every site. Every fact that made the cached slot authoritative is guarded
     // live; a miss goes to the checked helper, which observes mutations and arbitrary alternate
     // shapes exactly like the generic JIT miss path.
-    let compact = preferred.filter(|st| {
+    let bakeable = |st: &crate::bytecode::IcState| {
         st.depth <= 3
             && (st.depth < 2
                 || (st.depth == 2 && st.mid_ok & 1 != 0)
                 || (st.depth == 3 && st.mid_ok & 3 == 3))
-    });
-    if let Some(st) = compact {
+    };
+    let compact = preferred.filter(bakeable);
+    // A polymorphic site (virtual methods over a few receiver classes) bakes each warm way into
+    // its own compact probe, tried in cache order; a miss on all of them falls to the generic
+    // way loop, which still sees ways filled after compilation, and then to the helper.
+    let baked: Vec<crate::bytecode::IcState> = match compact {
+        Some(st) => vec![st],
+        None if cache_ptr != 0 => (0..crate::bytecode::PROP_IC_WAYS)
+            .map(|way| unsafe {
+                (*(cache_ptr as *const std::cell::Cell<crate::bytecode::IcState>).add(way)).get()
+            })
+            .filter(|st| st.has_cacheable_shapes() && bakeable(st))
+            .collect(),
+        None => Vec::new(),
+    };
+    let emit_baked = |a: &mut asm::Asm, st: crate::bytecode::IcState, miss: usize| {
         a.add_imm(11, 10, rcv);
         a.ldrb_imm(14, 11, ex);
         if arr_ok || str_ok {
@@ -4907,27 +4947,27 @@ fn emit_prop_load_inline(
                 a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
                 a.b_cond(C_EQ, recv_exotic_ok);
             }
-            a.b(slow);
+            a.b(miss);
             a.bind(recv_exotic_ok);
         } else {
             a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, slow);
+            a.b_cond(C_NE, miss);
         }
         a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, slow);
+        a.cbz(14, false, miss);
         a.ldr_w_imm(14, 11, sh);
         a.mov_imm64(16, st.recv_shape as u64);
         a.cmp_reg_w(14, 16);
-        a.b_cond(C_NE, slow);
+        a.b_cond(C_NE, miss);
         if st.depth >= 1 {
             a.ldr_imm(17, 11, pr);
-            a.cbz(17, true, slow);
+            a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
             a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, slow);
+            a.b_cond(C_NE, miss);
             a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, slow);
+            a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
             let expected = if st.depth == 1 {
                 st.holder_shape
@@ -4936,17 +4976,17 @@ fn emit_prop_load_inline(
             };
             a.mov_imm64(16, expected as u64);
             a.cmp_reg_w(14, 16);
-            a.b_cond(C_NE, slow);
+            a.b_cond(C_NE, miss);
         }
         if st.depth >= 2 {
             a.ldr_imm(17, 11, pr);
-            a.cbz(17, true, slow);
+            a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
             a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, slow);
+            a.b_cond(C_NE, miss);
             a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, slow);
+            a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
             let expected = if st.depth == 2 {
                 st.holder_shape
@@ -4955,25 +4995,40 @@ fn emit_prop_load_inline(
             };
             a.mov_imm64(16, expected as u64);
             a.cmp_reg_w(14, 16);
-            a.b_cond(C_NE, slow);
+            a.b_cond(C_NE, miss);
         }
         if st.depth == 3 {
             a.ldr_imm(17, 11, pr);
-            a.cbz(17, true, slow);
+            a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
             a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, slow);
+            a.b_cond(C_NE, miss);
             a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, slow);
+            a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
             a.mov_imm64(16, st.holder_shape as u64);
             a.cmp_reg_w(14, 16);
-            a.b_cond(C_NE, slow);
+            a.b_cond(C_NE, miss);
         }
         a.mov_imm64(13, st.slot as u64);
         a.b(load);
+    };
+    let generic_entry = a.new_label();
+    for (index, st) in baked.iter().enumerate() {
+        let miss = if index + 1 < baked.len() {
+            a.new_label()
+        } else if compact.is_some() {
+            slow
+        } else {
+            generic_entry
+        };
+        emit_baked(a, *st, miss);
+        if miss != slow && miss != generic_entry {
+            a.bind(miss);
+        }
     }
+    a.bind(generic_entry);
     // 2-5. probe every cache way (sites allocate PROP_IC_WAYS consecutive cells; the fill path
     // demotes ways one step, so a site rotating through up to that many shapes stabilizes with
     // one shape per way). Each probe is self-contained: it recomputes the receiver base from
@@ -11711,6 +11766,10 @@ fn emit_chain(
                 // Known int-valued skips the round-trip guard (the conversion is exact by
                 // construction); otherwise guard like the standalone template.
                 for (src, iv, out) in [(rn, ni, 9u32), (rm, mi, 10u32)] {
+                    if !iv && jscvt_available() {
+                        a.fjcvtzs_w_d(out, src); // exact ToInt32: no guard needed
+                        continue;
+                    }
                     a.fcvtzs_x_d(out, src);
                     if !iv {
                         a.scvtf_d_x(0, out);

@@ -5514,8 +5514,10 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
         && i.array_append_unshadowed(&o)
     {
         let mut b = o.borrow_mut();
+        // Set(O, len, E, true) creates an own element: a non-extensible array rejects it
+        // (§10.1.6.3 ValidateAndApplyPropertyDescriptor) and the general path throws.
         let len = match b.props.length_property() {
-            Some(p) if !p.accessor() && p.writable() => match p.value() {
+            Some(p) if b.extensible && !p.accessor() && p.writable() => match p.value() {
                 Value::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => {
                     Some(n as u32)
                 }
@@ -5614,32 +5616,48 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
 /// `Err(value)` means no mutation occurred and hands the argument back to the caller for the
 /// exact generic builtin path. `Ok(length)` means the argument's ownership moved into the array.
 pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result<Value, Value> {
-    if !matches!(o.borrow().exotic, Exotic::Array)
-        || !i.ordinary_get_ptr(Rc::as_ptr(o) as usize)
-        || !i.array_append_unshadowed(o)
+    array_push_dense_packed(i, o, PackedValue::pack(value))
+        .map(|length| Value::Num(length as f64))
+        .map_err(PackedValue::into_value)
+}
+
+/// `Array.prototype.push(value)` (ECMA-262 §23.1.3.23) on an extensible ordinary Array whose
+/// `length` is a writable whole-number data property and whose prototypes provide no indexed
+/// properties: Set(O, len, value, true) is then exactly CreateDataProperty at the dense tail,
+/// and Set(O, "length", len + 1, true) the matching length update. Returns the new length,
+/// or hands the value back (nothing changed) for the general algorithm.
+pub(crate) fn array_push_dense_packed(
+    i: &Interp,
+    o: &Gc,
+    value: PackedValue,
+) -> Result<u32, PackedValue> {
     {
+        let b = o.borrow();
+        if !matches!(b.exotic, Exotic::Array) || !b.ic_plain.get() || !b.extensible {
+            return Err(value);
+        }
+    }
+    if !i.array_append_unshadowed(o) {
         return Err(value);
     }
     let mut b = o.borrow_mut();
     let len = match b.props.length_property() {
-        Some(p) if !p.accessor() && p.writable() => match p.value() {
-            Value::Num(n) if n.trunc() == n && (0.0..u32::MAX as f64).contains(&n) => n as u32,
+        Some(p) if !p.accessor() && p.writable() => match p.number_value() {
+            Some(n) if n.trunc() == n && (0.0..u32::MAX as f64).contains(&n) => n as u32,
             _ => return Err(value),
         },
         _ => return Err(value),
     };
-    match b.props.try_append_element(len, Property::plain(value)) {
+    match b
+        .props
+        .try_append_element(len, Property::plain_packed(value))
+    {
         Ok(()) => {
             let next = len + 1;
-            let slot = b.props.slot_of("length").unwrap();
-            b.props
-                .entry_at_mut(slot)
-                .unwrap()
-                .1
-                .set_value(Value::Num(next as f64));
-            Ok(Value::Num(next as f64))
+            b.props.set_array_length_value(next as f64);
+            Ok(next)
         }
-        Err(prop) => Err(prop.into_value()),
+        Err(prop) => Err(PackedValue::pack(prop.into_value())),
     }
 }
 

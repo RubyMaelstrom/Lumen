@@ -169,7 +169,7 @@ impl ActivationPlan {
         {
             let mut scope = activation.borrow_mut();
             for name in &self.lexicals {
-                scope.lexical_names.push(name.to_string());
+                scope.lexical_names.push(name.clone());
             }
         }
         // Every closure captures this invocation's actual environment. The

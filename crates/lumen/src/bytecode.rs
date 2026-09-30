@@ -2715,7 +2715,7 @@ impl Chunk {
                         // Non-strict FunctionDeclarationInstantiation keeps body lexicals visible
                         // to EvalDeclarationInstantiation's var-conflict walk. The compact Scope
                         // stores both binding kinds together, so preserve that distinction here.
-                        b.lexical_names.push(name.to_string());
+                        b.lexical_names.push(name.clone());
                         b.vars.insert(
                             name.clone(),
                             crate::interpreter::Binding {
@@ -14183,82 +14183,14 @@ fn run_vm_inner<S: StoredValue>(
                 let object = crate::builtins::box_primitive_pub(i, value);
                 *env = crate::interpreter::new_with_scope(env.clone(), object);
             }
-            Op::PushLex(scope) | Op::PushCatchLex(scope) => {
-                let next = if matches!(op, Op::PushCatchLex(_)) {
-                    crate::interpreter::new_catch_scope(env.clone())
-                } else {
-                    crate::interpreter::new_scope(Some(env.clone()))
-                };
-                {
-                    let mut record = next.borrow_mut();
-                    for binding in &chunk.lexical_scopes[scope as usize] {
-                        record.lexical_names.push(binding.name.to_string());
-                        record.vars.insert(
-                            binding.name.clone(),
-                            crate::interpreter::Binding {
-                                value: Value::Undefined,
-                                mutable: !binding.is_const,
-                                strict_immutable: binding.is_const,
-                                initialized: false,
-                                import_ref: None,
-                                imported: false,
-                                deletable: false,
-                            },
-                        );
-                    }
-                }
-                *env = next;
-            }
-            Op::CloneLex(scope) => {
-                let parent = env
-                    .borrow()
-                    .parent
-                    .clone()
-                    .expect("per-iteration lexical environment has a parent");
-                let next = crate::interpreter::new_scope(Some(parent));
-                {
-                    let current = env.borrow();
-                    let mut record = next.borrow_mut();
-                    for binding in &chunk.lexical_scopes[scope as usize] {
-                        let previous = current
-                            .vars
-                            .get(&binding.name)
-                            .expect("per-iteration binding missing");
-                        record.lexical_names.push(binding.name.to_string());
-                        record.vars.insert(
-                            binding.name.clone(),
-                            crate::interpreter::Binding {
-                                value: previous.value.clone(),
-                                mutable: previous.mutable,
-                                strict_immutable: previous.strict_immutable,
-                                initialized: previous.initialized,
-                                import_ref: None,
-                                imported: false,
-                                deletable: false,
-                            },
-                        );
-                    }
-                }
-                *env = next;
-            }
+            Op::PushLex(scope) => push_lexical_scope(chunk, env, scope, false),
+            Op::PushCatchLex(scope) => push_lexical_scope(chunk, env, scope, true),
+            Op::CloneLex(scope) => clone_lexical_scope(chunk, env, scope),
             Op::InitLex(name) => {
-                let name = &chunk.names[name as usize];
-                let mut record = env.borrow_mut();
-                let binding = record
-                    .vars
-                    .get_mut(name)
-                    .expect("lexical initialization requires an own binding");
-                binding.value = pop!();
-                binding.initialized = true;
+                let value = pop!();
+                initialize_lexical_binding(chunk, env, name, value);
             }
-            Op::PopEnv => {
-                let parent = env
-                    .borrow()
-                    .parent
-                    .clone()
-                    .expect("compiled environment scope has a parent");
-                *env = parent;
-            }
+            Op::PopEnv => pop_lexical_scope(env),
             Op::PushDisposeFrame => disposal_frames.push(Vec::new()),
             Op::AddDisposable(is_async) => {
                 let value = stack.last().expect("vm stack underflow");
@@ -18906,6 +18838,141 @@ pub(crate) unsafe extern "C" fn jit_reference_op(
     }
 }
 
+/// BlockDeclarationInstantiation (ECMA-262 §14.2.3) of a compiler-planned lexical scope, or a
+/// `catch` parameter environment (§14.15.2): a new declarative record whose bindings start
+/// uninitialized, pushed as the running LexicalEnvironment.
+fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
+    let next = if catch {
+        crate::interpreter::new_catch_scope(env.clone())
+    } else {
+        crate::interpreter::new_scope(Some(env.clone()))
+    };
+    {
+        let mut record = next.borrow_mut();
+        for binding in &chunk.lexical_scopes[scope as usize] {
+            record.lexical_names.push(binding.name.clone());
+            record.vars.insert(
+                binding.name.clone(),
+                crate::interpreter::Binding {
+                    value: Value::Undefined,
+                    mutable: !binding.is_const,
+                    strict_immutable: binding.is_const,
+                    initialized: false,
+                    import_ref: None,
+                    imported: false,
+                    deletable: false,
+                },
+            );
+        }
+    }
+    *env = next;
+}
+
+/// CreatePerIterationEnvironment (ECMA-262 §14.7.4.4): a sibling record copying each
+/// per-iteration binding's current value and state.
+fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
+    let parent = env
+        .borrow()
+        .parent
+        .clone()
+        .expect("per-iteration lexical environment has a parent");
+    let next = crate::interpreter::new_scope(Some(parent));
+    {
+        let current = env.borrow();
+        let mut record = next.borrow_mut();
+        for binding in &chunk.lexical_scopes[scope as usize] {
+            let previous = current
+                .vars
+                .get(&binding.name)
+                .expect("per-iteration binding missing");
+            record.lexical_names.push(binding.name.clone());
+            record.vars.insert(
+                binding.name.clone(),
+                crate::interpreter::Binding {
+                    value: previous.value.clone(),
+                    mutable: previous.mutable,
+                    strict_immutable: previous.strict_immutable,
+                    initialized: previous.initialized,
+                    import_ref: None,
+                    imported: false,
+                    deletable: false,
+                },
+            );
+        }
+    }
+    *env = next;
+}
+
+/// InitializeBinding (ECMA-262 §9.1.1.1.4) of an own lexical binding of the running scope.
+fn initialize_lexical_binding(chunk: &Chunk, env: &Env, name: u32, value: Value) {
+    let name = &chunk.names[name as usize];
+    let mut record = env.borrow_mut();
+    let binding = record
+        .vars
+        .get_mut(name)
+        .expect("lexical initialization requires an own binding");
+    binding.value = value;
+    binding.initialized = true;
+}
+
+/// Restore the running LexicalEnvironment to the outer record of a compiled scope.
+fn pop_lexical_scope(env: &mut Env) {
+    let parent = env
+        .borrow()
+        .parent
+        .clone()
+        .expect("compiled environment scope has a parent");
+    *env = parent;
+}
+
+fn jit_scope_operation(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::PushLex(_) | Op::PushCatchLex(_) | Op::CloneLex(_) | Op::InitLex(_) | Op::PopEnv
+    )
+}
+
+/// Dedicated lexical-environment slow path: the same Environment Record operations as the VM,
+/// applied directly to the native activation's canonical LexicalEnvironment, without copying
+/// the operand stack into a one-operation VM. None of them can run author code or throw.
+unsafe fn jit_scope_op(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    mut sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let ctx = &mut *ctx;
+    if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk {
+        return jit_vm_operation(ctx, pc, sp);
+    }
+    let chunk = &*ctx.chunk;
+    jit_opstat(ctx, pc);
+    ensure_native_activation(ctx);
+    let activation = ctx
+        .activation
+        .as_mut()
+        .expect("native activation initialized");
+    match chunk.ops[pc as usize] {
+        Op::PushLex(scope) => push_lexical_scope(chunk, &mut activation.env, scope, false),
+        Op::PushCatchLex(scope) => push_lexical_scope(chunk, &mut activation.env, scope, true),
+        Op::CloneLex(scope) => clone_lexical_scope(chunk, &mut activation.env, scope),
+        Op::InitLex(name) => {
+            sp = sp.sub(1);
+            let value = sp.read().into_value();
+            initialize_lexical_binding(chunk, &activation.env, name, value);
+        }
+        Op::PopEnv => pop_lexical_scope(&mut activation.env),
+        _ => unreachable!("lexical environment helper operation"),
+    }
+    ctx.env_raw = Rc::as_ptr(&activation.env) as *const u8;
+    ctx.env_parent_raw = activation
+        .env
+        .borrow()
+        .parent
+        .as_ref()
+        .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8);
+    crate::jit::SpFlag { sp, flag: 0 }
+}
+
 unsafe fn jit_vm_operation(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -18979,6 +19046,9 @@ pub(crate) unsafe extern "C" fn jit_exec(
         Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_)
     ) {
         return jit_reference_op(ctx, pc, sp);
+    }
+    if jit_scope_operation(&chunk.ops[pc as usize]) {
+        return jit_scope_op(ctx, pc, sp);
     }
     if jit_bridge_op(&chunk.ops[pc as usize]) {
         return jit_vm_operation(ctx, pc, sp);
@@ -19181,6 +19251,27 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
         _ => 4, // [receiver, callee, arg0, arg1]
     };
     let base = sp.sub(width);
+    if intrinsic == INTRINSIC_ARRAY_PUSH {
+        // [receiver, callee, value]. A guarded dense append runs no author code, so it needs
+        // none of the native-call boundary below (depth, safepoint, new.target bookkeeping).
+        if let Value::Obj(receiver) = (*base).unpack() {
+            let value = base.add(2).read();
+            match crate::builtins::array_push_dense_packed(i, &receiver, value) {
+                Ok(length) => {
+                    drop(receiver);
+                    std::ptr::drop_in_place(base);
+                    std::ptr::drop_in_place(base.add(1));
+                    base.write(PackedValue::pack(Value::Num(length as f64)));
+                    return crate::jit::SpFlag {
+                        sp: base.add(1),
+                        flag: 0,
+                    };
+                }
+                // Nothing changed: restore the moved owner for the general path.
+                Err(value) => base.add(2).write(value),
+            }
+        }
+    }
     let mut this_moved = false;
     let mut push_arg_moved = false;
     let mut call_args_moved = 0usize;

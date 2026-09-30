@@ -56,8 +56,10 @@ The default tier is JIT. Useful diagnostic controls:
   bodies can tier up immediately.
 - `LUMEN_INLINE_AT=N` changes the speculative inline recompile threshold (default:
   100 machine-code runs); zero disables inlining.
-- `LUMEN_JIT_NO_DIRECT_CALLS=1` disables ARM64 shared-context direct calls while
-  retaining ordinary JIT calls.
+- `LUMEN_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls (the inline call sequence
+  that runs the callee on a pooled frame record) while retaining ordinary JIT calls.
+- `LUMEN_JIT_NO_JSCVT=1` makes ARM64 code use the portable guarded ToInt32 sequence even
+  when the CPU implements FEAT_JSCVT (`fjcvtzs`).
 - `LUMEN_TIER_LOG=1` helps diagnose compilation bailouts.
 - On GNU/Linux, `LUMEN_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.

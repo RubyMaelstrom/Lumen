@@ -25944,3 +25944,60 @@ out.join(',')
         );
     }
 }
+
+/// ECMA-262 §23.1.3.23 Array.prototype.push performs Set(O, len, E, true): on a non-extensible
+/// array CreateDataProperty fails and push throws a TypeError without changing the array, in
+/// every tier including the dense and JIT-intrinsic fast paths. Expected output from Node.
+#[test]
+fn push_onto_non_extensible_arrays_throws_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#"function p(a, v){ return a.push(v); }
+var out=[];
+for (var k=0;k<50;k++){ var a=[1]; p(a,2); }
+var ne=[1,2]; Object.preventExtensions(ne);
+try { p(ne, 3); out.push('no throw', ne.length); } catch(e) { out.push(e.name, ne.length); }
+var fz=[1]; Object.freeze(fz);
+try { p(fz, 3); out.push('no throw', fz.length); } catch(e) { out.push(e.name, fz.length); }
+var ro=[1]; Object.defineProperty(ro,'length',{writable:false});
+try { p(ro, 3); out.push('no throw', ro.length); } catch(e) { out.push(e.name, ro.length, ro[1]); }
+var ne2=[]; Object.preventExtensions(ne2); for (var k=0;k<20;k++){ try{ p(ne2,k) }catch(e){} } out.push(ne2.length);
+out.join(',')
+"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                "TypeError,2,TypeError,1,TypeError,1,,0",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
+/// ECMA-262 §7.1.6 ToInt32 / §7.1.7 ToUint32 in every bitwise operator, including the
+/// FJCVTZS template on hardware with FEAT_JSCVT: NaN/±Infinity/±0 map to 0, fractions
+/// truncate, and every magnitude (±2^31 edges, 2^53, ±2^63, Number.MAX_VALUE) wraps modulo
+/// 2^32. Expected output from Node.
+#[test]
+fn bitwise_to_int32_edges_match_the_specification_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#"var vals=[0,-0,0.9,-0.9,1.5,-1.5,2147483647,2147483648,-2147483648,-2147483649,4294967295,4294967296,4294967297.5,-4294967297.5,9007199254740991,9007199254740993,1e20,-1e20,9223372036854775807,-9223372036854775808,18446744073709551616,1.7976931348623157e308,-1.7976931348623157e308,NaN,Infinity,-Infinity,5e-324,123456789.987];
+function ops(a,b){return [a|b,a&b,a^b,a<<(b&7),a>>(b&7),a>>>(b&7),a|0,b>>>0];}
+var h=0,parts=[];
+for(var r=0;r<30;r++){for(var i=0;i<vals.length;i++){for(var j=0;j<vals.length;j++){var o=ops(vals[i],vals[j]);for(var k=0;k<o.length;k++){h=(h*31+o[k])|0;} if(r===0&&j===3)parts.push(o.join(':'));}}}
+parts.slice(0,6).join(';')+'#'+h
+"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "0:0:0:0:0:0:0:0;0:0:0:0:0:0:0:0;0:0:0:0:0:0:0:0;0:0:0:0:0:0:0:0;1:0:1:1:1:1:1:0;-1:0:-1:-1:-1:4294967295:-1:0#1641255946",
+            "tier {tier:?}"
+        );
+    }
+}

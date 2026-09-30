@@ -4872,7 +4872,7 @@ impl Interp {
             // The variable environment itself may hold body-level lexicals (our function body
             // scope carries both); a var may not hoist over one of those either.
             for &(name, _) in &var_bindings {
-                if var_env.borrow().lexical_names.iter().any(|n| n == name) {
+                if var_env.borrow().lexical_names.iter().any(|n| &**n == name) {
                     return Err(self.throw(
                         "SyntaxError",
                         format!("Identifier '{name}' has already been declared"),
