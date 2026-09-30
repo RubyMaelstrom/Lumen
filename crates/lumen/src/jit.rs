@@ -5557,6 +5557,19 @@ fn emit_call_inline(
             a.bind(l_hit);
             let with_this = matches!(op, Op::CallWithThis(..));
             let hit_slow = a.new_label();
+            let ordinary_hit = a.new_label();
+            // A user function (and an unrecognized native) has intrinsic id zero.
+            // After the live IC proof, bypass every native-id comparison at once.
+            // Keep the hit entry and way registers for the ordinary call below.
+            if with_this
+                && ((*argc == 1 && rc_ok && layout.rc_strong_off == 0)
+                    || (*argc == 0 && array_intrinsics_on)
+                    || ((1..=8).contains(argc) && function_call_intrinsic_on)
+                    || *argc == 2)
+            {
+                a.ldrb_imm(9, 12, 96);
+                a.cbz(9, false, ordinary_hit);
+            }
             // Inline intrinsics: a native entry the template can finish without
             // leaving machine code. charCodeAt on a known-ASCII receiver with an
             // exact in-bounds u32 index is a byte load — meriyah-style scanners
@@ -5905,6 +5918,7 @@ fn emit_call_inline(
                 }
                 a.bind(no_intr);
             }
+            a.bind(ordinary_hit);
             // Direct shared-ctx call: its own gate misses land on `hit_slow` =
             // the H_CALL_HIT form below.
             if direct_on {

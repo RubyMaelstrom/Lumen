@@ -345,3 +345,54 @@ fn scalar_state_inline_success_carries_clean_prefix_and_distinct_duplicates() {
         }
     }
 }
+
+#[test]
+fn scalar_state_private_homes_survive_unary_and_key_conversion_observers() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = warmed(
+            tier,
+            r#"
+            var stateRecord={x:3},stateMarker={},stateThrows=false,stateGets=0;
+            function scalarConversions(o,n,v){
+                var changed=0;
+                var key={toString(){changed++;collectScalarTest();return 'x';}};
+                var sum=0;
+                for(var i=0;i<n;i++){
+                    sum+=i+1;
+                    void v;
+                    var category=typeof v,text=`${key}`;
+                    var value=o[key],{x}=o;
+                    if(category!=='number'||text!=='x')throw 'wrong conversion';
+                    sum+=value+x+changed;
+                }
+                return sum;
+            }
+            for(var warm=0;warm<8;warm++)scalarConversions(stateRecord,4,7);
+        "#,
+        );
+        let before = GUARDED_REGIONS.with(std::cell::Cell::get);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+                var good=true;
+                for(var r=0;r<8;r++)good=scalarConversions(stateRecord,4,NaN)===54&&good;
+                Object.defineProperty(stateRecord,'x',{get(){
+                    stateGets++;collectScalarTest();if(stateThrows)throw stateMarker;return 5;
+                }});
+                good=scalarConversions(stateRecord,4,-0)===70&&stateGets===8&&good;
+                stateThrows=true;
+                try{scalarConversions(stateRecord,4,Infinity);good=false;}
+                catch(e){good=e===stateMarker&&stateGets===9&&good;}
+                good;
+                "#,
+            ),
+            "true",
+            "{tier:?}"
+        );
+        if tier == Tier::Jit {
+            let after = GUARDED_REGIONS.with(std::cell::Cell::get);
+            assert!(after[0] > before[0], "actual native region execution");
+        }
+    }
+}

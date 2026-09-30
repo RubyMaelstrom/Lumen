@@ -584,6 +584,13 @@ fn frame_effect(op: &Op) -> FrameEffect {
         | Op::MakeRegExp(..)
         | Op::New(..)
         | Op::InstanceOf(..)
+        | Op::Void
+        | Op::Typeof
+        | Op::TypeofIs(..)
+        | Op::TypeofName(..)
+        | Op::ToStr
+        | Op::ToPropKey
+        | Op::DestructureGuard
         | Op::Not
         | Op::Pop
         | Op::Dup
@@ -594,7 +601,8 @@ fn frame_effect(op: &Op) -> FrameEffect {
         | Op::SetPropLocalDrop(slot, ..)
         | Op::GetElemLocal(slot)
         | Op::SetElemLocal(slot)
-        | Op::SetElemLocalDrop(slot) => FrameEffect::Read(slot),
+        | Op::SetElemLocalDrop(slot)
+        | Op::ToPropKeyLocal(slot) => FrameEffect::Read(slot),
         Op::StoreLocal(slot) | Op::UpdateLocal(slot, _) => FrameEffect::Write(slot),
         _ => FrameEffect::Full,
     }

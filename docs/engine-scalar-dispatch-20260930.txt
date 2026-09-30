@@ -1,0 +1,62 @@
+Scalar dispatch and private homes — 30 September 2026
+===================================================
+
+After the live ARM64 call-cache identity, epoch and realm proof, intrinsic id
+zero bypasses the native intrinsic comparisons. Ordinary user functions and
+unrecognized natives continue through their existing direct/checked calls.
+The branch is emitted only where intrinsic dispatch exists; argument ownership,
+callee identity, call frames, tier admission, exception and GC boundaries stay
+unchanged. Recognized natives retain every existing receiver/argument guard.
+
+The baseline SSA region effect allowlist now distinguishes Void, Typeof/Is/Name,
+ToStr, ToPropKey and DestructureGuard from operations that can change private
+caller slots. ToPropKeyLocal publishes just its inspected receiver slot.
+Canonical operand owners remain published, heap facts invalidate at effects,
+and error paths publish all numeric homes. CaptureScan places bindings visible
+to closures/eval/mapped arguments in Environment Records; those are not private
+numeric slot homes. A conversion may mutate heap/environment state, but cannot
+change a proven unexposed caller slot. Unknown operations retain full barriers.
+No helper/conversion is skipped or repeated; x64 retains checked execution.
+
+Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:5706, :5754,
+:20614 and :20631, plus the existing private-frame environment contract.
+ToString and ToPropertyKey preserve ordered author conversions/throws; void
+still performs GetValue; typeof keeps language-category behavior. Official clauses:
+https://tc39.es/ecma262/#sec-tostring
+https://tc39.es/ecma262/#sec-topropertykey
+https://tc39.es/ecma262/#sec-void-operator-runtime-semantics-evaluation
+https://tc39.es/ecma262/#sec-typeof-operator-runtime-semantics-evaluation
+The consulted local snapshot was not verified against current upstream text.
+
+One new regression exercises all ordinary tiers and actual native region entry,
+with captured binding mutation during string/key conversions, forced collection,
+Number/NaN/signed-zero inputs, changed field accessors and exact throw/effect
+counts. The initial fixture passed but forced excessive collections; its repeats
+were reduced without removing any case or native-entry assertion. All 1,591
+engine library tests, strict engine all-target Clippy and optional optimizing-jit
+all-target compilation pass. No fresh workspace-wide, Test262, x64/wasm or
+optional-backend execution is claimed.
+
+Four balanced fresh-process pairs on crystal ARM64 CPU5 use ordinary release JIT,
+default Intl, opt3/fat LTO/codegen-units1/panic-abort and cleared switches. Baseline
+is committed cycle17, 6a1e21a. Exact application outputs match, including single
+Node references. React reducer 115.5 ->115.5ms (paired interval .98481–1.01107),
+Djot 297.5 ->291.5ms (-2.02%; .95060–1.00841), complete solver process time
+8362.97 ->8305.27ms (0.69% lower; .98782–.99907) and Vue reactivity
+752 ->748.5ms (-0.47%; .99132–1.00005). Only the solver primary interval
+excludes parity. These are small improvements, not a major general engine gain.
+The scoped drivers are not full browser benchmark results.
+
+Separate four balanced Linux wait4 peak pairs report React 23,440 ->23,066 KiB
+(-1.60%; .93516–1.05233), Djot 54,204 ->55,244 KiB (+1.92%;
+.99709–1.04191), solver 638,500 ->641,232 KiB (+0.43%; .99521–1.00900)
+and Vue 43,528 ->43,666 KiB (+0.32%; .96061–1.03681). All peak intervals
+span parity; no memory or post-GC retained-memory benefit is claimed. No timing
+or peak component crosses the combined regression gate.
+
+The release build takes 3m39s; binary size increases 256 bytes. Full sources,
+patch, artifacts, outputs, distributions and check logs are preserved under
+benchmark-results/engine-cycle18-20260930. No owned build/test/profile overlaps
+acceptance timing/peak runs. Subsequent logical-frame work is isolated from
+measured/staged sources. Installed/accepted artifacts remain unchanged.
