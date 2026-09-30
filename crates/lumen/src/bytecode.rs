@@ -19686,6 +19686,15 @@ thread_local! {
     pub(crate) static TEST_JIT_EXEC_ELEMENT_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    pub(crate) static TEST_JIT_TO_STR_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static TEST_JIT_DESTRUCTURE_GUARD_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(crate) static TEST_JIT_VOID_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     pub(crate) static TEST_JIT_TYPEOF_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -21089,6 +21098,8 @@ unsafe fn jit_exec_inner(
             )?;
         }
         Op::DestructureGuard => {
+            #[cfg(test)]
+            TEST_JIT_DESTRUCTURE_GUARD_HELPERS.with(|count| count.set(count.get() + 1));
             if matches!(&(*sp.sub(1)).unpack(), Value::Undefined | Value::Null) {
                 return Err(i.throw("TypeError", "cannot destructure null or undefined"));
             }
@@ -21470,6 +21481,8 @@ unsafe fn jit_exec_inner(
             push!(Value::Bool(i.typeof_matches(&value, test) ^ negate));
         }
         Op::Void => {
+            #[cfg(test)]
+            TEST_JIT_VOID_HELPERS.with(|count| count.set(count.get() + 1));
             pop!();
             push!(Value::Undefined);
         }
@@ -21713,6 +21726,8 @@ unsafe fn jit_exec_inner(
             push!(i.new_target_vm(env));
         }
         Op::ToStr => {
+            #[cfg(test)]
+            TEST_JIT_TO_STR_HELPERS.with(|count| count.set(count.get() + 1));
             let v = pop!();
             let s = i.to_string(&v)?;
             push!(Value::Str(s));

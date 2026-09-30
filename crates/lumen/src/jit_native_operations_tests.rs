@@ -236,3 +236,164 @@ fn native_operations55_effects_keep_receiver_order_and_abrupt_completion() {
         assert_eq!(evaluate(&mut engine, "trace='';fail=true;var same=false;try{observed(target,key,2)}catch(e){same=e===token}[same,trace,target.value].join('|')"), "true|kg|6", "{tier:?}");
     }
 }
+
+#[test]
+fn native_void_releases_scalars_and_shared_owners_without_a_general_helper() {
+    let mut engine = prepared(
+        Tier::Jit,
+        "function nativeVoid(v){return void v;}nativeVoid(7);",
+    );
+    evaluate(&mut engine, "for(var warm=0;warm<64;warm++)nativeVoid(7);");
+    let env = engine.interp.global_env.clone();
+    let crate::value::Value::Obj(object) = engine
+        .interp
+        .get_var("nativeVoid", &env)
+        .unwrap_or_else(|_| panic!("fixture binding exists"))
+    else {
+        panic!("fixture is callable")
+    };
+    let object = object.borrow();
+    let crate::value::Callable::User(user) = &object.call else {
+        panic!("ordinary fixture")
+    };
+    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
+    drop(object);
+    let before = crate::bytecode::TEST_JIT_VOID_HELPERS.with(std::cell::Cell::get);
+    assert_eq!(evaluate(&mut engine,
+        "var xs=[undefined,null,true,7,NaN,-0,Infinity,-Infinity,'wide é',Symbol(),{},function(){}];var ok=true;for(var k=0;k<xs.length;k++)ok=ok&&nativeVoid(xs[k])===undefined;ok"),"true");
+    assert_eq!(
+        crate::bytecode::TEST_JIT_VOID_HELPERS.with(std::cell::Cell::get),
+        before
+    );
+}
+
+#[test]
+fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
+    use std::{cell::Cell, rc::Rc};
+    struct Probe(Rc<Cell<usize>>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = prepared(
+            tier,
+            r#"
+            function nativeVoid(v){return void v;}
+            function observedVoid(o,k){return void o[k];}
+            function temporaryVoid(){return void makeVoidTemp();}
+            for(var warm=0;warm<64;warm++)nativeVoid(7);
+        "#,
+        );
+        let drops = Rc::new(Cell::new(0));
+        let count = drops.clone();
+        let make = engine.interp.make_native_closure(
+            "makeVoidTemp",
+            0,
+            Rc::new(move |i, _, _| {
+                let probe = Probe(count.clone());
+                let object = crate::value::Object::new(Some(i.object_proto.clone()));
+                object.borrow_mut().call =
+                    crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
+                        body: crate::value::NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
+                            let _ = &probe;
+                            Ok(crate::value::Value::Undefined)
+                        })),
+                        retained: None,
+                        identity: Rc::from("void-owner-test"),
+                    }));
+                Ok(crate::value::Value::Obj(object))
+            }),
+        );
+        engine.interp.global.borrow_mut().props.insert(
+            "makeVoidTemp",
+            crate::value::Property::plain(crate::value::Value::Obj(make)),
+        );
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            var trace='',marker={},fail=false;
+            var o={get value(){trace+='g';if(fail)throw marker;return {valueOf(){trace+='v';return 1}};}};
+            var key={toString(){trace+='k';return 'value'}};
+            var first=observedVoid(o,key),same=false;
+            fail=true;try{observedVoid(o,key)}catch(e){same=e===marker;}
+            [first===undefined,same,trace,nativeVoid(1n)===undefined].join('|')
+        "#
+            ),
+            "true|true|kgkg|true",
+            "{tier:?}"
+        );
+        let before = crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get);
+        assert_eq!(evaluate(&mut engine, "temporaryVoid()===undefined"), "true");
+        assert_eq!(drops.get(), 1, "last owner is destroyed at void, {tier:?}");
+        if tier == Tier::Jit {
+            assert!(
+                crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get) > before,
+                "the last owner uses checked destruction"
+            );
+        }
+        engine.interp.gc_collect();
+        assert_eq!(drops.get(), 1);
+    }
+}
+
+#[test]
+fn native_string_identity_and_destructuring_guards_preserve_observers() {
+    let source = r#"
+        function plainTemplate(v){return `${v}`;}
+        function emptyPattern(v){const {}=v;return 3;}
+        for(var warm=0;warm<64;warm++){plainTemplate('warm é');emptyPattern({});}
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = prepared(tier, source);
+        let strings = crate::bytecode::TEST_JIT_TO_STR_HELPERS.with(std::cell::Cell::get);
+        let guards = crate::bytecode::TEST_JIT_DESTRUCTURE_GUARD_HELPERS.with(std::cell::Cell::get);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            var xs=[false,7,NaN,'é',Symbol(),1n,{},function(){}];var ok=true;
+            for(var k=0;k<xs.length;k++)ok=ok&&emptyPattern(xs[k])===3;
+            ok&&plainTemplate('A\uD800\uDFFFé')==='A\uD800\uDFFFé'
+        "#
+            ),
+            "true",
+            "{tier:?}"
+        );
+        if tier == Tier::Jit {
+            assert_eq!(
+                crate::bytecode::TEST_JIT_TO_STR_HELPERS.with(std::cell::Cell::get),
+                strings
+            );
+            assert_eq!(
+                crate::bytecode::TEST_JIT_DESTRUCTURE_GUARD_HELPERS.with(std::cell::Cell::get),
+                guards
+            );
+        }
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            var trace='',marker={},failure=false;
+            var converting={[Symbol.toPrimitive](hint){trace+=hint;if(failure)throw marker;return 'converted';}};
+            var first=plainTemplate(converting),same=false;
+            failure=true;try{plainTemplate(converting)}catch(e){same=e===marker;}
+            var nullish=0,symbols=0;
+            for(var v of [undefined,null])try{emptyPattern(v)}catch(e){if(e instanceof TypeError)nullish++;}
+            try{plainTemplate(Symbol())}catch(e){if(e instanceof TypeError)symbols++;}
+            [first,same,trace,nullish,symbols,plainTemplate(-0),plainTemplate(1n)].join('|')
+        "#
+            ),
+            "converted|true|stringstring|2|1|0|1",
+            "{tier:?}"
+        );
+        engine.interp.gc_collect();
+        assert_eq!(
+            evaluate(&mut engine, "emptyPattern({})+plainTemplate('')"),
+            "3"
+        );
+    }
+}

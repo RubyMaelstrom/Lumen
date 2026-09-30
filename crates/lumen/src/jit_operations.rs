@@ -544,6 +544,46 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
+        Op::DestructureGuard if fast & 1024 != 0 => {
+            let slow = a.new_label();
+            let done = a.new_label();
+            emit_exec_word_load(a, 9, 20, -8);
+            a.mov_imm64(10, crate::value::PACK_UNDEFINED);
+            a.cmp_reg_x(9, 10);
+            a.b_cond(C_EQ, slow);
+            a.mov_imm64(10, crate::value::PACK_NULL);
+            a.cmp_reg_x(9, 10);
+            a.b_cond(C_NE, done);
+            a.bind(slow);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
+        }
+        Op::ToStr if fast & 1024 != 0 => {
+            // ToString(String) returns the existing value. Keep its canonical owner
+            // in place; observable conversions and Symbol failures remain checked.
+            let slow = a.new_label();
+            let done = a.new_label();
+            emit_exec_word_load(a, 9, 20, -8);
+            emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 10, slow);
+            a.b(done);
+            a.bind(slow);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
+        }
+        Op::Void if fast & (64 | 128) == (64 | 128) && rc_ok => {
+            // GetValue/effects already ran. Release the consumed owner exactly as Pop,
+            // retaining checked destruction for last owners, then return undefined.
+            let slow = a.new_label();
+            let done = a.new_label();
+            emit_exec_word_load(a, 9, 20, -8);
+            emit_exec_drop_shared(a, layout, 9, 10, 11, slow);
+            a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+            emit_exec_word_store(a, 9, 20, -8);
+            a.b(done);
+            a.bind(slow);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
+        }
         Op::Undef if fast & 128 != 0 => {
             a.mov_imm64(9, crate::value::PACK_UNDEFINED);
             emit_exec_word_store(a, 9, 20, 0);

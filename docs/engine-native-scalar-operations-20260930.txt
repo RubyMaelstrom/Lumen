@@ -1,0 +1,70 @@
+Native scalar operation coverage — 30 September 2026
+==================================================
+
+The complete YouTube solver's prior helper trace contains 359,569 Void
+operations at fn(e,t) pc10. This label identifies a compiled body's local
+names, not a source function name. The patch adds compact native handling
+for three established bytecodes in the shared ARM64 baseline/SSA emitter.
+Void consumes a scalar or surviving shared owner and stores undefined.
+Last-owned values and BigInt retain checked destruction. ToStr leaves an
+already-String canonical operand in place, eliminating a helper and a
+retain/drop pair. Other conversions remain observable checked operations.
+DestructureGuard checks the two nullish words directly; its failure uses
+the existing exact-PC TypeError path. No inlining admission, call activation,
+object layout, value representation or VM opcode contract is changed.
+x64 keeps its established checked operations. The optional whole-function
+compiler is neither enabled nor changed by this patch.
+
+The focused native module passes 8 tests. Three new regressions check native
+scalar/shared-owner execution, last-owner native capture destruction, getter
+and key effects, throws, Symbol conversion failure, BigInt/signed-zero strings,
+short Unicode/surrogates and object-destructuring nullish errors across all
+three tiers. Test-only counters prove execution of the intended native cases
+and checked final destruction. All 1,581 engine library tests, strict engine
+all-target Clippy and all-target optimizing-jit compilation pass. An initial
+test build failed because a fixture used unwrap on a non-Debug error type;
+the corrected checked lookup and later passing logs are retained. No fresh
+Test262, x64/wasm execution or optional-backend execution result is claimed.
+
+Consulted local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:20611 (void operator),
+:5704 (ToString), :5862 (RequireObjectCoercible), :21522 (destructuring
+assignment) and GetValue. Operand GetValue and effects must still execute;
+a String conversion returns its input; only null/undefined fail the guard.
+Official clauses:
+https://tc39.es/ecma262/#sec-void-operator-runtime-semantics-evaluation
+https://tc39.es/ecma262/#sec-tostring
+https://tc39.es/ecma262/#sec-requireobjectcoercible
+https://tc39.es/ecma262/#sec-runtime-semantics-destructuringassignmentevaluation
+This is the consulted snapshot, not verified current upstream text.
+
+Four balanced fresh-process pairs on crystal ARM64 CPU5 use ordinary release
+JIT, default Intl, opt3/fat LTO/codegen-units1/panic-abort and cleared runtime
+switches. Baseline production matches b1c975f; preceding HEAD is 9014c6e
+(report-only cycles10–13 are excluded). Complete outputs match, including
+one Node v24.21.0 reference per workload. React's reducer-only measured
+workflow is 116.5 ->117ms (+0.43%; paired ratio interval .97132–1.02979).
+Djot's document conversion is 306 ->303ms (0.98% lower; .98665–.99702).
+Complete solver process time is 8607.39 ->8598.18ms (0.11% lower;
+.99198–1.00535). Vue reactivity control is 749 ->747.5ms (0.20% lower;
+.99209–1.00326). Djot's small benefit excludes parity; the other intervals
+include it. These drivers are not full browser benchmark results, and the
+Node observations are not comparison distributions. No timing gate fails.
+This is a modest coverage improvement, not the requested major engine gain.
+
+Separate four balanced peak-RSS pairs report React 22,598 ->23,508 KiB
+(+4.03%; paired ratio interval .90235–1.15358), Djot 55,034 ->54,864 KiB
+(-0.31%; .97968–1.01008), solver 639,196 ->638,428 KiB (-0.12%;
+.99065–1.00964), and Vue 43,922 ->43,930 KiB (+0.02%; .98190–1.01713).
+Every interval spans parity. React's median rise exceeds 3%, but does not
+satisfy the combined median-and-confidence regression rule. No memory
+benefit or post-GC retained-memory result is claimed. All peak-run outputs
+match; no timing or peak gate fails.
+
+The release binary is 256 bytes larger, and the build completes in 3m29s.
+No owned build/test/profile overlaps timing or peak runs; desktop applications
+remain active. Exact measured sources are staged separately from the next
+codePointAt experiment in the working tree. Source, binaries, full outputs,
+checks and distributions remain under benchmark-results/engine-cycle14-20260930.
+The tracked manifest records their hashes and condensed samples. No installed
+or accepted artifact is replaced.
