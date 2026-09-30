@@ -1,0 +1,179 @@
+Closed numeric/string advance calls — 30 September 2026
+=======================================================
+
+Decision: the scalar call prototype was reverted after a negative full-solver
+comparison. The following implementation describes the frozen experiment.
+
+Cycle19's logical-frame growth recorded 3,172,414 entry and exit helpers in
+the complete EJS solver without a convincing solver improvement. Source
+inspection associates a hot family with Meriyah's tiny advance function:
+return e.column++, e.currentChar=e.source.charCodeAt(++e.index).
+The names are incidental. The compiler proof recognizes the complete
+strict ordinary body: two distinct own field increments, a primitive-string
+field's exact charCodeAt, a distinct result-field assignment and return.
+This is a whole-body checked call specialization, not broader AST inlining.
+
+Chunk caches the bounded positive/negative structural proof. A bit in the
+existing CallIc directs admitted bodies through the checked shared Rust
+helper; ARM64 shared-frame calls remain disabled only for those bodies. The
+CallIc layout, object/value representation and executable memory contract
+are unchanged. The new plan cell adds 16 bytes per native Chunk; positive
+plans own no object, string or AST references and charge their Box storage
+in retained-memory accounting. All original body instructions and native
+code remain available for every miss.
+
+Every execution validates a current ordinary receiver, four distinct live
+own data descriptors, Number increment inputs, a Number result field, a
+primitive String source, writable destinations and the live exact native
+charCodeAt method in the current realm. Shapes cache slot positions only;
+attribute/value changes remain checked. Method replacement, getters, setters,
+proxies, inherited fields, wrappers, conversions and unsupported bodies
+retain the full call before any body effect. The method's own slot guard
+handles String.prototype's String-wrapper exotic by its named data property,
+never by an index/length shortcut. Property-only deferred values decline
+before unpacking; guards cannot materialize a lazy function prototype.
+
+Successful bodies have no JS/GC observer of an omitted call frame. The
+argument stays owned on the canonical operand stack plus a local snapshot;
+an additional live receiver owner is required, retaining the ordinary
+frame for last-owner parameter destruction. Only one-argument calls with
+an undefined this value use the shortcut: the ordinary moved entry releases
+unused receiver/surplus owners before the body, and host destructors can
+observe that order. A real host closure destructor regression verifies it.
+The checked helper preserves the packed consume-on-completion call contract.
+
+Due GC ticks, allocation pressure, physical stack exhaustion, pending tail
+work and already pending interrupts retain full execution. Success preserves
+the callee/native call GC cadence and both physical stack checkpoints,
+performs both Number increments before
+the native entry/exit interrupt checks, and publishes the result only after
+those checks. UTF-16 reads use the existing owning bounded cache. They
+allocate no GC object and run no author code. Full fallback maintains the
+logical Function/Realm/context for any observer or exception. This is not
+an optimizing-tier feature or a production change to the old AST inliner.
+
+Consulted local official ECMA-262 snapshot
+ e28783d5fc9dc12b3de905961e2c71410b38a202,
+ /big/web-standards/repositories/tc39/ecma262/spec.html:13449
+ (OrdinarySetWithOwnDescriptor), :36251 (charCodeAt), :13860
+ (PrepareForOrdinaryCall), :19922 (EvaluateCall), :12900 (Liveness).
+ Own writable data destinations need no setter/prototype observation;
+ charCodeAt reads UTF-16 code units, with ToIntegerOrInfinity, NaN and
+ out-of-range behavior retained. Observing paths still require Call.
+ https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor
+ https://tc39.es/ecma262/#sec-string.prototype.charcodeat
+ https://tc39.es/ecma262/#sec-prepareforordinarycall
+ https://tc39.es/ecma262/#sec-evaluatecall
+ https://tc39.es/ecma262/#sec-liveness
+ This is the consulted snapshot, not verified current upstream text.
+
+Five focused regressions pass, including actual native shortcut execution.
+They cover both directive/inherited strictness, whole-body/alias rejection,
+ASCII/Unicode/astral/lone-surrogate/view inputs, fractional/negative/infinite/
+NaN indexes, signed zero, fallback under due GC/allocation pressure, getters,
+setters, native method replacement/accessors, error stacks, proxies, inherited
+fields, BigInt conversion failures, wrapper sources, read-only partial effects,
+constructor calls and unused/surplus/last-parameter host owner boundaries.
+A native recursion/resource-unwind regression also verifies that both
+callee and builtin physical stack checkpoints remain intact. All 1596
+default engine library tests, strict all-target engine Clippy,
+optimizing-jit all-target compilation, workspace all-target compilation,
+format and diff checks pass. The initial bytecode-shape fixture failed to
+compile by asking ParseError for Debug via unwrap; repaired logs are retained.
+No fresh Test262, x64/wasm or optional optimizer execution is claimed.
+
+Base production engine: 74df1bb. Source HEAD 4c8ed37 changes only reports
+since cycle18; every preceding inventoried engine file matches that HEAD.
+Candidate exact staged patch SHA256:
+ ffd2dbb75523f19000b5c2576f2ce3bdc4cdda9764754d9515d0c4da1109f23d
+Baseline release SHA256:
+ 3ea7f67ecd934d13fce51500c35c8829fb7a5ab9af08f3fd62fe714d3c18b30f
+25,109,848 bytes. Full source inventories/snapshots and the exact staged
+patch are under benchmark-results/engine-cycle20-v2-20260930.
+The unmeasured v1 source/artifact/checks remain in engine-cycle20-20260930;
+v2 retains both physical stack checkpoints instead of checking only the
+combined depth. A v2 initial full run passed 1595 and missed the existing
+codePointAt intrinsic-count assertion. Its isolated recheck, paired recursion
+recheck and diagnostic full 1596-test run passed. The process-global cache
+epoch may be invalidated by parallel engines; the test now still requires
+all 120 native entries in one batch, retrying at most eight batches only
+on an observed epoch change. Stable-epoch misses fail immediately. The
+first failure did not record epoch/hit details, so a race is the source-based
+explanation, not a directly observed cause of that first failure. Final
+engine/Clippy/optional/workspace/format/diff checks all pass on frozen v2.
+
+Four fresh balanced application pairs: crystal Linux ARM64 CPU5, ordinary
+release template JIT, default Intl, opt3/fat LTO/codegen-units1/panic-abort,
+LUMEN_*/TRUST_*/LD_PRELOAD removed. Node v24.21.0 / V8 13.6.233.17-node.53
+supplies one reference per workload, not a comparison distribution. Inputs
+are unchanged pinned Djot@0.3.2 rendering, complete examples/ejs/code.js solver,
+Speedometer React TodoMVC reducer and Vue reactivity drivers. React/Vue are
+component measurements, not complete browser application scores. Exact
+normalized outputs must agree. Paired-log Student-t 95% intervals use four
+samples. Process wall/CPU and separate Linux wait4 peak RSS are evaluated
+independently. No post-GC, pause or isolated native compilation claim.
+Desktop applications remain active; no owned build/test/profile overlaps
+the acceptance timing or separate peak measurements.
+
+Decision: revert the prototype. The full solver is 1.38% slower, with a
+paired interval excluding parity. No independent combined 3% timing/CPU/peak
+regression gate is crossed, but this does not meet the intended solver gain.
+All engine and test changes were removed; only this report and manifest are
+retained. The workspace release binary is restored to the exact baseline.
+
+Measured application medians and candidate/baseline paired 95% intervals:
+
+ react: 115.50 -> 116.00 ms; reduction -0.43%; ratio 0.98319-1.03024.
+ djot: 290.00 -> 296.50 ms; reduction -2.24%; ratio 0.98677-1.03976.
+ ejs: 8274.50 -> 8388.44 ms; reduction -1.38%; ratio 1.01179-1.01494.
+ vue: 755.00 -> 745.50 ms; reduction +1.26%; ratio 0.98038-0.99850.
+
+The solver interval is 1.01179-1.01494. Vue elapsed falls 1.26%, with
+its interval excluding parity; React/Djot primary intervals include parity.
+Every process wall/user/system CPU component was checked independently.
+None crosses the combined stable-component regression gate.
+
+Separate peak RSS medians in KiB:
+
+ react: 23208 -> 23296; change +0.38%; ratio 0.97738-1.02107.
+ djot: 54900 -> 55080; change +0.33%; ratio 0.99890-1.00795.
+ ejs: 639072 -> 640402; change +0.21%; ratio 0.98670-1.01501.
+ vue: 43756 -> 44198; change +1.01%; ratio 0.96810-1.05621.
+
+Every peak interval includes parity. All 36 timing/reference runs and
+32 separate peak runs finish with identical normalized application output.
+
+Final candidate release SHA256:
+ 92b506461f0b6b5a85e317668c824bc098d64632d65a2e6143df9e4b3d01e87e
+ 25,123,024 bytes; build 229.31s.
+No fresh baseline build distribution or isolated compilation comparison is
+claimed. Baseline binary is the preceding cycle18 release artifact.
+
+One instrumented full solver execution per artifact follows all acceptance
+runs. Baseline SetProp helper count 2,770,681 becomes zero; CallWithThis
+helper count 918,724 becomes 3,685,608. These are fallback helper counts,
+not every native operation. They support body work bypass and the additional
+checked caller-dispatch traffic; they do not directly count shortcut entries
+or establish a causal time fraction. The shortcut disables ARM64 shared-frame
+direct calls for recognized bodies and adds live Rust receiver/method/field
+guards. It trades the assignment helper for the checked outer-call helper.
+No net solver benefit pays for that trade in the ordinary uninstrumented runs.
+
+Instrumented generated code totals match at 59,435,308 bytes. Largest code
+40,871,936 -> 40,871,952 bytes; 271 compilation successes on each artifact.
+Observed JIT compilation 0.43325 -> 0.41814 seconds is one instrumented
+functional observation only. No compilation speedup acceptance is claimed.
+
+The source/test rollback was checked against all 236 baseline inventory
+entries, including absence of the new scalar module. The restored workspace
+binary matches 3ea7f67ecd934d13fce51500c35c8829fb7a5ab9af08f3fd62fe714d3c18b30f.
+The candidate passed 1596 tests. The retained production source remains the
+previously checked cycle18 source with 1591 tests; no new test coverage is
+claimed after removing the five prototype regressions and counter rework.
+
+Next implementation direction: keep the established shared-frame native
+call path when specializing closed body operations, rather than forcing
+every hot call through the generic checked caller helper. Broader admission
+alone is not justified by these results. This is a direction, not a result.
+
+No installed or accepted release artifact is replaced.
