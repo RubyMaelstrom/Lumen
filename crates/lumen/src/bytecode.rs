@@ -20089,7 +20089,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
         let nf: crate::value::NativeFn = std::mem::transmute(ic.native);
         i.call_native_committed(nf, this_slot, args_ptr, argc)
     } else {
-        i.call_jit_committed(ic, code.as_deref().unwrap(), this_slot, args_ptr, argc)
+        i.call_jit_committed(&ic, code.as_deref().unwrap(), this_slot, args_ptr, argc)
     };
     // Arguments and `this` were moved; pop them virtually and drop only the callee slot
     // (same ownership story as jit_call_inner's Some arm).

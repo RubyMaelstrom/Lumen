@@ -174,8 +174,8 @@ impl Lowering<'_, '_> {
         let value = self.packed_number(number);
         self.b.ins().jump(done, &[value.into()]);
         self.b.switch_to_block(boolean);
-        let bit = self.b.ins().ushr_imm_u(tag_word, 8);
-        let bit = self.b.ins().band_imm_s(bit, 1);
+        // Value::Bool keeps its byte at the payload offset; the rest of that word is padding.
+        let bit = self.b.ins().band_imm_s(payload, 1);
         let value = self.b.ins().bor_imm_s(bit, PACK_BOOL as i64);
         self.b.ins().jump(done, &[value.into()]);
         self.b.switch_to_block(done);

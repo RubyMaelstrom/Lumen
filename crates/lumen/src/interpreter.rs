@@ -885,6 +885,14 @@ pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
 
 pub type Env = Rc<RefCell<Scope>>;
 
+/// A callee resolved once for a run of calls from one native algorithm; see
+/// [`Interp::prepare_call`].
+pub(crate) struct PreparedCall {
+    ic: crate::bytecode::CallIc,
+    /// Machine-code lease for a compiled user entry; `None` for a native entry.
+    code: Option<Rc<crate::jit::JitCode>>,
+}
+
 /// One entry of the legacy `fn.caller`/`fn.arguments` reflection stack (see `call_user`). The
 /// arguments object materializes lazily: a body that never names `arguments` skips building it,
 /// and `lazy` keeps what a later reflective read needs to conjure it on demand.
@@ -6622,6 +6630,20 @@ impl Interp {
         true
     }
 
+    /// HasProperty + Get of element `index` for an ordinary Array or object whose element is an
+    /// own present data property: the value, packed. A set `ic_plain` byte excludes every
+    /// side-table internal method (Proxy, typed array, namespace, Web IDL indexed object), and
+    /// the `exotic` check excludes arguments/wrapper objects. `None` routes the caller to the
+    /// general algorithms (holes consult the prototype chain there).
+    #[inline]
+    pub(crate) fn plain_own_element_packed(object: &Gc, index: u32) -> Option<PackedValue> {
+        let body = object.borrow();
+        if !body.ic_plain.get() || !matches!(body.exotic, Exotic::Array | Exotic::None) {
+            return None;
+        }
+        body.props.own_element_data_packed(index)
+    }
+
     /// `o[n]` read fast path: a dense data element or a Number-content TypedArray index, without
     /// stringifying the index. `None` means "take the generic path", never "absent".
     #[inline]
@@ -6629,20 +6651,27 @@ impl Interp {
         if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
             return None;
         }
-        if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)) {
-            // ECMA-262 ToPropertyKey + TypedArrayGetElement (snapshot e28783d5fc9d): a
-            // non-negative integral Number already identifies the element. Numeric -0 becomes
-            // the key "0"; the distinct string "-0" still goes through the generic path.
-            // The identity map cannot match a Proxy wrapping a TypedArray. ta_read retains
-            // detach/resize bounds and shared-memory synchronization. BigInt views stay on
-            // the general path: speculative numeric UpdateElem callers would discard that
-            // result and read again, which must not add a shared-memory read event.
-            return (!info.kind.is_bigint()).then(|| self.ta_read(info, n as usize));
-        }
-        if !self.plain_non_typed_for_elems(o) {
+        let mut b = o.borrow();
+        // A set `ic_plain` byte proves no side-table internal methods (see `object_ic_plain`).
+        if !b.ic_plain.get() {
+            drop(b);
+            if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)) {
+                // ECMA-262 ToPropertyKey + TypedArrayGetElement (snapshot e28783d5fc9d): a
+                // non-negative integral Number already identifies the element. Numeric -0
+                // becomes the key "0"; the distinct string "-0" still goes through the generic
+                // path. The identity map cannot match a Proxy wrapping a TypedArray. ta_read
+                // retains detach/resize bounds and shared-memory synchronization. BigInt views
+                // stay on the general path: speculative numeric UpdateElem callers would discard
+                // that result and read again, which must not add a shared-memory read event.
+                return (!info.kind.is_bigint()).then(|| self.ta_read(info, n as usize));
+            }
+            if !self.plain_non_typed_for_elems(o) {
+                return None;
+            }
+            b = o.borrow();
+        } else if !matches!(b.exotic, Exotic::Array | Exotic::None) {
             return None;
         }
-        let b = o.borrow();
         // One-load mirror hit (see `Props::mirror`); a miss only means "answer classically".
         if let Some(f) = b.props.mirror_get(n as u32) {
             return Some(Value::Num(f));
@@ -6664,21 +6693,25 @@ impl Interp {
         }
         // A Proxy/typed array/module/host object owns a different [[Set]] algorithm.  Do this
         // identity check before probing the ordinary property storage so a future side-table
-        // representation cannot accidentally bypass its trap or backing store.
-        if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied() {
-            // TypedArraySetElement converts the value before checking current bounds. Only an
-            // already-numeric value on a Number-content view can bypass that observable step;
-            // coercions, BigInt content and immutable-buffer errors retain the general path.
-            if let Value::Num(value) = v {
-                if !info.kind.is_bigint() && !self.immutable_buffers.contains(&info.buffer) {
-                    self.ta_write(&info, n as usize, value);
-                    return Ok(());
+        // representation cannot accidentally bypass its trap or backing store. A set
+        // `ic_plain` byte proves the object is in none of those tables.
+        if !o.borrow().ic_plain.get() {
+            if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied() {
+                // TypedArraySetElement converts the value before checking current bounds. Only
+                // an already-numeric value on a Number-content view can bypass that observable
+                // step; coercions, BigInt content and immutable-buffer errors retain the
+                // general path.
+                if let Value::Num(value) = v {
+                    if !info.kind.is_bigint() && !self.immutable_buffers.contains(&info.buffer) {
+                        self.ta_write(&info, n as usize, value);
+                        return Ok(());
+                    }
                 }
+                return Err(v);
             }
-            return Err(v);
-        }
-        if !self.non_typed_ordinary_get_ptr(Rc::as_ptr(o) as usize) {
-            return Err(v);
+            if !self.non_typed_ordinary_get_ptr(Rc::as_ptr(o) as usize) {
+                return Err(v);
+            }
         }
         let n = n as u32;
         let mut b = o.borrow_mut();
@@ -6722,10 +6755,7 @@ impl Interp {
         match result {
             Ok(()) => {
                 if n as f64 >= old_len {
-                    b.props
-                        .get_mut("length")
-                        .expect("array has own length")
-                        .set_value(Value::Num(n as f64 + 1.0));
+                    b.props.set_array_length_value(n as f64 + 1.0);
                 }
                 Ok(())
             }
@@ -7535,12 +7565,45 @@ impl Interp {
     /// common case in a hot loop.
     #[inline]
     pub(crate) fn ordinary_get_ptr(&self, ptr: usize) -> bool {
+        if Self::object_ic_plain(ptr) {
+            debug_assert!(self.side_table_ordinary_get_ptr(ptr));
+            return true;
+        }
+        self.side_table_ordinary_get_ptr(ptr)
+    }
+
+    #[inline]
+    fn side_table_ordinary_get_ptr(&self, ptr: usize) -> bool {
         (self.typed_arrays.is_empty() || !self.typed_arrays.contains_key(&ptr))
-            && self.non_typed_ordinary_get_ptr(ptr)
+            && self.side_table_non_typed_ordinary_get_ptr(ptr)
+    }
+
+    /// An object whose [[Get]]/[[Set]] behavior lives in an interpreter side table (Proxy,
+    /// typed array, module namespace, Web IDL indexed host object) always has its `ic_plain`
+    /// byte cleared at registration, and that byte is never set again. A set byte therefore
+    /// proves the object is in none of those tables with one load instead of several hash
+    /// probes. A clear byte (including an object currently borrowed mutably) is only a hint.
+    ///
+    /// `ptr` must be the address of a live object (`Rc::as_ptr` of a held `Gc`).
+    #[inline(always)]
+    fn object_ic_plain(ptr: usize) -> bool {
+        let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
+        // The shared reference ends before this returns, and a mutable borrow elsewhere makes
+        // this conservatively report "not proven plain".
+        matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if object.ic_plain.get())
     }
 
     #[inline]
     fn non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
+        if Self::object_ic_plain(ptr) {
+            debug_assert!(self.side_table_non_typed_ordinary_get_ptr(ptr));
+            return true;
+        }
+        self.side_table_non_typed_ordinary_get_ptr(ptr)
+    }
+
+    #[inline]
+    fn side_table_non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
         (self.proxies.is_empty() || !self.proxies.contains_key(&ptr))
             && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
             && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
@@ -11688,6 +11751,23 @@ impl Interp {
         args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
+        let ic = self.resolve_cached_call(site, callee)?;
+        if ic.native != 0 {
+            let nf: crate::value::NativeFn = unsafe { std::mem::transmute(ic.native) };
+            return Some(unsafe { self.call_native_committed(nf, this_slot, args, argc) });
+        }
+        let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
+        self.note_compiled_call(&ic);
+        Some(unsafe { self.call_jit_committed(&ic, &code, this_slot, args, argc) })
+    }
+
+    /// The cache resolution of [`Interp::call_jit_cached`]: the entry that would run `callee`
+    /// from `site` now, or `None` (with no side effects) when the site must revalidate.
+    fn resolve_cached_call(
+        &self,
+        site: &crate::bytecode::CallSite,
+        callee: &Value,
+    ) -> Option<crate::bytecode::CallIc> {
         #[cfg(feature = "architecture-diagnostics")]
         crate::bytecode::call_cache_diagnostics::probe(site, callee);
         let Value::Obj(o) = callee else { return None };
@@ -11712,7 +11792,7 @@ impl Interp {
         if hit.is_none() {
             hit = self.call_overflow.lookup(key, genv, epoch);
         }
-        let ic = match hit {
+        Some(match hit {
             Some(ic) => ic,
             None => {
                 // OrdinaryFunctionCreate gives each closure its own identity, [[Environment]]
@@ -11769,23 +11849,71 @@ impl Interp {
                 ic.env = ep;
                 ic
             }
-        };
-        if ic.native != 0 {
-            let nf: crate::value::NativeFn = unsafe { std::mem::transmute(ic.native) };
-            return Some(unsafe { self.call_native_committed(nf, this_slot, args, argc) });
+        })
+    }
+
+    /// Inline-recompile trigger shared by every compiled-entry call: a chunk that keeps running
+    /// in machine code gets one shot at splicing its own hot monomorphic callees (see
+    /// `bytecode::plan_inlines`).
+    #[inline]
+    fn note_compiled_call(&mut self, ic: &crate::bytecode::CallIc) {
+        let chunk_ref = unsafe { &**ic.chunk };
+        let runs = chunk_ref.jit_runs.get().saturating_add(1);
+        chunk_ref.jit_runs.set(runs);
+        if chunk_ref.inline_retry_due(runs) {
+            self.try_inline_recompile(ic.func, chunk_ref, ic.env);
         }
-        let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
-        // Inline-recompile trigger: a chunk that keeps running in machine code gets one shot at
-        // splicing its own hot monomorphic callees (see `bytecode::plan_inlines`).
-        {
-            let chunk_ref = unsafe { &**ic.chunk };
-            let runs = chunk_ref.jit_runs.get().saturating_add(1);
-            chunk_ref.jit_runs.set(runs);
-            if chunk_ref.inline_retry_due(runs) {
-                self.try_inline_recompile(ic.func, chunk_ref, ic.env);
+    }
+
+    /// Resolve `callee` once for a run of calls made by one native algorithm (an Array
+    /// iteration method, a sort comparator, ...). The result carries the machine-code lease, so
+    /// each [`Interp::call_prepared`] skips the identity probe, the entry copy and the lease.
+    /// The caller must keep `callee` alive while the preparation is in use.
+    pub(crate) fn prepare_call(
+        &self,
+        site: &crate::bytecode::CallSite,
+        callee: &Value,
+    ) -> Option<PreparedCall> {
+        let ic = self.resolve_cached_call(site, callee)?;
+        let code = (ic.native == 0).then(|| unsafe { crate::jit::cache::lease_raw(ic.code) });
+        Some(PreparedCall { ic, code })
+    }
+
+    /// Whether a preparation still describes the entry [`Interp::call_jit_cached`] would take:
+    /// the global call-cache epoch (recompiles, invalidations) and the active realm are
+    /// unchanged. Callee identity is fixed by the preparation's owner.
+    #[inline]
+    pub(crate) fn prepared_call_current(&self, prepared: &PreparedCall) -> bool {
+        prepared.ic.epoch
+            == crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+            && prepared.ic.global_env == Rc::as_ptr(&self.global_env) as usize
+    }
+
+    /// One call through a current [`PreparedCall`], with exactly the effects of the
+    /// corresponding [`Interp::call_jit_cached`] hit.
+    ///
+    /// # Safety
+    /// Same moved-operand contract as `call_jit_cached`'s `Some` arm; `prepared` must be current
+    /// (see [`Interp::prepared_call_current`]) for a callee the caller keeps alive.
+    pub(crate) unsafe fn call_prepared(
+        &mut self,
+        prepared: &PreparedCall,
+        this_slot: *const crate::value::PackedValue,
+        args: *mut crate::value::PackedValue,
+        argc: usize,
+    ) -> Result<PackedValue, Abrupt> {
+        let ic = &prepared.ic;
+        match &prepared.code {
+            None => {
+                let nf: crate::value::NativeFn = unsafe { std::mem::transmute(ic.native) };
+                unsafe { self.call_native_committed(nf, this_slot, args, argc) }
+                    .map(PackedValue::pack)
+            }
+            Some(code) => {
+                self.note_compiled_call(ic);
+                unsafe { self.call_jit_committed_packed(ic, code, this_slot, args, argc) }
             }
         }
-        Some(unsafe { self.call_jit_committed(ic, &code, this_slot, args, argc) })
     }
 
     /// A needs-env IC hit ([`crate::bytecode::CALL_IC_NEEDS_ENV`]): same guards and frame
@@ -11795,15 +11923,15 @@ impl Interp {
     ///
     /// # Safety
     /// Same contract as `call_jit_committed`.
-    pub(crate) unsafe fn call_jit_env_committed(
+    pub(crate) unsafe fn call_jit_env_committed_packed(
         &mut self,
-        ic: crate::bytecode::CallIc,
+        ic: &crate::bytecode::CallIc,
         code: &crate::jit::JitCode,
         env_ptr: *const RefCell<Scope>,
         this_slot: *const crate::value::PackedValue,
         args: *mut crate::value::PackedValue,
         argc: usize,
-    ) -> Result<Value, Abrupt> {
+    ) -> Result<PackedValue, Abrupt> {
         let drop_args = || unsafe {
             for k in 0..argc {
                 std::ptr::drop_in_place(args.add(k));
@@ -11878,7 +12006,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_tail(f, t, &a);
+                    r = self.call_tail(f, t, &a).map(PackedValue::pack);
                 }
                 None => break,
             }
@@ -11979,14 +12107,33 @@ impl Interp {
     /// `ic.code`, acquired immediately after validation and retained by the caller.
     pub(crate) unsafe fn call_jit_committed(
         &mut self,
-        ic: crate::bytecode::CallIc,
+        ic: &crate::bytecode::CallIc,
         code: &crate::jit::JitCode,
         this_slot: *const crate::value::PackedValue,
         args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Result<Value, Abrupt> {
+        unsafe { self.call_jit_committed_packed(ic, code, this_slot, args, argc) }
+            .map(PackedValue::into_value)
+    }
+
+    /// [`Interp::call_jit_committed`] with the completion value left packed: a native caller
+    /// that stores or forwards the result (Array callbacks) never widens it.
+    ///
+    /// # Safety
+    /// Same contract as `call_jit_committed`.
+    pub(crate) unsafe fn call_jit_committed_packed(
+        &mut self,
+        ic: &crate::bytecode::CallIc,
+        code: &crate::jit::JitCode,
+        this_slot: *const crate::value::PackedValue,
+        args: *mut crate::value::PackedValue,
+        argc: usize,
+    ) -> Result<PackedValue, Abrupt> {
         if ic.direct & crate::bytecode::CALL_IC_NEEDS_ENV != 0 {
-            return unsafe { self.call_jit_env_committed(ic, code, ic.env, this_slot, args, argc) };
+            return unsafe {
+                self.call_jit_env_committed_packed(ic, code, ic.env, this_slot, args, argc)
+            };
         }
         // --- committed: identical to call_jit_fast's committed path ---
         self.depth += 1;
@@ -12067,7 +12214,7 @@ impl Interp {
                         r = Err(e);
                         break;
                     }
-                    r = self.call_tail(f, t, &a);
+                    r = self.call_tail(f, t, &a).map(PackedValue::pack);
                 }
                 None => break,
             }
@@ -12772,6 +12919,7 @@ impl Interp {
                         (ic.n_params as usize, ic.n_slots as usize),
                     )
                 }
+                .map(PackedValue::into_value)
             } else {
                 match caller_ctx {
                     Some(caller_ctx) => unsafe {
@@ -12798,6 +12946,7 @@ impl Interp {
                             argc,
                             (ic.n_params as usize, ic.n_slots as usize),
                         )
+                        .map(PackedValue::into_value)
                     },
                 }
             }
@@ -13152,6 +13301,7 @@ impl Interp {
                     )
                 }
             }
+            .map(PackedValue::into_value)
         });
         self.fn_frames.pop();
         self.constructing = saved_ctor;

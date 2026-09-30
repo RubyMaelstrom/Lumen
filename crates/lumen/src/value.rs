@@ -92,12 +92,15 @@ pub trait NativeCallableRetained {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor);
 }
 
-/// The engine value. `repr(u8)` with fixed discriminants gives it a *defined* layout — tag byte
-/// at offset 0, payload at offset 8 — which the JIT's inline fast paths read directly (see
-/// `jit::layout` for the compile-time assertions). Tags 0..=4 are the trivially-copyable
-/// variants (no refcount): the JIT may memcpy exactly those.
+/// The engine value. `repr(u64)` with fixed discriminants gives it a *defined* layout — a full
+/// tag word at offset 0 and every payload (including Bool's byte) at offset 8 — which the JIT's
+/// inline fast paths read directly (see `jit::layout` for the assertions). A word-sized tag keeps
+/// every move of a Value two aligned word copies: with a byte tag, compilers split moves at the
+/// Bool byte and read the result back across two earlier stores, defeating store forwarding.
+/// Tags 0..=4 are the trivially-copyable variants (no refcount): the JIT may memcpy exactly
+/// those. The low byte of the tag word is the discriminant, so byte-wide tag reads stay valid.
 #[derive(Clone, Default)]
-#[repr(u8)]
+#[repr(u64)]
 pub enum Value {
     #[default]
     Undefined = 0,
@@ -220,6 +223,21 @@ impl PackedValue {
     #[cfg(feature = "optimizing-jit")]
     pub(crate) fn sampled_object(&self) -> Option<Gc> {
         (self.tag() == PACK_OBJ).then(|| unsafe { self.clone_word() })
+    }
+
+    /// ToBoolean when the word alone decides it (ECMA-262 §7.1.2): every non-reference value.
+    /// Strings, BigInts, Symbols and objects (one object is falsy: [[IsHTMLDDA]]) return None.
+    #[inline]
+    pub(crate) fn scalar_to_boolean(&self) -> Option<bool> {
+        match self.tag() {
+            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL => Some(false),
+            PACK_BOOL => Some(self.0.get() & 1 != 0),
+            PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ | PACK_LAZY_PROTO => None,
+            _ => {
+                let number = f64::from_bits(self.0.get());
+                Some(number != 0.0 && !number.is_nan())
+            }
+        }
     }
 
     /// Inspect a Number without manufacturing an owning Value. In particular, rejecting a
@@ -428,6 +446,47 @@ impl Drop for PackedValue {
 #[cfg(test)]
 mod packed_value_tests {
     use super::*;
+
+    /// The JIT backends read wide Values as (tag word, payload word) and a Bool as bit 0 of the
+    /// payload word. Pin that representation.
+    #[test]
+    fn wide_value_layout_is_tag_word_then_payload_word() {
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(std::mem::size_of::<Option<Value>>(), 16);
+        let words = |value: &Value| unsafe {
+            let base = value as *const Value as *const u8;
+            (base.cast::<u64>().read(), base.add(8).read())
+        };
+        assert_eq!(words(&Value::Undefined).0, 0);
+        assert_eq!(words(&Value::Null).0, 2);
+        assert_eq!(words(&Value::Bool(false)), (3, 0));
+        assert_eq!(words(&Value::Bool(true)), (3, 1));
+        let number = Value::Num(1.5);
+        assert_eq!(words(&number).0, 4);
+        assert_eq!(
+            unsafe {
+                (&number as *const Value as *const u8)
+                    .add(8)
+                    .cast::<f64>()
+                    .read()
+            },
+            1.5
+        );
+        // The Obj payload is the stored Rc pointer; the Object sits `obj_from_rc` bytes in.
+        let object = Object::new(None);
+        let layout = jit_layout(&object);
+        let value = Value::Obj(object.clone());
+        assert_eq!(words(&value).0, 8);
+        assert_eq!(
+            unsafe {
+                (&value as *const Value as *const u8)
+                    .add(8)
+                    .cast::<usize>()
+                    .read()
+            } + layout.obj_from_rc,
+            RefCell::as_ptr(&object) as usize
+        );
+    }
 
     #[test]
     fn packed_numeric_inspection_is_non_owning_and_preserves_number_bits() {
@@ -1559,6 +1618,8 @@ pub struct Object {
 }
 
 impl Object {
+    // Objects exist only behind their collected handle; `Gc` is that handle.
+    #[allow(clippy::new_ret_no_self)]
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new(proto: Option<Gc>) -> Gc {
         Self::new_with_capacity(proto, 0)
@@ -4116,6 +4177,21 @@ impl Props {
         Some(&self.entries.fields[slot])
     }
 
+    /// Replace the value of an Array's own writable `length` data property, found through the
+    /// `len_slot` memo. The caller has validated writability and the new length.
+    pub(crate) fn set_array_length_value(&mut self, length: f64) {
+        let slot = self.len_slot.get();
+        let slot = if slot != NO_SLOT {
+            slot as usize
+        } else {
+            let slot = self.find("length").expect("array has own length");
+            self.len_slot.set(slot as u32);
+            slot
+        };
+        debug_assert!(matches!(self.entries.get(slot), Some((k, _)) if &**k == "length"));
+        self.entries.fields[slot].set_value(Value::Num(length));
+    }
+
     /// Mark this object as a live prototype (see `proto_flag`).
     #[inline]
     pub(crate) fn mark_proto(&self) {
@@ -4197,6 +4273,15 @@ impl Props {
             return None;
         }
         Some(&self.entries.fields[slot as usize])
+    }
+
+    /// OrdinaryGet of own element `n` when it is a present data property: an owning packed
+    /// snapshot of its value. `None` for an absent element (a hole) or an accessor; the caller
+    /// then runs the general HasProperty/Get algorithms, which also consult the prototype chain.
+    #[inline]
+    pub(crate) fn own_element_data_packed(&self, n: u32) -> Option<PackedValue> {
+        let property = self.get_index(n)?;
+        (!property.accessor()).then(|| property.clone_value_packed())
     }
 
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).

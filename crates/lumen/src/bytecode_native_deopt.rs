@@ -62,9 +62,10 @@ pub(crate) unsafe extern "C" fn resume_before(
             .push((pc as usize, depth, ctx.handler_floor))
     });
 
-    // Direct calls may share the caller's JitCtx, including a DIFFERENT activation sidecar.
-    // Reuse only this chunk's state. A stateless callee instead owns a temporary sidecar,
-    // without replacing or clearing its caller's prepared References / lexical environment.
+    // Compiled calls give each callee a frame record of its own, so the sidecar found here is
+    // this chunk's. Remain defensive regardless: reuse only this chunk's state. A stateless
+    // callee instead owns a temporary sidecar, without replacing or clearing any other frame's
+    // prepared References / lexical environment.
     let same_activation = ctx
         .activation
         .as_ref()

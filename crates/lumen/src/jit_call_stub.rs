@@ -277,7 +277,6 @@ mod native {
             usize::from(argc),
             with_this,
             hit_slow,
-            slow,
             throw,
             normal,
             finish,

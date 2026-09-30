@@ -5990,10 +5990,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let cb = crate::callback::Callback::new(cb);
         let ov = Value::Obj(o.clone());
         for k in 0..len {
-            let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
+            let Some(v) = array_get_present_packed(i, &o, &ov, k)? else {
                 continue; // skip array holes
             };
-            ab(cb.call(i, cb_this.clone(), [v, Value::Num(k as f64), ov.clone()]))?;
+            let arguments = [
+                v,
+                PackedValue::pack(Value::Num(k as f64)),
+                PackedValue::pack(ov.clone()),
+            ];
+            ab(cb.call_packed(i, cb_this.clone(), arguments))?;
         }
         Ok(Value::Undefined)
     });
@@ -6009,14 +6014,19 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let ov = Value::Obj(o.clone());
         let result = array_species_create(i, &this, len)?;
         for k in 0..len {
-            let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
+            let Some(v) = array_get_present_packed(i, &o, &ov, k)? else {
                 continue; // holes stay holes in the result
             };
-            let mapped = ab(cb.call(i, cb_this.clone(), [v, Value::Num(k as f64), ov.clone()]))?;
+            let arguments = [
+                v,
+                PackedValue::pack(Value::Num(k as f64)),
+                PackedValue::pack(ov.clone()),
+            ];
+            let mapped = ab(cb.call_packed(i, cb_this.clone(), arguments))?;
             // ECMA-262 §23.1.3.21 step 6.3: CreateDataPropertyOrThrow.  The
             // trap-aware helper keeps the ordinary fresh-array fast path while
             // preserving species/proxy/exotic fallbacks.
-            cdp_index_or_throw(i, &result, k as u64, mapped)?;
+            cdp_index_packed_or_throw(i, &result, k as u64, mapped)?;
         }
         Ok(result)
     });
@@ -6036,17 +6046,18 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let result = array_species_create(i, &this, 0)?;
         let mut to = 0usize;
         for k in 0..len {
-            let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
+            let Some(v) = array_get_present_packed(i, &o, &ov, k)? else {
                 continue;
             };
-            let keep = ab(cb.call(
-                i,
-                cb_this.clone(),
-                [v.clone(), Value::Num(k as f64), ov.clone()],
-            ))?;
-            if i.to_boolean(&keep) {
+            let arguments = [
+                v.clone(),
+                PackedValue::pack(Value::Num(k as f64)),
+                PackedValue::pack(ov.clone()),
+            ];
+            let keep = ab(cb.call_packed(i, cb_this.clone(), arguments))?;
+            if i.to_boolean_packed(&keep) {
                 // ECMA-262 §23.1.3.8 step 6.3.1: CreateDataPropertyOrThrow.
-                cdp_index_or_throw(i, &result, to as u64, v)?;
+                cdp_index_packed_or_throw(i, &result, to as u64, v)?;
                 to += 1;
             }
         }
@@ -6067,7 +6078,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let mut k = 0;
         let mut acc;
         if args.len() >= 2 {
-            acc = arg(args, 1);
+            acc = PackedValue::pack(arg(args, 1));
         } else {
             // Seed with the first present element (holes are skipped).
             loop {
@@ -6076,7 +6087,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         i.make_error("TypeError", "Reduce of empty array with no initial value")
                     );
                 }
-                if let Some(value) = array_get_present_index(i, &o, &ov, k)? {
+                if let Some(value) = array_get_present_packed(i, &o, &ov, k)? {
                     acc = value;
                     k += 1;
                     break;
@@ -6085,16 +6096,18 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         }
         while k < len {
-            if let Some(v) = array_get_present_index(i, &o, &ov, k)? {
-                acc = ab(cb.call(
-                    i,
-                    Value::Undefined,
-                    [acc, v, Value::Num(k as f64), ov.clone()],
-                ))?;
+            if let Some(v) = array_get_present_packed(i, &o, &ov, k)? {
+                let arguments = [
+                    acc,
+                    v,
+                    PackedValue::pack(Value::Num(k as f64)),
+                    PackedValue::pack(ov.clone()),
+                ];
+                acc = ab(cb.call_packed(i, Value::Undefined, arguments))?;
             }
             k += 1;
         }
-        Ok(acc)
+        Ok(acc.into_value())
     });
     it.def_method(&ap, "reverse", 0, |i, this, _args| {
         let o = arr_to_object(i, &this)?;
@@ -6511,7 +6524,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let mut acc;
         let mut k = len as i64 - 1;
         if args.len() >= 2 {
-            acc = arg(args, 1);
+            acc = PackedValue::pack(arg(args, 1));
         } else {
             // Seed with the last present element (holes are skipped).
             loop {
@@ -6520,7 +6533,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                         i.make_error("TypeError", "Reduce of empty array with no initial value")
                     );
                 }
-                if let Some(value) = array_get_present_index(i, &o, &ov, k as usize)? {
+                if let Some(value) = array_get_present_packed(i, &o, &ov, k as usize)? {
                     acc = value;
                     k -= 1;
                     break;
@@ -6529,16 +6542,18 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             }
         }
         while k >= 0 {
-            if let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? {
-                acc = ab(cb.call(
-                    i,
-                    Value::Undefined,
-                    [acc, v, Value::Num(k as f64), ov.clone()],
-                ))?;
+            if let Some(v) = array_get_present_packed(i, &o, &ov, k as usize)? {
+                let arguments = [
+                    acc,
+                    v,
+                    PackedValue::pack(Value::Num(k as f64)),
+                    PackedValue::pack(ov.clone()),
+                ];
+                acc = ab(cb.call_packed(i, Value::Undefined, arguments))?;
             }
             k -= 1;
         }
-        Ok(acc)
+        Ok(acc.into_value())
     });
     it.def_method(&ap, "copyWithin", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
@@ -6799,6 +6814,23 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
 /// observable operation required by ECMA-262 §23.1.3 (Array methods), with the allocation-free
 /// path only replacing an unobservable own-data lookup.
 #[inline]
+/// [`array_get_index`] (Get only, no HasProperty) leaving an own data element packed.
+fn array_get_index_packed(
+    i: &mut Interp,
+    object: &Gc,
+    receiver: &Value,
+    index: usize,
+) -> Result<PackedValue, Value> {
+    if let Ok(index) = u32::try_from(index) {
+        if index != u32::MAX {
+            if let Some(word) = Interp::plain_own_element_packed(object, index) {
+                return Ok(word);
+            }
+        }
+    }
+    array_get_index(i, object, receiver, index).map(PackedValue::pack)
+}
+
 fn array_get_index(
     i: &mut Interp,
     object: &Gc,
@@ -6834,6 +6866,26 @@ fn array_get_index_after_has(
 /// one operation. Holes, accessors, inherited values, proxies, and other exotics retain the exact
 /// two-step generic algorithm from ECMA-262 §23.1.3.
 #[inline]
+/// [`array_get_present_index`] for iteration builtins that move the element straight into a
+/// callback: an own present data element of an ordinary Array/object is copied as its packed
+/// word. Every other case (holes, accessors, exotics, side-table objects) runs the general
+/// HasProperty and Get steps in order.
+fn array_get_present_packed(
+    i: &mut Interp,
+    object: &Gc,
+    receiver: &Value,
+    index: usize,
+) -> Result<Option<PackedValue>, Value> {
+    if let Ok(index) = u32::try_from(index) {
+        if index != u32::MAX {
+            if let Some(word) = Interp::plain_own_element_packed(object, index) {
+                return Ok(Some(word));
+            }
+        }
+    }
+    Ok(array_get_present_index(i, object, receiver, index)?.map(PackedValue::pack))
+}
+
 fn array_get_present_index(
     i: &mut Interp,
     object: &Gc,
@@ -6880,14 +6932,19 @@ fn array_find(
     let cb = crate::callback::Callback::new(cb);
     for step in 0..len {
         let k = if from_last { len - 1 - step } else { step };
-        let v = array_get_index(i, &o, &ov, k)?;
-        let r = ab(cb.call(
-            i,
-            cb_this.clone(),
-            [v.clone(), Value::Num(k as f64), ov.clone()],
-        ))?;
-        if i.to_boolean(&r) {
-            return Ok(if want_value { v } else { Value::Num(k as f64) });
+        let v = array_get_index_packed(i, &o, &ov, k)?;
+        let arguments = [
+            v.clone(),
+            PackedValue::pack(Value::Num(k as f64)),
+            PackedValue::pack(ov.clone()),
+        ];
+        let r = ab(cb.call_packed(i, cb_this.clone(), arguments))?;
+        if i.to_boolean_packed(&r) {
+            return Ok(if want_value {
+                v.into_value()
+            } else {
+                Value::Num(k as f64)
+            });
         }
     }
     Ok(if want_value {
@@ -6913,11 +6970,16 @@ fn array_some_every(
     let cb = crate::callback::Callback::new(cb);
     let ov = Value::Obj(o.clone());
     for k in 0..len {
-        let Some(v) = array_get_present_index(i, &o, &ov, k)? else {
+        let Some(v) = array_get_present_packed(i, &o, &ov, k)? else {
             continue; // skip holes
         };
-        let r = ab(cb.call(i, cb_this.clone(), [v, Value::Num(k as f64), ov.clone()]))?;
-        let b = i.to_boolean(&r);
+        let arguments = [
+            v,
+            PackedValue::pack(Value::Num(k as f64)),
+            PackedValue::pack(ov.clone()),
+        ];
+        let r = ab(cb.call_packed(i, cb_this.clone(), arguments))?;
+        let b = i.to_boolean_packed(&r);
         if every && !b {
             return Ok(Value::Bool(false));
         }
@@ -8455,46 +8517,69 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
 /// after every callback/await: a species result may escape, become non-extensible, freeze its
 /// length, or gain a descriptor before the next write. An absent dense index needs no decimal
 /// key or temporary descriptor object; prototypes do not participate in [[DefineOwnProperty]].
+/// [`cdp_index_or_throw`] for a value already in packed form: the ordinary fresh-Array case
+/// moves the word into element storage without widening it.
+fn cdp_index_packed_or_throw(
+    i: &mut Interp,
+    target: &Value,
+    index: u64,
+    value: PackedValue,
+) -> Result<(), Value> {
+    let value = match try_define_plain_array_index(target, index, Property::plain_packed(value)) {
+        Ok(()) => return Ok(()),
+        Err(property) => property.into_value(),
+    };
+    cdp_or_throw(i, target, &index.to_string(), value)
+}
+
+/// CreateDataProperty(A, index, value) for an extensible ordinary Array whose `length` is a
+/// writable data property and whose element `index` is absent: Array [[DefineOwnProperty]]
+/// (ECMA-262 §10.4.2.1) defines the element and, at or past `length`, raises `length`.
+/// `Err` hands the property back for the general, trap-aware algorithm.
+fn try_define_plain_array_index(
+    target: &Value,
+    index: u64,
+    property: Property,
+) -> Result<(), Property> {
+    if index >= u32::MAX as u64 {
+        return Err(property);
+    }
+    let Value::Obj(object) = target else {
+        return Err(property);
+    };
+    let mut object = object.borrow_mut();
+    if !object.ic_plain.get() || !matches!(object.exotic, Exotic::Array) || !object.extensible {
+        return Err(property);
+    }
+    let Some(length) = object.props.length_property().and_then(|length| {
+        if !length.accessor() && length.writable() {
+            if let Value::Num(length) = length.value() {
+                return Some(length as u32);
+            }
+        }
+        None
+    }) else {
+        return Err(property);
+    };
+    object
+        .props
+        .try_define_dense_element(index as u32, property)?;
+    if index >= u64::from(length) {
+        object.props.set_array_length_value((index + 1) as f64);
+    }
+    Ok(())
+}
+
 fn cdp_index_or_throw(
     i: &mut Interp,
     target: &Value,
     index: u64,
-    mut value: Value,
+    value: Value,
 ) -> Result<(), Value> {
-    if index < u32::MAX as u64 {
-        if let Value::Obj(object) = target {
-            let mut object = object.borrow_mut();
-            if object.ic_plain.get() && matches!(object.exotic, Exotic::Array) && object.extensible
-            {
-                let length = object.props.length_property().and_then(|property| {
-                    if !property.accessor() && property.writable() {
-                        if let Value::Num(length) = property.value() {
-                            return Some(length as u32);
-                        }
-                    }
-                    None
-                });
-                if let Some(length) = length {
-                    match object
-                        .props
-                        .try_define_dense_element(index as u32, Property::plain(value))
-                    {
-                        Ok(()) => {
-                            if index >= u64::from(length) {
-                                object
-                                    .props
-                                    .get_mut("length")
-                                    .expect("validated Array length")
-                                    .set_value(Value::Num((index + 1) as f64));
-                            }
-                            return Ok(());
-                        }
-                        Err(property) => value = property.into_value(),
-                    }
-                }
-            }
-        }
-    }
+    let value = match try_define_plain_array_index(target, index, Property::plain(value)) {
+        Ok(()) => return Ok(()),
+        Err(property) => property.into_value(),
+    };
     cdp_or_throw(i, target, &index.to_string(), value)
 }
 

@@ -15762,7 +15762,7 @@ pub(crate) unsafe fn run_moved(
     argc: usize,
     // `chunk.jit_frame()`, precomputed by the caller (the cached call reads it from its IC).
     frame: (usize, usize),
-) -> Result<Value, Abrupt> {
+) -> Result<PackedValue, Abrupt> {
     unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
 }
 
@@ -15795,6 +15795,7 @@ pub(crate) unsafe fn run_moved_shared(
     frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
     unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
+        .map(PackedValue::into_value)
 }
 
 #[cfg(test)]
@@ -15827,7 +15828,7 @@ pub(crate) unsafe fn run_moved_env(
     args: *mut PackedValue,
     argc: usize,
     frame: (usize, usize),
-) -> Result<Value, Abrupt> {
+) -> Result<PackedValue, Abrupt> {
     #[cfg(test)]
     TEST_PACKED_ENV_ENTRIES.with(|entries| entries.set(entries.get() + 1));
     let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
@@ -15875,7 +15876,7 @@ unsafe fn run_moved_inner(
     argc: usize,
     (n_params, n_slots): (usize, usize),
     arguments: Option<(usize, Value)>,
-) -> Result<Value, Abrupt> {
+) -> Result<PackedValue, Abrupt> {
     assert_eq!(
         code.entry_kind,
         NativeEntryKind::FreshFrame,
@@ -15954,7 +15955,7 @@ unsafe fn run_moved_inner(
         }
     }
     let result = if ok == 1 {
-        Ok(ctx.take_ret().into_value())
+        Ok(ctx.take_ret())
     } else {
         Err(ctx
             .error
@@ -15989,7 +15990,7 @@ unsafe fn run_moved_oversized(
     argc: usize,
     (n_params, n_slots): (usize, usize),
     arguments: Option<(usize, Value)>,
-) -> Result<Value, Abrupt> {
+) -> Result<PackedValue, Abrupt> {
     let seed = n_params.min(argc);
     let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
     slots.reserve(n_slots);
@@ -16068,7 +16069,7 @@ unsafe fn run_moved_oversized(
         i.vm_pool.push((slots, stack));
     }
     if ok == 1 {
-        Ok(ctx.take_ret().into_value())
+        Ok(ctx.take_ret())
     } else {
         Err(ctx
             .error
@@ -16118,7 +16119,7 @@ pub(crate) unsafe fn run_moved(
     _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),
-) -> Result<Value, Abrupt> {
+) -> Result<PackedValue, Abrupt> {
     unreachable!("jit code cannot exist on this platform")
 }
 
@@ -16167,6 +16168,6 @@ pub(crate) unsafe fn run_moved_env(
     _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),
-) -> Result<Value, Abrupt> {
+) -> Result<PackedValue, Abrupt> {
     unreachable!("jit code cannot exist on this platform")
 }

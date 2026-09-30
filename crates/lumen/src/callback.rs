@@ -7,9 +7,9 @@
 
 use crate::bytecode::{CallSite, Tier};
 use crate::fasthash::FastMap;
-use crate::interpreter::{Abrupt, Interp};
+use crate::interpreter::{Abrupt, Interp, PreparedCall};
 use crate::value::{Object, PackedValue, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::rc::Weak;
 
@@ -17,7 +17,17 @@ pub(crate) struct Callback {
     // This strong root owns the closure and its environment across every GC/callback reentry.
     callee: Value,
     cache: CallbackCache,
+    /// The cache entry resolved once for this fixed callee (see [`Interp::prepare_call`]).
+    /// A `Callback` is local to one builtin invocation, so this is never reached reentrantly.
+    prepared: RefCell<Option<PreparedCall>>,
+    /// Remaining attempts to prepare after a generic call; a callee that never reaches a
+    /// cacheable compiled or native entry stops paying for the attempt.
+    prepare_budget: Cell<u8>,
 }
+
+/// Generic calls after which a `Callback` stops trying to prepare its callee. Ordinary
+/// functions reach a compiled entry after the tier-up threshold.
+const PREPARE_ATTEMPTS: u8 = 32;
 
 /// Reusable identity/code feedback without a strong JS owner. The currently selected callback
 /// remains rooted by the caller, and no cache borrow survives JavaScript reentry. A shared entry
@@ -32,6 +42,8 @@ impl Callback {
         Self {
             callee,
             cache: CallbackCache::new(),
+            prepared: RefCell::new(None),
+            prepare_budget: Cell::new(PREPARE_ATTEMPTS),
         }
     }
 
@@ -41,7 +53,54 @@ impl Callback {
         this: Value,
         args: [Value; N],
     ) -> Result<Value, Abrupt> {
-        self.cache.call(interp, &self.callee, this, args)
+        if interp.tier == Tier::Jit {
+            let prepared = self.prepared.borrow();
+            if let Some(prepared) = prepared
+                .as_ref()
+                .filter(|prepared| interp.prepared_call_current(prepared))
+            {
+                let mut args = ManuallyDrop::new(args.map(PackedValue::pack));
+                let this = ManuallyDrop::new(PackedValue::pack(this));
+                // The prepared entry consumes every operand, exactly like a cache hit.
+                return unsafe { interp.call_prepared(prepared, &*this, args.as_mut_ptr(), N) }
+                    .map(PackedValue::into_value);
+            }
+        }
+        let result = self.cache.call(interp, &self.callee, this, args);
+        if interp.tier == Tier::Jit && self.prepare_budget.get() != 0 {
+            self.prepare_budget.set(self.prepare_budget.get() - 1);
+            let prepared = interp.prepare_call(&self.cache.site, &self.callee);
+            if prepared.is_some() {
+                self.prepare_budget.set(PREPARE_ATTEMPTS);
+            }
+            *self.prepared.borrow_mut() = prepared;
+        }
+        result
+    }
+
+    /// [`Callback::call`] over already-packed arguments, leaving the completion packed: an
+    /// iteration builtin moves elements from storage into the callee and its result into
+    /// storage without widening either.
+    pub(crate) fn call_packed<const N: usize>(
+        &self,
+        interp: &mut Interp,
+        this: Value,
+        args: [PackedValue; N],
+    ) -> Result<PackedValue, Abrupt> {
+        if interp.tier == Tier::Jit {
+            let prepared = self.prepared.borrow();
+            if let Some(prepared) = prepared
+                .as_ref()
+                .filter(|prepared| interp.prepared_call_current(prepared))
+            {
+                let mut args = ManuallyDrop::new(args);
+                let this = ManuallyDrop::new(PackedValue::pack(this));
+                // The prepared entry consumes every operand, exactly like a cache hit.
+                return unsafe { interp.call_prepared(prepared, &*this, args.as_mut_ptr(), N) };
+            }
+        }
+        self.call(interp, this, args.map(PackedValue::into_value))
+            .map(PackedValue::pack)
     }
 
     /// IteratorStepValue can consume a closed native iterator without materializing
@@ -209,6 +268,36 @@ mod tests {
             engine.interp.gc_collect();
             assert_eq!(eval(&mut engine, "1+2"), "3");
         }
+    }
+
+    /// ECMA-262 §23.1.3 (forEach, map, filter, some, every, find*, reduce*): the packed element
+    /// and result paths still perform HasProperty/Get per index against the live array (holes
+    /// consult the prototype, accessors run, mutations during iteration are observed), define
+    /// results with CreateDataPropertyOrThrow, and apply ToBoolean to every value kind.
+    #[test]
+    fn packed_iteration_paths_keep_live_array_semantics() {
+        check(
+            r#"
+            var log=[];
+            Array.prototype[3]='proto';
+            var a=[1,,{v:2},,'s'];
+            Object.defineProperty(a, 5, {get(){log.push('get5');return 5}, configurable:true, enumerable:true});
+            var m=a.map(function(x,k,o){ if(k===0){o[1]='late'; o.length=8; o[6]=6;} return typeof x==='object'?x.v:x; });
+            var seen=[];a.forEach(function(x,k){seen.push(k+':'+(typeof x==='object'?'obj':x));});
+            var f=a.filter(function(x){return x!=='s'&&x!=='proto';});
+            var truth=[10n,0n,'','x',0,NaN,-0,{},null,undefined,true,false,Symbol()].map(function(v){return [v].some(function(x){return x;})?1:0}).join('');
+            var every=[1,'a',{}].every(function(x){return x;})+'/'+[1,0].every(function(x){return x;});
+            var red=[{n:1},{n:2},{n:3}].reduce(function(acc,o){return {n:acc.n+o.n};}).n;
+            var redr=['a','b','c'].reduceRight(function(acc,x){return acc+x;});
+            var obj={k:2};var fnd=[{k:1},obj].find(function(o){return o.k===2;})===obj;
+            var fi=[5,6,7].findIndex(function(x){return x===7;})+'/'+[5,6,7].findLast(function(x){return x<7;})+'/'+[5,6].findLastIndex(function(x){return x>9;});
+            delete Array.prototype[3];
+            var big=[];for(var n=0;n<600;n++)big.push({n:n});
+            var total=0;for(var round=0;round<20;round++){total+=big.map(function(o){return o.n;}).filter(function(n){return n%3===0;}).reduce(function(s,n){return s+n;},0);}
+            [m.length, m.join(','), seen.join(','), f.length+':'+f.map(function(x){return typeof x}).join(','), truth, every, red, redr, fnd, fi, log.join(','), total].join('|')
+        "#,
+            "6|1,late,2,proto,s,5|0:1,1:late,2:obj,3:proto,4:s,5:5,6:6|5:number,string,object,number,number|1001000100101|true/false|6|cba|true|2/6/-1|get5,get5,get5|1194000",
+        );
     }
 
     #[test]

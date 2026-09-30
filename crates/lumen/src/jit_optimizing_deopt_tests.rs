@@ -463,16 +463,17 @@ fn bailout_callee_cannot_consume_native_callers_handlers_or_sidecar() {
     ENTRIES.with(|entries| {
         let entries = entries.borrow();
         assert_eq!(entries.len(), 12);
-        #[cfg(target_arch = "aarch64")]
+        // Every compiled call, direct or helper-mediated, runs the callee on a frame record
+        // of its own: the callee's continuation sees none of its caller's handlers.
         assert!(
-            entries.iter().any(|&(_, _, floor)| floor > 0),
-            "must exercise the actual shared native context, not just layered calls"
+            entries.iter().all(|&(_, _, floor)| floor == 0),
+            "a callee context must not contain its caller's handlers"
         );
     });
-    #[cfg(target_arch = "aarch64")]
-    assert!(
-        bytecode::native_deopt::FOREIGN_SIDECAR_ENTRIES.with(|count| count.get()) > 0,
-        "shared callee must preserve a caller sidecar already used by catch-scope operations"
+    assert_eq!(
+        bytecode::native_deopt::FOREIGN_SIDECAR_ENTRIES.with(|count| count.get()),
+        0,
+        "a callee context must not carry its caller's catch-scope sidecar"
     );
     for code in leases {
         assert_eq!(code.residency.active.get(), 0);

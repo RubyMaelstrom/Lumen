@@ -105,8 +105,8 @@ fn integer_switch_dispatch_preserves_case_block_semantics_in_all_tiers() {
 
 #[test]
 fn boolean_bitwise_fast_paths_preserve_numbers_and_coercion_in_all_tiers() {
-    // Validate the wide Value layout used by both native boolean templates against live fields.
-    // Do not read padding: Bool's byte is next to its tag, unlike Number's aligned double.
+    // Validate the wide Value layout used by both native boolean templates against live fields:
+    // a full tag word, then Bool's byte at the payload offset (the rest of that word is padding).
     for value in [
         crate::value::Value::Bool(false),
         crate::value::Value::Bool(true),
@@ -115,8 +115,8 @@ fn boolean_bitwise_fast_paths_preserve_numbers_and_coercion_in_all_tiers() {
         let crate::value::Value::Bool(ref boolean) = value else {
             unreachable!()
         };
-        assert_eq!(boolean as *const bool as usize - base, 1);
-        assert_eq!(unsafe { *(base as *const u8) }, 3);
+        assert_eq!(boolean as *const bool as usize - base, 8);
+        assert_eq!(unsafe { *(base as *const u64) }, 3);
     }
     // ECMA-262 ToNumeric, ToNumber, ApplyStringOrNumericBinaryOperator, snapshot e28783d5fc9d.
     // Comparisons feeding a bitwise mask are common in generated asm.js initialization loops.

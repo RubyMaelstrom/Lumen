@@ -432,7 +432,8 @@ fn read_word(a: &mut Asm, slow: usize) {
     a.nr_imm(AX, PACK_NULL);
     a.jmp(done);
     a.bind(boolean);
-    a.nr_load8(DX, CX, 1);
+    // Value::Bool's byte sits at the payload offset; the rest of that word is padding.
+    a.nr_load8(DX, CX, 8);
     a.nr_op_imm(4, DX, 1);
     a.nr_imm(AX, PACK_BOOL);
     a.nr_reg(0x09, AX, DX);
@@ -547,11 +548,9 @@ fn decode_rhs(a: &mut Asm, slow: usize) {
         a.jmp(done);
     }
     a.bind(boolean);
-    a.nr_mov(R8, R10);
-    a.nr_op_imm(4, R8, 1);
-    a.nr_shift(false, R8, 8);
-    a.nr_op_imm(1, R8, 3);
-    a.nr_imm(R9, 0);
+    a.nr_imm(R8, 3);
+    a.nr_mov(R9, R10);
+    a.nr_op_imm(4, R9, 1);
     a.jmp(done);
     for (label, tag) in [(string, 6), (symbol, 7), (object, 8)] {
         a.bind(label);

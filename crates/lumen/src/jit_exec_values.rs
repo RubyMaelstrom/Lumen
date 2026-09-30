@@ -42,8 +42,8 @@ pub(super) fn emit_exec_kind(a: &mut asm::Asm, raw: u32, kind: u32, scratch: u32
     a.bind(done);
 }
 
-/// Produce a borrowed wide pair for a compact word. The Bool payload
-/// occupies byte one of tag_word; refs are untagged in payload. No retain/drop.
+/// Produce a borrowed wide pair for a compact word: the discriminant in tag_word and every
+/// payload, including Bool's 0/1, in payload; refs are untagged. No retain/drop.
 /// Raw is preserved; both outputs, kind/scratch and NZCV are clobbered.
 pub(super) fn emit_exec_decode_wide(
     a: &mut asm::Asm,
@@ -72,9 +72,7 @@ pub(super) fn emit_exec_decode_wide(
     a.cmp_imm_w(kind, 3);
     a.b_cond(C_NE, done);
     a.movz(scratch, 1, 0);
-    a.logic_x(0, scratch, raw, scratch);
-    a.lsl_imm(scratch, scratch, 8);
-    a.logic_x(1, tag_word, tag_word, scratch);
+    a.logic_x(0, payload, raw, scratch);
     a.b(done);
     a.bind(number);
     a.mov(payload, raw);
@@ -168,8 +166,8 @@ pub(super) fn emit_exec_number_store(
 }
 
 /// Encode a borrowed/moved wide Value pair; ownership does not change here. The low
-/// byte of tag_word is its discriminant, Bool's payload is byte one, and other payloads
-/// use the second word. BigInt is a thin stored handle, exactly as PackedValue::pack.
+/// byte of tag_word is its discriminant and every payload uses the second word; only bit 0
+/// of a Bool's payload word is meaningful (the rest of that word is padding). BigInt is a thin stored handle, exactly as PackedValue::pack.
 /// Inputs are preserved; packed/tag_scratch/const_scratch/fp_scratch and NZCV clobbered.
 pub(super) fn emit_exec_encode_wide(
     a: &mut asm::Asm,
@@ -216,8 +214,7 @@ pub(super) fn emit_exec_encode_wide(
     }
     a.b(slow);
     a.bind(boolean);
-    a.lsr_imm(packed, tag_word, 8);
-    a.logic_imm_w(0, packed, packed, asm::logical_imm_w(1).unwrap());
+    a.logic_imm_w(0, packed, payload, asm::logical_imm_w(1).unwrap());
     a.mov_imm64(const_scratch, PACK_BOOL);
     a.logic_x(1, packed, packed, const_scratch);
     a.b(done);
