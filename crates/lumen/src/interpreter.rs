@@ -2686,6 +2686,9 @@ pub struct Interp {
     pub(crate) fragment_cache: crate::bytecode::fragment_cache::Cache,
     pub(crate) enumeration_keys:
         crate::cache::ByteLru<crate::eval::EnumerationShape, crate::eval::CachedForInKeys>,
+    /// Immutable property-name encodings used by ordinary record enumeration.
+    /// The Rc pin prevents address reuse; no object, descriptor or value is cached.
+    pub(crate) property_key_strings: crate::cache::ByteLru<usize, (Rc<str>, crate::lstr::LStr)>,
     /// Freelist of fixed-size raw frame buffers ([`crate::jit::FRAME_BUF`] `Value`s each) for the
     /// JIT fast call's slots + operand stack — a pop and pointer math per call instead of `Vec`
     /// bookkeeping. Buffers hold no live values while pooled.
@@ -3138,6 +3141,7 @@ interp_memory_inventory! {
     computed_reads => "measured",
     fragment_cache => "measured",
     enumeration_keys => "measured",
+    property_key_strings => "measured",
     frame_pool => "measured",
     creation_pins => "measured",
     global_env_pins => "measured",
@@ -3277,7 +3281,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 147);
+    assert_eq!(names.len(), 148);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4091,6 +4095,7 @@ impl Interp {
             computed_reads: Default::default(),
             fragment_cache: Default::default(),
             enumeration_keys: crate::cache::ByteLru::new(1 << 20, 256),
+            property_key_strings: crate::cache::ByteLru::new(256 << 10, 512),
             frame_pool: FramePool(Vec::new()),
             creation_pins: Default::default(),
             global_env_pins: Vec::new(),
@@ -5449,6 +5454,38 @@ impl Interp {
             );
         }
         Value::Obj(obj)
+    }
+
+    /// CreateArrayFromList for an entry pair: move the packed value straight into
+    /// canonical array storage without an intermediate Vec or wide conversion.
+    pub(crate) fn make_entry_pair(&self, key: crate::lstr::LStr, value: PackedValue) -> Value {
+        Value::Obj(Object::new_with_parts(
+            Some(self.array_proto.clone()),
+            Props::packed_array_from_packed(
+                [PackedValue::pack(Value::Str(key)), value].into_iter(),
+            ),
+            Exotic::Array,
+        ))
+    }
+
+    /// Share only a String encoding of an already owned immutable key. Live
+    /// property attributes and values are always read by the enumeration caller.
+    pub(crate) fn property_key_string(&mut self, key: &Rc<str>) -> crate::lstr::LStr {
+        let identity = Rc::as_ptr(key) as *const () as usize;
+        if let Some(string) = self
+            .property_key_strings
+            .get_mapped(&identity, |(pin, string)| {
+                debug_assert!(Rc::ptr_eq(pin, key));
+                string.clone()
+            })
+        {
+            return string;
+        }
+        let string = crate::lstr::LStr::from(key.as_ref());
+        let bytes = key.len().saturating_add(string.retained_requested_bytes());
+        self.property_key_strings
+            .insert(identity, (key.clone(), string.clone()), bytes);
+        string
     }
 
     /// Copy a bounded ordinary Array containing only own numeric data properties.

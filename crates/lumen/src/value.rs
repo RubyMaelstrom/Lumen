@@ -3735,6 +3735,12 @@ impl Props {
         Self::packed_array_properties(items.into_iter().map(Property::plain))
     }
 
+    pub(crate) fn packed_array_from_packed(
+        items: impl ExactSizeIterator<Item = PackedValue>,
+    ) -> Props {
+        Self::packed_array_properties(items.map(Property::plain_packed))
+    }
+
     fn packed_array_properties(items: impl ExactSizeIterator<Item = Property>) -> Props {
         let len = items.len();
         let inline = len <= INLINE_PACKED_CAPACITY;

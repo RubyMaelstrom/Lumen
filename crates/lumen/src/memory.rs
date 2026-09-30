@@ -1199,6 +1199,18 @@ fn scan_realm(
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
     let (bytes, exact) = interp
+        .property_key_strings
+        .scan_retained_memory(|(key, string)| {
+            visitor.rc_str(key);
+            visitor.lstr(string);
+        });
+    totals.engine_caches.add(bytes);
+    if !exact {
+        totals
+            .engine_caches
+            .make_lower_bound("opaque standard-library HashMap bucket storage");
+    }
+    let (bytes, exact) = interp
         .str_units
         .scan_retained_memory(|(string, units, index)| {
             visitor.lstr(string);

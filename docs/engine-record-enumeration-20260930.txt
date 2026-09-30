@@ -1,0 +1,72 @@
+Ordinary record enumeration — 30 September 2026
+===============================================
+
+The prior complete solver trace records 138,673 Object.entries native calls.
+The implementation validates an ordinary, non-callable, non-exotic receiver
+and every live descriptor before selecting its closed named-data path.
+Indexed/Symbol/private/filter/accessor cases retain the full ordered algorithm.
+Eligible insertion order is OwnPropertyKeys order; every value is own data.
+The fast path traverses descriptors directly, replacing a key snapshot,
+repeated descriptor lookup and repeated OrdinaryGet. It constructs each entry
+pair by moving its packed value into canonical Array storage, avoiding a
+separate two-Value vector and a decode/repack round trip. Object.values uses
+the same live record proof. Result arrays and descriptors stay independent.
+
+Immutable property-name String encodings use a ByteLru capped at 512 entries
+and 256 KiB of charged string payload. Rc keys pin identity addresses against
+reuse; the cache holds no objects, layouts, descriptors or JS values. Queue
+metadata remains bounded by the existing ByteLru compaction policy. The
+managed-memory census visits both string owners and cache metadata, marking
+opaque HashMap storage as a lower bound. No tier admission or object/value
+representation changes; all ordinary tiers share the builtin implementation.
+
+Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:6682 and :31299.
+EnumerableOwnProperties orders own keys, live descriptor inspection and Get
+per key; entry pairs use CreateArrayFromList. Only the fully inert data case
+can combine those steps. Official clauses:
+https://tc39.es/ecma262/#sec-enumerableownproperties
+https://tc39.es/ecma262/#sec-object.entries
+https://tc39.es/ecma262/#sec-object.values
+The consulted local snapshot was not verified against current upstream text.
+
+Three new regressions cover actual fast-path execution in every tier, frozen
+sources/default result attributes, independent pair arrays, live aliases,
+Symbol/BigInt/signed-zero/undefined values, Unicode keys, getter deletion,
+non-enumerability, integer order, proxies/trap order, primitive/nullish input,
+GC and cache quota/oversize admission. All 1,587 engine library tests, strict
+engine all-target Clippy, workspace/all-target checks and optional optimizing-
+jit all-target compilation pass. The first build used a nonexistent Props
+length method; corrected reservation reads the iterator's size hint. The
+first broad run passes 1,586 and fails the memory inventory's stale 147-field
+count. The inventory already classifies the new cache; its count is updated
+to 148. Later full execution passes. Original failures remain in local logs.
+No fresh Test262, x64/wasm or optional-backend execution is claimed.
+
+Four balanced fresh-process pairs on crystal ARM64 CPU5 use ordinary release
+JIT, default Intl, opt3/fat LTO/codegen-units1/panic-abort and cleared runtime
+switches. Baseline is committed cycle15, e16403f. Complete outputs match,
+including one Node v24.21.0 reference per workload. React reducer measured
+time is 116 ->117ms (+0.86%; paired ratio interval .98084–1.02844), Djot
+292.5 ->292ms (-0.17%; .95848–1.02420), complete solver process time
+8624.88 ->8551.07ms (0.86% lower; .98630–.99343), and Vue reactivity
+749 ->745.5ms (-0.47%; .98128–1.01088). The solver's interval excludes
+parity; the other workload intervals span it. This is a small application
+benefit, not a major engine gain or closure of the reported Node gap.
+These scoped drivers are not full browser benchmark results, and single
+Node observations are not comparison distributions.
+
+Separate four balanced Linux wait4 peak pairs report React 23,702 ->22,918
+KiB (-3.31%; .92403–1.02375), Djot 54,728 ->54,800 KiB (+0.13%;
+.98261–1.01865), solver 640,004 ->641,210 KiB (+0.19%; .98747–1.01733)
+and Vue 43,492 ->44,416 KiB (+2.12%; 1.00084–1.03729). Vue's peak increase
+excludes parity but is below the combined policy's 3% median-loss threshold;
+other peak intervals span parity. No memory benefit or post-GC retained-
+memory result is claimed. No timing or peak regression gate fails.
+
+Release build log and exact timing/peak distributions remain under
+benchmark-results/engine-cycle16-20260930, with source, patch, binaries,
+complete outputs and check logs. The binary grows by 8,808 bytes. No owned
+build/test/profile overlaps acceptance timing or peak runs; desktop apps
+remain active. Source for the next getter experiment is separate from the
+measured/staged sources. Installed/accepted artifacts are unchanged.

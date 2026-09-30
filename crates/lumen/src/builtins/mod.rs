@@ -1229,6 +1229,33 @@ fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
 /// [[GetOwnProperty]] then — if enumerable — [[Get]] the value, interleaved per key (matters for the
 /// observable trap order on proxies). `entries` controls value vs `[key, value]` output.
 fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result<Value, Value> {
+    // ECMA-262 EnumerableOwnProperties: a fully validated ordinary named data
+    // record has no observable key/descriptor/Get effects. Its insertion order
+    // is the required key order. A failed proof runs the ordered algorithm below.
+    if let Some(object) = o
+        .as_obj()
+        .filter(|object| i.ordinary_get_ptr(Rc::as_ptr(object) as usize))
+    {
+        let object = object.borrow();
+        if object.ic_plain.get()
+            && matches!(object.exotic, Exotic::None)
+            && matches!(object.call, Callable::None)
+            && object.props.named_data_keys().is_some()
+        {
+            #[cfg(test)]
+            TEST_RECORD_ENUMERATIONS.with(|count| count.set(count.get() + 1));
+            let mut out = Vec::with_capacity(object.props.iter().size_hint().0);
+            for (key, property) in object.props.iter() {
+                out.push(if entries {
+                    let key = i.property_key_string(key);
+                    i.make_entry_pair(key, property.clone_value_packed())
+                } else {
+                    property.value()
+                });
+            }
+            return Ok(i.make_array(out));
+        }
+    }
     let mut out = Vec::new();
     if let Some((t, h)) = proxy_pair(i, o) {
         for k in proxy_own_keys(i, &t, &h)? {
@@ -1344,6 +1371,13 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
         }
     }
     Ok(i.make_array(out))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_RECORD_ENUMERATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 fn global_fn(it: &Interp, name: &str, len: usize, f: NativeFn) {

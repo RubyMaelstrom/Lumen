@@ -86,6 +86,8 @@ mod ordered_collection;
 #[cfg(test)]
 mod ordered_collection_tests;
 mod parser;
+#[cfg(test)]
+mod record_enumeration_tests;
 mod regex;
 mod regex_emoji;
 mod regex_fold;
