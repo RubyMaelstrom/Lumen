@@ -92,6 +92,7 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
     "#,
     );
     let before = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get);
+    let epoch_before = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         eval(
             &mut engine,
@@ -103,9 +104,9 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
         ),
         "true"
     );
-    assert!(
-        crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get) - before >= 120,
-        "warm String/Number calls bypass generic native argument decoding"
-    );
+    let hits = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get) - before;
+    let epoch_after = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(hits >= 120,
+        "warm String/Number calls bypass generic native argument decoding: {hits} hits, epoch {epoch_before}->{epoch_after}");
     assert!(engine.interp.fn_frames.is_empty());
 }

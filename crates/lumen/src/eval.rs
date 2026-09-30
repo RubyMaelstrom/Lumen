@@ -3335,8 +3335,9 @@ impl Interp {
             return Err(self.throw("TypeError", "cannot set property on null super base"));
         }
         let key = self.to_property_key(&key)?;
-        self.set_member_recv(base, &key, value, receiver)
-            .map(|_| ())
+        let strict = self.strict;
+        let success = self.set_member_recv(base, &key, value, receiver)?;
+        self.finish_assignment_set(&key, strict, success)
     }
 
     fn eval_array(&mut self, elems: &[ArrayElem], env: &Env) -> Result<Value, Abrupt> {
@@ -8899,8 +8900,9 @@ impl Interp {
                 // final write lands on the receiver.
                 let proto = proto.clone();
                 let receiver = receiver.clone();
-                self.set_member_recv(&proto, &k, value, receiver)
-                    .map(|_| ())
+                let strict = self.strict;
+                let success = self.set_member_recv(&proto, &k, value, receiver)?;
+                self.finish_assignment_set(&k, strict, success)
             }
         }
     }

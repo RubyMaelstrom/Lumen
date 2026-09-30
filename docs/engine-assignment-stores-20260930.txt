@@ -1,0 +1,145 @@
+Native named assignment results — 30 September 2026
+====================================================
+
+The preceding whole-call shortcut removed 2,770,681 SetProp helper calls
+from the complete solver, but introduced 2,766,884 checked caller helpers
+and made the solver 1.38% slower. It was reverted. The source reveals a
+more direct gap: statement-position named stores already use ARM64 inline
+own-property overwrite/creation, while the value-keeping SetProp always
+used the Rust helper. Return/chain/conditional assignments therefore paid
+that helper even for ordinary own writable data and scalar RHS values.
+
+The existing store emitter now accepts the result-preserving form. Live
+receiver/exotic/shape/slot/descriptor and creation proofs are unchanged.
+All misses precede stores and owner acquisition. On success the property
+acquires one RHS owner and the original operand owner moves over the
+receiver into the expression result. Old-value/receiver decrements still
+require non-final owners; alias, lazy/BigInt, exotic, descriptor and shape
+misses retain the original exact-PC checked operation. No extra cache,
+opcode, object layout, call dispatcher, frame omission or host dependency
+is added. Baseline and SSA barrier emission share this operation. x64
+retains its established checked property stores. Ordinary optimizing-JIT
+selection/architecture probes remain off.
+
+A fallback regression exposed a pre-existing PutValue rejection bug:
+strict assignment ignored a false Proxy [[Set]] result. The pinned baseline
+reports 0:8:false:12 across interpreter/bytecode/JIT for a fixture with six
+strict named/computed/super/inherited writes, one Reflect.set and one sloppy
+write; Node reports 6:8:false:12. Assignment wrappers now enforce the
+reference's captured strictness after [[Set]], while the internal Boolean
+result used by Reflect.set is unchanged. Profiled paths and both super
+assignment paths use the same completion check. All three tiers now match
+Node for that rejection fixture.
+
+Consulted official local ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202:
+ /big/web-standards/repositories/tc39/ecma262/spec.html:21240,
+ AssignmentExpression Evaluation returns the RHS after successful PutValue.
+ :4550, PutValue throws TypeError for false [[Set]] on a strict reference.
+ :13449, OrdinarySetWithOwnDescriptor preserves live descriptor rejection.
+ https://tc39.es/ecma262/#sec-assignment-operators-runtime-semantics-evaluation
+ https://tc39.es/ecma262/#sec-putvalue
+ https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor
+This is the consulted snapshot, not verified current upstream text.
+
+Five regressions cover all three tiers: scalar/signed-zero/NaN/infinite/
+undefined/null values, String/Symbol/Object/BigInt owners, fresh creation,
+self/old/new aliases, GC reachability, descriptor replacement, strict/sloppy
+rejections, proxies, inherited setters, read-only and non-extensible data,
+throwing setters, RHS/receiver ordering, named array properties, computed/
+super/Reflect.set rejection, and exact host destructor counts. A native
+helper counter remains unchanged over 270 warm Number/primitive/reference
+assignment expressions, proving the new fast path is entered. BigInt and
+final old owners retain checked cloning/destruction.
+
+The first full library run passed 1594 and failed two cases: the host
+fixture stored Cell<i32> but retrieved Cell<usize>, and the existing warmed
+codePointAt intrinsic-count assertion missed its strict 120-entry target.
+The fixture now explicitly stores Cell<usize>. The intrinsic assertion still
+requires 120 entries; its diagnostic now reports hit count and process-wide
+call-cache epoch. The original failed run has no epoch/count details, so a
+parallel cache-refill race is a source-based explanation, not an observed
+cause. All 1596 library tests pass on the revised source. Only formatting
+followed that functional run. Strict engine all-target Clippy, optional
+optimizing-jit all-target compilation, workspace all-target compilation,
+format and diff checks pass. Failed logs and snapshots remain preserved.
+No fresh Test262, x64/wasm execution, or optional-backend execution is claimed.
+
+Base production engine 74df1bb; source HEAD ffbfed1 changes only reports
+since cycle18. Every preceding inventoried engine file matches that HEAD.
+Candidate exact staged engine patch SHA256:
+ 5a7a042cf8d29e228401567a0da677b40489c7c12522194268dbdda7d2903b60
+Baseline release SHA256:
+ 3ea7f67ecd934d13fce51500c35c8829fb7a5ab9af08f3fd62fe714d3c18b30f
+25,109,848 bytes. Complete snapshots, patch, exact binaries, logs and
+application outputs remain under benchmark-results/engine-cycle21-20260930.
+
+Four balanced fresh-process application pairs use crystal Linux ARM64 CPU5,
+ordinary default-Intl release JIT, opt3/fat LTO/codegen-units1/panic-abort,
+with LUMEN_*/TRUST_*/LD_PRELOAD removed. Node v24.21.0 / V8 13.6.233.17-node.53
+supplies one reference per workload, not a distribution. Inputs are unchanged
+Djot@0.3.2 rendering, complete examples/ejs/code.js solver, Speedometer React
+TodoMVC reducer and Vue reactivity drivers. React/Vue are component work,
+not full browser scores. Full normalized outputs must agree. Four-pair
+paired-log Student-t 95% intervals use t3=3.182446305; primary/process wall,
+user/system CPU and separate Linux wait4 peak RSS are checked independently.
+Desktop applications remain active; no owned build/test/profile overlaps
+timing or peak. No post-GC, pauses or isolated compilation gain is claimed.
+
+Decision: retain the small solver gain and strict assignment correction.
+
+Application medians and candidate/baseline paired 95% intervals:
+
+ react: 116.00 -> 116.00ms; reduction +0.00%; ratio 0.98330-1.03005.
+ djot: 287.50 -> 288.50ms; reduction -0.35%; ratio 0.97416-1.05494.
+ ejs: 8277.17 -> 8202.06ms; reduction +0.91%; ratio 0.98723-0.99474.
+ vue: 752.50 -> 755.00ms; reduction -0.33%; ratio 0.98628-1.01727.
+
+The complete solver falls 0.91%; its interval excludes parity. All other
+primary/process wall/CPU comparisons stay below the independent regression
+gates; other primary intervals include parity. These are paired incremental
+results, not a cumulative session speedup or a broad Node-parity result.
+
+Separate peak RSS medians in KiB:
+
+ react: 22612 -> 22464; change -0.65%; ratio 0.94792-1.05161.
+ djot: 54480 -> 54330; change -0.28%; ratio 0.97006-1.02569.
+ ejs: 640390 -> 637750; change -0.41%; ratio 0.98855-1.00619.
+ vue: 43950 -> 44002; change +0.12%; ratio 0.98797-1.02791.
+
+All peak intervals include parity. All 36 timing/reference and 32 peak runs
+complete with matching normalized outputs. No independent combined stable-
+component timing, CPU or peak regression gate is crossed.
+
+Exact release candidate SHA256:
+ be117258c84d7de89846416994cc8a02040c7f512ea4125a1044678455923401
+25,112,992 bytes; release build 221.02s. Baseline build is
+the preserved cycle18 artifact, not a new compilation distribution. Binary
+grows 3,144 bytes. No installed or accepted release artifact is promoted.
+
+The frozen release artifact also matches Node's 6:8:false:12 rejection
+fixture on all three tiers with call threshold zero. That correctness
+control is separate from the ordinary default-switch acceptance runs.
+
+One instrumented solver execution per artifact follows all timing/peak
+runs. SetProp helpers fall 2,770,681 -> 0; CallWithThis stays 918,724. The
+271 successful JIT compilations, 58 successful inline bodies, 143 inline
+plan sites and call-cache epoch 58 match. This confirms that the store
+change preserves the preceding call path rather than adding caller helpers.
+Helper counts exclude native fast instructions; no causal time fraction
+is claimed. Diagnostic normalized outputs match the acceptance output.
+
+Instrumented generated code grows 59,435,280 -> 59,543,396 bytes (108,116
+bytes); largest body 40,871,912 -> 40,871,968 bytes. JIT compilation is
+0.42645 -> 0.41621s and 12 collections/pause totals 0.58460 -> 0.59051s
+in those single instrumented runs. These observations do not establish
+compile or pause improvement/regression. Peak distributions include parity.
+
+The diagnostic also records 394,184 GetIterator operations, 820,125 steps
+and 330,628 closes; their counts match on both artifacts. Most initial
+iterator objects remain materialized even when the existing intrinsic step
+path avoids result objects. This is a larger allocation/dispatch target for
+the next implementation audit. Some/every native durations are inclusive
+of callbacks and nesting, so their totals cannot be treated as exclusive
+builtin cost or added to predict a speedup.
+
+No installed or accepted release artifact is promoted.

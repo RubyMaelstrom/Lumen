@@ -4464,6 +4464,9 @@ mod call_epoch_tests;
 #[path = "jit_numeric_array_tests.rs"]
 mod numeric_array_tests;
 #[cfg(test)]
+#[path = "jit_property_store_tests.rs"]
+mod property_store_tests;
+#[cfg(test)]
 #[path = "jit_return_tests.rs"]
 mod return_tests;
 
@@ -7815,16 +7818,6 @@ fn emit_instanceof_inline(
     a.bind(done);
 }
 
-/// Inline own-property store (`this.x = v`, statement position → `SetPropDrop`): the machine-code
-/// mirror of `Interp::try_ic_set`'s shape fast path. Validates the receiver by shape (a match
-/// proves the cached slot still maps this name), re-checks `accessor`/`writable`, then *moves*
-/// the 16-byte value off the operand stack into the slot — a pure value overwrite never changes
-/// the shape, so no cache invalidation is needed. The old value drops inline (strong-- when
-/// refcounted and not the last reference); a BigInt old value (compound drop), a last-reference
-/// old value or receiver, an accessor/non-writable slot, a shape or depth miss, and any exotic
-/// receiver all fall to the checked helper. Every guard branches to `slow` before any state is
-/// written, so the fallback re-runs the op cleanly.
-///
 /// Probe one polymorphic property-creation way. Entry has x11 at the receiver Object and the
 /// incoming value at sp-16. A hit leaves x12 at its IcState and x13 holding the current entries
 /// length and x7 at a replacement layout Rc (zero keeps the current prediction), then branches
@@ -7983,6 +7976,11 @@ fn emit_prop_create_probe(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+/// Native own-data store, including the assignment expression's RHS result.
+/// Every declining guard precedes mutation or owner acquisition. `keep` adds
+/// one property owner while moving the original RHS owner over the receiver.
+/// Descriptor/shape/exotic and final-owner misses retain the exact checked op.
+/// ECMA-262 e28783d5: OrdinarySetWithOwnDescriptor and assignment Evaluation.
 fn emit_set_prop_inline(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
@@ -7991,7 +7989,9 @@ fn emit_set_prop_inline(
     pc: u32,
     l_unwind: usize,
     recv: PropRecv,
+    keep: bool,
 ) {
+    debug_assert!(!keep || matches!(recv, PropRecv::Stack));
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT};
     if layout.entry_accessor != layout.entry_value + 8 {
         emit_op_helper(a, H_SET_PROP, pc, l_unwind);
@@ -8011,8 +8011,18 @@ fn emit_set_prop_inline(
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
-    // 1. receiver must be an Obj (tag 8). Stack form: [obj @ -32, v @ -16], refcount-managed;
-    // this/slot forms: [v @ -16] only, the frame owns the receiver.
+    if keep {
+        // A retained RHS needs two owners. Keep BigInt's checked clone and
+        // never admit TDZ/property-only words as a JavaScript result.
+        emit_exec_word_load(a, 16, 20, -8);
+        emit_exec_kind(a, 16, 9, 14, slow);
+        a.cmp_imm_w(9, 1);
+        a.b_cond(C_EQ, slow);
+        a.cmp_imm_w(9, 5);
+        a.b_cond(C_EQ, slow);
+    }
+    // Stack form: [obj @ -16, v @ -8], both owned; this/slot forms
+    // have [v @ -8] only and the frame owns the receiver.
     match recv {
         PropRecv::Stack => {
             emit_exec_word_load(a, 9, 20, -16);
@@ -8073,6 +8083,13 @@ fn emit_set_prop_inline(
         }
 
         a.bind(create_commit);
+        if keep {
+            // All creation proofs are complete. Preserve x7 (layout), x12
+            // (IC), x13 (length) and x10/x11 (receiver); acquire RHS ownership
+            // before installing the replacement layout or publishing a field.
+            emit_exec_word_load(a, 16, 20, -8);
+            emit_exec_clone(a, layout, 16, 6, 17, slow);
+        }
         let layout_installed = a.new_label();
         a.cbz(7, true, layout_installed);
         a.ldur(17, 7, strong);
@@ -8113,7 +8130,12 @@ fn emit_set_prop_inline(
             a.ldur(9, 10, strong);
             a.sub_imm(9, 9, 1);
             a.stur(9, 10, strong);
-            a.sub_imm(20, 20, 16);
+            if keep {
+                emit_exec_word_store(a, 16, 20, -16);
+                a.sub_imm(20, 20, 8);
+            } else {
+                a.sub_imm(20, 20, 16);
+            }
         } else {
             a.sub_imm(20, 20, 8);
         }
@@ -8225,6 +8247,11 @@ fn emit_set_prop_inline(
     // Move v into the entry. Packed storage encodes the wide stack value in x16; ownership of a
     // refcounted payload transfers unchanged from the stack slot into the property.
     emit_exec_word_load(a, 16, 20, -8);
+    if keep {
+        // Preserve the old-owner proof in x9/x12/x14 and the entry in x15.
+        // No helper/observer can change the preflighted RHS category.
+        emit_exec_clone(a, layout, 16, 6, 17, slow);
+    }
     a.stur(16, 15, ev);
     // drop the old value (refcounted: strong was > 1, so this never frees)
     let no_old_dec = a.new_label();
@@ -8239,8 +8266,14 @@ fn emit_set_prop_inline(
         a.ldur(9, 10, strong);
         a.sub_imm(9, 9, 1);
         a.stur(9, 10, strong);
-        // pop both operands, push nothing
-        a.sub_imm(20, 20, 16);
+        if keep {
+            // Move the original RHS owner to the expression result slot;
+            // the property owns the extra retain above, including aliases.
+            emit_exec_word_store(a, 16, 20, -16);
+            a.sub_imm(20, 20, 8);
+        } else {
+            a.sub_imm(20, 20, 16);
+        }
     } else {
         // pop just the value
         a.sub_imm(20, 20, 8);

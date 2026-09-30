@@ -2254,7 +2254,8 @@ fn emit_effect(
                 ElemLocalKind::SetDrop,
             );
         }
-        Op::SetPropDrop(name, cache)
+        Op::SetProp(name, cache)
+        | Op::SetPropDrop(name, cache)
         | Op::SetPropThisDrop(name, cache)
         | Op::SetPropLocalDrop(_, name, cache)
             if fast & 65536 != 0
@@ -2274,6 +2275,7 @@ fn emit_effect(
                 pc_u32,
                 unwind,
                 receiver,
+                matches!(op, Op::SetProp(..)),
             );
         }
         Op::UpdateProp(_, cache, kind) if fast & 65536 != 0 && set_prop_inlinable(layout) => {

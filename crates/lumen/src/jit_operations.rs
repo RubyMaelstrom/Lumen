@@ -405,18 +405,21 @@ pub(super) fn emit(
         Op::Not if fast & 131072 != 0 && eq_inlinable(layout) => {
             emit_not_inline(a, layout, pc as u32, unwind);
         }
-        Op::SetPropDrop(_, cache) if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) => {
+        Op::SetProp(_, cache) | Op::SetPropDrop(_, cache)
+            if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
+        {
             emit_set_prop_inline(
                 a,
                 layout,
                 chunk.jit_cache_ptr(*cache),
                 chunk.jit_name(match op {
-                    Op::SetPropDrop(n, _) => *n,
+                    Op::SetProp(n, _) | Op::SetPropDrop(n, _) => *n,
                     _ => unreachable!(),
                 }),
                 pc as u32,
                 unwind,
                 PropRecv::Stack,
+                matches!(op, Op::SetProp(..)),
             );
         }
         Op::SetPropThisDrop(_, cache)
@@ -433,6 +436,7 @@ pub(super) fn emit(
                 pc as u32,
                 unwind,
                 PropRecv::This,
+                false,
             );
         }
         Op::SetPropLocalDrop(s, _, cache)
@@ -452,6 +456,7 @@ pub(super) fn emit(
                 pc as u32,
                 unwind,
                 PropRecv::Slot(*s as u32 * 8),
+                false,
             );
         }
         Op::UpdateProp(_, cache, kind)

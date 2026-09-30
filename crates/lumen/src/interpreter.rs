@@ -7167,8 +7167,9 @@ impl Interp {
                 return Ok(());
             }
         }
-        self.set_member_recv_impl(base, name, v, base.clone(), Some(trace))
-            .map(|_| ())
+        let strict = self.strict;
+        let success = self.set_member_recv_impl(base, name, v, base.clone(), Some(trace))?;
+        self.finish_assignment_set(name, strict, success)
     }
 
     /// The `SetProp` inline-cache fast path; `false` means "take the slow path". Writes cache
@@ -8126,8 +8127,25 @@ impl Interp {
     }
 
     pub fn set_member(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Abrupt> {
-        self.set_member_recv(base, key, value, base.clone())
-            .map(|_| ())
+        let strict = self.strict;
+        let success = self.set_member_recv(base, key, value, base.clone())?;
+        self.finish_assignment_set(key, strict, success)
+    }
+
+    /// PutValue tests the Boolean [[Set]] result using the reference's strictness.
+    /// Proxy traps can reject a write normally; Reflect.set still receives false
+    /// from the underlying internal method instead of an assignment exception.
+    pub(crate) fn finish_assignment_set(
+        &mut self,
+        key: &str,
+        strict: bool,
+        success: bool,
+    ) -> Result<(), Abrupt> {
+        if !success && strict {
+            Err(self.throw("TypeError", format!("Cannot assign to property '{key}'")))
+        } else {
+            Ok(())
+        }
     }
 
     /// Profile-enabled `[[Set]]` entry used by computed element operations. The trace is filled at
@@ -8140,8 +8158,9 @@ impl Interp {
         trace: &mut crate::feedback::CurrentPropertyTrace,
     ) -> Result<(), Abrupt> {
         trace.receiver_shape = self.property_receiver_shape(base);
-        self.set_member_recv_impl(base, key, value, base.clone(), Some(trace))
-            .map(|_| ())
+        let strict = self.strict;
+        let success = self.set_member_recv_impl(base, key, value, base.clone(), Some(trace))?;
+        self.finish_assignment_set(key, strict, success)
     }
 
     /// [[Set]](P, V, Receiver): like [`set_member`] but with an explicit `receiver` and returning the
