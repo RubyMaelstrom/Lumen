@@ -1275,14 +1275,13 @@ fn scan_realm(
                 interp
                     .frame_pool
                     .capacity()
-                    .saturating_mul(size_of::<std::ptr::NonNull<crate::value::PackedValue>>()),
+                    .saturating_mul(size_of::<std::ptr::NonNull<crate::jit::JitFrame>>()),
             )
             .saturating_add(
-                interp.frame_pool.len().saturating_mul(
-                    crate::jit::FRAME_BUF.saturating_mul(size_of::<
-                        std::mem::MaybeUninit<crate::value::PackedValue>,
-                    >()),
-                ),
+                interp
+                    .frame_pool
+                    .len()
+                    .saturating_mul(size_of::<crate::jit::JitFrame>()),
             )
             .saturating_add(
                 interp

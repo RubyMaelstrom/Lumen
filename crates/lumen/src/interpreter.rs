@@ -971,12 +971,13 @@ fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
     });
 }
 
-/// The JIT fast call's frame-buffer freelist (see `Interp::frame_pool`). A newtype so teardown
-/// frees the raw buffers (their contents are already dropped whenever a buffer is pooled).
-pub(crate) struct FramePool(pub(crate) Vec<std::ptr::NonNull<crate::value::PackedValue>>);
+/// The JIT's activation-record freelist (see `Interp::frame_pool` and [`crate::jit::JitFrame`]).
+/// A newtype so teardown frees the records (their frame contents are already released whenever
+/// a record is pooled).
+pub(crate) struct FramePool(pub(crate) Vec<std::ptr::NonNull<crate::jit::JitFrame>>);
 
 impl std::ops::Deref for FramePool {
-    type Target = Vec<std::ptr::NonNull<crate::value::PackedValue>>;
+    type Target = Vec<std::ptr::NonNull<crate::jit::JitFrame>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -989,12 +990,8 @@ impl std::ops::DerefMut for FramePool {
 impl Drop for FramePool {
     fn drop(&mut self) {
         for p in self.0.drain(..) {
-            unsafe {
-                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    p.as_ptr() as *mut std::mem::MaybeUninit<crate::value::PackedValue>,
-                    crate::jit::FRAME_BUF,
-                )));
-            }
+            // SAFETY: pooled records come from `JitFrame::alloc` and are not executing.
+            drop(unsafe { Box::from_raw(p.as_ptr()) });
         }
     }
 }
@@ -2587,7 +2584,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
     for _ in 0..3 {
         i.frame_pool
             .0
-            .push(std::ptr::NonNull::new(0x2000 as *mut PackedValue).unwrap());
+            .push(std::ptr::NonNull::new(0x2000 as *mut crate::jit::JitFrame).unwrap());
     }
     let fp = probe_vec_words(&i.frame_pool.0, 3, i.frame_pool.0.capacity());
     i.frame_pool.0.clear();

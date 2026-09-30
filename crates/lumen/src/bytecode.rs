@@ -19643,65 +19643,63 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
     }
 }
 
-/// Teardown for a direct (shared-ctx) JIT→JIT call — the asm sequence already ran the callee
-/// with the ctx fields swapped to the callee's frame; this drops whatever the callee left
-/// (operand-stack range + slots, with the shared-reference decrement fast path), returns the
-/// frame buffer to the pool, pops the FnFrame (including a materialized `extra`), drains a
-/// pending tail call, and decrements the recursion depth. The caller's asm then restores the
-/// swapped fields and pushes `ctx.ret` (still owned by ctx until the asm moves it out).
-/// Returns 0 = ok (ret valid) / 1 = threw (ctx.error set).
+/// Teardown for a direct JIT→JIT call, the slow path of the generated finish stub. The callee
+/// ran on its own pooled record ([`crate::jit::JitFrame`]); this drops whatever it left (operand
+/// stack range and slots), moves its completion (return value or error) into the caller's
+/// context, returns the record to the pool, pops the FnFrame (including a materialized `extra`),
+/// drains a pending tail call and decrements the recursion depth. The caller's generated code
+/// then pushes `caller.ret` or unwinds with `caller.error`.
+/// Returns 0 = ok (`caller.ret` valid) / 1 = threw (`caller.error` set).
 ///
 /// # Safety
-/// `ctx` must still hold the CALLEE's swapped frame fields (slots/stack_base/final_sp/n_slots),
-/// with `ctx.slots` being the pooled buffer base.
+/// `callee` must be the finished record the direct-call sequence popped for this call, and
+/// `caller` the live context of the calling frame.
 pub(crate) unsafe extern "C" fn jit_direct_finish(
-    ctx: *mut crate::jit::JitCtx,
+    caller: *mut crate::jit::JitCtx,
+    callee: *mut crate::jit::JitCtx,
     threw: u32,
-    _sp: *mut PackedValue,
 ) -> u64 {
-    let ctx = &mut *ctx;
-    // Returning from inside a try bypasses the lexical PopHandler. Direct calls share their
-    // caller's handler allocation, so discard every record above this activation's watermark
-    // before the caller resumes (ECMA-262 14.10.1 and 14.15.3).
-    ctx.handlers.truncate(ctx.handler_floor);
-    let i = &mut *ctx.interp;
+    let caller = &mut *caller;
+    let record = std::ptr::NonNull::new_unchecked(callee.cast::<crate::jit::JitFrame>());
+    let callee = &mut *callee;
+    let i = &mut *callee.interp;
     // Leftover operand stack (only on throw; clean returns leave it empty).
-    let mut p = ctx.stack_base;
-    while p < ctx.final_sp {
+    let mut p = callee.stack_base;
+    while p < callee.final_sp {
         std::ptr::drop_in_place(p);
         p = p.add(1);
     }
     // Exact packed-owner destruction; numeric words require no heap operation.
-    for k in 0..ctx.n_slots {
-        std::ptr::drop_in_place(ctx.slots.add(k));
+    for k in 0..callee.n_slots {
+        std::ptr::drop_in_place(callee.slots.add(k));
     }
-    // Return the frame buffer (asm popped it from the freelist; base == ctx.slots).
-    let buf = std::ptr::NonNull::new_unchecked(ctx.slots);
-    if i.frame_pool.len() < 64 {
-        i.frame_pool.0.push(buf);
+    let mut threw = threw != 0;
+    if threw {
+        caller.error = Some(
+            callee
+                .error
+                .take()
+                .unwrap_or(Abrupt::Throw(Value::Undefined)),
+        );
     } else {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-            ctx.slots as *mut std::mem::MaybeUninit<PackedValue>,
-            crate::jit::FRAME_BUF,
-        )));
+        caller.ret = callee.take_ret();
     }
-    // The callee's `this` binding lives in the shared ctx — drop it before the asm restores
-    // the caller's value over it (a plain overwrite would leak a refcounted `this` per call).
-    ctx.this_val = Value::Undefined;
+    // Returning from inside a try bypasses the lexical PopHandler; `release` also discards the
+    // callee's own handler records (ECMA-262 14.10.1 and 14.15.3) and its `this` binding.
+    crate::jit::JitFrame::release(i, record);
     // FnFrame pop (the asm pushed it; a materialized `extra` drops here).
     if let Some(f) = i.fn_frames.pop() {
         drop(f.extra);
     }
-    let mut threw = threw != 0;
     // Proper-tail-call trampoline, exactly like the layered paths.
     if !threw {
         while let Some(bx) = i.pending_tail.take() {
             let (f, t, a) = *bx;
             let r = i.gc_check_amortized().and_then(|()| i.call_tail(f, t, &a));
             match r {
-                Ok(v) => ctx.ret = PackedValue::pack(v),
+                Ok(v) => caller.ret = PackedValue::pack(v),
                 Err(e) => {
-                    ctx.error = Some(e);
+                    caller.error = Some(e);
                     threw = true;
                     break;
                 }

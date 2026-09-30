@@ -6087,6 +6087,7 @@ fn emit_direct_call(
     // overwhelmingly below 64.
     let gc_data_off = layout.gc_data_off;
     if !ilayout.valid
+        || FRAME_WORDS_OFF >= 4096
         || argc > 64
         || gc_data_off >= 4096
         || !layout.scope_parent_valid
@@ -6130,7 +6131,6 @@ fn emit_direct_call(
     const IC_CHUNK_RAW: i32 = 64;
     const IC_CODE_MEM: i32 = 72;
     const IC_PC_OFFS: i32 = 80;
-    let cx_slots = offset_of!(JitCtx, slots) as u32;
     let cx_stack_base = offset_of!(JitCtx, stack_base) as u32;
     let cx_env_raw = offset_of!(JitCtx, env_raw) as u32;
     let cx_env_parent_raw = offset_of!(JitCtx, env_parent_raw) as u32;
@@ -6138,7 +6138,6 @@ fn emit_direct_call(
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
     let cx_code_base = offset_of!(JitCtx, code_base) as u32;
     let cx_pc_offsets = offset_of!(JitCtx, pc_offsets) as u32;
-    let cx_floor = offset_of!(JitCtx, handler_floor) as u32;
     let cx_this = offset_of!(JitCtx, this_val) as u32;
     let cx_ret = offset_of!(JitCtx, ret) as u32;
     let cx_live_objects = offset_of!(JitCtx, live_objects) as u32;
@@ -6262,16 +6261,18 @@ fn emit_direct_call(
     a.stur(31, 6, 16); // extra = None (xzr)
     a.add_imm(16, 16, 1);
     a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
-    // frame pool pop: buf = ptr[--len] → x9 (the callee slots base)
+    // Pop the callee's activation record: x9 = the record (and its JitCtx), x15 = its slot
+    // storage. The callee runs on this record; the caller's context is never modified.
     a.sub_imm(7, 7, 1);
     a.str_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
     a.ldr_imm(5, 14, (il.frame_pool + il.fp_ptr_word) as u32);
     a.ldr_x_lsl3(9, 5, 7);
+    a.add_imm(15, 9, FRAME_WORDS_OFF as u32);
     // Move packed argument owners byte-for-byte; there is no conversion or possible miss.
     a.sub_imm(8, 20, (argc * 8) as u32);
     for k in 0..argc {
         a.ldr_imm(4, 8, (k * 8) as u32);
-        a.str_imm(4, 9, (k * 8) as u32);
+        a.str_imm(4, 15, (k * 8) as u32);
     }
     // Initialize every remaining local to a complete packed Undefined word.
     a.ldrh_imm(5, 12, IC_NSLOTS);
@@ -6283,86 +6284,59 @@ fn emit_direct_call(
     a.bind(init_loop);
     a.cmp_reg_w(6, 5);
     a.b_cond(C_HS, init_done);
-    a.madd(3, 6, 4, 9);
+    a.madd(3, 6, 4, 15);
     a.stur(17, 3, 0);
     a.add_imm(6, 6, 1);
     a.b(init_loop);
     a.bind(init_done);
 
-    // ---- swap: save the caller's frame fields to an SP-carved area, install the callee's --
-    a.sub_imm(31, 31, 128);
-    // slots
-    a.ldr_imm(4, 19, cx_slots);
-    a.stur(4, 31, 0);
-    a.str_imm(9, 19, cx_slots);
+    // ---- install the callee's per-frame fields in its own record ----
+    // Interpreter-constant fields (helpers, interp, counters, slots, this_raw) were written when
+    // the record was created; this_val/ret/error/handlers are vacant while it is pooled.
     // stack_base = slots + n_slots*8
-    a.ldr_imm(4, 19, cx_stack_base);
-    a.stur(4, 31, 8);
     a.movz(4, 8, 0);
-    a.madd(3, 5, 4, 9);
-    a.str_imm(3, 19, cx_stack_base);
-    // env_raw
-    a.ldr_imm(4, 19, cx_env_raw);
-    a.stur(4, 31, 16);
+    a.madd(3, 5, 4, 15);
+    a.str_imm(3, 9, cx_stack_base);
+    // env_raw, and its parent cache from the callee's actual closure environment
     a.ldur(4, 12, IC_ENV);
-    a.str_imm(4, 19, cx_env_raw);
-    // Parent caches follow the callee's actual closure environment, not the caller's.
-    a.ldr_imm(6, 19, cx_env_parent_raw);
-    a.stur(6, 31, 112);
+    a.str_imm(4, 9, cx_env_raw);
     a.ldr_imm(6, 4, layout.scope_parent as u32);
     let no_parent = a.new_label();
     a.cbz(6, true, no_parent);
     a.add_imm(6, 6, layout.scope_data_off as u32);
     a.bind(no_parent);
-    a.str_imm(6, 19, cx_env_parent_raw);
-    // chunk
-    a.ldr_imm(4, 19, cx_chunk);
-    a.stur(4, 31, 24);
+    a.str_imm(6, 9, cx_env_parent_raw);
     a.ldur(4, 12, IC_CHUNK_RAW);
-    a.str_imm(4, 19, cx_chunk);
-    // n_slots
-    a.ldr_imm(4, 19, cx_n_slots);
-    a.stur(4, 31, 32);
-    a.str_imm(5, 19, cx_n_slots);
-    // code_base
-    a.ldr_imm(4, 19, cx_code_base);
-    a.stur(4, 31, 40);
+    a.str_imm(4, 9, cx_chunk);
+    a.str_imm(5, 9, cx_n_slots);
     a.ldur(4, 12, IC_CODE_MEM);
-    a.str_imm(4, 19, cx_code_base);
-    // pc_offsets
-    a.ldr_imm(4, 19, cx_pc_offsets);
-    a.stur(4, 31, 48);
+    a.str_imm(4, 9, cx_code_base);
     a.ldur(4, 12, IC_PC_OFFS);
-    a.str_imm(4, 19, cx_pc_offsets);
-    // handler_floor = live handlers.len
-    a.ldr_imm(4, 19, cx_floor);
-    a.stur(4, 31, 56);
-    a.ldr_imm(4, 19, handlers_len_off as u32);
-    a.str_imm(4, 19, cx_floor);
-    // this_val (16B): save old, install the callee's
-    a.ldr_imm(4, 19, cx_this);
-    a.ldr_imm(5, 19, cx_this + 8);
-    a.stur(4, 31, 64);
-    a.stur(5, 31, 72);
+    a.str_imm(4, 9, cx_pc_offsets);
+    // Same Realm as the caller (the probe compared genv): its global body and scope.
+    a.ldr_imm(4, 19, 56);
+    a.str_imm(4, 9, 56);
+    a.ldr_imm(4, 19, 64);
+    a.str_imm(4, 9, 64);
     if with_this {
-        // ALWAYS move the receiver into ctx.this_val — even when the callee never reads
-        // `this` — because the finish helper's `this_val = Undefined` is what consumes it
-        // (skipping the caller-stack slot at cleanup without this move leaked the receiver
-        // on every this-less method call; Splay OOM'd on exactly that).
-        a.str_imm(0, 19, cx_this);
-        a.str_imm(1, 19, cx_this + 8);
-    } else {
-        a.strb_imm(31, 19, cx_this); // Undefined tag (payload stale; tag-only reads)
+        // ALWAYS move the receiver into the callee's this_val — even when the callee never
+        // reads `this` — because the finish stub's release of that binding is what consumes it
+        // (skipping it would leak the receiver on every this-less method call).
+        a.str_imm(0, 9, cx_this);
+        a.str_imm(1, 9, cx_this + 8);
     }
-    // constructing (byte) + new_target (tag byte): cleared for the callee
+    // Save area: [record, constructing, new_target (16B)]. constructing and new_target live on
+    // the interpreter and are cleared for the callee.
+    a.sub_imm(31, 31, 32);
+    a.stur(9, 31, 0);
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.ldrb_imm(4, construct_base, construct_offset);
-    a.stur(4, 31, 88);
+    a.stur(4, 31, 8);
     a.strb_imm(31, construct_base, construct_offset);
     a.ldr_imm(4, 14, il.new_target as u32);
     a.ldr_imm(5, 14, (il.new_target + 8) as u32);
-    a.stur(4, 31, 96);
-    a.stur(5, 31, 104);
+    a.stur(4, 31, 16);
+    a.stur(5, 31, 24);
     let (target_base, target_offset) = byte_field_address(a, 14, il.new_target, 16);
     let lexical_target = a.new_label();
     a.ldurb(4, 12, IC_DIRECT);
@@ -6372,49 +6346,29 @@ fn emit_direct_call(
     a.strb_imm(31, target_base, target_offset); // ordinary calls clear new.target
     a.bind(lexical_target); // arrows retain their lexical function environment's new.target
 
-    // ---- run the callee on the shared ctx ----
-    a.mov(0, 19);
+    // ---- run the callee on its own record ----
+    a.mov(0, 9);
     a.ldur(16, 12, IC_CODE_MEM);
     a.blr(16);
-    // w0 = 1 ok / 0 threw → w1 = threw for the finish stub
+    // w0 = 1 ok / 0 threw → w1 = threw for the finish stub; x10 = the callee record.
     let field1 = asm::logical_imm_w(1).unwrap();
     a.logic_imm_w(2, 1, 0, field1); // eor w1, w0, #1
-                                    // Teardown (drops, pool return, frame pop, tail drain, depth--): one shared per-chunk stub
-                                    // (see `emit_direct_finish_stub`) whose fast path never leaves machine code. w8 = threw.
+    a.ldur(10, 31, 0);
+    // Teardown (drops, completion transfer, record return, frame pop, tail drain, depth--): one
+    // shared per-chunk stub (see `emit_direct_finish_stub`) whose fast path never leaves
+    // machine code. w8 = threw.
     a.bl_label(finish_stub);
 
-    // ---- restore every swapped field ----
+    // ---- restore the interpreter's construct state ----
     a.ldr_imm(14, 19, 72); // ctx.interp (x14 was clobbered by the callee/helpers)
-    a.ldur(4, 31, 0);
-    a.str_imm(4, 19, cx_slots);
     a.ldur(4, 31, 8);
-    a.str_imm(4, 19, cx_stack_base);
-    a.ldur(4, 31, 16);
-    a.str_imm(4, 19, cx_env_raw);
-    a.ldur(4, 31, 112);
-    a.str_imm(4, 19, cx_env_parent_raw);
-    a.ldur(4, 31, 24);
-    a.str_imm(4, 19, cx_chunk);
-    a.ldur(4, 31, 32);
-    a.str_imm(4, 19, cx_n_slots);
-    a.ldur(4, 31, 40);
-    a.str_imm(4, 19, cx_code_base);
-    a.ldur(4, 31, 48);
-    a.str_imm(4, 19, cx_pc_offsets);
-    a.ldur(4, 31, 56);
-    a.str_imm(4, 19, cx_floor);
-    a.ldur(4, 31, 64);
-    a.ldur(5, 31, 72);
-    a.str_imm(4, 19, cx_this);
-    a.str_imm(5, 19, cx_this + 8);
-    a.ldur(4, 31, 88);
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.strb_imm(4, construct_base, construct_offset);
-    a.ldur(4, 31, 96);
-    a.ldur(5, 31, 104);
+    a.ldur(4, 31, 16);
+    a.ldur(5, 31, 24);
     a.str_imm(4, 14, il.new_target as u32);
     a.str_imm(5, 14, (il.new_target + 8) as u32);
-    a.add_imm(31, 31, 128);
+    a.add_imm(31, 31, 32);
 
     // ---- pop the callee (and skip the consumed this slot); dispatch on threw ----
     emit_direct_callee_drop(a, argc);
@@ -6881,16 +6835,15 @@ mod direct_call_tests {
     }
 
     #[test]
-    fn direct_finish_truncates_callee_handlers_to_the_activation_floor() {
-        let floor = std::mem::offset_of!(super::JitCtx, handler_floor) as u32;
+    fn direct_finish_clears_the_callee_records_handlers() {
         let handlers_len = super::jit_handlers_len_offset().expect("Vec length word") as u32;
         let mut asm = super::asm::Asm::new();
-        super::emit_handler_truncate(&mut asm, floor, handlers_len);
+        super::emit_handler_clear(&mut asm, 10, handlers_len);
 
         let words = asm.finish();
-        let load_floor = 0xF940_0000 | ((floor / 8) << 10) | (19 << 5) | 9;
-        let store_len = 0xF900_0000 | ((handlers_len / 8) << 10) | (19 << 5) | 9;
-        assert_eq!(words, [load_floor, store_len]);
+        // str xzr, [x10, #handlers_len]
+        let store_len = 0xF900_0000 | ((handlers_len / 8) << 10) | (10 << 5) | 31;
+        assert_eq!(words, [store_len]);
     }
 }
 
@@ -7072,27 +7025,25 @@ fn byte_field_address(a: &mut asm::Asm, base: u32, offset: usize, scratch: u32) 
     }
 }
 
-/// Remove handler records owned by the direct callee before restoring its caller's activation.
+/// Discard handler records left in a finished direct callee's own record (register `record`).
 /// A `return` is an abrupt completion that leaves its surrounding `try` (ECMA-262 14.10.1 and
 /// 14.15.3), so a direct callee may legitimately bypass its lexical `PopHandler` operation.
+/// `Handler` has no destructor, so clearing the length releases nothing else.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_handler_truncate(a: &mut asm::Asm, cx_handler_floor: u32, handlers_len_off: u32) {
-    a.ldr_imm(9, 19, cx_handler_floor);
-    a.str_imm(9, 19, handlers_len_off);
+fn emit_handler_clear(a: &mut asm::Asm, record: u32, handlers_len_off: u32) {
+    a.str_imm(31, record, handlers_len_off);
 }
 
 /// The direct-call teardown stub, emitted ONCE per chunk (sites reach it by `bl`; per-site
-/// inlining would grow every call site by ~90 instructions). Entry: w1 = threw, x19 = ctx
-/// (still holding the CALLEE's swapped frame fields), x21 = helpers. Exit: w8 = final threw,
-/// everything else caller-saved clobbered. The fast path replicates `jit_direct_finish` for
-/// the common shape — clean return, empty operand stack, no pending tail call, no
-/// materialized FnFrame extra, room in the frame pool, and every owned Value (slots +
-/// `this`) either trivially droppable (tag < 5) or a shared reference (bare strong-count
-/// decrement) — in two passes: validate everything with NO mutation, then commit. Any
-/// deviation falls to the H_DIRECT_FINISH helper with state untouched.
+/// inlining would grow every call site by ~90 instructions). Entry: w1 = threw, x10 = the
+/// callee's finished activation record (its `JitCtx`), x19 = the caller's context, x21 =
+/// helpers. Exit: w8 = final threw, with the completion moved into the caller's context
+/// (`ret` or `error`) and the record back in the pool; everything else caller-saved is
+/// clobbered. The fast path replicates `jit_direct_finish` for a normal return without a
+/// pending tail call or materialized `extra`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -7108,14 +7059,17 @@ fn emit_direct_finish_stub(
     let cx_this = offset_of!(JitCtx, this_val) as u32;
     let cx_slots = offset_of!(JitCtx, slots) as u32;
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
-    let cx_handler_floor = offset_of!(JitCtx, handler_floor) as u32;
+    let cx_ret = offset_of!(JitCtx, ret) as u32;
     let slow = a.new_label();
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
+    let handlers_len_off = jit_handlers_len_offset().filter(|&off| fits8(off));
     let fast_ok = rc_dec_ok
         && il.valid
+        && handlers_len_off.is_some()
         && fits8(cx_this as usize)
         && fits8(cx_slots as usize)
         && fits8(cx_n_slots as usize)
+        && fits8(cx_ret as usize)
         && fits8(il.pending_tail)
         && fits8(il.fn_frames + il.fnf_ptr_word)
         && fits8(il.fn_frames + il.fnf_len_word)
@@ -7125,19 +7079,18 @@ fn emit_direct_finish_stub(
         && il.depth & 3 == 0
         && il.depth / 4 < 4096;
     // The stub calls out (H_DROP_AT per last-reference Value, or the full helper), so lr is
-    // spilled for the whole body; both exits share the epilogue.
+    // spilled for the whole body, with the record at [sp, 16]; both exits share the epilogue.
     let done = a.new_label();
-    a.stp_pre(29, 30, -16);
-    if let Some(handlers_len_off) = jit_handlers_len_offset() {
-        emit_handler_truncate(a, cx_handler_floor, handlers_len_off as u32);
-    }
+    a.stp_pre(29, 30, -32);
+    a.stur(10, 31, 16);
     if fast_ok {
+        let handlers_len_off = handlers_len_off.expect("checked above") as u32;
         a.cbnz(1, false, slow); // threw → helper
         a.ldr_imm(14, 19, 72); // ctx.interp
                                // operand stack clean (a clean return always leaves final_sp == stack_base)
-        a.ldr_imm(9, 19, 16); // ctx.final_sp
-        a.ldr_imm(10, 19, 8); // ctx.stack_base
-        a.cmp_reg_x(9, 10);
+        a.ldr_imm(9, 10, 16); // record.final_sp
+        a.ldr_imm(11, 10, 8); // record.stack_base
+        a.cmp_reg_x(9, 11);
         a.b_cond(C_NE, slow);
         // no pending proper-tail-call (Option<Box> niche: None = 0)
         a.ldr_imm(9, 14, il.pending_tail as u32);
@@ -7151,16 +7104,23 @@ fn emit_direct_finish_stub(
         a.madd(6, 16, 5, 6);
         a.ldur(9, 6, 16); // FnFrame.extra
         a.cbnz(9, true, slow);
-        // frame-pool room: len < 64 (the pool's policy cap) and len < capacity (a push must
-        // not reallocate the Vec from machine code). Value drops below never touch the pool,
-        // the frame stack, or the depth, so validating here stays sound.
+        // pool room: len < FRAME_POOL_LIMIT and len < capacity (a push must not reallocate the
+        // Vec from machine code). Value drops below never touch the pool, the frame stack, or
+        // the depth, so validating here stays sound.
         a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
-        a.cmp_imm_x(7, 64);
+        a.cmp_imm_x(7, FRAME_POOL_LIMIT as u32);
         a.b_cond(C_HS, slow);
         a.ldr_imm(4, 14, (il.frame_pool + il.fp_cap_word) as u32);
         a.cmp_reg_x(7, 4);
         a.b_cond(C_HS, slow);
         // ---- commit ----
+        emit_handler_clear(a, 10, handlers_len_off);
+        // Move the completion into the caller: its `ret` is vacant while it runs, so the
+        // record's owned word transfers without a reference-count change.
+        a.ldr_imm(4, 10, cx_ret);
+        a.str_imm(4, 19, cx_ret);
+        a.mov_imm64(5, crate::value::PACK_UNDEFINED);
+        a.str_imm(5, 10, cx_ret);
         // Drop the owned Values (callee `this`, then every slot). The strong count is re-read
         // PER VALUE, after all earlier decrements: two slots aliasing one object (`a = b = new
         // X` seeds several slots from one allocation) must route the LAST reference to a real
@@ -7168,7 +7128,7 @@ fn emit_direct_finish_stub(
         // destructor and leak the whole subgraph (Splay's splay_ dummy node caught exactly
         // that). Bare dec when shared; H_DROP_AT (full drop, may cascade) for a last reference
         // or a BigInt. Only x9 (cursor) and x5 (remaining) survive the helper: spilled around
-        // the call, everything else re-read afterwards.
+        // the call; the record is reloaded from the stub frame and everything else re-read.
         let drop_at = |a: &mut asm::Asm, value_reg: u32, helper: usize| {
             // x<value_reg> = address of the Value to drop; clobbers x0-x17 minus the spills.
             a.stp_pre(9, 5, -16);
@@ -7178,23 +7138,25 @@ fn emit_direct_finish_stub(
             a.ldr_imm(16, 21, (helper * 8) as u32);
             a.blr(16);
             a.ldp_post(9, 5, 16);
+            a.ldur(10, 31, 16);
         };
-        // callee `this` (the caller's restore overwrites the 16 bytes right after the stub)
+        // callee `this`, then reset the record's binding to Undefined (a pooled invariant)
         let this_done = a.new_label();
         let this_drop = a.new_label();
-        a.ldrb_imm(9, 19, cx_this);
+        a.ldrb_imm(9, 10, cx_this);
         a.cmp_imm_w(9, 5);
         a.b_cond(C_LO, this_done);
         a.b_cond(C_EQ, this_drop); // BigInt → full drop
-        a.ldr_imm(10, 19, cx_this + 8);
-        a.ldur(11, 10, 0); // strong (rc contract: payload+0)
-        a.cmp_imm_x(11, 1);
+        a.ldr_imm(11, 10, cx_this + 8);
+        a.ldur(12, 11, 0); // strong (rc contract: payload+0)
+        a.cmp_imm_x(12, 1);
         a.b_cond(C_LS, this_drop); // last reference → full drop
-        a.sub_imm(11, 11, 1);
-        a.stur(11, 10, 0);
+        a.sub_imm(12, 12, 1);
+        a.stur(12, 11, 0);
+        a.strb_imm(31, 10, cx_this);
         a.b(this_done);
         a.bind(this_drop);
-        a.add_imm(9, 19, cx_this);
+        a.add_imm(9, 10, cx_this);
         drop_at(a, 9, H_DROP_AT);
         a.bind(this_done);
         // slots
@@ -7202,8 +7164,8 @@ fn emit_direct_finish_stub(
         let c_next = a.new_label();
         let c_drop = a.new_label();
         let c_done = a.new_label();
-        a.ldr_imm(9, 19, cx_slots);
-        a.ldr_imm(5, 19, cx_n_slots);
+        a.ldr_imm(9, 10, cx_slots);
+        a.ldr_imm(5, 10, cx_n_slots);
         a.bind(c_loop);
         a.cbz(5, true, c_done);
         a.ldur(11, 9, 0);
@@ -7246,13 +7208,12 @@ fn emit_direct_finish_stub(
         a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
         a.sub_imm(16, 16, 1);
         a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
-        // frame-pool push: ptr[len] = ctx.slots; len++ (room validated above; drops can't
-        // have grown the pool)
+        // record push: ptr[len] = record; len++ (room validated above; drops can't have grown
+        // the pool)
         a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
         a.ldr_imm(4, 14, (il.frame_pool + il.fp_ptr_word) as u32);
-        a.ldr_imm(6, 19, cx_slots);
         a.add_shifted(4, 4, 7, 3);
-        a.stur(6, 4, 0);
+        a.stur(10, 4, 0);
         a.add_imm(7, 7, 1);
         a.str_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
         // depth--
@@ -7264,12 +7225,14 @@ fn emit_direct_finish_stub(
     }
     // ---- helper fallback (nothing mutated above: `slow` is only reachable pre-commit) ----
     a.bind(slow);
-    a.mov(0, 19);
+    a.mov(2, 1); // threw
+    a.mov(1, 10); // callee record
+    a.mov(0, 19); // caller context
     a.ldr_imm(16, 21, (H_DIRECT_FINISH * 8) as u32);
     a.blr(16);
     a.mov(8, 0);
     a.bind(done);
-    a.ldp_post(29, 30, 16);
+    a.ldp_post(29, 30, 32);
     a.ret();
 }
 
@@ -15690,10 +15653,106 @@ pub fn run(
     }
 }
 
-/// The per-frame buffer size (in packed words) of [`Interp::frame_pool`]: slots + operand stack of a
-/// JIT fast-call frame carve one fixed raw buffer, so frame setup is a freelist pop + pointer
-/// math instead of `Vec` bookkeeping. Frames that need more fall back to the pooled-`Vec` path.
+/// The per-frame storage size (in packed words) of a [`JitFrame`]: slots + operand stack of a
+/// JIT frame carve one fixed raw buffer, so frame setup is a freelist pop + pointer math instead
+/// of `Vec` bookkeeping. Frames that need more fall back to the pooled-`Vec` path.
 pub(crate) const FRAME_BUF: usize = 256;
+
+/// Pooled activation records kept per interpreter. Records beyond this bound are freed on
+/// release; deeper recursion allocates (and later frees) the excess.
+pub(crate) const FRAME_POOL_LIMIT: usize = 256;
+
+/// A pooled JIT activation record: the frame's own [`JitCtx`] followed by its fixed
+/// [`FRAME_BUF`]-word slot and operand-stack storage.
+///
+/// Every activation that fits runs on a record of its own — Rust entries and direct JIT→JIT
+/// calls alike — so entering a frame writes only the callee's per-frame fields. Nothing is
+/// saved, swapped into a shared context, or restored afterwards. Interpreter-constant fields
+/// (helper table, interpreter, live-object counter, IC-safety byte, diagnostic switches and the
+/// `slots`/`this_raw` self-pointers) are written once, when the record is created; a record never
+/// leaves its interpreter's pool.
+///
+/// Pooled records hold: `this_val` and `ret` Undefined; `error`, `activation` and `resume_step`
+/// None; an empty `handlers` Vec (capacity retained); null resume/reference pointers; and a zero
+/// handler floor. Generated code relies on these to skip the corresponding stores on entry.
+#[repr(C)]
+pub(crate) struct JitFrame {
+    pub(crate) ctx: JitCtx,
+    words: [std::mem::MaybeUninit<PackedValue>; FRAME_BUF],
+}
+
+/// Byte offset of a record's slot storage from the record (and its context) base.
+pub(crate) const FRAME_WORDS_OFF: usize = std::mem::offset_of!(JitFrame, words);
+
+impl JitFrame {
+    /// A new record owned by `i`'s pool, with its interpreter-constant fields initialized.
+    pub(crate) fn alloc(i: &mut Interp) -> std::ptr::NonNull<JitFrame> {
+        let mut record = Box::<JitFrame>::new_uninit();
+        let base = record.as_mut_ptr();
+        unsafe {
+            let words = std::ptr::addr_of_mut!((*base).words).cast::<PackedValue>();
+            std::ptr::addr_of_mut!((*base).ctx).write(JitCtx {
+                helpers: i.jit_helpers.as_ptr(),
+                stack_base: words,
+                final_sp: words,
+                slots: words,
+                inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+                env_raw: std::ptr::null(),
+                this_raw: std::ptr::null(),
+                global_body: std::ptr::null(),
+                genv: 0,
+                interp: i as *mut Interp,
+                chunk: std::ptr::null(),
+                this_val: Value::Undefined,
+                n_slots: 0,
+                handlers: Vec::new(),
+                handler_floor: 0,
+                code_base: std::ptr::null(),
+                pc_offsets: std::ptr::null(),
+                error: None,
+                ret: PackedValue::pack(Value::Undefined),
+                env_parent_raw: std::ptr::null(),
+                opstat_enabled: crate::bytecode::jit_opstat_enabled(),
+                callstat_enabled: crate::bytecode::jit_callstat_enabled(),
+                inline_recompile_at: crate::bytecode::inline_recompile_at(),
+                live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+                activation: None,
+                resume_activation: std::ptr::null_mut(),
+                resume_pc: 0,
+                resume_step: None,
+                references_raw: std::ptr::null_mut(),
+            });
+            (*base).ctx.this_raw = std::ptr::addr_of!((*base).ctx.this_val);
+            std::ptr::NonNull::new_unchecked(Box::into_raw(record.assume_init()))
+        }
+    }
+
+    /// Restore the pooled invariants of a record whose activation has finished (its slots and
+    /// operand stack already released) and return it to `i`'s pool.
+    ///
+    /// # Safety
+    /// `frame` must come from [`JitFrame::alloc`] for `i` and no longer be executing.
+    pub(crate) unsafe fn release(i: &mut Interp, frame: std::ptr::NonNull<JitFrame>) {
+        let ctx = unsafe { &mut (*frame.as_ptr()).ctx };
+        // A throw can escape through open try regions; a pooled record owns no handlers.
+        ctx.handlers.clear();
+        ctx.handler_floor = 0;
+        // Owned values are released here, not by the next user of the record.
+        ctx.this_val = Value::Undefined;
+        drop(ctx.take_ret());
+        ctx.error = None;
+        ctx.activation = None;
+        ctx.resume_step = None;
+        ctx.resume_activation = std::ptr::null_mut();
+        ctx.resume_pc = 0;
+        ctx.references_raw = std::ptr::null_mut();
+        if i.frame_pool.len() < FRAME_POOL_LIMIT {
+            i.frame_pool.push(frame);
+        } else {
+            drop(unsafe { Box::from_raw(frame.as_ptr()) });
+        }
+    }
+}
 
 /// [`run`] for the JIT→JIT fast call: takes ownership of `argc` argument packed words at `args`
 /// (moved off the caller's operand stack — the caller must NOT drop them), seeding parameter
@@ -15728,17 +15787,12 @@ pub(crate) unsafe fn run_moved(
     unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
 }
 
-/// Constructor counterpart of the direct shared-context call path.
-///
-/// `Op::New` is entered through a helper because allocating the instance and validating the live
-/// `prototype` property remain Rust operations.  Once those checks have committed, however, a
-/// no-activation constructor can run on the caller's existing [`JitCtx`].  Swapping its frame
-/// fields here avoids constructing a second context and handler vector for every short-lived
-/// Vector/Cons/Node constructor while retaining the fixed-buffer moved-argument ABI.
+/// Constructor entry from the `Op::New` helper, after allocation and `prototype` validation
+/// have committed. Runs the no-activation constructor on its own pooled record exactly like
+/// [`run_moved`]; the caller's context is left untouched.
 ///
 /// # Safety
-/// Same moved-argument and environment lifetime contract as [`run_moved`]. `caller` must be the
-/// live context whose machine code invoked the constructor helper.
+/// Same moved-argument and environment lifetime contract as [`run_moved`].
 #[cfg(any(
     all(
         target_arch = "aarch64",
@@ -15749,135 +15803,19 @@ pub(crate) unsafe fn run_moved(
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     )
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_moved_shared(
     i: &mut Interp,
-    caller: &mut JitCtx,
+    _caller: &mut JitCtx,
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
     this_val: Value,
     args: *mut PackedValue,
     argc: usize,
-    (n_params, n_slots): (usize, usize),
+    frame: (usize, usize),
 ) -> Result<Value, Abrupt> {
-    let seed = n_params.min(argc);
-    let mut legacy: Option<crate::execution_storage::CompactFrame> = None;
-    let (slots_ptr, stack_base) = if n_slots + code.max_stack <= FRAME_BUF {
-        let buf = i.frame_pool.pop().unwrap_or_else(|| {
-            let b: Box<[std::mem::MaybeUninit<PackedValue>]> = Box::new_uninit_slice(FRAME_BUF);
-            std::ptr::NonNull::new(Box::into_raw(b) as *mut PackedValue).unwrap()
-        });
-        (buf.as_ptr(), unsafe { buf.as_ptr().add(n_slots) })
-    } else {
-        let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
-        slots.reserve(n_slots);
-        stack.clear();
-        stack.reserve(code.max_stack);
-        let p = (slots.as_mut_ptr(), stack.as_mut_ptr());
-        legacy = Some((slots, stack));
-        p
-    };
-    unsafe {
-        std::ptr::copy_nonoverlapping(args, slots_ptr, seed);
-        for k in seed..argc {
-            std::ptr::drop_in_place(args.add(k));
-        }
-        for k in seed..n_slots {
-            slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
-        }
-    }
-
-    // Save the caller activation. The handlers allocation is deliberately shared; the callee's
-    // watermark makes an escaping throw stop before it can consume the caller's regions.
-    let old_stack_base = caller.stack_base;
-    let old_final_sp = caller.final_sp;
-    let old_slots = caller.slots;
-    let old_env_raw = caller.env_raw;
-    let old_env_parent_raw = caller.env_parent_raw;
-    let old_global_body = caller.global_body;
-    let old_chunk = caller.chunk;
-    let old_n_slots = caller.n_slots;
-    let old_handler_floor = caller.handler_floor;
-    let old_code_base = caller.code_base;
-    let old_pc_offsets = caller.pc_offsets;
-    let old_this = std::mem::replace(&mut caller.this_val, this_val);
-    let old_error = caller.error.take();
-    let old_ret = caller.take_ret();
-    let handlers_len = caller.handlers.len();
-
-    caller.stack_base = stack_base;
-    caller.final_sp = stack_base;
-    caller.slots = slots_ptr;
-    caller.env_raw = Rc::as_ptr(unsafe { &*env }) as *const u8;
-    caller.env_parent_raw = jit_env_parent_raw(unsafe { &*env });
-    caller.global_body = jit_global_body(i, code);
-    caller.chunk = Rc::as_ptr(chunk);
-    caller.n_slots = n_slots;
-    caller.handler_floor = handlers_len;
-    caller.code_base = code.mem;
-    caller.pc_offsets = code.pc_offsets.as_ptr();
-
-    let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
-    let ok = entry(caller);
-    let callee_final_sp = caller.final_sp;
-    let result = if ok == 1 {
-        Ok(caller.take_ret().into_value())
-    } else {
-        Err(caller
-            .error
-            .take()
-            .unwrap_or_else(|| Abrupt::Throw(Value::Undefined)))
-    };
-
-    unsafe {
-        let mut p = stack_base;
-        while p < callee_final_sp {
-            std::ptr::drop_in_place(p);
-            p = p.add(1);
-        }
-        for k in 0..n_slots {
-            std::ptr::drop_in_place(slots_ptr.add(k));
-        }
-    }
-    match legacy {
-        None => {
-            let buf = unsafe { std::ptr::NonNull::new_unchecked(slots_ptr) };
-            if i.frame_pool.len() < 64 {
-                i.frame_pool.push(buf);
-            } else {
-                unsafe {
-                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                        slots_ptr as *mut std::mem::MaybeUninit<PackedValue>,
-                        FRAME_BUF,
-                    )));
-                }
-            }
-        }
-        Some((mut slots, stack)) => {
-            unsafe { slots.set_len(0) };
-            if i.vm_pool.len() < 64 {
-                i.vm_pool.push((slots, stack));
-            }
-        }
-    }
-
-    caller.handlers.truncate(handlers_len);
-    caller.stack_base = old_stack_base;
-    caller.final_sp = old_final_sp;
-    caller.slots = old_slots;
-    caller.env_raw = old_env_raw;
-    caller.env_parent_raw = old_env_parent_raw;
-    caller.global_body = old_global_body;
-    caller.chunk = old_chunk;
-    caller.n_slots = old_n_slots;
-    caller.handler_floor = old_handler_floor;
-    caller.code_base = old_code_base;
-    caller.pc_offsets = old_pc_offsets;
-    let callee_this = std::mem::replace(&mut caller.this_val, old_this);
-    drop(callee_this);
-    caller.error = old_error;
-    caller.ret = old_ret;
-    result
+    unsafe { run_moved_inner(i, chunk, code, env, this_val, args, argc, frame, None) }
 }
 
 #[cfg(test)]
@@ -15965,26 +15903,28 @@ unsafe fn run_moved_inner(
         NativeEntryKind::FreshFrame,
         "moved ordinary entry cannot borrow a live frame"
     );
+    if n_slots + code.max_stack > FRAME_BUF {
+        return unsafe {
+            run_moved_oversized(
+                i,
+                chunk,
+                code,
+                env,
+                this_val,
+                args,
+                argc,
+                (n_params, n_slots),
+                arguments,
+            )
+        };
+    }
     let seed = n_params.min(argc);
-    // Frame memory: one fixed-size raw buffer from the freelist ([slots | operand stack]);
-    // oversized frames use the legacy pooled-Vec pair. The buffer is a plain allocation (not a
-    // bump arena), so parked coroutines holding frames on other threads can't be aliased.
-    let mut legacy: Option<crate::execution_storage::CompactFrame> = None;
-    let (slots_ptr, stack_base) = if n_slots + code.max_stack <= FRAME_BUF {
-        let buf = i.frame_pool.pop().unwrap_or_else(|| {
-            let b: Box<[std::mem::MaybeUninit<PackedValue>]> = Box::new_uninit_slice(FRAME_BUF);
-            std::ptr::NonNull::new(Box::into_raw(b) as *mut PackedValue).unwrap()
-        });
-        (buf.as_ptr(), unsafe { buf.as_ptr().add(n_slots) })
-    } else {
-        let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
-        slots.reserve(n_slots);
-        stack.clear();
-        stack.reserve(code.max_stack);
-        let p = (slots.as_mut_ptr(), stack.as_mut_ptr());
-        legacy = Some((slots, stack));
-        p
-    };
+    // The activation runs on a pooled record of its own (see `JitFrame`): only per-frame fields
+    // are written here, and the interpreter-constant ones were set when the record was created.
+    let frame = i.frame_pool.pop().unwrap_or_else(|| JitFrame::alloc(i));
+    let ctx = unsafe { &mut (*frame.as_ptr()).ctx };
+    let slots_ptr = ctx.slots;
+    let stack_base = unsafe { slots_ptr.add(n_slots) };
     unsafe {
         std::ptr::copy_nonoverlapping(args, slots_ptr, seed);
         // Surplus arguments were still moved to us: drop them.
@@ -16002,19 +15942,100 @@ unsafe fn run_moved_inner(
             slots_ptr.add(slot).write(PackedValue::pack(value));
         }
     }
-
     let env = unsafe { &*env };
-    let env_raw = Rc::as_ptr(env) as *const u8;
-    let env_parent_raw = jit_env_parent_raw(env);
+    ctx.stack_base = stack_base;
+    ctx.final_sp = stack_base;
+    ctx.env_raw = Rc::as_ptr(env) as *const u8;
+    ctx.env_parent_raw = jit_env_parent_raw(env);
+    ctx.global_body = jit_global_body(i, code);
+    ctx.genv = Rc::as_ptr(&i.global_env) as usize;
+    ctx.chunk = Rc::as_ptr(chunk);
+    ctx.this_val = this_val;
+    ctx.n_slots = n_slots;
+    ctx.code_base = code.mem;
+    ctx.pc_offsets = code.pc_offsets.as_ptr();
+    let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
+    let ok = entry(ctx);
+    unsafe {
+        let mut p = ctx.stack_base;
+        while p < ctx.final_sp {
+            std::ptr::drop_in_place(p);
+            p = p.add(1);
+        }
+        // Every local is an initialized owned packed word. Its exact destructor skips scalar
+        // tags and releases heap payloads, including last owners, without widening the frame.
+        for k in 0..n_slots {
+            std::ptr::drop_in_place(slots_ptr.add(k));
+        }
+    }
+    let result = if ok == 1 {
+        Ok(ctx.take_ret().into_value())
+    } else {
+        Err(ctx
+            .error
+            .take()
+            .unwrap_or_else(|| Abrupt::Throw(Value::Undefined)))
+    };
+    unsafe { JitFrame::release(i, frame) };
+    result
+}
+
+/// [`run_moved_inner`] for a frame larger than a pooled record: pooled `Vec` storage and a
+/// context of its own on the native stack.
+#[cfg(any(
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ),
+    all(
+        target_arch = "x86_64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
+#[allow(clippy::too_many_arguments)]
+#[cold]
+unsafe fn run_moved_oversized(
+    i: &mut Interp,
+    chunk: &Rc<Chunk>,
+    code: &JitCode,
+    env: *const Env,
+    this_val: Value,
+    args: *mut PackedValue,
+    argc: usize,
+    (n_params, n_slots): (usize, usize),
+    arguments: Option<(usize, Value)>,
+) -> Result<Value, Abrupt> {
+    let seed = n_params.min(argc);
+    let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
+    slots.reserve(n_slots);
+    stack.clear();
+    stack.reserve(code.max_stack);
+    let (slots_ptr, stack_base) = (slots.as_mut_ptr(), stack.as_mut_ptr());
+    unsafe {
+        std::ptr::copy_nonoverlapping(args, slots_ptr, seed);
+        for k in seed..argc {
+            std::ptr::drop_in_place(args.add(k));
+        }
+        for k in seed..n_slots {
+            slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
+        }
+        if let Some((slot, value)) = arguments {
+            if slot < seed {
+                std::ptr::drop_in_place(slots_ptr.add(slot));
+            }
+            slots_ptr.add(slot).write(PackedValue::pack(value));
+        }
+    }
+    let env = unsafe { &*env };
     let mut ctx = JitCtx {
         helpers: i.jit_helpers.as_ptr(),
         stack_base,
         final_sp: stack_base,
-        env_raw,
+        env_raw: Rc::as_ptr(env) as *const u8,
         this_raw: std::ptr::null(),
         global_body: jit_global_body(i, code),
         genv: Rc::as_ptr(&i.global_env) as usize,
-        env_parent_raw,
+        env_parent_raw: jit_env_parent_raw(env),
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
@@ -16046,33 +16067,14 @@ unsafe fn run_moved_inner(
             std::ptr::drop_in_place(p);
             p = p.add(1);
         }
-        // Every local is an initialized owned packed word. Its exact destructor skips scalar
-        // tags and releases heap payloads, including last owners, without widening the frame.
         for k in 0..n_slots {
             std::ptr::drop_in_place(slots_ptr.add(k));
         }
+        // The values were dropped above; the Vec must not double-drop them.
+        slots.set_len(0);
     }
-    match legacy {
-        None => {
-            let buf = unsafe { std::ptr::NonNull::new_unchecked(slots_ptr) };
-            if i.frame_pool.len() < 64 {
-                i.frame_pool.push(buf);
-            } else {
-                unsafe {
-                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                        slots_ptr as *mut std::mem::MaybeUninit<PackedValue>,
-                        FRAME_BUF,
-                    )));
-                }
-            }
-        }
-        Some((mut slots, stack)) => {
-            // The values were dropped above; the Vec must not double-drop them.
-            unsafe { slots.set_len(0) };
-            if i.vm_pool.len() < 64 {
-                i.vm_pool.push((slots, stack));
-            }
-        }
+    if i.vm_pool.len() < 64 {
+        i.vm_pool.push((slots, stack));
     }
     if ok == 1 {
         Ok(ctx.take_ret().into_value())
