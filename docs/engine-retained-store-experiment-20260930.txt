@@ -1,0 +1,61 @@
+Retained scalar property stores — parked 30 September 2026
+========================================================
+
+The solver trace contained 2,768,275 checked SetProp executions at fn(e) pc8.
+The source's character-advance routine returns an assignment to currentChar.
+The prototype extends the guarded ARM64 own-data store to retain a scalar RHS
+as the assignment result. It rejects heap-valued RHS inputs before all writes,
+uses the existing live descriptor/exotic/ownership guards, and leaves creation
+checked. The shared emitter covers baseline and SSA regions; the older region
+fallback retains discarded-result mode. No object layout or interpreter/VM
+algorithm changes are needed.
+
+The first compile caught the older region emitter's missing mode argument.
+After that correction, 12 selected tests, all 1,580 engine library tests and
+strict engine all-target Clippy pass. New checks prove executing native scalar
+stores avoid helpers and preserve the returned value, signed zero and NaN.
+All tiers agree on accessor replacement during RHS evaluation, setters, strict
+read-only failure, proxies, creation, heap-valued returns and receiver aliases.
+Returned owners survive an explicit collection. No x64, wasm, Test262 or
+optional optimizer execution result is claimed.
+
+Consulted ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:21240 (assignment
+evaluation), :4550 (PutValue), :13449 (OrdinarySetWithOwnDescriptor).
+An assignment returns its RHS after PutValue; live descriptor checks preserve
+setters and failure. Official clauses:
+https://tc39.es/ecma262/#sec-assignment-operators-runtime-semantics-evaluation
+https://tc39.es/ecma262/#sec-putvalue
+https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor
+This is the consulted snapshot, not verified current upstream text.
+
+Four balanced fresh-process pairs use the committed typeof cycle b1c975f as
+baseline, ordinary release template JIT, default Intl, crystal ARM64 CPU 5 and
+cleared diagnostic/runtime switches. All complete outputs match, including
+one Node reference per application. Every timing interval spans parity:
+React measured medians 116.5 -> 115.5 ms (0.86% lower); Djot 329 -> 329 ms;
+solver process 9697.11 -> 9831.87 ms (1.39% higher, ratio interval
+0.97318–1.05121); Vue 754 -> 752.5 ms (0.20% lower).
+These are scoped React reducer, Djot rendering, complete EJS solver and Vue
+reactivity workloads, not full browser benchmark scores.
+
+Separate four-pair Linux wait4 peaks also span parity. Median changes:
+React +1.69%, Djot -0.53%, solver +0.40%, Vue -0.29%. No component meets the
+combined greater-than-3% median loss and slower-direction interval gate.
+No post-GC memory claim. Release compilation finishes in 4m02s; its duration
+is not an isolated JIT compilation-cost comparison.
+
+A post-acceptance helper trace with a bytecode dump no longer includes the hot
+retained store in the highest-count sites: native lowering removes that checked
+traffic. The actual applications nevertheless show no established speedup.
+The production change and its added tests are therefore restored to b1c975f;
+this documentation alone is committed. Do not reintroduce the prototype based
+on helper counts or isolated scalar loops. A larger numeric-field workload may
+justify revisiting it, with compilation and code-size costs considered.
+
+Exact source snapshots, patch, binaries, complete outputs, balanced observations,
+analysis and check logs are preserved in benchmark-results/engine-cycle10-20260930.
+The target/release binary still contains the parked experiment; subsequent
+baselines must use the pinned committed-cycle artifact rather than that path.
+No owned build/test/profile overlaps acceptance timings or separate peak runs.
+Desktop applications remain active. Installed/accepted artifacts are unchanged.
