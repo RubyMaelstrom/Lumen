@@ -28,7 +28,7 @@ use property_shapes::{LayoutEntry, LayoutPage, ShapeLayouts};
 #[path = "property_shape_tests.rs"]
 mod property_shape_tests;
 
-pub type Gc = Rc<RefCell<Object>>;
+pub use crate::gc_handle::Gc;
 
 /// A native (Rust-implemented) function. It can only throw (via `Err`), never break/return/continue,
 /// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract.
@@ -1585,15 +1585,7 @@ impl Object {
             heap.live.set(heap.live.get() + 1);
             heap.allocated.set(heap.allocated.get().wrapping_add(1));
             let mut reg = heap.registry.borrow_mut();
-            let slot = match reg.free.pop() {
-                Some(slot) => slot,
-                None => {
-                    let slot = reg.entries.len();
-                    reg.entries.push(None);
-                    reg.young_positions.push(usize::MAX);
-                    slot
-                }
-            };
+            let slot = reg.reserve();
             let slot_u32: u32 = slot.try_into().expect("object registry exceeded u32 slots");
             #[cfg(feature = "architecture-diagnostics")]
             heap.diagnostics.borrow_mut().born(
@@ -1612,7 +1604,7 @@ impl Object {
                     crate::heap::HeapGeneration::Young,
                 )
                 .expect("central heap handle space exhausted during bridge allocation");
-            let obj = Rc::new(RefCell::new(Object {
+            let obj = Gc::new(RefCell::new(Object {
                 gc_heap: heap.clone(),
                 proto,
                 props,
@@ -1628,9 +1620,7 @@ impl Object {
                 #[cfg(feature = "heap-bridge")]
                 central_ref: Cell::new(Some(central_ref)),
             }));
-            reg.entries[slot] = Some(Rc::downgrade(&obj));
-            reg.young_positions[slot] = reg.young_slots.len();
-            reg.young_slots.push(slot);
+            reg.publish(slot, Rc::as_ptr(&obj));
             obj
         }
     }
@@ -1644,19 +1634,7 @@ impl Drop for Object {
         let slot = self.gc_internal.get() as usize;
         #[cfg(feature = "architecture-diagnostics")]
         self.gc_heap.diagnostics.borrow_mut().died(slot);
-        let mut reg = self.gc_heap.registry.borrow_mut();
-        if slot < reg.entries.len() && reg.entries[slot].take().is_some() {
-            let position = reg.young_positions[slot];
-            if position != usize::MAX {
-                reg.young_slots.swap_remove(position);
-                if let Some(&moved) = reg.young_slots.get(position) {
-                    reg.young_positions[moved] = position;
-                }
-                reg.young_positions[slot] = usize::MAX;
-            }
-            reg.free.push(slot);
-        }
-        drop(reg);
+        self.gc_heap.registry.borrow_mut().remove(slot);
         if self.gc_weak_observed.get() {
             let observers = {
                 let mut watched = self.gc_heap.weak_observers.borrow_mut();
@@ -1673,103 +1651,132 @@ impl Drop for Object {
             let _ = self.gc_heap.central.borrow_mut().free(reference);
         }
         self.gc_heap.live.set(self.gc_heap.live.get() - 1);
-        self.release_owned_references();
-    }
-}
-
-/// Owned references moved out of an object whose destruction was reached too deep inside
-/// another object's destruction. Dropping them later is unobservable: no author code runs
-/// during destruction, and weak observers were already notified above.
-struct DeferredObjectFields {
-    _proto: Option<Gc>,
-    _props: Props,
-    _call: Callable,
-    _exotic: Exotic,
-    _native_typed_array: Option<Box<crate::native_typed_array::NativeTypedArray>>,
-}
-
-struct ObjectDropState {
-    depth: Cell<u32>,
-    deferred: RefCell<Vec<DeferredObjectFields>>,
-}
-
-thread_local! {
-    static OBJECT_DROP_STATE: ObjectDropState = const {
-        ObjectDropState {
-            depth: Cell::new(0),
-            deferred: RefCell::new(Vec::new()),
-        }
-    };
-}
-
-/// Nested destruction depth before an object's children are queued instead of dropped in place.
-/// Each level costs a few hundred bytes of native stack, so this bounds destruction of arbitrarily
-/// long object chains (linked lists, closure chains, nested arrays) to a small constant stack.
-const OBJECT_DROP_DEPTH_LIMIT: u32 = 128;
-
-impl Object {
-    /// Release this object's owned references with bounded native recursion. Without this, the
-    /// compiler-generated field drop glue recursed once per link of a reachable chain and a
-    /// 50,000-node linked list overflowed the stack.
-    fn release_owned_references(&mut self) {
-        let mut fields = || DeferredObjectFields {
-            _proto: self.proto.take(),
-            _props: std::mem::take(&mut self.props),
-            _call: std::mem::replace(&mut self.call, Callable::None),
-            _exotic: std::mem::replace(&mut self.exotic, Exotic::None),
-            _native_typed_array: self.native_typed_array.take(),
-        };
-        let Ok(depth) = OBJECT_DROP_STATE.try_with(|state| state.depth.get()) else {
-            // Thread-local teardown: fall back to ordinary field drop order.
-            return;
-        };
-        if depth >= OBJECT_DROP_DEPTH_LIMIT {
-            let fields = fields();
-            // If the thread-local were already torn down, the closure (and `fields`) would simply
-            // drop in place; the successful access above makes that unreachable in practice.
-            let _ =
-                OBJECT_DROP_STATE.try_with(move |state| state.deferred.borrow_mut().push(fields));
-            return;
-        }
-        let _ = OBJECT_DROP_STATE.try_with(|state| state.depth.set(depth + 1));
-        drop(fields());
-        if depth == 0 {
-            // The outermost destruction drains everything queued below it. Each queued bundle is
-            // dropped at depth one, so its own chain may again descend to the limit and queue.
-            while let Some(next) = OBJECT_DROP_STATE
-                .try_with(|state| state.deferred.borrow_mut().pop())
-                .ok()
-                .flatten()
-            {
-                drop(next);
-            }
-        }
-        let _ = OBJECT_DROP_STATE.try_with(|state| state.depth.set(depth));
     }
 }
 
 // The GC is a refcount-based cycle collector (lumen has no tracing GC). Every heap object is
-// registered through a non-owning weak slot and the live count is maintained via Object::new /
-// Drop. Weak handles make a stale registry entry harmless rather than allowing a freed address to
-// be reconstructed as an `Rc`. `Interp::gc_collect` reclaims objects referenced only by other
-// (also-unreachable) objects — see interpreter.rs.
-struct GcRegistry {
-    entries: Vec<Option<Weak<RefCell<Object>>>>,
+// registered through a non-owning slot and the live count is maintained via Object::new / Drop.
+// `Object::drop` clears its slot before the allocation is released, so every non-null entry names
+// a live object; the registry itself never touches reference counts (a `Weak` per object cost a
+// weak-count update at both allocation and destruction). `Interp::gc_collect` reclaims objects
+// referenced only by other (also-unreachable) objects — see interpreter.rs.
+struct SlotRegistry<T> {
+    entries: Vec<*const RefCell<T>>,
     free: Vec<usize>,
-    /// Dense nursery membership, removed synchronously with object destruction. Unlike an
-    /// append-only Weak list, acyclic allocation churn cannot retain dead allocation headers.
+    /// Dense nursery membership, removed synchronously with destruction, so acyclic allocation
+    /// churn cannot accumulate entries between collections.
     young_slots: Vec<usize>,
     young_positions: Vec<usize>,
+}
+
+impl<T> SlotRegistry<T> {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            free: Vec::new(),
+            young_slots: Vec::new(),
+            young_positions: Vec::new(),
+        }
+    }
+
+    /// Reserve a slot for an allocation that [`SlotRegistry::publish`] will register.
+    #[inline]
+    fn reserve(&mut self) -> usize {
+        match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                let slot = self.entries.len();
+                self.entries.push(std::ptr::null());
+                self.young_positions.push(usize::MAX);
+                slot
+            }
+        }
+    }
+
+    /// Register a reserved slot as a live, young entry.
+    #[inline]
+    fn publish(&mut self, slot: usize, entry: *const RefCell<T>) {
+        self.entries[slot] = entry;
+        self.young_positions[slot] = self.young_slots.len();
+        self.young_slots.push(slot);
+    }
+
+    /// Remove a live entry synchronously with its destruction. Stale or foreign slots are ignored.
+    #[inline]
+    fn remove(&mut self, slot: usize) {
+        if slot >= self.entries.len()
+            || std::mem::replace(&mut self.entries[slot], std::ptr::null()).is_null()
+        {
+            return;
+        }
+        let position = self.young_positions[slot];
+        if position != usize::MAX {
+            self.young_slots.swap_remove(position);
+            if let Some(&moved) = self.young_slots.get(position) {
+                self.young_positions[moved] = position;
+            }
+            self.young_positions[slot] = usize::MAX;
+        }
+        self.free.push(slot);
+    }
+
+    fn live_len(&self) -> usize {
+        self.entries.len() - self.free.len()
+    }
+
+    fn requested_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<*const RefCell<T>>())
+            .saturating_add(
+                (self.free.capacity()
+                    + self.young_slots.capacity()
+                    + self.young_positions.capacity())
+                .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+
+    /// End the nursery: every current entry becomes old.
+    fn clear_young(&mut self) {
+        while let Some(slot) = self.young_slots.pop() {
+            self.young_positions[slot] = usize::MAX;
+        }
+    }
+
+    /// Strong handles to every live entry.
+    fn snapshot(&self) -> Vec<Rc<RefCell<T>>> {
+        let mut live = Vec::with_capacity(self.live_len());
+        for &entry in &self.entries {
+            if !entry.is_null() {
+                // SAFETY: entries are removed before their allocation is released, so a non-null
+                // entry names a live allocation with a strong count of at least one.
+                live.push(unsafe { upgrade_registered(entry) });
+            }
+        }
+        live
+    }
+
+    /// Strong handles to the live young entries.
+    fn young_snapshot(&self) -> Vec<Rc<RefCell<T>>> {
+        self.young_slots
+            .iter()
+            .filter_map(|&slot| {
+                let entry = self.entries[slot];
+                // SAFETY: as in `snapshot`.
+                (!entry.is_null()).then(|| unsafe { upgrade_registered(entry) })
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct GcState {
     heap_id: u64,
     #[cfg(feature = "architecture-diagnostics")]
     diagnostics: RefCell<allocation_diagnostics::State>,
-    registry: RefCell<GcRegistry>,
+    registry: RefCell<SlotRegistry<Object>>,
     weak_observers: RefCell<crate::fasthash::FastMap<usize, crate::weak_metadata::DeathObservers>>,
-    scope_registry: RefCell<Vec<Weak<RefCell<crate::interpreter::Scope>>>>,
-    young_scopes: RefCell<Vec<Weak<RefCell<crate::interpreter::Scope>>>>,
+    /// Environment records, registered like objects and removed synchronously by `Scope::drop`.
+    scopes: RefCell<SlotRegistry<crate::interpreter::Scope>>,
     minor_collections: Cell<u8>,
     major_live: Cell<i64>,
     shapes: RefCell<ShapeTable>,
@@ -1852,33 +1859,9 @@ pub(crate) fn scan_gc_heap_retained_memory(
     heap: &GcHeap,
     visitor: &mut crate::memory::Visitor,
 ) -> (usize, bool) {
-    let registry = heap.registry.borrow();
     let mut bytes = std::mem::size_of::<GcState>()
-        .saturating_add(
-            registry
-                .entries
-                .capacity()
-                .saturating_mul(std::mem::size_of::<Option<Weak<RefCell<Object>>>>()),
-        )
-        .saturating_add(
-            registry
-                .free
-                .capacity()
-                .saturating_mul(std::mem::size_of::<usize>()),
-        )
-        .saturating_add(
-            registry
-                .young_slots
-                .capacity()
-                .saturating_mul(std::mem::size_of::<usize>()),
-        )
-        .saturating_add(
-            registry
-                .young_positions
-                .capacity()
-                .saturating_mul(std::mem::size_of::<usize>()),
-        );
-    drop(registry);
+        .saturating_add(heap.registry.borrow().requested_bytes())
+        .saturating_add(heap.scopes.borrow().requested_bytes());
     {
         let observed = heap.weak_observers.borrow();
         bytes = bytes.saturating_add(
@@ -1892,18 +1875,6 @@ pub(crate) fn scan_gc_heap_retained_memory(
                 .sum::<usize>(),
         );
     }
-    bytes = bytes.saturating_add(
-        heap.scope_registry
-            .borrow()
-            .capacity()
-            .saturating_mul(std::mem::size_of::<Weak<RefCell<crate::interpreter::Scope>>>()),
-    );
-    bytes = bytes.saturating_add(
-        heap.young_scopes
-            .borrow()
-            .capacity()
-            .saturating_mul(std::mem::size_of::<Weak<RefCell<crate::interpreter::Scope>>>()),
-    );
     #[cfg(feature = "heap-bridge")]
     {
         bytes = bytes.saturating_add(heap.central.borrow().requested_bytes());
@@ -2098,15 +2069,9 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         #[cfg(feature = "architecture-diagnostics")]
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),
-        registry: RefCell::new(GcRegistry {
-            entries: Vec::new(),
-            free: Vec::new(),
-            young_slots: Vec::new(),
-            young_positions: Vec::new(),
-        }),
+        registry: RefCell::new(SlotRegistry::new()),
         weak_observers: RefCell::new(Default::default()),
-        scope_registry: RefCell::new(Vec::new()),
-        young_scopes: RefCell::new(Vec::new()),
+        scopes: RefCell::new(SlotRegistry::new()),
         minor_collections: Cell::new(0),
         major_live: Cell::new(0),
         shapes: RefCell::new(ShapeTable::new()),
@@ -2212,7 +2177,7 @@ pub(crate) fn active_agent_slow_switches() -> u64 {
     ACTIVE_AGENT_SLOW_SWITCHES.with(Cell::get)
 }
 
-fn active_gc_heap() -> GcHeap {
+pub(crate) fn active_gc_heap() -> GcHeap {
     ACTIVE_GC_HEAP.with(|active| {
         let mut active = active.borrow_mut();
         active.get_or_insert_with(new_gc_heap).clone()
@@ -2303,34 +2268,47 @@ pub fn gc_snapshot() -> Vec<Gc> {
     heap_gc_snapshot(&active_gc_heap())
 }
 
-pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
-    let reg = heap.registry.borrow();
-    let mut live = Vec::with_capacity(reg.entries.len() - reg.free.len());
-    for weak in reg.entries.iter().flatten() {
-        if let Some(object) = weak.upgrade() {
-            live.push(object);
-        }
+/// A strong handle to a registered object.
+///
+/// # Safety
+/// `object` must be a non-null registry entry. `Object::drop` clears the entry before the
+/// allocation is released, so a registered object's strong count is at least one.
+unsafe fn upgrade_registered<T>(entry: *const RefCell<T>) -> Rc<RefCell<T>> {
+    unsafe {
+        Rc::increment_strong_count(entry);
+        Rc::from_raw(entry)
     }
-    live
+}
+
+/// One registry slot cycle, for the allocation micro-benchmark.
+#[cfg(test)]
+pub(crate) fn bench_registry_cycle(heap: &GcHeap, entry: *const Object) {
+    let mut registry = heap.registry.borrow_mut();
+    let slot = registry.reserve();
+    registry.publish(slot, entry.cast());
+    registry.remove(slot);
+}
+
+pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
+    heap.registry
+        .borrow()
+        .snapshot()
+        .into_iter()
+        .map(Gc::from_rc)
+        .collect()
 }
 
 /// Snapshot just the nursery. Old-to-young strong references are conservatively roots in the
 /// refcount-based nursery collector, so no uninstrumented native/property write can lose one.
 pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
-    let objects = {
-        let registry = heap.registry.borrow();
-        registry
-            .young_slots
-            .iter()
-            .filter_map(|&slot| registry.entries[slot].as_ref().and_then(Weak::upgrade))
-            .collect()
-    };
-    let scopes = heap
-        .young_scopes
+    let objects = heap
+        .registry
         .borrow()
-        .iter()
-        .filter_map(Weak::upgrade)
+        .young_snapshot()
+        .into_iter()
+        .map(Gc::from_rc)
         .collect();
+    let scopes = heap.scopes.borrow().young_snapshot();
     (objects, scopes)
 }
 
@@ -2343,12 +2321,8 @@ pub(crate) fn gc_finish_generation(heap: &GcHeap, major: bool) {
         allocation_diagnostics::report(heap);
         crate::bytecode::call_cache_diagnostics::report();
     }
-    let mut registry = heap.registry.borrow_mut();
-    while let Some(slot) = registry.young_slots.pop() {
-        registry.young_positions[slot] = usize::MAX;
-    }
-    drop(registry);
-    heap.young_scopes.borrow_mut().clear();
+    heap.registry.borrow_mut().clear_young();
+    heap.scopes.borrow_mut().clear_young();
     if major {
         heap.minor_collections.set(0);
         heap.major_live.set(heap.live.get());
@@ -2415,47 +2389,48 @@ pub(crate) fn destroy_gc_heap(heap: &GcHeap) {
 /// any object, so `Object::drop` always sees its stable slot.
 pub(crate) fn gc_restore_registry_slots(heap: &GcHeap) {
     let reg = heap.registry.borrow();
-    for (slot, weak) in reg.entries.iter().enumerate() {
-        if let Some(object) = weak.as_ref().and_then(Weak::upgrade) {
+    for (slot, &object) in reg.entries.iter().enumerate() {
+        if !object.is_null() {
             let slot: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-            object.borrow().gc_internal.set(slot);
+            // SAFETY: a non-null entry names a live object (see `upgrade_registered`).
+            unsafe { &*object }.borrow().gc_internal.set(slot);
         }
     }
 }
 
+/// Register a newly created environment record in its heap's scope registry.
 pub(crate) fn gc_register_scope(scope: &Env) {
-    let heap = active_gc_heap();
-    heap.scope_registry.borrow_mut().push(Rc::downgrade(scope));
-    heap.young_scopes.borrow_mut().push(Rc::downgrade(scope));
-}
-
-pub(crate) fn gc_scope_registry_len(heap: &GcHeap) -> usize {
-    heap.scope_registry.borrow().len()
-}
-
-/// Purge dead weak entries, returning the live count. A dead `Weak` still pins its `RcBox`
-/// allocation, so scope-heavy programs prune independently of the object allocation trigger.
-pub(crate) fn gc_scope_registry_prune(heap: &GcHeap) -> usize {
-    heap.young_scopes
+    let record = scope.borrow();
+    let slot = record.gc_heap.scopes.borrow_mut().reserve();
+    record
+        .gc_heap
+        .scopes
         .borrow_mut()
-        .retain(|scope| scope.strong_count() > 0);
-    let mut registry = heap.scope_registry.borrow_mut();
-    registry.retain(|scope| scope.strong_count() > 0);
-    registry.len()
+        .publish(slot, Rc::as_ptr(scope));
+    record
+        .gc_slot
+        .set(slot.try_into().expect("scope registry exceeded u32 slots"));
 }
 
-/// The live scopes owned by `heap`, purging dead weak entries as it goes.
+/// Remove a dying environment record from its heap's registry (see `Scope::drop`).
+pub(crate) fn gc_unregister_scope(heap: &GcHeap, slot: u32) {
+    heap.scopes.borrow_mut().remove(slot as usize);
+}
+
+/// The live environment-record count.
+pub(crate) fn gc_scope_registry_len(heap: &GcHeap) -> usize {
+    heap.scopes.borrow().live_len()
+}
+
+/// Environment records unregister synchronously on destruction, so there are no dead entries to
+/// purge; this reports the live count for callers that used to prune.
+pub(crate) fn gc_scope_registry_prune(heap: &GcHeap) -> usize {
+    gc_scope_registry_len(heap)
+}
+
+/// The live scopes owned by `heap`.
 pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
-    let mut registry = heap.scope_registry.borrow_mut();
-    let mut live = Vec::with_capacity(registry.len());
-    registry.retain(|weak| match weak.upgrade() {
-        Some(scope) => {
-            live.push(scope);
-            true
-        }
-        None => false,
-    });
-    live
+    heap.scopes.borrow().snapshot()
 }
 
 #[cfg(test)]

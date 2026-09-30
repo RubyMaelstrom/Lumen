@@ -656,7 +656,7 @@ pub struct WeakValue(std::rc::Weak<RefCell<crate::value::Object>>);
 
 impl WeakValue {
     pub fn upgrade(&self) -> Option<Value> {
-        self.0.upgrade().map(Value::Obj)
+        self.0.upgrade().map(|object| Value::Obj(Gc::from(object)))
     }
 }
 
@@ -741,7 +741,7 @@ impl WeakTarget {
 
     pub(crate) fn upgrade(&self) -> Option<Value> {
         match self {
-            Self::Object(object) => object.upgrade().map(Value::Obj),
+            Self::Object(object) => object.upgrade().map(|object| Value::Obj(Gc::from(object))),
             Self::Symbol(symbol, _) => symbol.upgrade().map(Value::Sym),
         }
     }
@@ -929,7 +929,7 @@ impl FnFrame {
         let p = self.fn_ptr as *const RefCell<crate::value::Object>;
         unsafe {
             Rc::increment_strong_count(p);
-            Rc::from_raw(p)
+            Gc::from_raw(p)
         }
     }
 }
@@ -1915,6 +1915,10 @@ mod binding_layout_tests {
 }
 
 pub struct Scope {
+    /// Slot in [`Scope::gc_heap`]'s environment registry (`u32::MAX` while unregistered).
+    pub(crate) gc_slot: std::cell::Cell<u32>,
+    /// The heap whose registry lists this record; `Scope::drop` unregisters it there.
+    pub(crate) gc_heap: crate::value::GcHeap,
     pub vars: VarMap,
     pub parent: Option<Env>,
     /// For a `with (obj)` block: identifier resolution checks `obj`'s properties before the parent.
@@ -1938,6 +1942,15 @@ pub struct Scope {
     /// body scope holds both hoisted vars and body-level lexicals; a sloppy direct eval's
     /// var/lexical conflict check needs to tell them apart.
     pub lexical_names: ScopeNames,
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        let slot = self.gc_slot.get();
+        if slot != u32::MAX {
+            crate::value::gc_unregister_scope(&self.gc_heap, slot);
+        }
+    }
 }
 
 /// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
@@ -2026,6 +2039,8 @@ fn register_scope(e: &Env) {
 pub fn new_scope(parent: Option<Env>) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
     let e = Rc::new(RefCell::new(Scope {
+        gc_slot: std::cell::Cell::new(u32::MAX),
+        gc_heap: crate::value::active_gc_heap(),
         vars: Default::default(),
         parent,
         with_obj: None,
@@ -2051,6 +2066,8 @@ pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) 
 pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
     let e = Rc::new(RefCell::new(Scope {
+        gc_slot: std::cell::Cell::new(u32::MAX),
+        gc_heap: crate::value::active_gc_heap(),
         vars,
         parent,
         with_obj: None,
@@ -2068,6 +2085,8 @@ pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> 
 pub fn new_catch_scope(parent: Env) -> Env {
     let under_with = parent.borrow().under_with;
     let e = Rc::new(RefCell::new(Scope {
+        gc_slot: std::cell::Cell::new(u32::MAX),
+        gc_heap: crate::value::active_gc_heap(),
         vars: Default::default(),
         parent: Some(parent),
         with_obj: None,
@@ -2083,6 +2102,8 @@ pub fn new_catch_scope(parent: Env) -> Env {
 /// A `with (obj)` environment: identifier lookups consult `obj` before the enclosing scope.
 pub fn new_with_scope(parent: Env, obj: Value) -> Env {
     let e = Rc::new(RefCell::new(Scope {
+        gc_slot: std::cell::Cell::new(u32::MAX),
+        gc_heap: crate::value::active_gc_heap(),
         vars: Default::default(),
         parent: Some(parent),
         with_obj: Some(obj),

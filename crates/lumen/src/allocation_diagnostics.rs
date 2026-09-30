@@ -144,12 +144,9 @@ pub(super) fn report(heap: &GcHeap) {
     let mut live = [0; 7];
     let mut borrowed = 0;
     let registry = heap.registry.borrow();
-    for object in registry
-        .entries
-        .iter()
-        .flatten()
-        .filter_map(std::rc::Weak::upgrade)
-    {
+    for &object in registry.entries.iter().filter(|object| !object.is_null()) {
+        // SAFETY: a non-null registry entry names a live object; `Object::drop` clears it first.
+        let object = unsafe { &*object };
         let Ok(object) = object.try_borrow() else {
             borrowed += 1;
             continue;

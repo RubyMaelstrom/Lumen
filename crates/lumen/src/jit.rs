@@ -1827,7 +1827,7 @@ unsafe extern "C" fn jit_prepare_numeric_packed_array(
     let interp = unsafe { &mut *ctx.interp };
     // `raw` is Rc::as_ptr. The frame owns the live Gc throughout this call and the generated
     // region, so borrow an Rc view without changing its strong count.
-    let obj = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
+    let obj = std::mem::ManuallyDrop::new(unsafe { crate::value::Gc::from_raw(raw) });
     {
         let b = obj.borrow();
         if !matches!(&b.exotic, crate::value::Exotic::Array) || !b.ic_plain.get() || !b.extensible {
@@ -4202,7 +4202,7 @@ fn compile_entry(
                 // like `value::jit_layout` probes it. A dead callee (or an unprobed layout)
                 // degrades to the generic call unconditionally.
                 let stored = it.pin.upgrade().filter(|_| layout.valid).map(|o| {
-                    let some: Option<crate::value::Gc> = Some(o);
+                    let some: Option<crate::value::Gc> = Some(crate::value::Gc::from(o));
                     unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
                 });
                 match stored {

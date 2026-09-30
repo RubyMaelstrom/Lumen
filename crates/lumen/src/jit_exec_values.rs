@@ -723,7 +723,7 @@ mod tests {
             Value::Str(crate::lstr::LStr::from("native owner λ")),
             interp.new_symbol(Some("native owner".into())),
         ] {
-            let object_weak = value.as_obj().map(Rc::downgrade);
+            let object_weak = value.as_obj().map(|object| Rc::downgrade(object));
             let symbol_weak = if let Value::Sym(symbol) = &value {
                 Some(Rc::downgrade(symbol))
             } else {

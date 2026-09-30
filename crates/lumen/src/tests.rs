@@ -5177,7 +5177,7 @@ fn engine_teardown_reclaims_the_entire_object_and_environment_graph() {
             let heap = Rc::downgrade(&engine.interp.gc_heap);
             let objects: Vec<_> = crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
                 .iter()
-                .map(Rc::downgrade)
+                .map(|object| Rc::downgrade(object))
                 .collect();
             let scopes: Vec<_> = crate::value::gc_scope_snapshot(&engine.interp.gc_heap)
                 .iter()

@@ -1469,7 +1469,7 @@ pub(super) fn emit(
                     guard_misses.push(bailout);
                     let guard = chunk.jit_inline_target(target);
                     let stored = guard.pin.upgrade().filter(|_| layout.valid).map(|object| {
-                        let owner: Option<crate::value::Gc> = Some(object);
+                        let owner: Option<crate::value::Gc> = Some(crate::value::Gc::from(object));
                         unsafe { *(&owner as *const Option<crate::value::Gc> as *const usize) }
                     });
                     if let Some(stored) = stored {

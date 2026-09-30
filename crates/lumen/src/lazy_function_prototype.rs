@@ -53,7 +53,7 @@ impl LazyFunctionPrototype {
             props
                 .entries
                 .fields
-                .push(Property::builtin(super::Value::Obj(owner)));
+                .push(Property::builtin(super::Value::Obj(super::Gc::from(owner))));
         }
         props.shape = self.shape;
         let prototype = Object::new_with_parts(Some(parent.clone()), props, Exotic::None);

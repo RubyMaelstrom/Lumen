@@ -626,7 +626,10 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         e.set_tier(Tier::Jit);
         assert_eq!(eval(&mut e, "target=new Function('x','return x+70');target(1);invokeTarget(target,2);invokeTarget(target,3);"), "73");
         assert_ne!(
-            value(&mut e, "target").as_obj().map(Rc::as_ptr).unwrap() as usize,
+            value(&mut e, "target")
+                .as_obj()
+                .map(|object| Rc::as_ptr(object))
+                .unwrap() as usize,
             key
         );
     }

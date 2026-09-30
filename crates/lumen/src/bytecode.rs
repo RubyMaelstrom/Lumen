@@ -6588,7 +6588,7 @@ fn plan_inlines_at(
             let Some(weak) = pins.get(&ic.callee) else {
                 skip!(idx, "no pin")
             };
-            let Some(obj) = weak.upgrade() else {
+            let Some(obj) = weak.upgrade().map(crate::value::Gc::from) else {
                 skip!(idx, "dead callee")
             };
             let b = obj.borrow();
@@ -19777,7 +19777,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
     match sp.read().into_value() {
         Value::Obj(o) => {
             if Rc::strong_count(&o) > 1 {
-                unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+                unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
             } else {
                 drop(o);
             }
@@ -20076,7 +20076,7 @@ unsafe fn jit_new_inner(
         match unsafe { sp.read().into_value() } {
             Value::Obj(o) => {
                 if Rc::strong_count(&o) > 1 {
-                    unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+                    unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
                 } else {
                     drop(o);
                 }
@@ -20668,7 +20668,9 @@ unsafe fn jit_call_inner(
                     match sp.read().into_value() {
                         Value::Obj(o) => {
                             if Rc::strong_count(&o) > 1 {
-                                unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+                                unsafe {
+                                    Rc::decrement_strong_count(crate::value::Gc::into_raw(o))
+                                };
                             } else {
                                 drop(o);
                             }
@@ -20702,7 +20704,7 @@ unsafe fn jit_call_inner(
         match sp.read().into_value() {
             Value::Obj(o) => {
                 if Rc::strong_count(&o) > 1 {
-                    unsafe { Rc::decrement_strong_count(Rc::into_raw(o)) };
+                    unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
                 } else {
                     drop(o);
                 }

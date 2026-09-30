@@ -57,6 +57,7 @@ mod for_in_cache_tests;
 mod gc_diagnostics;
 mod gc_edges;
 mod gc_generational;
+mod gc_handle;
 mod gc_native;
 mod gc_sweep;
 mod heap;
@@ -84,6 +85,8 @@ mod native_constructor_tests;
 mod native_typed_array;
 #[cfg(feature = "intl")]
 mod numbering;
+#[cfg(test)]
+mod object_alloc_bench;
 #[cfg(test)]
 mod object_literal_jit_tests;
 mod ordered_collection;
