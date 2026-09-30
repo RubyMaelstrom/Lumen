@@ -319,7 +319,10 @@ impl Interp {
                     (
                         binding.initialized,
                         binding.value.clone(),
-                        binding.import_ref.clone(),
+                        binding
+                            .import_ref
+                            .as_deref()
+                            .map(|(exporter, local)| (exporter.clone(), local.clone())),
                     )
                 };
                 if !initialized {

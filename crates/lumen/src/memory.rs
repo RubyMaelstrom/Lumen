@@ -1028,8 +1028,10 @@ impl Visitor {
         for (name, binding) in scope.vars.iter() {
             self.rc_str(name);
             self.value(&binding.value);
-            if let Some((_, import_name)) = &binding.import_ref {
-                bytes = bytes.saturating_add(import_name.capacity());
+            if let Some((_, import_name)) = binding.import_ref.as_deref() {
+                bytes =
+                    bytes.saturating_add(size_of::<(crate::interpreter::Env, std::rc::Rc<str>)>());
+                self.rc_str(import_name);
             }
         }
         (bytes, exact)

@@ -2433,7 +2433,7 @@ impl Interp {
                     ));
                 }
                 // A live module import reads through to the exporter's binding.
-                if let Some((src_env, local)) = &binding.import_ref {
+                if let Some((src_env, local)) = binding.import_ref.as_deref() {
                     let (src_env, local) = (src_env.clone(), local.clone());
                     drop(b);
                     return Ok((self.get_var(&local, &src_env)?, None));

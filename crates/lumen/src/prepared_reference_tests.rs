@@ -236,12 +236,12 @@ fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
 }
 
 #[test]
-fn prepared_reference_native_kind_flags_preserve_binding_size_and_imports() {
+fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_imports() {
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
         std::mem::size_of::<Binding>(),
-        56,
-        "kind bit uses existing flag padding"
+        32,
+        "kind bit uses flag padding in the compact binding"
     );
     let target = new_scope(None);
     let mut binding = Binding::data(Value::Undefined, false, true);

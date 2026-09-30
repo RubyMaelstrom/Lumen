@@ -1601,6 +1601,86 @@ mod binding_layout_tests {
     use super::*;
 
     #[test]
+    fn cold_import_cells_keep_independent_environment_owners_and_shared_names() {
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::size_of::<Binding>(), 32);
+            assert_eq!(std::mem::size_of::<(Rc<str>, Binding)>(), 48);
+        }
+        let exporter = new_scope(None);
+        let mut first = Binding::data(Value::Undefined, false, true);
+        first.set_import_reference(Some((exporter.clone(), "source".into())));
+        let before = Rc::strong_count(&exporter);
+        let second = first.clone();
+        assert_eq!(Rc::strong_count(&exporter), before + 1);
+        let left = first.import_ref.as_deref().unwrap();
+        let right = second.import_ref.as_deref().unwrap();
+        assert!(
+            !std::ptr::eq(left, right),
+            "collector edges own separate handles"
+        );
+        assert!(Rc::ptr_eq(&left.1, &right.1));
+        drop(second);
+        assert_eq!(Rc::strong_count(&exporter), before);
+        first.set_import_reference(None);
+        assert_eq!(Rc::strong_count(&exporter), 1);
+    }
+
+    #[test]
+    fn cold_import_cells_trace_exporters_and_keep_cached_reads_live() {
+        for tier in [
+            crate::bytecode::Tier::Interp,
+            crate::bytecode::Tier::Bytecode,
+            crate::bytecode::Tier::Jit,
+        ] {
+            let mut engine = crate::Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let global = engine.interp.global_env.clone();
+            let exporter = new_scope(Some(global.clone()));
+            let object = engine.interp.new_object();
+            object
+                .borrow_mut()
+                .props
+                .insert("n", crate::value::Property::plain(Value::Num(7.)));
+            exporter
+                .borrow_mut()
+                .vars
+                .insert("source", Binding::data(Value::Obj(object), true, true));
+            let mut import = Binding::data(Value::Undefined, false, true);
+            import.set_import_reference(Some((exporter.clone(), "source".into())));
+            global.borrow_mut().vars.insert("coldLeft", import.clone());
+            global.borrow_mut().vars.insert("coldRight", import);
+            let weak = Rc::downgrade(&exporter);
+            drop(exporter);
+            assert_eq!(evaluate(&mut engine, "function readCold(){return coldLeft.n+coldRight.n;}for(var k=0;k<40;k++)readCold();readCold()"), "14");
+            engine.interp.gc_collect();
+            let exporter = weak
+                .upgrade()
+                .expect("rooted imports retain their exporter");
+            let value = exporter.borrow().vars.get("source").unwrap().value.clone();
+            value
+                .as_obj()
+                .unwrap()
+                .borrow_mut()
+                .props
+                .insert("n", crate::value::Property::plain(Value::Num(9.)));
+            drop(value);
+            drop(exporter);
+            assert_eq!(evaluate(&mut engine, "readCold()"), "18", "{tier:?}");
+            global.borrow_mut().vars.remove("coldLeft");
+            engine.interp.gc_collect();
+            assert_eq!(evaluate(&mut engine, "coldRight.n"), "9", "{tier:?}");
+            global.borrow_mut().vars.remove("coldRight");
+            engine.interp.gc_collect();
+            assert!(
+                weak.upgrade().is_none(),
+                "removed imports release their exporter"
+            );
+        }
+    }
+
+    #[test]
     fn cold_environment_layout_preserves_values_across_order_and_structural_changes() {
         let cached = std::cell::OnceCell::new();
         let mut first = VarMap::default();
@@ -1901,8 +1981,11 @@ pub struct Binding {
     pub mutable: bool,
     /// `false` while a `let`/`const` is in its temporal dead zone.
     pub initialized: bool,
-    /// A live module import: reads/writes redirect to `(exporter scope, local name)`.
-    pub import_ref: Option<(Env, String)>,
+    /// A live module import: reads redirect to `(exporter scope, local name)`. Ordinary
+    /// bindings need only a nullable pointer. Each cold box independently owns its Env;
+    /// sharing that owner would change the collector's incoming-reference accounting.
+    /// Immutable names can share their bytes across temporary resolution snapshots.
+    pub import_ref: Option<Box<(Env, Rc<str>)>>,
     /// Native-visible kind bit, occupying existing flag padding. All structural insertion
     /// paths normalize it; in-place import changes must use set_import_reference.
     pub(crate) imported: bool,
@@ -1920,7 +2003,7 @@ impl Binding {
     #[cfg(test)]
     pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, String)>) {
         self.imported = reference.is_some();
-        self.import_ref = reference;
+        self.import_ref = reference.map(|(env, name)| Box::new((env, Rc::from(name))));
     }
     pub(crate) fn data(value: Value, mutable: bool, initialized: bool) -> Binding {
         Binding {
@@ -9495,7 +9578,7 @@ impl Interp {
                     let ob = o.borrow();
                     ob.gc_internal.set(ob.gc_internal.get() + 1);
                 }
-                if let Some((ie, _)) = &bind.import_ref {
+                if let Some((ie, _)) = bind.import_ref.as_deref() {
                     if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
                         s_internal[k] += 1;
                     }
@@ -10113,7 +10196,7 @@ impl Interp {
                         stack.push(o.clone());
                     }
                 }
-                if let Some((ie, _)) = &bind.import_ref {
+                if let Some((ie, _)) = bind.import_ref.as_deref() {
                     if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
                         if !s_mark[k] {
                             s_mark[k] = true;

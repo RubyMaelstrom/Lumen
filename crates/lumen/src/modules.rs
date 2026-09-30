@@ -787,7 +787,7 @@ impl Interp {
                         mutable: false,
                         strict_immutable: true,
                         initialized: true,
-                        import_ref: Some((src_env, src_local)),
+                        import_ref: Some(Box::new((src_env, Rc::from(src_local)))),
                         imported: true,
                         deletable: false,
                     },

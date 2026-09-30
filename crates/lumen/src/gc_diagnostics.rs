@@ -137,7 +137,7 @@ impl Snapshot<'_> {
                             destinations
                                 .push((Node::Object(Rc::as_ptr(object) as usize), "binding"));
                         }
-                        if let Some((scope, _)) = &binding.import_ref {
+                        if let Some((scope, _)) = binding.import_ref.as_deref() {
                             destinations
                                 .push((Node::Scope(Rc::as_ptr(scope) as usize), "import-binding"));
                         }

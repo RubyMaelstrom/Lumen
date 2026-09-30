@@ -184,7 +184,7 @@ fn scope_edges(scope: &Env, objects: &mut Vec<Gc>, scopes: &mut Vec<Env>) {
         if let Value::Obj(object) = &binding.value {
             objects.push(object.clone());
         }
-        if let Some((scope, _)) = &binding.import_ref {
+        if let Some((scope, _)) = binding.import_ref.as_deref() {
             scopes.push(scope.clone());
         }
     }

@@ -1,0 +1,45 @@
+Compact binding storage — 30 September 2026
+==========================================
+
+Ordinary declarative bindings reserved an inline exporter Env and String for the
+rare module-import case. Import indirection now lives in an independently owned
+Box; its immutable target name is an Rc<str>. On the tested 64-bit build, Binding
+shrinks from 56 to 32 bytes and a named vector entry from 72 to 48 bytes. Import
+resolution snapshots clone the two required handles without copying name bytes
+or cloning the box. Every import still reads the exporter's current binding.
+
+The boxes deliberately do not share exporter owners: the Rc collector counts
+one incoming Env handle per binding. Major/minor tracing and diagnostics follow
+the box's owned Env; memory accounting charges each box and deduplicates names.
+Live imported-kind flags and binding mutability/TDZ checks remain authoritative.
+Native backends derive their binding offsets/stride from the existing live Rust
+layout probe; no stale 56-byte/72-byte native layout is retained.
+
+The consulted local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:11764, requires live target
+reads and TDZ errors. Official clause:
+https://tc39.es/ecma262/#sec-module-environment-records-getbindingvalue-n-s.
+This is the consulted snapshot, not verified current upstream text.
+
+The full library run passed 1573 cases and failed one old assertion that required
+56-byte Binding storage. Updating that layout contract to 32 bytes passed its
+focused recheck. No production change followed the full run. New tests cover
+independent import owners, shared names, cached reads after exporter mutation,
+collection and release of removed imports across interpreter/bytecode/JIT.
+Workspace all-target checks and strict engine all-target Clippy pass. No new
+x64 execution, wasm build or Test262 claim is made.
+
+Four balanced actual-application pairs show no clear timing gain; all timing
+intervals include parity. Separate peak intervals also include parity. React's
+median peak is 4.06% higher (23840 vs 22910 KiB), with a paired 95% interval
+0.98636–1.07018; the observed increase is uncertain. It does not meet the policy's
+combined >3% median-loss and slower-direction interval gate. No other component
+crosses that gate. The binary grows 4400 bytes. Smaller binding storage is proven;
+an overall application speedup or peak-memory reduction is not established.
+
+Exact observations and source/artifact hashes are in
+../benchmarks/engine-compact-bindings-2026-09-30.json. Local complete outputs and
+source copies are under benchmark-results/engine-cycle6-20260930. Baseline is
+the completed packed-argument cycle; HEAD alone is insufficient while .git is
+read-only. No owned build/test/profile overlapped the observations. User desktop
+apps remained active. Installed/accepted artifacts were not replaced.
