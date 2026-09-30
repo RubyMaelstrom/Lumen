@@ -6572,6 +6572,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         Ok(ov)
     });
     it.def_method(&ap, "values", 0, nf_array_values);
+    // %Array.prototype.values%: arguments objects install the intrinsic itself as @@iterator
+    // (ECMA-262 CreateUnmappedArgumentsObject / CreateMappedArgumentsObject), not whatever the
+    // property holds later.
+    let values_intrinsic = ap.borrow().props.get("values").map(|p| p.value());
+    if let Some(Value::Obj(values)) = values_intrinsic {
+        it.extra_protos.insert("%Array.prototype.values%", values);
+    }
     it.def_method(&ap, "keys", 0, |i, this, _| {
         arr_require_coercible(i, &this)?;
         Ok(make_array_iterator(i, this, 1))

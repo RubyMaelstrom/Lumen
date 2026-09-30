@@ -11,7 +11,19 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
     }
 }
 
-fn check(source: &str, expected: &str, prepared: &[&str], native: bool) {
+/// Which compiled entry a function declaration must use. Rest and destructuring parameters,
+/// ordinary `new.target`, and mapped `arguments` projections have lean entries; parameter
+/// expressions that create closures, direct eval, and arrows that observe the activation still
+/// need the general FunctionDeclarationInstantiation entry.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Entry {
+    Prepared,
+    Lean,
+}
+
+use Entry::{Lean, Prepared};
+
+fn check(source: &str, expected: &str, functions: &[(&str, Entry)], native: bool) {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -20,7 +32,7 @@ fn check(source: &str, expected: &str, prepared: &[&str], native: bool) {
         if matches!(tier, Tier::Interp) {
             continue;
         }
-        for name in prepared {
+        for &(name, entry) in functions {
             let env = engine.interp.global_env.clone();
             let value = engine
                 .interp
@@ -39,12 +51,13 @@ fn check(source: &str, expected: &str, prepared: &[&str], native: bool) {
                 .get()
                 .and_then(Option::as_ref)
                 .unwrap_or_else(|| panic!("{name} stayed interpreted"));
-            // Named expressions and arrows can use the lean entry now that their lexical
-            // bindings are retained by closure creation. The other fixtures need full FDI.
+            // Named expressions and arrows can use either entry now that their lexical
+            // bindings are retained by closure creation.
             if !user.func.is_arrow && !user.func.is_fn_expr {
-                assert!(
-                    chunk.prepared_entry,
-                    "{name} did not use the general compiled entry"
+                let actual = if chunk.prepared_entry { Prepared } else { Lean };
+                assert_eq!(
+                    actual, entry,
+                    "{name} used the wrong compiled entry ({tier:?})"
                 );
             }
             if native
@@ -76,7 +89,7 @@ fn compiled_entry_rest_destructuring_and_parameter_default_order() {
         out.join('|')+'|'+log.join(',')
     "#,
         "7|9|7|ReferenceError|3|a,b",
-        &["rest", "destructure", "tdz"],
+        &[("rest", Lean), ("destructure", Lean), ("tdz", Prepared)],
         true,
     );
 }
@@ -98,7 +111,7 @@ fn compiled_entry_parameter_iterator_closing_happens_once_before_body() {
         log.join(',')
     "#,
         "next,close,body,next,close,body,undefined,close,9",
-        &["first", "fail"],
+        &[("first", Lean), ("fail", Prepared)],
         true,
     );
 }
@@ -116,7 +129,13 @@ fn compiled_entry_arguments_mapping_and_parameter_body_cells() {
         [mapped(1,2),duplicate(1,2),unmapped(1),complex(),separate(),captured(1)].join('|')
     "#,
         "4:4:7|9:8|4:9|4:9|1:9|14",
-        &["mapped", "duplicate", "complex", "separate", "captured"],
+        &[
+            ("mapped", Prepared),
+            ("duplicate", Prepared),
+            ("complex", Prepared),
+            ("separate", Prepared),
+            ("captured", Prepared),
+        ],
         true,
     );
 }
@@ -133,7 +152,35 @@ fn compiled_entry_hoists_and_block_capture_identity() {
         [hoists(3),blocks(3),sibling(3),body(3),annex(3)].join('|')
     "#,
         "true|4|4|4|true",
-        &["hoists", "blocks", "sibling", "body", "annex"],
+        &[
+            ("hoists", Lean),
+            ("blocks", Lean),
+            ("sibling", Lean),
+            ("body", Lean),
+            ("annex", Lean),
+        ],
+        false,
+    );
+    // A closure in a parameter expression gives the body its own var environment (ECMA-262
+    // §10.2.11 step 28), which keeps the same hoisting and block-capture semantics on the
+    // general entry.
+    check(
+        r#"
+        function hoists(v,p=()=>v){var before=f;function f(){return v};return before===f && f()===3;}
+        function blocks(v,p=()=>v){var get;{let x=v;get=()=>x;x++;}return get();}
+        function sibling(v,p=()=>v){var a,b;{let x=1;a=()=>x}{let x=v;b=()=>x}return a()+b();}
+        function body(v,p=()=>v){let x=v;var read=()=>x;x++;return read();}
+        function annex(v,p=()=>v){var before=f;{function f(){return v}}return before===undefined && f()===3;}
+        [hoists(3),blocks(3),sibling(3),body(3),annex(3)].join('|')
+    "#,
+        "true|4|4|4|true",
+        &[
+            ("hoists", Prepared),
+            ("blocks", Prepared),
+            ("sibling", Prepared),
+            ("body", Prepared),
+            ("annex", Prepared),
+        ],
         false,
     );
 }
@@ -150,7 +197,13 @@ fn compiled_entry_named_function_self_binding_and_shadowing() {
         [named(8),shadow(),strict(),one(),two(),one()].join('|')
     "#,
         "function|4|TypeError|10|20|10",
-        &["named", "shadow", "strict", "one", "two"],
+        &[
+            ("named", Lean),
+            ("shadow", Lean),
+            ("strict", Lean),
+            ("one", Lean),
+            ("two", Lean),
+        ],
         true,
     );
 }
@@ -171,7 +224,13 @@ fn compiled_entry_arrows_inherit_lexical_this_arguments_and_new_target() {
         result.join('|')
     "#,
         "42|5|true|true|[object Number]|true",
-        &["arrow", "argsArrow", "targetArrow", "C", "sloppy"],
+        &[
+            ("arrow", Lean),
+            ("argsArrow", Lean),
+            ("targetArrow", Lean),
+            ("C", Prepared),
+            ("sloppy", Lean),
+        ],
         false,
     );
 }
@@ -187,7 +246,12 @@ fn compiled_entry_direct_eval_observes_and_updates_live_bindings() {
         [evaluate(1),lexical(),localEval(x=>x+2,5),scoped()].join('|')
     "#,
         "4:5:6:4|8|7|10:1",
-        &["evaluate", "lexical", "localEval", "scoped"],
+        &[
+            ("evaluate", Prepared),
+            ("lexical", Prepared),
+            ("localEval", Prepared),
+            ("scoped", Prepared),
+        ],
         false,
     );
 }
@@ -202,7 +266,49 @@ fn compiled_entry_constructor_fallback_keeps_return_mapping() {
         a.value+':'+(a instanceof C)+':'+b.value+':'+(b instanceof C)
     "#,
         "3:true:4:false",
-        &["C"],
+        &[("C", Lean)],
+        true,
+    );
+    check(
+        r#"
+        function C(v,w,p=()=>v){this.value=v;return w}
+        C.call({},1,2);
+        var a=new C(3,9),b=new C(3,{value:4});
+        a.value+':'+(a instanceof C)+':'+b.value+':'+(b instanceof C)
+    "#,
+        "3:true:4:false",
+        &[("C", Prepared)],
+        true,
+    );
+}
+
+#[test]
+fn compiled_entry_new_target_observers_keep_their_own_activation() {
+    // ECMA-262 §9.4.5 GetNewTarget: an arrow, a class computed key, or a class heritage
+    // expression reads the [[NewTarget]] of the nearest non-arrow function, even when an
+    // enclosing function also has one and even after the activation has returned.
+    check(
+        r#"
+        var named, keyed, heritage;
+        function Named(){named=()=>new.target;var local=()=>new.target;return local()}
+        function Keyed(){var k=class{[(()=>typeof new.target)()](){}};keyed=Object.getOwnPropertyNames(k.prototype)[1]}
+        function Outer(){return function inner(){return class extends (new.target?Object:Array){}}}
+        function Plain(){return new.target}
+        var direct=new Named()===undefined;
+        var after=named()===Named;Named();var cleared=named()===undefined;
+        new Keyed();var constructed=keyed;Keyed();
+        var inner=new Outer();heritage=[inner()===undefined, Object.getPrototypeOf(inner()) === Array,
+            Object.getPrototypeOf(new inner()) === Object];
+        [direct, after, cleared, constructed, keyed, heritage.join(','),
+         Plain()===undefined, new Plain()===undefined].join('|')
+    "#,
+        "false|true|true|function|undefined|false,true,true|true|false",
+        &[
+            ("Named", Prepared),
+            ("Keyed", Prepared),
+            ("Outer", Lean),
+            ("Plain", Lean),
+        ],
         true,
     );
 }
@@ -230,7 +336,7 @@ fn compiled_lean_arrows_read_live_lexical_this_only_when_executed() {
         [before,error,first,arrow(true),captured()].join('|')
     "#,
         "3|ReferenceError|42|43|9",
-        &["arrow", "captured"],
+        &[("arrow", Lean), ("captured", Lean)],
         true,
     );
 }

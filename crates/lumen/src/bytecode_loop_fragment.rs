@@ -300,6 +300,9 @@ fn compile(
 ) -> Option<(Rc<Chunk>, u16, Vec<u16>)> {
     let (kind, source) = source.owned();
     let mut c = Compiler {
+        lean_new_target: false,
+        rest_slot: None,
+        arguments_length_only: false,
         strict: context.strict,
         fragment_entry: true,
         fragment_root: Some(kind),

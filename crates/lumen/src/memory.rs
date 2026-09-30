@@ -1320,6 +1320,11 @@ fn scan_realm(
     for name in interp.stub_cache_names.borrow().iter().flatten() {
         visitor.rc_str(name);
     }
+    if let Some((keys, _)) = &interp.arguments_shapes {
+        for key in keys {
+            visitor.rc_str(key);
+        }
+    }
     if !interp.creation_pins.is_empty() {
         totals
             .engine_caches

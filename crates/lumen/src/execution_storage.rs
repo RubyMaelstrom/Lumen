@@ -186,6 +186,19 @@ impl CallArgs<'_> {
             Self::Packed(values) => PackedValue::with_values(values, f),
         }
     }
+
+    /// Owned copies of the arguments from `first` on (a rest parameter's list).
+    pub(crate) fn rest_values(&self, first: usize) -> Vec<Value> {
+        match self {
+            Self::Values(values) => values.get(first..).unwrap_or(&[]).to_vec(),
+            Self::Packed(values) => values
+                .get(first..)
+                .unwrap_or(&[])
+                .iter()
+                .map(PackedValue::unpack)
+                .collect(),
+        }
+    }
 }
 
 /// A bounded argument-boundary decode, never an activation conversion. Most JS/native calls

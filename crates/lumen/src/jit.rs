@@ -3472,6 +3472,14 @@ fn compile_entry(
         a.movz(9, u32::from(chunk.jit_is_strict()), 0);
         a.strb_imm(9, strict_base, strict_off);
     }
+    // Function entry is a safepoint, like a loop back-edge: allocation pressure and host
+    // interruption are observed here on the shared amortized cadence. Code that never takes a
+    // back-edge (loop-free recursion makes billions of calls) must still be interruptible, since
+    // a user agent may abort a running script at any time (HTML §8.1.4.5). The frame is fully
+    // established and the operand stack empty, so the helper sees every owned root.
+    if !borrowed_entry {
+        emit_interrupt_poll(&mut a, ilayout, l_unwind);
+    }
     #[cfg(feature = "optimizing-jit")]
     if !borrowed_entry {
         if let Some(counter) = optimizing::hot_counter(chunk) {
@@ -5949,7 +5957,6 @@ fn emit_call_inline(
                     *argc as usize,
                     with_this,
                     hit_slow,
-                    slow,
                     l_unwind,
                     done,
                     l_direct_finish,
@@ -6073,7 +6080,6 @@ fn emit_direct_call(
     argc: usize,
     with_this: bool,
     hit_slow: usize,
-    gc_slow: usize,
     l_unwind: usize,
     done: usize,
     // Label of the chunk's shared direct-finish stub (`emit_direct_finish_stub`).
@@ -6211,18 +6217,8 @@ fn emit_direct_call(
     a.ldr_w_imm(13, 14, il.direct_call_depth as u32);
     a.cmp_reg_x(11, 13); // w-load zero-extends; the compare stays 64-bit
     a.b_cond(C_HS, hit_slow);
-    // Check actual allocation pressure in generated code. Collection-due calls take the full
-    // cache-reprobing helper because a collection can invalidate validated raw call state.
-    emit_live_objects_load(a, cx_live_objects);
-    a.ldr_imm(13, 14, il.gc_next as u32);
-    let gc_due = a.new_label();
-    a.cmp_reg_x(4, 13);
-    a.b_cond(C_GT, gc_due);
-    a.ldr_w_imm(13, 14, il.gc_tick as u32);
-    a.add_imm(13, 13, 1);
-    let maint_mask = asm::logical_imm_w(crate::interpreter::GC_DIRECT_MAINT_MASK).unwrap();
-    a.logic_imm_w(0, 4, 13, maint_mask);
-    a.cbz(4, false, hit_slow);
+    // Allocation pressure and host interruption are observed by the callee's entry safepoint
+    // (see the prologue), after this call has committed.
     a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
     a.ldr_imm(17, 14, (il.fn_frames + il.fnf_cap_word) as u32);
     a.cmp_reg_x(16, 17);
@@ -6247,8 +6243,7 @@ fn emit_direct_call(
     // ---- mutations ----
     a.add_imm(11, 11, 1);
     a.str_w_imm(11, 14, il.depth as u32); // depth++ (u32 field)
-    a.str_w_imm(13, 14, il.gc_tick as u32); // tick (not due)
-                                            // FnFrame push: entry = ptr + len*24
+                                          // FnFrame push: entry = ptr + len*24
     a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
     a.movz(5, 24, 0);
     a.madd(6, 16, 5, 6);
@@ -6387,10 +6382,6 @@ fn emit_direct_call(
         a.blr(16);
     }
     a.b(done);
-    a.bind(gc_due);
-    a.movz(13, crate::interpreter::GC_CALL_POLL_MASK, 0);
-    a.str_w_imm(13, 14, il.gc_tick as u32);
-    a.b(gc_slow);
     true
 }
 
@@ -6435,18 +6426,6 @@ fn emit_direct_callee_drop(a: &mut asm::Asm, argc: usize) {
     a.blr(16);
     a.ldp_post(8, 31, 16);
     a.bind(done);
-}
-
-/// Load the executing thread's live-object count into x4 through the current [`JitCtx`]. A JIT
-/// chunk can outlive or cross from the thread that compiled it, so this must remain a runtime
-/// activation-relative load rather than an absolute TLS address embedded in machine code.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_live_objects_load(a: &mut asm::Asm, cx_live_objects: u32) {
-    a.ldr_imm(4, 19, cx_live_objects);
-    a.ldr_imm(4, 4, 0);
 }
 
 #[cfg(all(
@@ -6779,7 +6758,6 @@ mod direct_call_tests {
         let value_layout = crate::value::jit_layout(&engine.interp.object_proto);
         let mut asm = super::asm::Asm::new();
         let hit_slow = asm.new_label();
-        let gc_slow = asm.new_label();
         let unwind = asm.new_label();
         let done = asm.new_label();
         let finish = asm.new_label();
@@ -6789,7 +6767,7 @@ mod direct_call_tests {
                 &mut asm, &layout, &value_layout, attempted,
                 std::mem::offset_of!(crate::bytecode::Chunk, jit_runs),
                 std::mem::offset_of!(crate::bytecode::Chunk, inline_retry_at), 1, false,
-                hit_slow, gc_slow, unwind, done, finish,
+                hit_slow, unwind, done, finish,
             ),
             "direct calls silently disabled: valid={}, depth={}, direct_depth={}, gc_tick={}, gc_next={}, coro={}, constructing={}, new_target={}, frames={}, pool={}, attempted={}",
             layout.valid, layout.depth, layout.direct_call_depth, layout.gc_tick,
@@ -6820,18 +6798,6 @@ mod direct_call_tests {
             assert_eq!(bytes[offset], 173);
             assert_eq!(bytes.iter().filter(|&&byte| byte != 0).count(), 1);
         }
-    }
-
-    #[test]
-    fn live_object_count_is_loaded_through_the_execution_context() {
-        let offset = std::mem::offset_of!(super::JitCtx, live_objects) as u32;
-        let mut asm = super::asm::Asm::new();
-        super::emit_live_objects_load(&mut asm, offset);
-
-        let words = asm.finish();
-        let from_ctx = 0xF940_0000 | ((offset / 8) << 10) | (19 << 5) | 4;
-        let dereference = 0xF940_0000 | (4 << 5) | 4;
-        assert_eq!(words, [from_ctx, dereference]);
     }
 
     #[test]
@@ -7129,6 +7095,13 @@ fn emit_direct_finish_stub(
         // that). Bare dec when shared; H_DROP_AT (full drop, may cascade) for a last reference
         // or a BigInt. Only x9 (cursor) and x5 (remaining) survive the helper: spilled around
         // the call; the record is reloaded from the stub frame and everything else re-read.
+        // Tag bounds for the slot filter below, kept in w14/w15 across the loop.
+        let low_heap_tag = (crate::value::PACK_BIGINT >> 48) as u32;
+        let object_tag = (crate::value::PACK_OBJ >> 48) as u32;
+        const _: () = assert!(
+            crate::value::PACK_STR >> 48 == (crate::value::PACK_BIGINT >> 48) + 1
+                && crate::value::PACK_SYM >> 48 == (crate::value::PACK_BIGINT >> 48) + 2
+        );
         let drop_at = |a: &mut asm::Asm, value_reg: u32, helper: usize| {
             // x<value_reg> = address of the Value to drop; clobbers x0-x17 minus the spills.
             a.stp_pre(9, 5, -16);
@@ -7139,6 +7112,8 @@ fn emit_direct_finish_stub(
             a.blr(16);
             a.ldp_post(9, 5, 16);
             a.ldur(10, 31, 16);
+            a.movz(14, low_heap_tag, 0);
+            a.movz(15, object_tag, 0);
         };
         // callee `this`, then reset the record's binding to Undefined (a pooled invariant)
         let this_done = a.new_label();
@@ -7166,27 +7141,30 @@ fn emit_direct_finish_stub(
         let c_done = a.new_label();
         a.ldr_imm(9, 10, cx_slots);
         a.ldr_imm(5, 10, cx_n_slots);
+        a.movz(14, low_heap_tag, 0);
+        a.movz(15, object_tag, 0);
+        let packed_ref = a.new_label();
+        let low_heap = a.new_label();
+        let high_heap = a.new_label();
         a.bind(c_loop);
         a.cbz(5, true, c_done);
         a.ldur(11, 9, 0);
         a.lsr_imm(13, 11, 48);
-        a.movz(12, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-        a.cmp_reg_x(13, 12);
-        a.b_cond(C_EQ, c_drop);
-        let packed_ref = a.new_label();
-        for tag in [
-            crate::value::PACK_STR,
-            crate::value::PACK_SYM,
-            crate::value::PACK_OBJ,
-        ] {
-            a.movz(12, (tag >> 48) as u32, 0);
-            a.cmp_reg_x(13, 12);
-            a.b_cond(C_EQ, packed_ref);
-        }
-        a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
-        a.cmp_reg_x(13, 12);
-        a.b_cond(C_HI, c_drop); // unknown/property-only tags never get scalar treatment
+        // Scalars (Numbers, Undefined/Null/Boolean/Empty) are the common case: two unsigned
+        // range tests classify every tag. BigInt/String/Symbol occupy the three tags from
+        // PACK_BIGINT; Object and the property-only tags start at PACK_OBJ. No Number can
+        // carry a tag at or above PACK_OBJ because packing canonicalizes NaN.
+        a.sub_reg(12, 13, 14);
+        a.cmp_imm_w(12, 2);
+        a.b_cond(C_LS, low_heap);
+        a.cmp_reg_w(13, 15);
+        a.b_cond(C_HS, high_heap);
         a.b(c_next);
+        a.bind(low_heap);
+        a.cbz(12, false, c_drop); // BigInt → full drop
+        a.b(packed_ref); // String / Symbol
+        a.bind(high_heap);
+        a.b_cond(C_HI, c_drop); // property-only tags never get the bare decrement
         a.bind(packed_ref);
         emit_exec_payload(a, 11, 12);
         a.ldur(13, 12, 0);
@@ -15583,11 +15561,12 @@ pub fn run(
     let seed = n_params.min(args.len());
     slots.extend(args[..seed].iter().cloned().map(PackedValue::pack));
     slots.resize_with(n_slots, || PackedValue::pack(Value::Undefined));
+    if let Some(rest) = chunk.rest_slot {
+        let rest_values = args.get(n_params..).unwrap_or(&[]).to_vec();
+        slots.write_value(rest as usize, i.make_array(rest_values));
+    }
     if let Some(s) = chunk.jit_arguments_slot() {
-        slots.write_value(
-            s as usize,
-            Value::Obj(i.make_compiled_arguments_object(args, &env)),
-        );
+        slots.write_value(s as usize, chunk.arguments_slot_value(i, args, &env));
     }
     stack.clear();
     stack.reserve(code.max_stack);
@@ -15857,9 +15836,8 @@ pub(crate) unsafe fn run_moved_env(
     let arguments = chunk.jit_arguments_slot().map(|slot| {
         (
             slot as usize,
-            crate::execution_storage::CallArgs::Packed(args_ref).with_values(|values| {
-                Value::Obj(i.make_compiled_arguments_object(values, &activation))
-            }),
+            crate::execution_storage::CallArgs::Packed(args_ref)
+                .with_values(|values| chunk.arguments_slot_value(i, values, &activation)),
         )
     });
     unsafe {
@@ -15927,13 +15905,20 @@ unsafe fn run_moved_inner(
     let stack_base = unsafe { slots_ptr.add(n_slots) };
     unsafe {
         std::ptr::copy_nonoverlapping(args, slots_ptr, seed);
-        // Surplus arguments were still moved to us: drop them.
-        for k in seed..argc {
-            std::ptr::drop_in_place(args.add(k));
-        }
         // A packed Undefined is a complete tagged word, never a zeroed wide discriminant.
         for k in seed..n_slots {
             slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
+        }
+        // Surplus arguments were still moved to us: they become the rest parameter's Array
+        // (CreateArrayFromList), or are dropped.
+        if let Some(rest) = chunk.rest_slot {
+            let array = i.make_array_from_raw(args.add(seed), argc - seed);
+            std::ptr::drop_in_place(slots_ptr.add(rest as usize));
+            slots_ptr.add(rest as usize).write(PackedValue::pack(array));
+        } else {
+            for k in seed..argc {
+                std::ptr::drop_in_place(args.add(k));
+            }
         }
         if let Some((slot, value)) = arguments {
             if slot < seed {
@@ -16013,11 +15998,17 @@ unsafe fn run_moved_oversized(
     let (slots_ptr, stack_base) = (slots.as_mut_ptr(), stack.as_mut_ptr());
     unsafe {
         std::ptr::copy_nonoverlapping(args, slots_ptr, seed);
-        for k in seed..argc {
-            std::ptr::drop_in_place(args.add(k));
-        }
         for k in seed..n_slots {
             slots_ptr.add(k).write(PackedValue::pack(Value::Undefined));
+        }
+        if let Some(rest) = chunk.rest_slot {
+            let array = i.make_array_from_raw(args.add(seed), argc - seed);
+            std::ptr::drop_in_place(slots_ptr.add(rest as usize));
+            slots_ptr.add(rest as usize).write(PackedValue::pack(array));
+        } else {
+            for k in seed..argc {
+                std::ptr::drop_in_place(args.add(k));
+            }
         }
         if let Some((slot, value)) = arguments {
             if slot < seed {

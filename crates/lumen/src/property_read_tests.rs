@@ -90,9 +90,11 @@ fn record_getter_specialization_returns_fresh_live_records() {
                 .unwrap_or_else(|_| panic!("source binding"));
             let before = property_read::TEST_RECORD_GETTERS.with(Cell::get);
             engine.interp.gc_tick = GC_CALL_POLL_MASK;
+            // A property IC site is PROP_IC_WAYS adjacent cells; a fill rotates older ways.
+            let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
             let value = engine
                 .interp
-                .get_prop_ic(&source, "state", &Cell::new(IcState::EMPTY))
+                .get_prop_ic(&source, "state", &cache[0])
                 .unwrap_or_else(|_| panic!("maintenance getter"));
             assert!(matches!(
                 engine.interp.get_member(&value, "index"),

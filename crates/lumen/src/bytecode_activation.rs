@@ -23,6 +23,8 @@ pub(super) struct ActivationPlan {
     bindings: Vec<(Rc<str>, Binding)>,
     layout: Option<Rc<BindingLayout>>,
     parameters: Vec<(usize, u16)>,
+    /// A captured rest parameter: (binding index, first argument index).
+    rest: Option<(usize, u16)>,
     functions: Vec<(usize, u16)>,
     lexicals: Vec<Rc<str>>,
     this_slot: Option<usize>,
@@ -35,6 +37,7 @@ impl ActivationPlan {
             bindings: Vec::with_capacity(chunk.cap_inits.len() + 2),
             layout: None,
             parameters: Vec::new(),
+            rest: None,
             functions: Vec::new(),
             lexicals: Vec::new(),
             this_slot: None,
@@ -71,6 +74,16 @@ impl ActivationPlan {
                         true,
                     );
                     plan.parameters.push((index, *parameter));
+                }
+                CapInit::Rest(first, name) => {
+                    let index = slot(
+                        &mut plan.bindings,
+                        &mut slots,
+                        name.clone(),
+                        Binding::data(Value::Undefined, true, true),
+                        true,
+                    );
+                    plan.rest = Some((index, *first));
                 }
                 CapInit::Var(name) => {
                     slot(
@@ -142,6 +155,12 @@ impl ActivationPlan {
         let mut vars = VarMap::from_fixed_bindings(self.bindings.clone(), self.layout.as_ref());
         for &(slot, parameter) in &self.parameters {
             vars.initialize_fixed_value(slot, arguments.read(usize::from(parameter)));
+        }
+        if let Some((slot, first)) = self.rest {
+            vars.initialize_fixed_value(
+                slot,
+                interp.make_array(arguments.rest_values(usize::from(first))),
+            );
         }
         if let Some(slot) = self.this_slot {
             vars.initialize_fixed_value(slot, this_value.clone());

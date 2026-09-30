@@ -1777,6 +1777,10 @@ pub enum Op {
     PushIterator(u32, u32, u32, u32),
     /// Leave a protected try/iteration region normally: drop the innermost handler.
     PopHandler,
+    /// `arguments[key]` in a body whose arguments object is never materialized (see
+    /// [`Chunk::lazy_arguments`]): the slot holds a plain Array of the actual arguments. An
+    /// in-range integer index reads it; any other key materializes the exact arguments object.
+    ArgElem(u16),
 }
 
 /// An active `try` region on the VM's handler stack.
@@ -1818,6 +1822,9 @@ enum PendingCompletion {
 pub(crate) enum CapInit {
     /// A captured parameter: seed from argument `k`.
     Param(u16, Rc<str>),
+    /// A captured rest parameter: an Array of the arguments from index `k` on
+    /// (FunctionDeclarationInstantiation → IteratorBindingInitialization → CreateArrayFromList).
+    Rest(u16, Rc<str>),
     /// A captured function-scoped `var`: undefined, unless already bound (a same-named param).
     Var(Rc<str>),
     /// A hoisted function declaration: a closure over the activation itself (self-recursion).
@@ -1836,6 +1843,17 @@ pub struct Chunk {
     /// The existing activation, including mapped arguments and parameter-expression scopes,
     /// is authoritative. Lean/moved call entries must never bypass this prologue.
     pub(crate) prepared_entry: bool,
+    /// An ordinary function whose own body reads `new.target` without an activation: its
+    /// NewTarget is the interpreter's current value (see [`Compiler::lean_new_target`]).
+    pub(crate) lean_new_target: bool,
+    /// The local slot of an uncaptured trailing rest parameter. Every fresh-frame entry fills
+    /// it with an Array of the arguments from `n_params` on instead of dropping them.
+    pub(crate) rest_slot: Option<u16>,
+    /// The body only reads `arguments.length` and `arguments[key]`: the arguments object can
+    /// never be observed, written or aliased, so `arguments_slot` holds a plain Array of the
+    /// actual arguments instead (`length` is then identical) and element reads use
+    /// [`Op::ArgElem`]. See [`lazy_arguments_rewrite`].
+    pub(crate) lazy_arguments: bool,
     // (fields below; Debug is manual — `consts` holds engine Values)
     ops: Vec<Op>,
     /// Derived after all bytecode transformations. Emission queries this for each captured
@@ -2269,6 +2287,7 @@ impl Chunk {
         for init in &self.cap_inits {
             let name = match init {
                 CapInit::Param(_, name)
+                | CapInit::Rest(_, name)
                 | CapInit::Var(name)
                 | CapInit::Fn(_, name)
                 | CapInit::Lexical(name, _) => name,
@@ -2652,6 +2671,20 @@ impl Chunk {
                             name.clone(),
                             crate::interpreter::Binding {
                                 value: args.read(*k as usize),
+                                mutable: true,
+                                strict_immutable: false,
+                                initialized: true,
+                                import_ref: None,
+                                imported: false,
+                                deletable: false,
+                            },
+                        );
+                    }
+                    CapInit::Rest(first, name) => {
+                        b.vars.insert(
+                            name.clone(),
+                            crate::interpreter::Binding {
+                                value: i.make_array(args.rest_values(*first as usize)),
                                 mutable: true,
                                 strict_immutable: false,
                                 initialized: true,
@@ -5777,15 +5810,11 @@ fn compile_inner(
     // retain it for every resumption, including as the lexical parent of async arrows. A compiled
     // derived constructor likewise runs under its required Function Environment Record. Other
     // lean ordinary frames still omit the activation, so keep their conservative exclusion.
-    if scan & SCAN_NEW_TARGET != 0
+    let lean_new_target = scan & SCAN_NEW_TARGET != 0
         && !func.is_arrow
         && !is_coroutine
         && !derived_constructor
-        && !prepared_entry
-    {
-        log_bail("fn", "new.target");
-        return None;
-    }
+        && !prepared_entry;
     let uses_arguments = !script_body && scan & SCAN_ARGUMENTS != 0;
     // ECMA-262 §10.2.11: strict functions never map arguments indices to parameter
     // bindings. Simple parameters can therefore use the ordinary compiled entry;
@@ -5808,12 +5837,20 @@ fn compile_inner(
             .params
             .iter()
             .any(|param| matches!(&param.pattern, Pattern::Ident(name) if name == "arguments"));
+    // A mapped object is observable only through its index properties. If the body reads
+    // nothing but `arguments.length` (proven on the final operation stream by
+    // `lazy_arguments_rewrite`, with no element read), neither parameter writes nor argument
+    // writes can be observed, so the parameters keep ordinary slots and no object is created.
+    // An unproven body fails this compilation and takes the prepared (exactly mapped) entry.
+    let arguments_length_only = has_mapped_parameter_aliases && !is_coroutine && !prepared_entry;
+    let has_mapped_parameter_aliases = has_mapped_parameter_aliases && !arguments_length_only;
     if uses_arguments
         && !func.is_arrow
         && !is_coroutine
         && !prepared_entry
         && !func.params.is_empty()
         && !strict_simple_arguments
+        && !arguments_length_only
     {
         log_bail("fn", "arguments with arrow/async/parameters");
         return None;
@@ -5855,6 +5892,9 @@ fn compile_inner(
         }
     }
     let mut c = Compiler {
+        lean_new_target,
+        rest_slot: None,
+        arguments_length_only,
         // A module already has its own `this` binding, initialized to undefined. Reuse that
         // environment for nested arrows instead of synthesizing a function activation.
         // A derived constructor already runs under its mandatory Function Environment Record;
@@ -5949,7 +5989,6 @@ fn compile_inner(
         // tree-walker before their resumable context is created. For them, flatten BoundNames into
         // slots and seed those slots from the live bindings; this admits rest/destructuring/default
         // parameter lists without replaying any binding or initializer operation.
-        let mut defaulted: Vec<(u16, &Expr)> = Vec::new();
         if prepared_entry {
             c.push_compile_scope();
             for name in crate::interpreter::param_bound_names(&func.params) {
@@ -5975,53 +6014,134 @@ fn compile_inner(
             }
             c.n_params = bound_names.len();
         } else {
+            // ECMA-262 FunctionDeclarationInstantiation → IteratorBindingInitialization of the
+            // formals, strictly left to right. Every frame entry seeds argument k into slot k, so
+            // the first pass allocates exactly one slot per positional parameter (a hidden
+            // argument slot for a destructuring pattern) and then the rest parameter's slot;
+            // names bound inside patterns are allocated afterwards. Parameter expressions
+            // (defaults, pattern defaults, computed keys) are admitted only when they cannot
+            // observe this or a later parameter's binding and create no closure (see
+            // `default_expr_safe`), which makes the specification's separate parameter scope
+            // unobservable.
+            enum ParamInit<'a> {
+                Default(u16, &'a Expr),
+                Pattern(u16, &'a Pattern, Option<&'a Expr>),
+            }
+            let bound: Vec<Vec<String>> = func
+                .params
+                .iter()
+                .map(|param| {
+                    let mut names = Vec::new();
+                    crate::interpreter::pattern_idents(&param.pattern, &mut names);
+                    names
+                })
+                .collect();
+            let banned_from = |k: usize| -> std::collections::HashSet<&str> {
+                bound[k..].iter().flatten().map(String::as_str).collect()
+            };
+            let mut inits: Vec<ParamInit> = Vec::new();
             for (k, p) in func.params.iter().enumerate() {
                 if p.rest {
-                    log_bail("params", "rest parameter");
-                    return None;
-                }
-                let Pattern::Ident(name) = &p.pattern else {
-                    log_bail("params", "destructuring parameter");
-                    return None;
-                };
-                if let Some(d) = &p.default {
-                    // Lowerable defaults: an uncaptured identifier parameter whose default expression
-                    // can't observe this-or-later parameters (see `default_expr_safe`).
+                    // A trailing BindingRestElement binds CreateArrayFromList(the remaining
+                    // arguments). An identifier target needs no iteration protocol: the frame
+                    // entry builds the Array (see `rest_slot`).
+                    let Pattern::Ident(name) = &p.pattern else {
+                        log_bail("params", "destructuring rest parameter");
+                        return None;
+                    };
+                    debug_assert_eq!(k + 1, func.params.len(), "rest is the final parameter");
+                    let slot = c.fresh_slot(name);
                     if captured.contains(name) {
-                        log_bail("params", "captured defaulted parameter");
-                        return None;
+                        c.cap_inits
+                            .push(CapInit::Rest(k as u16, Rc::from(name.as_str())));
+                        c.env_bind(name, false);
+                    } else {
+                        c.scope_bind(name, slot, false);
+                        c.rest_slot = Some(slot);
                     }
-                    let banned: std::collections::HashSet<&str> = func.params[k..]
-                        .iter()
-                        .filter_map(|q| match &q.pattern {
-                            Pattern::Ident(n) => Some(n.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if !default_expr_safe(d, &banned) {
-                        log_bail("params", "unsafe default expression");
-                        return None;
-                    }
-                    defaulted.push((k as u16, d));
+                    break;
                 }
-                let slot = c.fresh_slot(name);
-                if captured.contains(name) {
-                    c.cap_inits
-                        .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
-                    c.env_bind(name, false);
-                } else {
-                    c.scope_bind(name, slot, false);
+                match &p.pattern {
+                    Pattern::Ident(name) => {
+                        if let Some(d) = &p.default {
+                            if captured.contains(name) {
+                                log_bail("params", "captured defaulted parameter");
+                                return None;
+                            }
+                            if !default_expr_safe(d, &banned_from(k)) {
+                                log_bail("params", "unsafe default expression");
+                                return None;
+                            }
+                        }
+                        let slot = c.fresh_slot(name);
+                        if captured.contains(name) {
+                            c.cap_inits
+                                .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
+                            c.env_bind(name, false);
+                        } else {
+                            c.scope_bind(name, slot, false);
+                        }
+                        if let Some(d) = &p.default {
+                            inits.push(ParamInit::Default(slot, d));
+                        }
+                    }
+                    pattern @ (Pattern::Object(_) | Pattern::Array(_)) => {
+                        let banned = banned_from(k);
+                        if p.default
+                            .as_ref()
+                            .is_some_and(|d| !default_expr_safe(d, &banned))
+                            || !pattern_exprs_safe(pattern, &banned)
+                            || bound[k].iter().any(|name| name == "arguments")
+                        {
+                            log_bail("params", "destructuring parameter with unsafe expressions");
+                            return None;
+                        }
+                        let slot = c.fresh_slot(&format!("\u{0}param{k}"));
+                        inits.push(ParamInit::Pattern(slot, pattern, p.default.as_ref()));
+                    }
+                    Pattern::Member(_) => {
+                        log_bail("params", "member parameter target");
+                        return None;
+                    }
                 }
             }
-            c.n_params = func.params.len();
-            for (slot, d) in defaulted {
-                c.emit(Op::LoadLocal(slot));
-                c.emit(Op::Undef);
-                c.emit(Op::StrictEq);
-                let jf = c.emit(Op::JumpIfFalse(0));
-                c.expr(d).ok()?;
-                c.emit(Op::StoreLocal(slot));
-                c.patch(jf);
+            // Names bound by destructuring parameters, after every argument-seeded slot.
+            for (k, p) in func.params.iter().enumerate() {
+                if p.rest {
+                    break;
+                }
+                if matches!(p.pattern, Pattern::Ident(_)) {
+                    continue;
+                }
+                for name in &bound[k] {
+                    if captured.contains(name) {
+                        c.cap_inits.push(CapInit::Var(Rc::from(name.as_str())));
+                        c.env_bind(name, false);
+                    } else {
+                        let slot = c.fresh_slot(name);
+                        c.scope_bind(name, slot, false);
+                    }
+                }
+            }
+            c.n_params = func.params.iter().filter(|param| !param.rest).count();
+            for init in inits {
+                let (slot, default) = match init {
+                    ParamInit::Default(slot, d) => (slot, Some(d)),
+                    ParamInit::Pattern(slot, _, d) => (slot, d),
+                };
+                if let Some(d) = default {
+                    c.emit(Op::LoadLocal(slot));
+                    c.emit(Op::Undef);
+                    c.emit(Op::StrictEq);
+                    let jf = c.emit(Op::JumpIfFalse(0));
+                    c.expr(d).ok()?;
+                    c.emit(Op::StoreLocal(slot));
+                    c.patch(jf);
+                }
+                if let ParamInit::Pattern(slot, pattern, _) = init {
+                    c.emit(Op::LoadLocal(slot));
+                    c.destructure_store(pattern, DeclKind::Var).ok()?;
+                }
             }
         }
         if uses_arguments && !func.is_arrow && !prepared_entry {
@@ -6275,6 +6395,16 @@ fn finish_chunk(
     });
     // The final operation stream includes inlining, fragments and prepared/coroutine entries.
     // Cache only facts about that immutable stream, never runtime environments or IC state.
+    // See `Chunk::lazy_arguments`: proven and applied on the final operation stream.
+    let lazy_arguments = c
+        .arguments_slot
+        .is_some_and(|slot| lazy_arguments_rewrite(&mut c.ops, slot, &c.names));
+    if c.arguments_length_only
+        && !(lazy_arguments && !c.ops.iter().any(|op| matches!(op, Op::ArgElem(_))))
+    {
+        log_bail("fn", "mapped arguments observed beyond length");
+        return None;
+    }
     let jit_needs_activation_state = c.ops.iter().any(jit_bridge_op);
     let has_tail_calls = c
         .ops
@@ -6282,6 +6412,9 @@ fn finish_chunk(
         .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray));
     Some(Rc::new(Chunk {
         prepared_entry,
+        lean_new_target: c.lean_new_target,
+        rest_slot: c.rest_slot,
+        lazy_arguments,
         ops: c.ops,
         jit_needs_activation_state,
         has_tail_calls,
@@ -6808,6 +6941,17 @@ fn integer_switch_cases(cases: &[SwitchCase]) -> Option<Vec<(i32, usize)>> {
 
 #[derive(Default)]
 struct Compiler {
+    /// ECMA-262 GetNewTarget in an ordinary function compiled without a Function Environment
+    /// Record. Every call path installs the callee's [[NewTarget]] as the interpreter's current
+    /// value and restores the caller's around nested calls, so the body reads it directly. An
+    /// arrow that observes `new.target` would need that record as its lexical environment, so
+    /// such an arrow makes the enclosing function ineligible (see `expr`).
+    lean_new_target: bool,
+    /// See [`Chunk::rest_slot`].
+    rest_slot: Option<u16>,
+    /// A sloppy function with simple parameters compiled without its mapped arguments object:
+    /// valid only if the body reads nothing but `arguments.length` (see `finish_chunk`).
+    arguments_length_only: bool,
     /// Borrow the already-instantiated AST environment and return exact source completions.
     fragment_entry: bool,
     fragment_async_generator: bool,
@@ -7073,6 +7217,134 @@ pub enum CallArgsMode {
 /// where slots would read a seeded `undefined`), and no nested function/class (whose capture
 /// analysis of a *parameter expression* scope the slot model doesn't carry). Whitelist
 /// recursion: unknown constructs answer false (the function stays on the tree-walker).
+/// Whether `op` names local `slot` through any slot operand. Conservative: every operand that
+/// may be a local slot index counts (a false positive only forgoes an optimization). Argument
+/// and element counts of calls/array literals and the separate reference-slot namespace are not
+/// local slots.
+fn op_mentions_slot(op: &Op, slot: u16) -> bool {
+    match *op {
+        Op::LoadLocal(a)
+        | Op::StoreLocal(a)
+        | Op::UpdateLocal(a, _)
+        | Op::Tdz(a)
+        | Op::StoreConstLocal(a, _)
+        | Op::GetPropLocal(a, ..)
+        | Op::SetPropLocalDrop(a, ..)
+        | Op::GetElemLocal(a)
+        | Op::SetElemLocal(a)
+        | Op::SetElemLocalDrop(a)
+        | Op::ToPropKeyLocal(a)
+        | Op::IterCloseL(a)
+        | Op::IterAbortL(a)
+        | Op::DestructureArr(a)
+        | Op::ObjectRest(a)
+        | Op::CallSpread(a)
+        | Op::CallSpreadThis(a)
+        | Op::ClassStart(_, a)
+        | Op::ClassKey(_, a)
+        | Op::ClassDecorator(_, a)
+        | Op::ArgElem(a) => a == slot,
+        Op::IterStepL(a, b)
+        | Op::IterCloseIfNotDoneL(a, b)
+        | Op::IterAbortIfNotDoneL(a, b)
+        | Op::AsyncIterResumeL(a, b)
+        | Op::AsyncIterCloseL(a, b, _) => a == slot || b == slot,
+        Op::ForInStepL(a, b, c)
+        | Op::DestructureStepL(a, b, c)
+        | Op::DestructureRestL(a, b, c)
+        | Op::TryArrayBinding(a, b, c)
+        | Op::ArrayBindingStep(a, b, c) => a == slot || b == slot || c == slot,
+        Op::AsyncIterStepL(a, b, c, d) => a == slot || b == slot || c == slot || d == slot,
+        Op::ResetSlots(start, count) => (start..start.saturating_add(count)).contains(&slot),
+        _ => false,
+    }
+}
+
+/// See [`Chunk::lazy_arguments`]. The arguments object of a body is unobservable when its slot
+/// is read only as `arguments.length` and `arguments[key]`: it is never stored, passed, called,
+/// captured, written or deleted, so no code other than those two reads can reach it. Rewrite
+/// the element reads to [`Op::ArgElem`] and report success; otherwise leave `ops` unchanged.
+fn lazy_arguments_rewrite(ops: &mut [Op], slot: u16, names: &[Rc<str>]) -> bool {
+    let only_reads = ops.iter().all(|op| match *op {
+        Op::GetPropLocal(a, name, _) if a == slot => &*names[name as usize] == "length",
+        Op::GetElemLocal(a) if a == slot => true,
+        _ => !op_mentions_slot(op, slot),
+    });
+    if !only_reads {
+        return false;
+    }
+    for op in ops.iter_mut() {
+        if matches!(*op, Op::GetElemLocal(a) if a == slot) {
+            *op = Op::ArgElem(slot);
+        }
+    }
+    true
+}
+
+/// The `arguments[key]` read of a lazily represented arguments object (see
+/// [`Chunk::lazy_arguments`]). `list` is the plain Array of actual arguments: an in-range integer
+/// index is exactly the corresponding own element of the arguments object. Any other key
+/// materializes the arguments object this body would have created (unmapped, or sloppy without
+/// parameters and thus without a ParameterMap) and performs the ordinary [[Get]] on it.
+pub(crate) fn lazy_arguments_element(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    list: &Value,
+    key: &Value,
+    materialized: impl FnOnce(&Value),
+) -> Result<Value, Abrupt> {
+    let still_lazy = matches!(list, Value::Obj(object)
+        if matches!(object.borrow().exotic, crate::value::Exotic::Array));
+    if !still_lazy {
+        // Already materialized by an earlier fallback: an ordinary arguments object.
+        return get_computed_element(i, chunk, pc, list, key);
+    }
+    if let (Value::Obj(list), Value::Num(index)) = (list, key) {
+        if let Some(value) = i.fast_get_elem(list, *index) {
+            return Ok(value);
+        }
+    }
+    // The [[Get]] may reach an inherited accessor that receives (and could keep or mutate) the
+    // arguments object, so it replaces the list for every later read in this activation.
+    let values = crate::builtins::dense_array_snapshot(i, list).unwrap_or_default();
+    let scope = i.global_env.clone();
+    let arguments = Value::Obj(i.make_compiled_arguments_object(&values, &scope));
+    materialized(&arguments);
+    get_computed_element(i, chunk, pc, &arguments, key)
+}
+
+/// [`default_expr_safe`] for every expression inside a binding pattern: nested defaults and
+/// computed keys.
+fn pattern_exprs_safe(pattern: &Pattern, banned: &std::collections::HashSet<&str>) -> bool {
+    match pattern {
+        Pattern::Ident(_) => true,
+        Pattern::Member(_) => false,
+        Pattern::Object(object) => object.props.iter().all(|prop| {
+            let key_safe = match &prop.key {
+                PropKey::Computed(key) => default_expr_safe(key, banned),
+                PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_) => true,
+            };
+            key_safe
+                && prop
+                    .default
+                    .as_ref()
+                    .is_none_or(|default| default_expr_safe(default, banned))
+                && pattern_exprs_safe(&prop.value, banned)
+        }),
+        Pattern::Array(elements) => elements.iter().all(|element| match element {
+            ArrayPatElem::Hole => true,
+            ArrayPatElem::Elem { pattern, default } => {
+                default
+                    .as_ref()
+                    .is_none_or(|default| default_expr_safe(default, banned))
+                    && pattern_exprs_safe(pattern, banned)
+            }
+            ArrayPatElem::Rest(pattern) => pattern_exprs_safe(pattern, banned),
+        }),
+    }
+}
+
 fn default_expr_safe(e: &Expr, banned: &std::collections::HashSet<&str>) -> bool {
     match e {
         Expr::Num(_)
@@ -8610,7 +8882,7 @@ impl Compiler {
 
     fn instantiate_block_function(&mut self, function: &Rc<Function>) -> CResult {
         let name = function.name.as_ref().ok_or(Bail)?;
-        self.emit_closure(function, None);
+        self.emit_closure(function, None)?;
         if self.current_lexical_env_has(name) {
             let name = self.name_idx(name);
             self.emit(Op::InitLex(name));
@@ -9956,11 +10228,21 @@ impl Compiler {
         locals
     }
 
-    fn retain_eval_expr(&mut self, expr: &Expr) {
-        self.retain_named_eval_expr(expr, None);
+    fn retain_eval_expr(&mut self, expr: &Expr) -> CResult {
+        self.retain_named_eval_expr(expr, None)
     }
 
-    fn retain_named_eval_expr(&mut self, expr: &Expr, name: Option<&str>) {
+    fn retain_named_eval_expr(&mut self, expr: &Expr, name: Option<&str>) -> CResult {
+        // The projected evaluator answers GetNewTarget by searching the Environment Record chain.
+        // A lean frame has no record of its own, so that search could find an enclosing
+        // function's [[NewTarget]] (ECMA-262 §9.4.5). Such a frame needs the general activation.
+        if self.lean_new_target && crate::ast::expr_scan_flags(expr) & SCAN_NEW_TARGET != 0 {
+            log_bail(
+                "expr",
+                "retained expression observing an activation-less new.target",
+            );
+            return Err(Bail);
+        }
         // The projected evaluator resolves `this` through an Environment Record. Keeping one in
         // an ordinary bridged frame also covers super-property helpers. A derived constructor
         // already has the live, initially-uninitialized record that SuperCall must bind; a new
@@ -9976,6 +10258,7 @@ impl Compiler {
             name: name.map(str::to_string),
         });
         self.emit(Op::EvalExpr(plan));
+        Ok(())
     }
 
     fn prepare_identifier_reference(&mut self, name: &str) -> Result<PreparedAssignmentRef, Bail> {
@@ -11334,7 +11617,14 @@ impl Compiler {
 
     /// Emit a closure over the current environment; `name` applies NamedEvaluation to an
     /// anonymous function expression (`var f = function(){}` → `f.name === "f"`).
-    fn emit_closure(&mut self, f: &Rc<Function>, name: Option<&str>) {
+    fn emit_closure(&mut self, f: &Rc<Function>, name: Option<&str>) -> CResult {
+        // ECMA-262 §9.4.5 GetNewTarget: an arrow reads the enclosing function's [[NewTarget]]
+        // when it runs, possibly after that activation returned. A lean frame keeps new.target
+        // only in the interpreter register, so such an arrow needs the general activation.
+        if self.lean_new_target && f.is_arrow && f.scan_flags() & SCAN_NEW_TARGET != 0 {
+            log_bail("fn", "arrow observing an activation-less new.target");
+            return Err(Bail);
+        }
         let fidx = self.funcs.len() as u32;
         self.funcs.push(f.clone());
         let name_idx = match name {
@@ -11342,21 +11632,20 @@ impl Compiler {
             _ => u32::MAX,
         };
         self.emit(Op::MakeClosure(fidx, name_idx));
+        Ok(())
     }
 
     /// Compile a value expression in a naming position (declaration/assignment to `name`).
     fn named_expr(&mut self, e: &Expr, name: &str) -> CResult {
         if let Expr::Func(f) = e {
-            self.emit_closure(f, Some(name));
-            return Ok(());
+            return self.emit_closure(f, Some(name));
         }
         if let Expr::Class(class) = e {
             if class.name.is_none() {
                 if crate::eval::expr_has_own_suspension(e) {
                     return self.staged_class(class, Some(name));
                 }
-                self.retain_named_eval_expr(e, Some(name));
-                return Ok(());
+                return self.retain_named_eval_expr(e, Some(name));
             }
         }
         self.expr(e)
@@ -11553,10 +11842,7 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> CResult {
         match e {
-            Expr::Func(f) => {
-                self.emit_closure(f, None);
-                Ok(())
-            }
+            Expr::Func(f) => self.emit_closure(f, None),
             Expr::Class(class) if crate::eval::expr_has_own_suspension(e) => {
                 self.staged_class(class, None)
             }
@@ -11864,8 +12150,7 @@ impl Compiler {
                     // UpdateExpression retains one Environment Reference across GetValue,
                     // ToNumeric (which may run user code), and PutValue. Re-resolving a name
                     // through a mutable with object after ToNumeric would be observable.
-                    self.retain_eval_expr(e);
-                    return Ok(());
+                    return self.retain_eval_expr(e);
                 }
                 let kind = match (*op, *prefix) {
                     ("++", true) => UpdKind::PreInc,
@@ -12182,8 +12467,7 @@ impl Compiler {
                     log_bail("expr", &format!("{:.60}", format!("{other:?}")));
                     return Err(Bail);
                 }
-                self.retain_eval_expr(other);
-                Ok(())
+                self.retain_eval_expr(other)
             }
         }
     }
@@ -12775,11 +13059,12 @@ fn run_inner(
     let seed = chunk.n_params.min(args.len());
     slots.extend(args[..seed].iter().cloned().map(PackedValue::pack));
     slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
+    if let Some(rest) = chunk.rest_slot {
+        let rest_values = args.get(chunk.n_params..).unwrap_or(&[]).to_vec();
+        slots.write_value(rest as usize, i.make_array(rest_values));
+    }
     if let Some(s) = chunk.arguments_slot {
-        slots.write_value(
-            s as usize,
-            Value::Obj(i.make_compiled_arguments_object(args, &env)),
-        );
+        slots.write_value(s as usize, chunk.arguments_slot_value(i, args, &env));
     }
     let mut pc = 0usize;
     let mut handlers: Vec<Handler> = Vec::new();
@@ -14272,6 +14557,18 @@ fn run_vm_inner<S: StoredValue>(
                 let value = get_computed_element(i, chunk, op_pc, &obj, &key)?;
                 stack.push(value);
             }
+            Op::ArgElem(s) => {
+                let key = pop!();
+                let list = slots.read_value(s as usize);
+                let mut replacement = None;
+                let value = lazy_arguments_element(i, chunk, op_pc, &list, &key, |object| {
+                    replacement = Some(object.clone())
+                });
+                if let Some(object) = replacement {
+                    slots.write_value(s as usize, object);
+                }
+                stack.push(value?);
+            }
             Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => {
                 let keep = matches!(op, Op::SetElemLocal(_));
                 let v = pop!();
@@ -14898,7 +15195,11 @@ fn run_vm_inner<S: StoredValue>(
                 }
             }
             Op::ImportMeta => stack.push(i.import_meta_vm(env)),
-            Op::NewTarget => stack.push(i.new_target_vm(env)),
+            Op::NewTarget => stack.push(if chunk.lean_new_target {
+                i.new_target.clone()
+            } else {
+                i.new_target_vm(env)
+            }),
             Op::DynamicImport(phase, has_options) => {
                 let options = has_options.then(|| pop!());
                 let specifier = pop!();
@@ -16211,7 +16512,7 @@ impl VmCoro {
         if let Some(slot) = chunk.arguments_slot {
             slots.write_value(
                 slot as usize,
-                Value::Obj(i.make_compiled_arguments_object(arguments, &env)),
+                chunk.arguments_slot_value(i, arguments, &env),
             );
         }
         let class_states = (0..chunk.class_plans.len()).map(|_| None).collect();
@@ -17603,6 +17904,21 @@ impl Chunk {
     pub(crate) fn jit_arguments_slot(&self) -> Option<u16> {
         self.arguments_slot
     }
+
+    /// The initial value of `arguments_slot`: the arguments object, or for a
+    /// [`Chunk::lazy_arguments`] body the plain Array of actual arguments standing in for it.
+    pub(crate) fn arguments_slot_value(
+        &self,
+        i: &mut Interp,
+        args: &[Value],
+        scope: &Env,
+    ) -> Value {
+        if self.lazy_arguments {
+            i.make_array(args.to_vec())
+        } else {
+            Value::Obj(i.make_compiled_arguments_object(args, scope))
+        }
+    }
     /// Recognize the Prototype.js-style forwarding constructor
     /// `this.<initializer>.apply(this, arguments);`.
     ///
@@ -17888,7 +18204,13 @@ impl Chunk {
     }
     /// [`CallIc::direct`] gates for this chunk (see its docs).
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
-        if self.resumable || !direct_shared_context_enabled() || self.jit_needs_activation_state() {
+        // The machine-code sequence seeds positional parameters only; a rest parameter's Array
+        // is built by the Rust frame entries.
+        if self.resumable
+            || !direct_shared_context_enabled()
+            || self.jit_needs_activation_state()
+            || self.rest_slot.is_some()
+        {
             return 0;
         }
         #[allow(unused_mut)] // Only the ARM64 shared-call backend adds frame flags.
@@ -18186,7 +18508,7 @@ impl Chunk {
             Op::AsyncIterStepL(..) => (0, 1),
             Op::AsyncIterResumeL(..) => (1, 2),
             Op::AsyncIterCloseL(..) => (0, 0),
-            Op::GetElemLocal(_) => (1, 1),
+            Op::GetElemLocal(_) | Op::ArgElem(_) => (1, 1),
             Op::SetElemLocal(_) => (2, 1),
             Op::SetElemLocalDrop(_) => (2, 0),
             Op::ToPropKey => (2, 2),
@@ -21494,6 +21816,18 @@ unsafe fn jit_exec_inner(
             let value = get_computed_element(i, chunk, pc as usize, &obj, &key)?;
             push!(value);
         }
+        Op::ArgElem(s) => {
+            let key = pop!();
+            let list = slots.read_value(s as usize);
+            let mut replacement = None;
+            let value = lazy_arguments_element(i, chunk, pc as usize, &list, &key, |object| {
+                replacement = Some(object.clone())
+            });
+            if let Some(object) = replacement {
+                slots.write_value(s as usize, object);
+            }
+            push!(value?);
+        }
         Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElemLocal(_));
             let v = pop!();
@@ -21945,8 +22279,13 @@ unsafe fn jit_exec_inner(
         }
         Op::NewTarget => {
             // GetNewTarget follows the nearest this-binding Environment Record;
-            // an arrow must observe its defining environment, not the caller.
-            push!(i.new_target_vm(env));
+            // an arrow must observe its defining environment, not the caller. A lean ordinary
+            // body has no such record: its [[NewTarget]] is the interpreter's current value.
+            push!(if chunk.lean_new_target {
+                i.new_target.clone()
+            } else {
+                i.new_target_vm(env)
+            });
         }
         Op::ToStr => {
             #[cfg(test)]

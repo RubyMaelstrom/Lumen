@@ -1583,6 +1583,42 @@ fn microtask_checkpoint_drains_long_await_chains_to_completion() {
     }
 }
 
+/// Host interruption (HTML may abort a running script at any time) must reach code that
+/// never takes a loop back-edge: exponential recursion makes billions of calls and no loops.
+#[test]
+fn interruption_stops_loop_free_recursion() {
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let interrupt = engine.interrupt_handle();
+        interrupt.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+        ));
+        let started = std::time::Instant::now();
+        let outcome = engine
+            .eval_interruptible(
+                "function f(n) { return n === 0 ? 0 : f(n - 1) + f(n - 1); } f(60);",
+                false,
+            )
+            .expect("script parses");
+        assert!(
+            matches!(
+                outcome,
+                ExecutionOutcome::Interrupted {
+                    reason: InterruptReason::DeadlineExceeded
+                }
+            ),
+            "{tier:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{tier:?}: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
 /// Without a job budget, an endlessly self-re-enqueueing microtask loop must still be
 /// stoppable by the host, and the interrupted checkpoint discards the remaining jobs.
 #[test]
@@ -1611,6 +1647,218 @@ fn interruption_stops_an_endless_microtask_chain() {
     match engine.eval("String(turns > 1)", false).expect("parse") {
         Completion::Value(value) => assert_eq!(value, "true"),
         Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}
+
+/// Arguments objects that only `arguments.length`/`arguments[key]` can reach are represented by
+/// the plain list of actual arguments (ECMA-262 CreateUnmappedArgumentsObject /
+/// CreateMappedArgumentsObject remain observably exact): out-of-range and non-index keys,
+/// `callee`, @@iterator (the %Array.prototype.values% intrinsic), inherited accessors that
+/// receive and mutate the object, escaping/written objects, and sloppy parameter aliasing.
+#[test]
+fn lazily_represented_arguments_objects_are_observably_exact() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = r#"
+            var out = [];
+            var values = Array.prototype.values;
+            function len() { return arguments.length; }
+            function sum() { var s = 0; for (var i = 0; i < arguments.length; i++) s += arguments[i]; return s; }
+            function babelRest(a) { "use strict"; for (var _len = arguments.length, rest = new Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) rest[_key - 1] = arguments[_key]; return a + ":" + rest.join(","); }
+            function outOfRange() { return arguments[5] === undefined && arguments[-1] === undefined; }
+            function negZero() { return arguments[-0]; }
+            function strKey() { return arguments["1"]; }
+            function sloppyCallee() { return arguments["callee"] === sloppyCallee; }
+            function strictCallee() { "use strict"; try { arguments["callee"]; return "no"; } catch (e) { return e instanceof TypeError; } }
+            function iter() { return arguments[Symbol.iterator] === values; }
+            function toStr() { return typeof arguments["toString"]; }
+            function escapes() { return arguments; }
+            function writes() { arguments[0] = 9; return arguments[0]; }
+            function applies() { return sum.apply(null, arguments); }
+            function spreads() { return [...arguments].length; }
+            function sl(a, b) { if (arguments.length < 2) b = 10; a = a + 1; return a + b + arguments.length; }
+            function slElem(a) { return arguments[0]; }
+            function slElemAlias(a) { a = 5; return arguments[0]; }
+            function slWriteArg(a) { arguments[0] = 7; return a; }
+            Object.defineProperty(Object.prototype, "grab", { get() { this[0] = 42; return this.length; }, configurable: true });
+            function strictGrab() { "use strict"; var x = arguments["grab"]; return arguments[0] + ":" + arguments.length + ":" + x; }
+            function sloppyNoParamsGrab() { var x = arguments["grab"]; return arguments[0]; }
+            var acc = 0;
+            for (var i = 0; i < 300; i++) {
+              acc += len(1, 2, 3) + sum(1, 2, 3) + negZero(7) + strKey(1, 2) + sl(1) + sl(1, 2)
+                + slElem(3) + slElemAlias(1) + slWriteArg(1);
+            }
+            out.push(acc, babelRest(1, 2, 3), babelRest(1), outOfRange(1, 2), sloppyCallee(),
+              strictCallee(), iter(1), toStr());
+            out.push(Object.prototype.toString.call(escapes(1)), writes(1), applies(1, 2, 3), spreads(1, 2));
+            out.push(strictGrab(1), sloppyNoParamsGrab(1), strictGrab(), sl(1, 2, 3));
+            delete Object.prototype.grab;
+            out.join("|")
+        "#;
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(
+                value,
+                "15600|1:2,3|1:|true|true|true|true|function|[object Arguments]|9|6|2|42:1:1|42|42:0:0|7",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
+/// ECMA-262 FunctionDeclarationInstantiation → IteratorBindingInitialization for destructuring
+/// formals: left-to-right binding with defaults, nested/rest patterns, getter order, iterable
+/// sources, captured names, holes, a shadowing body `var`, `length`, and TypeError on nullish.
+#[test]
+fn compiled_destructuring_parameters_bind_in_order() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = r#"
+            var out = [];
+            function a({ x, y }) { return x + y; }
+            function b({ x = 1, y } = {}) { return x + ":" + y; }
+            function c([p, q], r) { return p + q + r; }
+            function d({ m: { n } }) { return n; }
+            function e({ x }) { return () => x; }
+            function f({ a, ...rest }) { return a + Object.keys(rest).join(""); }
+            function g([h, ...t]) { return h + t.length; }
+            function k([, second]) { return second; }
+            function shadow({ x }) { var x; return x; }
+            function order({ a, b }) { return a + b; }
+            function len1(a, { b }, c = 1, d) {}
+            var log = "";
+            var getters = { get a() { log += "a"; return 1; }, get b() { log += "b"; return 2; } };
+            var acc = 0;
+            for (var i = 0; i < 300; i++) {
+              acc += a({ x: 1, y: 2 }) + c([1, 2], 3) + d({ m: { n: 4 } }) + e({ x: 5 })()
+                + g([1, 2, 3]) + k([0, 7]) + shadow({ x: 1 });
+            }
+            out.push(acc, b(), b({ x: 3, y: 4 }), b({ y: 5 }), f({ a: "A", p: 1, q: 2 }),
+              c("xy", "z"), c(new Set([1, 2]), 0));
+            log = ""; out.push(order(getters), log, len1.length);
+            try { a(); out.push("no error"); } catch (err) { out.push(err instanceof TypeError); }
+            try { c(null); out.push("no error"); } catch (err) { out.push(err instanceof TypeError); }
+            out.join("|")
+        "#;
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(
+                value, "8700|1:undefined|3:4|1:5|Apq|xyz|3|3|ab|2|true|true",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
+/// ECMA-262 FunctionDeclarationInstantiation binds a trailing rest parameter to a fresh Array of
+/// the remaining arguments, for every entry path: direct and cached calls, apply/spread, native
+/// callbacks, constructors, methods and arrows, captured or not, with and without defaults.
+#[test]
+fn compiled_rest_parameters_collect_surplus_arguments() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = r#"
+            var out = [];
+            function f(...xs) { return xs; }
+            function g(a, ...xs) { return a + ":" + xs.join(","); }
+            function h(...xs) { return () => xs.length; }
+            function k(a = 5, ...r) { return a + r.length; }
+            function mutate(...xs) { xs.push(9); return xs.length; }
+            var arrow = (...a) => a.length;
+            var obj = { m(first, ...rest) { return first + rest.length; } };
+            class C { constructor(...parts) { this.n = parts.length; } }
+            var acc = 0;
+            for (var i = 0; i < 300; i++) {
+              acc += f().length + f(1, 2).length + mutate(1) + mutate() + arrow(1, 2, 3)
+                + obj.m(1, 2, 3) + new C(1, 2).n + h(1, 2, 3)();
+            }
+            out.push(acc);
+            out.push(Array.isArray(f()), f(1, 2) instanceof Array, f(1, 2) !== f(1, 2),
+              JSON.stringify(f(1, "a", null)));
+            out.push(g(1), g(1, 2, 3), k(), k(1, 2, 3), f.length, g.length, k.length);
+            out.push(f.apply(null, [4, 5, 6]).length, f(...[7, 8]).length,
+              [1, 2, 3].map(function (...a) { return a.length; }).join(""));
+            out.push(h()(), Object.getPrototypeOf(f(1)) === Array.prototype);
+            out.join("|")
+        "#;
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(
+                value, "4800|true|true|true|[1,\"a\",null]|1:|1:2,3|5|3|0|1|0|3|2|333|0|true",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
+/// ECMA-262 GetNewTarget in ordinary functions compiled without an activation: the value is the
+/// current call's [[NewTarget]] in every tier, around nested calls and constructs, through
+/// Reflect.construct/bound constructors/classes, while an arrow that observes it still sees its
+/// enclosing function's value.
+#[test]
+fn new_target_in_lean_ordinary_functions_follows_each_call() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = r#"
+            var log = [];
+            function F() { return new.target === undefined ? "call" : (new.target === F ? "F" : new.target.name); }
+            function G() {}
+            function Inner() { return new.target === undefined ? "u" : "c"; }
+            function Outer() {
+                var before = new.target === Outer;
+                var inner = Inner();
+                var constructed = new Inner();
+                var after = new.target === Outer;
+                this.r = [before, inner, constructed instanceof Inner, after].join(",");
+            }
+            function WithArrow() { var a = () => new.target; this.r = a() === WithArrow; }
+            class Base { constructor() { this.t = new.target.name; } }
+            class Derived extends Base {}
+            for (var i = 0; i < 300; i++) {
+                log.length = 0;
+                log.push(F());
+                log.push(new F() instanceof F);
+                log.push(Reflect.construct(F, [], G) instanceof G);
+                log.push(F.call(null), F.apply(null, []));
+                var B = F.bind(null);
+                log.push(new B() instanceof F);
+                log.push(new Outer().r);
+                log.push(new WithArrow().r);
+                log.push(new Base().t, new Derived().t);
+            }
+            log.join("|")
+        "#;
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(
+                value, "call|true|true|call|call|true|true,u,true,true|true|Base|Derived",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
     }
 }
 

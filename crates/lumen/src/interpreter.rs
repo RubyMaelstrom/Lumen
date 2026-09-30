@@ -2699,6 +2699,10 @@ pub struct Interp {
     /// later chunk whose allocator reused that address.
     pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
     pub(crate) stub_cache_names: std::cell::RefCell<Vec<Option<Rc<str>>>>,
+    /// The shape chain of an arguments object's named properties (`length`, @@iterator,
+    /// `callee`) appended to empty or packed element storage, derived once by ordinary insertion
+    /// into this interpreter's heap. Holds only keys and shape ids: no JS value or Realm.
+    pub(crate) arguments_shapes: Option<([Rc<str>; 3], [u32; 3])>,
     pub(crate) computed_reads: crate::bytecode::ComputedReadCache,
     /// Quiescent source-scoped loop plans; executing plans have only weak cache entries.
     pub(crate) fragment_cache: crate::bytecode::fragment_cache::Cache,
@@ -3158,6 +3162,7 @@ interp_memory_inventory! {
     vm_pool => "measured",
     native_arg_pool => "measured",
     stub_cache => "measured",
+    arguments_shapes => "measured",
     stub_cache_names => "measured",
     computed_reads => "measured",
     fragment_cache => "measured",
@@ -3303,7 +3308,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 149);
+    assert_eq!(names.len(), 150);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4168,6 +4173,7 @@ impl Interp {
             vm_pool: Vec::new(),
             native_arg_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
+            arguments_shapes: None,
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
             computed_reads: Default::default(),
             fragment_cache: Default::default(),
@@ -10821,6 +10827,9 @@ impl Interp {
                 ));
             }
         };
+        // A call is a safepoint on the shared amortized interruption cadence, so loop-free
+        // recursion in the interpreter and bytecode tiers stays abortable (HTML §8.1.4.5).
+        self.interrupt_poll()?;
         // Proxy with an `apply` trap (or forward to the target).
         if !self.proxies.is_empty() {
             if let Some((target, handler)) = self.proxies.get(&(Rc::as_ptr(&obj) as usize)).cloned()
@@ -11250,8 +11259,11 @@ impl Interp {
         scope: &Env,
         fn_obj: &Gc,
     ) -> Gc {
+        // ECMA-262 CreateUnmappedArgumentsObject / CreateMappedArgumentsObject (local snapshot
+        // e28783d5, spec.html:15059): "length", the indices, then @@iterator as the intrinsic
+        // %Array.prototype.values% (not the current property value) and "callee".
         let ao = Object::new(Some(self.object_proto.clone()));
-        {
+        let packed = {
             let mut object = ao.borrow_mut();
             object.exotic = crate::value::Exotic::Arguments;
             // Create{Unmapped,Mapped}ArgumentsObject defines a contiguous run of
@@ -11262,45 +11274,67 @@ impl Interp {
             for value in args {
                 object.props.push_dense(Property::plain(value.clone()));
             }
-        }
-        ao.borrow_mut().props.insert(
-            "length",
-            Property::data(Value::Num(args.len() as f64), true, false, true),
-        );
-        if let Some(sym) = self.iterator_sym.clone() {
-            let values = self
-                .array_proto
-                .borrow()
-                .props
-                .get("values")
-                .map(|p| p.value());
-            if let Some(v) = values {
-                ao.borrow_mut()
-                    .props
-                    .insert(Self::sym_key(&sym), Property::builtin(v));
-            }
-        }
+            args.is_empty() || object.props.has_packed_elements()
+        };
         let simple_params = func
             .params
             .iter()
             .all(|p| !p.rest && p.default.is_none() && matches!(p.pattern, Pattern::Ident(_)));
-        if func.is_strict || !simple_params {
-            if let Some(tte) = self.extra_protos.get("%ThrowTypeError%").cloned() {
-                ao.borrow_mut().props.insert(
-                    "callee",
-                    crate::value::Property::accessor_prop(
-                        Some(Value::Obj(tte.clone())),
-                        Some(Value::Obj(tte)),
+        let unmapped = func.is_strict || !simple_params;
+        let length = Property::data(Value::Num(args.len() as f64), true, false, true);
+        let iterator = self
+            .extra_protos
+            .get("%Array.prototype.values%")
+            .cloned()
+            .map(|values| Property::builtin(Value::Obj(values)));
+        let callee = if unmapped {
+            self.extra_protos
+                .get("%ThrowTypeError%")
+                .cloned()
+                .map(|thrower| {
+                    Property::accessor_prop(
+                        Some(Value::Obj(thrower.clone())),
+                        Some(Value::Obj(thrower)),
                         false,
                         false,
-                    ),
-                );
-            }
+                    )
+                })
         } else {
-            ao.borrow_mut().props.insert(
-                "callee",
-                crate::value::Property::data(Value::Obj(fn_obj.clone()), true, false, true),
-            );
+            Some(Property::data(
+                Value::Obj(fn_obj.clone()),
+                true,
+                false,
+                true,
+            ))
+        };
+        let shapes = if packed && iterator.is_some() && callee.is_some() {
+            self.arguments_named_shapes()
+        } else {
+            None
+        };
+        {
+            let mut object = ao.borrow_mut();
+            match (shapes, iterator, callee) {
+                (Some((keys, shapes)), Some(iterator), Some(callee)) => {
+                    // Known-absent keys landing on the recorded child shapes: no existence scan,
+                    // index parse, or transition lookup.
+                    let [length_key, iterator_key, callee_key] = keys;
+                    object.props.append_new(length_key, length, shapes[0]);
+                    object.props.append_new(iterator_key, iterator, shapes[1]);
+                    object.props.append_new(callee_key, callee, shapes[2]);
+                }
+                (_, iterator, callee) => {
+                    object.props.insert("length", length);
+                    if let (Some(sym), Some(iterator)) = (self.iterator_sym.clone(), iterator) {
+                        object.props.insert(Self::sym_key(&sym), iterator);
+                    }
+                    if let Some(callee) = callee {
+                        object.props.insert("callee", callee);
+                    }
+                }
+            }
+        }
+        if !unmapped {
             // Mapped: indices alias the parameter bindings (which live in `scope`). With
             // duplicate parameter names only the LAST occurrence is mapped — earlier indices
             // stay plain data properties holding the original argument values.
@@ -11330,6 +11364,36 @@ impl Interp {
             }
         }
         ao
+    }
+
+    /// The recorded shape chain for an arguments object's `length`, @@iterator and `callee`
+    /// properties (see `Interp::arguments_shapes`), derived on first use.
+    fn arguments_named_shapes(&mut self) -> Option<([Rc<str>; 3], [u32; 3])> {
+        if self.arguments_shapes.is_none() {
+            let iterator = self.iterator_sym.clone()?;
+            let keys: [Rc<str>; 3] = [
+                Rc::from("length"),
+                Rc::from(Self::sym_key(&iterator)),
+                Rc::from("callee"),
+            ];
+            let mut probe = Props::new();
+            let mut shapes = [0u32; 3];
+            for (index, key) in keys.iter().enumerate() {
+                probe.insert(
+                    key.clone(),
+                    Property::data(Value::Undefined, true, false, true),
+                );
+                shapes[index] = probe.shape();
+            }
+            if !shapes
+                .iter()
+                .all(|&shape| crate::value::is_cacheable_shape(shape))
+            {
+                return None;
+            }
+            self.arguments_shapes = Some((keys, shapes));
+        }
+        self.arguments_shapes.clone()
     }
 
     /// Materialize the dedicated unmapped arguments slot of a compiled function. The active

@@ -1293,6 +1293,14 @@ fn scan_stmt(s: &Stmt, flags: &mut u8) {
     }
 }
 
+/// Activation observations (`arguments`, `new.target`, `this`) of one expression evaluated in
+/// the enclosing function scope, seen through arrows exactly as [`Function::scan_flags`] does.
+pub(crate) fn expr_scan_flags(e: &Expr) -> u8 {
+    let mut flags = 0;
+    scan_expr(e, &mut flags);
+    flags
+}
+
 fn scan_expr(e: &Expr, flags: &mut u8) {
     match e {
         Expr::Ident(n) => {

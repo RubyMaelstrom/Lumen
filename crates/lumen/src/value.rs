@@ -4131,6 +4131,12 @@ impl Props {
         }
     }
 
+    /// Whether indexed elements live in the keyless packed representation (no index keys among
+    /// the named entries).
+    pub(crate) fn has_packed_elements(&self) -> bool {
+        self.elems.packed_is_some()
+    }
+
     /// This map's shape id — the inline cache's structural validation token (see the `shape` field).
     #[inline]
     pub(crate) fn shape(&self) -> u32 {
