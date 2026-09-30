@@ -159,7 +159,7 @@
         "sha256": "0b7ca81f383264b11da75efaeef77e4186a9a447339421cfe1a22e9bb1dec384"
       }
     ],
-    "patch_sha256": "d3e02397cb6957d858697363e6b3aecc837a547599062790c0c01ba6c485460d"
+    "patch_sha256": "f72fffcf4f5cb3b05e7d7c22dfe76ad3d0bcd1b4104232a5ffa84f6732b0c43e"
   },
   "baseline_source": {
     "head": "6a1e21a508a1bcbe67bf187993f0614e0dd34cbe",
@@ -1646,5 +1646,12 @@
     "memory.json": "24adef8eaf6d4f6c14e15ac24c55e6f159066756bd409e83243889123320b49a",
     "memory-analysis.json": "163e61fc935cf232b529978cae7673d17bb3ce189060b3825e507bb2dfaceadc"
   },
-  "artifact_promotion": "No installed or accepted binary replaced."
+  "artifact_promotion": "No installed or accepted binary replaced.",
+  "provenance_correction": {
+    "recorded": "2026-09-30",
+    "field": "candidate_source.patch_sha256",
+    "previous_copied_value": "d3e02397cb6957d858697363e6b3aecc837a547599062790c0c01ba6c485460d",
+    "corrected_value": "f72fffcf4f5cb3b05e7d7c22dfe76ad3d0bcd1b4104232a5ffa84f6732b0c43e",
+    "reason": "An inherited inventory field retained the earlier prototype patch hash. Corrected from the preserved exact source.patch, already recorded correctly under evidence_hashes. Raw snapshots, source file hashes, binary identities and observations are unchanged."
+  }
 }
