@@ -1,0 +1,48 @@
+Large caller inline growth — blocked by semantics, parked 30 September 2026
+==========================================================================
+
+The existing whole-body source-op budget leaves callers above 320 operations
+with no inline allowance. The solver's large lexer is one such target; its
+small character-advance helper cannot be spliced under that policy. The
+prototype grants a bounded minimum remaining budget of 64 source operations
+to callers up to 4096 ops, retaining existing context, size, environment,
+identity and nesting guards. Explicit diagnostic budgets retain their old
+meaning. This is an admission experiment, not a measured speedup.
+
+The native publication regression passes and demonstrates an inline guard
+in a caller above the old limit, with replacement, getter effects, throws
+and collection checked across interpreter, bytecode and template JIT.
+All 29 selected inlining tests and strict all-target engine Clippy pass.
+The release engine builds in 3m43s. These checks were insufficient: a later
+reflection check catches a semantic regression before performance screening.
+
+With LUMEN_TIER_THRESHOLD=0, a getter inside the small sloppy helper observes
+h.f.caller===large as true on the pinned baseline and false on the prototype.
+The tier log confirms publication of the larger caller. Narrowing growth
+to strict functions alone is insufficient: the strict equivalent capturing
+Error.stack prints get value, f, large on baseline, but only get value, large
+on the prototype. The existing AST splice omits the logical callee frame.
+Frame/lifetime recovery needs an explicit contract before admission expands;
+merely retaining current allowlist guards does not preserve observations.
+This report does not claim that smaller pre-existing inlining is unaffected.
+
+Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+/big/web-standards/repositories/tc39/ecma262/spec.html:13860
+(PrepareForOrdinaryCall), :19922 (EvaluateCall), :12900 (Liveness), and :13010
+(AddToKeptObjects). Ordinary calls create the callee execution context;
+optimizations must preserve observable identity/context and permitted weak
+liveness. The legacy caller and Error.stack observations are Lumen extensions,
+and the project's tier agreement still applies. Official clauses:
+https://tc39.es/ecma262/#sec-prepareforordinarycall
+https://tc39.es/ecma262/#sec-evaluatecall
+https://tc39.es/ecma262/#sec-liveness
+https://tc39.es/ecma262/#sec-addtokeptobjects
+This is the consulted local snapshot, not verified current upstream text.
+
+The prototype code and test are fully restored. No throughput or memory
+comparison was run after the semantic failure. Raw source, exact patch,
+release binaries, check logs and baseline/prototype reflection outputs remain
+in benchmark-results/engine-cycle12-20260930. Baseline production matches
+b1c975f; HEAD before this report is 62f4593. target/release/lumen still holds
+the parked prototype. Installed artifacts are unchanged. Only this report
+is committed; a larger budget must not be reintroduced without frame proofs.
