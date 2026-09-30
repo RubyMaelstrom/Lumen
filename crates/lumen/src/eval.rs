@@ -2864,38 +2864,41 @@ impl Interp {
             if matches!(handler, Value::Null) {
                 return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
             }
-            let trap = self.get_member(&handler, "has")?;
-            if matches!(trap, Value::Undefined | Value::Null) {
+            let Some(trap) =
+                self.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_HAS, "has")?
+            else {
                 return self.js_has_property(&target, key);
-            }
-            if !trap.is_callable() {
-                return Err(self.throw("TypeError", "proxy 'has' trap is not callable"));
-            }
+            };
             // The trap receives the original property key — a symbol stays a symbol.
             let key_val = self
                 .sym_from_key(key)
                 .unwrap_or_else(|| Value::from_string(key.to_string()));
-            let res = self.call(trap, handler, &[target.clone(), key_val])?;
+            let res = self.proxy_call_trap(
+                crate::interpreter::PROXY_TRAP_HAS,
+                &trap,
+                handler,
+                [target.clone(), key_val],
+            )?;
             let present = self.to_boolean(&res);
             if !present {
+                // ECMA-262 §10.5.7 step 9: target.[[GetOwnProperty]](P), then IsExtensible(target)
+                // only for a configurable target property; both may run a Proxy target's traps.
                 if let Value::Obj(t) = &target {
-                    let ordinary = t.borrow().props.get(key).cloned();
-                    let p = match ordinary {
-                        some @ Some(_) => some,
-                        None => self.host_indexed_own_value(t, key)?.map(|value| {
-                            crate::value::Property::data(
-                                value,
-                                false,
-                                crate::value::canonical_index(key).is_some(),
-                                true,
-                            )
-                        }),
-                    };
-                    if let Some(p) = p {
-                        if !p.configurable() || !t.borrow().extensible {
+                    let target_desc = crate::builtins::object_get_own_property(self, t, key)
+                        .map_err(Abrupt::Throw)?;
+                    if let Some(target_desc) = target_desc {
+                        if !target_desc.configurable() {
                             return Err(self.throw(
                                 "TypeError",
                                 "proxy 'has' trap hid a non-configurable property",
+                            ));
+                        }
+                        if !crate::builtins::js_is_extensible(self, &target)
+                            .map_err(Abrupt::Throw)?
+                        {
+                            return Err(self.throw(
+                                "TypeError",
+                                "proxy 'has' trap hid a property of a non-extensible target",
                             ));
                         }
                     }
@@ -6811,69 +6814,43 @@ impl Interp {
         if matches!(handler, Value::Null) {
             return Err(self.throw("TypeError", "cannot delete on a revoked proxy"));
         }
-        let trap = self.get_member(&handler, "deleteProperty")?;
-        if matches!(trap, Value::Undefined | Value::Null) {
-            // Forward to the target's [[Delete]] (recursing if the target is itself a proxy).
-            if let Value::Obj(t) = &target {
-                let tptr = Rc::as_ptr(t) as usize;
-                if let Some((t2, h2)) = self.proxies.get(&tptr).cloned() {
-                    return self.proxy_delete(t2, h2, key);
-                }
-                if self.host_indexed_array_key(t, key) {
-                    let supported = crate::value::canonical_index(key)
-                        .is_some_and(|index| index < self.host_indexed_len(t).unwrap_or(0));
-                    return Ok(!supported);
-                }
-                if self.host_named_visible(t, key)? {
-                    return Ok(false);
-                }
-                let configurable = t
-                    .borrow()
-                    .props
-                    .get(key)
-                    .map(|p| p.configurable())
-                    .unwrap_or(true);
-                if configurable {
-                    t.borrow_mut().props.remove(key);
-                    return Ok(true);
-                }
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-        if !trap.is_callable() {
-            return Err(self.throw("TypeError", "proxy 'deleteProperty' trap is not callable"));
-        }
+        let trap = self.proxy_get_trap(
+            &handler,
+            crate::interpreter::PROXY_TRAP_DELETE,
+            "deleteProperty",
+        )?;
+        let Some(trap) = trap else {
+            // ECMA-262 §10.5.10 step 7: target.[[Delete]](P), with the target's own internal
+            // method (a Proxy, TypedArray, mapped arguments or host object has its own).
+            let deleted = self.delete_prop_with(target, key, false)?;
+            return Ok(matches!(deleted, Value::Bool(true)));
+        };
         let kv = self
             .sym_from_key(key)
             .unwrap_or_else(|| Value::from_string(key.to_string()));
-        let res = self.call(trap, handler, &[target.clone(), kv])?;
+        let res = self.proxy_call_trap(
+            crate::interpreter::PROXY_TRAP_DELETE,
+            &trap,
+            handler,
+            [target.clone(), kv],
+        )?;
         if !self.to_boolean(&res) {
             return Ok(false);
         }
-        // Invariant: a non-configurable property, or any property of a non-extensible target,
-        // can't be reported as deleted.
+        // ECMA-262 §10.5.10 steps 10-15: a non-configurable property, or any property of a
+        // non-extensible target, can't be reported as deleted. Both queries use the target's
+        // own internal methods.
         if let Value::Obj(t) = &target {
-            let ordinary = t.borrow().props.get(key).cloned();
-            let p = match ordinary {
-                some @ Some(_) => some,
-                None => self.host_indexed_own_value(t, key)?.map(|value| {
-                    crate::value::Property::data(
-                        value,
-                        false,
-                        crate::value::canonical_index(key).is_some(),
-                        true,
-                    )
-                }),
-            };
-            if let Some(p) = p {
-                if !p.configurable() {
+            let target_desc =
+                crate::builtins::object_get_own_property(self, t, key).map_err(Abrupt::Throw)?;
+            if let Some(target_desc) = target_desc {
+                if !target_desc.configurable() {
                     return Err(self.throw(
                         "TypeError",
                         "proxy 'deleteProperty' removed a non-configurable property",
                     ));
                 }
-                if !t.borrow().extensible {
+                if !crate::builtins::js_is_extensible(self, &target).map_err(Abrupt::Throw)? {
                     return Err(self.throw(
                         "TypeError",
                         "proxy 'deleteProperty' removed a non-extensible target's property",

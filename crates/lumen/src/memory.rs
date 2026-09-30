@@ -825,10 +825,14 @@ impl Visitor {
         if let Some(chunk) = function.code2.get().and_then(Option::as_ref) {
             self.chunk(chunk);
         }
-        if let Some((function_map, prototype_map)) = function.fn_maps.get() {
-            self.props(function_map);
-            if let Some(prototype_map) = prototype_map {
+        if let Some(maps) = function.fn_maps.get() {
+            self.props(&maps.function);
+            if let Some(prototype_map) = &maps.prototype {
                 self.props(prototype_map);
+            }
+            if let Some((name, named)) = &*maps.named.borrow() {
+                bytes = bytes.saturating_add(name.len());
+                self.props(named);
             }
         }
         if let Some(layouts) = function.env_layouts.get() {
@@ -1900,6 +1904,12 @@ fn scan_realm(
         .add(interp.call_overflow.retained_bytes());
     if let Some(cache) = &interp.native_callback_cache {
         totals.engine_caches.add(cache.retained_bytes());
+        totals
+            .engine_caches
+            .make_lower_bound("opaque callback HashMap bucket and Weak allocation storage");
+    }
+    if let Some(caches) = &interp.proxy_trap_caches {
+        totals.engine_caches.add(caches.retained_bytes());
         totals
             .engine_caches
             .make_lower_bound("opaque callback HashMap bucket and Weak allocation storage");

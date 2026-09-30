@@ -893,6 +893,47 @@ pub(crate) struct PreparedCall {
     code: Option<Rc<crate::jit::JitCode>>,
 }
 
+pub(crate) const PROXY_TRAP_GET: usize = 0;
+pub(crate) const PROXY_TRAP_SET: usize = 1;
+pub(crate) const PROXY_TRAP_HAS: usize = 2;
+pub(crate) const PROXY_TRAP_DELETE: usize = 3;
+const PROXY_TRAP_KINDS: usize = 4;
+
+/// Caches for the hottest Proxy internal methods (ECMA-262 §10.5): each trap's GetMethod on the
+/// handler goes through a property inline cache of its own, and its Call through a callback
+/// cache of its own, so handlers shared by many proxies (framework reactivity) stay
+/// monomorphic. Neither caches a result: every operation still performs GetMethod and Call.
+pub(crate) struct ProxyTrapCaches {
+    lookups: [[std::cell::Cell<crate::bytecode::IcState>; crate::bytecode::PROP_IC_WAYS];
+        PROXY_TRAP_KINDS],
+    calls: [crate::callback::CallbackCache; PROXY_TRAP_KINDS],
+}
+
+impl ProxyTrapCaches {
+    fn new() -> Self {
+        Self {
+            lookups: std::array::from_fn(|_| {
+                [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
+                    crate::bytecode::PROP_IC_WAYS]
+            }),
+            calls: std::array::from_fn(|_| crate::callback::CallbackCache::new()),
+        }
+    }
+
+    pub(crate) fn prune_dead(&self) {
+        for cache in &self.calls {
+            cache.prune_dead();
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.calls
+            .iter()
+            .map(crate::callback::CallbackCache::retained_bytes)
+            .fold(std::mem::size_of::<Self>(), usize::saturating_add)
+    }
+}
+
 /// One entry of the legacy `fn.caller`/`fn.arguments` reflection stack (see `call_user`). The
 /// arguments object materializes lazily: a body that never names `arguments` skips building it,
 /// and `lazy` keeps what a later reflective read needs to conjure it on demand.
@@ -2817,6 +2858,7 @@ pub struct Interp {
     /// Lazily allocated reusable entry for already-resolved accessor/proxy/host callbacks.
     /// All JS identity and AST pins are Weak; this cache cannot keep a closure or realm alive.
     pub(crate) native_callback_cache: Option<Rc<crate::callback::CallbackCache>>,
+    pub(crate) proxy_trap_caches: Option<Rc<ProxyTrapCaches>>,
     /// Small ordered key layouts learned from successful ordinary construction, keyed and
     /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
@@ -3199,6 +3241,7 @@ interp_memory_inventory! {
     construct_ics => "measured",
     call_overflow => "measured",
     native_callback_cache => "measured",
+    proxy_trap_caches => "measured",
     construct_capacity_hints => "measured",
     iterator_sym => "measured",
     wk_syms => "measured",
@@ -3316,7 +3359,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 150);
+    assert_eq!(names.len(), 151);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4154,6 +4197,7 @@ impl Interp {
             construct_ics: Default::default(),
             call_overflow: Default::default(),
             native_callback_cache: None,
+            proxy_trap_caches: None,
             construct_capacity_hints: Default::default(),
             iterator_sym: None,
             wk_syms: Vec::new(),
@@ -6330,6 +6374,17 @@ impl Interp {
     }
 
     pub(crate) fn make_function(&self, func: Rc<Function>, env: Env) -> Value {
+        self.make_function_named(func, env, None)
+    }
+
+    /// [`Interp::make_function`] followed by NamedEvaluation's SetFunctionName(F, `name`) for an
+    /// anonymous function (ECMA-262 §10.2.9): the name is part of the cloned property template.
+    pub(crate) fn make_function_named(
+        &self,
+        func: Rc<Function>,
+        env: Env,
+        name: Option<&Rc<str>>,
+    ) -> Value {
         let is_arrow = func.is_arrow;
         let is_method = func.is_method;
         let is_generator = func.is_generator;
@@ -6355,7 +6410,7 @@ impl Interp {
         // hashing, and the name string are paid once; every closure instance clones the finished
         // maps (entry-vector copy, refcount bumps) and patches the two identity-dependent values
         // in place — value writes never touch the shape.
-        let (fn_map, proto_map) = func.fn_maps.get_or_init(|| {
+        let maps = func.fn_maps.get_or_init(|| {
             let arity = func
                 .params
                 .iter()
@@ -6391,8 +6446,37 @@ impl Interp {
             } else {
                 None
             };
-            (p, pp)
+            crate::ast::FunctionMaps {
+                function: p,
+                prototype: pp,
+                named: std::cell::RefCell::new(None),
+            }
         });
+        let proto_map = &maps.prototype;
+        // SetFunctionName applies only to anonymous, non-method functions (the compiler passes
+        // a name only for those); the template's `name` slot is entry 1 with the "" value.
+        let named = name.filter(|_| func.name.is_none() && !is_method);
+        let fn_map = match named {
+            None => maps.function.clone(),
+            Some(name) => {
+                let mut named = maps.named.borrow_mut();
+                match &*named {
+                    Some((cached, props)) if **cached == **name => props.clone(),
+                    _ => {
+                        let mut props = maps.function.clone();
+                        props
+                            .entry_at_mut(1)
+                            .expect("function name slot")
+                            .1
+                            .set_value(Value::from_string(name.to_string()));
+                        if named.is_none() {
+                            *named = Some((name.clone(), props.clone()));
+                        }
+                        props
+                    }
+                }
+            }
+        };
         // Instantiate{Ordinary,Generator,Async}FunctionExpression creates the immutable
         // self-name environment ONCE, outside the activation, when the closure is created.
         // Retain it in [[Environment]] so all execution tiers and recursive calls share the
@@ -6410,7 +6494,7 @@ impl Interp {
                 self_env.as_ref().cloned().unwrap_or(env),
                 Rc::as_ptr(&self.global) as usize,
             );
-            b.props = fn_map.clone();
+            b.props = fn_map;
         }
         if has_prototype {
             let proto_parent = match (is_generator, is_async) {
@@ -7892,22 +7976,17 @@ impl Interp {
                                 None,
                             );
                         }
-                        let trap = self.get_member(&handler, "get")?;
-                        if matches!(trap, Value::Undefined | Value::Null) {
+                        let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")?
+                        else {
                             // Forward to the target's [[Get]], preserving the original Receiver.
                             return self.get_member_recv(&target, key, receiver);
-                        }
-                        if !trap.is_callable() {
-                            return Err(self.throw("TypeError", "proxy 'get' trap is not callable"));
-                        }
-                        let res = self.call_callback(
-                            trap,
+                        };
+                        let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                        let res = self.proxy_call_trap(
+                            PROXY_TRAP_GET,
+                            &trap,
                             handler,
-                            &[
-                                target.clone(),
-                                self.sym_from_key(key).unwrap_or_else(|| Value::str(key)),
-                                receiver.clone(),
-                            ],
+                            [target.clone(), key_value, receiver],
                         )?;
                         self.proxy_get_invariant(&target, key, &res)?;
                         return Ok(res);
@@ -8030,21 +8109,15 @@ impl Interp {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
                 }
-                let trap = self.get_member(&handler, "get")?;
-                if matches!(trap, Value::Undefined | Value::Null) {
+                let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
                     return self.get_member_recv(&target, key, receiver.clone());
-                }
-                if !trap.is_callable() {
-                    return Err(self.throw("TypeError", "proxy 'get' trap is not callable"));
-                }
-                let res = self.call_callback(
-                    trap,
+                };
+                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                let res = self.proxy_call_trap(
+                    PROXY_TRAP_GET,
+                    &trap,
                     handler,
-                    &[
-                        target.clone(),
-                        self.sym_from_key(key).unwrap_or_else(|| Value::str(key)),
-                        receiver.clone(),
-                    ],
+                    [target.clone(), key_value, receiver.clone()],
                 )?;
                 self.proxy_get_invariant(&target, key, &res)?;
                 return Ok(res);
@@ -8169,7 +8242,10 @@ impl Interp {
                     }
                 }
                 return match getter {
-                    Some(getter) => self.call_callback(getter, receiver.clone(), &[]),
+                    Some(getter) => match self.try_binding_getter(&getter) {
+                        Some(value) => Ok(value),
+                        None => self.call_callback(getter, receiver.clone(), &[]),
+                    },
                     None => Ok(Value::Undefined),
                 };
             }
@@ -8521,23 +8597,16 @@ impl Interp {
                         None,
                     );
                 }
-                let trap = self.get_member(&handler, "set")?;
-                if matches!(trap, Value::Undefined | Value::Null) {
+                let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
                     // Forward to the target's [[Set]], preserving the original Receiver.
                     return self.set_member_recv(&target, key, value, receiver);
-                }
-                if !trap.is_callable() {
-                    return Err(self.throw("TypeError", "proxy 'set' trap is not callable"));
-                }
-                let ok = self.call_callback(
-                    trap,
+                };
+                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                let ok = self.proxy_call_trap(
+                    PROXY_TRAP_SET,
+                    &trap,
                     handler,
-                    &[
-                        target.clone(),
-                        self.sym_from_key(key).unwrap_or_else(|| Value::str(key)),
-                        value.clone(),
-                        receiver.clone(),
-                    ],
+                    [target.clone(), key_value, value.clone(), receiver],
                 )?;
                 // A successful `set` can't contradict a non-configurable property on the target.
                 let success = self.to_boolean(&ok);
@@ -8597,22 +8666,15 @@ impl Interp {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'set' on a revoked proxy"));
                 }
-                let trap = self.get_member(&handler, "set")?;
-                if matches!(trap, Value::Undefined | Value::Null) {
+                let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
                     return self.set_member_recv(&target, key, value, receiver);
-                }
-                if !trap.is_callable() {
-                    return Err(self.throw("TypeError", "proxy 'set' trap is not callable"));
-                }
-                let ok = self.call_callback(
-                    trap,
+                };
+                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                let ok = self.proxy_call_trap(
+                    PROXY_TRAP_SET,
+                    &trap,
                     handler,
-                    &[
-                        target.clone(),
-                        self.sym_from_key(key).unwrap_or_else(|| Value::str(key)),
-                        value.clone(),
-                        receiver.clone(),
-                    ],
+                    [target.clone(), key_value, value.clone(), receiver],
                 )?;
                 let success = self.to_boolean(&ok);
                 if success {
@@ -10547,6 +10609,9 @@ impl Interp {
         if let Some(cache) = &self.native_callback_cache {
             cache.prune_dead();
         }
+        if let Some(caches) = &self.proxy_trap_caches {
+            caches.prune_dead();
+        }
         self.construct_capacity_hints
             .retain(|_, (pin, _)| pin.strong_count() != 0);
         self.global_env_pins.retain(|pin| pin.strong_count() != 0);
@@ -10605,6 +10670,54 @@ impl Interp {
     /// [[Set]], [[Call]] still perform every descriptor/trap lookup before entering here. Only
     /// the immutable function identity/code proof is reusable; replacement/revocation, realm
     /// switching and parameter-instantiation fallbacks remain in the ordinary Call machinery.
+    fn proxy_trap_caches(&mut self) -> Rc<ProxyTrapCaches> {
+        self.proxy_trap_caches
+            .get_or_insert_with(|| Rc::new(ProxyTrapCaches::new()))
+            .clone()
+    }
+
+    /// GetMethod(handler, name) (ECMA-262 §7.3.10) for Proxy trap `kind`, through that trap's
+    /// inline cache: `None` for an undefined/null trap, TypeError for a non-callable one.
+    pub(crate) fn proxy_get_trap(
+        &mut self,
+        handler: &Value,
+        kind: usize,
+        name: &'static str,
+    ) -> Result<Option<Value>, Abrupt> {
+        let caches = self.proxy_trap_caches();
+        match self.get_prop_ic(handler, name, &caches.lookups[kind][0])? {
+            Value::Undefined | Value::Null => Ok(None),
+            trap if trap.is_callable() => Ok(Some(trap)),
+            _ => Err(self.throw("TypeError", format!("proxy '{name}' trap is not callable"))),
+        }
+    }
+
+    /// Call(trap, handler, args) for Proxy trap `kind`, through that trap's callback cache.
+    pub(crate) fn proxy_call_trap<const N: usize>(
+        &mut self,
+        kind: usize,
+        trap: &Value,
+        handler: Value,
+        args: [Value; N],
+    ) -> Result<Value, Abrupt> {
+        let caches = self.proxy_trap_caches();
+        caches.calls[kind].call(self, trap, handler, args)
+    }
+
+    /// Whether an ordinary target (set `ic_plain`, no exotic tag) proves a Proxy invariant check
+    /// for `key` vacuous: it has no own `key`, or only a configurable one (ECMA-262 §10.5.8 step
+    /// 9 and §10.5.9 step 10 constrain non-configurable properties only). No descriptor copy.
+    fn proxy_invariant_vacuous(target: &Value, key: &str) -> bool {
+        let Value::Obj(target) = target else {
+            return false;
+        };
+        let body = target.borrow();
+        body.ic_plain.get()
+            && matches!(body.exotic, Exotic::None | Exotic::Array)
+            && !Self::is_private_key(key)
+            && body.props.get(key).is_none_or(Property::configurable)
+    }
+
     pub(crate) fn call_callback(
         &mut self,
         callee: Value,
@@ -14455,26 +14568,20 @@ impl Interp {
     /// Proxy `[[Get]]` invariant: a non-configurable non-writable data property on the target must be
     /// reported with its actual value; a non-configurable accessor with no getter must report
     /// undefined. (`Abrupt` carries the thrown TypeError.)
+    /// ECMA-262 §10.5.8 steps 8-9: validate a `get` trap result against
+    /// target.[[GetOwnProperty]](P), which may itself run a Proxy target's traps.
     fn proxy_get_invariant(
         &mut self,
         target: &Value,
         key: &str,
         result: &Value,
     ) -> Result<(), Abrupt> {
+        if Self::proxy_invariant_vacuous(target, key) {
+            return Ok(());
+        }
         let prop = match target {
             Value::Obj(t) => {
-                let ordinary = t.borrow().props.get(key).cloned();
-                match ordinary {
-                    some @ Some(_) => some,
-                    None => self.host_indexed_own_value(t, key)?.map(|value| {
-                        Property::data(
-                            value,
-                            false,
-                            crate::value::canonical_index(key).is_some(),
-                            true,
-                        )
-                    }),
-                }
+                crate::builtins::object_get_own_property(self, t, key).map_err(Abrupt::Throw)?
             }
             _ => None,
         };
@@ -14505,15 +14612,14 @@ impl Interp {
         key: &str,
         value: &Value,
     ) -> Result<(), Abrupt> {
+        // ECMA-262 §10.5.9 steps 9-10: target.[[GetOwnProperty]](P), which may itself run a
+        // Proxy target's traps.
+        if Self::proxy_invariant_vacuous(target, key) {
+            return Ok(());
+        }
         let prop = match target {
             Value::Obj(t) => {
-                let ordinary = t.borrow().props.get(key).cloned();
-                match ordinary {
-                    some @ Some(_) => some,
-                    None => self
-                        .host_indexed_own_value(t, key)?
-                        .map(|indexed| Property::data(indexed, false, true, true)),
-                }
+                crate::builtins::object_get_own_property(self, t, key).map_err(Abrupt::Throw)?
             }
             _ => None,
         };

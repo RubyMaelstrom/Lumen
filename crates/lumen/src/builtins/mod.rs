@@ -325,6 +325,34 @@ pub(crate) fn intl_delegate(
     ab(i.call(f, inst, call_args))
 }
 
+/// ECMA-262 [[OwnPropertyKeys]]() for any object, as String/Symbol key values in the spec's
+/// order: a Proxy runs §10.5.11; a TypedArray lists its valid integer indices first
+/// (§10.4.5.7); every other object uses OrdinaryOwnPropertyKeys order (array-index keys
+/// ascending, then strings, then symbols, each in insertion order).
+pub(crate) fn object_own_property_keys(i: &mut Interp, o: &Gc) -> Result<Vec<Value>, Value> {
+    ab(i.defer_trigger(o, None))?;
+    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        return proxy_own_keys(i, &target, &handler);
+    }
+    let mut out: Vec<Value> = if let Some(info) = ta_info(i, o) {
+        (0..i.ta_len(&info).unwrap_or(0))
+            .map(|k| Value::from_string(k.to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for k in ordinary_own_keys_ordered(i, o)? {
+        if Interp::is_sym_key(&k) {
+            if let Some(s) = i.sym_from_key(&k) {
+                out.push(s);
+            }
+        } else {
+            out.push(Value::from_string(k));
+        }
+    }
+    Ok(out)
+}
+
 /// Proxy `[[OwnPropertyKeys]]`: the trap result (must be a list of strings/symbols) or the target's
 /// own keys.
 pub(crate) fn proxy_own_keys(
@@ -332,106 +360,85 @@ pub(crate) fn proxy_own_keys(
     target: &Value,
     handler: &Value,
 ) -> Result<Vec<Value>, Value> {
+    // ECMA-262 §10.5.11, steps 1-22 in order.
+    if matches!(handler, Value::Null) {
+        return Err(i.make_error("TypeError", "proxy is revoked"));
+    }
+    let Value::Obj(target_object) = target else {
+        return Ok(Vec::new());
+    };
     let trap = ab(i.get_member(handler, "ownKeys"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        // Forward to the target's [[OwnPropertyKeys]] (recursing for a proxy target).
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_own_keys(i, &t2, &h2);
-        }
-        return Ok(match target {
-            Value::Obj(t) => {
-                // OrdinaryOwnPropertyKeys order: array-index keys ascending, then other string keys in
-                // insertion order, then symbol keys (as their Symbol values) in insertion order.
-                ordinary_own_keys_ordered(i, t)?
-                    .into_iter()
-                    .map(|k| i.sym_from_key(&k).unwrap_or_else(|| Value::from_string(k)))
-                    .collect()
-            }
-            _ => Vec::new(),
-        });
+        return object_own_property_keys(i, target_object);
     }
     if !trap.is_callable() {
         return Err(i.make_error("TypeError", "proxy 'ownKeys' trap is not callable"));
     }
-    if trap.is_callable() {
-        let res = ab(i.call(trap, handler.clone(), std::slice::from_ref(target)))?;
-        if !matches!(res, Value::Obj(_)) {
-            return Err(i.make_error("TypeError", "ownKeys trap must return an array-like object"));
-        }
-        let keys = ab(i.create_list_from_arraylike(&res))?;
-        let mut key_strs: Vec<crate::value::PropertyKey> = Vec::with_capacity(keys.len());
-        for k in &keys {
-            if !matches!(k, Value::Str(_) | Value::Sym(_)) {
-                return Err(i.make_error(
-                    "TypeError",
-                    "ownKeys trap result must contain only strings and symbols",
-                ));
-            }
-            key_strs.push(ab(i.to_property_key(k))?);
-        }
-        // No duplicate keys.
-        let result_set: std::collections::HashSet<&str> =
-            key_strs.iter().map(|s| s.as_str()).collect();
-        if result_set.len() != key_strs.len() {
-            return Err(i.make_error("TypeError", "ownKeys trap result has duplicate keys"));
-        }
-        // Invariants relative to the target's own keys / extensibility.
-        if let Value::Obj(t) = target {
-            let extensible = t.borrow().extensible;
-            let target_keys: Vec<(String, bool)> = ordinary_own_keys_ordered(i, t)?
-                .into_iter()
-                .map(|k| {
-                    let conf = t
-                        .borrow()
-                        .props
-                        .get(&k)
-                        .map(|p| p.configurable())
-                        // Web IDL indexed properties are configurable.
-                        .unwrap_or(true);
-                    (k, conf)
-                })
-                .collect();
-            for (tk, conf) in &target_keys {
-                if !conf && !result_set.contains(tk.as_str()) {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "ownKeys trap omitted a non-configurable target key",
-                    ));
-                }
-            }
-            if !extensible {
-                for (tk, _) in &target_keys {
-                    if !result_set.contains(tk.as_str()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            "ownKeys trap omitted a key of a non-extensible target",
-                        ));
-                    }
-                }
-                if key_strs.len() != target_keys.len() {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "ownKeys trap added a key to a non-extensible target",
-                    ));
-                }
-            }
-        }
-        Ok(keys)
-    } else if let Value::Obj(t) = target {
-        Ok(t.borrow()
-            .props
-            .keys()
-            .into_iter()
-            .map(|k| Value::Str(k.into()))
-            .collect())
-    } else {
-        Ok(Vec::new())
+    let res = ab(i.call(trap, handler.clone(), std::slice::from_ref(target)))?;
+    if !matches!(res, Value::Obj(_)) {
+        return Err(i.make_error("TypeError", "ownKeys trap must return an array-like object"));
     }
+    let keys = ab(i.create_list_from_arraylike(&res))?;
+    let mut key_strs: Vec<crate::value::PropertyKey> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        if !matches!(k, Value::Str(_) | Value::Sym(_)) {
+            return Err(i.make_error(
+                "TypeError",
+                "ownKeys trap result must contain only strings and symbols",
+            ));
+        }
+        key_strs.push(ab(i.to_property_key(k))?);
+    }
+    let mut unchecked: std::collections::HashSet<&str> =
+        key_strs.iter().map(|s| s.as_str()).collect();
+    if unchecked.len() != key_strs.len() {
+        return Err(i.make_error("TypeError", "ownKeys trap result has duplicate keys"));
+    }
+    let extensible_target = js_is_extensible(i, target)?;
+    let target_keys = object_own_property_keys(i, target_object)?;
+    let mut configurable_keys = Vec::new();
+    let mut nonconfigurable_keys = Vec::new();
+    for key in target_keys {
+        let key = ab(i.to_property_key(&key))?;
+        match object_get_own_property(i, target_object, &key)? {
+            Some(desc) if !desc.configurable() => nonconfigurable_keys.push(key),
+            _ => configurable_keys.push(key),
+        }
+    }
+    if extensible_target && nonconfigurable_keys.is_empty() {
+        return Ok(keys);
+    }
+    for key in &nonconfigurable_keys {
+        if !unchecked.remove(key.as_str()) {
+            return Err(i.make_error(
+                "TypeError",
+                "ownKeys trap omitted a non-configurable target key",
+            ));
+        }
+    }
+    if extensible_target {
+        return Ok(keys);
+    }
+    for key in &configurable_keys {
+        if !unchecked.remove(key.as_str()) {
+            return Err(i.make_error(
+                "TypeError",
+                "ownKeys trap omitted a key of a non-extensible target",
+            ));
+        }
+    }
+    if !unchecked.is_empty() {
+        return Err(i.make_error(
+            "TypeError",
+            "ownKeys trap added a key to a non-extensible target",
+        ));
+    }
+    Ok(keys)
 }
 
 /// Proxy `[[GetPrototypeOf]]`: call the trap or forward to the target.
 /// `[[IsExtensible]]`, proxy-aware (recurses into a proxy target, enforcing the trap invariant).
-fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
+pub(crate) fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -751,38 +758,96 @@ pub(crate) fn has_own_property_trapped(
     Ok(o.borrow().props.contains(key))
 }
 
-pub(crate) fn proxy_gopd_value(
+/// ECMA-262 §6.2.6 / §10.1.5 [[GetOwnProperty]](P) for any object: the complete descriptor of
+/// its own property `key`, or None. Every exotic kind applies its own internal method: Proxy
+/// objects run §10.5.5 (trap and validation), typed arrays and namespaces their exotic rules,
+/// mapped arguments report the live parameter value, and Web IDL indexed objects their
+/// platform getter. Ordinary objects (set `ic_plain`, no exotic tag) read their own storage.
+pub(crate) fn object_get_own_property(
+    i: &mut Interp,
+    o: &Gc,
+    key: &str,
+) -> Result<Option<Property>, Value> {
+    {
+        let body = o.borrow();
+        if body.ic_plain.get()
+            && matches!(body.exotic, Exotic::None | Exotic::Array)
+            && !Interp::is_private_key(key)
+        {
+            return Ok(body.props.get(key).cloned());
+        }
+    }
+    ab(i.defer_trigger(o, Some(key)))?;
+    if Interp::is_private_key(key) {
+        return Ok(None); // a private-name slot is not a property
+    }
+    let ptr = Rc::as_ptr(o) as usize;
+    // A mapped arguments index reports the live parameter value (§10.4.4.1).
+    if let Some(value) = i.mapped_arg_value(ptr, key) {
+        let mut property = o.borrow().props.get(key).cloned();
+        if let Some(property) = &mut property {
+            property.set_value(value);
+        }
+        return Ok(property);
+    }
+    // A TypedArray canonical numeric index is an own data property reading from the buffer; a
+    // canonical-but-invalid index has no own property (§10.4.5.1). Non-canonical keys such as
+    // "1.0" or "+1" are ordinary.
+    if let Some(info) = ta_info(i, o) {
+        if i.canonical_numeric_index(key).is_some() {
+            return Ok(match i.ta_index_kind(&info, key) {
+                TaIndex::Element(index) => {
+                    let value = i.ta_read(&info, index);
+                    Some(Property::data(value, true, true, true))
+                }
+                _ => None,
+            });
+        }
+    }
+    if let Some(value) = ab(i.host_indexed_own_value(o, key))? {
+        return Ok(Some(Property::data(
+            value,
+            false,
+            crate::value::canonical_index(key).is_some(),
+            true,
+        )));
+    }
+    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        return proxy_get_own_property(i, &target, &handler, key);
+    }
+    if i.is_namespace(ptr) {
+        if let Some(result) = i.namespace_own_property(ptr, key) {
+            return Ok(Some(ab(result)?));
+        }
+    }
+    Ok(o.borrow().props.get(key).cloned())
+}
+
+/// [[GetOwnProperty]] of a Proxy's target: the target is always an object.
+fn target_own_property(
+    i: &mut Interp,
+    target: &Value,
+    key: &str,
+) -> Result<Option<Property>, Value> {
+    match target {
+        Value::Obj(target) => object_get_own_property(i, target, key),
+        _ => Ok(None),
+    }
+}
+
+/// ECMA-262 §10.5.5 Proxy [[GetOwnProperty]](P), steps 1-17 in order.
+fn proxy_get_own_property(
     i: &mut Interp,
     target: &Value,
     handler: &Value,
     key: &str,
-) -> Result<Value, Value> {
+) -> Result<Option<Property>, Value> {
     if matches!(handler, Value::Null) {
         return Err(i.make_error("TypeError", "proxy is revoked"));
     }
     let trap = ab(i.get_member(handler, "getOwnPropertyDescriptor"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_gopd_value(i, &t2, &h2, key);
-        }
-        if let Value::Obj(t) = target {
-            if let Some(value) = ab(i.host_indexed_own_value(t, key))? {
-                return Ok(descriptor_from_prop(
-                    i,
-                    Property::data(
-                        value,
-                        false,
-                        crate::value::canonical_index(key).is_some(),
-                        true,
-                    ),
-                ));
-            }
-            let prop = t.borrow().props.get(key).cloned();
-            return Ok(prop
-                .map(|p| descriptor_from_prop(i, p))
-                .unwrap_or(Value::Undefined));
-        }
-        return Ok(Value::Undefined);
+        return target_own_property(i, target, key);
     }
     if !trap.is_callable() {
         return Err(i.make_error(
@@ -793,162 +858,147 @@ pub(crate) fn proxy_gopd_value(
     let key_val = i
         .sym_from_key(key)
         .unwrap_or_else(|| Value::from_string(key.to_string()));
-    let res = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
-    // Proxy [[GetOwnProperty]] always obtains the target's descriptor after the trap. For a Web
-    // IDL indexed property that step invokes the target's platform getter.
-    let host_target_prop = if let Value::Obj(target_object) = target {
-        ab(i.host_indexed_own_value(target_object, key))?.map(|value| {
-            Property::data(
-                value,
-                false,
-                crate::value::canonical_index(key).is_some(),
-                true,
-            )
-        })
-    } else {
-        None
-    };
-    if matches!(res, Value::Undefined) {
-        // The trap may report a property absent only if the target permits it.
-        if let Value::Obj(t) = target {
-            let tprop = t
-                .borrow()
-                .props
-                .get(key)
-                .cloned()
-                .or_else(|| host_target_prop.clone());
-            if let Some(p) = tprop {
-                if !p.configurable() {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "gOPD trap reported undefined for a non-configurable property",
-                    ));
-                }
-                if !t.borrow().extensible {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "gOPD trap reported undefined for a non-extensible target's property",
-                    ));
-                }
-            }
-        }
-        return Ok(Value::Undefined);
-    }
-    if !matches!(res, Value::Obj(_)) {
+    let result = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
+    if !matches!(result, Value::Obj(_) | Value::Undefined) {
         return Err(i.make_error(
             "TypeError",
             "getOwnPropertyDescriptor trap must return an object or undefined",
         ));
     }
-    let pd = ab(build_partial(i, &res))?;
-    // A descriptor may be reported for a property the target lacks only on an extensible target.
-    if let Value::Obj(t) = target {
-        if !t.borrow().props.contains(key) && host_target_prop.is_none() && !t.borrow().extensible {
+    let target_desc = target_own_property(i, target, key)?;
+    if matches!(result, Value::Undefined) {
+        let Some(target_desc) = target_desc else {
+            return Ok(None);
+        };
+        if !target_desc.configurable() {
             return Err(i.make_error(
                 "TypeError",
-                "gOPD trap reported a property missing from a non-extensible target",
+                "gOPD trap reported undefined for a non-configurable property",
             ));
         }
+        if !js_is_extensible(i, target)? {
+            return Err(i.make_error(
+                "TypeError",
+                "gOPD trap reported undefined for a non-extensible target's property",
+            ));
+        }
+        return Ok(None);
     }
-    // A non-configurable target property pins the reported descriptor: configurability,
-    // enumerability and the data/accessor shape must all match (IsCompatiblePropertyDescriptor).
-    if let Value::Obj(t) = target {
-        if let Some(p) = t.borrow().props.get(key) {
-            if !p.configurable() {
-                if !matches!(pd.configurable, Some(false)) {
+    let extensible_target = js_is_extensible(i, target)?;
+    let result_desc = completed_partial(ab(build_partial(i, &result))?);
+    if !is_compatible_property_descriptor(extensible_target, &result_desc, target_desc.as_ref()) {
+        return Err(i.make_error(
+            "TypeError",
+            format!("proxy reported an incompatible descriptor for '{key}'"),
+        ));
+    }
+    if result_desc.configurable == Some(false) {
+        match &target_desc {
+            None => {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported a non-configurable descriptor the target lacks",
+                ))
+            }
+            Some(target_desc) if target_desc.configurable() => {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported a configurable target property as non-configurable",
+                ))
+            }
+            Some(target_desc) => {
+                if result_desc.writable == Some(false)
+                    && !target_desc.accessor()
+                    && target_desc.writable()
+                {
                     return Err(i.make_error(
                         "TypeError",
-                        format!("proxy can't report an existing non-configurable property '{key}' as configurable"),
+                        "gOPD trap reported non-writable for a writable target property",
                     ));
-                }
-                if let Some(e) = pd.enumerable {
-                    if e != p.enumerable() {
-                        return Err(i.make_error(
-                            "TypeError",
-                            format!("proxy can't report a different 'enumerable' for '{key}' when the target property is not configurable"),
-                        ));
-                    }
-                }
-                let reported_accessor = pd.get.is_some() || pd.set.is_some();
-                let reported_data = pd.value.is_some() || pd.writable.is_some();
-                if (reported_accessor && !p.accessor()) || (reported_data && p.accessor()) {
-                    return Err(i.make_error(
-                        "TypeError",
-                        format!("proxy can't report a differently-shaped descriptor for the non-configurable property '{key}'"),
-                    ));
-                }
-                if !p.accessor() && !p.writable() && matches!(pd.writable, Some(true)) {
-                    return Err(i.make_error(
-                        "TypeError",
-                        format!("proxy can't report a non-configurable, non-writable property '{key}' as writable"),
-                    ));
-                }
-                if !p.accessor() && !p.writable() {
-                    if let Some(v) = &pd.value {
-                        if !same_value(v, &p.value()) {
-                            return Err(i.make_error(
-                                "TypeError",
-                                format!("proxy must report the same value for the non-writable, non-configurable property '{key}'"),
-                            ));
-                        }
-                    }
-                }
-                if p.accessor() {
-                    let same_fn = |a: &Option<Value>, b: &Option<Value>| match (a, b) {
-                        (Some(x), Some(y)) => same_value(x, y),
-                        (None, None) => true,
-                        (Some(x), None) | (None, Some(x)) => matches!(x, Value::Undefined),
-                    };
-                    if pd.get.is_some() && !same_fn(&pd.get, &p.getter().cloned()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            format!("proxy must report the same getter for the non-configurable property '{key}'"),
-                        ));
-                    }
-                    if pd.set.is_some() && !same_fn(&pd.set, &p.setter().cloned()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            format!("proxy must report the same setter for the non-configurable property '{key}'"),
-                        ));
-                    }
                 }
             }
         }
     }
-    // A reported non-configurable descriptor must be backed by the target.
-    if matches!(pd.configurable, Some(false)) {
-        if let Value::Obj(t) = target {
-            let tprop = t
-                .borrow()
-                .props
-                .get(key)
-                .cloned()
-                .or_else(|| host_target_prop.clone());
-            match tprop {
-                None => {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "gOPD trap reported a non-configurable descriptor the target lacks",
-                    ));
-                }
-                Some(p) => {
-                    if p.configurable() {
-                        return Err(i.make_error(
-                            "TypeError",
-                            "gOPD trap reported non-configurable for a configurable target property",
-                        ));
-                    }
-                    if matches!(pd.writable, Some(false)) && !p.accessor() && p.writable() {
-                        return Err(i.make_error(
-                            "TypeError",
-                            "gOPD trap reported non-writable for a writable target property",
-                        ));
-                    }
-                }
+    Ok(Some(complete_descriptor(result_desc)))
+}
+
+/// Proxy [[GetOwnProperty]] as a descriptor object (FromPropertyDescriptor).
+pub(crate) fn proxy_gopd_value(
+    i: &mut Interp,
+    target: &Value,
+    handler: &Value,
+    key: &str,
+) -> Result<Value, Value> {
+    Ok(match proxy_get_own_property(i, target, handler, key)? {
+        Some(property) => descriptor_from_prop(i, property),
+        None => Value::Undefined,
+    })
+}
+
+/// CompletePropertyDescriptor (§6.2.6.6) of a partial descriptor, keeping the field-presence
+/// representation so it can feed IsCompatiblePropertyDescriptor.
+fn completed_partial(mut desc: PartialDesc) -> PartialDesc {
+    if desc.is_accessor() {
+        desc.get.get_or_insert(Value::Undefined);
+        desc.set.get_or_insert(Value::Undefined);
+    } else {
+        desc.value.get_or_insert(Value::Undefined);
+        desc.writable.get_or_insert(false);
+    }
+    desc.enumerable.get_or_insert(false);
+    desc.configurable.get_or_insert(false);
+    desc
+}
+
+/// ECMA-262 §10.1.6.2 IsCompatiblePropertyDescriptor(Extensible, Desc, Current), i.e.
+/// ValidateAndApplyPropertyDescriptor(undefined, "", Extensible, Desc, Current).
+fn is_compatible_property_descriptor(
+    extensible: bool,
+    desc: &PartialDesc,
+    current: Option<&Property>,
+) -> bool {
+    let Some(current) = current else {
+        return extensible;
+    };
+    let has_fields = desc.is_accessor()
+        || desc.is_data()
+        || desc.enumerable.is_some()
+        || desc.configurable.is_some();
+    if !has_fields {
+        return true;
+    }
+    if !current.configurable() {
+        if desc.configurable == Some(true) {
+            return false;
+        }
+        if desc
+            .enumerable
+            .is_some_and(|enumerable| enumerable != current.enumerable())
+        {
+            return false;
+        }
+        let generic = !desc.is_accessor() && !desc.is_data();
+        if !generic && desc.is_accessor() != current.accessor() {
+            return false;
+        }
+        if current.accessor() {
+            let same = |field: &Option<Value>, attribute: Option<&Value>| match field {
+                None => true,
+                Some(value) => same_value(value, attribute.unwrap_or(&Value::Undefined)),
+            };
+            if !same(&desc.get, current.getter()) || !same(&desc.set, current.setter()) {
+                return false;
+            }
+        } else if !current.writable() {
+            if desc.writable == Some(true) {
+                return false;
+            }
+            if let Some(value) = &desc.value {
+                return same_value(value, &current.value());
             }
         }
     }
-    Ok(descriptor_from_prop(i, complete_descriptor(pd)))
+    true
 }
 
 fn proxy_key_enumerable(
@@ -1039,114 +1089,53 @@ fn proxy_define_property(
     if !i.to_boolean(&res) {
         return Ok(false);
     }
-    // Invariants relative to the target's existing property and extensibility.
+    // ECMA-262 §10.5.6 steps 11-16: validate against target.[[GetOwnProperty]](P) and
+    // IsExtensible(target), both of which may run a Proxy target's traps.
+    let target_desc = match target {
+        Value::Obj(t) => object_get_own_property(i, t, key).map_err(Abrupt::Throw)?,
+        _ => None,
+    };
+    let extensible_target = js_is_extensible(i, target).map_err(Abrupt::Throw)?;
     let setting_config_false = matches!(pd.configurable, Some(false));
-    if let Value::Obj(t) = target {
-        let host_property = i.host_indexed_own_value(t, key)?.map(|value| {
-            Property::data(
-                value,
-                false,
-                crate::value::canonical_index(key).is_some(),
-                true,
-            )
-        });
-        let tprop = t.borrow().props.get(key).cloned().or(host_property);
-        let extensible = t.borrow().extensible;
-        match tprop {
-            None => {
-                if !extensible {
-                    return Err(i.throw(
-                        "TypeError",
-                        "proxy 'defineProperty' added a property to a non-extensible target",
-                    ));
-                }
-                if setting_config_false {
-                    return Err(i.throw(
-                        "TypeError",
-                        "proxy 'defineProperty' defined a non-configurable property the target lacks",
-                    ));
-                }
+    match target_desc {
+        None => {
+            if !extensible_target {
+                return Err(i.throw(
+                    "TypeError",
+                    "proxy 'defineProperty' added a property to a non-extensible target",
+                ));
             }
-            Some(p) => {
-                if setting_config_false && p.configurable() {
-                    return Err(i.throw(
-                        "TypeError",
-                        "proxy 'defineProperty' made a configurable target property non-configurable",
-                    ));
-                }
-                // IsCompatiblePropertyDescriptor: a non-configurable target property can't be
-                // redefined as configurable, change enumerability, or switch shape.
-                if !p.configurable() && matches!(pd.configurable, Some(true)) {
-                    return Err(i.throw(
-                        "TypeError",
-                        "proxy 'defineProperty' made a non-configurable target property configurable",
-                    ));
-                }
-                if !p.configurable() {
-                    if let Some(e) = pd.enumerable {
-                        if e != p.enumerable() {
-                            return Err(i.throw(
-                                "TypeError",
-                                format!("proxy can't report a different 'enumerable' for '{key}' when the target property is not configurable"),
-                            ));
-                        }
-                    }
-                    let rep_acc = pd.get.is_some() || pd.set.is_some();
-                    let rep_data = pd.value.is_some() || pd.writable.is_some();
-                    if (rep_acc && !p.accessor()) || (rep_data && p.accessor()) {
-                        return Err(i.throw(
-                            "TypeError",
-                            format!("proxy can't change the descriptor shape of the non-configurable property '{key}'"),
-                        ));
-                    }
-                    if p.accessor() {
-                        let same_fn = |a: &Option<Value>, b: &Option<Value>| match (a, b) {
-                            (Some(x), Some(y)) => same_value(x, y),
-                            (None, None) => true,
-                            (Some(x), None) | (None, Some(x)) => matches!(x, Value::Undefined),
-                        };
-                        if pd.get.is_some() && !same_fn(&pd.get, &p.getter().cloned()) {
-                            return Err(i.throw(
-                                "TypeError",
-                                format!("proxy must define the same getter for the non-configurable property '{key}'"),
-                            ));
-                        }
-                        if pd.set.is_some() && !same_fn(&pd.set, &p.setter().cloned()) {
-                            return Err(i.throw(
-                                "TypeError",
-                                format!("proxy must define the same setter for the non-configurable property '{key}'"),
-                            ));
-                        }
-                    }
-                }
-                if !p.configurable() && !p.accessor() && !p.writable() {
-                    if matches!(pd.writable, Some(true)) {
-                        return Err(i.throw(
-                            "TypeError",
-                            "proxy 'defineProperty' made a non-writable property writable",
-                        ));
-                    }
-                    // A non-configurable, non-writable data property's value can't be changed.
-                    if let Some(v) = &pd.value {
-                        if !i.strict_equals(v, &p.value()) {
-                            return Err(i.throw(
-                                "TypeError",
-                                "proxy 'defineProperty' changed a non-configurable non-writable value",
-                            ));
-                        }
-                    }
-                }
-                // Step 16.c: a non-configurable *writable* data target can't be reported non-writable.
-                if !p.configurable()
-                    && !p.accessor()
-                    && p.writable()
-                    && matches!(pd.writable, Some(false))
-                {
-                    return Err(i.throw(
-                        "TypeError",
-                        "proxy 'defineProperty' reported a non-configurable writable property as non-writable",
-                    ));
-                }
+            if setting_config_false {
+                return Err(i.throw(
+                    "TypeError",
+                    "proxy 'defineProperty' defined a non-configurable property the target lacks",
+                ));
+            }
+        }
+        Some(p) => {
+            if !is_compatible_property_descriptor(extensible_target, &pd, Some(&p)) {
+                return Err(i.throw(
+                    "TypeError",
+                    format!(
+                        "proxy 'defineProperty' reported an incompatible descriptor for '{key}'"
+                    ),
+                ));
+            }
+            if setting_config_false && p.configurable() {
+                return Err(i.throw(
+                    "TypeError",
+                    "proxy 'defineProperty' made a configurable target property non-configurable",
+                ));
+            }
+            if !p.accessor()
+                && !p.configurable()
+                && p.writable()
+                && matches!(pd.writable, Some(false))
+            {
+                return Err(i.throw(
+                    "TypeError",
+                    "proxy 'defineProperty' reported a non-configurable writable property as non-writable",
+                ));
             }
         }
     }
@@ -4457,98 +4446,28 @@ fn install_object(it: &mut Interp) {
         Ok(Value::Obj(o))
     });
     it.def_method(&ctor, "getOwnPropertyDescriptor", 2, |i, _this, args| {
-        // ToObject coerces a primitive target (and throws for null/undefined).
+        // ECMA-262 §20.1.2.8: ToObject coerces a primitive target (throws for null/undefined),
+        // then ToPropertyKey, then obj.[[GetOwnProperty]](key) and FromPropertyDescriptor.
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyDescriptor")?;
         let key = ab(i.to_property_key(&arg(args, 1)))?;
-        ab(i.defer_trigger(&o, Some(&key)))?;
-        if Interp::is_private_key(&key) {
-            return Ok(Value::Undefined); // private-name slot is not an own property
-        }
-        // A mapped arguments index reports the live parameter value.
-        if let Some(v) = i.mapped_arg_value(Rc::as_ptr(&o) as usize, &key) {
-            if let Some(p) = o.borrow_mut().props.get_mut(&key) {
-                p.set_value(v);
-            }
-        }
-        // A TypedArray canonical numeric index is an own data property reading from the buffer; a
-        // canonical-but-out-of-range index has no own property (a non-canonical key like "1.0" or
-        // "+1" is an ordinary property, handled below).
-        if let Some(info) = ta_info(i, &o) {
-            if i.canonical_numeric_index(&key).is_some() {
-                return Ok(match i.ta_index_kind(&info, &key) {
-                    TaIndex::Element(idx) => {
-                        let val = i.ta_read(&info, idx);
-                        descriptor_from_prop(i, Property::data(val, true, true, true))
-                    }
-                    _ => Value::Undefined,
-                });
-            }
-        }
-        if let Some(value) = ab(i.host_indexed_own_value(&o, &key))? {
-            return Ok(descriptor_from_prop(
-                i,
-                Property::data(
-                    value,
-                    false,
-                    crate::value::canonical_index(&key).is_some(),
-                    true,
-                ),
-            ));
-        }
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            return proxy_gopd_value(i, &target, &handler, &key);
-        }
-        let ptr = Rc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            if let Some(res) = i.namespace_own_property(ptr, &key) {
-                return Ok(descriptor_from_prop(i, ab(res)?));
-            }
-        }
-        let prop = o.borrow().props.get(&key).cloned();
-        match prop {
-            None => Ok(Value::Undefined),
-            Some(p) => Ok(descriptor_from_prop(i, p)),
-        }
+        Ok(match object_get_own_property(i, &o, &key)? {
+            Some(property) => descriptor_from_prop(i, property),
+            None => Value::Undefined,
+        })
     });
     it.def_method(&ctor, "getOwnPropertyDescriptors", 1, |i, _this, args| {
-        // ToObject coerces primitives (and throws for null/undefined).
+        // ECMA-262 §20.1.2.9: [[OwnPropertyKeys]], then [[GetOwnProperty]] per key in order.
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyDescriptors")?;
-        let ov = Value::Obj(o.clone());
+        let keys = object_own_property_keys(i, &o)?;
         let result = i.new_object();
-        // A proxy goes through its [[OwnPropertyKeys]]/[[GetOwnProperty]] traps, in order.
-        if let Some((target, handler)) = proxy_pair(i, &ov) {
-            for k in proxy_own_keys(i, &target, &handler)? {
-                let key = ab(i.to_property_key(&k))?;
-                let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-                if !matches!(desc, Value::Undefined) {
-                    result
-                        .borrow_mut()
-                        .props
-                        .insert(key.as_str(), Property::plain(desc));
-                }
-            }
-            return Ok(Value::Obj(result));
-        }
-        let keys = ordinary_own_keys_ordered(i, &o)?;
-        for key in keys {
-            if Interp::is_private_key(&key) {
-                continue;
-            }
-            let prop = match ab(i.host_indexed_own_value(&o, &key))? {
-                Some(value) => Some(Property::data(
-                    value,
-                    false,
-                    crate::value::canonical_index(&key).is_some(),
-                    true,
-                )),
-                None => o.borrow().props.get(&key).cloned(),
-            };
-            if let Some(p) = prop {
-                let d = descriptor_from_prop(i, p);
+        for k in keys {
+            let key = ab(i.to_property_key(&k))?;
+            if let Some(property) = object_get_own_property(i, &o, &key)? {
+                let descriptor = descriptor_from_prop(i, property);
                 result
                     .borrow_mut()
                     .props
-                    .insert(key.as_str(), Property::plain(d));
+                    .insert(key.as_str(), Property::plain(descriptor));
             }
         }
         Ok(Value::Obj(result))

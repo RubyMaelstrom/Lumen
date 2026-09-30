@@ -63,6 +63,11 @@ pub(crate) const ASCII_HINT: u32 = 1 << 31;
 // also rejects it by its <=10-byte length guard before accessing inline bytes.
 const VIEW_CAP: u32 = ASCII_HINT - 1;
 const MIN_VIEW_BYTES: usize = 256;
+/// A view may keep an owner of at most this size alive regardless of the slice's length; larger
+/// owners are pinned only by slices covering at least half of them. Copying every short slice
+/// of a moderately sized document made incremental scanners (repeated `substring(0, n)` +
+/// sticky RegExp exec) quadratic in both the copy and the matcher's text preparation.
+const VIEW_PIN_BYTES: usize = 1 << 20;
 const _: () = assert!(MIN_VIEW_BYTES > 10);
 
 fn layout(cap: u32) -> Layout {
@@ -224,8 +229,9 @@ impl LStr {
             .map(|view| (&view.owner, view.offset, view.offset + self.len()))
     }
 
-    /// Slice already-proven UTF-8 boundaries. Copy small tokens and ranges that would pin
-    /// more than twice their byte length; large nearby prefixes share a flat source owner.
+    /// Slice already-proven UTF-8 boundaries. Copy small tokens, and ranges that would pin a
+    /// large owner (over `VIEW_PIN_BYTES`) more than twice their byte length; other slices
+    /// share their flat source owner.
     pub(crate) fn slice_bytes(&self, start: usize, end: usize) -> LStr {
         let bytes = &self.as_str()[start..end];
         if start == 0 && end == self.len() {
@@ -234,8 +240,9 @@ impl LStr {
         let (owner, offset) = self
             .view()
             .map_or((self, start), |view| (&view.owner, view.offset + start));
+        let owner_bytes = owner.allocation_requested_bytes();
         if bytes.len() < MIN_VIEW_BYTES
-            || owner.allocation_requested_bytes() > bytes.len().saturating_mul(2)
+            || (owner_bytes > bytes.len().saturating_mul(2) && owner_bytes > VIEW_PIN_BYTES)
         {
             return LStr::from(bytes);
         }
@@ -662,14 +669,36 @@ mod tests {
 
     #[test]
     fn small_or_disproportionate_slices_copy_and_release_source() {
+        // Small tokens always copy; a moderately sized owner may be shared by any other slice.
         let source = LStr::from("x".repeat(2048));
-        for (start, end) in [(0, 10), (0, 900), (1024, 1030)] {
+        for (start, end) in [(0, 10), (1024, 1030)] {
             let slice = source.slice_bytes(start, end);
             assert!(slice.view_owner().is_none());
             assert_eq!(slice.as_str(), &source[start..end]);
             assert_eq!(source.strong_count(), 1);
         }
-        let spare = source.concat_grown("x");
+        let shared = source.slice_bytes(0, 900);
+        assert!(shared.view_owner().is_some());
+        drop(shared);
+        assert_eq!(source.strong_count(), 1);
+        // A large owner is pinned only by a slice covering at least half of it.
+        let large = LStr::from("x".repeat(VIEW_PIN_BYTES + 4096));
+        for (start, end) in [(0, 900), (1024, 300_000)] {
+            let slice = large.slice_bytes(start, end);
+            assert!(slice.view_owner().is_none());
+            assert_eq!(slice.as_str(), &large[start..end]);
+            assert_eq!(large.strong_count(), 1);
+        }
+        assert!(large
+            .slice_bytes(0, large.len() / 2 + 1024)
+            .view_owner()
+            .is_some());
+        // The pinning bound charges the owner's allocation, including spare capacity, rather
+        // than its visible length.
+        let base = LStr::from("x".repeat(VIEW_PIN_BYTES - 4096));
+        let spare = base.concat_grown("x");
+        assert!(spare.len() <= VIEW_PIN_BYTES);
+        assert!(spare.allocation_requested_bytes() > VIEW_PIN_BYTES);
         let slice = spare.slice_bytes(0, 1100);
         assert!(
             slice.view_owner().is_none(),

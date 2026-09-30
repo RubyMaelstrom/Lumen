@@ -13832,10 +13832,9 @@ fn run_vm_inner<S: StoredValue>(
                 })?;
             }
             Op::MakeClosure(fidx, name_n) => {
-                let v = i.make_function(chunk.funcs[fidx as usize].clone(), env.clone());
-                if name_n != u32::MAX {
-                    i.set_fn_name(&v, &chunk.names[name_n as usize]);
-                }
+                let name = (name_n != u32::MAX).then(|| &chunk.names[name_n as usize]);
+                let v =
+                    i.make_function_named(chunk.funcs[fidx as usize].clone(), env.clone(), name);
                 observe_allocation(
                     &chunk.feedback,
                     op_pc,
@@ -21486,10 +21485,8 @@ unsafe fn jit_exec_inner(
             }
         }
         Op::MakeClosure(fidx, name_n) => {
-            let v = i.make_function(chunk.funcs[fidx as usize].clone(), env.clone());
-            if name_n != u32::MAX {
-                i.set_fn_name(&v, &chunk.names[name_n as usize]);
-            }
+            let name = (name_n != u32::MAX).then(|| &chunk.names[name_n as usize]);
+            let v = i.make_function_named(chunk.funcs[fidx as usize].clone(), env.clone(), name);
             observe_allocation(
                 &chunk.feedback,
                 pc as usize,

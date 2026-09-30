@@ -16,8 +16,7 @@
 //! Threads (coroutine parking) are handled by construction: each thread caches its own frees,
 //! and a block freed on a different thread than it was allocated on simply joins that thread's
 //! cache — the backing system allocation is thread-agnostic. Thread teardown drains the lists
-//! back to the system (`Drop`); allocation during teardown falls through to the system
-//! (`try_with`).
+//! back to the system (`ExitDrain`); frees after that fall through to the system.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -45,22 +44,39 @@ const fn class_caps() -> [usize; NUM_CLASSES] {
 
 const CLASS_CAPS: [usize; NUM_CLASSES] = class_caps();
 
+/// The per-thread free lists. The type has no destructor, so the const-initialized
+/// thread-local is a plain TLS access on every allocation (a destructor would add a lazy
+/// registration-state check to each one). Teardown is delegated to [`ExitDrain`].
 struct Cache {
     heads: [Cell<*mut u8>; NUM_CLASSES],
     counts: [Cell<usize>; NUM_CLASSES],
-}
-
-impl Drop for Cache {
-    fn drop(&mut self) {
-        drain(self);
-    }
+    /// `ExitDrain` has been registered for this thread.
+    registered: Cell<bool>,
+    /// This thread's `ExitDrain` has run: frees go straight to the system from now on.
+    exited: Cell<bool>,
 }
 
 thread_local! {
     static CACHE: Cache = const { Cache {
         heads: [const { Cell::new(std::ptr::null_mut()) }; NUM_CLASSES],
         counts: [const { Cell::new(0) }; NUM_CLASSES],
+        registered: Cell::new(false),
+        exited: Cell::new(false),
     } };
+    static EXIT_DRAIN: ExitDrain = const { ExitDrain };
+}
+
+/// Returns a thread's cached blocks to the system when the thread exits. Registered lazily,
+/// when the thread first caches a freed block.
+struct ExitDrain;
+
+impl Drop for ExitDrain {
+    fn drop(&mut self) {
+        let _ = CACHE.try_with(|cache| {
+            cache.exited.set(true);
+            drain(cache);
+        });
+    }
 }
 
 #[inline]
@@ -132,6 +148,15 @@ unsafe impl GlobalAlloc for ClassAlloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if let Some(class) = class_of(layout.size(), layout.align()) {
             let cached = CACHE.with(|c| {
+                if c.exited.get() {
+                    return false;
+                }
+                if !c.registered.get() {
+                    c.registered.set(true);
+                    // Touching the key registers its destructor; during teardown it may
+                    // already be gone, in which case the blocks simply stay with the thread.
+                    let _ = EXIT_DRAIN.try_with(|_| ());
+                }
                 if c.counts[class].get() < CLASS_CAPS[class] {
                     unsafe { *(ptr as *mut *mut u8) = c.heads[class].get() };
                     c.heads[class].set(ptr);

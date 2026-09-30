@@ -138,10 +138,57 @@ impl Interp {
             Ok(Value::Undefined)
         } else {
             let getter = read.value.into_value();
+            if let Some(value) = self.try_binding_getter(&getter) {
+                return Ok(value);
+            }
             if let Some(result) = self.try_record_getter(&getter, receiver) {
                 return result;
             }
             self.call_callback(getter, receiver.clone(), &[])
+        }
+    }
+
+    /// A getter whose entire body is `return <identifier>` — the export accessors module
+    /// bundlers emit (`() => binding`) — observes nothing but that binding. When the name
+    /// resolves, before any object Environment Record, to an initialized ordinary declarative
+    /// binding, its value is exactly the result of Call(getter, receiver): no parameters,
+    /// declarations, `this` or `arguments` are involved (ECMA-262 §10.2.1.3
+    /// OrdinaryCallEvaluateBody, §9.1.2.1 GetIdentifierReference, §9.1.1.1.6 GetBindingValue).
+    /// TDZ bindings, imports, `with` scopes and global lookups keep the real Call.
+    pub(crate) fn try_binding_getter(&self, getter: &Value) -> Option<Value> {
+        use crate::ast::{Expr, Stmt};
+        use crate::value::Callable;
+        let getter = getter.as_obj()?;
+        let getter = getter.borrow();
+        let Callable::User(user) = &getter.call else {
+            return None;
+        };
+        let f = &user.func;
+        if !f.params.is_empty() || f.is_generator || f.is_async || f.body.len() != 1 {
+            return None;
+        }
+        let Stmt::Return(Some(Expr::Ident(name))) = &f.body[0] else {
+            return None;
+        };
+        if name == "arguments" {
+            return None;
+        }
+        // Every scope on the chain is kept alive by the getter's [[Environment]].
+        let mut scope: *const std::cell::RefCell<crate::interpreter::Scope> =
+            std::rc::Rc::as_ptr(&user.env);
+        loop {
+            let record = unsafe { &*scope }.borrow();
+            // A global Environment Record's object part (and any `with` object) may run code.
+            if record.parent.is_none() || record.with_obj.is_some() || record.under_with {
+                return None;
+            }
+            if let Some(binding) = record.vars.get(name.as_str()) {
+                if !binding.initialized || binding.imported || binding.import_ref.is_some() {
+                    return None;
+                }
+                return Some(binding.value.clone());
+            }
+            scope = std::rc::Rc::as_ptr(record.parent.as_ref()?);
         }
     }
 

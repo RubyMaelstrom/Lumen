@@ -460,6 +460,20 @@ pub enum PropKey {
     Computed(Expr),
 }
 
+/// See [`Function::fn_maps`].
+#[derive(Debug, Clone)]
+pub struct FunctionMaps {
+    /// The function object's own properties: `length`, `name` and, for prototype-bearing kinds,
+    /// a `prototype` placeholder patched per closure.
+    pub function: crate::value::Props,
+    /// The fresh `.prototype` object's properties, for prototype-bearing kinds.
+    pub prototype: Option<crate::value::Props>,
+    /// `function` with the `name` NamedEvaluation gave the first named closure of this
+    /// anonymous function (`var f = () => {}`): a creation site's inferred name is fixed, so
+    /// later closures clone it instead of running SetFunctionName per instance.
+    pub named: std::cell::RefCell<Option<(Rc<str>, crate::value::Props)>>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // expr_body is recorded for a future `toString`/source-fidelity pass
 pub struct Function {
@@ -507,7 +521,7 @@ pub struct Function {
     /// placeholder) and, for prototype-bearing kinds, the fresh `.prototype`'s `Props` — cloned
     /// per closure instance instead of rebuilt insert by insert, so key hashing and shape
     /// transitions are paid once per FUNCTION rather than once per closure.
-    pub fn_maps: std::cell::OnceCell<(crate::value::Props, Option<crate::value::Props>)>,
+    pub fn_maps: std::cell::OnceCell<FunctionMaps>,
     /// Actual parameter/body key layouts observed before tier-up. Each cache is
     /// bounded to one layout; eval-dependent alternatives keep dynamic storage.
     pub(crate) env_layouts:

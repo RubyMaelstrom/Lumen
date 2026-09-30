@@ -25848,3 +25848,99 @@ fn interp_layout_probes() {
     assert!(words(l.fnf_ptr_word, l.fnf_len_word, l.fnf_cap_word));
     assert!(words(l.fp_ptr_word, l.fp_len_word, l.fp_cap_word));
 }
+
+/// ECMA-262 §10.5.5-§10.5.11: every Proxy invariant check reads target.[[GetOwnProperty]](P),
+/// IsExtensible(target) and target.[[OwnPropertyKeys]]() through the target's own internal
+/// methods, in the specified order — a Proxy target's traps observe each step, and exotic
+/// targets (TypedArray elements) report their own descriptors and keys. Reflect.
+/// getOwnPropertyDescriptor performs ToPropertyKey once (§28.1.7). Expected output from Node.
+#[test]
+fn proxy_invariants_use_the_targets_internal_methods_in_order() {
+    let source = r#"var log=[];
+function logged(target){return new Proxy(target,{
+  getOwnPropertyDescriptor(t,k){log.push('gopd:'+String(k));return Reflect.getOwnPropertyDescriptor(t,k);},
+  isExtensible(t){log.push('isExt');return Reflect.isExtensible(t);},
+  ownKeys(t){log.push('keys');return Reflect.ownKeys(t);}});}
+var base={a:1};Object.defineProperty(base,'fixed',{value:7,writable:false,configurable:false});
+var inner=logged(base);
+var outer=new Proxy(inner,{get(){return 7},set(){return true},has(){return false},deleteProperty(){return true},
+  defineProperty(){return true},getOwnPropertyDescriptor(t,k){return Reflect.getOwnPropertyDescriptor(t,k)},ownKeys(t){return Reflect.ownKeys(t)}});
+var out=[];
+out.push(outer.fixed);log.push('|');
+try{outer.fixed=8}catch(e){out.push('set:'+e.name)}log.push('|');
+out.push('a' in outer);log.push('|');
+try{'fixed' in outer}catch(e){out.push('has:'+e.name)}log.push('|');
+out.push(delete outer.a);log.push('|');
+try{delete outer.fixed}catch(e){out.push('del:'+e.name)}log.push('|');
+out.push(Reflect.defineProperty(outer,'b',{value:1}));log.push('|');
+out.push(JSON.stringify(Object.getOwnPropertyDescriptor(outer,'a')));log.push('|');
+out.push(Reflect.ownKeys(outer).join('.'));log.push('|');
+// typed array targets
+var ta=new Uint8Array([5,6]);
+var pta=new Proxy(ta,{});
+out.push(Reflect.ownKeys(pta).join('.'), delete pta[0], JSON.stringify(Object.getOwnPropertyDescriptor(pta,'1')));
+out.push(JSON.stringify(Object.getOwnPropertyDescriptors(ta)));
+// non-extensible nested target: has/delete must consult IsExtensible through the inner proxy
+var frozenish={c:1};Object.preventExtensions(frozenish);
+var inner2=logged(frozenish);log.push('|');
+var outer2=new Proxy(inner2,{has(){return false},deleteProperty(){return true}});
+try{'c' in outer2}catch(e){out.push('has2:'+e.name)}
+try{delete outer2.c}catch(e){out.push('del2:'+e.name)}
+// ToPropertyKey exactly once
+var n=0;Reflect.getOwnPropertyDescriptor({x:1},{toString(){n++;return 'x'}});out.push('tpk:'+n);
+out.join('/')+'#'+log.join(',')
+"#;
+    use crate::bytecode::Tier;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            r#"7/set:TypeError/false/has:TypeError/true/del:TypeError/true/{"value":1,"writable":true,"enumerable":true,"configurable":true}/a.fixed/0.1/false/{"value":6,"writable":true,"enumerable":true,"configurable":true}/{"0":{"value":5,"writable":true,"enumerable":true,"configurable":true},"1":{"value":6,"writable":true,"enumerable":true,"configurable":true}}/has2:TypeError/del2:TypeError/tpk:1#gopd:fixed,|,gopd:fixed,|,gopd:a,isExt,|,gopd:fixed,|,gopd:a,isExt,|,gopd:fixed,|,gopd:b,isExt,|,gopd:a,gopd:a,isExt,|,keys,isExt,keys,gopd:a,gopd:fixed,|,|,gopd:c,isExt,gopd:c,isExt"#,
+            "tier {tier:?}"
+        );
+    }
+}
+
+/// A getter whose body is `return <identifier>` (bundler export accessors) reads its binding
+/// directly only when that equals Call(getter): live rebinding is observed, a TDZ binding still
+/// throws ReferenceError, and `arguments`, `with` objects and global-object lookups keep the
+/// real call (ECMA-262 §10.2.1.3, §9.1.2.1). Expected output from Node.
+#[test]
+fn binding_getters_read_live_bindings_with_call_semantics() {
+    use crate::bytecode::Tier;
+    let source = r#"var out=[];
+function mod(){ var kJ=function(x){return Array.isArray(x)}; const exp={};
+  Object.defineProperty(exp,'tdz',{get:()=>t2});
+  var tdzName; for(var k=0;k<3;k++){ try{exp.tdz}catch(err){tdzName=err.name} }
+  let t2=7;
+  Object.defineProperty(exp,'kJ',{enumerable:true,get:()=>kJ});
+  Object.defineProperty(exp,'self',{get:function self(){return self}});
+  Object.defineProperty(exp,'args',{get:function(){return arguments}});
+  var box={v:1}; with(box){ Object.defineProperty(exp,'w',{get:()=>v}); }
+  Object.defineProperty(exp,'glob',{get:()=>globalThis.gv});
+  return {exp, tdzName, set(v){kJ=v}};
+}
+var m=mod(); var e=m.exp;
+out.push(m.tdzName, e.tdz);
+out.push((0,e.kJ)([1]));
+m.set(function(){return 'swapped'}); out.push(e.kJ());
+out.push(typeof e.self, e.self===Object.getOwnPropertyDescriptor(e,'self').get);
+out.push(e.args.length);
+out.push(e.w);
+globalThis.gv=9; out.push(e.glob);
+var s=0; for(var i=0;i<200;i++){ s+=(0,e.kJ)(i)==='swapped'?1:0; } out.push(s);
+out.join(',')
+"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "ReferenceError,7,true,swapped,function,true,0,1,9,200",
+            "tier {tier:?}"
+        );
+    }
+}

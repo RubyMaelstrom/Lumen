@@ -91,21 +91,30 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
         for(var warm=0;warm<160;warm++)point('é😀',1);
     "#,
     );
-    let before = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get);
-    let epoch_before = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(
-        eval(
-            &mut engine,
-            r#"
-        var s='é😀',wide='x'.repeat(80)+s,ok=true;
-        for(var n=0;n<40;n++)ok=ok&&point(s,1)===0x1F600&&point(wide,81)===0x1F600&&point('plain',2)===97;
-        ok
-    "#
-        ),
-        "true"
-    );
-    let hits = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get) - before;
-    let epoch_after = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    // CALL_IC_EPOCH is process-wide: a concurrently running test that recompiles a chunk
+    // invalidates every cached call site, and the next few calls here legitimately revalidate
+    // through the generic path. Measure a run during which the epoch stayed unchanged.
+    let (mut hits, mut epoch_before, mut epoch_after) = (0, 0, 1);
+    for _attempt in 0..20 {
+        let before = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get);
+        epoch_before = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+            var s='é😀',wide='x'.repeat(80)+s,ok=true;
+            for(var n=0;n<40;n++)ok=ok&&point(s,1)===0x1F600&&point(wide,81)===0x1F600&&point('plain',2)===97;
+            ok
+        "#
+            ),
+            "true"
+        );
+        hits = crate::bytecode::TEST_JIT_CODE_POINT_INTRINSICS.with(std::cell::Cell::get) - before;
+        epoch_after = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if epoch_before == epoch_after {
+            break;
+        }
+    }
     assert!(hits >= 120,
         "warm String/Number calls bypass generic native argument decoding: {hits} hits, epoch {epoch_before}->{epoch_after}");
     assert!(engine.interp.fn_frames.is_empty());

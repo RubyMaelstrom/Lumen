@@ -88,66 +88,19 @@ pub(super) fn install_reflect(it: &mut Interp) {
         Ok(Value::Bool(ab(i.js_has_property(&target, &key))?))
     });
     it.def_method(&r, "getOwnPropertyDescriptor", 2, |i, _t, a| {
-        let o = match arg(a, 0) {
-            Value::Obj(o) => {
-                let key = ab(i.to_property_key(&arg(a, 1)))?;
-                ab(i.defer_trigger(&o, Some(&key)))?;
-                o
-            }
-            _ => {
-                return Err(i.make_error(
-                    "TypeError",
-                    "Reflect.getOwnPropertyDescriptor on non-object",
-                ));
-            }
+        // ECMA-262 §28.1.7: TypeError for a non-object target, then ToPropertyKey exactly once,
+        // then target.[[GetOwnProperty]](key) and FromPropertyDescriptor.
+        let Value::Obj(o) = arg(a, 0) else {
+            return Err(i.make_error(
+                "TypeError",
+                "Reflect.getOwnPropertyDescriptor on non-object",
+            ));
         };
         let key = ab(i.to_property_key(&arg(a, 1)))?;
-        if Interp::is_private_key(&key) {
-            return Ok(Value::Undefined); // private-name slot is not an own property
-        }
-        // A mapped arguments index reports the live parameter value.
-        if let Some(v) = i.mapped_arg_value(Rc::as_ptr(&o) as usize, &key) {
-            if let Some(p) = o.borrow_mut().props.get_mut(&key) {
-                p.set_value(v);
-            }
-        }
-        // A TypedArray canonical numeric index reads from the buffer (out-of-range → undefined).
-        if let Some(info) = ta_info(i, &o) {
-            if i.canonical_numeric_index(&key).is_some() {
-                return Ok(match i.ta_index_kind(&info, &key) {
-                    TaIndex::Element(idx) => {
-                        let val = i.ta_read(&info, idx);
-                        descriptor_from_prop(i, Property::data(val, true, true, true))
-                    }
-                    _ => Value::Undefined,
-                });
-            }
-        }
-        if let Some(value) = ab(i.host_indexed_own_value(&o, &key))? {
-            return Ok(descriptor_from_prop(
-                i,
-                Property::data(
-                    value,
-                    false,
-                    crate::value::canonical_index(&key).is_some(),
-                    true,
-                ),
-            ));
-        }
-        // A proxy's [[GetOwnProperty]] goes through its getOwnPropertyDescriptor trap.
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            return proxy_gopd_value(i, &target, &handler, &key);
-        }
-        let ptr = Rc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            if let Some(res) = i.namespace_own_property(ptr, &key) {
-                return Ok(descriptor_from_prop(i, ab(res)?));
-            }
-        }
-        let prop = o.borrow().props.get(&key).cloned();
-        Ok(prop
-            .map(|p| descriptor_from_prop(i, p))
-            .unwrap_or(Value::Undefined))
+        Ok(match object_get_own_property(i, &o, &key)? {
+            Some(property) => descriptor_from_prop(i, property),
+            None => Value::Undefined,
+        })
     });
     it.def_method(&r, "deleteProperty", 2, |i, _t, a| {
         let key = ab(i.to_property_key(&arg(a, 1)))?;
@@ -191,32 +144,8 @@ pub(super) fn install_reflect(it: &mut Interp) {
             Value::Obj(o) => o,
             _ => return Err(i.make_error("TypeError", "Reflect.ownKeys called on non-object")),
         };
-        ab(i.defer_trigger(&o, None))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            let keys = proxy_own_keys(i, &target, &handler)?;
-            return Ok(i.make_array(keys));
-        }
-        // A TypedArray's integer indices come first (ascending), then string keys, then symbols.
-        let mut out: Vec<Value> = if let Some(info) = ta_info(i, &o) {
-            (0..i.ta_len(&info).unwrap_or(0))
-                .map(|k| Value::from_string(k.to_string()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // Spec [[OwnPropertyKeys]] order: array-index keys ascending, then string keys (insertion
-        // order), then symbol keys (insertion order) — exactly what `ordered_keys` produces.
-        let ordered = ordinary_own_keys_ordered(i, &o)?;
-        for k in ordered {
-            if Interp::is_sym_key(&k) {
-                if let Some(s) = i.sym_from_key(&k) {
-                    out.push(s);
-                }
-            } else {
-                out.push(Value::from_string(k));
-            }
-        }
-        Ok(i.make_array(out))
+        let keys = object_own_property_keys(i, &o)?;
+        Ok(i.make_array(keys))
     });
     it.def_method(&r, "getPrototypeOf", 1, |i, _t, a| match arg(a, 0) {
         Value::Obj(o) => {
