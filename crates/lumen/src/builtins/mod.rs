@@ -4950,6 +4950,29 @@ fn defer_trigger_v(i: &mut Interp, v: &Value, key: Option<&str>) -> Result<(), V
 fn define_own_property(i: &mut Interp, o: &Gc, key: &str, desc: &Value) -> Result<bool, Abrupt> {
     i.defer_trigger(o, Some(key))?;
     let d = build_partial(i, desc)?;
+    define_own_property_record(i, o, key, &d)
+}
+
+/// The data descriptor { [[Value]]: v, all attributes true } of CreateDataProperty.
+fn data_record(v: Value) -> PartialDesc {
+    PartialDesc {
+        value: Some(v),
+        writable: Some(true),
+        enumerable: Some(true),
+        configurable: Some(true),
+        ..PartialDesc::default()
+    }
+}
+
+/// [[DefineOwnProperty]] of a non-proxy object with a Property Descriptor record. Callers
+/// that construct the record themselves (CreateDataProperty) need no descriptor object: only
+/// a proxy trap observes one (ECMA-262 FromPropertyDescriptor in [[DefineOwnProperty]]).
+fn define_own_property_record(
+    i: &mut Interp,
+    o: &Gc,
+    key: &str,
+    d: &PartialDesc,
+) -> Result<bool, Abrupt> {
     // ArgumentsExoticObject [[DefineOwnProperty]]: sync the live parameter value into the
     // ordinary property first; after a successful ordinary define, a plain value write goes
     // through the map, and only an accessor or writable:false severs the alias.
@@ -4961,7 +4984,7 @@ fn define_own_property(i: &mut Interp, o: &Gc, key: &str, desc: &Value) -> Resul
                 p.set_value(cur);
             }
         }
-        let allowed = define_own_property_ordinary(i, o, key, &d)?;
+        let allowed = define_own_property_ordinary(i, o, key, d)?;
         if !allowed {
             return Ok(false);
         }
@@ -4977,7 +5000,7 @@ fn define_own_property(i: &mut Interp, o: &Gc, key: &str, desc: &Value) -> Resul
         }
         return Ok(true);
     }
-    define_own_property_ordinary(i, o, key, &d)
+    define_own_property_ordinary(i, o, key, d)
 }
 
 fn define_own_property_ordinary(
@@ -4986,10 +5009,6 @@ fn define_own_property_ordinary(
     key: &str,
     d: &PartialDesc,
 ) -> Result<bool, Abrupt> {
-    // A defineProperty can rewrite attributes (data → accessor, writable → false) without a
-    // structural change: conservatively invalidate the property-creation inline caches, whose
-    // fill-time chain walks assumed no such shadow could appear (the op is rare).
-    crate::value::bump_proto_epoch();
     let d = d.clone();
     // Module namespace [[DefineOwnProperty]]: a String key is only redefinable to a descriptor that
     // matches the export's fixed shape (writable, enumerable, non-configurable, same value); adding
@@ -5042,6 +5061,7 @@ fn define_own_property_ordinary(
     let is_array = matches!(o.borrow().exotic, crate::value::Exotic::Array);
     // Array exotic [[DefineOwnProperty]]: `length` and array indices have special rules.
     if is_array && key == "length" {
+        crate::value::bump_proto_epoch();
         return array_set_length(i, o, &d);
     }
     let array_index = if is_array { canonical_index(key) } else { None };
@@ -5122,6 +5142,11 @@ fn define_own_property_ordinary(
             }
         }
     }
+    // Redefining can rewrite attributes (data → accessor, writable → false) without a
+    // structural change: invalidate the property-creation inline caches and protectors, whose
+    // proofs assumed no such shadow could appear. A new key needs no bump here: Props::insert
+    // already notes structural changes to marked prototypes.
+    crate::value::bump_proto_epoch();
     // Apply the present fields.
     if d.is_accessor() {
         cur.set_accessor(true);
@@ -8372,15 +8397,15 @@ pub(crate) fn cdp_or_throw(
             }
         }
     }
-    let desc = i.new_object();
-    set_data(&desc, "value", v);
-    set_data(&desc, "writable", Value::Bool(true));
-    set_data(&desc, "enumerable", Value::Bool(true));
-    set_data(&desc, "configurable", Value::Bool(true));
     let r = if let Some((t, h)) = proxy_pair(i, target) {
+        let desc = i.new_object();
+        set_data(&desc, "value", v);
+        set_data(&desc, "writable", Value::Bool(true));
+        set_data(&desc, "enumerable", Value::Bool(true));
+        set_data(&desc, "configurable", Value::Bool(true));
         proxy_define_property(i, &t, &h, key, &Value::Obj(desc))
     } else {
-        define_own_property(i, o, key, &Value::Obj(desc))
+        define_own_property_record(i, o, key, &data_record(v))
     };
     match r {
         Ok(true) => Ok(()),

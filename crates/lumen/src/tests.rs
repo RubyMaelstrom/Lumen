@@ -8193,6 +8193,64 @@ fn define_property_semantics() {
     );
 }
 #[test]
+fn new_property_definitions_keep_creation_caches_and_still_invalidate_them() {
+    // CreateDataProperty and defineProperty of a NEW key change structure, which Props::insert
+    // already reports for marked prototypes; only redefining an existing property needs the
+    // global creation-cache epoch. Other tests may bump that process-global epoch at any time,
+    // so accept the first trial in which it stayed stable.
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "class Fields { a = 1; b = []; c = () => this.a; }\n\
+         function define() { var o = new Fields(); Object.defineProperty(o, 'd', {value: 4});\n\
+           return Object.fromEntries([['x', o.c()]]).x + Array.from([1, 2]).length; }",
+    );
+    let stable = (0..256).any(|_| {
+        let epoch = crate::value::proto_epoch();
+        assert_eq!(run_in(&mut engine, "define()"), "3");
+        let unchanged = crate::value::proto_epoch() == epoch;
+        if !unchanged {
+            std::thread::yield_now();
+        }
+        unchanged
+    });
+    assert!(
+        stable,
+        "every trial of new-key definitions bumped the creation epoch"
+    );
+    let epoch = crate::value::proto_epoch();
+    run_in(
+        &mut engine,
+        "var redefined = new Fields(); Object.defineProperty(redefined, 'a', {value: 9});",
+    );
+    assert!(
+        crate::value::proto_epoch() > epoch,
+        "redefinitions still invalidate"
+    );
+
+    // Warmed creation sites observe a setter later defined on the prototype chain, whether
+    // as a new key or by redefining an inherited writable data property.
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = "function Fresh() {} function Inherited() {} Inherited.prototype.k = 0;\n\
+             function make(C) { var o = new C(); o.k = 1; return o; }\n\
+             for (var i = 0; i < 200; i++) { make(Fresh); make(Inherited); }\n\
+             var hits = 0; var setter = { set(v) { hits++; }, configurable: true };\n\
+             Object.defineProperty(Fresh.prototype, 'k', setter);\n\
+             Object.defineProperty(Inherited.prototype, 'k', setter);\n\
+             var own = make(Fresh).hasOwnProperty('k') || make(Inherited).hasOwnProperty('k');\n\
+             hits + ':' + own";
+        assert_eq!(run_in(&mut engine, source), "2:false", "{tier:?}");
+    }
+}
+
+#[test]
 fn coll_brand_checks() {
     for src in [
         "Set.prototype.clear.call({})",
