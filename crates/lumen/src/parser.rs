@@ -3,7 +3,7 @@
 
 use crate::ast::*;
 use crate::lexer::tokenize_with_source;
-use crate::token::{Tok, Token, TplPart, KEYWORDS};
+use crate::token::{Tok, Token, TplPart};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -614,7 +614,7 @@ impl Parser {
     /// A property shorthand (`{ x }` / `{ x = d }`) binds/references `x`, so the name must be a valid
     /// identifier — not a reserved word (even one spelled with a `\u` escape, which lexes as a keyword).
     fn check_shorthand_ident(&self, name: &str) -> Result<(), ParseError> {
-        if KEYWORDS.contains(&name) {
+        if crate::token::keyword(name).is_some() {
             return self.err(format!(
                 "'{name}' is a reserved word and cannot be a shorthand property"
             ));

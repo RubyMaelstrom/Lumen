@@ -2,7 +2,7 @@
 //! streaming buys nothing) and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
 
-use crate::token::{Tok, Token, TplPart, KEYWORDS, PUNCTUATORS};
+use crate::token::{Tok, Token, TplPart, PUNCTUATORS};
 use std::rc::Rc;
 
 pub struct LexError {
@@ -460,7 +460,7 @@ impl Lexer {
         // A reserved word is always a keyword — even spelled with a `\u` escape. An escaped reserved
         // word can't be an Identifier (the parser rejects a keyword there), but it still works as a
         // property name (keywords are accepted in those positions).
-        if let Some(kw) = KEYWORDS.iter().find(|k| **k == s) {
+        if let Some(kw) = crate::token::keyword(&s) {
             self.push(Tok::Keyword(kw));
             if had_escape {
                 self.mark_escaped();
@@ -1217,28 +1217,34 @@ impl Lexer {
     }
 
     fn read_punct(&mut self) -> Result<(), LexError> {
-        let rest: String = self.chars[self.pos..(self.pos + 4).min(self.chars.len())]
-            .iter()
-            .collect();
+        // Punctuators are ASCII and at most four long: compare against a stack copy of the
+        // ASCII lookahead, and only the punctuators sharing its first byte.
+        let mut buffer = [0u8; 4];
+        let mut len = 0;
+        for &c in self.chars[self.pos..].iter().take(4) {
+            if !c.is_ascii() {
+                break;
+            }
+            buffer[len] = c as u8;
+            len += 1;
+        }
+        let rest = &buffer[..len];
         // `?.` followed by a digit is `?` then `.` (a conditional like `x ? .5 : .3`), not optional
         // chaining.
-        if rest.starts_with("?.")
-            && self
-                .chars
-                .get(self.pos + 2)
-                .is_some_and(|c| c.is_ascii_digit())
-        {
+        if rest.starts_with(b"?.") && rest.get(2).is_some_and(u8::is_ascii_digit) {
             self.bump();
             self.push(Tok::Punct("?"));
             return Ok(());
         }
-        for p in PUNCTUATORS {
-            if rest.starts_with(p) {
-                for _ in 0..p.chars().count() {
-                    self.bump();
+        if let Some(&first) = rest.first() {
+            for p in PUNCTUATORS {
+                if p.as_bytes()[0] == first && rest.starts_with(p.as_bytes()) {
+                    for _ in 0..p.len() {
+                        self.bump();
+                    }
+                    self.push(Tok::Punct(p));
+                    return Ok(());
                 }
-                self.push(Tok::Punct(p));
-                return Ok(());
             }
         }
         Err(self.err(format!(

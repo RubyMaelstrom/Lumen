@@ -103,6 +103,21 @@ pub const KEYWORDS: &[&str] = &[
     "with",
 ];
 
+/// The [`KEYWORDS`] entry `s` spells, if any. Every keyword is 2–10 lowercase ASCII letters, so
+/// the lexer rejects most identifiers (minified code is full of one-letter names) before
+/// comparing any text.
+pub fn keyword(s: &str) -> Option<&'static str> {
+    let bytes = s.as_bytes();
+    let &first = bytes.first()?;
+    if !(2..=10).contains(&bytes.len()) || !first.is_ascii_lowercase() {
+        return None;
+    }
+    KEYWORDS
+        .iter()
+        .copied()
+        .find(|k| k.len() == bytes.len() && k.as_bytes()[0] == first && *k == s)
+}
+
 /// Multi-char punctuators, longest first so the lexer is maximal-munch.
 pub const PUNCTUATORS: &[&str] = &[
     ">>>=", "...", "===", "!==", "**=", "<<=", ">>=", ">>>", "&&=", "||=", "??=", "=>", "==", "!=",
@@ -110,3 +125,25 @@ pub const PUNCTUATORS: &[&str] = &[
     "**", "<<", ">>", "{", "}", "(", ")", "[", "]", ".", ";", ",", "<", ">", "+", "-", "*", "/",
     "%", "&", "|", "^", "!", "~", "?", ":", "=", "@",
 ];
+
+#[cfg(test)]
+#[test]
+fn keyword_lookup_matches_the_reserved_word_list() {
+    for &word in KEYWORDS {
+        assert!(std::ptr::eq(keyword(word).unwrap(), word));
+    }
+    for word in [
+        "",
+        "e",
+        "If",
+        "let",
+        "of",
+        "await",
+        "ifx",
+        "instanceofs",
+        "nulL",
+        "#in",
+    ] {
+        assert_eq!(keyword(word), None, "{word}");
+    }
+}
