@@ -455,3 +455,38 @@ fn in_operator_dense_element_hits_stay_native() {
         6
     );
 }
+
+/// CreateDataPropertyOrThrow (ECMA-262 §7.3.7) appending to a self-hosted `map`/`filter`
+/// result is machine code once element storage exists: only starting the storage, moving it
+/// out of its inline slots and growing its capacity reach the checked operation, whether the
+/// values keep the numeric mirror or not.
+#[test]
+fn self_hosted_result_appends_stay_native() {
+    let mut engine = prepared(
+        Tier::Jit,
+        "var src=[];for(var i=0;i<64;i++)src.push(i);\
+         function twice(){return src.map(x=>x*2);}function boxed(){return src.map(x=>({x:x}));}\
+         function odd(){return src.filter(x=>x&1);}",
+    );
+    evaluate(
+        &mut engine,
+        "for(var warm=0;warm<16;warm++){twice();boxed();odd();}",
+    );
+    let before = crate::bytecode::TEST_JIT_DEFINE_ELEMENT_HELPERS.with(std::cell::Cell::get);
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            "var s=0;for(var r=0;r<10;r++){var a=twice(),b=boxed(),c=odd();\
+             s+=a[63]+b[63].x+c[31]+a.length+b.length+c.length;}s"
+        ),
+        "4120"
+    );
+    let entries =
+        crate::bytecode::TEST_JIT_DEFINE_ELEMENT_HELPERS.with(std::cell::Cell::get) - before;
+    // Per result: start the storage, leave its 10 inline slots, then capacity doublings of the
+    // element Vec and (for Numbers) of the mirror — logarithmic, never one per element.
+    assert!(
+        entries <= 30 * 8,
+        "{entries} checked appends for 30 results of up to 64 elements"
+    );
+}

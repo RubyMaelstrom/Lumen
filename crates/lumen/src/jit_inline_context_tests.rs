@@ -183,3 +183,42 @@ fn frame_independent_effects_still_inline_with_local_and_receiver_remapping() {
     );
     require_hot_native(&mut engine, "hotIndependent", true);
 }
+
+/// A spliced self-hosted built-in (`crate::self_hosted`) compiles its intrinsics to the same
+/// operations as its own body: they resolve in its private environment, never as free names of
+/// the caller. The built-ins are strict, so only strict callers splice them (and only at calls
+/// that are not proper tail calls).
+#[test]
+fn hot_self_hosted_methods_keep_their_intrinsics_when_spliced() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            'use strict';
+            var values=[1,2,3,4];
+            function anyLarge(list){var r=list.some(function(x){return x>3;});return r;}
+            function firstAbove(list){var r=list.find(function(x){return x>2;});return r;}
+            function drive(){var n=0;for(var k=0;k<1000;k++)n+=anyLarge(values)+firstAbove(values);return n;}
+            drive()+'|'+anyLarge([])+'|'+(function(){try{anyLarge(null)}catch(e){return e.name}})();
+        "#
+            ),
+            "4000|false|TypeError",
+            "{tier:?}"
+        );
+        if tier == Tier::Jit {
+            require_hot_native(&mut engine, "anyLarge", true);
+            // Where the JIT spliced the call (asserted above), the body kept its operations.
+            let caller = function(&mut engine, "anyLarge");
+            if let Some(spliced) = caller.code2.get().and_then(Option::as_ref) {
+                assert!(spliced
+                    .jit_ops()
+                    .iter()
+                    .any(|op| matches!(op, crate::bytecode::Op::Abstract(_))));
+            }
+        }
+    }
+}

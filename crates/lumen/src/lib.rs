@@ -106,6 +106,7 @@ mod script_entry_tests;
 mod script_scope_tests;
 #[cfg(test)]
 mod script_tiering_tests;
+mod self_hosted;
 #[cfg(test)]
 mod shared_layout_tests;
 mod snapshot;

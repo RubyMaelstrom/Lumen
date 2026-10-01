@@ -300,6 +300,11 @@ fn compile(
 ) -> Option<(Rc<Chunk>, u16, Vec<u16>)> {
     let (kind, source) = source.owned();
     let mut c = Compiler {
+        // Fragments borrow a tree-walker frame and never know its function. Self-hosted
+        // built-ins compile on their first call, so they reach the tree-walker only in the
+        // interpreter-only tier, which compiles no fragments; their intrinsics' native forms
+        // would in any case have the same semantics.
+        self_hosted: false,
         lean_new_target: false,
         rest_slot: None,
         arguments_length_only: false,

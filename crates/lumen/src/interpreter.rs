@@ -2870,6 +2870,9 @@ pub struct Interp {
     /// All JS identity and AST pins are Weak; this cache cannot keep a closure or realm alive.
     pub(crate) native_callback_cache: Option<Rc<crate::callback::CallbackCache>>,
     pub(crate) proxy_trap_caches: Option<Rc<ProxyTrapCaches>>,
+    /// The parsed self-hosted built-in source, shared by every Realm this interpreter creates
+    /// (see `crate::self_hosted`).
+    pub(crate) self_hosted: std::cell::OnceCell<Rc<crate::self_hosted::SelfHostedSource>>,
     /// Small ordered key layouts learned from successful ordinary construction, keyed and
     /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
@@ -3254,6 +3257,7 @@ interp_memory_inventory! {
     call_overflow => "measured",
     native_callback_cache => "measured",
     proxy_trap_caches => "measured",
+    self_hosted => "measured",
     construct_capacity_hints => "measured",
     iterator_sym => "measured",
     wk_syms => "measured",
@@ -3371,7 +3375,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 152);
+    assert_eq!(names.len(), 153);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4215,6 +4219,7 @@ impl Interp {
             call_overflow: Default::default(),
             native_callback_cache: None,
             proxy_trap_caches: None,
+            self_hosted: std::cell::OnceCell::new(),
             construct_capacity_hints: Default::default(),
             iterator_sym: None,
             wk_syms: Vec::new(),
@@ -6749,20 +6754,6 @@ impl Interp {
         body.ic_plain.get()
             && matches!(body.exotic, Exotic::Array | Exotic::None)
             && body.props.get_index(index).is_some()
-    }
-
-    /// HasProperty + Get of element `index` for an ordinary Array or object whose element is an
-    /// own present data property: the value, packed. A set `ic_plain` byte excludes every
-    /// side-table internal method (Proxy, typed array, namespace, Web IDL indexed object), and
-    /// the `exotic` check excludes arguments/wrapper objects. `None` routes the caller to the
-    /// general algorithms (holes consult the prototype chain there).
-    #[inline]
-    pub(crate) fn plain_own_element_packed(object: &Gc, index: u32) -> Option<PackedValue> {
-        let body = object.borrow();
-        if !body.ic_plain.get() || !matches!(body.exotic, Exotic::Array | Exotic::None) {
-            return None;
-        }
-        body.props.own_element_data_packed(index)
     }
 
     /// `o[n]` read fast path: a dense data element or a Number-content TypedArray index, without
@@ -13523,7 +13514,11 @@ impl Interp {
                 func.calls.set(n);
                 // A body with a loop compiles on its first call: one call can run a million
                 // iterations, so the call-count threshold would leave it on the tree-walker.
-                if n > self.tier_threshold || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0 {
+                // So does a self-hosted built-in: engine code gathers no useful warm-up.
+                if n > self.tier_threshold
+                    || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0
+                    || func.self_hosted
+                {
                     let compiled = if derived_class_construct {
                         crate::bytecode::compile_derived_constructor(func)
                     } else {

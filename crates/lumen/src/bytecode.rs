@@ -1344,6 +1344,44 @@ pub enum UpdKind {
     DecDiscard,
 }
 
+/// An ECMA-262 abstract operation performed directly by [`Op::Abstract`]. Only the engine's
+/// self-hosted built-ins (`crate::self_hosted`) compile these, from calls of the intrinsic of
+/// the same name; each step is the specification's, including the order of its abrupt
+/// completions. Operand `u32`s index the chunk's `names` (message text).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbstractOp {
+    /// ToObject(V) (§7.1.18): pops V, pushes the Object. The *TypeError* for undefined or null
+    /// names the built-in method `names[n]`.
+    ToObject(u32),
+    /// LengthOfArrayLike(O) (§7.3.18): pops O, pushes ℝ(? ToLength(? Get(O, "length"))) as a
+    /// Number.
+    LengthOfArrayLike,
+    /// IsCallable(V) (§7.2.3): pops V, pushes a Boolean.
+    IsCallable,
+    /// ArraySpeciesCreate(O, length) (§10.4.2.3): pops [O, length], pushes the new object.
+    ArraySpeciesCreate,
+    /// CreateDataPropertyOrThrow(O, P, V) (§7.3.7): pops [O, P, V], pushes *true*. P is any
+    /// value; it is converted by ToPropertyKey (an array-index Number is used directly).
+    CreateDataPropertyOrThrow,
+    /// Throw a *TypeError* of the current Realm with message `names[n]`. Its result slot (stack
+    /// effect (0, 1), keeping the call expression's shape) is never written.
+    ThrowTypeError(u32),
+}
+
+impl AbstractOp {
+    /// Operands popped and results pushed.
+    pub(crate) fn stack_effect(self) -> (usize, usize) {
+        match self {
+            AbstractOp::ToObject(_) | AbstractOp::LengthOfArrayLike | AbstractOp::IsCallable => {
+                (1, 1)
+            }
+            AbstractOp::ArraySpeciesCreate => (2, 1),
+            AbstractOp::CreateDataPropertyOrThrow => (3, 1),
+            AbstractOp::ThrowTypeError(_) => (0, 1),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     FragmentExit(FragmentExitKind),
@@ -1675,6 +1713,8 @@ pub enum Op {
     /// [`Op::ObjectMethod`] (function index, kind) for a static identifier or string key
     /// (`names` index).
     ObjectMethodName(u32, u8, u32),
+    /// An ECMA-262 abstract operation of the self-hosted built-ins (see [`AbstractOp`]).
+    Abstract(AbstractOp),
     /// Meta/import/private-name expression forms. DynamicImport's bool says whether an options
     /// operand is present; its phase is the parsed proposal/core import phase.
     ImportMeta,
@@ -5625,6 +5665,7 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         is_method: false,
         is_fn_expr: false,
         default_ctor: false,
+        self_hosted: false,
         source: None,
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
@@ -5666,6 +5707,7 @@ pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
         is_method: false,
         is_fn_expr: false,
         default_ctor: false,
+        self_hosted: false,
         source: None,
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
@@ -5955,6 +5997,7 @@ fn compile_inner(
         }
     }
     let mut c = Compiler {
+        self_hosted: func.self_hosted,
         lean_new_target,
         rest_slot: None,
         arguments_length_only,
@@ -6695,6 +6738,7 @@ fn inline_capability(op: &Op) -> InlineCapability {
         | Op::InstanceOf(_)
         | Op::In
         | Op::GenBin(_)
+        | Op::Abstract(_)
         | Op::Neg
         | Op::Plus
         | Op::Not
@@ -7013,6 +7057,10 @@ fn integer_switch_cases(cases: &[SwitchCase]) -> Option<Vec<(i32, usize)>> {
 
 #[derive(Default)]
 struct Compiler {
+    /// Compiling a body of the engine's self-hosted built-in source (see `crate::self_hosted`):
+    /// calls of its intrinsics' free names compile to operations (see `self_hosted_intrinsic`).
+    /// Follows the function being compiled, including a callee spliced by the inliner.
+    self_hosted: bool,
     /// ECMA-262 GetNewTarget in an ordinary function compiled without a Function Environment
     /// Record. Every call path installs the callee's [[NewTarget]] as the interpreter's current
     /// value and restores the caller's around nested calls, so the body reads it directly. An
@@ -7839,6 +7887,9 @@ impl Compiler {
         let saved_try = std::mem::replace(&mut self.try_depth, 0);
         let saved_this = std::mem::replace(&mut self.inline_this, this_slot);
         let saved_returns = std::mem::take(&mut self.inline_returns);
+        // The body compiles as its own function would: a self-hosted callee's intrinsics are
+        // operations, never free names of the caller (the plan found none in its chunk).
+        let saved_self_hosted = std::mem::replace(&mut self.self_hosted, f.self_hosted);
         self.inline_depth += 1;
         self.plan_stack.push((w.nested.clone(), 0));
         let hot_chunk = f.code.get().and_then(Option::as_ref);
@@ -7873,6 +7924,7 @@ impl Compiler {
         self.cache_seed_stack.pop();
         self.plan_stack.pop();
         self.inline_depth -= 1;
+        self.self_hosted = saved_self_hosted;
         let returns = std::mem::replace(&mut self.inline_returns, saved_returns);
         self.inline_this = saved_this;
         self.try_depth = saved_try;
@@ -8303,6 +8355,71 @@ impl Compiler {
             }
         }
         Ok(CallArgsMode::Array)
+    }
+
+    /// Compile a call of a self-hosted built-in's intrinsic (see `crate::self_hosted`) to the
+    /// operation it names: `Call(F, V, ...args)` becomes the method-call sequence with V as the
+    /// receiver, and every other intrinsic its [`AbstractOp`]. Only engine source compiles
+    /// these, only while the name is free (it then resolves to the intrinsic's own binding,
+    /// whose native form the tree-walking interpreter calls with identical semantics), and only
+    /// with the intrinsic's exact arity and plain arguments; a message operand must be a string
+    /// literal. Returns whether the call was compiled; any other shape is an ordinary call.
+    fn self_hosted_intrinsic(&mut self, callee: &Expr, args: &[ArrayElem]) -> Result<bool, Bail> {
+        if !self.self_hosted {
+            return Ok(false);
+        }
+        let Expr::Ident(name) = callee else {
+            return Ok(false);
+        };
+        if self.home(name).is_some() {
+            return Ok(false);
+        }
+        let Some(items) = args
+            .iter()
+            .map(|argument| match argument {
+                ArrayElem::Item(expr) => Some(expr),
+                ArrayElem::Spread(_) | ArrayElem::Hole => None,
+            })
+            .collect::<Option<Vec<&Expr>>>()
+        else {
+            return Ok(false);
+        };
+        let message = |index: usize| match items.get(index) {
+            Some(Expr::Str(text)) => Some(text.clone()),
+            _ => None,
+        };
+        // (operation, value operands); a message operand is folded into the operation.
+        let (op, operands) = match (name.as_str(), items.len()) {
+            ("Call", argc) if argc >= 2 => {
+                // The receiver sits beneath the callee, exactly as for `V.method(...args)`.
+                self.expr(items[1])?;
+                self.expr(items[0])?;
+                self.finish_call(&args[2..], true, true)?;
+                return Ok(true);
+            }
+            ("ToObject", 2) => {
+                let Some(method) = message(1) else {
+                    return Ok(false);
+                };
+                (AbstractOp::ToObject(self.name_idx(&method)), 1)
+            }
+            ("LengthOfArrayLike", 1) => (AbstractOp::LengthOfArrayLike, 1),
+            ("IsCallable", 1) => (AbstractOp::IsCallable, 1),
+            ("ArraySpeciesCreate", 2) => (AbstractOp::ArraySpeciesCreate, 2),
+            ("CreateDataPropertyOrThrow", 3) => (AbstractOp::CreateDataPropertyOrThrow, 3),
+            ("ThrowTypeError", 1) => {
+                let Some(text) = message(0) else {
+                    return Ok(false);
+                };
+                (AbstractOp::ThrowTypeError(self.name_idx(&text)), 0)
+            }
+            _ => return Ok(false),
+        };
+        for item in &items[..operands] {
+            self.expr(item)?;
+        }
+        self.emit(Op::Abstract(op));
+        Ok(true)
     }
 
     fn finish_call(&mut self, args: &[ArrayElem], with_this: bool, allow_inline: bool) -> CResult {
@@ -12332,6 +12449,9 @@ impl Compiler {
                 args,
                 optional: false,
             } => {
+                if self.self_hosted_intrinsic(callee, args)? {
+                    return Ok(());
+                }
                 if matches!(&**callee, Expr::Ident(n) if n == "eval") {
                     if !self.direct_eval {
                         return Err(Bail);
@@ -15226,6 +15346,44 @@ fn run_vm_inner<S: StoredValue>(
                 };
                 i.copy_data_properties_into(&object, &source, &[])?;
             }
+            Op::Abstract(operation) => match operation {
+                AbstractOp::ToObject(method) => {
+                    let value = pop!();
+                    let method = &chunk.names[method as usize];
+                    stack.push(crate::self_hosted::to_object(i, value, method)?);
+                }
+                AbstractOp::LengthOfArrayLike => {
+                    let object = pop!();
+                    let length = crate::self_hosted::length_of_array_like(i, &object)?;
+                    stack.push(Value::Num(length));
+                }
+                AbstractOp::IsCallable => {
+                    let value = pop!();
+                    stack.push(Value::Bool(value.is_callable()));
+                }
+                AbstractOp::ArraySpeciesCreate => {
+                    let length = pop!();
+                    let original = pop!();
+                    let array = crate::self_hosted::array_species_create(i, &original, &length)?;
+                    stack.push(array);
+                }
+                AbstractOp::CreateDataPropertyOrThrow => {
+                    let value = pop!();
+                    let key = pop!();
+                    let object = pop!();
+                    crate::self_hosted::create_data_property_or_throw(
+                        i,
+                        &object,
+                        &key,
+                        PackedValue::pack(value),
+                    )?;
+                    stack.push(Value::Bool(true));
+                }
+                AbstractOp::ThrowTypeError(message) => {
+                    let message = &chunk.names[message as usize];
+                    return Err(crate::self_hosted::type_error(i, message));
+                }
+            },
             Op::ObjectProto => {
                 let prototype = pop!();
                 let Value::Obj(object) = stack.last().expect("object builder missing") else {
@@ -18637,6 +18795,7 @@ impl Chunk {
                 (2, 1)
             }
             Op::ObjectMethodName(..) => (1, 1),
+            Op::Abstract(op) => op.stack_effect(),
             Op::ImportMeta | Op::NewTarget | Op::TemplateObject(_) => (0, 1),
             Op::DynamicImport(_, has_options) => (usize::from(*has_options) + 1, 1),
             Op::PrivateIn(_) => (1, 1),
@@ -20716,6 +20875,9 @@ thread_local! {
     pub(crate) static TEST_JIT_IN_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    pub(crate) static TEST_JIT_DEFINE_ELEMENT_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     pub(crate) static TEST_JIT_TYPEOF_IS_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -20780,6 +20942,92 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
+}
+
+/// Dedicated [`Op::Abstract`] entry (same contract as [`jit_exec`]): the self-hosted
+/// built-ins' abstract operations without the generic operation dispatch.
+pub(crate) unsafe extern "C" fn jit_abstract_operation(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    mut sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let ctx = &mut *ctx;
+    jit_opstat(ctx, pc);
+    let chunk = &*ctx.chunk;
+    let Op::Abstract(operation) = chunk.ops[pc as usize] else {
+        unreachable!("jit_abstract_operation emitted only for Op::Abstract");
+    };
+    match jit_abstract_operation_inner(ctx, operation, &mut sp) {
+        Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+        Err(abrupt) => {
+            ctx.error = Some(abrupt);
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
+/// [`Op::Abstract`] on the native operand stack. Every operand is moved into Rust ownership
+/// (and `sp` lowered past it) before the fallible step, so an abrupt completion drops each
+/// exactly once and leaves `sp` at the unwind boundary. CreateDataPropertyOrThrow keeps the
+/// value packed on the array-element path.
+unsafe fn jit_abstract_operation_inner(
+    ctx: &mut crate::jit::JitCtx,
+    operation: AbstractOp,
+    sp: &mut *mut PackedValue,
+) -> Result<(), Abrupt> {
+    let i = &mut *ctx.interp;
+    let chunk = &*ctx.chunk;
+    macro_rules! pop {
+        () => {{
+            *sp = sp.sub(1);
+            sp.read().into_value()
+        }};
+    }
+    macro_rules! push {
+        ($v:expr) => {{
+            sp.write(PackedValue::pack($v));
+            *sp = sp.add(1);
+        }};
+    }
+    match operation {
+        AbstractOp::ToObject(method) => {
+            let value = pop!();
+            let method = &chunk.names[method as usize];
+            push!(crate::self_hosted::to_object(i, value, method)?);
+        }
+        AbstractOp::LengthOfArrayLike => {
+            let object = pop!();
+            push!(Value::Num(crate::self_hosted::length_of_array_like(
+                i, &object
+            )?));
+        }
+        AbstractOp::IsCallable => {
+            let value = pop!();
+            push!(Value::Bool(value.is_callable()));
+        }
+        AbstractOp::ArraySpeciesCreate => {
+            let length = pop!();
+            let original = pop!();
+            push!(crate::self_hosted::array_species_create(
+                i, &original, &length
+            )?);
+        }
+        AbstractOp::CreateDataPropertyOrThrow => {
+            #[cfg(test)]
+            TEST_JIT_DEFINE_ELEMENT_HELPERS.with(|count| count.set(count.get() + 1));
+            *sp = sp.sub(1);
+            let value = sp.read();
+            let key = pop!();
+            let object = pop!();
+            crate::self_hosted::create_data_property_or_throw(i, &object, &key, value)?;
+            push!(Value::Bool(true));
+        }
+        AbstractOp::ThrowTypeError(message) => {
+            let message = &chunk.names[message as usize];
+            return Err(crate::self_hosted::type_error(i, message));
+        }
+    }
+    Ok(())
 }
 
 /// Dedicated `Op::New` entry (same contract as [`jit_exec`]): enters the identity-cached
@@ -22736,6 +22984,7 @@ unsafe fn jit_exec_inner(
         | Op::ObjectSpread
         | Op::ObjectMethod(..)
         | Op::ObjectMethodName(..) => jit_object_literal_inner(ctx, pc, sp)?,
+        Op::Abstract(operation) => jit_abstract_operation_inner(ctx, operation, sp)?,
         Op::NewTarget => {
             // GetNewTarget follows the nearest this-binding Environment Record;
             // an arrow must observe its defining environment, not the caller. A lean ordinary

@@ -161,6 +161,18 @@ The standalone engine shell accepts `--tier=interp|bytecode|jit`. The runtime CL
 current argument parser only accepts `--tier=interp|bytecode`; use `LUMEN_TIER=jit`
 or the default for runtime JIT execution.
 
+Some built-ins are self-hosted: `crates/lumen/src/self_hosted/*.js` defines them as strict
+JavaScript methods, evaluated per Realm in a private environment whose only bindings are
+the intrinsics documented in `self_hosted.rs` (ECMA-262 abstract operations such as
+`ToObject`, `LengthOfArrayLike`, `ArraySpeciesCreate`, `CreateDataPropertyOrThrow` and
+`Call`). The tree-walker calls the intrinsics' native forms; the bytecode compiler emits
+`Op::Abstract` or an ordinary method call, including where the inliner splices a
+self-hosted body into a caller. Write self-hosted source step for step from the
+specification: it may observe nothing the algorithm does not (no author-reachable global,
+prototype method or `Function.prototype` member), and its methods receive their specified
+`length` at installation. They render as NativeFunction, are not constructors and compile
+on their first call. Add Node-verified tests across every tier for each change.
+
 Preserve activation and GC boundaries in generated calls: bind thread-local GC
 state at execution time and discard callee-owned exception handlers before restoring
 the caller. Keep raw object-layout assumptions validated against live Rust types

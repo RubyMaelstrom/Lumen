@@ -40,6 +40,31 @@ pub fn parse_script_eval(
     allow_super: bool,
     private_names: &[String],
 ) -> Result<Vec<Stmt>, ParseError> {
+    parse_script_with(
+        src,
+        strict,
+        allow_new_target,
+        allow_super,
+        private_names,
+        false,
+    )
+}
+
+/// Parse the engine's self-hosted built-in source (strict script code; see
+/// `crate::self_hosted`). Every function it contains is marked [`Function::self_hosted`] and
+/// retains no source text.
+pub(crate) fn parse_self_hosted(src: &str) -> Result<Vec<Stmt>, ParseError> {
+    parse_script_with(src, true, false, false, &[], true)
+}
+
+fn parse_script_with(
+    src: &str,
+    strict: bool,
+    allow_new_target: bool,
+    allow_super: bool,
+    private_names: &[String],
+    self_hosted: bool,
+) -> Result<Vec<Stmt>, ParseError> {
     let lexed = tokenize_with_source(src).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
@@ -78,6 +103,7 @@ pub fn parse_script_eval(
         last_paren: false,
         single_stmt: false,
         in_static_block: false,
+        self_hosted,
     };
     let strict_prologue = p.has_use_strict_prologue();
     p.strict = p.strict || strict_prologue;
@@ -159,6 +185,7 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         last_paren: false,
         single_stmt: false,
         in_static_block: false,
+        self_hosted: false,
     };
     let perf_started = crate::jit::perf_stage_start();
     let body = match p.parse_stmts_until_eof() {
@@ -409,6 +436,10 @@ struct Parser {
     /// Inside a `static { … }` class block, where `await` is reserved entirely (neither an
     /// identifier nor an await expression). Cleared by nested function boundaries.
     in_static_block: bool,
+    /// Parsing the engine's self-hosted built-in source (see `crate::self_hosted`): every
+    /// function is marked [`Function::self_hosted`] and keeps no source text, so
+    /// Function.prototype.toString renders it as a NativeFunction.
+    self_hosted: bool,
 }
 
 #[derive(Default)]
@@ -436,6 +467,9 @@ impl Parser {
     }
     /// The source text between two char offsets (a function's `toString` view).
     fn src_slice(&self, start: u32, end: u32) -> Option<Rc<str>> {
+        if self.self_hosted {
+            return None;
+        }
         let (s, e) = (start as usize, end as usize);
         if s <= e && e <= self.src_chars.len() {
             Some(Rc::from(self.src_chars[s..e].iter().collect::<String>()))
@@ -2908,6 +2942,7 @@ impl Parser {
                         last_paren: false,
                         single_stmt: false,
                         in_static_block: false,
+                        self_hosted: self.self_hosted,
                     };
                     // A substitution is ToString'd (string hint), not concatenated raw.
                     let e = sub.parse_expr()?;
@@ -2977,6 +3012,7 @@ impl Parser {
                         last_paren: false,
                         single_stmt: false,
                         in_static_block: false,
+                        self_hosted: self.self_hosted,
                     };
                     let e = sub.parse_expr()?;
                     self.proto_dups.append(&mut sub.proto_dups);
@@ -3338,6 +3374,7 @@ impl Parser {
             is_method: false,
             is_fn_expr: is_expr,
             default_ctor: false,
+            self_hosted: self.self_hosted,
             source: self.src_slice(start, self.prev_end()),
         };
         // A function declaration/expression is never a derived constructor, so a `super(...)` call
@@ -3544,6 +3581,7 @@ impl Parser {
                 is_method: false,
                 is_fn_expr: false,
                 default_ctor: false,
+                self_hosted: self.self_hosted,
                 source: None,
             };
             return Ok(vec![ClassMember {
@@ -3723,6 +3761,7 @@ impl Parser {
             is_method: true,
             is_fn_expr: false,
             default_ctor: false,
+            self_hosted: self.self_hosted,
             source: self.src_slice(start, self.prev_end()),
         })
     }
@@ -3966,6 +4005,7 @@ impl Parser {
                 is_method: false,
                 is_fn_expr: false,
                 default_ctor: false,
+                self_hosted: self.self_hosted,
                 source: self.src_slice(start, self.prev_end()),
             }
         } else {
@@ -3989,6 +4029,7 @@ impl Parser {
                 is_method: false,
                 is_fn_expr: false,
                 default_ctor: false,
+                self_hosted: self.self_hosted,
                 source: self.src_slice(start, self.prev_end()),
             }
         };

@@ -1772,6 +1772,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         optimizing_loop_enter as *const () as usize,
         crate::bytecode::jit_make_closure as *const () as usize,
         crate::bytecode::jit_object_literal as *const () as usize,
+        crate::bytecode::jit_abstract_operation as *const () as usize,
     ]
 }
 
@@ -1892,7 +1893,9 @@ pub const H_OPT_LOOP: usize = 32;
 pub const H_MAKE_CLOSURE: usize = 33;
 /// Incremental object-literal builder ops (see `bytecode::jit_object_literal`).
 pub const H_OBJECT_LITERAL: usize = 34;
-pub const N_HELPERS: usize = 35;
+/// Self-hosted built-ins' abstract operations (see `bytecode::jit_abstract_operation`).
+pub const H_ABSTRACT: usize = 35;
+pub const N_HELPERS: usize = 36;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -1933,6 +1936,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "optimizing_loop",
     "make_closure",
     "object_literal",
+    "abstract_operation",
 ];
 
 #[inline]
@@ -10823,6 +10827,235 @@ fn emit_in_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, l
     a.b(done);
     a.bind(slow);
     emit_op_helper(a, H_EXEC, pc, l_unwind);
+    a.bind(done);
+}
+
+/// Whether [`emit_define_elem_inline`]'s offsets fit its addressing forms and its packed-element
+/// and length-entry assumptions match the probed layout.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn define_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
+    let props = layout.obj_props;
+    let mirror = layout.dense_mirror;
+    crate::value::dense_elements_enabled()
+        && elem_inlinable(layout)
+        && packed_elem_inlinable(layout)
+        // The length entry and the packed elements are both `Property` values.
+        && layout.entry_size == layout.property_size
+        && layout.entry_value == layout.property_value
+        && layout.entry_accessor == layout.property_meta
+        && layout.dense_inline_capacity < 256
+        && [
+            layout.obj_extensible,
+            props + layout.props_proto_flag,
+            props + layout.props_elem_mode,
+            props + layout.props_has_far,
+            props + layout.props_mirror_flags,
+        ]
+        .into_iter()
+        .all(|off| off < 4096)
+        && (props + layout.props_len_slot).is_multiple_of(4)
+        && (props + layout.props_len_slot) / 4 < 4096
+        && [
+            props + layout.props_entries + layout.vec_ptr_off,
+            mirror + layout.vec_ptr_off,
+            mirror + layout.vec_len_off,
+            mirror + layout.vec_cap_off,
+            layout.vec_cap_off,
+        ]
+        .into_iter()
+        .all(|off| off.is_multiple_of(8) && off / 8 < 4096)
+}
+
+/// Inline CreateDataPropertyOrThrow(A, k, V) ([`crate::bytecode::AbstractOp`]; ECMA-262 §7.3.7)
+/// for the case every element of a self-hosted `map`/`filter` result takes: A is a plain,
+/// extensible Array — no prototype, so no proof depends on its shape — whose packed elements
+/// end exactly at k with spare capacity and whose `length` is a writable data property.
+/// Array.[[DefineOwnProperty]] (§10.4.2.1) then appends { [[Value]]: V, [[Writable]],
+/// [[Enumerable]], [[Configurable]]: true } and, at or past `length`, sets it to k + 1: the
+/// machine-code form of `Props::try_define_dense_element`'s append, including its numeric
+/// mirror. V's word moves into the element. Every guard branches to the checked operation
+/// before any write; it also starts, grows and converts element storage.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_define_elem_inline(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    pc: u32,
+    l_unwind: usize,
+) {
+    use crate::value::{MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK, MIRROR_PACKED};
+    debug_assert!(define_elem_inlinable(layout));
+    let strong = layout.rc_strong_off as i32;
+    let props = layout.obj_props as u32;
+    let mirror = layout.dense_mirror as u32;
+    let (vec_ptr, vec_len, vec_cap) = (
+        layout.vec_ptr_off as u32,
+        layout.vec_len_off as u32,
+        layout.vec_cap_off as u32,
+    );
+    let slow = a.new_label();
+    let done = a.new_label();
+    let inline = a.new_label();
+    let slot_ready = a.new_label();
+    let no_mirror = a.new_label();
+    let mirror_ready = a.new_label();
+    // 1. stack: [A @ -24, k @ -16, V @ -8]. A an Object; k a Number that is exactly a u32 (x9,
+    //    d0); V an ordinary value word (x13) that can move into a property.
+    emit_exec_word_load(a, 9, 20, -24);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    emit_exec_word_load(a, 9, 20, -16);
+    emit_exec_number_guard(a, 9, 0, 11, slow);
+    a.ldur_d(0, 20, -16);
+    a.fcvtzu_w_d(9, 0);
+    a.ucvtf_d_w(1, 9);
+    a.fcmp(0, 1);
+    a.b_cond(C_NE, slow);
+    emit_exec_word_load(a, 13, 20, -8);
+    a.lsr_imm(14, 13, 48);
+    for tag in [crate::value::PACK_EMPTY, crate::value::PACK_LAZY_PROTO] {
+        a.mov_imm64(15, tag >> 48);
+        a.cmp_reg_w(14, 15);
+        a.b_cond(C_EQ, slow);
+    }
+    // 2. A's refcount > 1, so dropping the operand never frees (x10 = Rc pointer).
+    emit_exec_word_load(a, 10, 20, -24);
+    emit_exec_payload(a, 10, 10);
+    a.ldur(11, 10, strong);
+    a.cmp_imm_x(11, 1);
+    a.b_cond(C_LS, slow);
+    // 3. An extensible, plain Array (x11 = Object) ...
+    a.add_imm(11, 10, layout.obj_from_rc as u32);
+    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+    a.cmp_imm_w(12, layout.exotic_array_tag as u32);
+    a.b_cond(C_NE, slow);
+    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
+    a.cbz(12, false, slow);
+    a.ldrb_imm(12, 11, layout.obj_extensible as u32);
+    a.cbz(12, false, slow);
+    // ... that is no marked prototype, keeps every index in element storage ...
+    a.ldrb_imm(12, 11, props + layout.props_proto_flag as u32);
+    a.cbnz(12, false, slow);
+    a.ldrb_imm(12, 11, props + layout.props_elem_mode as u32);
+    a.cbz(12, false, slow);
+    a.ldrb_imm(12, 11, props + layout.props_has_far as u32);
+    a.cbnz(12, false, slow);
+    // ... and has a memoized, writable data `length` holding a Number (x14 = entry, d1 = L).
+    a.ldr_w_imm(12, 11, props + layout.props_len_slot as u32);
+    a.cmn_imm_w(12, 1);
+    a.b_cond(C_EQ, slow);
+    a.ldr_imm(
+        14,
+        11,
+        props + (layout.props_entries + layout.vec_ptr_off) as u32,
+    );
+    a.mov_imm64(15, layout.entry_size as u64);
+    a.madd(14, 12, 15, 14);
+    guard_prop_data(a, 15, 14, layout.entry_accessor as u32, slow);
+    guard_prop_writable(a, 15, 14, layout.entry_writable as u32, slow);
+    a.ldur(15, 14, layout.entry_value as i32);
+    emit_exec_number_guard(a, 15, 1, 16, slow);
+    // 4. Packed storage ending at k with room for one more (x16 = length, x17 = the new slot;
+    //    x15 = the heap Vec header, or null for inline slots).
+    a.ldr_imm(12, 11, props + layout.props_elems as u32);
+    a.cbz(12, true, slow);
+    a.ldr_imm(15, 12, layout.dense_packed as u32);
+    a.cbz(15, true, inline);
+    a.ldr_imm(16, 15, vec_len);
+    a.cmp_reg_x(9, 16);
+    a.b_cond(C_NE, slow);
+    a.ldr_imm(17, 15, vec_cap);
+    a.cmp_reg_x(16, 17);
+    a.b_cond(C_HS, slow);
+    a.ldr_imm(17, 15, vec_ptr);
+    a.add_shifted(17, 17, 16, 4); // property_size == 16 (packed_elem_inlinable)
+    a.b(slot_ready);
+    a.bind(inline);
+    a.ldrb_imm(16, 12, layout.dense_inline_len as u32);
+    a.cbz(16, false, slow); // no packed storage yet: the checked operation starts it
+    a.cmp_reg_x(9, 16);
+    a.b_cond(C_NE, slow);
+    a.cmp_imm_w(16, layout.dense_inline_capacity as u32);
+    a.b_cond(C_HS, slow);
+    a.add_imm(17, 12, layout.dense_inline_data as u32);
+    a.add_shifted(17, 17, 16, 4);
+    a.bind(slot_ready);
+    // 5. The numeric mirror (w0 = flags): inactive, or coherent with the packed elements with
+    //    room for V, which must be a Number other than the hole pattern (d2). Anything else is
+    //    the checked operation's to invalidate.
+    a.ldrb_imm(0, 11, props + layout.props_mirror_flags as u32);
+    a.cbz(0, false, no_mirror);
+    for bit in [MIRROR_OK, MIRROR_PACKED] {
+        a.logic_imm_w(0, 1, 0, asm::logical_imm_w(bit as u32).unwrap());
+        a.cbz(1, false, slow);
+    }
+    emit_exec_number_guard(a, 13, 2, 1, slow);
+    a.mov_imm64(1, MIRROR_HOLE);
+    a.cmp_reg_x(13, 1);
+    a.b_cond(C_EQ, slow);
+    a.ldr_imm(2, 12, mirror + vec_len);
+    a.cmp_reg_x(2, 16);
+    a.b_cond(C_NE, slow);
+    a.ldr_imm(3, 12, mirror + vec_cap);
+    a.cmp_reg_x(2, 3);
+    a.b_cond(C_HS, slow);
+    // --- commit: element, mirror, length; nothing below can fail ---
+    a.ldr_imm(3, 12, mirror + vec_ptr);
+    a.str_d_lsl3(2, 3, 2);
+    a.add_imm(2, 2, 1);
+    a.str_imm(2, 12, mirror + vec_len);
+    // MIRROR_ALL_I32 survives only an exact i32 (bit-identical round trip: not -0, NaN or a
+    // fraction).
+    a.fcvtzs_w_d(1, 2);
+    a.scvtf_d_w(3, 1);
+    a.fmov_x_d(1, 3);
+    a.cmp_reg_x(1, 13);
+    a.b_cond(C_EQ, mirror_ready);
+    let keep = asm::logical_imm_w(!(MIRROR_ALL_I32 as u32)).unwrap();
+    a.logic_imm_w(0, 0, 0, keep);
+    a.strb_imm(0, 11, props + layout.props_mirror_flags as u32);
+    a.b(mirror_ready);
+    a.bind(no_mirror);
+    // --- commit (no mirror) ---
+    a.bind(mirror_ready);
+    a.stur(13, 17, layout.property_value as i32);
+    a.mov_imm64(
+        1,
+        (crate::value::PROP_WRITABLE
+            | crate::value::PROP_ENUMERABLE
+            | crate::value::PROP_CONFIGURABLE) as u64,
+    );
+    a.stur(1, 17, layout.property_meta as i32);
+    a.add_imm(16, 16, 1);
+    let inline_appended = a.new_label();
+    let appended = a.new_label();
+    a.cbz(15, true, inline_appended);
+    a.str_imm(16, 15, vec_len);
+    a.b(appended);
+    a.bind(inline_appended);
+    a.strb_imm(16, 12, layout.dense_inline_len as u32);
+    a.bind(appended);
+    // k ≥ length: length = k + 1 (exact: k < 2^32 − 1 because it equals a storage length).
+    let length_kept = a.new_label();
+    a.fcmp(0, 1);
+    a.b_cond(C_LO, length_kept);
+    a.ucvtf_d_w(1, 16);
+    a.stur_d(1, 14, layout.entry_value as i32);
+    a.bind(length_kept);
+    // Drop A (strong was > 1; the key is a Number): [A, k, V] → [true].
+    a.ldur(1, 10, strong);
+    a.sub_imm(1, 1, 1);
+    a.stur(1, 10, strong);
+    a.mov_imm64(1, crate::value::PACK_BOOL | 1);
+    emit_exec_word_store(a, 1, 20, -24);
+    a.sub_imm(20, 20, 16);
+    a.b(done);
+    a.bind(slow);
+    emit_op_helper(a, H_ABSTRACT, pc, l_unwind);
     a.bind(done);
 }
 

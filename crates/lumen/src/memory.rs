@@ -1914,6 +1914,11 @@ fn scan_realm(
             .engine_caches
             .make_lower_bound("opaque callback HashMap bucket and Weak allocation storage");
     }
+    if let Some(source) = interp.self_hosted.get() {
+        totals
+            .engine_caches
+            .add(source.scan_retained_memory(visitor));
+    }
     totals
         .engine_caches
         .add(interp.fragment_cache.scan_retained_memory(visitor));

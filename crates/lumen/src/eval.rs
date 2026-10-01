@@ -7886,14 +7886,6 @@ impl Interp {
         }
     }
 
-    /// [`Interp::to_boolean`] of a packed value. Scalars answer from the word; strings, BigInts,
-    /// symbols and objects (including [[IsHTMLDDA]]) use the general algorithm.
-    #[inline]
-    pub(crate) fn to_boolean_packed(&self, v: &crate::value::PackedValue) -> bool {
-        v.scalar_to_boolean()
-            .unwrap_or_else(|| self.to_boolean(&v.unpack()))
-    }
-
     pub fn to_number(&mut self, v: &Value) -> Result<f64, Abrupt> {
         Ok(match v {
             Value::Undefined | Value::Empty => f64::NAN,
@@ -8301,6 +8293,7 @@ fn default_constructor(derived: bool) -> Function {
         is_method: false,
         is_fn_expr: false,
         default_ctor: derived,
+        self_hosted: false,
         source: None,
     }
 }

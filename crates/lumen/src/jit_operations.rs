@@ -669,6 +669,14 @@ pub(super) fn emit(
         Op::MakeArray(..) => {
             emit_op_helper(a, H_MAKE_ARRAY, pc as u32, unwind);
         }
+        Op::Abstract(crate::bytecode::AbstractOp::CreateDataPropertyOrThrow)
+            if fast & 4096 != 0 && define_elem_inlinable(layout) =>
+        {
+            emit_define_elem_inline(a, layout, pc as u32, unwind);
+        }
+        Op::Abstract(_) => {
+            emit_op_helper(a, H_ABSTRACT, pc as u32, unwind);
+        }
         Op::New(argc, _) => {
             // H_NEW needs only the pc for optional diagnostics and the statically encoded
             // arity. Pack both so the million-call constructor path does not reload/decode

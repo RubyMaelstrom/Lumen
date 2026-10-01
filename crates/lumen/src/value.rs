@@ -225,21 +225,6 @@ impl PackedValue {
         (self.tag() == PACK_OBJ).then(|| unsafe { self.clone_word() })
     }
 
-    /// ToBoolean when the word alone decides it (ECMA-262 §7.1.2): every non-reference value.
-    /// Strings, BigInts, Symbols and objects (one object is falsy: [[IsHTMLDDA]]) return None.
-    #[inline]
-    pub(crate) fn scalar_to_boolean(&self) -> Option<bool> {
-        match self.tag() {
-            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL => Some(false),
-            PACK_BOOL => Some(self.0.get() & 1 != 0),
-            PACK_BIGINT | PACK_STR | PACK_SYM | PACK_OBJ | PACK_LAZY_PROTO => None,
-            _ => {
-                let number = f64::from_bits(self.0.get());
-                Some(number != 0.0 && !number.is_nan())
-            }
-        }
-    }
-
     /// Inspect a Number without manufacturing an owning Value. In particular, rejecting a
     /// reference or deferred prototype must not clone it or materialize it as a side effect.
     #[inline]
@@ -955,9 +940,12 @@ pub struct JitLayout {
     pub obj_extensible: usize,
     pub props_shape: usize,
     /// Validated named-entry memo for the own `length` key, or NO_SLOT.
-    #[cfg(feature = "optimizing-jit")]
     pub props_len_slot: usize,
     pub props_proto_flag: usize,
+    /// `Props::elem_mode` and `Props::has_far` (`Cell<bool>` bytes): an Array's map whose
+    /// canonical-index keys all live in element storage.
+    pub props_elem_mode: usize,
+    pub props_has_far: usize,
     /// The contiguous instance-field `Vec<Property>` within `Props`.
     pub props_entries: usize,
     /// Nullable stored Rc pointer to the shared key Vec; live keys are its fields-length prefix.
@@ -989,6 +977,8 @@ pub struct JitLayout {
     /// needs to grow it into the optional Vec). Offsets are measured from the live types.
     pub dense_inline_len: usize,
     pub dense_inline_data: usize,
+    /// `INLINE_PACKED_CAPACITY`: the inline slots before packed storage moves to the heap Vec.
+    pub dense_inline_capacity: usize,
     /// The `mirror_flags` byte within `Props`.
     pub props_mirror_flags: usize,
     /// `size_of::<Property>()` — the keyless instance-field stride.
@@ -1305,9 +1295,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         obj_is_constructor: offset_of!(Object, is_constructor),
         obj_extensible: offset_of!(Object, extensible),
         props_shape: offset_of!(Props, shape),
-        #[cfg(feature = "optimizing-jit")]
         props_len_slot: offset_of!(Props, len_slot),
         props_proto_flag: offset_of!(Props, proto_flag),
+        props_elem_mode: offset_of!(Props, elem_mode),
+        props_has_far: offset_of!(Props, has_far),
         props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, fields),
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
         layout_data_off,
@@ -1324,6 +1315,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         dense_mirror: offset_of!(DenseBuffers, mirror),
         dense_packed: offset_of!(DenseBuffers, packed),
         dense_inline_len: offset_of!(DenseBuffers, inline_packed) + offset_of!(InlinePacked, len),
+        dense_inline_capacity: INLINE_PACKED_CAPACITY,
         dense_inline_data: offset_of!(DenseBuffers, inline_packed)
             + offset_of!(InlinePacked, slots),
         props_mirror_flags: offset_of!(Props, mirror_flags),
@@ -4327,15 +4319,6 @@ impl Props {
             return None;
         }
         Some(&self.entries.fields[slot as usize])
-    }
-
-    /// OrdinaryGet of own element `n` when it is a present data property: an owning packed
-    /// snapshot of its value. `None` for an absent element (a hole) or an accessor; the caller
-    /// then runs the general HasProperty/Get algorithms, which also consult the prototype chain.
-    #[inline]
-    pub(crate) fn own_element_data_packed(&self, n: u32) -> Option<PackedValue> {
-        let property = self.get_index(n)?;
-        (!property.accessor()).then(|| property.clone_value_packed())
     }
 
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).

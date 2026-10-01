@@ -78,31 +78,6 @@ impl Callback {
         result
     }
 
-    /// [`Callback::call`] over already-packed arguments, leaving the completion packed: an
-    /// iteration builtin moves elements from storage into the callee and its result into
-    /// storage without widening either.
-    pub(crate) fn call_packed<const N: usize>(
-        &self,
-        interp: &mut Interp,
-        this: Value,
-        args: [PackedValue; N],
-    ) -> Result<PackedValue, Abrupt> {
-        if interp.tier == Tier::Jit {
-            let prepared = self.prepared.borrow();
-            if let Some(prepared) = prepared
-                .as_ref()
-                .filter(|prepared| interp.prepared_call_current(prepared))
-            {
-                let mut args = ManuallyDrop::new(args);
-                let this = ManuallyDrop::new(PackedValue::pack(this));
-                // The prepared entry consumes every operand, exactly like a cache hit.
-                return unsafe { interp.call_prepared(prepared, &*this, args.as_mut_ptr(), N) };
-            }
-        }
-        self.call(interp, this, args.map(PackedValue::into_value))
-            .map(PackedValue::pack)
-    }
-
     /// IteratorStepValue can consume a closed native iterator without materializing
     /// its result object. Custom next methods retain their ordinary callback cache.
     pub(crate) fn iterator_step(

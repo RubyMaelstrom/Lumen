@@ -26435,6 +26435,159 @@ out.join(",")
     );
 }
 
+/// The self-hosted Array.prototype iteration methods (ECMA-262 §23.1.3.6, .8–.12, .15, .21,
+/// .24, .25, .29): HasProperty/Get order observed through a Proxy (FindViaPredicate reads holes,
+/// the others skip them), length read once, inherited elements, thisArg and callback receivers,
+/// `arguments`-sensitive reduce seeding, ToObject of primitives, ArrayCreate's RangeError,
+/// species results including a frozen one (CreateDataPropertyOrThrow throws), and built-in
+/// function properties (name, length, attributes, NativeFunction source, no [[Construct]]).
+/// Expected output from Node.
+#[test]
+fn self_hosted_array_iteration_methods_follow_ecma262_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#""use strict";
+var out = [];
+function show(v) {
+  if (Array.isArray(v)) return "[" + Array.from({ length: v.length }, (_, i) => (i in v ? show(v[i]) : "_")).join(",") + "]";
+  return typeof v === "string" ? v : String(v);
+}
+function attempt(f) {
+  try { return show(f()); } catch (e) { return e.constructor.name; }
+}
+var log = [];
+var traced = new Proxy([1, , 3], {
+  has(t, k) { log.push("has:" + String(k)); return Reflect.has(t, k); },
+  get(t, k, r) { log.push("get:" + String(k)); return Reflect.get(t, k, r); },
+});
+out.push(show(Array.prototype.map.call(traced, x => x * 2)), log.join(" "));
+log = [];
+Array.prototype.forEach.call(traced, () => {});
+Array.prototype.find.call(traced, () => false);
+out.push(log.join(" "));
+var holes = [1, , 3, , 5];
+var visited = [];
+holes.forEach((v, i, o) => visited.push(i + "=" + v + (o === holes)));
+out.push(visited.join(" "), show(holes.map(x => x * 10)), show(holes.filter(x => x > 1)));
+out.push(holes.some(x => x === undefined), holes.every(x => x !== undefined));
+out.push(holes.find(x => x === undefined), holes.findIndex(x => x === undefined));
+out.push(holes.findLast(x => x === undefined), holes.findLastIndex(x => x === undefined));
+out.push(holes.reduce((a, b) => a + b), holes.reduceRight((a, b) => a + "," + b), [, , 7, ,].reduce((a, b) => a + b));
+out.push(attempt(() => [, ,].reduce((a, b) => a)), attempt(() => [].reduceRight((a, b) => a)), [].reduce((a, b) => a, "init"));
+out.push([1, 2, 3].reduce((a, b) => a + b, undefined), [1, 2].reduce(function (a, b) { return a + typeof this; }, ""));
+var proto = { 1: "inherited", 3: "far" };
+var arrayLike = Object.create(proto);
+arrayLike.length = 4;
+arrayLike[0] = "own";
+out.push(show(Array.prototype.map.call(arrayLike, x => x.toUpperCase())));
+var growing = [1, 2, 3];
+out.push(show(growing.map((x, i, a) => { a.push(x); if (i === 0) delete a[2]; return x; })), growing.length);
+var thisValues = [];
+[1].forEach(function () { thisValues.push(typeof this); });
+[1].forEach(function () { thisValues.push(this === undefined); }, undefined);
+[1].forEach(function () { thisValues.push(this.tag); }, { tag: "bound" });
+[1].forEach(() => thisValues.push(typeof this));
+var sloppy = Function("return this === globalThis");
+out.push(thisValues.join(" "), [1].map(sloppy)[0]);
+out.push(attempt(() => [1].map(1)), attempt(() => [1].forEach()), attempt(() => Array.prototype.some.call(null, x => x)));
+out.push(attempt(() => Array.prototype.every.call(undefined, x => x)));
+var stopped = [];
+out.push(attempt(() => [1, 2, 3].forEach(x => { stopped.push(x); if (x === 2) throw new RangeError("stop"); })), stopped.join());
+out.push(show(Array.prototype.map.call("abc", c => c + c)), show(Array.prototype.filter.call({ length: 3, 0: "a", 2: "c" }, () => true)));
+out.push(attempt(() => Array.prototype.map.call({ length: 2 ** 32 }, x => x)));
+out.push(attempt(() => Array.prototype.forEach.call({ length: -1 }, () => { throw 1; })));
+out.push(attempt(() => Array.prototype.some.call({ length: "2", 0: 0, 1: 1 }, x => x)));
+class MyArray extends Array {}
+var mine = MyArray.from([1, 2, 3]);
+out.push(mine.map(x => x) instanceof MyArray, mine.filter(x => x) instanceof MyArray, mine.forEach(x => x) === undefined);
+var nullSpecies = [1, 2];
+nullSpecies.constructor = { [Symbol.species]: null };
+out.push(Object.getPrototypeOf(nullSpecies.map(x => x)) === Array.prototype);
+var badSpecies = [1];
+badSpecies.constructor = { [Symbol.species]: {} };
+out.push(attempt(() => badSpecies.map(x => x)));
+var lengths = [];
+function Recorder(n) { lengths.push(n); return { frozen: false }; }
+var recorded = [1, 2, 3];
+recorded.constructor = { [Symbol.species]: Recorder };
+var recResult = recorded.map(x => x + 1);
+out.push(lengths.join(), recResult[2], recResult.length);
+function Frozen() { return Object.freeze({}); }
+var frozenSource = [1];
+frozenSource.constructor = { [Symbol.species]: Frozen };
+out.push(attempt(() => frozenSource.filter(() => true)), attempt(() => frozenSource.map(x => x)));
+var methods = ["forEach", "map", "filter", "some", "every", "find", "findIndex", "findLast", "findLastIndex", "reduce", "reduceRight"];
+out.push(methods.map(m => {
+  var f = Array.prototype[m], d = Object.getOwnPropertyDescriptor(Array.prototype, m);
+  return [f.name, f.length, d.writable, d.enumerable, d.configurable, "prototype" in f,
+    Object.getOwnPropertyNames(f).join("+"), String(f) === "function " + m + "() { [native code] }",
+    attempt(() => new f(() => 0)), Object.getPrototypeOf(f) === Function.prototype].join("/");
+}).join(" "));
+out.join("\n");
+"#;
+    let expected = [
+        "[2,_,6]",
+        "get:length get:constructor has:0 get:0 has:1 has:2 get:2",
+        "get:length has:0 get:0 has:1 has:2 get:2 get:length get:0 get:1 get:2",
+        "0=1true 2=3true 4=5true",
+        "[10,_,30,_,50]",
+        "[3,5]",
+        "false",
+        "true",
+        "",
+        "1",
+        "",
+        "3",
+        "9",
+        "5,3,1",
+        "7",
+        "TypeError",
+        "TypeError",
+        "init",
+        "NaN",
+        "undefinedundefined",
+        "[OWN,INHERITED,_,FAR]",
+        "[1,2,_]",
+        "5",
+        "undefined true bound object",
+        "true",
+        "TypeError",
+        "TypeError",
+        "TypeError",
+        "TypeError",
+        "RangeError",
+        "1,2",
+        "[aa,bb,cc]",
+        "[a,c]",
+        "RangeError",
+        "undefined",
+        "true",
+        "true",
+        "true",
+        "true",
+        "true",
+        "TypeError",
+        "3",
+        "4",
+        "",
+        "TypeError",
+        "TypeError",
+        "forEach/1/true/false/true/false/length+name/true/TypeError/true map/1/true/false/true/false/length+name/true/TypeError/true filter/1/true/false/true/false/length+name/true/TypeError/true some/1/true/false/true/false/length+name/true/TypeError/true every/1/true/false/true/false/length+name/true/TypeError/true find/1/true/false/true/false/length+name/true/TypeError/true findIndex/1/true/false/true/false/length+name/true/TypeError/true findLast/1/true/false/true/false/length+name/true/TypeError/true findLastIndex/1/true/false/true/false/length+name/true/TypeError/true reduce/1/true/false/true/false/length+name/true/TypeError/true reduceRight/1/true/false/true/false/length+name/true/TypeError/true",
+    ]
+    .join("\n");
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                expected,
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
 /// `lval in rval` (ECMA-262 §13.10.1): array-index Numbers answered from element storage (the
 /// JIT's inline path) agree with HasProperty for holes, inherited and accessor elements (whose
 /// getter never runs), -0, non-index Numbers, string keys, symbols, typed arrays, String
@@ -26600,6 +26753,86 @@ out.join("\n");
             );
         }
     }
+}
+
+/// Self-hosted `map`/`filter` results built by CreateDataPropertyOrThrow (ECMA-262 §7.3.7,
+/// Array.[[DefineOwnProperty]] §10.4.2.1), whose appends the JIT performs inline: integral and
+/// fractional Numbers (the numeric mirror and its all-i32 proof), a mirror invalidated part way
+/// by -0, NaN, strings and objects, growth from inline slots to heap storage, `filter`'s
+/// length growth, hole-skipping results, an element that is its own array, and default element
+/// attributes, read back through ordinary loops in every tier. Expected output from Node.
+#[test]
+fn self_hosted_results_keep_element_storage_coherent_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#""use strict";
+function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s; }
+function isum(a) { var s = 0; for (var i = 0; i < a.length; i++) s = (s + a[i]) | 0; return s; }
+function describe(a, i) {
+  var d = Object.getOwnPropertyDescriptor(a, i);
+  return [d.writable, d.enumerable, d.configurable].map(Number).join("");
+}
+var src = [];
+for (var i = 0; i < 40; i++) src.push(i);
+var rows = [];
+for (var round = 0; round < 8; round++) {
+  var ints = src.map(x => x * 2);
+  var halves = src.map(x => x / 2);
+  var mixed = src.map(x => (x % 3 === 0 ? -0 : x % 3 === 1 ? NaN : "s" + x));
+  var late = src.map(x => (x < 25 ? x : { v: x }));
+  var objs = src.map(x => ({ v: x }));
+  var odd = src.filter(x => x & 1);
+  var none = src.filter(() => false);
+  var holes = [1, , 3, , 5].map(x => x * 10);
+  var self = [0, 1, 2];
+  self.length = 3;
+  var selfMapped = self.map((x, k, o) => o);
+  ints.push(-1);
+  halves[40] = 0.25;
+  rows.push([
+    sum(ints), isum(ints), sum(halves), isum(halves), ints.length, halves.length,
+    mixed.length, Object.is(mixed[0], -0), Number.isNaN(mixed[1]), mixed[2], sum(late.slice(0, 25)), late[39].v,
+    objs[39].v, odd.length, odd[19], sum(odd), none.length, holes.length, 1 in holes, 2 in holes, holes[4],
+    selfMapped[2] === self, describe(ints, 39), describe(odd, 0), describe(holes, 4),
+  ].join());
+}
+[rows[0], rows[7] === rows[0]].join("\n");
+"#;
+    let expected = [
+        "1559,1559,390.25,380,41,41,40,true,true,s2,300,39,39,20,39,400,0,5,false,true,50,true,111,111,111",
+        "true",
+    ]
+    .join("\n");
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                expected,
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+    // Each appended value is moved into its element exactly once: dropped results release
+    // every element.
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    run_in(
+        &mut engine,
+        "var src = []; for (var i = 0; i < 50; i++) src.push(i); \
+         function build() { return src.map(x => ({ x: x })).filter(o => o.x & 1); } build();",
+    );
+    engine.interp.gc_collect();
+    let before = engine.interp.live_object_count();
+    run_in(&mut engine, "for (var j = 0; j < 400; j++) build();");
+    engine.interp.gc_collect();
+    let after = engine.interp.live_object_count();
+    assert!(
+        after.saturating_sub(before) < 100,
+        "appended elements leaked: {before} -> {after}"
+    );
 }
 
 /// `arguments.length` (CreateUnmappedArgumentsObject / CreateMappedArgumentsObject, ECMA-262

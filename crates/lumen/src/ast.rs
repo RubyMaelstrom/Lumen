@@ -498,6 +498,10 @@ pub struct Function {
     /// `constructor(...args) { super(...args); }`; see `default_constructor`). Always false for
     /// parsed source; only the class member synthesis sets it.
     pub default_ctor: bool,
+    /// Part of the engine's self-hosted built-in source (see `crate::self_hosted`): compiled with
+    /// that source's intrinsic operations, and rendered as a NativeFunction (it has no `source`).
+    /// Never set for author code.
+    pub self_hosted: bool,
     /// The source text this function was parsed from, for `Function.prototype.toString`.
     pub source: Option<Rc<str>>,
     /// Lazily-computed body facts (see [`Function::scan_flags`]): bit 0 = scanned, bit 1 =

@@ -24,7 +24,7 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// Snapshots are an optimization for trusted build-time glue, but the public embedding API can be
 /// handed arbitrary bytes. Keep corrupt data from turning its length fields into unbounded work.
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -1325,6 +1325,7 @@ fn enc_function_inner(w: &mut Writer, f: &Function) {
         | (f.is_fn_expr as u8) << 6
         | (f.default_ctor as u8) << 7;
     w.u8(flags);
+    w.bool(f.self_hosted);
     if w.include_source {
         enc_opt_rcstr(w, &f.source);
     } else {
@@ -1351,6 +1352,7 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
     }
     let body = dec_stmts(r)?;
     let flags = r.u8()?;
+    let self_hosted = r.bool()?;
     let source = dec_opt_rcstr(r)?;
     Ok(Function {
         name,
@@ -1364,6 +1366,7 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         is_method: flags & 32 != 0,
         is_fn_expr: flags & 64 != 0,
         default_ctor: flags & 128 != 0,
+        self_hosted,
         source,
         // Lazy runtime caches — start empty, exactly as the parser leaves them.
         scan: Cell::new(0),

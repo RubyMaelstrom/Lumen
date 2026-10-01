@@ -102,6 +102,7 @@ pub(super) fn checked_writes(op: &Op) -> SlotWrites {
         | Op::SetElemDrop
         | Op::SetElemLocal(_)
         | Op::SetElemLocalDrop(_)
+        | Op::Abstract(_)
         | Op::UpdateProp(..)
         | Op::UpdateElem(_)
         | Op::ToPropKey
