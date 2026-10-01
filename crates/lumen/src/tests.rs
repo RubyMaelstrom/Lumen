@@ -4411,6 +4411,61 @@ fn gc_reclaims_cycles() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn task_pressure_collects_the_nursery_and_released_documents_the_whole_heap() {
+    // A retained page heap is not rescanned for each task's growth: young cycles are
+    // reclaimed by a nursery collection (ECMA-262 #sec-liveness permits any non-maximal
+    // set), while a released document's old graph still gets a full collection.
+    let mut engine = Engine::new();
+    engine
+        .eval_value_interruptible(
+            "var page=[];for(var i=0;i<60000;i++){var n={};n.self=n;page.push(n);}",
+        )
+        .unwrap()
+        .unwrap_or_else(|_| panic!("page fixture threw"));
+    engine.collect_garbage_at_idle();
+    let minor = |engine: &Engine| crate::value::heap_minor_collections(&engine.interp.gc_heap);
+    assert_eq!(minor(&engine), 0);
+    engine
+        .eval_value_interruptible(
+            "for(var i=0;i<15000;i++){var o={};o.self=o;}o=null;\n\
+             var weak=new WeakRef(page[0]);",
+        )
+        .unwrap()
+        .unwrap_or_else(|_| panic!("garbage fixture threw"));
+    let before = engine.ctx().live_object_count();
+    engine.run_microtasks_interruptible().unwrap();
+    assert_eq!(minor(&engine), 1, "task pressure took the nursery path");
+    assert!(engine.ctx().live_object_count() + 14_000 < before);
+    assert!(matches!(
+        engine
+            .eval_value_interruptible("weak.deref()===page[0]")
+            .unwrap()
+            .unwrap_or_else(|_| panic!("weak result threw")),
+        crate::value::Value::Bool(true)
+    ));
+
+    // Release an old Realm: its graph is only reachable by a full collection.
+    let abandoned = engine.ctx().create_embed_realm();
+    let abandoned_ptr = engine.ctx().object_addr(&abandoned).unwrap();
+    assert!(engine
+        .ctx()
+        .with_embed_realm(&abandoned, |ctx| ctx.set_host_job_context(91))
+        .is_ok());
+    engine.collect_garbage_at_idle();
+    engine.run_microtasks_interruptible().unwrap();
+    assert!(engine.ctx().release_host_job_context(91));
+    drop(abandoned);
+    assert!(engine.collect_pending_task_garbage() > 0);
+    assert_eq!(
+        minor(&engine),
+        0,
+        "a released document forces a full collection"
+    );
+    assert!(!engine.ctx().realms.contains_key(&abandoned_ptr));
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
     // ECMA-262 #sec-liveness / #sec-clear-kept-objects and HTML
     // #perform-a-microtask-checkpoint: collection is optional; completing

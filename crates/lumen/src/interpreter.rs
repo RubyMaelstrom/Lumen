@@ -3100,6 +3100,9 @@ pub struct Interp {
     /// Allocation safepoints and their existing limits remain enabled.
     pub(crate) gc_task_deferred: bool,
     pub(crate) gc_task_pending: bool,
+    /// The pending task collection must revisit the complete graph: the host released old
+    /// objects (a discarded document) that a nursery collection would not reach.
+    pub(crate) gc_task_major: bool,
     /// Prune the scope registry once its entry count passes this floating threshold.
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
@@ -3327,6 +3330,7 @@ interp_memory_inventory! {
     gc_task_live => "non_owning",
     gc_task_deferred => "non_owning",
     gc_task_pending => "non_owning",
+    gc_task_major => "non_owning",
     scope_gc_next => "non_owning",
     constructing => "non_owning",
     super_call_ok => "non_owning",
@@ -3375,7 +3379,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 153);
+    assert_eq!(names.len(), 154);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3935,6 +3939,7 @@ impl Interp {
         // objects and the current job: this only coalesces a collection request,
         // honoring the host's existing task deferral and ClearKeptObjects order.
         self.gc_task_pending = true;
+        self.gc_task_major = true;
         true
     }
 
@@ -4322,6 +4327,7 @@ impl Interp {
             gc_task_live: crate::value::heap_live_objects(&gc_heap),
             gc_task_deferred: false,
             gc_task_pending: false,
+            gc_task_major: false,
             scope_gc_next: SCOPE_GC_TRIGGER,
             constructing: false,
             super_call_ok: false,
@@ -9885,9 +9891,15 @@ impl Interp {
     }
 
     fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
-        // Explicit/idle/task collections still revisit the complete graph. Allocation pressure
-        // usually visits only newly allocated objects, with bounded major-collection debt.
-        if matches!(cause, crate::value::GcCause::AllocationThreshold)
+        // Allocation and task-boundary pressure usually visit only newly allocated objects,
+        // with bounded major-collection debt: a retained page heap is not rescanned for each
+        // 1/8 of growth. Explicit/idle collections and released documents revisit everything.
+        let young_cause = match cause {
+            crate::value::GcCause::AllocationThreshold => true,
+            crate::value::GcCause::TaskBoundary => !self.gc_task_major,
+            crate::value::GcCause::Explicit => false,
+        };
+        if young_cause
             && crate::gc_generational::enabled()
             && crate::value::heap_live_objects(&self.gc_heap) < self.live_object_limit
             && !crate::value::gc_major_due(&self.gc_heap, GC_TRIGGER)
@@ -10661,6 +10673,7 @@ impl Interp {
         crate::value::gc_finish_generation(&self.gc_heap, true);
         self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_task_pending = false;
+        self.gc_task_major = false;
         #[cfg(not(target_arch = "wasm32"))]
         if garbage >= 50_000 {
             crate::fastalloc::trim();

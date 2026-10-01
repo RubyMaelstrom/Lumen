@@ -2438,6 +2438,12 @@ pub(crate) fn gc_finish_generation(heap: &GcHeap, major: bool) {
     }
 }
 
+/// Nursery collections since the last full one.
+#[cfg(all(test, feature = "embed"))]
+pub(crate) fn heap_minor_collections(heap: &GcHeap) -> u8 {
+    heap.minor_collections.get()
+}
+
 pub(crate) fn gc_major_due(heap: &GcHeap, nursery_floor: i64) -> bool {
     heap.minor_collections.get() >= 7
         || heap.live.get()
