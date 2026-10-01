@@ -26601,3 +26601,57 @@ out.join("\n");
         }
     }
 }
+
+/// `arguments.length` (CreateUnmappedArgumentsObject / CreateMappedArgumentsObject, ECMA-262
+/// §10.4.4.6–7: the number of actual arguments) in bodies whose arguments object is otherwise
+/// unobservable keeps only that number: strict and sloppy bodies, mapped parameters reassigned,
+/// spread, `call`/`apply`/`Reflect.apply`, construction and arrows, beside bodies that also read
+/// elements, and the self-hosted reduce's explicit `undefined` initial value. Expected output
+/// from Node.
+#[test]
+fn arguments_length_only_bodies_count_actual_arguments_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#"var out = [];
+function strictCount(a, b) { "use strict"; return arguments.length * 10 + (a === undefined ? 0 : 1); }
+function sloppyCount() { return arguments.length; }
+function sloppyParams(a, b) { a = 7; return arguments.length + ":" + a + ":" + b; }
+function list(a) { "use strict"; return arguments.length > 1 ? arguments[1] : a; }
+function sloppyList(a) { a = "w"; return arguments.length + arguments[0]; }
+var arrowCount = function () { return (() => arguments.length)(); };
+function Construct() { this.n = arguments.length; }
+var rows = [];
+for (var round = 0; round < 20; round++) {
+  rows.push([
+    strictCount(), strictCount(1), strictCount(1, 2, 3), strictCount(...[1, 2, 3, 4]),
+    strictCount.call(null, 1), strictCount.apply(null, [1, 2]), Reflect.apply(strictCount, null, []),
+    sloppyCount(), sloppyCount(undefined), sloppyCount(1, 2, 3, 4, 5, 6),
+    sloppyParams(), sloppyParams(1), sloppyParams(1, 2, 3),
+    list(1), list(1, 2), list(1, undefined), sloppyList(1), sloppyList(),
+    arrowCount(), arrowCount(1, 2), new Construct().n, new Construct(1, 2).n,
+    [1, 2, 3].reduce((a, b) => a + b), [1, 2, 3].reduce((a, b) => a + b, undefined),
+    [].reduce((a, b) => a, undefined), [5].reduceRight((a, b) => a + b, 1),
+  ].join());
+}
+[rows[0], rows[19] === rows[0], strictCount.length, sloppyParams.length, [].reduce.length].join("\n");
+"#;
+    let expected = [
+        "0,11,31,41,11,21,0,0,1,6,0:7:undefined,1:7:undefined,3:7:2,1,2,,1w,NaN,0,2,0,2,6,NaN,,6",
+        "true",
+        "2",
+        "2",
+        "1",
+    ]
+    .join("\n");
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                expected,
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}

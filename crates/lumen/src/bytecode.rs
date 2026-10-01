@@ -1910,6 +1910,9 @@ pub struct Chunk {
     /// actual arguments instead (`length` is then identical) and element reads use
     /// [`Op::ArgElem`]. See [`lazy_arguments_rewrite`].
     pub(crate) lazy_arguments: bool,
+    /// A [`Chunk::lazy_arguments`] body that reads only `arguments.length`: `arguments_slot`
+    /// holds that length, the number of actual arguments, and the reads are plain slot loads.
+    pub(crate) arguments_count: bool,
     // (fields below; Debug is manual — `consts` holds engine Values)
     ops: Vec<Op>,
     /// Derived after all bytecode transformations. Emission queries this for each captured
@@ -6456,9 +6459,11 @@ fn finish_chunk(
     // The final operation stream includes inlining, fragments and prepared/coroutine entries.
     // Cache only facts about that immutable stream, never runtime environments or IC state.
     // See `Chunk::lazy_arguments`: proven and applied on the final operation stream.
-    let lazy_arguments = c
+    let lazy = c
         .arguments_slot
-        .is_some_and(|slot| lazy_arguments_rewrite(&mut c.ops, slot, &c.names));
+        .and_then(|slot| lazy_arguments_rewrite(&mut c.ops, slot, &c.names));
+    let lazy_arguments = lazy.is_some();
+    let arguments_count = lazy == Some(LazyArguments::Count);
     if c.arguments_length_only
         && !(lazy_arguments && !c.ops.iter().any(|op| matches!(op, Op::ArgElem(_))))
     {
@@ -6475,6 +6480,7 @@ fn finish_chunk(
         lean_new_target: c.lean_new_target,
         rest_slot: c.rest_slot,
         lazy_arguments,
+        arguments_count,
         ops: c.ops,
         jit_needs_activation_state,
         has_tail_calls,
@@ -7326,25 +7332,48 @@ fn op_mentions_slot(op: &Op, slot: u16) -> bool {
     }
 }
 
+/// How [`lazy_arguments_rewrite`] represents an unobservable arguments object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LazyArguments {
+    /// A plain Array of the actual arguments (see [`Chunk::lazy_arguments`]).
+    List,
+    /// Their number alone (see [`Chunk::arguments_count`]).
+    Count,
+}
+
 /// See [`Chunk::lazy_arguments`]. The arguments object of a body is unobservable when its slot
 /// is read only as `arguments.length` and `arguments[key]`: it is never stored, passed, called,
 /// captured, written or deleted, so no code other than those two reads can reach it. Rewrite
-/// the element reads to [`Op::ArgElem`] and report success; otherwise leave `ops` unchanged.
-fn lazy_arguments_rewrite(ops: &mut [Op], slot: u16, names: &[Rc<str>]) -> bool {
+/// the element reads to [`Op::ArgElem`]; without any, only the length is observable
+/// (CreateUnmappedArgumentsObject and CreateMappedArgumentsObject both define it as the number
+/// of actual arguments, ECMA-262 §10.4.4.6–7), so rewrite its reads to slot loads of that
+/// number. Otherwise leave `ops` unchanged and return `None`.
+fn lazy_arguments_rewrite(ops: &mut [Op], slot: u16, names: &[Rc<str>]) -> Option<LazyArguments> {
     let only_reads = ops.iter().all(|op| match *op {
         Op::GetPropLocal(a, name, _) if a == slot => &*names[name as usize] == "length",
         Op::GetElemLocal(a) if a == slot => true,
         _ => !op_mentions_slot(op, slot),
     });
     if !only_reads {
-        return false;
+        return None;
+    }
+    if !ops
+        .iter()
+        .any(|op| matches!(*op, Op::GetElemLocal(a) if a == slot))
+    {
+        for op in ops.iter_mut() {
+            if matches!(*op, Op::GetPropLocal(a, ..) if a == slot) {
+                *op = Op::LoadLocal(slot);
+            }
+        }
+        return Some(LazyArguments::Count);
     }
     for op in ops.iter_mut() {
         if matches!(*op, Op::GetElemLocal(a) if a == slot) {
             *op = Op::ArgElem(slot);
         }
     }
-    true
+    Some(LazyArguments::List)
 }
 
 /// The `arguments[key]` read of a lazily represented arguments object (see
@@ -17943,14 +17972,17 @@ impl Chunk {
     }
 
     /// The initial value of `arguments_slot`: the arguments object, or for a
-    /// [`Chunk::lazy_arguments`] body the plain Array of actual arguments standing in for it.
+    /// [`Chunk::lazy_arguments`] body the plain Array of actual arguments standing in for it
+    /// (for a [`Chunk::arguments_count`] body, their number).
     pub(crate) fn arguments_slot_value(
         &self,
         i: &mut Interp,
         args: &[Value],
         scope: &Env,
     ) -> Value {
-        if self.lazy_arguments {
+        if self.arguments_count {
+            Value::Num(args.len() as f64)
+        } else if self.lazy_arguments {
             i.make_array(args.to_vec())
         } else {
             Value::Obj(i.make_compiled_arguments_object(args, scope))
