@@ -26234,3 +26234,82 @@ out.join("|")
         }
     }
 }
+
+/// Compiled block and loop scopes (ECMA-262 §14.2.3 BlockDeclarationInstantiation,
+/// §14.7.4.4 CreatePerIterationEnvironment): each iteration's closures observe their own
+/// bindings, including values written after capture; `for-in`/`for-of`, `switch` and `catch`
+/// scopes, TDZ reads through a closure, direct eval declaring vars and nested lexical scopes
+/// inside blocks. Expected output from Node.
+#[test]
+fn compiled_block_and_iteration_scopes_keep_per_record_bindings_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r##"function run(round) {
+  var fs = [], log = [];
+  for (let i = 0; i < 4; i++) { const sq = i * i; fs.push(() => i + ":" + sq); if (i === 1) i++; }
+  for (const k in { a: 1, b: 2 }) fs.push(() => k);
+  for (const v of ["x", "y"]) { let w = v + v; fs.push(() => w); w += "!"; }
+  let j = 0;
+  for (let i = 0; i < 3; i++) { fs.push(() => i); i += 0; j++; }
+  switch (round % 2) { case 0: let z = "even"; fs.push(() => z); break; case 1: fs.push(() => typeof q); }
+  try { throw new Error("c" + round); } catch (e) { let tag = "t"; fs.push(() => e.message + tag); }
+  for (let i = 0; i < 2; i++) {
+    try { fs.push(() => shadow); let shadow = "late" + i; } catch (err) { log.push(err.name); }
+    eval("var fromEval" + i + " = " + i);
+    { let inner = i * 10; eval("let inner2 = inner + 1; fs.push(() => inner2)"); }
+  }
+  var tdz;
+  try { for (let m = 0; m < 1; m++) { tdz = () => later; tdz(); let later = 5; } } catch (e) { log.push("x" + e.name); }
+  return fs.map(f => { try { return f(); } catch (e) { return e.name; } }).join(",") + "|" + log.join(",") + "|" + typeof fromEval1 + "|" + j;
+}
+var out;
+for (var r = 0; r < 12; r++) out = run(r);
+out + "#" + run(1)
+"##;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                "0:0,2:1,3:9,a,b,xx!,yy!,0,1,2,undefined,c11t,late0,1,late1,11|xReferenceError|number|3#0:0,2:1,3:9,a,b,xx!,yy!,0,1,2,undefined,c1t,late0,1,late1,11|xReferenceError|number|3",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
+/// Every per-iteration record a compiled loop creates publishes the same nonzero binding
+/// layout, so guarded name caches filled against one iteration's record serve the next.
+#[test]
+fn compiled_iteration_records_share_one_published_layout() {
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        run_in(
+            &mut engine,
+            "function make(){ var fs = []; for (let i = 0; i < 3; i++) { let d = i * 2; \
+             fs.push(() => i + d); } return fs; } var fs = make();",
+        );
+        let env = engine.interp.global_env.clone();
+        let fs = engine.interp.get_var("fs", &env).ok().unwrap();
+        let layouts: Vec<u32> = (0..3)
+            .map(|k| {
+                let f = engine.interp.get_member(&fs, &k.to_string()).ok().unwrap();
+                let object = f.as_obj().unwrap().borrow();
+                let crate::value::Callable::User(user) = &object.call else {
+                    panic!("closure")
+                };
+                let id = user.env.borrow().vars.layout_id();
+                id
+            })
+            .collect();
+        assert_ne!(layouts[0], 0, "{tier:?}");
+        assert!(
+            layouts.iter().all(|&id| id == layouts[0]),
+            "{tier:?}: {layouts:?}"
+        );
+        assert_eq!(run_in(&mut engine, "fs.map(f => f()).join()"), "0,3,6");
+    }
+}

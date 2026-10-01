@@ -1844,6 +1844,48 @@ struct LexicalBinding {
     is_const: bool,
 }
 
+/// A compiled block/loop scope's captured bindings in their fixed record order, plus the
+/// published identity of that ordered key set (see `VarMap::publish_layout`). Every Environment
+/// Record the chunk creates for the scope — at block entry and for each
+/// CreatePerIterationEnvironment copy — holds exactly these names in this order, and a lexical
+/// record's key set never changes afterwards (a direct eval declares its own lexical names in a
+/// new record and its vars in the variable environment). Guarded name caches filled against one
+/// such record therefore serve every later one (ECMA-262 §9.1, §14.2.3, §14.7.4.4).
+struct LexicalScope {
+    bindings: Vec<LexicalBinding>,
+    /// Nonzero process-unique identity of `bindings`' names and order; zero if identities are
+    /// exhausted (the records then stay unpublished and caches revalidate by identity).
+    layout_id: u32,
+    /// Name → slot index shared by wide records (`BindingLayout::fixed`); narrow records scan.
+    index: Option<Rc<crate::interpreter::BindingLayout>>,
+}
+
+impl LexicalScope {
+    fn new(bindings: Vec<LexicalBinding>) -> Self {
+        // One slot per name in first-declaration order; a repeated name (an early error in
+        // source) keeps its first position with the last declaration's attributes, exactly like
+        // successive inserts into one record.
+        let mut slots = crate::fasthash::FastMap::<Rc<str>, usize>::default();
+        let mut unique: Vec<LexicalBinding> = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            match slots.get(&binding.name) {
+                Some(&slot) => unique[slot] = binding,
+                None => {
+                    slots.insert(binding.name.clone(), unique.len());
+                    unique.push(binding);
+                }
+            }
+        }
+        let layout_id = crate::interpreter::new_binding_layout_id();
+        let index = crate::interpreter::BindingLayout::fixed(layout_id, slots);
+        Self {
+            bindings: unique,
+            layout_id,
+            index,
+        }
+    }
+}
+
 pub struct Chunk {
     /// The caller must complete FunctionDeclarationInstantiation before running this body.
     /// The existing activation, including mapped arguments and parameter-expression scopes,
@@ -1916,7 +1958,7 @@ pub struct Chunk {
     assignment_targets: Vec<AssignmentTargetPlan>,
     /// Captured subsets of block/loop lexical scopes. These allocate only when closure identity is
     /// observable; ordinary lexical bindings stay in the allocation-free slot representation.
-    lexical_scopes: Vec<Vec<LexicalBinding>>,
+    lexical_scopes: Vec<LexicalScope>,
     /// Captured bindings to seed into a fresh activation env at entry; empty = no activation
     /// needed (closures, if any, capture the definition env directly).
     cap_inits: Vec<CapInit>,
@@ -2182,7 +2224,7 @@ impl Chunk {
             .saturating_add(vec_bytes!(eval_exprs, EvalExprPlan))
             .saturating_add(vec_bytes!(class_plans, ClassPlan))
             .saturating_add(vec_bytes!(assignment_targets, AssignmentTargetPlan))
-            .saturating_add(vec_bytes!(lexical_scopes, Vec<LexicalBinding>))
+            .saturating_add(vec_bytes!(lexical_scopes, LexicalScope))
             .saturating_add(vec_bytes!(cap_inits, CapInit))
             .saturating_add(vec_bytes!(caches, std::cell::Cell<IcState>))
             .saturating_add(vec_bytes!(
@@ -2283,11 +2325,15 @@ impl Chunk {
         for scope in &self.lexical_scopes {
             bytes = bytes.saturating_add(
                 scope
+                    .bindings
                     .capacity()
                     .saturating_mul(std::mem::size_of::<LexicalBinding>()),
             );
-            for binding in scope {
+            for binding in &scope.bindings {
                 visitor.rc_str(&binding.name);
+            }
+            if let Some(index) = &scope.index {
+                visitor.binding_layout(index);
             }
         }
         for init in &self.cap_inits {
@@ -6444,7 +6490,11 @@ fn finish_chunk(
         eval_exprs: c.eval_exprs,
         class_plans: c.class_plans,
         assignment_targets: c.assignment_targets,
-        lexical_scopes: c.lexical_scopes,
+        lexical_scopes: c
+            .lexical_scopes
+            .into_iter()
+            .map(LexicalScope::new)
+            .collect(),
         cap_inits: c.cap_inits,
         activation_plan: std::cell::OnceCell::new(),
         binding_layout_id: crate::interpreter::new_binding_layout_id(),
@@ -18884,16 +18934,12 @@ pub(crate) unsafe extern "C" fn jit_reference_op(
 /// `catch` parameter environment (§14.15.2): a new declarative record whose bindings start
 /// uninitialized, pushed as the running LexicalEnvironment.
 fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
-    let next = if catch {
-        crate::interpreter::new_catch_scope(env.clone())
-    } else {
-        crate::interpreter::new_scope(Some(env.clone()))
-    };
-    {
-        let mut record = next.borrow_mut();
-        for binding in &chunk.lexical_scopes[scope as usize] {
-            record.lexical_names.push(binding.name.clone());
-            record.vars.insert(
+    let scope = &chunk.lexical_scopes[scope as usize];
+    let bindings = scope
+        .bindings
+        .iter()
+        .map(|binding| {
+            (
                 binding.name.clone(),
                 crate::interpreter::Binding {
                     value: Value::Undefined,
@@ -18904,44 +18950,74 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
                     imported: false,
                     deletable: false,
                 },
-            );
-        }
-    }
+            )
+        })
+        .collect();
+    let next = if catch {
+        crate::interpreter::new_catch_scope(env.clone())
+    } else {
+        crate::interpreter::new_scope(Some(env.clone()))
+    };
+    // A block record is never a VariableEnvironment, so it records no `lexical_names` (only
+    // EvalDeclarationInstantiation's variable-environment check reads them; it tests block
+    // records through HasBinding).
+    install_lexical_bindings(&next, scope, bindings);
     *env = next;
+}
+
+/// Give a fresh block/loop record `scope`'s complete ordered key set and publish its identity.
+fn install_lexical_bindings(
+    record: &Env,
+    scope: &LexicalScope,
+    bindings: Vec<(Rc<str>, crate::interpreter::Binding)>,
+) {
+    let mut record = record.borrow_mut();
+    record.vars = crate::interpreter::VarMap::from_fixed_bindings(bindings, scope.index.as_ref());
+    record.vars.publish_layout(scope.layout_id);
 }
 
 /// CreatePerIterationEnvironment (ECMA-262 §14.7.4.4): a sibling record copying each
 /// per-iteration binding's current value and state.
 fn clone_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32) {
+    let scope = &chunk.lexical_scopes[scope as usize];
     let parent = env
         .borrow()
         .parent
         .clone()
         .expect("per-iteration lexical environment has a parent");
     let next = crate::interpreter::new_scope(Some(parent));
-    {
+    let bindings = {
         let current = env.borrow();
-        let mut record = next.borrow_mut();
-        for binding in &chunk.lexical_scopes[scope as usize] {
-            let previous = current
-                .vars
-                .get(&binding.name)
+        // A record this chunk created holds the scope's bindings in order; a borrowed first
+        // iteration (a loop fragment's tree-walker record) is read by name.
+        let ordered = scope.layout_id != 0 && current.vars.layout_id() == scope.layout_id;
+        scope
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(slot, binding)| {
+                let previous = if ordered {
+                    current.vars.fixed_binding_at(slot)
+                } else {
+                    current.vars.get(&binding.name)
+                }
                 .expect("per-iteration binding missing");
-            record.lexical_names.push(binding.name.clone());
-            record.vars.insert(
-                binding.name.clone(),
-                crate::interpreter::Binding {
-                    value: previous.value.clone(),
-                    mutable: previous.mutable,
-                    strict_immutable: previous.strict_immutable,
-                    initialized: previous.initialized,
-                    import_ref: None,
-                    imported: false,
-                    deletable: false,
-                },
-            );
-        }
-    }
+                (
+                    binding.name.clone(),
+                    crate::interpreter::Binding {
+                        value: previous.value.clone(),
+                        mutable: previous.mutable,
+                        strict_immutable: previous.strict_immutable,
+                        initialized: previous.initialized,
+                        import_ref: None,
+                        imported: false,
+                        deletable: false,
+                    },
+                )
+            })
+            .collect()
+    };
+    install_lexical_bindings(&next, scope, bindings);
     *env = next;
 }
 
