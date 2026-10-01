@@ -7715,7 +7715,10 @@ fn emit_direct_finish_stub(
             a.movz(14, low_heap_tag, 0);
             a.movz(15, object_tag, 0);
         };
-        // callee `this`, then reset the record's binding to Undefined (a pooled invariant)
+        // callee `this`, then reset the record's binding to Undefined (a pooled invariant) on
+        // every path. `jit_drop_at` destroys the Value in place without overwriting it, so a
+        // last-reference receiver (`new C().m()`) left the record naming a freed object; the
+        // record's next entry, finish or release then dropped it again.
         let this_done = a.new_label();
         let this_drop = a.new_label();
         a.ldrb_imm(9, 10, cx_this);
@@ -7728,12 +7731,12 @@ fn emit_direct_finish_stub(
         a.b_cond(C_LS, this_drop); // last reference → full drop
         a.sub_imm(12, 12, 1);
         a.stur(12, 11, 0);
-        a.strb_imm(31, 10, cx_this);
         a.b(this_done);
         a.bind(this_drop);
         a.add_imm(9, 10, cx_this);
-        drop_at(a, 9, H_DROP_AT);
+        drop_at(a, 9, H_DROP_AT); // reloads the record into x10
         a.bind(this_done);
+        a.strb_imm(31, 10, cx_this);
         // slots
         let c_loop = a.new_label();
         let c_next = a.new_label();

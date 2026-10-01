@@ -404,6 +404,50 @@ fn direct_calls_enter_callees_that_materialize_native_activations() {
     );
 }
 
+/// A direct method call whose receiver is the only reference (`new Target(k).to(k)`) releases
+/// `this` through the finish stub's full-drop path, which must still vacate the record's
+/// binding. A pooled record left naming the destroyed receiver was released again by its next
+/// user, corrupting the heap (route-recognizer's `match(path).to(handler)` on Discourse).
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn direct_finish_vacates_a_last_reference_receiver() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let source = r#"
+        function Target(p) { this.p = p; }
+        Target.prototype.to = function (x) { return this.p + x; };
+        function routes(n) {
+          var s = 0;
+          for (var k = 0; k < n; k++) s += new Target(k).to(k);
+          return s;
+        }
+        routes(3);
+    "#;
+    match engine.eval(source, false).expect("fixture parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+    super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+    match engine.eval("routes(500)", false).expect("call parses") {
+        Completion::Value(value) => assert_eq!(value, "249500"),
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+    let direct = super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get());
+    assert!(direct >= 350, "method calls must take the direct sequence ({direct})");
+    assert!(!engine.interp.frame_pool.is_empty());
+    assert_eq!(
+        engine
+            .interp
+            .frame_pool
+            .iter()
+            .filter(|record| unsafe { !matches!(record.as_ref().ctx.this_val, Value::Undefined) })
+            .count(),
+        0,
+        "a pooled record must not retain a `this` binding"
+    );
+}
+
 /// ECMA-262 OrdinaryFunctionCreate gives each evaluation of a function expression a new closure
 /// with its own [[Environment]], while all of them share the function's code. A call site that
 /// sees a fresh closure of an already-cached function takes the direct JIT→JIT sequence (the
