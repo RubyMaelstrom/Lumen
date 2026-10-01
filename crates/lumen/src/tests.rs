@@ -26512,3 +26512,92 @@ out.join("\n");
         }
     }
 }
+
+/// ArraySpeciesCreate (ECMA-262 §10.4.2.3) behind its intrinsic fast path: assigning or
+/// redefining %Array.prototype%.constructor, redefining or deleting %Array%[@@species], an own
+/// `constructor`, a different prototype and a frozen %Array.prototype% are each honored by map,
+/// filter, slice, splice, concat and flatMap. Replacing the global `Array` binding changes
+/// nothing: only the Realm's intrinsic %Array% constructs a plain Array, so a subclass found
+/// through @@species still constructs itself. Expected output from Node.
+#[test]
+fn array_species_create_tracks_the_realms_intrinsic_array_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#""use strict";
+var out = [];
+var IntrinsicArrayPrototype = Array.prototype;
+function kind(v) {
+  var p = Object.getPrototypeOf(v);
+  return p === IntrinsicArrayPrototype ? "Array" : p.constructor.name;
+}
+function results(a) {
+  return [a.map(x => x), a.filter(() => true), a.slice(0), a.splice(0, 0), a.concat([]), a.flatMap(x => [x])].map(kind).join(",");
+}
+function probe(label) { out.push(label + " " + results([1, 2, 3])); }
+probe("intrinsic");
+class Sub extends Array {}
+Array.prototype.constructor = Sub;
+probe("assigned-constructor");
+Array.prototype.constructor = Array;
+probe("restored");
+var Original = Array;
+globalThis.Array = Sub;
+probe("global-binding-replaced");
+out.push("sub-instance " + results(Sub.from([1, 2])));
+globalThis.Array = Original;
+var speciesDescriptor = Object.getOwnPropertyDescriptor(Array, Symbol.species);
+class Other extends Array {}
+Object.defineProperty(Array, Symbol.species, { get() { return Other; }, configurable: true });
+probe("redefined-species");
+delete Array[Symbol.species];
+probe("deleted-species");
+Object.defineProperty(Array, Symbol.species, speciesDescriptor);
+probe("restored-species");
+Object.defineProperty(Array.prototype, "constructor", { get() { return Sub; }, configurable: true });
+probe("accessor-constructor");
+Object.defineProperty(Array.prototype, "constructor", { value: Array, writable: true, configurable: true });
+probe("data-constructor");
+var own = [1, 2];
+own.constructor = Other;
+out.push("own-constructor " + results(own));
+var reparented = Object.setPrototypeOf([1, 2], Sub.prototype);
+out.push("reparented " + results(reparented));
+Object.freeze(Array.prototype);
+probe("frozen-prototype");
+var counted = 0;
+var observed = new Proxy([1], { get(t, k, r) { if (k === "constructor") counted++; return Reflect.get(t, k, r); } });
+Array.prototype.map.call(observed, x => x);
+out.push("proxy-constructor-reads " + counted);
+out.push("range " + (() => { try { Array.prototype.map.call({ length: 2 ** 32 + 1 }, x => x); } catch (e) { return e.constructor.name; } })());
+out.join("\n");
+"#;
+    let expected = [
+        "intrinsic Array,Array,Array,Array,Array,Array",
+        "assigned-constructor Sub,Sub,Sub,Sub,Sub,Sub",
+        "restored Array,Array,Array,Array,Array,Array",
+        "global-binding-replaced Array,Array,Array,Array,Array,Array",
+        "sub-instance Sub,Sub,Sub,Sub,Sub,Sub",
+        "redefined-species Other,Other,Other,Other,Other,Other",
+        "deleted-species Array,Array,Array,Array,Array,Array",
+        "restored-species Array,Array,Array,Array,Array,Array",
+        "accessor-constructor Sub,Sub,Sub,Sub,Sub,Sub",
+        "data-constructor Array,Array,Array,Array,Array,Array",
+        "own-constructor Other,Other,Other,Other,Other,Other",
+        "reparented Sub,Sub,Sub,Sub,Sub,Sub",
+        "frozen-prototype Array,Array,Array,Array,Array,Array",
+        "proxy-constructor-reads 1",
+        "range RangeError",
+    ]
+    .join("\n");
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                expected,
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}

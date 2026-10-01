@@ -3136,46 +3136,131 @@ fn map_ptr(this: &Value) -> Option<usize> {
     this.as_obj().map(|o| Rc::as_ptr(o) as usize)
 }
 
-/// ArraySpeciesCreate(originalArray, length): build the result array for a method like map/filter,
-/// honoring `this.constructor[@@species]`; for an ordinary array (or no species) it's a plain array.
-fn make_sparse_array(i: &mut Interp, len: usize) -> Result<Value, Value> {
-    // ArrayCreate: a length past 2^32-1 is a RangeError. (Compared as u64: usize is 32-bit on
-    // wasm32, where the comparison would be vacuous.)
-    if len as u64 > 4294967295 {
+/// ArrayCreate(length) (ECMA-262 §10.4.2.2) with the current Realm's %Array.prototype%: a
+/// *RangeError* past 2^32 − 1, else an Array of that `length` with no elements.
+fn array_create(i: &mut Interp, length: u64) -> Result<Value, Value> {
+    if length > u64::from(u32::MAX) {
         return Err(i.make_error("RangeError", "invalid array length"));
     }
-    let arr = i.make_array(Vec::new());
-    if let Value::Obj(o) = &arr {
-        o.borrow_mut().props.insert(
-            "length",
-            crate::value::Property::data(Value::Num(len as f64), true, false, false),
-        );
+    let array = i.make_array(Vec::new());
+    if length != 0 {
+        if let Value::Obj(object) = &array {
+            object
+                .borrow_mut()
+                .props
+                .set_array_length_value(length as f64);
+        }
     }
-    Ok(arr)
+    Ok(array)
 }
 
-fn array_species_create(i: &mut Interp, original: &Value, len: usize) -> Result<Value, Value> {
-    // IsArray pierces proxies (a proxy over an array is an array).
-    if !json_is_array(i, original)? {
-        return make_sparse_array(i, len);
+/// Whether ArraySpeciesCreate(`original`, length) is unobservably ArrayCreate(length): an
+/// ordinary Array (IsArray, not a Proxy) without an own "constructor", inheriting from the
+/// current Realm's %Array.prototype% a "constructor" data property that holds this Realm's
+/// %Array%, whose @@species is still the intrinsic getter (which returns its receiver). Every
+/// Get in steps 3–5 then reads a data property or calls that getter, nothing author-visible
+/// runs, and step 8 constructs with %Array% itself: Construct(%Array%, « 𝔽(length) ») is
+/// ArrayCreate(length) with %Array.prototype% (ECMA-262 §23.1.1.1; its *RangeError* is
+/// ArrayCreate's).
+fn array_species_is_intrinsic(i: &Interp, original: &Gc) -> bool {
+    {
+        let body = original.borrow();
+        if !body.ic_plain.get()
+            || !matches!(body.exotic, Exotic::Array)
+            || !body
+                .proto
+                .as_ref()
+                .is_some_and(|p| Rc::ptr_eq(p, &i.array_proto))
+            || body.props.contains("constructor")
+        {
+            return false;
+        }
     }
+    let (Some(array_ctor), Some(slot)) = (i.array_ctor.as_ref(), intrinsic_species_slot(i)) else {
+        return false;
+    };
+    let prototype = i.array_proto.borrow();
+    prototype
+        .props
+        .property_at(slot)
+        .is_some_and(|constructor| {
+            !constructor.accessor()
+                && matches!(constructor.value(), Value::Obj(c) if Rc::ptr_eq(&c, array_ctor))
+        })
+}
+
+/// The `entries` slot of %Array.prototype%'s own "constructor" data property while %Array%'s
+/// @@species is the intrinsic getter, under the epoch-validated [`Interp::species_protector`].
+fn intrinsic_species_slot(i: &Interp) -> Option<usize> {
+    let epoch = crate::value::proto_epoch();
+    if epoch == u32::MAX {
+        return None; // permanently invalidated: never trust a proof
+    }
+    let (proven, slot) = i.species_protector.get();
+    if proven != epoch {
+        let slot = verify_intrinsic_species(i).map_or(u32::MAX, |slot| slot as u32);
+        i.species_protector.set((epoch, slot));
+        return (slot != u32::MAX).then_some(slot as usize);
+    }
+    (slot != u32::MAX).then_some(slot as usize)
+}
+
+/// Establish [`Interp::species_protector`]'s proof from scratch, marking both objects as
+/// prototypes so later redefinitions or structural changes invalidate it.
+fn verify_intrinsic_species(i: &Interp) -> Option<usize> {
+    let array_ctor = i.array_ctor.as_ref()?;
+    let species = well_known_key(i, "species")?;
+    let intrinsic_getter = array_ctor.borrow().props.get(&species).is_some_and(|p| {
+        p.accessor()
+            && matches!(p.getter(), Some(Value::Obj(getter)) if matches!(
+                getter.borrow().call,
+                crate::value::Callable::Native(f)
+                    if f as *const () == nf_species_getter as *const ()
+            ))
+    });
+    if !intrinsic_getter {
+        return None;
+    }
+    let prototype = i.array_proto.borrow();
+    let slot = prototype.props.slot_of("constructor")?;
+    if prototype.props.property_at(slot)?.accessor() {
+        return None;
+    }
+    prototype.props.mark_proto();
+    array_ctor.borrow().props.mark_proto();
+    Some(slot)
+}
+
+/// ArraySpeciesCreate(originalArray, length) (ECMA-262 §10.4.2.3).
+fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Value, Value> {
+    if let Value::Obj(object) = original {
+        if array_species_is_intrinsic(i, object) {
+            return array_create(i, len);
+        }
+    }
+    // 1–2. IsArray pierces proxies (a proxy over an array is an array).
+    if !json_is_array(i, original)? {
+        return array_create(i, len);
+    }
+    // 3. Get(originalArray, "constructor").
     let mut c = ab(i.get_member(original, "constructor"))?;
-    // A constructor that is another realm's %Array% counts as the default (its @@species is
-    // never read).
+    // 4. Another Realm's intrinsic %Array% counts as the default; its @@species is never read.
+    //    SameValue(C, ctorRealm.[[Intrinsics]].[[%Array%]]) holds exactly when C is the %Array%
+    //    of the Realm GetFunctionRealm(C) names.
     if is_constructor_value(&c) {
         if let Value::Obj(co) = &c {
-            let foreign_array = i.realms.values().any(|rs| {
-                matches!(
-                    rs.global.borrow().props.get("Array").map(|p| p.value()),
-                    Some(Value::Obj(ac)) if Rc::ptr_eq(&ac, co)
-                        && !Rc::ptr_eq(&rs.global, &i.global)
-                )
-            });
+            let is_array_ctor =
+                |ctor: &Option<Gc>| ctor.as_ref().is_some_and(|ac| Rc::ptr_eq(ac, co));
+            let foreign_array = !is_array_ctor(&i.array_ctor)
+                && i.realms
+                    .values()
+                    .any(|realm| is_array_ctor(&realm.array_ctor));
             if foreign_array {
-                return make_sparse_array(i, len);
+                return array_create(i, len);
             }
         }
     }
+    // 5. Get(C, @@species); null becomes undefined.
     if matches!(&c, Value::Obj(_)) {
         if let Some(key) = well_known_key(i, "species") {
             c = ab(i.get_member(&c, &key))?;
@@ -3184,17 +3269,19 @@ fn array_species_create(i: &mut Interp, original: &Value, len: usize) -> Result<
             c = Value::Undefined;
         }
     }
+    // 6. Undefined selects ArrayCreate.
     if matches!(c, Value::Undefined) {
-        return make_sparse_array(i, len);
+        return array_create(i, len);
     }
-    let array_ctor = i.global.borrow().props.get("Array").map(|p| p.value());
-    if let (Value::Obj(s), Some(Value::Obj(ac))) = (&c, &array_ctor) {
-        if Rc::ptr_eq(s, ac) {
-            return make_sparse_array(i, len);
-        }
-    }
+    // 7. IsConstructor.
     if !is_constructor_value(&c) {
         return Err(i.make_error("TypeError", "Array @@species is not a constructor"));
+    }
+    // 8. Construct(C, « 𝔽(length) »); the current Realm's %Array% constructs ArrayCreate(length).
+    if let (Value::Obj(s), Some(ac)) = (&c, i.array_ctor.as_ref()) {
+        if Rc::ptr_eq(s, ac) {
+            return array_create(i, len);
+        }
     }
     ab(i.construct(c, &[Value::Num(len as f64)]))
 }
@@ -5753,7 +5840,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             v => norm_index(ab(i.to_number(&v))?, len),
         };
         let count = (end - start).max(0) as usize;
-        let result = array_species_create(i, &this, count)?;
+        let result = array_species_create(i, &this, count as u64)?;
         let ov = Value::Obj(o.clone());
         let mut k = start;
         let mut to = 0usize;
@@ -5949,7 +6036,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let cb_this = arg(args, 1);
         let cb = crate::callback::Callback::new(cb);
         let ov = Value::Obj(o.clone());
-        let result = array_species_create(i, &this, len)?;
+        let result = array_species_create(i, &this, len as u64)?;
         for k in 0..len {
             let Some(v) = array_get_present_packed(i, &o, &ov, k)? else {
                 continue; // holes stay holes in the result
@@ -7053,7 +7140,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
         return Err(i.make_error("TypeError", "splice result is too long"));
     }
     // The removed array (ArraySpeciesCreate) preserves holes via HasProperty.
-    let removed = array_species_create(i, &this, delete_count.max(0) as usize)?;
+    let removed = array_species_create(i, &this, delete_count.max(0) as u64)?;
     for k in 0..delete_count {
         let from = (start + k).to_string();
         if ab(i.js_has_property(&ov, &from))? {

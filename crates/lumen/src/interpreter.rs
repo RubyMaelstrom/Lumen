@@ -2851,6 +2851,14 @@ pub struct Interp {
     /// the proof lapses. Every defineProperty / proto swap / structural change to a marked
     /// prototype bumps the epoch, forcing a re-verify.
     pub(crate) elems_protector: std::cell::Cell<(u32, bool)>,
+    /// The ArraySpeciesCreate protector (see `builtins::array_species_is_intrinsic`):
+    /// `(epoch, slot)`. While `epoch` matches the live [`crate::value::proto_epoch`], the
+    /// current Realm's %Array% has its intrinsic `@@species` getter and `slot` is the `entries`
+    /// slot of %Array.prototype%'s own "constructor" data property (`u32::MAX`: the proof
+    /// failed). Both objects are marked prototypes, so every defineProperty and structural
+    /// change to either bumps the epoch; an assignment can still replace the constructor's
+    /// value, which each use re-reads.
+    pub(crate) species_protector: std::cell::Cell<(u32, u32)>,
     /// Per-CONSTRUCTOR construct cache (`new F(...)` — keyed by callee identity, since a
     /// constructor's derived state doesn't vary per site): the same raw pointers a [`CallIc`]
     /// caches, validated by the same epoch. The `Weak` pins the callee's address against
@@ -3241,6 +3249,7 @@ interp_memory_inventory! {
     eval_realm_fns => "measured",
     native_function_realms => "measured",
     elems_protector => "non_owning",
+    species_protector => "non_owning",
     construct_ics => "measured",
     call_overflow => "measured",
     native_callback_cache => "measured",
@@ -3362,7 +3371,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 151);
+    assert_eq!(names.len(), 152);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3813,6 +3822,10 @@ impl Interp {
         self.error_protos = r.error_protos.clone();
         self.eval_fn = r.eval_fn.clone();
         self.extra_protos = r.extra_protos.clone();
+        // The protectors prove facts about the active Realm's intrinsics; epoch 0 is never
+        // live, so the next use re-verifies against the restored ones.
+        self.elems_protector.set((0, false));
+        self.species_protector.set((0, u32::MAX));
     }
 
     /// Select the global lexical state associated with an embedder settings
@@ -4197,6 +4210,7 @@ impl Interp {
             eval_realm_fns: Default::default(),
             native_function_realms: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
+            species_protector: std::cell::Cell::new((0, u32::MAX)),
             construct_ics: Default::default(),
             call_overflow: Default::default(),
             native_callback_cache: None,
