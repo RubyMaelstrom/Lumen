@@ -12,7 +12,7 @@
   <section class="todoapp"></section>
   <output id="replay-result" data-replay-state="pending" data-replay-checksum="pending" data-replay-expected="100:100:100"></output>
   <script>
-  (() => {
+  document.addEventListener("DOMContentLoaded", () => {
     "use strict";
     const result = document.getElementById("replay-result");
     const count = selector => document.querySelectorAll(selector).length;
@@ -60,7 +60,7 @@
         }, 0);
       }, 0);
     }, 0);
-  })();
+  });
   </script>
 </body>
 </html>
