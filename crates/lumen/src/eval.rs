@@ -2849,6 +2849,28 @@ impl Interp {
         Ok(out)
     }
 
+    /// The `in` operator (ECMA-262 §13.10.1, RelationalExpression : RelationalExpression `in`
+    /// ShiftExpression, steps 5–6): a *TypeError* unless `object` is an Object, then
+    /// HasProperty(object, ? ToPropertyKey(key)). An array-index Number that names an element of
+    /// an ordinary object's own element storage is answered without building its string key;
+    /// any other case runs the general algorithm.
+    pub(crate) fn in_operator(&mut self, key: &Value, object: &Value) -> Result<bool, Abrupt> {
+        let Value::Obj(target) = object else {
+            return Err(self.throw("TypeError", "'in' requires an object on the right"));
+        };
+        if let Value::Num(n) = *key {
+            if n >= 0.0
+                && n < u32::MAX as f64
+                && n.fract() == 0.0
+                && Self::plain_own_element_present(target, n as u32)
+            {
+                return Ok(true);
+            }
+        }
+        let key = self.to_property_key(key)?;
+        self.js_has_property(object, &key)
+    }
+
     /// `[[HasProperty]]`: the trap-aware `in` check. Handles a proxy anywhere on the chain (its `has`
     /// trap, or forwarding to the target's own `[[HasProperty]]`), TypedArray index slots, then the
     /// ordinary own-property + prototype walk.
@@ -7500,14 +7522,7 @@ impl Interp {
             }
             ">>>" => unreachable!("handled by the numeric block"),
             "instanceof" => self.instanceof(&l, &r),
-            "in" => {
-                if matches!(&r, Value::Obj(_)) {
-                    let key = self.to_property_key(&l)?;
-                    Ok(Value::Bool(self.js_has_property(&r, &key)?))
-                } else {
-                    Err(self.throw("TypeError", "'in' requires an object on the right"))
-                }
-            }
+            "in" => Ok(Value::Bool(self.in_operator(&l, &r)?)),
             _ => unreachable!("binary {op}"),
         }
     }

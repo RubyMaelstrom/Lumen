@@ -400,3 +400,58 @@ fn native_string_identity_and_destructuring_guards_preserve_observers() {
         );
     }
 }
+
+/// `lval in rval` (ECMA-262 §13.10.1) for an array index naming a present own element is
+/// answered in machine code (no checked-operation entry, no key string); holes, out-of-bounds
+/// indices, string keys and primitives reach the checked operation, which consults the
+/// prototype chain or throws.
+#[test]
+fn in_operator_dense_element_hits_stay_native() {
+    let mut engine = prepared(Tier::Jit, "function has(k,o){return k in o;}has(0,[1]);");
+    evaluate(
+        &mut engine,
+        "for(var warm=0;warm<64;warm++)has(warm&1,[1,2]);",
+    );
+    let env = engine.interp.global_env.clone();
+    let crate::value::Value::Obj(object) = engine
+        .interp
+        .get_var("has", &env)
+        .unwrap_or_else(|_| panic!("fixture binding exists"))
+    else {
+        panic!("fixture is callable")
+    };
+    let object = object.borrow();
+    let crate::value::Callable::User(user) = &object.call else {
+        panic!("ordinary fixture")
+    };
+    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
+    drop(object);
+    let before = crate::bytecode::TEST_JIT_IN_HELPERS.with(std::cell::Cell::get);
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            "var packed=[1,'two',{}],plain={0:1,1:2},holey=[1,,3];holey.length=8;\
+             var hits=0;for(var k=0;k<3;k++)hits+=has(k,packed)+has(k&1,plain)+has(k===1?0:k,holey);hits"
+        ),
+        "9"
+    );
+    assert_eq!(
+        crate::bytecode::TEST_JIT_IN_HELPERS.with(std::cell::Cell::get),
+        before,
+        "present own elements are answered without the checked operation"
+    );
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            "Object.prototype[1]='inherited';var r=[has(1,holey),has(5,holey),has('0',packed),\
+             has(3,packed),has(-1,packed)];delete Object.prototype[1];\
+             var thrown;try{has(0,'str')}catch(e){thrown=e.name}r.join()+'|'+thrown"
+        ),
+        "true,false,true,false,false|TypeError"
+    );
+    assert_eq!(
+        crate::bytecode::TEST_JIT_IN_HELPERS.with(std::cell::Cell::get) - before,
+        6
+    );
+}

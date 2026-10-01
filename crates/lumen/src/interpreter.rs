@@ -6723,6 +6723,20 @@ impl Interp {
         true
     }
 
+    /// HasOwnProperty of element `index` for an ordinary Array or object whose element storage
+    /// holds it (a data or accessor property). A set `ic_plain` byte excludes every side-table
+    /// internal method (Proxy, typed array, namespace, Web IDL indexed object), and the `exotic`
+    /// check excludes arguments and wrapper objects. `false` means "use the general algorithm"
+    /// (holes and far keys consult the string-keyed map and the prototype chain there), never
+    /// "absent".
+    #[inline]
+    pub(crate) fn plain_own_element_present(object: &Gc, index: u32) -> bool {
+        let body = object.borrow();
+        body.ic_plain.get()
+            && matches!(body.exotic, Exotic::Array | Exotic::None)
+            && body.props.get_index(index).is_some()
+    }
+
     /// HasProperty + Get of element `index` for an ordinary Array or object whose element is an
     /// own present data property: the value, packed. A set `ic_plain` byte excludes every
     /// side-table internal method (Proxy, typed array, namespace, Web IDL indexed object), and

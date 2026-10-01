@@ -131,6 +131,7 @@ pub(super) fn checked_writes(op: &Op) -> SlotWrites {
         | Op::StrictEq
         | Op::StrictNotEq
         | Op::InstanceOf(_)
+        | Op::In
         | Op::GenBin(_)
         | Op::Neg
         | Op::Plus

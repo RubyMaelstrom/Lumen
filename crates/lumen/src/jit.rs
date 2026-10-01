@@ -10735,6 +10735,97 @@ fn emit_packed_element_store(
     a.bind(classic);
 }
 
+/// Inline `lval in rval` (ECMA-262 §13.10.1) when lval is a Number that is exactly an array
+/// index and rval a plain object or Array whose own element storage holds that element — the
+/// machine-code form of `Interp::plain_own_element_present`. HasProperty then answers *true*
+/// with no key string, no prototype walk and nothing observable. Holes (which consult the
+/// prototype chain), out-of-bounds indices, other keys and receivers, and a last reference to
+/// the receiver all take the checked operation, which also produces every *false* answer.
+/// Every guard branches to `slow` before any state is written.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_in_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, l_unwind: usize) {
+    let strong = layout.rc_strong_off as i32;
+    let rcv = layout.obj_from_rc as u32;
+    let ex = layout.obj_exotic as u32;
+    let plain = layout.obj_ic_plain as u32;
+    let el = (layout.obj_props + layout.props_elems) as u32;
+    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
+    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
+    let slow = a.new_label();
+    let present = a.new_label();
+    let done = a.new_label();
+    // 1. stack: [lval @ -16, rval @ -8]; rval must be an Object, lval a Number that is exactly a
+    //    u32 (NaN, negative, fractional and huge values fail the round trip; 2^32 − 1, which is
+    //    not an array index, fails every bounds check below).
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    emit_exec_word_load(a, 9, 20, -16);
+    emit_exec_number_guard(a, 9, 0, 11, slow);
+    a.ldur_d(0, 20, -16);
+    a.fcvtzu_w_d(9, 0);
+    a.ucvtf_d_w(1, 9);
+    a.fcmp(0, 1);
+    a.b_cond(C_NE, slow);
+    // 2. receiver refcount > 1, so popping it below never frees.
+    emit_exec_word_load(a, 10, 20, -8);
+    emit_exec_payload(a, 10, 10);
+    a.ldur(11, 10, strong);
+    a.cmp_imm_x(11, 1);
+    a.b_cond(C_LS, slow);
+    // 3. object base; exotic None or Array, and plain (no side-table internal methods).
+    a.add_imm(11, 10, rcv);
+    a.ldrb_imm(12, 11, ex);
+    let exotic_ok = a.new_label();
+    a.cmp_imm_w(12, layout.exotic_none_tag as u32);
+    a.b_cond(C_EQ, exotic_ok);
+    a.cmp_imm_w(12, layout.exotic_array_tag as u32);
+    a.b_cond(C_NE, slow);
+    a.bind(exotic_ok);
+    a.ldrb_imm(12, 11, plain);
+    a.cbz(12, false, slow);
+    // 4. element storage sidecar (none: no elements to find here).
+    a.ldr_imm(12, 11, el);
+    a.cbz(12, true, slow);
+    if packed_elem_inlinable(layout) {
+        // Packed: a non-Empty Property at n (data or accessor) is a present own element.
+        let classic = a.new_label();
+        emit_packed_elements_base(a, layout, classic);
+        a.cmp_reg_x(9, 14);
+        a.b_cond(C_HS, slow);
+        a.add_shifted(15, 15, 9, 4); // property_size == 16 (gate above)
+        a.ldur(13, 15, layout.property_value as i32);
+        a.mov_imm64(14, crate::value::PACK_EMPTY);
+        a.cmp_reg_x(13, 14);
+        a.b_cond(C_EQ, slow);
+        a.b(present);
+        a.bind(classic);
+    }
+    // Classic: elems[n] names the element's entry slot, NO_SLOT (0xFFFF_FFFF) a hole.
+    a.ldr_imm(14, 12, evl);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, slow);
+    a.ldr_imm(12, 12, evp);
+    a.add_shifted(12, 12, 9, 2);
+    a.ldr_w_imm(13, 12, 0);
+    a.cmn_imm_w(13, 1);
+    a.b_cond(C_EQ, slow);
+    // --- commit: drop the receiver (strong was > 1); [lval, rval] → [true] ---
+    a.bind(present);
+    a.ldur(9, 10, strong);
+    a.sub_imm(9, 9, 1);
+    a.stur(9, 10, strong);
+    a.mov_imm64(9, crate::value::PACK_BOOL | 1);
+    emit_exec_word_store(a, 9, 20, -16);
+    a.sub_imm(20, 20, 8);
+    a.b(done);
+    a.bind(slow);
+    emit_op_helper(a, H_EXEC, pc, l_unwind);
+    a.bind(done);
+}
+
 /// Which fused parameter-slot element op to emit.
 #[cfg(all(
     target_arch = "aarch64",

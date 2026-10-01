@@ -247,6 +247,9 @@ pub(super) fn emit(
         Op::GetElem if fast & 1024 != 0 && get_elem_inlinable(layout) => {
             emit_get_elem_inline(a, layout, pc as u32, unwind);
         }
+        Op::In if fast & 1024 != 0 && get_elem_inlinable(layout) => {
+            emit_in_inline(a, layout, pc as u32, unwind);
+        }
         Op::SetElemDrop if fast & 2048 != 0 && elem_inlinable(layout) => {
             emit_set_elem_inline(a, layout, pc as u32, unwind, false);
         }

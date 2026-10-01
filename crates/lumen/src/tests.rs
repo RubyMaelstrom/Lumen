@@ -26434,3 +26434,81 @@ out.join(",")
         "surplus arguments leaked: {before} -> {after}"
     );
 }
+
+/// `lval in rval` (ECMA-262 §13.10.1): array-index Numbers answered from element storage (the
+/// JIT's inline path) agree with HasProperty for holes, inherited and accessor elements (whose
+/// getter never runs), -0, non-index Numbers, string keys, symbols, typed arrays, String
+/// wrappers, Proxy `has` traps (string keys), sparse arrays and last-reference receivers; a
+/// primitive rval throws before ToPropertyKey(lval) runs. Expected output from Node.
+#[test]
+fn in_operator_answers_element_keys_and_rejects_primitives_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#""use strict";
+var out = [];
+function attempt(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+var dense = [10, 20, 30];
+var holey = [1, , 3];
+var inherits = Object.setPrototypeOf([1, , 3], Object.assign(Object.create(Array.prototype), { 1: "p" }));
+var accessor = [];
+var getterCalls = 0;
+Object.defineProperty(accessor, 0, { get() { getterCalls++; return 1; }, configurable: true });
+var sym = Symbol("s");
+var keyed = { 0: "a", "1.5": "b", "-0": "c", [sym]: "d", NaN: "e" };
+var ta = new Int8Array(2);
+var traps = [];
+var proxy = new Proxy([5], { has(t, k) { traps.push(typeof k + ":" + String(k)); return Reflect.has(t, k); } });
+function sample(round) {
+  return [
+    0 in dense, 2 in dense, 3 in dense, -0 in dense, 1.5 in dense, NaN in dense, "1" in dense, "01" in dense,
+    1 in holey, 1 in inherits, 0 in accessor, 4294967295 in [], 4294967294 in [],
+    0 in keyed, 1.5 in keyed, -0 in keyed, "-0" in keyed, sym in keyed, NaN in keyed, 2 in keyed,
+    0 in ta, 2 in ta, -0 in ta, "-0" in ta, 0 in proxy, 1 in proxy,
+    0 in new String("ab"), 2 in new String("ab"), "length" in dense, 0 in [round], (round % 3) in dense,
+  ].map(Number).join("");
+}
+var rows = [];
+for (var round = 0; round < 12; round++) rows.push(sample(round));
+out.push(rows[0], rows[11] === rows[0] ? "stable" : rows[11], getterCalls, traps.slice(0, 4).join(" "));
+var order = [];
+var key = { toString() { order.push("key"); return "0"; } };
+out.push(attempt(() => key in 5), order.join(), attempt(() => key in [1]), order.join());
+out.push(attempt(() => 0 in null), attempt(() => "x" in "string"), attempt(() => sym in undefined));
+var sparse = [];
+sparse[1000000] = 1;
+out.push(1000000 in sparse, 999999 in sparse, 0 in sparse);
+var revoked = Proxy.revocable([], {});
+revoked.revoke();
+out.push(attempt(() => 0 in revoked.proxy));
+out.join("\n");
+"#;
+    let expected = [
+        "1101001001100111111010101010111",
+        "stable",
+        "0",
+        "string:0 string:1 string:0 string:1",
+        "TypeError",
+        "",
+        "true",
+        "key",
+        "TypeError",
+        "TypeError",
+        "TypeError",
+        "true",
+        "false",
+        "false",
+        "TypeError",
+    ]
+    .join("\n");
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                expected,
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}

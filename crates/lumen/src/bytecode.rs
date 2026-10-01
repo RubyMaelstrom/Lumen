@@ -1603,7 +1603,10 @@ pub enum Op {
     /// constructor case. The JIT additionally validates the live constructor/prototype chain;
     /// misses retain the complete `@@hasInstance` semantics through the generic executor.
     InstanceOf(u32),
-    /// Any other binary operator (`**`, `in`, `instanceof`) via the interpreter, op in names.
+    /// `lval in rval` (ECMA-262 §13.10.1): pops [lval, rval]; throws a *TypeError* unless rval
+    /// is an Object, else pushes HasProperty(rval, ? ToPropertyKey(lval)).
+    In,
+    /// Any other binary operator (`**`) via the interpreter, op in names.
     GenBin(u32),
     Neg,
     Plus,
@@ -6684,6 +6687,7 @@ fn inline_capability(op: &Op) -> InlineCapability {
         | Op::StrictEq
         | Op::StrictNotEq
         | Op::InstanceOf(_)
+        | Op::In
         | Op::GenBin(_)
         | Op::Neg
         | Op::Plus
@@ -12122,6 +12126,7 @@ impl Compiler {
                     "===" => Op::StrictEq,
                     "!==" => Op::StrictNotEq,
                     "instanceof" => Op::InstanceOf(self.new_single_cache()),
+                    "in" => Op::In,
                     other => {
                         let i = self.name_idx(other);
                         Op::GenBin(i)
@@ -14781,6 +14786,11 @@ fn run_vm_inner<S: StoredValue>(
                 let a = pop!();
                 let v = i.instanceof_ic(&a, &b, &chunk.caches[c as usize])?;
                 stack.push(v);
+            }
+            Op::In => {
+                let object = pop!();
+                let key = pop!();
+                stack.push(Value::Bool(i.in_operator(&key, &object)?));
             }
             Op::GenBin(n) => {
                 let b = pop!();
@@ -18563,6 +18573,7 @@ impl Chunk {
             | Op::StrictEq
             | Op::StrictNotEq
             | Op::InstanceOf(_)
+            | Op::In
             | Op::GenBin(_) => (2, 1),
             Op::Neg
             | Op::Plus
@@ -20670,6 +20681,9 @@ thread_local! {
     pub(crate) static TEST_JIT_TYPEOF_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    pub(crate) static TEST_JIT_IN_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     pub(crate) static TEST_JIT_TYPEOF_IS_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -22428,6 +22442,13 @@ unsafe fn jit_exec_inner(
             let a = pop!();
             let v = i.instanceof_ic(&a, &b, &chunk.caches[c as usize])?;
             push!(v);
+        }
+        Op::In => {
+            #[cfg(test)]
+            TEST_JIT_IN_HELPERS.with(|count| count.set(count.get() + 1));
+            let object = pop!();
+            let key = pop!();
+            push!(Value::Bool(i.in_operator(&key, &object)?));
         }
         Op::GenBin(n) => {
             let b = pop!();
