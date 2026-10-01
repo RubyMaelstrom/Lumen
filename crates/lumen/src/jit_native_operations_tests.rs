@@ -330,9 +330,12 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
         assert_eq!(evaluate(&mut engine, "temporaryVoid()===undefined"), "true");
         assert_eq!(drops.get(), 1, "last owner is destroyed at void, {tier:?}");
         if tier == Tier::Jit {
-            assert!(
-                crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get) > before,
-                "the last owner uses checked destruction"
+            // The native template destroys a last owner through the packed drop helper (Rust
+            // destruction only), without the generic Void operation.
+            assert_eq!(
+                crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get),
+                before,
+                "the last owner is released natively"
             );
         }
         engine.interp.gc_collect();

@@ -1770,6 +1770,8 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_slice_op as *const () as usize,
         crate::bytecode::jit_reference_op as *const () as usize,
         optimizing_loop_enter as *const () as usize,
+        crate::bytecode::jit_make_closure as *const () as usize,
+        crate::bytecode::jit_object_literal as *const () as usize,
     ]
 }
 
@@ -1886,7 +1888,11 @@ pub const H_SLICE_OP: usize = 30;
 pub const H_REFERENCE_OP: usize = 31;
 #[cfg(feature = "optimizing-jit")]
 pub const H_OPT_LOOP: usize = 32;
-pub const N_HELPERS: usize = 33;
+/// `Op::MakeClosure` (see `bytecode::jit_make_closure`).
+pub const H_MAKE_CLOSURE: usize = 33;
+/// Incremental object-literal builder ops (see `bytecode::jit_object_literal`).
+pub const H_OBJECT_LITERAL: usize = 34;
+pub const N_HELPERS: usize = 35;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -1925,6 +1931,8 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "slice_op",
     "reference_op",
     "optimizing_loop",
+    "make_closure",
+    "object_literal",
 ];
 
 #[inline]

@@ -6380,8 +6380,9 @@ impl Interp {
         self.make_function_named(func, env, None)
     }
 
-    /// [`Interp::make_function`] followed by NamedEvaluation's SetFunctionName(F, `name`) for an
-    /// anonymous function (ECMA-262 §10.2.9): the name is part of the cloned property template.
+    /// [`Interp::make_function`] followed by SetFunctionName(F, `name`) (ECMA-262 §10.2.9) for an
+    /// anonymous function expression's NamedEvaluation or a concise method's key: the name is
+    /// part of the cloned property template.
     pub(crate) fn make_function_named(
         &self,
         func: Rc<Function>,
@@ -6456,15 +6457,20 @@ impl Interp {
             }
         });
         let proto_map = &maps.prototype;
-        // SetFunctionName applies only to anonymous, non-method functions (the compiler passes
-        // a name only for those); the template's `name` slot is entry 1 with the "" value.
-        let named = name.filter(|_| func.name.is_none() && !is_method);
+        // SetFunctionName: NamedEvaluation of an anonymous function expression, or a concise
+        // method's key (MethodDefinitionEvaluation). A function with its own name keeps it; the
+        // template's `name` slot is entry 1 with the "" value.
+        let named = name.filter(|_| func.name.is_none());
         let fn_map = match named {
             None => maps.function.clone(),
             Some(name) => {
                 let mut named = maps.named.borrow_mut();
                 match &*named {
-                    Some((cached, props)) if **cached == **name => props.clone(),
+                    // A creation site passes its chunk's interned name, so identity is the common
+                    // proof; equal text from another site shares the template too.
+                    Some((cached, props)) if Rc::ptr_eq(cached, name) || **cached == **name => {
+                        props.clone()
+                    }
                     _ => {
                         let mut props = maps.function.clone();
                         props

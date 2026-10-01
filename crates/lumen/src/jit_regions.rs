@@ -2337,6 +2337,10 @@ fn emit_effect(
         Op::UpdateLocal(slot, kind) if fast & 32 != 0 && slot as u32 * 8 + 8 < 4096 => {
             emit_update_local(a, slot, kind, pc_u32, unwind);
         }
+        Op::Pop if fast & 64 != 0 && layout.valid && layout.rc_strong_off < 256 => {
+            emit_exec_release_word(a, layout, 20, -8);
+            a.sub_imm(20, 20, 8);
+        }
         Op::Pop | Op::Dup if fast & 64 != 0 => {
             let slow = a.new_label();
             let done = a.new_label();

@@ -1661,6 +1661,12 @@ pub enum Op {
     ObjectSpread,
     ObjectProto,
     ObjectMethod(u32, u8),
+    /// [`Op::ObjectData`] for a static identifier or string key (`names` index, then the
+    /// NamedEvaluation flag): the key is already a property key, so no ToPropertyKey runs.
+    ObjectDataName(u32, bool),
+    /// [`Op::ObjectMethod`] (function index, kind) for a static identifier or string key
+    /// (`names` index).
+    ObjectMethodName(u32, u8, u32),
     /// Meta/import/private-name expression forms. DynamicImport's bool says whether an options
     /// operand is present; its phase is the parsed proposal/core import phase.
     ImportMeta,
@@ -6653,6 +6659,7 @@ fn inline_capability(op: &Op) -> InlineCapability {
         | Op::MakeObject(..)
         | Op::NewObject
         | Op::ObjectData(_)
+        | Op::ObjectDataName(..)
         | Op::ObjectSpread
         | Op::ObjectProto
         | Op::ObjectRest(_)
@@ -12378,39 +12385,63 @@ impl Compiler {
                 Ok(())
             }
             Expr::Object(props) => {
-                let plain = props.iter().all(|property| {
-                    let PropDef::KeyValue { key, .. } = property else {
-                        return false;
-                    };
+                // A static, ordinary own-property key: no ToPropertyKey effects, not the
+                // `__proto__` setter form, not a private name.
+                let static_key = |key: &PropKey| {
                     matches!(key, PropKey::Ident(key) if key != "__proto__" && !key.starts_with('#'))
                         || matches!(key, PropKey::Str(key) if &**key != "__proto__" && !key.starts_with('#'))
+                };
+                // Concise methods are ordinary enumerable data properties (ECMA-262
+                // MethodDefinitionEvaluation: DefineMethod, SetFunctionName(closure, key),
+                // DefineMethodProperty), so a literal of static data keys and methods has a
+                // fixed final shape. A method that can observe its [[HomeObject]] (`super`,
+                // direct eval) keeps the incremental builder, which binds the literal itself.
+                let plain = props.iter().all(|property| match property {
+                    PropDef::KeyValue { key, .. } => static_key(key),
+                    PropDef::Method { key, func } => {
+                        static_key(key) && !func.observes_home_object()
+                    }
+                    _ => false,
                 });
                 if !plain {
+                    // An identifier or string property name is already a property key.
+                    let static_name = |key: &PropKey| match key {
+                        PropKey::Ident(key) => Some(key.clone()),
+                        PropKey::Str(key) => Some(key.to_string()),
+                        PropKey::Num(_) | PropKey::Computed(_) => None,
+                    };
                     self.emit(Op::NewObject);
                     for property in props {
                         match property {
                             PropDef::KeyValue { key, value } | PropDef::Cover { key, value } => {
-                                self.object_literal_key(key)?;
-                                self.expr(value)?;
-                                self.emit(Op::ObjectData(crate::eval::is_anonymous_fn(value)));
+                                let anonymous = crate::eval::is_anonymous_fn(value);
+                                if let Some(name) = static_name(key) {
+                                    self.expr(value)?;
+                                    let name = self.name_idx(&name);
+                                    self.emit(Op::ObjectDataName(name, anonymous));
+                                } else {
+                                    self.object_literal_key(key)?;
+                                    self.expr(value)?;
+                                    self.emit(Op::ObjectData(anonymous));
+                                }
                             }
-                            PropDef::Method { key, func } => {
-                                self.object_literal_key(key)?;
+                            PropDef::Method { key, func }
+                            | PropDef::Getter { key, func }
+                            | PropDef::Setter { key, func } => {
+                                let kind = match property {
+                                    PropDef::Method { .. } => 0,
+                                    PropDef::Getter { .. } => 1,
+                                    _ => 2,
+                                };
                                 let function = self.funcs.len() as u32;
                                 self.funcs.push(func.clone());
-                                self.emit(Op::ObjectMethod(function, 0));
-                            }
-                            PropDef::Getter { key, func } => {
-                                self.object_literal_key(key)?;
-                                let function = self.funcs.len() as u32;
-                                self.funcs.push(func.clone());
-                                self.emit(Op::ObjectMethod(function, 1));
-                            }
-                            PropDef::Setter { key, func } => {
-                                self.object_literal_key(key)?;
-                                let function = self.funcs.len() as u32;
-                                self.funcs.push(func.clone());
-                                self.emit(Op::ObjectMethod(function, 2));
+                                if let Some(name) = static_name(key) {
+                                    let name = self.name_idx(&name);
+                                    self.emit(Op::ObjectMethodName(function, kind, name));
+                                } else {
+                                    self.object_literal_key(key)?;
+                                    self.emit(Op::ObjectMethod(function, kind));
+                                }
                             }
                             PropDef::Spread(value) => {
                                 self.expr(value)?;
@@ -12429,7 +12460,7 @@ impl Compiler {
                 // Keys must land contiguously in `names`; values go on the stack in order.
                 let mut keys: Vec<String> = Vec::new();
                 for p in props {
-                    let PropDef::KeyValue { key, value } = p else {
+                    let (PropDef::KeyValue { key, .. } | PropDef::Method { key, .. }) = p else {
                         unreachable!("plain object literal fast path checked above")
                     };
                     let k = match key {
@@ -12437,8 +12468,18 @@ impl Compiler {
                         PropKey::Str(k) => k.to_string(),
                         _ => unreachable!("plain object literal key checked above"),
                     };
-                    // NamedEvaluation: `{ m: function(){} }` names the anonymous function "m".
-                    self.named_expr(value, &k)?;
+                    match p {
+                        // NamedEvaluation: `{ m: function(){} }` names the anonymous function "m".
+                        PropDef::KeyValue { value, .. } => self.named_expr(value, &k)?,
+                        // The method closure, named by its key (SetFunctionName).
+                        PropDef::Method { func, .. } => {
+                            let function = self.funcs.len() as u32;
+                            self.funcs.push(func.clone());
+                            let name = self.name_idx(&k);
+                            self.emit(Op::MakeClosure(function, name));
+                        }
+                        _ => unreachable!("plain object literal fast path checked above"),
+                    }
                     keys.push(k);
                 }
                 // Keys go into `names` only after every value is compiled — value expressions
@@ -15066,17 +15107,23 @@ fn run_vm_inner<S: StoredValue>(
                 // owner until CreateDataProperty has retained the identity
                 // (ECMA-262 e28783d5, sec-topropertykey).
                 let key = i.to_property_key(&key)?;
-                if name_anonymous {
-                    let name = i.fn_name_for_key(&key);
-                    i.set_fn_name(&value, &name);
-                }
                 let Value::Obj(object) = stack.last().expect("object builder missing") else {
                     unreachable!("object literal builder retains an Object")
                 };
-                object
-                    .borrow_mut()
-                    .props
-                    .insert(key.as_str(), crate::value::Property::plain(value));
+                literal_define_data(i, &object, key.as_str(), value, name_anonymous);
+            }
+            Op::ObjectDataName(name, name_anonymous) => {
+                let value = pop!();
+                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                    unreachable!("object literal builder retains an Object")
+                };
+                literal_define_data(
+                    i,
+                    &object,
+                    chunk.names[name as usize].clone(),
+                    value,
+                    name_anonymous,
+                );
             }
             Op::ObjectSpread => {
                 let source = pop!();
@@ -15102,28 +15149,22 @@ fn run_vm_inner<S: StoredValue>(
                 let Value::Obj(object) = stack.last().expect("object builder missing") else {
                     unreachable!("object literal builder retains an Object")
                 };
-                let home_env = crate::interpreter::new_scope(Some(env.clone()));
-                crate::eval::bind(&home_env, "%homeobject%", Value::Obj(object.clone()));
-                let value = i.make_function(chunk.funcs[function as usize].clone(), home_env);
-                let name = i.fn_name_for_key(&key);
-                match kind {
-                    0 => {
-                        i.set_fn_name(&value, &name);
-                        object
-                            .borrow_mut()
-                            .props
-                            .insert(key.as_str(), crate::value::Property::plain(value));
-                    }
-                    1 => {
-                        i.set_fn_name(&value, &format!("get {name}"));
-                        i.define_accessor(&object, &key, Some(value), None);
-                    }
-                    2 => {
-                        i.set_fn_name(&value, &format!("set {name}"));
-                        i.define_accessor(&object, &key, None, Some(value));
-                    }
-                    _ => unreachable!("object method kind is compiler-internal"),
-                }
+                let func = &chunk.funcs[function as usize];
+                literal_define_method(i, &object, env, func, key.as_str(), kind);
+            }
+            Op::ObjectMethodName(function, kind, name) => {
+                let Value::Obj(object) = stack.last().expect("object builder missing") else {
+                    unreachable!("object literal builder retains an Object")
+                };
+                let func = &chunk.funcs[function as usize];
+                literal_define_method(
+                    i,
+                    &object,
+                    env,
+                    func,
+                    chunk.names[name as usize].clone(),
+                    kind,
+                );
             }
             Op::ImportMeta => stack.push(i.import_meta_vm(env)),
             Op::NewTarget => stack.push(if chunk.lean_new_target {
@@ -18297,7 +18338,6 @@ impl Chunk {
                 | Op::EvalCallArgsArray
                 | Op::TailEvalCallArgsArray
                 | Op::NewArgsArray
-                | Op::ObjectMethod(..)
                 | Op::ImportMeta
                 | Op::DynamicImport(..)
                 | Op::PrivateIn(_)
@@ -18493,7 +18533,10 @@ impl Chunk {
             Op::MakeObject(_, count, _) => (*count as usize, 1),
             Op::NewObject => (0, 1),
             Op::ObjectData(_) => (3, 1),
-            Op::ObjectSpread | Op::ObjectProto | Op::ObjectMethod(..) => (2, 1),
+            Op::ObjectSpread | Op::ObjectProto | Op::ObjectMethod(..) | Op::ObjectDataName(..) => {
+                (2, 1)
+            }
+            Op::ObjectMethodName(..) => (1, 1),
             Op::ImportMeta | Op::NewTarget | Op::TemplateObject(_) => (0, 1),
             Op::DynamicImport(_, has_options) => (usize::from(*has_options) + 1, 1),
             Op::PrivateIn(_) => (1, 1),
@@ -18628,7 +18671,6 @@ fn jit_bridge_op(op: &Op) -> bool {
             | Op::CallArgsArrayThis
             | Op::EvalCallArgsArray
             | Op::NewArgsArray
-            | Op::ObjectMethod(..)
             | Op::ImportMeta
             | Op::DynamicImport(..)
             | Op::PrivateIn(_)
@@ -19049,6 +19091,9 @@ pub(crate) unsafe extern "C" fn jit_exec(
     }
     if jit_scope_operation(&chunk.ops[pc as usize]) {
         return jit_scope_op(ctx, pc, sp);
+    }
+    if jit_object_literal_operation(&chunk.ops[pc as usize]) {
+        return jit_object_literal(ctx, pc, sp);
     }
     if jit_bridge_op(&chunk.ops[pc as usize]) {
         return jit_vm_operation(ctx, pc, sp);
@@ -20209,6 +20254,227 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
             ctx.error = Some(ab);
             crate::jit::SpFlag { sp, flag: 1 }
         }
+    }
+}
+
+/// PropertyDefinitionEvaluation of `PropertyName : AssignmentExpression` into an object literal
+/// under construction (ECMA-262 §13.2.5.5): NamedEvaluation's SetFunctionName for an anonymous
+/// function definition, then CreateDataPropertyOrThrow, which cannot fail on the fresh,
+/// extensible ordinary object. Runs no author code.
+fn literal_define_data<K: AsRef<str> + Into<Rc<str>>>(
+    i: &mut Interp,
+    object: &crate::value::Gc,
+    key: K,
+    value: Value,
+    anonymous: bool,
+) {
+    if anonymous {
+        let name = i.fn_name_for_key(key.as_ref());
+        i.set_fn_name(&value, &name);
+    }
+    object
+        .borrow_mut()
+        .props
+        .insert(key, crate::value::Property::plain(value));
+}
+
+/// MethodDefinitionEvaluation (`kind` 0: DefineMethod, SetFunctionName, DefineMethodProperty) or
+/// an accessor definition (1: getter, 2: setter; SetFunctionName with its "get"/"set" prefix,
+/// then that half of the accessor) into an object literal under construction, closing over the
+/// running LexicalEnvironment `env`. MakeMethod binds the literal as [[HomeObject]] only for a
+/// method that can observe it (see `Function::observes_home_object`). Runs no author code and
+/// cannot fail.
+fn literal_define_method<K: AsRef<str> + Into<Rc<str>>>(
+    i: &mut Interp,
+    object: &crate::value::Gc,
+    env: &Env,
+    func: &Rc<Function>,
+    key: K,
+    kind: u8,
+) {
+    let method_env = if func.observes_home_object() {
+        let home_env = crate::interpreter::new_scope(Some(env.clone()));
+        crate::eval::bind(&home_env, "%homeobject%", Value::Obj(object.clone()));
+        home_env
+    } else {
+        env.clone()
+    };
+    let value = i.make_function(func.clone(), method_env);
+    let name = i.fn_name_for_key(key.as_ref());
+    match kind {
+        0 => {
+            i.set_fn_name(&value, &name);
+            object
+                .borrow_mut()
+                .props
+                .insert(key, crate::value::Property::plain(value));
+        }
+        1 => {
+            i.set_fn_name(&value, &format!("get {name}"));
+            i.define_accessor(object, key.as_ref(), Some(value), None);
+        }
+        2 => {
+            i.set_fn_name(&value, &format!("set {name}"));
+            i.define_accessor(object, key.as_ref(), None, Some(value));
+        }
+        _ => unreachable!("object method kind is compiler-internal"),
+    }
+}
+
+/// Whether `op` builds an object literal incrementally (see [`jit_object_literal`]).
+fn jit_object_literal_operation(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::NewObject
+            | Op::ObjectData(_)
+            | Op::ObjectDataName(..)
+            | Op::ObjectProto
+            | Op::ObjectSpread
+            | Op::ObjectMethod(..)
+            | Op::ObjectMethodName(..)
+    )
+}
+
+/// Dedicated incremental ObjectLiteral entry (same contract as [`jit_exec`]): the builder ops
+/// operate on the native operand stack and the frame's current environment directly, without
+/// the generic operation dispatch or a one-operation VM. The fresh object stays owned by the
+/// operand stack while ToPropertyKey, getters and Proxy traps (CopyDataProperties) run.
+pub(crate) unsafe extern "C" fn jit_object_literal(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    mut sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let ctx = &mut *ctx;
+    jit_opstat(ctx, pc);
+    match jit_object_literal_inner(ctx, pc, &mut sp) {
+        Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+        Err(ab) => {
+            ctx.error = Some(ab);
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
+unsafe fn jit_object_literal_inner(
+    ctx: &mut crate::jit::JitCtx,
+    pc: u32,
+    sp: &mut *mut PackedValue,
+) -> Result<(), Abrupt> {
+    let i = &mut *ctx.interp;
+    let chunk = &*ctx.chunk;
+    macro_rules! pop {
+        () => {{
+            *sp = sp.sub(1);
+            sp.read().into_value()
+        }};
+    }
+    // The builder object under construction, borrowed from the operand stack (which keeps it
+    // alive and owned across any fallible step).
+    macro_rules! builder {
+        () => {{
+            let Value::Obj(object) = (*sp.sub(1)).unpack() else {
+                unreachable!("object literal builder retains an Object")
+            };
+            object
+        }};
+    }
+    match chunk.ops[pc as usize] {
+        Op::NewObject => {
+            let value = Value::Obj(i.new_object());
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::Object,
+                0,
+            );
+            sp.write(PackedValue::pack(value));
+            *sp = sp.add(1);
+        }
+        Op::ObjectData(name_anonymous) => {
+            // pop! updates the unwind boundary before any fallible work; moved key/value
+            // owners are dropped by Rust on an abrupt completion, never again by the JIT.
+            let value = pop!();
+            let key = pop!();
+            let key = i.to_property_key(&key)?;
+            literal_define_data(i, &builder!(), key.as_str(), value, name_anonymous);
+        }
+        Op::ObjectDataName(name, name_anonymous) => {
+            let value = pop!();
+            let key = chunk.names[name as usize].clone();
+            literal_define_data(i, &builder!(), key, value, name_anonymous);
+        }
+        Op::ObjectProto => {
+            let prototype = pop!();
+            // A fresh, unexposed ordinary object, not an author-visible __proto__ assignment.
+            // Primitive values other than null are ignored.
+            let object = builder!();
+            match prototype {
+                Value::Obj(prototype) => object.borrow_mut().proto = Some(prototype),
+                Value::Null => object.borrow_mut().proto = None,
+                _ => {}
+            }
+        }
+        Op::ObjectSpread => {
+            // ECMA-262 CopyDataProperties: consume the source before any fallible operation so
+            // unwind cannot drop it twice.
+            let source = pop!();
+            i.copy_data_properties_into(&builder!(), &source, &[])?;
+        }
+        Op::ObjectMethod(function, kind) | Op::ObjectMethodName(function, kind, _) => {
+            let key = match chunk.ops[pc as usize] {
+                Op::ObjectMethodName(_, _, name) => {
+                    crate::value::PropertyKey::string(chunk.names[name as usize].to_string())
+                }
+                _ => {
+                    let key = pop!();
+                    i.to_property_key(&key)?
+                }
+            };
+            let env = std::mem::ManuallyDrop::new(Rc::from_raw(
+                ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+            ));
+            let func = &chunk.funcs[function as usize];
+            literal_define_method(i, &builder!(), &env, func, key.as_str(), kind);
+        }
+        _ => unreachable!("jit_object_literal emitted only for object literal builder ops"),
+    }
+    Ok(())
+}
+
+/// Dedicated `Op::MakeClosure` entry (same contract as [`jit_exec`]): InstantiateOrdinaryFunction
+/// Expression / ArrowFunction evaluation (OrdinaryFunctionCreate over the running execution
+/// context's LexicalEnvironment, plus NamedEvaluation's name) without the generic operation
+/// dispatch. The environment is the frame's current one, exactly as `jit_exec_inner` derives it;
+/// creating a closure runs no author code and cannot throw.
+pub(crate) unsafe extern "C" fn jit_make_closure(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let ctx = &mut *ctx;
+    jit_opstat(ctx, pc);
+    let i = &mut *ctx.interp;
+    let chunk = &*ctx.chunk;
+    let Op::MakeClosure(function, name) = chunk.ops[pc as usize] else {
+        unreachable!("jit_make_closure emitted only for MakeClosure");
+    };
+    // Borrowed, like `jit_exec_inner`: the frame keeps its current environment alive.
+    let env = std::mem::ManuallyDrop::new(Rc::from_raw(
+        ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+    ));
+    let name = (name != u32::MAX).then(|| &chunk.names[name as usize]);
+    let closure =
+        i.make_function_named(chunk.funcs[function as usize].clone(), (*env).clone(), name);
+    observe_allocation(
+        &chunk.feedback,
+        pc as usize,
+        crate::feedback::AllocationObjectKind::Function,
+        0,
+    );
+    sp.write(PackedValue::pack(closure));
+    crate::jit::SpFlag {
+        sp: sp.add(1),
+        flag: 0,
     }
 }
 
@@ -22313,58 +22579,13 @@ unsafe fn jit_exec_inner(
             );
             push!(v);
         }
-        Op::NewObject => {
-            let value = Value::Obj(i.new_object());
-            observe_allocation(
-                &chunk.feedback,
-                pc as usize,
-                crate::feedback::AllocationObjectKind::Object,
-                0,
-            );
-            push!(value);
-        }
-        Op::ObjectData(name_anonymous) => {
-            // Keep the fresh builder owned by the operand stack throughout conversion.
-            // pop! updates the unwind boundary before any fallible work; moved key/value
-            // owners are dropped by Rust on an abrupt completion, never again by the JIT.
-            let value = pop!();
-            let key = pop!();
-            let key = i.to_property_key(&key)?;
-            if name_anonymous {
-                let name = i.fn_name_for_key(&key);
-                i.set_fn_name(&value, &name);
-            }
-            let Value::Obj(object) = &(*sp.sub(1)).unpack() else {
-                unreachable!("object literal builder retains an Object")
-            };
-            object
-                .borrow_mut()
-                .props
-                .insert(key.as_str(), crate::value::Property::plain(value));
-        }
-        Op::ObjectProto => {
-            let prototype = pop!();
-            let Value::Obj(object) = &(*sp.sub(1)).unpack() else {
-                unreachable!("object literal builder retains an Object")
-            };
-            // This is a fresh, unexposed ordinary object, not an author-visible
-            // __proto__ assignment. Primitive values other than null are ignored.
-            match prototype {
-                Value::Obj(prototype) => object.borrow_mut().proto = Some(prototype),
-                Value::Null => object.borrow_mut().proto = None,
-                _ => {}
-            }
-        }
-        Op::ObjectSpread => {
-            // ECMA-262 CopyDataProperties: retain the fresh target on the live
-            // stack while source getters/proxy traps run, and consume the source
-            // before any fallible operation so unwind cannot drop it twice.
-            let source = pop!();
-            let Value::Obj(object) = &(*sp.sub(1)).unpack() else {
-                unreachable!("object literal builder retains an Object")
-            };
-            i.copy_data_properties_into(object, &source, &[])?;
-        }
+        Op::NewObject
+        | Op::ObjectData(_)
+        | Op::ObjectDataName(..)
+        | Op::ObjectProto
+        | Op::ObjectSpread
+        | Op::ObjectMethod(..)
+        | Op::ObjectMethodName(..) => jit_object_literal_inner(ctx, pc, sp)?,
         Op::NewTarget => {
             // GetNewTarget follows the nearest this-binding Environment Record;
             // an arrow must observe its defining environment, not the caller. A lean ordinary
@@ -22477,7 +22698,6 @@ unsafe fn jit_exec_inner(
         | Op::ArraySpread
         | Op::EvalCallArgsArray
         | Op::TailEvalCallArgsArray
-        | Op::ObjectMethod(..)
         | Op::ImportMeta
         | Op::DynamicImport(..)
         | Op::PrivateIn(_)

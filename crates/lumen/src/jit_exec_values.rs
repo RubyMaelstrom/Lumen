@@ -307,6 +307,36 @@ pub(super) fn emit_exec_drop_shared(
     a.bind(done);
 }
 
+/// Release the packed owner stored at `[base + off]` (a local slot or an operand-stack word).
+/// Shared owners are decremented inline; a last owner, a BigInt or any other word whose release
+/// needs its destructor goes to `H_DROP_PACKED_AT`, which runs only Rust destruction (no author
+/// code, allocation of JS values, or unwinding). The word is left moved-from: the caller must
+/// overwrite or pop it. Scratch x9..x11; the helper path clobbers x0..x17 (the frame registers
+/// x19..x22 are preserved).
+pub(super) fn emit_exec_release_word(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    base: u32,
+    off: i32,
+) {
+    let release = a.new_label();
+    let done = a.new_label();
+    emit_exec_word_load(a, 9, base, off);
+    emit_exec_drop_shared(a, layout, 9, 10, 11, release);
+    a.b(done);
+    a.bind(release);
+    a.mov(0, 19);
+    a.movz(1, 0, 0);
+    if off >= 0 {
+        a.add_imm(2, base, off as u32);
+    } else {
+        a.sub_imm(2, base, off.unsigned_abs());
+    }
+    a.ldr_imm(16, 21, (super::H_DROP_PACKED_AT * 8) as u32);
+    a.blr(16);
+    a.bind(done);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

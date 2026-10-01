@@ -539,15 +539,8 @@ pub(super) fn emit(
             emit_update_local(a, *slot, *kind, pc as u32, unwind);
         }
         Op::Pop if fast & 64 != 0 && rc_ok => {
-            let slow = a.new_label();
-            let done = a.new_label();
-            emit_exec_word_load(a, 9, 20, -8);
-            emit_exec_drop_shared(a, layout, 9, 10, 11, slow);
+            emit_exec_release_word(a, layout, 20, -8);
             a.sub_imm(20, 20, 8);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
-            a.bind(done);
         }
         Op::DestructureGuard if fast & 1024 != 0 => {
             let slow = a.new_label();
@@ -576,18 +569,11 @@ pub(super) fn emit(
             a.bind(done);
         }
         Op::Void if fast & (64 | 128) == (64 | 128) && rc_ok => {
-            // GetValue/effects already ran. Release the consumed owner exactly as Pop,
-            // retaining checked destruction for last owners, then return undefined.
-            let slow = a.new_label();
-            let done = a.new_label();
-            emit_exec_word_load(a, 9, 20, -8);
-            emit_exec_drop_shared(a, layout, 9, 10, 11, slow);
+            // GetValue/effects already ran. Release the consumed owner exactly as Pop (a last
+            // owner's destructor runs through the drop helper), then return undefined.
+            emit_exec_release_word(a, layout, 20, -8);
             a.mov_imm64(9, crate::value::PACK_UNDEFINED);
             emit_exec_word_store(a, 9, 20, -8);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
-            a.bind(done);
         }
         Op::Undef if fast & 128 != 0 => {
             a.mov_imm64(9, crate::value::PACK_UNDEFINED);
@@ -632,33 +618,21 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
+        // Block entry puts the slot in its temporal dead zone. The previous iteration's value
+        // is commonly the slot's last owner; release it in place (no generic dispatch).
         Op::Tdz(slot) if fast & 16 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
             let off = *slot as i32 * 8;
-            let slow = a.new_label();
-            let done = a.new_label();
-            emit_exec_word_load(a, 9, 22, off);
-            emit_exec_drop_shared(a, layout, 9, 10, 11, slow);
+            emit_exec_release_word(a, layout, 22, off);
             a.mov_imm64(9, crate::value::PACK_EMPTY);
             emit_exec_word_store(a, 9, 22, off);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
-            a.bind(done);
         }
         Op::ResetSlots(start, count) if rc_ok && (*start as u32 + *count as u32) * 8 < 4096 => {
-            let slow = a.new_label();
-            let done = a.new_label();
             for k in *start..*start + *count {
                 let off = k as i32 * 8;
-                emit_exec_word_load(a, 9, 22, off);
-                emit_exec_drop_shared(a, layout, 9, 10, 11, slow);
+                emit_exec_release_word(a, layout, 22, off);
                 a.mov_imm64(9, crate::value::PACK_UNDEFINED);
                 emit_exec_word_store(a, 9, 22, off);
             }
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
-            a.bind(done);
         }
         Op::Call(..) | Op::CallWithThis(..) => {
             emit_call_inline(
@@ -676,6 +650,18 @@ pub(super) fn emit(
         }
         Op::MakeObject(..) => {
             emit_op_helper(a, H_MAKE_OBJECT, pc as u32, unwind);
+        }
+        Op::MakeClosure(..) => {
+            emit_op_helper(a, H_MAKE_CLOSURE, pc as u32, unwind);
+        }
+        Op::NewObject
+        | Op::ObjectData(_)
+        | Op::ObjectDataName(..)
+        | Op::ObjectProto
+        | Op::ObjectSpread
+        | Op::ObjectMethod(..)
+        | Op::ObjectMethodName(..) => {
+            emit_op_helper(a, H_OBJECT_LITERAL, pc as u32, unwind);
         }
         Op::MakeArray(..) => {
             emit_op_helper(a, H_MAKE_ARRAY, pc as u32, unwind);

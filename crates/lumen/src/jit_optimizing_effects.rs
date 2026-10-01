@@ -150,8 +150,11 @@ pub(super) fn checked_writes(op: &Op) -> SlotWrites {
         | Op::NewTarget
         | Op::NewObject
         | Op::ObjectData(_)
+        | Op::ObjectDataName(..)
         | Op::ObjectProto
         | Op::ObjectSpread
+        | Op::ObjectMethod(..)
+        | Op::ObjectMethodName(..)
         | Op::MakeObject(..)
         | Op::MakeArray(_)
         | Op::Call(..)

@@ -3719,6 +3719,7 @@ impl Props {
             // In particular a frozen source must not produce frozen copied properties.
             self.note_structural();
             self.entries.layout = source.entries.layout.clone();
+            self.entries.fields.reserve_exact(source.entries.len());
             self.entries.fields.extend(
                 source
                     .entries

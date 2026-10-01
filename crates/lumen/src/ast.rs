@@ -1049,6 +1049,12 @@ pub const SCAN_THIS: u8 = 8;
 pub const SCAN_HAS_LOOP: u8 = 16;
 const SCAN_SELF_DONE: u8 = 32;
 const SCAN_SELF_NEEDED: u8 = 64;
+/// The body (seen through arrows, like the flags above) can observe this function's
+/// [[HomeObject]]: it contains a `super` reference, or a direct `eval` whose code may contain
+/// one. ECMA-262 reads [[HomeObject]] only through HasSuperBinding (MakeSuperPropertyReference,
+/// PerformEval's `inMethod`) and GetSuperBase, and both are reached only from `super` in the
+/// function's own code or its direct eval code.
+pub const SCAN_HOME: u8 = 128;
 
 /// Does this statement list itself own a loop? Nested functions and class static
 /// blocks execute through separate entries and must not make a cold Script hot.
@@ -1144,9 +1150,10 @@ impl Function {
     }
 
     /// What this function's own activation must provide: whether the body (or a nested arrow, or a
-    /// possible direct `eval`) can observe `arguments`, `new.target`, or `this`. Ordinary nested
-    /// functions are opaque (they get their own); arrows are transparent. Conservative on the
-    /// safe side: a false positive only costs an unused binding.
+    /// possible direct `eval`) can observe `arguments`, `new.target`, `this`, or the function's
+    /// [[HomeObject]] ([`SCAN_HOME`]). Ordinary nested functions are opaque (they get their own);
+    /// arrows are transparent. Conservative on the safe side: a false positive only costs an
+    /// unused binding.
     pub fn scan_flags(&self) -> u8 {
         let cached = self.scan.get();
         if cached & SCAN_DONE != 0 {
@@ -1163,6 +1170,16 @@ impl Function {
         self.scan
             .set(flags | (cached & (SCAN_SELF_DONE | SCAN_SELF_NEEDED)));
         flags
+    }
+
+    /// Whether a method closure of this function must carry its [[HomeObject]]. Method
+    /// definitions (ECMA-262 DefineMethod, MethodDefinitionEvaluation) always perform MakeMethod,
+    /// but the slot is observable only through `super` references and direct `eval` in the
+    /// method's own code (see [`SCAN_HOME`]). Leaving it unset otherwise avoids retaining the home
+    /// object from each of its methods: an object literal and its methods would form a
+    /// reference cycle that only the cycle collector could reclaim.
+    pub(crate) fn observes_home_object(&self) -> bool {
+        self.scan_flags() & SCAN_HOME != 0
     }
 
     /// Cache the conservative self-binding query on shared source, never per
@@ -1186,7 +1203,8 @@ impl Function {
     }
 }
 
-const SCAN_ALL: u8 = SCAN_DONE | SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS | SCAN_HAS_LOOP;
+const SCAN_ALL: u8 =
+    SCAN_DONE | SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS | SCAN_HAS_LOOP | SCAN_HOME;
 
 fn scan_stmts(body: &[Stmt], flags: &mut u8) {
     for s in body {
@@ -1332,8 +1350,9 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
         | Expr::Undefined
         | Expr::Regex { .. }
         | Expr::ImportMeta => {}
-        // `super.x` resolves its receiver through the `this` binding; `super()` initializes it.
-        Expr::Super => *flags |= SCAN_THIS,
+        // `super.x` resolves its receiver through the `this` binding and its base through the
+        // [[HomeObject]]; `super()` initializes the `this` binding.
+        Expr::Super => *flags |= SCAN_THIS | SCAN_HOME,
         Expr::Paren(inner)
         | Expr::ToStr(inner)
         | Expr::Await(inner)
@@ -1367,7 +1386,7 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
         Expr::Func(f) => {
             if f.is_arrow {
                 let inner = f.scan_flags();
-                *flags |= inner & (SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS);
+                *flags |= inner & (SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS | SCAN_HOME);
             }
         }
         Expr::Class(c) => scan_class(c, flags),
@@ -1404,9 +1423,10 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
             args,
             optional: _,
         } => {
-            // A direct `eval` can name any of the three dynamically.
+            // A direct `eval` can name any of the three dynamically, and its code may contain a
+            // SuperProperty when the caller is method code (PerformEval's `inMethod`).
             if matches!(&**callee, Expr::Ident(n) if n == "eval") {
-                *flags |= SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS;
+                *flags |= SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS | SCAN_HOME;
             }
             // SuperCall begins with GetNewTarget. An arrow is transparent to that lookup, so a
             // constructor containing an async arrow with `super(...)` must retain its own

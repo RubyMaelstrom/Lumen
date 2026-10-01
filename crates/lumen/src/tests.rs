@@ -26001,3 +26001,236 @@ parts.slice(0,6).join(';')+'#'+h
         );
     }
 }
+
+/// ECMA-262 MakeMethod sets [[HomeObject]] on every method, but only HasSuperBinding and
+/// GetSuperBase read it: `super` in the method's own code (including arrows, computed keys and
+/// parameter defaults) and SuperProperty inside its direct eval code. Methods that contain
+/// neither close over their environment directly; the rest still resolve `super` against the
+/// home object's current prototype, including after a borrowed method is called on another
+/// receiver, and a nested ordinary function still shields eval's SuperProperty with an early
+/// SyntaxError. Expected output from Node.
+#[test]
+fn object_literal_methods_observe_home_object_only_through_super() {
+    use crate::bytecode::Tier;
+    let source = r#"var log = [];
+var base = { x: "base-x", who() { return "base:" + this.tag; }, get g() { return "base-g"; }, set s(v) { log.push("base-s:" + v); } };
+var other = { x: "other-x", who() { return "other:" + this.tag; } };
+function run() {
+  log = [];
+  var o = {
+    tag: "o",
+    __proto__: base,
+    plain() { return this.tag; },
+    viaSuper() { return super.x; },
+    callSuper() { return super.who(); },
+    get acc() { return super.g; },
+    set acc(v) { super.s = v; },
+    arrow() { return (() => (() => super.x)())(); },
+    evalSuper() { return eval("super.x"); },
+    evalArrow() { return (() => eval("super.x"))(); },
+    evalNoSuper() { return eval("this.tag"); },
+    computedKey() { return Object.keys({ [super.x]: 1 })[0]; },
+    nestedMethod() { return { __proto__: other, inner() { return super.x; } }.inner(); },
+    nestedClass() { return new (class extends Object { m() { return 1; } })().m() + ":" + super.x; },
+    defaultParam(a = super.x) { return a; },
+    *gen() { yield super.x; },
+  };
+  log.push(o.plain(), o.viaSuper(), o.callSuper(), o.acc);
+  o.acc = 5;
+  log.push(o.arrow(), o.evalSuper(), o.evalArrow(), o.evalNoSuper(), o.computedKey(),
+    o.nestedMethod(), o.nestedClass(), o.defaultParam(), o.gen().next().value);
+  Object.setPrototypeOf(o, other);
+  log.push(o.viaSuper(), o.callSuper(), o.arrow());
+  var borrowed = { tag: "b", __proto__: base, viaSuper: o.viaSuper, plain: o.plain };
+  log.push(borrowed.viaSuper(), borrowed.plain());
+  var p = { __proto__: base, m() { return function () { try { return eval("super.x"); } catch (e) { return e.constructor.name; } }(); } };
+  log.push(p.m());
+  var q = { __proto__: base, m() { var s = "super.x"; return eval(s); } };
+  log.push(q.m());
+}
+for (var k = 0; k < 20; k++) run();
+log.join("|")
+"#;
+    let expected =
+        "o|base-x|base:o|base-g|base-s:5|base-x|base-x|base-x|o|base-x|other-x|1:base-x|\
+base-x|base-x|other-x|other:o|other-x|other-x|b|SyntaxError|base-x";
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                expected,
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
+/// A method that cannot observe its [[HomeObject]] must not retain the object literal that
+/// defines it: otherwise every literal with a method would be a reference cycle reclaimed only
+/// by the cycle collector. A literal whose method uses `super` is reclaimed by that collector.
+#[test]
+fn object_literal_methods_without_super_do_not_form_cycles() {
+    use crate::bytecode::Tier;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            for (source, needs_home) in [
+                (
+                    "function make(){ return { a: 1, m(){ return this.a; }, get g(){ return 2; }, \
+                     set s(v){}, *gen(){}, async am(){} }; }",
+                    false,
+                ),
+                (
+                    "function make(){ return { __proto__: {}, m(){ return super.x; } }; }",
+                    true,
+                ),
+            ] {
+                let mut engine = Engine::new();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(threshold);
+                run_in(
+                    &mut engine,
+                    &format!(
+                        "{source} for (var i = 0; i < 20; i++) make(); var o = make(); o.m();"
+                    ),
+                );
+                let env = engine.interp.global_env.clone();
+                let value = engine
+                    .interp
+                    .get_var("o", &env)
+                    .unwrap_or_else(|_| panic!("o"));
+                let weak = std::rc::Rc::downgrade(value.as_obj().unwrap());
+                drop(value);
+                run_in(&mut engine, "o = null;");
+                if !needs_home {
+                    assert!(
+                        weak.upgrade().is_none(),
+                        "tier {tier:?} threshold {threshold}: {source}"
+                    );
+                }
+                engine.interp.gc_collect();
+                assert!(weak.upgrade().is_none(), "tier {tier:?}: {source}");
+            }
+        }
+    }
+}
+
+/// Object literals of static data keys and concise methods that cannot observe [[HomeObject]]
+/// are built from one pre-shaped template: each method is an ordinary enumerable, writable,
+/// configurable data property (ECMA-262 MethodDefinitionEvaluation, DefineMethodProperty) whose
+/// closure is named by its key (SetFunctionName), is not a constructor, and has a `prototype`
+/// only as a generator. Key order, duplicate keys (last definition wins, in first position) and
+/// per-evaluation closure identity match the incremental builder. Expected output from Node.
+#[test]
+fn object_literal_methods_are_named_enumerable_data_properties_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#"function make(i) {
+  return { id: i, m() { return this.id; }, "a b"() { return 1; }, *g() { yield i; }, async am() { return i; }, last: i + 1 };
+}
+function dup() { return { m() { return 1; }, x: 0, m() { return 2; } }; }
+function dup2() { return { m: 1, m() { return 3; } }; }
+function dup3() { return { m() { return 4; }, m: 5 }; }
+var out = [];
+for (var k = 0; k < 30; k++) {
+  var o = make(k);
+  if (k === 29) {
+    out.push(Object.keys(o).join(","));
+    out.push([o.m.name, o["a b"].name, o.g.name, o.am.name].join(","));
+    var d = Object.getOwnPropertyDescriptor(o, "m");
+    out.push([d.writable, d.enumerable, d.configurable, typeof d.value].join(","));
+    out.push(["prototype" in o.m, "prototype" in o.g, "prototype" in o.am, o.m.hasOwnProperty("caller")].join(","));
+    try { new o.m(); out.push("constructed"); } catch (e) { out.push(e.name); }
+    out.push([o.m(), o.m.call({ id: "x" }), o.g().next().value, o.m.length, o["a b"]()].join(","));
+    out.push(Object.getOwnPropertyNames(o.m).join(","));
+    out.push(Object.getPrototypeOf(o.g) === Object.getPrototypeOf(function* () {}));
+    var a = make(1), b = make(2);
+    out.push([a.m === b.m, a.m() + b.m()].join(","));
+    out.push([dup().m(), Object.keys(dup()).join(""), dup2().m(), typeof dup3().m, Object.keys(dup3()).join("")].join(","));
+  }
+}
+out.join("|")
+"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                "id,m,a b,g,am,last|m,a b,g,am|true,true,true,function|false,true,false,false|TypeError|29,x,29,0,1|length,name|true|false,3|2,mx,3,number,m",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
+/// ECMA-262 PropertyDefinitionEvaluation through the incremental object-literal builder
+/// (spreads, computed/numeric/static keys, accessors, `__proto__`, `super` methods): evaluation
+/// and ToPropertyKey order, CopyDataProperties over getters, symbols, non-enumerables and Proxy
+/// traps, accessor halves merging, NamedEvaluation for static, computed and symbol keys, and
+/// abrupt completions from ToPropertyKey and spread getters. Expected output from Node.
+#[test]
+fn incremental_object_literals_define_properties_in_order_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#"var log = [];
+var sym = Symbol("s");
+var src = { a: 1, get g() { log.push("get-g"); return 2; }, [sym]: 3 };
+Object.defineProperty(src, "hidden", { value: 4, enumerable: false });
+var proxy = new Proxy({ p: 5, q: 6 }, {
+  ownKeys(t) { log.push("ownKeys"); return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, k) { log.push("gopd:" + String(k)); return Reflect.getOwnPropertyDescriptor(t, k); },
+  get(t, k, r) { log.push("get:" + String(k)); return Reflect.get(t, k, r); },
+});
+var base = { x: "base-x" };
+function key(k) { log.push("key:" + k); return k; }
+function build(i) {
+  return {
+    ...src,
+    first: i,
+    [key("computed")]: i + 1,
+    2: "two",
+    anon: function () {},
+    arrow: () => 0,
+    [key("canon")]: () => 0,
+    [sym]: function () {},
+    get acc() { return "g" + i; },
+    set acc(v) { log.push("set:" + v); },
+    get onlyGet() { return 1; },
+    m() { return super.x; },
+    __proto__: base,
+    ...proxy,
+    "__proto__"() { return "own"; },
+    a: "overridden",
+  };
+}
+var o;
+for (var k = 0; k < 25; k++) { log = []; o = build(k); }
+o.acc = 7;
+var out = [
+  Reflect.ownKeys(o).map(String).join(","),
+  log.join(","),
+  [o.a, o.g, o[sym] === undefined ? "u" : typeof o[sym], o.hidden, o.first, o.computed, o[2], o.acc, o.p, o.q].join(","),
+  [o.anon.name, o.arrow.name, o.canon.name, o[sym].name, Object.getOwnPropertyDescriptor(o, "acc").get.name, Object.getOwnPropertyDescriptor(o, "acc").set.name].join(","),
+  [o.m(), Object.getPrototypeOf(o) === base, o["__proto__"](), Object.keys(o).length].join(","),
+];
+var thrown;
+try { ({ [{ toString() { throw new EvalError("tk"); } }]: 1 }); } catch (e) { thrown = e.name + ":" + e.message; }
+out.push(thrown);
+try { ({ ...{ get boom() { throw new RangeError("sg"); } } }); } catch (e) { out.push(e.name + ":" + e.message); }
+out.join("|")
+"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                "2,a,g,first,computed,anon,arrow,canon,acc,onlyGet,m,p,q,__proto__,Symbol(s)|get-g,key:computed,key:canon,ownKeys,gopd:p,get:p,gopd:q,get:q,set:7|overridden,2,function,,24,25,two,g24,5,6|anon,arrow,canon,[s],get acc,set acc|base-x,true,own,14|EvalError:tk|RangeError:sg",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}

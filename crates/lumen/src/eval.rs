@@ -3408,9 +3408,22 @@ impl Interp {
     fn eval_object(&mut self, props: &[PropDef], env: &Env) -> Result<Value, Abrupt> {
         let obj = self.new_object();
         // Methods/getters/setters carry a [[HomeObject]] (the literal itself) so `super.x` resolves
-        // against the object's *current* prototype, evaluated dynamically at access time.
-        let home_env = new_scope(Some(env.clone()));
-        bind(&home_env, "%homeobject%", Value::Obj(obj.clone()));
+        // against the object's *current* prototype, evaluated dynamically at access time. Only
+        // methods that can observe it close over that record (see `Function::observes_home_object`);
+        // the rest close over `env` directly and so do not form a cycle with the literal.
+        let mut home_env: Option<Env> = None;
+        let mut method_env = |func: &Rc<Function>| -> Env {
+            if !func.observes_home_object() {
+                return env.clone();
+            }
+            home_env
+                .get_or_insert_with(|| {
+                    let home = new_scope(Some(env.clone()));
+                    bind(&home, "%homeobject%", Value::Obj(obj.clone()));
+                    home
+                })
+                .clone()
+        };
         for prop in props {
             match prop {
                 // A Cover reaching evaluation means the parse accepted it as part of a pattern
@@ -3429,7 +3442,7 @@ impl Interp {
                 }
                 PropDef::Method { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
-                    let f = self.make_function(func.clone(), home_env.clone());
+                    let f = self.make_function(func.clone(), method_env(func));
                     let name = self.fn_name_for_key(&k);
                     self.set_fn_name(&f, &name);
                     obj.borrow_mut()
@@ -3438,14 +3451,14 @@ impl Interp {
                 }
                 PropDef::Getter { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
-                    let f = self.make_function(func.clone(), home_env.clone());
+                    let f = self.make_function(func.clone(), method_env(func));
                     let name = self.fn_name_for_key(&k);
                     self.set_fn_name(&f, &format!("get {name}"));
                     self.define_accessor(&obj, &k, Some(f), None);
                 }
                 PropDef::Setter { key, func } => {
                     let k = self.eval_prop_key(key, env)?;
-                    let f = self.make_function(func.clone(), home_env.clone());
+                    let f = self.make_function(func.clone(), method_env(func));
                     let name = self.fn_name_for_key(&k);
                     self.set_fn_name(&f, &format!("set {name}"));
                     self.define_accessor(&obj, &k, None, Some(f));
