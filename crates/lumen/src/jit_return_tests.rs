@@ -434,7 +434,10 @@ fn direct_finish_vacates_a_last_reference_receiver() {
         Completion::Throw { name, message } => panic!("{name}: {message}"),
     }
     let direct = super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get());
-    assert!(direct >= 350, "method calls must take the direct sequence ({direct})");
+    assert!(
+        direct >= 350,
+        "method calls must take the direct sequence ({direct})"
+    );
     assert!(!engine.interp.frame_pool.is_empty());
     assert_eq!(
         engine
