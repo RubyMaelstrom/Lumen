@@ -58,6 +58,10 @@ The default tier is JIT. Useful diagnostic controls:
   100 machine-code runs); zero disables inlining.
 - `LUMEN_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls (the inline call sequence
   that runs the callee on a pooled frame record) while retaining ordinary JIT calls.
+- `LUMEN_JIT_INLINE_STUBS=1` emits ARM64 name-cache validation, generic property-cache
+  probes, secondary call-cache probes and direct-call sequences at every site instead of
+  as per-chunk shared stubs (by default only loop bodies keep name validation and direct
+  calls in line). It is a code-size/performance ablation with the same behavior.
 - `LUMEN_JIT_NO_JSCVT=1` makes ARM64 code use the portable guarded ToInt32 sequence even
   when the CPU implements FEAT_JSCVT (`fjcvtzs`).
 - `LUMEN_TIER_LOG=1` helps diagnose compilation bailouts.

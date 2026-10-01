@@ -318,3 +318,144 @@ fn packed_native_return_constructors_and_tail_throw_keep_result_owners() {
         "true",
     );
 }
+
+/// A callee whose body needs the checked one-operation bridge (block scopes, array and object
+/// destructuring, object-literal methods, template literals) materializes a native activation
+/// on its own frame record. Such callees take the direct JIT→JIT sequence like any other: the
+/// generated finish stub routes a materialized activation to `jit_direct_finish`, whose record
+/// release drops it, for normal and abrupt completions alike. Expected output from Node.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn direct_calls_enter_callees_that_materialize_native_activations() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    engine
+        .eval(
+            r#""use strict";
+        function shaped(n, tag) {
+          const pair = [n, n + 1];
+          const [a, b] = pair;
+          let total = 0;
+          for (let k = 0; k < 3; k++) { const f = () => k * 2; total += f() + a; }
+          const o = { tag, b, m() { return this.tag + ":" + this.b; } };
+          const { tag: t, ...rest } = { tag: upper(tag), extra: n };
+          if (n === 13) throw new RangeError("boom" + rest.extra);
+          return total + "|" + o.m() + "|" + t + "|" + rest.extra + "|" + `${a}-${b}`;
+        }
+        function upper(x) { return x.toUpperCase(); }
+        shaped(0, "warm"); upper("warm");
+    "#,
+            false,
+        )
+        .unwrap();
+    let env = engine.interp.global_env.clone();
+    for name in ["shaped", "upper"] {
+        let function = engine.interp.get_var(name, &env).ok().unwrap();
+        let object = function.as_obj().unwrap().borrow();
+        let crate::value::Callable::User(user) = &object.call else {
+            panic!("user function")
+        };
+        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        assert!(chunk.jit.get().flatten().is_some());
+        assert_eq!(chunk.jit_needs_activation_state(), name == "shaped");
+        chunk.inline_attempted.set(true);
+        chunk.inline_retry_at.set(0);
+    }
+    super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+    let result = engine
+        .eval(
+            r#"
+        var out = [], errors = 0;
+        for (var i = 0; i < 200; i++) {
+          try { out.push(shaped(i, "x" + (i % 3))); }
+          catch (e) { errors++; out.push(e.name + ":" + e.message); }
+        }
+        [out.length, errors, out[0], out[13], out[199]].join(";")
+    "#,
+            false,
+        )
+        .unwrap();
+    match result {
+        Completion::Value(value) => assert_eq!(
+            value,
+            "200;1;6|x0:1|X0|0|0-1;RangeError:boom13;603|x1:200|X1|199|199-200"
+        ),
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+    // 199 normal returns from `shaped` plus the 200 `upper` returns it makes directly, less
+    // the first call at each site, which fills its cache through the helper. Without direct
+    // entry into `shaped`, only the `upper` returns would count.
+    let direct = super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get());
+    assert!(
+        direct >= 390,
+        "bridge-using callees must take the direct sequence ({direct} direct returns)"
+    );
+    engine.interp.gc_collect();
+    assert_eq!(
+        engine
+            .interp
+            .frame_pool
+            .iter()
+            .filter(|record| unsafe { record.as_ref().ctx.activation.is_some() })
+            .count(),
+        0,
+        "a pooled record must not retain a materialized activation"
+    );
+}
+
+/// ECMA-262 OrdinaryFunctionCreate gives each evaluation of a function expression a new closure
+/// with its own [[Environment]], while all of them share the function's code. A call site that
+/// sees a fresh closure of an already-cached function takes the direct JIT→JIT sequence (the
+/// code-keyed probe) and runs the LIVE closure: each call observes its own captured `k`, arrows
+/// keep their lexical `this`, method calls bind their receiver, and a closure created under a
+/// `with` statement still resolves through the object environment. Expected output from Node.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn recreated_closures_take_direct_calls_with_their_own_environment() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let source = r#"
+        function make(k) { return function (x) { return x * 3 + k; }; }
+        function makeArrow(k) { return (x) => x - k; }
+        function makeThis(k) { return function (x) { return this.base + x + k; }; }
+        var withObj = { y: 1000 };
+        var underWith;
+        with (withObj) { underWith = function (x) { return x + y; }; }
+        function run(n) {
+          var s = 0, t = 0, u = 0, w = 0;
+          var holder = { base: 7 };
+          for (var r = 0; r < n; r++) {
+            var f = make(r), g = makeArrow(r), h = makeThis(r);
+            holder.m = h;
+            for (var i = 0; i < 10; i++) {
+              s = (s + f(i)) | 0;
+              t = (t + g(i)) | 0;
+              u = (u + holder.m(i)) | 0;
+            }
+          }
+          for (var i = 0; i < 50; i++) { withObj.y = i; w = (w + underWith(i)) | 0; }
+          return [s, t, u, w].join(",");
+        }
+        run(3);
+    "#;
+    match engine.eval(source, false).expect("fixture parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+    super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+    match engine.eval("run(500)", false).expect("call parses") {
+        Completion::Value(value) => assert_eq!(value, "1315000,-1225000,1305000,2450"),
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+    // 15000 closure calls, each closure fresh every outer iteration. Only each callee's first
+    // ~100 runs (before its one-shot recompile settles) and the cache-filling calls take the
+    // helper. The factories capture `k` in an activation and are not direct entries. Without
+    // the code-keyed probe every fresh closure misses the identity ways (no direct returns).
+    let direct = super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get());
+    assert!(
+        direct >= 14_000,
+        "fresh closures of a cached function must take the direct sequence ({direct})"
+    );
+}

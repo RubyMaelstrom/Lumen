@@ -26313,3 +26313,124 @@ fn compiled_iteration_records_share_one_published_layout() {
         assert_eq!(run_in(&mut engine, "fs.map(f => f()).join()"), "0,3,6");
     }
 }
+
+/// Every out-of-line shared stub a compiled chunk can use, exercised through its call sites:
+/// direct calls of arity 0-10 with and without a receiver (including the declined-gate path of a
+/// sloppy `this` user called on a primitive, and a callee's throw unwinding through the stub),
+/// polymorphic property reads over five receiver shapes (the way-probe loop), key-checked Array
+/// `length`, String primitive methods, cached absence, and free names two closures deep (the
+/// name-cache stub). Expected output from Node.
+#[test]
+fn shared_jit_stubs_preserve_call_property_and_name_semantics_in_every_tier() {
+    use crate::bytecode::Tier;
+    let source = r#""use strict";
+var out = [];
+function f0() { return 0; } function f1(a) { return a; } function f2(a, b) { return a + b; }
+function f5(a, b, c, d, e) { return a + b + c + d + e; }
+function f10(a, b, c, d, e, f, g, h, i, j) { return a + b + c + d + e + f + g + h + i + j; }
+function thrower(x) { if (x === 7) throw new TypeError("seven"); return x; }
+var obj = { v: 3, m0() { return this.v; }, m2(a, b) { return this.v + a + b; } };
+var sloppyThis = Function("return typeof this");
+var shapes = [{ x: 1 }, { a: 0, x: 2 }, { b: 0, c: 0, x: 3 }, { d: 0, e: 0, f: 0, x: 4 }, { g: 0, h: 0, i: 0, j: 0, x: 5 }];
+function outer() { var deep = 40; return function mid() { var q = 1; return function inner() { return deep + q; }; }; }
+var innerFn = outer()();
+function run(round) {
+  var s = 0, caught = 0;
+  for (var i = 0; i < 12; i++) {
+    s += f0() + f1(i) + f2(i, 1) + f5(1, 2, 3, 4, i) + f10(1, 2, 3, 4, 5, 6, 7, 8, 9, i);
+    s += obj.m0() + obj.m2(i, 2);
+    try { s += thrower(i); } catch (e) { caught++; s += e.message.length; }
+    s += shapes[i % 5].x;
+    s += [1, 2, 3, i].length + "abc".charCodeAt(i % 3) + "text".slice(1, 3).length;
+    var o = shapes[i % 2]; s += (o.missing === undefined ? 1 : 0);
+    s += innerFn();
+  }
+  var sl = sloppyThis.call(5) + (5).constructor.name;
+  return [s, caught, sl].join(":");
+}
+for (var r = 0; r < 30; r++) out.push(run(r));
+out[0] + "|" + out[29]
+"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                "2947:1:objectNumber|2947:1:objectNumber",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
+/// Over-applied direct calls (ECMA-262 FunctionDeclarationInstantiation binds only the formal
+/// parameters; `arguments` still sees every value): the callee runs with its declared
+/// parameters, and the surplus words — last owners, two words naming one object, BigInts,
+/// strings — are released after the call, including when the callee throws. Expected output
+/// from Node.
+#[test]
+fn over_applied_direct_calls_bind_parameters_and_release_surplus_arguments() {
+    use crate::bytecode::Tier;
+    let source = r#""use strict";
+var reg = 0;
+function one(a) { return typeof a === "number" ? a : 1; }
+function none() { return 7; }
+function count() { return arguments.length; }
+function lastArg() { return arguments[arguments.length - 1]; }
+function boom(a) { if (a === 3) throw new RangeError("b" + a); return a; }
+function make(i) { return { i: i, big: BigInt(i) * 10n ** 30n, s: "str" + i }; }
+var out = [];
+var total = 0, caught = 0, counts = 0, lasts = "";
+for (var i = 0; i < 300; i++) {
+  var shared = { v: i };
+  total += one(i, make(i), shared, shared, "x" + i, 10n ** 40n);
+  total += none(make(i), [i], i);
+  counts += count(1, 2, i);
+  lasts = lastArg(i, "q" + i);
+  try { total += boom(i % 5, make(i), shared); } catch (e) { caught++; }
+}
+out.push(total, caught, counts, lasts);
+// Surplus last owners must be released: a WeakRef-free check via a finalization-independent
+// identity count (objects created only as surplus arguments never become reachable).
+function sink(a) { return a; }
+var keep = [];
+for (var j = 0; j < 1000; j++) keep.push(sink(j, { tmp: j }, [j]));
+out.push(keep.length, keep[999]);
+out.join(",")
+"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                "47370,60,900,q299,1000,999",
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+    // Objects passed only as surplus arguments must not stay alive: a missed release would
+    // leave a permanent external count that no collection can reclaim.
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    run_in(
+        &mut engine,
+        "function sink(a) { return a; } for (var j = 0; j < 100; j++) sink(j, {}, [j]);",
+    );
+    engine.interp.gc_collect();
+    let before = engine.interp.live_object_count();
+    run_in(
+        &mut engine,
+        "for (var j = 0; j < 20000; j++) sink(j, { t: j }, [j], { t: j });",
+    );
+    engine.interp.gc_collect();
+    let after = engine.interp.live_object_count();
+    assert!(
+        after - before < 100,
+        "surplus arguments leaked: {before} -> {after}"
+    );
+}

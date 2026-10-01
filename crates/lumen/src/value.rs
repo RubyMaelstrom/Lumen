@@ -1051,6 +1051,19 @@ pub struct JitLayout {
     /// Whether the four fields above probed successfully (key-checked array-holder entries can
     /// inline their key compare only when they did).
     pub key_probe_ok: bool,
+    /// `call` within `Object`: [`Callable`]'s discriminant byte at +0, its payload word at +8.
+    pub obj_call: usize,
+    /// Stored `Rc<UserCallable>` pointer → its `func`, `env` and `realm` fields.
+    pub user_func: usize,
+    pub user_env: usize,
+    pub user_realm: usize,
+    /// Stored `Rc<Function>` pointer → `Rc::as_ptr` (the AST identity a `CallIc` records).
+    pub func_data_off: usize,
+    /// `Rc::as_ptr(env)` → `Scope::under_with` (through the `RefCell`).
+    pub scope_under_with: usize,
+    /// The six fields above matched the live representation, so the JIT's code-keyed call probe
+    /// may read a callee's [`UserCallable`] directly.
+    pub call_probe_valid: bool,
     pub valid: bool,
 }
 
@@ -1246,6 +1259,27 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let binding_init = offset_of!(crate::interpreter::Binding, initialized);
     let binding_import = offset_of!(crate::interpreter::Binding, imported);
 
+    // Code-keyed call probe: `Callable` is repr(u8) (discriminant byte, then one payload word)
+    // and `UserCallable` is repr(C). Verify both against live values, and that every `Rc` the
+    // probe follows has the same header size as the object `Rc` measured above.
+    fn call_layout_probe(_: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Undefined)
+    }
+    let native: NativeFn = call_layout_probe;
+    let native_callable = Callable::Native(native);
+    let native_words: [usize; 2] =
+        unsafe { std::mem::transmute_copy::<Callable, [usize; 2]>(&native_callable) };
+    let callable_ok = std::mem::size_of::<Callable>() == 16
+        && native_words[0] & 0xff == 1
+        && native_words[1] == native as usize
+        && std::mem::align_of::<UserCallable>() == 8
+        && std::mem::align_of::<Function>() <= 8;
+    let func_probe = Rc::new([0usize; 3]);
+    let func_probe_word = unsafe { *(&func_probe as *const Rc<[usize; 3]> as *const usize) };
+    let func_data_off = (Rc::as_ptr(&func_probe) as usize).wrapping_sub(func_probe_word);
+    let scope_under_with = scope_refcell + offset_of!(crate::interpreter::Scope, under_with);
+    let call_probe_valid = callable_ok && func_data_off == rcbox_data && rcbox_data < 256;
+
     let valid = strong_ok
         && niche_ok
         && vec_ptr_off.is_some()
@@ -1325,6 +1359,13 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         binding_mutable,
         binding_init,
         binding_import,
+        obj_call: offset_of!(Object, call),
+        user_func: rcbox_data + offset_of!(UserCallable, func),
+        user_env: rcbox_data + offset_of!(UserCallable, env),
+        user_realm: rcbox_data + offset_of!(UserCallable, realm),
+        func_data_off,
+        scope_under_with,
+        call_probe_valid,
         valid,
     }
 }
@@ -1426,34 +1467,43 @@ impl TypeofTest {
 }
 
 /// How an object can be called. Most objects are not callable (`None`).
+///
+/// `repr(u8)` with fixed discriminants gives the enum a defined layout: the discriminant byte
+/// at offset 0 and the single pointer-sized payload at offset 8. The JIT's code-keyed call
+/// probe reads [`Callable::User`]'s tag and its `Rc<UserCallable>` pointer straight from a
+/// callee object (see `JitLayout::obj_call_tag`).
 #[derive(Clone)]
+#[repr(u8)]
 pub enum Callable {
-    None,
-    Native(NativeFn),
+    None = 0,
+    Native(NativeFn) = 1,
     /// A native function carrying captured state (see [`NativeClosure`]).
-    NativeData(Rc<NativeCallable>),
+    NativeData(Rc<NativeCallable>) = 2,
     /// An interpreted function: its AST plus the lexical environment it closed over.
-    User(Rc<UserCallable>),
+    User(Rc<UserCallable>) = CALLABLE_USER_TAG,
     /// The result of `Function.prototype.bind`.
-    Bound(Box<BoundCallable>),
+    Bound(Box<BoundCallable>) = 4,
     /// A ShadowRealm wrapped function: `target` is a callable inside the sub-realm identified by
     /// `realm` (its pointer). Calls marshal primitive args in and the primitive result out.
-    WrappedShadow(Rc<WrappedShadowCallable>),
+    WrappedShadow(Rc<WrappedShadowCallable>) = 5,
     /// The inverse: a function living *inside* a ShadowRealm whose `target` is a callable of the
     /// host realm. `realm` is this sub-realm's key in the host's map and `parent` is the host
     /// interpreter's stable address (hosts are either the engine root or boxed sub-realms, both
     /// pinned in memory while any of their sub-realm objects exist).
-    WrappedCross(Box<WrappedCrossCallable>),
+    WrappedCross(Box<WrappedCrossCallable>) = 6,
     /// An auto-accessor's synthesized getter: reads the private backing field (brand-checked) off
     /// the receiver.
-    AccessorGet(Rc<Rc<str>>),
+    AccessorGet(Rc<Rc<str>>) = 7,
     /// An auto-accessor's synthesized setter: writes the private backing field (brand-checked).
-    AccessorSet(Rc<Rc<str>>),
+    AccessorSet(Rc<Rc<str>>) = 8,
     /// A decorator `context.access.get`: returns `args[0][name]`.
-    PropGet(Rc<Rc<str>>),
+    PropGet(Rc<Rc<str>>) = 9,
     /// A decorator `context.access.set`: performs `args[0][name] = args[1]`.
-    PropSet(Rc<Rc<str>>),
+    PropSet(Rc<Rc<str>>) = 10,
 }
+
+/// The discriminant of [`Callable::User`] (see the enum's layout note).
+pub(crate) const CALLABLE_USER_TAG: u8 = 3;
 
 /// Cold payloads boxed out of [`Callable`], so every non-callable ordinary object does not pay
 /// for the largest function variants inline.
@@ -1481,7 +1531,10 @@ pub(crate) enum NativeCallableBody {
     },
 }
 
+/// `repr(C)`: the JIT's code-keyed call probe reads `func`, `env` and `realm` at fixed offsets
+/// from the `Rc<UserCallable>` data (see `JitLayout::user_func`).
 #[derive(Clone)]
+#[repr(C)]
 pub struct UserCallable {
     pub(crate) func: Rc<Function>,
     pub(crate) env: Env,

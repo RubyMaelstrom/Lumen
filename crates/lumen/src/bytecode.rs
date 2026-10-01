@@ -838,6 +838,10 @@ pub struct CallIc {
     /// Intrinsic id for a native entry the call template can inline entirely (0 = none;
     /// see `INTRINSIC_CHAR_CODE_AT`). Filled from the fn pointer at record time.
     pub intrinsic: u8,
+    /// The filled closure's [[Realm]] (`UserCallable::realm`; 0 for a native entry). A
+    /// code-keyed hit — another closure of the same `func` (see [`CallSite`]) — must belong to
+    /// this Realm: the entry's same-realm proof was made for it.
+    pub realm: usize,
 }
 
 /// [`CallIc::direct`] bit 4: the callee needs an activation environment (captured locals or
@@ -885,6 +889,7 @@ impl CallIc {
         pc_offs_ptr: std::ptr::null(),
         native: 0,
         intrinsic: 0,
+        realm: 0,
     };
 }
 
@@ -18225,14 +18230,16 @@ impl Chunk {
         first || changed
     }
     /// [`CallIc::direct`] gates for this chunk (see its docs).
+    ///
+    /// A chunk that materializes a native activation for its bridge operations (see
+    /// [`Chunk::jit_needs_activation_state`]) is eligible: the direct sequence runs it on a
+    /// pooled record of its own, exactly like `run_moved`, the activation is created lazily from
+    /// that record's closure environment, and the finish stub hands any materialized
+    /// activation to `jit_direct_finish`, whose record release drops it.
     pub(crate) fn jit_direct_flags(&self, code: &crate::jit::JitCode) -> u8 {
         // The machine-code sequence seeds positional parameters only; a rest parameter's Array
         // is built by the Rust frame entries.
-        if self.resumable
-            || !direct_shared_context_enabled()
-            || self.jit_needs_activation_state()
-            || self.rest_slot.is_some()
-        {
+        if self.resumable || !direct_shared_context_enabled() || self.rest_slot.is_some() {
             return 0;
         }
         #[allow(unused_mut)] // Only the ARM64 shared-call backend adds frame flags.
@@ -20276,7 +20283,23 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
         Op::Call(argc, c) => (argc as usize, c, false),
         _ => unreachable!("jit_call_hit emitted only for call ops"),
     };
-    let ic = chunk.call_caches[c as usize].entries[way].get();
+    let mut ic = chunk.call_caches[c as usize].entries[way].get();
+    // A code-keyed probe hit (see `jit::emit_call_code_probe`) matched another closure of this
+    // way's function. PrepareForOrdinaryCall's F is the LIVE closure: run the shared code with
+    // its identity and [[Environment]], never the filling closure's (a local copy; the way is
+    // unchanged, like `Interp::resolve_cached_call`'s code-sharing retry).
+    if ic.native == 0 {
+        if let Value::Obj(callee) = (*sp.sub(argc + 1)).unpack() {
+            let key = Rc::as_ptr(&callee) as usize;
+            if key != ic.callee {
+                if let crate::value::Callable::User(user) = &callee.borrow().call {
+                    debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
+                    ic.callee = key;
+                    ic.env = Rc::as_ptr(&user.env);
+                }
+            }
+        }
+    }
     // The emitted probe already validated this epoch. Acquire before inline
     // recompilation, which may now reclaim other inactive native code.
     let code = (ic.native == 0).then(|| crate::jit::cache::lease_raw(ic.code));
@@ -21397,6 +21420,7 @@ unsafe fn jit_call_inner(
                                         }
                                         _ => 0,
                                     },
+                                    realm: 0,
                                 },
                                 None,
                             );
@@ -21613,9 +21637,6 @@ unsafe fn jit_callstat(
         }
         if ic.direct & 2 != 0 && ctx.global_body.is_null() {
             break 'r "gate: needs_global, no live global_body";
-        }
-        if (ic.n_params as usize) < argc {
-            break 'r "gate: argc > n_params";
         }
         if ic.uses_this && !ic.strict {
             if !with_this {

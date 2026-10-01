@@ -61,6 +61,36 @@ fn probe_words(
     a.movz(1, 0, 0);
     a.ldp_post(19, 30, 16);
     a.ret();
+    // The probe may be the shared out-of-line stub (reached with `bl`; lr is saved above).
+    emit_shared_stubs(
+        &mut a,
+        &StubContext {
+            layout,
+            ilayout: None,
+            direct: None,
+        },
+    );
+    a.finish()
+}
+
+/// The validator body emitted inline at a site-shaped continuation (the shared stub wraps
+/// exactly this body), for emission-order assertions.
+fn body_words(layout: &crate::value::JitLayout, cache: &Cell<NameIc>, packed_ok: bool) -> Vec<u32> {
+    let mut a = asm::Asm::new();
+    let slow = a.new_label();
+    a.stp_pre(19, 30, -16);
+    a.mov(19, 0);
+    a.mov_imm64(12, cache.as_ptr() as u64);
+    emit_name_ic_value_ptr_body(&mut a, layout, slow, packed_ok);
+    a.mov(0, 14);
+    a.mov(1, 7);
+    a.ldp_post(19, 30, 16);
+    a.ret();
+    a.bind(slow);
+    a.movz(0, 0, 0);
+    a.movz(1, 0, 0);
+    a.ldp_post(19, 30, 16);
+    a.ret();
     a.finish()
 }
 
@@ -239,7 +269,7 @@ fn name_dispatch_emission_places_deep_island_after_ordinary_mode_proofs() {
     let engine = crate::Engine::new();
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
     let cache = Cell::new(NameIc::EMPTY);
-    let words = probe_words(&layout, &cache, true);
+    let words = body_words(&layout, &cache, true);
     let instruction = |emit: fn(&mut asm::Asm)| {
         let mut a = asm::Asm::new();
         emit(&mut a);

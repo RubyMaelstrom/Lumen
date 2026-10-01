@@ -13198,6 +13198,8 @@ impl Interp {
             pc_offs_ptr: code.pc_offsets_ptr(),
             native: 0,
             intrinsic: 0,
+            // Checked above: the constructor belongs to the active Realm.
+            realm: Rc::as_ptr(&self.global) as usize,
         };
         self.construct_ics.insert(
             key,
@@ -13236,8 +13238,10 @@ impl Interp {
         // The immutable Callable and identity pin preserve this proof on cached hits.
         let Value::Obj(o) = callee else { return None };
         let object = o.borrow();
-        let (func, env) = match &object.call {
-            Callable::User(user) if object.ic_plain.get() => (user.func.clone(), user.env.clone()),
+        let (func, env, realm) = match &object.call {
+            Callable::User(user) if object.ic_plain.get() => {
+                (user.func.clone(), user.env.clone(), user.realm)
+            }
             _ => return None,
         };
         drop(object);
@@ -13344,6 +13348,7 @@ impl Interp {
                             pc_offs_ptr: code.pc_offsets_ptr(),
                             native: 0,
                             intrinsic: 0,
+                            realm,
                         },
                         Some(&func),
                     );

@@ -140,6 +140,20 @@ fn call_probe(engine: &mut crate::Engine, chunk: &Chunk) -> (ExecutableBuffer, u
     a.ldp_post(21, 30, 16);
     a.ldp_post(19, 20, 16);
     a.ret();
+    // The secondary probes may be the chunk's shared stub (reached with `bl`; lr is saved).
+    emit_shared_stubs(
+        &mut a,
+        &StubContext {
+            layout: &layout,
+            ilayout: Some(&ilayout),
+            direct: Some(DirectCallContext {
+                attempted_off: chunk.jit_inline_attempted_off(),
+                runs_off: chunk.jit_runs_off(),
+                retry_off: chunk.jit_inline_retry_at_off(),
+                finish_stub: finish,
+            }),
+        },
+    );
     let words = a.finish();
     assert_eq!(
         words.iter().filter(|&&word| word == 0x3100_05ff).count(),

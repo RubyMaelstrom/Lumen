@@ -1941,6 +1941,100 @@ pub(crate) fn helper_name(index: usize) -> &'static str {
     HELPER_NAMES.get(index).copied().unwrap_or("invalid")
 }
 
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod shared_stub_tests {
+    use super::*;
+
+    /// Loop bodies run from a backward branch's target through the branch; sequential and
+    /// nested loops are both covered, forward branches and code between loops are not.
+    #[test]
+    fn loop_body_mask_spans_each_backward_branch() {
+        use crate::bytecode::Op;
+        let ops = [
+            Op::Undef,              // 0
+            Op::JumpIfFalse(8),     // 1  outer header (forward exit)
+            Op::JumpIfFalsePeek(5), // 2  inner header
+            Op::Pop,                // 3
+            Op::Jump(2),            // 4  inner backedge
+            Op::Pop,                // 5
+            Op::Jump(1),            // 6  outer backedge
+            Op::Undef,              // 7
+            Op::Pop,                // 8
+            Op::JumpIfTruePeek(8),  // 9  self-contained do-while
+            Op::ReturnUndef,        // 10
+        ];
+        let expected = [
+            false, true, true, true, true, true, true, false, true, true, false,
+        ];
+        assert_eq!(loop_body_mask(&ops), expected);
+    }
+
+    #[test]
+    fn shared_stubs_are_requested_once_and_forgotten_with_a_rewound_emission() {
+        let mut a = asm::Asm::new();
+        let name = SharedStub::NameValuePtr { packed_ok: true }.key();
+        let first = a.shared_stub(name);
+        assert_eq!(a.shared_stub(name), first, "one entry label per stub");
+        let checkpoint = a.checkpoint();
+        let transient = a.shared_stub(SharedStub::NameValuePtr { packed_ok: false }.key());
+        assert_ne!(transient, first);
+        a.rewind(checkpoint);
+        let requested = a.take_shared_stubs();
+        assert_eq!(
+            requested,
+            vec![(name, first)],
+            "a rewound request is dropped"
+        );
+        assert!(a.take_shared_stubs().is_empty());
+    }
+
+    #[test]
+    fn shared_stub_keys_round_trip() {
+        let mut keys = vec![
+            SharedStub::NameValuePtr { packed_ok: false }.key(),
+            SharedStub::NameValuePtr { packed_ok: true }.key(),
+        ];
+        #[cfg(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
+        {
+            for bits in 0..16u32 {
+                keys.push(
+                    SharedStub::PropWays(PropProbeFlags {
+                        arr_ok: bits & 1 != 0,
+                        str_ok: bits & 2 != 0,
+                        method: bits & 4 != 0,
+                        kc: bits & 8 != 0,
+                    })
+                    .key(),
+                );
+            }
+            keys.push(SharedStub::CallSecondary.key());
+            for argc in [0u8, 1, 8, 64] {
+                for with_this in [false, true] {
+                    keys.push(SharedStub::DirectCall { argc, with_this }.key());
+                }
+            }
+        }
+        for &key in &keys {
+            assert_eq!(SharedStub::from_key(key).key(), key);
+        }
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "distinct stubs have distinct keys"
+        );
+    }
+}
+
 #[cfg(test)]
 mod helper_identity_tests {
     use super::*;
@@ -2184,7 +2278,8 @@ mod layout_asserts {
     const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, pc_offs_ptr) == 80);
     const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, native) == 88);
     const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, intrinsic) == 96);
-    const _: () = assert!(std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>() == 104);
+    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, realm) == 104);
+    const _: () = assert!(std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>() == 112);
     const _: () = assert!(std::mem::offset_of!(JitCtx, genv) == 64);
     // 3b reads Interp state from machine code through ctx.interp.
     const _: () = assert!(std::mem::offset_of!(JitCtx, interp) == 72);
@@ -2223,6 +2318,12 @@ mod asm {
         /// (instruction index, label id, kind) — resolved in `finish`.
         patches: Vec<(usize, usize, PatchKind)>,
         labels: Vec<Option<usize>>, // label id → instruction index
+        /// Out-of-line routines shared by every site of this compilation, as (stub key, entry
+        /// label). The compiler emits each once after the body (see `super::SharedStub`).
+        stubs: Vec<(u32, usize)>,
+        /// The code being emitted runs once per loop iteration: sites keep their fast paths in
+        /// line instead of calling a shared stub (see `super::use_shared_stub`).
+        hot: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -2239,7 +2340,29 @@ mod asm {
                 buf: Vec::new(),
                 patches: Vec::new(),
                 labels: Vec::new(),
+                stubs: Vec::new(),
+                hot: false,
             }
+        }
+        /// Mark the following code as (not) running once per loop iteration.
+        pub fn set_hot(&mut self, hot: bool) {
+            self.hot = hot;
+        }
+        pub fn hot(&self) -> bool {
+            self.hot
+        }
+        /// The entry label of the shared stub `key`, requesting its emission on first use.
+        pub fn shared_stub(&mut self, key: u32) -> usize {
+            if let Some(&(_, label)) = self.stubs.iter().find(|&&(k, _)| k == key) {
+                return label;
+            }
+            let label = self.new_label();
+            self.stubs.push((key, label));
+            label
+        }
+        /// Take the stubs requested so far (the compiler binds and emits each one).
+        pub fn take_shared_stubs(&mut self) -> Vec<(u32, usize)> {
+            std::mem::take(&mut self.stubs)
         }
         /// Transaction for an optional region. The region may allocate/bind only NEW labels;
         /// branches to existing baseline labels are fine. This caps added native bytes before
@@ -2251,6 +2374,8 @@ mod asm {
             self.buf.truncate(checkpoint.0);
             self.patches.truncate(checkpoint.1);
             self.labels.truncate(checkpoint.2);
+            // A stub first requested by the discarded emission loses its label with it.
+            self.stubs.retain(|&(_, label)| label < checkpoint.2);
         }
         /// Labels actually referenced by an optional emission, before relaxation. A region
         /// uses this to omit unreachable deoptimization stubs and unnecessary baseline entries.
@@ -3615,8 +3740,10 @@ fn compile_entry(
     // The preserved baseline and established whole-loop lowerings remain independent.
     let mut region_copy_bytes = 0usize;
     let mut stronger_header_cache = vec![None; ops.len()];
+    let in_loop = loop_body_mask(ops);
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pc_labels[pc]);
+        a.set_hot(in_loop[pc]);
         if interrupt_targets[pc] {
             emit_interrupt_poll(&mut a, ilayout, l_unwind);
             #[cfg(feature = "optimizing-jit")]
@@ -4283,6 +4410,7 @@ fn compile_entry(
             }
         }
     }
+    a.set_hot(false);
     // Fall off the end: return undefined (compile() always terminates with ReturnUndef, but be
     // safe about it).
     if borrowed_entry {
@@ -4370,6 +4498,21 @@ fn compile_entry(
     if direct_on {
         emit_direct_finish_stub(&mut a, ilayout, rc_ok && layout.rc_strong_off == 0);
     }
+    // ---- shared out-of-line stubs requested by this chunk's sites ----
+    a.set_hot(false);
+    emit_shared_stubs(
+        &mut a,
+        &StubContext {
+            layout,
+            ilayout: Some(ilayout),
+            direct: direct_on.then(|| DirectCallContext {
+                attempted_off: chunk.jit_inline_attempted_off(),
+                runs_off: chunk.jit_runs_off(),
+                retry_off: chunk.jit_inline_retry_at_off(),
+                finish_stub: l_direct_finish,
+            }),
+        },
+    );
 
     // The unwinder (ECMA-262 14.15.3) needs the same final catch addresses as patched
     // branches, including every word inserted while relaxing long conditional branches.
@@ -4807,6 +4950,296 @@ enum PropRecv {
     Slot(u32),
 }
 
+/// Receiver/holder variants of the generic property-cache way probe (see
+/// [`emit_prop_way_probe`]); each distinct combination is one shared stub per chunk.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+struct PropProbeFlags {
+    /// An `Exotic::Array` receiver may shape-validate (the site's name is not an element key).
+    arr_ok: bool,
+    /// A string-primitive method read probes `String.prototype` (and StrWrap holders pass).
+    str_ok: bool,
+    /// A method load: cached absence is not served (the helper throws for a missing method).
+    method: bool,
+    /// Key-checked Array holder states route to the site's key compare.
+    kc: bool,
+}
+
+/// One generic property-cache way probe: x12 = the way's `IcState` cell, x10 = the receiver's
+/// stored Rc pointer (preserved). A validated data hit branches to `load` (x11 = holder object
+/// base, x13 = slot), a key-checked holder to `load_kc` (same registers; the site verifies the
+/// entry key), a validated cached absence to `absent_hit`; anything else to `miss`. Clobbers
+/// x9, x11..x17 only.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_prop_way_probe(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    flags: PropProbeFlags,
+    miss: usize,
+    load: usize,
+    load_kc: usize,
+    absent_hit: usize,
+) {
+    use crate::bytecode::{
+        IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID3_SHAPE, IC_OFF_MID4_SHAPE,
+        IC_OFF_MID_OK, IC_OFF_MID_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
+    };
+    let PropProbeFlags {
+        arr_ok,
+        str_ok,
+        method,
+        kc,
+    } = flags;
+    let rcv = layout.obj_from_rc as u32;
+    let ex = layout.obj_exotic as u32;
+    let pr = layout.obj_proto as u32;
+    let sh = (layout.obj_props + layout.props_shape) as u32;
+    let plain = layout.obj_ic_plain as u32;
+    let none_tag = layout.exotic_none_tag as u32;
+    let d1 = a.new_label();
+    a.ldrb_imm(9, 12, IC_OFF_DEPTH);
+    a.ldr_w_imm(13, 12, IC_OFF_SLOT);
+    // receiver hop: exotic None (or Array when `arr_ok` — but only as a NON-holder, so an
+    // Array receiver additionally requires depth ≥ 1: its shape proves named-key ABSENCE,
+    // not slot positions, because element entries occupy slots without transitioning the
+    // shape; or StrWrap when `str_ok` — String.prototype/string wrappers intercept only
+    // index and `length` reads, both excluded by the str_ok name gates), plain,
+    // shape == recv_shape; x11 = receiver object base
+    a.add_imm(11, 10, rcv);
+    a.ldrb_imm(14, 11, ex);
+    if arr_ok || str_ok {
+        let ex_ok = a.new_label();
+        a.cmp_imm_w(14, none_tag);
+        a.b_cond(C_EQ, ex_ok);
+        if arr_ok {
+            let not_arr = a.new_label();
+            a.cmp_imm_w(14, layout.exotic_array_tag as u32);
+            a.b_cond(C_NE, not_arr);
+            a.cbz(9, false, miss); // Array receiver must not be the holder (w9 = depth)
+            a.b(ex_ok);
+            a.bind(not_arr);
+        }
+        if str_ok {
+            a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
+            a.b_cond(C_EQ, ex_ok);
+        }
+        a.b(miss);
+        a.bind(ex_ok);
+    } else {
+        a.cmp_imm_w(14, none_tag);
+        a.b_cond(C_NE, miss);
+    }
+    a.ldrb_imm(14, 11, plain);
+    a.cbz(14, false, miss);
+    a.ldr_w_imm(14, 11, sh);
+    a.ldr_w_imm(16, 12, IC_OFF_RECV_SHAPE);
+    a.cmp_reg_w(14, 16);
+    a.b_cond(C_NE, miss);
+    // depth routing: 0 → holder is the receiver; 1 → one hop; 2/3 validate their recorded
+    // intermediate shapes then fall to d1 for the holder. Non-plain depths divert to the
+    // key-checked decoder (`kc_route`) so the common depths pay nothing for its existence.
+    a.cbz(9, false, load);
+    a.cmp_imm_w(9, 1);
+    a.b_cond(C_EQ, d1);
+    let kc_route = if kc { a.new_label() } else { miss };
+    let depth2 = a.new_label();
+    let other = a.new_label();
+    a.cmp_imm_w(9, 2);
+    a.b_cond(C_EQ, depth2);
+    a.cmp_imm_w(9, 3);
+    a.b_cond(C_NE, other);
+    a.ldrb_imm(14, 12, IC_OFF_MID_OK);
+    a.cmp_imm_w(14, 3);
+    a.b_cond(C_NE, miss);
+    // depth-3 first intermediate hop.
+    a.ldr_imm(17, 11, pr);
+    a.cbz(17, true, miss);
+    a.add_imm(11, 17, rcv);
+    a.ldrb_imm(14, 11, ex);
+    a.cmp_imm_w(14, none_tag);
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(14, 11, plain);
+    a.cbz(14, false, miss);
+    a.ldr_w_imm(14, 11, sh);
+    a.ldr_w_imm(16, 12, IC_OFF_MID_SHAPE);
+    a.cmp_reg_w(14, 16);
+    a.b_cond(C_NE, miss);
+    // depth-3 second intermediate hop; the common holder validation follows at d1.
+    a.ldr_imm(17, 11, pr);
+    a.cbz(17, true, miss);
+    a.add_imm(11, 17, rcv);
+    a.ldrb_imm(14, 11, ex);
+    a.cmp_imm_w(14, none_tag);
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(14, 11, plain);
+    a.cbz(14, false, miss);
+    a.ldr_w_imm(14, 11, sh);
+    a.ldr_w_imm(16, 12, IC_OFF_MID2_SHAPE);
+    a.cmp_reg_w(14, 16);
+    a.b_cond(C_NE, miss);
+    a.b(d1);
+    a.bind(depth2);
+    a.ldrb_imm(14, 12, IC_OFF_MID_OK);
+    a.cbz(14, false, miss);
+    // depth-2 mid hop: follow the live proto, validate against mid_shape
+    a.ldr_imm(17, 11, pr); // Option<Gc> niche: pointer or 0
+    a.cbz(17, true, miss);
+    a.add_imm(11, 17, rcv);
+    a.ldrb_imm(14, 11, ex);
+    a.cmp_imm_w(14, none_tag);
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(14, 11, plain);
+    a.cbz(14, false, miss);
+    a.ldr_w_imm(14, 11, sh);
+    a.ldr_w_imm(16, 12, IC_OFF_MID_SHAPE);
+    a.cmp_reg_w(14, 16);
+    a.b_cond(C_NE, miss);
+    // holder hop (depth 1 entry point; depth 2 falls through): validate holder_shape
+    a.bind(d1);
+    a.ldr_imm(17, 11, pr);
+    a.cbz(17, true, miss);
+    a.add_imm(11, 17, rcv);
+    a.ldrb_imm(14, 11, ex);
+    a.cmp_imm_w(14, none_tag);
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(14, 11, plain);
+    a.cbz(14, false, miss);
+    a.ldr_w_imm(14, 11, sh);
+    a.ldr_w_imm(16, 12, IC_OFF_HOLDER_SHAPE);
+    a.cmp_reg_w(14, 16);
+    a.b_cond(C_NE, miss);
+    a.b(load);
+    // Cached ABSENCE (`IC_ABSENT`, the AST-shaped read `node.optionalField`): re-walk the
+    // live chain — every level None-exotic, ic-plain, shape matching the recorded walk
+    // (level 1 already validated by the receiver checks above; ABSENT states only fill
+    // from all-None chains, so re-require None on receivers the `arr_ok`/`str_ok` gates
+    // let through) — and the chain must END where the fill saw it end. Then the read is
+    // `undefined` with no entry scan at all. Method loads keep the helper (an absent
+    // method throws there anyway).
+    a.bind(other);
+    if !method {
+        a.cmp_imm_w(9, crate::bytecode::IC_ABSENT as u32);
+        a.b_cond(C_NE, kc_route);
+        if arr_ok || str_ok {
+            a.ldrb_imm(14, 11, ex);
+            a.cmp_imm_w(14, none_tag);
+            a.b_cond(C_NE, miss);
+        }
+        let chain_end = a.new_label();
+        for (lvl, shape_off) in [
+            (2u32, IC_OFF_MID_SHAPE),
+            (3u32, IC_OFF_MID2_SHAPE),
+            (4u32, IC_OFF_MID3_SHAPE),
+            (5u32, IC_OFF_MID4_SHAPE),
+            (6u32, IC_OFF_HOLDER_SHAPE),
+        ] {
+            a.cmp_imm_w(13, lvl);
+            a.b_cond(C_LO, chain_end);
+            a.ldr_imm(17, 11, pr);
+            a.cbz(17, true, miss); // chain ended before the recorded level count
+            a.add_imm(11, 17, rcv);
+            a.ldrb_imm(14, 11, ex);
+            a.cmp_imm_w(14, none_tag);
+            a.b_cond(C_NE, miss);
+            a.ldrb_imm(14, 11, plain);
+            a.cbz(14, false, miss);
+            a.ldr_w_imm(14, 11, sh);
+            a.ldr_w_imm(16, 12, shape_off);
+            a.cmp_reg_w(14, 16);
+            a.b_cond(C_NE, miss);
+        }
+        a.bind(chain_end);
+        a.ldr_imm(17, 11, pr);
+        a.cbz(17, true, absent_hit);
+        a.b(miss); // a proto was attached where the fill saw the end
+    } else if !kc {
+        a.b(miss);
+    }
+    // key-checked states (`IC_ARR_KEYCHK`): 0x40 = the array receiver IS the holder
+    // (`arr.length`); 0x41 = one hop to an array holder (Array.prototype methods — itself
+    // an Array exotic). The receiver-side Array gate above already passed 0x40 (nonzero
+    // depth). Deeper key-checked states → helper.
+    if kc {
+        a.bind(kc_route);
+        a.cmp_imm_w(9, 0x40);
+        a.b_cond(C_EQ, load_kc);
+        a.cmp_imm_w(9, 0x41);
+        a.b_cond(C_NE, miss);
+        // one proto hop; the holder may be Exotic::None or an Array (its entry key gets
+        // re-checked, which is what makes an array holder's slot trustworthy at all)
+        a.ldr_imm(17, 11, pr);
+        a.cbz(17, true, miss);
+        a.add_imm(11, 17, rcv);
+        a.ldrb_imm(14, 11, ex);
+        let ex_ok = a.new_label();
+        a.cmp_imm_w(14, none_tag);
+        a.b_cond(C_EQ, ex_ok);
+        a.cmp_imm_w(14, layout.exotic_array_tag as u32);
+        a.b_cond(C_NE, miss);
+        a.bind(ex_ok);
+        a.ldrb_imm(14, 11, plain);
+        a.cbz(14, false, miss);
+        a.ldr_w_imm(14, 11, sh);
+        a.ldr_w_imm(16, 12, IC_OFF_HOLDER_SHAPE);
+        a.cmp_reg_w(14, 16);
+        a.b_cond(C_NE, miss);
+        a.b(load_kc);
+    }
+}
+
+/// Status codes the shared property way loop returns in w9 (0 = no way validated).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const PROP_PROBE_LOAD: u32 = 1;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const PROP_PROBE_LOAD_KC: u32 = 2;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const PROP_PROBE_ABSENT: u32 = 3;
+
+/// Probe every cache way of a site (x8 = its first `IcState` cell, x10 = receiver): x8 is the
+/// way cursor and w7 the ways left, both untouched by the probe body. Clobbers x7..x9, x11..x17.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_prop_way_loop(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    flags: PropProbeFlags,
+    miss: usize,
+    load: usize,
+    load_kc: usize,
+    absent_hit: usize,
+) {
+    let l_way = a.new_label();
+    let l_way_next = a.new_label();
+    a.movz(7, crate::bytecode::PROP_IC_WAYS as u32, 0);
+    a.bind(l_way);
+    a.mov(12, 8);
+    emit_prop_way_probe(a, layout, flags, l_way_next, load, load_kc, absent_hit);
+    a.bind(l_way_next);
+    let ic_stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::IcState>>();
+    a.add_imm(8, 8, ic_stride as u32);
+    a.sub_imm(7, 7, 1);
+    a.cbnz(7, false, l_way);
+    a.b(miss);
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -4833,10 +5266,6 @@ fn emit_prop_load_inline(
     arr_ok: bool,
     recv: PropRecv,
 ) {
-    use crate::bytecode::{
-        IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID3_SHAPE, IC_OFF_MID4_SHAPE,
-        IC_OFF_MID_OK, IC_OFF_MID_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
-    };
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
@@ -5043,217 +5472,35 @@ fn emit_prop_load_inline(
     // x10 and jumps to `load` with x11 = holder base, x13 = slot.
     // `cache_ptr` = the IcState cell address, or 0 for "x12 already holds it" (the stub-cache
     // arm computes the entry address at run time).
-    let probe = |a: &mut asm::Asm, cache_ptr: usize, miss: usize| {
-        let d1 = a.new_label();
-        if cache_ptr != 0 {
-            a.mov_imm64(12, cache_ptr as u64);
-        }
-        a.ldrb_imm(9, 12, IC_OFF_DEPTH);
-        a.ldr_w_imm(13, 12, IC_OFF_SLOT);
-        // receiver hop: exotic None (or Array when `arr_ok` — but only as a NON-holder, so an
-        // Array receiver additionally requires depth ≥ 1: its shape proves named-key ABSENCE,
-        // not slot positions, because element entries occupy slots without transitioning the
-        // shape; or StrWrap when `str_ok` — String.prototype/string wrappers intercept only
-        // index and `length` reads, both excluded by the str_ok name gates), plain,
-        // shape == recv_shape; x11 = receiver object base
-        a.add_imm(11, 10, rcv);
-        a.ldrb_imm(14, 11, ex);
-        if arr_ok || str_ok {
-            let ex_ok = a.new_label();
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_EQ, ex_ok);
-            if arr_ok {
-                let not_arr = a.new_label();
-                a.cmp_imm_w(14, layout.exotic_array_tag as u32);
-                a.b_cond(C_NE, not_arr);
-                a.cbz(9, false, miss); // Array receiver must not be the holder (w9 = depth)
-                a.b(ex_ok);
-                a.bind(not_arr);
-            }
-            if str_ok {
-                a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
-                a.b_cond(C_EQ, ex_ok);
-            }
-            a.b(miss);
-            a.bind(ex_ok);
-        } else {
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, miss);
-        }
-        a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, miss);
-        a.ldr_w_imm(14, 11, sh);
-        a.ldr_w_imm(16, 12, IC_OFF_RECV_SHAPE);
-        a.cmp_reg_w(14, 16);
-        a.b_cond(C_NE, miss);
-        // depth routing: 0 → holder is the receiver; 1 → one hop; 2/3 validate their recorded
-        // intermediate shapes then fall to d1 for the holder. Non-plain depths divert to the
-        // key-checked decoder (`kc_route`) so the common depths pay nothing for its existence.
-        a.cbz(9, false, load);
-        a.cmp_imm_w(9, 1);
-        a.b_cond(C_EQ, d1);
-        let kc_route = if kc { a.new_label() } else { miss };
-        let depth2 = a.new_label();
-        let other = a.new_label();
-        a.cmp_imm_w(9, 2);
-        a.b_cond(C_EQ, depth2);
-        a.cmp_imm_w(9, 3);
-        a.b_cond(C_NE, other);
-        a.ldrb_imm(14, 12, IC_OFF_MID_OK);
-        a.cmp_imm_w(14, 3);
-        a.b_cond(C_NE, miss);
-        // depth-3 first intermediate hop.
-        a.ldr_imm(17, 11, pr);
-        a.cbz(17, true, miss);
-        a.add_imm(11, 17, rcv);
-        a.ldrb_imm(14, 11, ex);
-        a.cmp_imm_w(14, none_tag);
-        a.b_cond(C_NE, miss);
-        a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, miss);
-        a.ldr_w_imm(14, 11, sh);
-        a.ldr_w_imm(16, 12, IC_OFF_MID_SHAPE);
-        a.cmp_reg_w(14, 16);
-        a.b_cond(C_NE, miss);
-        // depth-3 second intermediate hop; the common holder validation follows at d1.
-        a.ldr_imm(17, 11, pr);
-        a.cbz(17, true, miss);
-        a.add_imm(11, 17, rcv);
-        a.ldrb_imm(14, 11, ex);
-        a.cmp_imm_w(14, none_tag);
-        a.b_cond(C_NE, miss);
-        a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, miss);
-        a.ldr_w_imm(14, 11, sh);
-        a.ldr_w_imm(16, 12, IC_OFF_MID2_SHAPE);
-        a.cmp_reg_w(14, 16);
-        a.b_cond(C_NE, miss);
-        a.b(d1);
-        a.bind(depth2);
-        a.ldrb_imm(14, 12, IC_OFF_MID_OK);
-        a.cbz(14, false, miss);
-        // depth-2 mid hop: follow the live proto, validate against mid_shape
-        a.ldr_imm(17, 11, pr); // Option<Gc> niche: pointer or 0
-        a.cbz(17, true, miss);
-        a.add_imm(11, 17, rcv);
-        a.ldrb_imm(14, 11, ex);
-        a.cmp_imm_w(14, none_tag);
-        a.b_cond(C_NE, miss);
-        a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, miss);
-        a.ldr_w_imm(14, 11, sh);
-        a.ldr_w_imm(16, 12, IC_OFF_MID_SHAPE);
-        a.cmp_reg_w(14, 16);
-        a.b_cond(C_NE, miss);
-        // holder hop (depth 1 entry point; depth 2 falls through): validate holder_shape
-        a.bind(d1);
-        a.ldr_imm(17, 11, pr);
-        a.cbz(17, true, miss);
-        a.add_imm(11, 17, rcv);
-        a.ldrb_imm(14, 11, ex);
-        a.cmp_imm_w(14, none_tag);
-        a.b_cond(C_NE, miss);
-        a.ldrb_imm(14, 11, plain);
-        a.cbz(14, false, miss);
-        a.ldr_w_imm(14, 11, sh);
-        a.ldr_w_imm(16, 12, IC_OFF_HOLDER_SHAPE);
-        a.cmp_reg_w(14, 16);
-        a.b_cond(C_NE, miss);
-        a.b(load);
-        // Cached ABSENCE (`IC_ABSENT`, the AST-shaped read `node.optionalField`): re-walk the
-        // live chain — every level None-exotic, ic-plain, shape matching the recorded walk
-        // (level 1 already validated by the receiver checks above; ABSENT states only fill
-        // from all-None chains, so re-require None on receivers the `arr_ok`/`str_ok` gates
-        // let through) — and the chain must END where the fill saw it end. Then the read is
-        // `undefined` with no entry scan at all. Method loads keep the helper (an absent
-        // method throws there anyway).
-        a.bind(other);
-        if !method {
-            a.cmp_imm_w(9, crate::bytecode::IC_ABSENT as u32);
-            a.b_cond(C_NE, kc_route);
-            if arr_ok || str_ok {
-                a.ldrb_imm(14, 11, ex);
-                a.cmp_imm_w(14, none_tag);
-                a.b_cond(C_NE, miss);
-            }
-            let chain_end = a.new_label();
-            for (lvl, shape_off) in [
-                (2u32, IC_OFF_MID_SHAPE),
-                (3u32, IC_OFF_MID2_SHAPE),
-                (4u32, IC_OFF_MID3_SHAPE),
-                (5u32, IC_OFF_MID4_SHAPE),
-                (6u32, IC_OFF_HOLDER_SHAPE),
-            ] {
-                a.cmp_imm_w(13, lvl);
-                a.b_cond(C_LO, chain_end);
-                a.ldr_imm(17, 11, pr);
-                a.cbz(17, true, miss); // chain ended before the recorded level count
-                a.add_imm(11, 17, rcv);
-                a.ldrb_imm(14, 11, ex);
-                a.cmp_imm_w(14, none_tag);
-                a.b_cond(C_NE, miss);
-                a.ldrb_imm(14, 11, plain);
-                a.cbz(14, false, miss);
-                a.ldr_w_imm(14, 11, sh);
-                a.ldr_w_imm(16, 12, shape_off);
-                a.cmp_reg_w(14, 16);
-                a.b_cond(C_NE, miss);
-            }
-            a.bind(chain_end);
-            a.ldr_imm(17, 11, pr);
-            a.cbz(17, true, absent_hit);
-            a.b(miss); // a proto was attached where the fill saw the end
-        } else if !kc {
-            a.b(miss);
-        }
-        // key-checked states (`IC_ARR_KEYCHK`): 0x40 = the array receiver IS the holder
-        // (`arr.length`); 0x41 = one hop to an array holder (Array.prototype methods — itself
-        // an Array exotic). The receiver-side Array gate above already passed 0x40 (nonzero
-        // depth). Deeper key-checked states → helper.
-        if kc {
-            a.bind(kc_route);
-            a.cmp_imm_w(9, 0x40);
-            a.b_cond(C_EQ, load_kc);
-            a.cmp_imm_w(9, 0x41);
-            a.b_cond(C_NE, miss);
-            // one proto hop; the holder may be Exotic::None or an Array (its entry key gets
-            // re-checked, which is what makes an array holder's slot trustworthy at all)
-            a.ldr_imm(17, 11, pr);
-            a.cbz(17, true, miss);
-            a.add_imm(11, 17, rcv);
-            a.ldrb_imm(14, 11, ex);
-            let ex_ok = a.new_label();
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_EQ, ex_ok);
-            a.cmp_imm_w(14, layout.exotic_array_tag as u32);
-            a.b_cond(C_NE, miss);
-            a.bind(ex_ok);
-            a.ldrb_imm(14, 11, plain);
-            a.cbz(14, false, miss);
-            a.ldr_w_imm(14, 11, sh);
-            a.ldr_w_imm(16, 12, IC_OFF_HOLDER_SHAPE);
-            a.cmp_reg_w(14, 16);
-            a.b_cond(C_NE, miss);
-            a.b(load_kc);
-        }
-    };
-    // Loop the self-contained probe over every way (x8 = way cursor, w7 = ways left — both
-    // untouched by the probe body; a hit exits through `load`/`load_kc`). One emitted body
-    // instead of PROP_IC_WAYS unrolled copies keeps per-site code size flat.
+    // Probe every way through the chunk's shared out-of-line way loop (x8 = the site's first
+    // cell, x10 = receiver); it reports which landing validated in w9. With stubs disabled, the
+    // same loop is emitted at the site.
     if compact.is_none() {
-        let l_way = a.new_label();
-        let l_way_next = a.new_label();
+        let flags = PropProbeFlags {
+            arr_ok,
+            str_ok,
+            method,
+            kc,
+        };
         a.mov_imm64(8, cache_ptr as u64);
-        a.movz(7, crate::bytecode::PROP_IC_WAYS as u32, 0);
-        a.bind(l_way);
-        a.mov(12, 8);
-        probe(a, 0, l_way_next);
-        a.bind(l_way_next);
-        let ic_stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::IcState>>();
-        a.add_imm(8, 8, ic_stride as u32);
-        a.sub_imm(7, 7, 1);
-        a.cbnz(7, false, l_way);
-        a.b(slow);
+        if shared_stubs_enabled() {
+            let stub = a.shared_stub(SharedStub::PropWays(flags).key());
+            a.bl_label(stub);
+            a.cbz(9, false, slow);
+            a.cmp_imm_w(9, PROP_PROBE_LOAD);
+            a.b_cond(C_EQ, load);
+            if kc {
+                a.cmp_imm_w(9, PROP_PROBE_LOAD_KC);
+                a.b_cond(C_EQ, load_kc);
+            }
+            if !method {
+                a.cmp_imm_w(9, PROP_PROBE_ABSENT);
+                a.b_cond(C_EQ, absent_hit);
+            }
+            a.b(slow);
+        } else {
+            emit_prop_way_loop(a, layout, flags, slow, load, load_kc, absent_hit);
+        }
     }
     // 6. x11 = holder base: bounds-check the cached slot against the live entries length
     //    (defense in depth — fills only record exact-slot holders, but an OOB read through a
@@ -5634,7 +5881,19 @@ fn emit_call_inline(
             a.add_imm(12, 12, stride as u32);
             a.sub_imm(14, 14, 1);
             a.cbnz(14, false, l_probe);
-            emit_call_overflow_probe(a, ilayout, l_hit, slow);
+            // Secondary probes (the engine-wide identity overflow cache, then code-keyed ways):
+            // out of line in the chunk's shared stub. The primary loop left x12 exactly
+            // CALL_IC_WAYS strides past the site's first way.
+            if shared_stubs_enabled() {
+                a.sub_imm(12, 12, (crate::bytecode::CALL_IC_WAYS * stride) as u32);
+                let stub = a.shared_stub(SharedStub::CallSecondary.key());
+                a.bl_label(stub);
+                a.cbz(9, false, slow);
+                a.b(l_hit);
+            } else {
+                a.mov_imm64(6, ic0 as u64);
+                emit_call_secondary_probes(a, layout, ilayout, l_hit, slow);
+            }
             // x15 = the hit way (ways-left counter → index), kept live through
             // the direct sequence's NO-MUTATION gate checks (they never touch
             // x15; every route into hit_slow happens before any blr).
@@ -6010,27 +6269,60 @@ fn emit_call_inline(
             // the H_CALL_HIT form below.
             if direct_on {
                 let attempted_off = chunk.jit_inline_attempted_off();
-                emit_direct_call(
-                    a,
-                    ilayout,
-                    layout,
-                    attempted_off,
-                    chunk.jit_runs_off(),
-                    chunk.jit_inline_retry_at_off(),
-                    *argc as usize,
-                    with_this,
-                    hit_slow,
-                    l_unwind,
-                    done,
-                    l_direct_finish,
-                );
+                let runs_off = chunk.jit_runs_off();
+                let retry_off = chunk.jit_inline_retry_at_off();
+                let argc = *argc as usize;
+                if use_shared_stub(a)
+                    && direct_call_supported(
+                        ilayout,
+                        layout,
+                        attempted_off,
+                        runs_off,
+                        retry_off,
+                        argc,
+                    )
+                {
+                    // The chunk's shared sequence for this arity and receiver form.
+                    let stub = a.shared_stub(
+                        SharedStub::DirectCall {
+                            argc: argc as u8,
+                            with_this,
+                        }
+                        .key(),
+                    );
+                    a.bl_label(stub);
+                    let not_returned = a.new_label();
+                    const _: () = assert!(DIRECT_CALL_RETURNED == 0);
+                    a.cbnz(9, false, not_returned);
+                    a.b(done);
+                    a.bind(not_returned);
+                    a.cmp_imm_w(9, DIRECT_CALL_THREW);
+                    a.b_cond(C_EQ, l_unwind);
+                    // A declined gate falls through to the H_CALL_HIT form below.
+                } else {
+                    emit_direct_call(
+                        a,
+                        ilayout,
+                        layout,
+                        attempted_off,
+                        runs_off,
+                        retry_off,
+                        argc,
+                        with_this,
+                        hit_slow,
+                        l_unwind,
+                        done,
+                        l_direct_finish,
+                    );
+                }
             }
             a.bind(hit_slow);
             // Secondary ways are not indices into the caller's four primary
             // entries. A non-direct/non-intrinsic secondary hit re-probes through
-            // the checked helper; it must never alias primary way zero.
+            // the checked helper; it must never alias primary way zero. A code-keyed
+            // hit's tagged index still names its primary way in the low bits.
             a.cmp_imm_w(15, crate::bytecode::CALL_IC_WAYS as u32);
-            a.b_cond(C_HS, slow);
+            a.b_cond(C_EQ, slow);
             a.mov(0, 19);
             // x1 = pc | way << 16 (pcs are < 65536: every helper call encodes
             // the pc as one movz)
@@ -6054,6 +6346,139 @@ fn emit_call_inline(
     a.cbnz(1, false, l_unwind);
     a.bind(done);
 }
+/// The call site's secondary probes after its primary identity ways miss: the engine-wide
+/// identity overflow cache, then the code-keyed ways (x6 = the site's first way). Inputs and hit
+/// outputs are those of the primary probe (see `emit_call_overflow_probe`,
+/// `emit_call_code_probe`). Clobbers x7, x9, x11, x12, x14 and x16 only.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_call_secondary_probes(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    hit: usize,
+    miss: usize,
+) {
+    let code_keyed = a.new_label();
+    emit_call_overflow_probe(a, ilayout, hit, code_keyed);
+    a.bind(code_keyed);
+    emit_call_code_probe(a, layout, hit, miss);
+}
+
+/// Code-keyed probe, after the identity probes miss: accept another closure of a primary way's
+/// function. ECMA-262 OrdinaryFunctionCreate gives every evaluation of a function expression a
+/// new object with its own [[Environment]] and [[Realm]], but all of them run the same code, so
+/// a way filled for one closure serves the others once the live callee is proven to be an
+/// ordinary user closure (`Callable::User`, `ic_plain`) of the way's function (`CallIc::func`,
+/// which the site pins against address reuse — see `CallSite`), in the way's Realm and the
+/// fill-time epoch/active Realm, and not under a `with` (see `Interp::call_jit_fast`). Class
+/// constructors never match: every closure of a class constructor's function is a class
+/// constructor, and such closures are never filled.
+///
+/// Inputs match the primary probe (x10 = stored callee pointer, w15 = live epoch, x17 = the
+/// active Realm's global scope), plus x6 = the site's first way. On a hit, x12 points at the way
+/// and x15 is its index tagged
+/// with [`CALL_CODE_HIT`]; the call then runs the LIVE closure (the direct sequence and
+/// `jit_call_hit` take its environment and identity from the callee, never from the way). No
+/// calls, allocation or state changes occur.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_call_code_probe(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    hit: usize,
+    miss: usize,
+) {
+    use std::mem::offset_of;
+    let call_tag = layout.obj_from_rc + layout.obj_call;
+    let call_payload = call_tag + 8;
+    let ic_plain = layout.obj_from_rc + layout.obj_ic_plain;
+    let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
+    let ic_func = offset_of!(crate::bytecode::CallIc, func);
+    let ic_realm = offset_of!(crate::bytecode::CallIc, realm);
+    if !(layout.valid
+        && layout.call_probe_valid
+        && layout.scope_parent_valid
+        && call_tag < 4096
+        && ic_plain < 4096
+        && fits8(call_payload)
+        && fits8(layout.user_func)
+        && fits8(layout.user_env)
+        && fits8(layout.user_realm)
+        && layout.func_data_off < 4096
+        && layout.scope_data_off < 4096
+        && layout.scope_under_with < 4096)
+    {
+        a.b(miss);
+        return;
+    }
+    a.ldrb_imm(9, 10, call_tag as u32);
+    a.cmp_imm_w(9, crate::value::CALLABLE_USER_TAG as u32);
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(9, 10, ic_plain as u32);
+    a.cbz(9, false, miss);
+    a.ldr_imm(9, 10, call_payload as u32); // stored Rc<UserCallable>
+    a.ldr_imm(11, 9, layout.user_func as u32);
+    a.add_imm(11, 11, layout.func_data_off as u32); // the closure's function identity
+    a.ldr_imm(16, 9, layout.user_realm as u32);
+    a.mov(12, 6);
+    a.movz(14, crate::bytecode::CALL_IC_WAYS as u32, 0);
+    let probe = a.new_label();
+    let next = a.new_label();
+    let found = a.new_label();
+    a.bind(probe);
+    a.ldr_imm(7, 12, ic_func as u32);
+    a.cmp_reg_x(7, 11);
+    a.b_cond(C_NE, next);
+    a.ldr_w_imm(7, 12, 56); // epoch
+    a.cmp_reg_w(7, 15);
+    a.b_cond(C_NE, next);
+    a.ldr_imm(7, 12, 32); // global_env
+    a.cmp_reg_x(7, 17);
+    a.b_cond(C_NE, next);
+    a.ldr_imm(7, 12, ic_realm as u32);
+    a.cmp_reg_x(7, 16);
+    a.b_cond(C_EQ, found);
+    a.bind(next);
+    let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>();
+    a.add_imm(12, 12, stride as u32);
+    a.sub_imm(14, 14, 1);
+    a.cbnz(14, false, probe);
+    a.b(miss);
+    a.bind(found);
+    a.ldr_imm(7, 9, layout.user_env as u32);
+    a.add_imm(7, 7, layout.scope_data_off as u32);
+    a.ldrb_imm(7, 7, layout.scope_under_with as u32);
+    a.cbnz(7, false, miss);
+    a.movz(15, crate::bytecode::CALL_IC_WAYS as u32 + CALL_CODE_HIT, 0);
+    a.sub_reg(15, 15, 14);
+    a.b(hit);
+}
+
+/// Way-index tag (x15 at a call template's hit label) marking a code-keyed hit (see
+/// [`emit_call_code_probe`]). The direct sequence then installs the live closure's environment,
+/// and the H_CALL_HIT form still reads the way from the index's low bits (`jit_call_hit`, which
+/// also runs the live closure). The overflow probe's sentinel is exactly `CALL_IC_WAYS`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const CALL_CODE_HIT: u32 = 8;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const _: () = assert!(crate::bytecode::CALL_IC_WAYS.is_power_of_two());
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const _: () = assert!((crate::bytecode::CALL_IC_WAYS as u32) < CALL_CODE_HIT);
+
 /// Secondary identity probe. Inputs match the primary probe: x13 = live callee identity,
 /// w15 = epoch, x17 = realm, x10 = stored callee pointer. On hit x12 points at a CallIc and
 /// w15 is the non-primary sentinel. No calls, allocation, GC or observable state changes occur.
@@ -6109,6 +6534,55 @@ fn emit_call_overflow_probe(
     a.b(hit);
 }
 
+/// Emission-time preconditions of [`emit_direct_call`]: every probed Interp/JitCtx offset the
+/// sequence addresses exists and fits its addressing mode, and the arity is within the unrolled
+/// argument-move ceiling (real-world call sites are overwhelmingly below 64 arguments).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn direct_call_supported(
+    ilayout: &crate::interpreter::InterpLayout,
+    layout: &crate::value::JitLayout,
+    attempted_off: usize,
+    runs_off: usize,
+    retry_off: usize,
+    argc: usize,
+) -> bool {
+    use std::mem::offset_of;
+    let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
+    let fits4 = |o: usize| o & 3 == 0 && o / 4 < 4096;
+    let il = ilayout;
+    il.valid
+        && FRAME_WORDS_OFF < 4096
+        && argc <= 64
+        && layout.gc_data_off < 4096
+        && layout.scope_parent_valid
+        && layout.scope_parent.is_multiple_of(8)
+        && layout.scope_parent / 8 < 4096
+        && layout.scope_data_off < 4096
+        && fits4(il.depth)
+        && fits4(il.direct_call_depth)
+        && fits4(il.gc_tick)
+        && fits8(il.gc_next)
+        && fits4(il.cur_coro)
+        && fits8(il.new_target)
+        && fits8(il.fn_frames + il.fnf_ptr_word)
+        && fits8(il.fn_frames + il.fnf_len_word)
+        && fits8(il.fn_frames + il.fnf_cap_word)
+        && fits8(il.frame_pool + il.fp_ptr_word)
+        && fits8(il.frame_pool + il.fp_len_word)
+        && fits8(il.new_target + 8)
+        // The handlers Vec's length-word offset within JitCtx (per-instantiation, probed).
+        && jit_handlers_len_offset().is_some_and(fits8)
+        && fits8(offset_of!(JitCtx, this_val))
+        && fits8(offset_of!(JitCtx, ret))
+        && fits8(offset_of!(JitCtx, live_objects))
+        && attempted_off < 4096
+        && fits4(runs_off)
+        && fits4(retry_off)
+}
+
 /// The direct (shared-ctx) JIT→JIT call sequence, emitted after a guarded cache hit when the
 /// fill-time gates allow it (see [`crate::bytecode::CallIc::direct`]). Everything the layered
 /// path does survives — recursion depth, the amortized gc tick (a due tick falls to the
@@ -6149,48 +6623,12 @@ fn emit_direct_call(
     finish_stub: usize,
 ) -> bool {
     use std::mem::offset_of;
-    // Emission gates: probed Interp offsets must exist and fit the addressing modes used. Wide
-    // calls address their operand block through a computed positive-offset base, rather than
-    // signed LDUR offsets from sp (which capped the old sequence at eight arguments). Keep a
-    // generous code-size ceiling: argument moves are unrolled and real-world JS call sites are
-    // overwhelmingly below 64.
-    let gc_data_off = layout.gc_data_off;
-    if !ilayout.valid
-        || FRAME_WORDS_OFF >= 4096
-        || argc > 64
-        || gc_data_off >= 4096
-        || !layout.scope_parent_valid
-        || !layout.scope_parent.is_multiple_of(8)
-        || layout.scope_parent / 8 >= 4096
-        || layout.scope_data_off >= 4096
-    {
+    if !direct_call_supported(ilayout, layout, attempted_off, runs_off, retry_off, argc) {
         return false;
     }
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
-    let fits4 = |o: usize| o & 3 == 0 && o / 4 < 4096;
+    let gc_data_off = layout.gc_data_off;
     let il = ilayout;
-    if !(fits4(il.depth)
-        && fits4(il.direct_call_depth)
-        && fits4(il.gc_tick)
-        && fits8(il.gc_next)
-        && fits4(il.cur_coro)
-        && fits8(il.new_target)
-        && fits8(il.fn_frames + il.fnf_ptr_word)
-        && fits8(il.fn_frames + il.fnf_len_word)
-        && fits8(il.fn_frames + il.fnf_cap_word)
-        && fits8(il.frame_pool + il.fp_ptr_word)
-        && fits8(il.frame_pool + il.fp_len_word)
-        && fits8(il.new_target + 8))
-    {
-        return false;
-    }
-    // The handlers Vec's length-word offset within JitCtx (per-instantiation, probed here).
-    let Some(handlers_len_off) = jit_handlers_len_offset() else {
-        return false;
-    };
-    if !fits8(handlers_len_off) {
-        return false;
-    }
     const IC_ENV: i32 = 8;
     const IC_STRICT: u32 = 40;
     const IC_USES_THIS: u32 = 41;
@@ -6209,18 +6647,17 @@ fn emit_direct_call(
     let cx_pc_offsets = offset_of!(JitCtx, pc_offsets) as u32;
     let cx_this = offset_of!(JitCtx, this_val) as u32;
     let cx_ret = offset_of!(JitCtx, ret) as u32;
-    let cx_live_objects = offset_of!(JitCtx, live_objects) as u32;
-    if !(fits8(cx_this as usize) && fits8(cx_ret as usize) && fits8(cx_live_objects as usize)) {
-        return false;
-    }
     // rc strong at payload+0 — same contract as the templates (layout.valid checked upstream).
     let strong = 0i32;
+    // The code-keyed probe is emitted only under these conditions (see `emit_call_code_probe`);
+    // without it every hit is an identity hit and the way's recorded environment is the callee's.
+    let call_env_from_callee = layout.call_probe_valid
+        && fits8(layout.obj_from_rc + layout.obj_call + 8)
+        && fits8(layout.user_env)
+        && layout.scope_data_off < 4096;
 
     // ---- checks (entry state: x12 = ic0 ptr, x10 = callee stored Rc ptr; NO mutations) ----
     // direct bits 0 (no force resets) and 2 (recompile settled)
-    if attempted_off >= 4096 || !fits4(runs_off) || !fits4(retry_off) {
-        return false;
-    }
     a.ldurb(9, 12, IC_DIRECT);
     let field1b = asm::logical_imm_w(1).unwrap();
     a.logic_imm_w(0, 11, 9, field1b); // bit 0: no force resets
@@ -6240,13 +6677,10 @@ fn emit_direct_call(
     a.ldr_imm(11, 19, 56); // ctx.global_body
     a.cbz(11, true, hit_slow);
     a.bind(no_glob);
-    // n_params >= argc: the sequence moves exactly `argc` arguments and its slot-init loop
-    // already tags every remaining slot (argc..n_slots) Undefined, which IS the missing-
-    // argument binding. Over-application (argc > n_params) keeps the helper: the surplus
-    // values must be dropped, and refcounted drops don't belong in this sequence.
-    a.ldrh_imm(9, 12, IC_NPARAMS);
-    a.cmp_imm_w(9, argc as u32);
-    a.b_cond(C_LO, hit_slow);
+    // Arity needs no gate: the sequence moves min(argc, n_params) arguments into their slots,
+    // tags every remaining slot Undefined (the missing-argument binding), and leaves any
+    // over-applied surplus on the caller's operand stack for release after the call (see
+    // `emit_direct_surplus_drop`).
     // this binding: a this-using SLOPPY callee needs boxing/global fallback unless the
     // incoming receiver is already an object.
     a.ldrb_imm(9, 12, IC_USES_THIS);
@@ -6303,6 +6737,27 @@ fn emit_direct_call(
     a.str_w_imm(6, 4, runs_off as u32);
     a.bind(retry_done);
 
+    // x13 = the callee's [[Environment]] (`Rc::as_ptr`), kept until the install below. An
+    // identity hit's way recorded exactly this closure's environment; a code-keyed hit
+    // (CALL_CODE_HIT in x15) matched another closure of the same function, so read the LIVE
+    // closure's (x10 is the stored callee pointer).
+    if call_env_from_callee {
+        let code_env = a.new_label();
+        let env_done = a.new_label();
+        let code_bit = asm::logical_imm_w(CALL_CODE_HIT).unwrap();
+        a.logic_imm_w(0, 9, 15, code_bit);
+        a.cbnz(9, false, code_env);
+        a.ldur(13, 12, IC_ENV);
+        a.b(env_done);
+        a.bind(code_env);
+        a.ldr_imm(13, 10, (layout.obj_from_rc + layout.obj_call + 8) as u32);
+        a.ldr_imm(13, 13, layout.user_env as u32);
+        a.add_imm(13, 13, layout.scope_data_off as u32);
+        a.bind(env_done);
+    } else {
+        a.ldur(13, 12, IC_ENV);
+    }
+
     // ---- mutations ----
     a.add_imm(11, 11, 1);
     a.str_w_imm(11, 14, il.depth as u32); // depth++ (u32 field)
@@ -6327,14 +6782,43 @@ fn emit_direct_call(
     a.ldr_x_lsl3(9, 5, 7);
     a.add_imm(15, 9, FRAME_WORDS_OFF as u32);
     // Move packed argument owners byte-for-byte; there is no conversion or possible miss.
+    // ECMA-262 OrdinaryCallBindThis/FunctionDeclarationInstantiation bind the first n_params
+    // values; an over-applied call's surplus words stay owned by the caller's operand stack and
+    // are released after the call (w7 = their count, kept in the save area across it).
     a.sub_imm(8, 20, (argc * 8) as u32);
+    let surplus = a.new_label();
+    let moved = a.new_label();
+    a.ldrh_imm(6, 12, IC_NPARAMS);
+    a.cmp_imm_w(6, argc as u32);
+    a.b_cond(C_LO, surplus);
     for k in 0..argc {
         a.ldr_imm(4, 8, (k * 8) as u32);
         a.str_imm(4, 15, (k * 8) as u32);
     }
-    // Initialize every remaining local to a complete packed Undefined word.
+    a.movz(6, argc as u32, 0); // first slot left to initialize
+    a.movz(7, 0, 0); // no surplus
+    a.b(moved);
+    a.bind(surplus);
+    // w6 = n_params < argc: move exactly those arguments.
+    {
+        let move_loop = a.new_label();
+        let move_done = a.new_label();
+        a.movz(3, 0, 0);
+        a.bind(move_loop);
+        a.cmp_reg_w(3, 6);
+        a.b_cond(C_HS, move_done);
+        a.ldr_x_lsl3(4, 8, 3);
+        a.add_shifted(16, 15, 3, 3);
+        a.str_imm(4, 16, 0);
+        a.add_imm(3, 3, 1);
+        a.b(move_loop);
+        a.bind(move_done);
+        a.movz(7, argc as u32, 0);
+        a.sub_reg(7, 7, 6);
+    }
+    a.bind(moved);
+    // Initialize every remaining local (from slot w6) to a complete packed Undefined word.
     a.ldrh_imm(5, 12, IC_NSLOTS);
-    a.movz(6, argc as u32, 0);
     a.movz(4, 8, 0);
     a.mov_imm64(17, crate::value::PACK_UNDEFINED);
     let init_loop = a.new_label();
@@ -6355,10 +6839,9 @@ fn emit_direct_call(
     a.movz(4, 8, 0);
     a.madd(3, 5, 4, 15);
     a.str_imm(3, 9, cx_stack_base);
-    // env_raw, and its parent cache from the callee's actual closure environment
-    a.ldur(4, 12, IC_ENV);
-    a.str_imm(4, 9, cx_env_raw);
-    a.ldr_imm(6, 4, layout.scope_parent as u32);
+    // env_raw (selected into x13 above), and its parent cache from that environment
+    a.str_imm(13, 9, cx_env_raw);
+    a.ldr_imm(6, 13, layout.scope_parent as u32);
     let no_parent = a.new_label();
     a.cbz(6, true, no_parent);
     a.add_imm(6, 6, layout.scope_data_off as u32);
@@ -6383,13 +6866,14 @@ fn emit_direct_call(
         a.str_imm(0, 9, cx_this);
         a.str_imm(1, 9, cx_this + 8);
     }
-    // Save area: [record, constructing, new_target (16B)]. constructing and new_target live on
-    // the interpreter and are cleared for the callee.
+    // Save area: [record, constructing (byte) | surplus count (u32 @ 12), new_target (16B)].
+    // constructing and new_target live on the interpreter and are cleared for the callee.
     a.sub_imm(31, 31, 32);
     a.stur(9, 31, 0);
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.ldrb_imm(4, construct_base, construct_offset);
     a.stur(4, 31, 8);
+    a.str_w_imm(7, 31, DIRECT_SAVE_SURPLUS); // over-applied argument count
     a.strb_imm(31, construct_base, construct_offset);
     a.ldr_imm(4, 14, il.new_target as u32);
     a.ldr_imm(5, 14, (il.new_target + 8) as u32);
@@ -6426,9 +6910,12 @@ fn emit_direct_call(
     a.ldur(5, 31, 24);
     a.str_imm(4, 14, il.new_target as u32);
     a.str_imm(5, 14, (il.new_target + 8) as u32);
+    a.ldr_w_imm(7, 31, DIRECT_SAVE_SURPLUS);
     a.add_imm(31, 31, 32);
 
-    // ---- pop the callee (and skip the consumed this slot); dispatch on threw ----
+    // ---- release over-applied arguments, pop the callee (and skip the consumed this slot);
+    // dispatch on threw ----
+    emit_direct_surplus_drop(a, layout);
     emit_direct_callee_drop(a, argc);
     let popped = ((argc + 1 + with_this as usize) * 8) as u32;
     a.sub_imm(20, 20, popped);
@@ -6456,6 +6943,45 @@ thread_local! {
 #[cfg(all(test, target_arch = "aarch64"))]
 extern "C" fn record_direct_packed_return() {
     TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(count.get() + 1));
+}
+
+/// Byte offset, within the direct sequence's save area, of the over-applied argument count
+/// (the u32 above the `constructing` byte).
+const DIRECT_SAVE_SURPLUS: u32 = 12;
+
+/// Release the w7 over-applied argument words — the last w7 of the call's argument words, just
+/// below x20 — that the callee never bound. Shared owners are decremented inline; a last owner
+/// (including two surplus words naming one object) or a BigInt runs its destructor through
+/// `H_DROP_PACKED_AT` (Rust destruction only). Releasing them after the call rather than at
+/// entry is unobservable. w8 (the completion flag) survives; x3..x7 and x16 are clobbered.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_direct_surplus_drop(a: &mut asm::Asm, layout: &crate::value::JitLayout) {
+    let done = a.new_label();
+    let next_word = a.new_label();
+    let helper = a.new_label();
+    let word = a.new_label();
+    a.cbz(7, false, done);
+    a.bind(word);
+    a.lsl_imm(3, 7, 3);
+    a.sub_reg(3, 20, 3); // the next surplus word, oldest first
+    a.ldr_imm(5, 3, 0);
+    emit_exec_drop_shared(a, layout, 5, 6, 4, helper);
+    a.b(next_word);
+    a.bind(helper);
+    a.stp_pre(7, 8, -16);
+    a.mov(0, 19);
+    a.movz(1, 0, 0);
+    a.mov(2, 3);
+    a.ldr_imm(16, 21, (H_DROP_PACKED_AT * 8) as u32);
+    a.blr(16);
+    a.ldp_post(7, 8, 16);
+    a.bind(next_word);
+    a.sub_imm(7, 7, 1);
+    a.cbnz(7, false, word);
+    a.bind(done);
 }
 
 /// Release the caller's callee operand after restoring its activation. w8 carries the
@@ -7089,10 +7615,12 @@ fn emit_direct_finish_stub(
     let cx_slots = offset_of!(JitCtx, slots) as u32;
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
     let cx_ret = offset_of!(JitCtx, ret) as u32;
+    let cx_activation = offset_of!(JitCtx, activation) as u32;
     let slow = a.new_label();
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
     let handlers_len_off = jit_handlers_len_offset().filter(|&off| fits8(off));
     let fast_ok = rc_dec_ok
+        && fits8(cx_activation as usize)
         && il.valid
         && handlers_len_off.is_some()
         && fits8(cx_this as usize)
@@ -7123,6 +7651,11 @@ fn emit_direct_finish_stub(
         a.b_cond(C_NE, slow);
         // no pending proper-tail-call (Option<Box> niche: None = 0)
         a.ldr_imm(9, 14, il.pending_tail as u32);
+        a.cbnz(9, true, slow);
+        // No materialized native activation (Option<Box> niche: None = 0): bridge operations
+        // create it on demand, and only `JitFrame::release` may drop it and restore the pooled
+        // invariant.
+        a.ldr_imm(9, 10, cx_activation);
         a.cbnz(9, true, slow);
         // FnFrame top: no materialized `extra` (the asm push wrote None; only the callee's own
         // arguments-object materialization could have filled it)
@@ -7835,10 +8368,11 @@ fn emit_instanceof_inline(
     a.bind(done);
 }
 
-/// Probe one polymorphic property-creation way. Entry has x11 at the receiver Object and the
-/// incoming value at sp-16. A hit leaves x12 at its IcState and x13 holding the current entries
-/// length and x7 at a replacement layout Rc (zero keeps the current prediction), then branches
-/// to `commit`; a miss has no side effects.
+/// Probe one polymorphic property-creation way: x12 = the way's `IcState` cell. Entry has x11
+/// at the receiver Object and the incoming value at sp-16. A hit leaves x12 at its IcState and
+/// x13 holding the current entries length and x7 at a replacement layout Rc (zero keeps the
+/// current prediction), then branches to `commit`; a miss has no side effects. Clobbers x7, x9
+/// and x12..x17 only.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -7846,7 +8380,6 @@ fn emit_instanceof_inline(
 fn emit_prop_create_probe(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
-    cache_ptr: usize,
     name: &str,
     miss: usize,
     commit: usize,
@@ -7856,7 +8389,6 @@ fn emit_prop_create_probe(
         IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
     };
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    a.mov_imm64(12, cache_ptr as u64);
     a.ldrb_imm(9, 12, IC_OFF_DEPTH);
     a.cmp_imm_w(9, IC_CREATE as u32);
     a.b_cond(C_NE, miss);
@@ -8072,93 +8604,14 @@ fn emit_set_prop_inline(
     a.ldrb_imm(9, 11, plain);
     a.cbz(9, false, slow);
     // Creation IC: constructors repeatedly assign a named field to a fresh receiver whose map
-    // lacks it. Reuse the checked path's shape/epoch/prototype proof and append directly into
-    // already-reserved Vec capacity. Small named-only maps have no index/dense sidecar, so the
-    // append has no secondary structure to maintain and performs no allocation.
-    if layout.key_probe_ok
+    // lacks it (see `emit_prop_create_probe`). Its ways share the site's cells with ordinary
+    // update ways; the single way loop below dispatches on each way's kind.
+    let create_ok = layout.key_probe_ok
         && !name.is_empty()
         && !name.as_bytes()[0].is_ascii_digit()
         && name != "length"
-        && name != "prototype"
-    {
-        use crate::bytecode::IC_OFF_HOLDER_SHAPE;
-        let not_create = a.new_label();
-        let create_commit = a.new_label();
-        let len_off = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
-        let stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::IcState>>();
-        for way in 0..crate::bytecode::PROP_IC_WAYS {
-            let miss = if way + 1 == crate::bytecode::PROP_IC_WAYS {
-                not_create
-            } else {
-                a.new_label()
-            };
-            let way_ptr = cache_ptr + way * stride;
-            emit_prop_create_probe(a, layout, way_ptr, name, miss, create_commit);
-            if way + 1 != crate::bytecode::PROP_IC_WAYS {
-                a.bind(miss);
-            }
-        }
-
-        a.bind(create_commit);
-        if keep {
-            // All creation proofs are complete. Preserve x7 (layout), x12
-            // (IC), x13 (length) and x10/x11 (receiver); acquire RHS ownership
-            // before installing the replacement layout or publishing a field.
-            emit_exec_word_load(a, 16, 20, -8);
-            emit_exec_clone(a, layout, 16, 6, 17, slow);
-        }
-        let layout_installed = a.new_label();
-        a.cbz(7, true, layout_installed);
-        a.ldur(17, 7, strong);
-        a.add_imm(17, 17, 1);
-        a.stur(17, 7, strong);
-        a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
-        let old_layout_released = a.new_label();
-        a.cbz(16, true, old_layout_released);
-        a.ldur(17, 16, strong);
-        a.sub_imm(17, 17, 1);
-        a.stur(17, 16, strong);
-        a.bind(old_layout_released);
-        a.str_imm(7, 11, (layout.obj_props + layout.props_layout) as u32);
-        a.bind(layout_installed);
-        // From here no branch can fail: compute the vacant entry and pack the incoming value.
-        a.ldr_imm(15, 11, en);
-        a.mov_imm64(16, es);
-        a.madd(15, 13, 16, 15);
-        emit_exec_word_load(a, 16, 20, -8);
-        // The predicted key is already owned by the shared layout (validated pre-commit).
-        // Only install Property::plain; no per-instance key ownership operation is needed.
-        a.stur(16, 15, ev);
-        a.movz(
-            14,
-            (crate::value::PROP_WRITABLE
-                | crate::value::PROP_ENUMERABLE
-                | crate::value::PROP_CONFIGURABLE) as u32,
-            0,
-        );
-        a.stur(14, 15, ea as i32);
-        // Publish the entry by updating shape then length. No allocation or side structure is
-        // touched; the stack Value's refcounted payload ownership moved into the packed slot.
-        a.ldr_w_imm(14, 12, IC_OFF_HOLDER_SHAPE);
-        a.str_w_imm(14, 11, sh);
-        a.add_imm(13, 13, 1);
-        a.str_imm(13, 11, len_off);
-        if matches!(recv, PropRecv::Stack) {
-            a.ldur(9, 10, strong);
-            a.sub_imm(9, 9, 1);
-            a.stur(9, 10, strong);
-            if keep {
-                emit_exec_word_store(a, 16, 20, -16);
-                a.sub_imm(20, 20, 8);
-            } else {
-                a.sub_imm(20, 20, 16);
-            }
-        } else {
-            a.sub_imm(20, 20, 8);
-        }
-        a.b(done);
-        a.bind(not_create);
-    }
+        && name != "prototype";
+    let create_commit = a.new_label();
     // 3-8 per way (sites allocate PROP_IC_WAYS consecutive cells; the Rust fast path probes
     // all of them, so the template must too or a rotating store site helper-calls forever):
     // depth 0, shape match, slot bounds, data+writable, old-value droppability. Guard misses
@@ -8243,20 +8696,33 @@ fn emit_set_prop_inline(
             a.bind(old_plain);
         }
     };
+    // One pass over the ways (x8 = way cursor, w6 = ways left; neither probe clobbers them,
+    // and the creation probe returns its layout in x7): each way is examined once, by kind — an
+    // update way (depth 0) or, for a creation-eligible name, a creation way. The two kinds prove
+    // different receiver shapes (without and with the property), so at most one validates.
     {
+        use crate::bytecode::IC_CREATE;
         let l_way = a.new_label();
         let l_way_next = a.new_label();
         a.mov_imm64(8, cache_ptr as u64);
-        a.movz(7, crate::bytecode::PROP_IC_WAYS as u32, 0);
+        a.movz(6, crate::bytecode::PROP_IC_WAYS as u32, 0);
         a.bind(l_way);
         a.mov(12, 8);
+        if create_ok {
+            let update_way = a.new_label();
+            a.ldrb_imm(9, 12, IC_OFF_DEPTH);
+            a.cmp_imm_w(9, IC_CREATE as u32);
+            a.b_cond(C_NE, update_way);
+            emit_prop_create_probe(a, layout, name, l_way_next, create_commit);
+            a.bind(update_way);
+        }
         way(a, 0, l_way_next);
         a.b(commit);
         a.bind(l_way_next);
         let ic_stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::IcState>>();
         a.add_imm(8, 8, ic_stride as u32);
-        a.sub_imm(7, 7, 1);
-        a.cbnz(7, false, l_way);
+        a.sub_imm(6, 6, 1);
+        a.cbnz(6, false, l_way);
         a.b(slow);
     }
     a.bind(commit);
@@ -8296,6 +8762,69 @@ fn emit_set_prop_inline(
         a.sub_imm(20, 20, 8);
     }
     a.b(done);
+    // Creation commit (out of the update hit's fall-through line).
+    if create_ok {
+        use crate::bytecode::IC_OFF_HOLDER_SHAPE;
+        let len_off = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
+        a.bind(create_commit);
+        if keep {
+            // All creation proofs are complete. Preserve x7 (layout), x12
+            // (IC), x13 (length) and x10/x11 (receiver); acquire RHS ownership
+            // before installing the replacement layout or publishing a field.
+            emit_exec_word_load(a, 16, 20, -8);
+            emit_exec_clone(a, layout, 16, 6, 17, slow);
+        }
+        let layout_installed = a.new_label();
+        a.cbz(7, true, layout_installed);
+        a.ldur(17, 7, strong);
+        a.add_imm(17, 17, 1);
+        a.stur(17, 7, strong);
+        a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
+        let old_layout_released = a.new_label();
+        a.cbz(16, true, old_layout_released);
+        a.ldur(17, 16, strong);
+        a.sub_imm(17, 17, 1);
+        a.stur(17, 16, strong);
+        a.bind(old_layout_released);
+        a.str_imm(7, 11, (layout.obj_props + layout.props_layout) as u32);
+        a.bind(layout_installed);
+        // From here no branch can fail: compute the vacant entry and pack the incoming value.
+        a.ldr_imm(15, 11, en);
+        a.mov_imm64(16, es);
+        a.madd(15, 13, 16, 15);
+        emit_exec_word_load(a, 16, 20, -8);
+        // The predicted key is already owned by the shared layout (validated pre-commit).
+        // Only install Property::plain; no per-instance key ownership operation is needed.
+        a.stur(16, 15, ev);
+        a.movz(
+            14,
+            (crate::value::PROP_WRITABLE
+                | crate::value::PROP_ENUMERABLE
+                | crate::value::PROP_CONFIGURABLE) as u32,
+            0,
+        );
+        a.stur(14, 15, ea as i32);
+        // Publish the entry by updating shape then length. No allocation or side structure is
+        // touched; the stack Value's refcounted payload ownership moved into the packed slot.
+        a.ldr_w_imm(14, 12, IC_OFF_HOLDER_SHAPE);
+        a.str_w_imm(14, 11, sh);
+        a.add_imm(13, 13, 1);
+        a.str_imm(13, 11, len_off);
+        if matches!(recv, PropRecv::Stack) {
+            a.ldur(9, 10, strong);
+            a.sub_imm(9, 9, 1);
+            a.stur(9, 10, strong);
+            if keep {
+                emit_exec_word_store(a, 16, 20, -16);
+                a.sub_imm(20, 20, 8);
+            } else {
+                a.sub_imm(20, 20, 16);
+            }
+        } else {
+            a.sub_imm(20, 20, 8);
+        }
+        a.b(done);
+    }
     a.bind(slow);
     emit_op_helper(a, H_SET_PROP, pc, l_unwind);
     a.bind(done);
@@ -9092,10 +9621,364 @@ fn emit_load_name_value(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+/// Out-of-line routines emitted once per compiled chunk and reached from each site with `bl`.
+/// The site passes arguments in fixed registers; a stub is a leaf (it calls nothing and keeps the
+/// machine stack untouched), clobbers exactly the registers its inline form would, and reports
+/// hit/miss in w9. Sharing them keeps per-site code small: before, every free-name read carried
+/// the complete multi-mode cache proof, and compiled applications reached megabytes of
+/// generated code (instruction-fetch stalls). `LUMEN_JIT_INLINE_STUBS=1` restores inline
+/// emission for comparison.
+#[derive(Clone, Copy)]
+enum SharedStub {
+    /// [`emit_name_ic_value_ptr_body`]: x12 = `NameIc` cell → w9 = hit, x14 = value, x7 = kind.
+    NameValuePtr { packed_ok: bool },
+    /// [`emit_prop_way_loop`]: x8 = a site's first `IcState` cell, x10 = receiver → w9 = 0 or a
+    /// `PROP_PROBE_*` landing, with x11 = holder base and x13 = slot for the data landings.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    PropWays(PropProbeFlags),
+    /// [`emit_call_secondary_probes`]: the call-site probe inputs plus x12 = the site's first
+    /// way → w9 = hit, with x12/x15 set as at the primary hit label.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    CallSecondary,
+    /// [`emit_direct_call`] for one arity and receiver form, entered at a call site's primary
+    /// hit with its registers → w9 = `DIRECT_CALL_*` (a declined gate keeps x10/x12/x15 for
+    /// the site's H_CALL_HIT form).
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    DirectCall { argc: u8, with_this: bool },
+}
+
+/// Status codes of the shared direct-call stub. The common completion is zero, so a site pays
+/// one untaken branch for it.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const DIRECT_CALL_RETURNED: u32 = 0;
+/// A gate declined before anything was mutated (the site continues with H_CALL_HIT).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const DIRECT_CALL_DECLINED: u32 = 1;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const DIRECT_CALL_THREW: u32 = 2;
+
+/// What shared stubs may need beyond the object layout (see [`SharedStub::emit`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+struct StubContext<'a> {
+    layout: &'a crate::value::JitLayout,
+    /// The interpreter layout, for call stubs (absent in layout-only test harnesses).
+    ilayout: Option<&'a crate::interpreter::InterpLayout>,
+    /// Chunk-derived direct-call inputs (see [`DirectCallContext`]).
+    direct: Option<DirectCallContext>,
+}
+
+/// The direct-call sequence's chunk-level inputs: the `Chunk` field offsets it reads from the
+/// callee (every chunk shares the monomorphized layout) and the chunk's finish-stub label.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+struct DirectCallContext {
+    attempted_off: usize,
+    runs_off: usize,
+    retry_off: usize,
+    finish_stub: usize,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl SharedStub {
+    const NAME_VALUE_PTR: u32 = 0x000;
+    const PROP_WAYS: u32 = 0x100;
+    const CALL_SECONDARY: u32 = 0x200;
+    const DIRECT_CALL: u32 = 0x300;
+
+    fn key(self) -> u32 {
+        match self {
+            SharedStub::NameValuePtr { packed_ok } => Self::NAME_VALUE_PTR | u32::from(packed_ok),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::PropWays(flags) => {
+                Self::PROP_WAYS
+                    | u32::from(flags.arr_ok)
+                    | u32::from(flags.str_ok) << 1
+                    | u32::from(flags.method) << 2
+                    | u32::from(flags.kc) << 3
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::CallSecondary => Self::CALL_SECONDARY,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::DirectCall { argc, with_this } => {
+                debug_assert!(argc < 128);
+                Self::DIRECT_CALL | u32::from(argc) | u32::from(with_this) << 7
+            }
+        }
+    }
+
+    fn from_key(key: u32) -> SharedStub {
+        match key & !0xff {
+            Self::NAME_VALUE_PTR => SharedStub::NameValuePtr {
+                packed_ok: key & 1 != 0,
+            },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::PROP_WAYS => SharedStub::PropWays(PropProbeFlags {
+                arr_ok: key & 1 != 0,
+                str_ok: key & 2 != 0,
+                method: key & 4 != 0,
+                kc: key & 8 != 0,
+            }),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::CALL_SECONDARY => SharedStub::CallSecondary,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::DIRECT_CALL => SharedStub::DirectCall {
+                argc: (key & 0x7f) as u8,
+                with_this: key & 0x80 != 0,
+            },
+            _ => unreachable!("shared stub keys are produced by SharedStub::key"),
+        }
+    }
+
+    /// The stub body at the current position (its entry label is already bound).
+    fn emit(self, a: &mut asm::Asm, context: &StubContext<'_>) {
+        let layout = context.layout;
+        match self {
+            SharedStub::NameValuePtr { packed_ok } => {
+                let miss = a.new_label();
+                emit_name_ic_value_ptr_body(a, layout, miss, packed_ok);
+                a.movz(9, 1, 0);
+                a.ret();
+                a.bind(miss);
+                a.movz(9, 0, 0);
+                a.ret();
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::PropWays(flags) => {
+                let miss = a.new_label();
+                let load = a.new_label();
+                let load_kc = a.new_label();
+                let absent = a.new_label();
+                emit_prop_way_loop(a, layout, flags, miss, load, load_kc, absent);
+                for (landing, status) in [
+                    (miss, 0),
+                    (load, PROP_PROBE_LOAD),
+                    (load_kc, PROP_PROBE_LOAD_KC),
+                    (absent, PROP_PROBE_ABSENT),
+                ] {
+                    a.bind(landing);
+                    a.movz(9, status, 0);
+                    a.ret();
+                }
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::CallSecondary => {
+                let ilayout = context
+                    .ilayout
+                    .expect("call stubs are requested only by chunk compilation");
+                let hit = a.new_label();
+                let miss = a.new_label();
+                a.mov(6, 12);
+                emit_call_secondary_probes(a, layout, ilayout, hit, miss);
+                a.bind(hit);
+                a.movz(9, 1, 0);
+                a.ret();
+                a.bind(miss);
+                a.movz(9, 0, 0);
+                a.ret();
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::DirectCall { argc, with_this } => {
+                let ilayout = context
+                    .ilayout
+                    .expect("call stubs are requested only by chunk compilation");
+                let direct = context
+                    .direct
+                    .expect("direct-call stubs are requested only by chunk compilation");
+                // The sequence calls the callee and the finish stub: keep the site's return
+                // address in a 16-byte frame of its own. Every landing below is reached with the
+                // sequence's own save area already released.
+                a.stp_pre(29, 30, -16);
+                let declined = a.new_label();
+                let returned = a.new_label();
+                let threw = a.new_label();
+                let emitted = emit_direct_call(
+                    a,
+                    ilayout,
+                    layout,
+                    direct.attempted_off,
+                    direct.runs_off,
+                    direct.retry_off,
+                    usize::from(argc),
+                    with_this,
+                    declined,
+                    threw,
+                    returned,
+                    direct.finish_stub,
+                );
+                assert!(emitted, "sites request the stub only when it is supported");
+                for (landing, status) in [
+                    (returned, DIRECT_CALL_RETURNED),
+                    (declined, DIRECT_CALL_DECLINED),
+                    (threw, DIRECT_CALL_THREW),
+                ] {
+                    a.bind(landing);
+                    a.ldp_post(29, 30, 16);
+                    a.movz(9, status, 0);
+                    a.ret();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn shared_stubs_enabled() -> bool {
+    static INLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*INLINE.get_or_init(|| std::env::var_os("LUMEN_JIT_INLINE_STUBS").is_some())
+}
+
+/// Whether the site being emitted calls the chunk's shared stub for a sequence it runs on every
+/// execution (name-cache validation, the direct-call sequence) rather than carrying it in line.
+/// Shared stubs keep straight-line code — most of an application's code, run once per call —
+/// compact; in a loop body the call and return cost more than the code size saves. Stubs a
+/// site reaches only after its primary cache way misses (the property way loop, the secondary
+/// call probes) stay shared everywhere: inlining them in loops measured +6-8% code for under 2%
+/// on polymorphic loops.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn use_shared_stub(a: &asm::Asm) -> bool {
+    shared_stubs_enabled() && !a.hot()
+}
+
+/// The operations of `ops` inside a loop body: from a backward branch's target through the
+/// branch itself (nested and overlapping loops alike).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn loop_body_mask(ops: &[crate::bytecode::Op]) -> Vec<bool> {
+    use crate::bytecode::Op;
+    let mut depth = vec![0i32; ops.len() + 1];
+    for (pc, op) in ops.iter().enumerate() {
+        if let Op::Jump(target)
+        | Op::AbruptJump(target, _)
+        | Op::JumpIfFalse(target)
+        | Op::JumpIfFalsePeek(target)
+        | Op::JumpIfTruePeek(target)
+        | Op::JumpIfNotNullishPeek(target) = *op
+        {
+            if target as usize <= pc {
+                depth[target as usize] += 1;
+                depth[pc + 1] -= 1;
+            }
+        }
+    }
+    let mut open = 0;
+    ops.iter()
+        .enumerate()
+        .map(|(pc, _)| {
+            open += depth[pc];
+            open > 0
+        })
+        .collect()
+}
+
+/// Emit every shared stub the chunk's sites requested (a stub may itself request others).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_shared_stubs(a: &mut asm::Asm, context: &StubContext<'_>) {
+    loop {
+        let requested = a.take_shared_stubs();
+        if requested.is_empty() {
+            return;
+        }
+        for (key, label) in requested {
+            a.bind(label);
+            SharedStub::from_key(key).emit(a, context);
+        }
+    }
+}
+
 fn emit_name_ic_value_ptr(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     cache_ptr: usize,
+    slow: usize,
+    packed_ok: bool,
+) {
+    a.mov_imm64(12, cache_ptr as u64);
+    if use_shared_stub(a) {
+        let stub = a.shared_stub(SharedStub::NameValuePtr { packed_ok }.key());
+        a.bl_label(stub);
+        a.cbz(9, false, slow);
+    } else {
+        emit_name_ic_value_ptr_body(a, layout, slow, packed_ok);
+    }
+}
+
+/// The name-cache validation shared by every free-name site (see
+/// [`emit_name_ic_value_ptr`]): x12 = the site's `NameIc` cell. On success x14 points at the
+/// resolved Value (x7 = 0 for a wide scope binding, 1 for a packed global property); a failed
+/// proof branches to `slow`. Clobbers x7 and x9..x17 only — callers keep chain values in x2..x8
+/// and FP registers — and calls nothing.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_name_ic_value_ptr_body(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
     slow: usize,
     packed_ok: bool,
 ) {
@@ -9113,7 +9996,6 @@ fn emit_name_ic_value_ptr(
     let g_es = layout.entry_size as u64;
     let none_tag = layout.exotic_none_tag as u32;
 
-    a.mov_imm64(12, cache_ptr as u64);
     a.ldr_imm(9, 19, 40); // ctx.env_raw
     a.ldrb_imm(17, 9, layout.scope_with as u32);
     a.cmp_imm_w(17, layout.scope_with_none as u32);
