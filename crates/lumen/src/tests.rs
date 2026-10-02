@@ -14471,6 +14471,15 @@ fn date_parse_rfc() {
     assert_eq!(run("Date.parse('2027/01/01 00:00')"), "1798761600000");
     assert_eq!(run("Date.parse('1/31/2027')"), "1801353600000");
     assert_eq!(run("isNaN(Date.parse('2027/13/01'))"), "true");
+    // An RFC 2822 numeric zone after the time is an offset, not the year.
+    assert_eq!(
+        run("Date.parse('Fri, 02 Oct 2026 17:50:28 -0000')"),
+        "1790963428000"
+    );
+    assert_eq!(
+        run("Date.parse('Fri, 02 Oct 2026 17:50:28 +0200')"),
+        "1790956228000"
+    );
 }
 #[test]
 fn date_get_set_year() {

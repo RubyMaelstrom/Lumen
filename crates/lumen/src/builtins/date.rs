@@ -277,6 +277,16 @@ fn parse_rfc(s: &str) -> f64 {
         }
         if let Some(idx) = MONTHS.iter().position(|m| low.starts_with(m)) {
             month = Some(idx as i64);
+        } else if got_time
+            && matches!(tok.as_bytes().first(), Some(b'+' | b'-'))
+            && tok.len() == 5
+            && tok[1..].bytes().all(|b| b.is_ascii_digit())
+        {
+            // RFC 2822 #section-3.3 zone: `+hhmm`/`-hhmm` after the time
+            // (`-0000` is UTC), not a year.
+            let mag: i64 =
+                tok[1..3].parse::<i64>().unwrap_or(0) * 60 + tok[3..5].parse::<i64>().unwrap_or(0);
+            offset = if tok.starts_with('-') { -mag } else { mag };
         } else if tok.contains(':') && !got_time {
             let mut p = tok.split(':');
             hh = p.next().and_then(|x| x.parse().ok()).unwrap_or(0);
