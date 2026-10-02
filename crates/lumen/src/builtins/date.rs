@@ -257,6 +257,24 @@ fn parse_rfc(s: &str) -> f64 {
             continue;
         }
         let low = tok.to_lowercase();
+        // Slash dates, as in other engines: year first (`2027/01/31`) or the
+        // US month/day/year order (`1/31/2027`).
+        if tok.contains('/') && year.is_none() && month.is_none() {
+            let parts: Vec<i64> = match tok.split('/').map(|p| p.parse()).collect() {
+                Ok(parts) => parts,
+                Err(_) => return f64::NAN,
+            };
+            let (y, mo, d) = match parts[..] {
+                [y, mo, d] if tok.split('/').next().is_some_and(|p| p.len() >= 3) => (y, mo, d),
+                [mo, d, y] => (y, mo, d),
+                _ => return f64::NAN,
+            };
+            if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+                return f64::NAN;
+            }
+            (year, month, day) = (Some(y), Some(mo - 1), Some(d));
+            continue;
+        }
         if let Some(idx) = MONTHS.iter().position(|m| low.starts_with(m)) {
             month = Some(idx as i64);
         } else if tok.contains(':') && !got_time {
@@ -290,6 +308,17 @@ fn parse_rfc(s: &str) -> f64 {
             parts_to_ms(y, mo, d, hh, mm, ss, 0) - (offset as f64) * 60000.0
         }
         _ => f64::NAN,
+    }
+}
+
+/// ECMA-262 #sec-date.parse: the Date Time String Format first, then the
+/// implementation-specific formats every browser engine accepts.
+fn parse_date_string(s: &str) -> f64 {
+    let v = parse_iso(s);
+    if v.is_nan() {
+        parse_rfc(s)
+    } else {
+        v
     }
 }
 
@@ -476,7 +505,9 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
             v => {
                 let prim = ab(i.to_primitive(v, crate::eval::Hint::Default))?;
                 match prim {
-                    Value::Str(s) => parse_iso(&s),
+                    // #sec-date-constructor step 4.b.ii: parse exactly as
+                    // Date.parse does, then TimeClip.
+                    Value::Str(s) => time_clip(parse_date_string(&s)),
                     p => time_clip(ab(i.to_number(&p))?),
                 }
             }
@@ -778,8 +809,7 @@ pub(super) fn install_date(it: &mut Interp) {
     it.def_method(&ctor, "now", 0, |i, _t, _a| Ok(Value::Num(now_ms(i))));
     it.def_method(&ctor, "parse", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
-        let v = parse_iso(&s);
-        Ok(Value::Num(if v.is_nan() { parse_rfc(&s) } else { v }))
+        Ok(Value::Num(parse_date_string(&s)))
     });
     it.def_method(&ctor, "UTC", 7, |i, _t, a| {
         // The year is always read; later components only if supplied. Coerce all reads first; any

@@ -14458,6 +14458,19 @@ fn date_parse_rfc() {
     );
     assert_eq!(run("Date.parse('2020-01-01T00:00:00Z')"), "1577836800000"); // ISO still works
     assert_eq!(run("isNaN(Date.parse('garbage'))"), "true");
+    // #sec-date-constructor parses a string exactly as Date.parse does,
+    // including the implementation-specific forms (local time is UTC here).
+    assert_eq!(
+        run("new Date('Jan 1, 2027 00:00:00').getTime()"),
+        "1798761600000"
+    );
+    assert_eq!(
+        run("new Date('Jan 1, 2027 00:00:00').getTime() === Date.parse('Jan 1, 2027 00:00:00')"),
+        "true"
+    );
+    assert_eq!(run("Date.parse('2027/01/01 00:00')"), "1798761600000");
+    assert_eq!(run("Date.parse('1/31/2027')"), "1801353600000");
+    assert_eq!(run("isNaN(Date.parse('2027/13/01'))"), "true");
 }
 #[test]
 fn date_get_set_year() {
