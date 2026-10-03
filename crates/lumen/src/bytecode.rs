@@ -869,6 +869,11 @@ pub const INTRINSIC_STRING_REPLACE_DISCARD: u8 = 10;
 pub const INTRINSIC_STRING_SPLIT_DISCARD: u8 = 11;
 pub const INTRINSIC_CHAR_AT: u8 = 12;
 pub const INTRINSIC_CODE_POINT_AT: u8 = 13;
+/// Global `isNaN` and `Number.isNaN`: identical for a Number argument, which the call template
+/// answers inline.
+pub const INTRINSIC_IS_NAN: u8 = 14;
+/// `String.fromCharCode` with one Number argument (the per-character decoder idiom).
+pub const INTRINSIC_FROM_CHAR_CODE: u8 = 15;
 
 impl CallIc {
     pub const EMPTY: CallIc = CallIc {
@@ -19768,6 +19773,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     let _pc = (packed & 0xffff) as usize;
     let width = match intrinsic {
         INTRINSIC_CHAR_AT | INTRINSIC_CODE_POINT_AT => 3, // [receiver, callee, index]
+        INTRINSIC_CHAR_CODE_AT | INTRINSIC_FROM_CHAR_CODE => 3, // [receiver, callee, Number]
         INTRINSIC_ARRAY_PUSH => 3,                        // [receiver, callee, arg]
         INTRINSIC_ARRAY_POP => 2,                         // [receiver, callee]
         INTRINSIC_FUNCTION_CALL => call_argc + 2,
@@ -19776,6 +19782,39 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
         _ => 4, // [receiver, callee, arg0, arg1]
     };
     let base = sp.sub(width);
+    if intrinsic == INTRINSIC_CHAR_CODE_AT || intrinsic == INTRINSIC_FROM_CHAR_CODE {
+        // [receiver, callee, Number]. String.prototype.charCodeAt on a String receiver and
+        // String.fromCharCode (ECMA-262 §22.1.3.2, §22.1.2.1) run no author code for a Number
+        // argument and only read or intern a string, so they need none of the native-call
+        // boundary below. The template proved the operand types.
+        // Move the three owners out; each is released exactly once below.
+        let receiver = base.read().into_value();
+        let callee = base.add(1).read();
+        let Value::Num(n) = base.add(2).read().into_value() else {
+            unreachable!("Number argument guard")
+        };
+        let value = if intrinsic == INTRINSIC_CHAR_CODE_AT {
+            let Value::Str(s) = &receiver else {
+                unreachable!("charCodeAt receiver guard")
+            };
+            let idx = if n.is_nan() { 0.0 } else { n.trunc() };
+            let unit = if idx < 0.0 || !idx.is_finite() {
+                None
+            } else {
+                i.unit_at(s, idx as usize)
+            };
+            Value::Num(unit.map_or(f64::NAN, f64::from))
+        } else {
+            Value::Str(crate::jstr::unit_lstr(crate::builtins::uint16_of_number(n)))
+        };
+        drop(callee);
+        drop(receiver);
+        base.write(PackedValue::pack(value));
+        return crate::jit::SpFlag {
+            sp: base.add(1),
+            flag: 0,
+        };
+    }
     if intrinsic == INTRINSIC_ARRAY_PUSH {
         // [receiver, callee, value]. A guarded dense append runs no author code, so it needs
         // none of the native-call boundary below (depth, safepoint, new.target bookkeeping).
@@ -21906,6 +21945,19 @@ unsafe fn jit_call_inner(
                                                 as usize =>
                                         {
                                             INTRINSIC_STRING_SPLIT_DISCARD
+                                        }
+                                        p if p
+                                            == crate::builtins::nf_is_nan as *const () as usize
+                                            || p == crate::builtins::nf_number_is_nan as *const ()
+                                                as usize =>
+                                        {
+                                            INTRINSIC_IS_NAN
+                                        }
+                                        p if p
+                                            == crate::builtins::nf_from_char_code as *const ()
+                                                as usize =>
+                                        {
+                                            INTRINSIC_FROM_CHAR_CODE
                                         }
                                         _ => 0,
                                     },

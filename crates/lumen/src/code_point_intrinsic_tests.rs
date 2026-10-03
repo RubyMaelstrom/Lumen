@@ -119,3 +119,49 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
         "warm String/Number calls bypass generic native argument decoding: {hits} hits, epoch {epoch_before}->{epoch_after}");
     assert!(engine.interp.fn_frames.is_empty());
 }
+
+/// charCodeAt on non-ASCII receivers and with any Number index, String.fromCharCode(Number) and
+/// isNaN/Number.isNaN(Number) take the JIT's operand-only paths; other operands, replaced
+/// functions and fresh (last-owner) receivers keep the full call. Expected values are Node's.
+#[test]
+fn unit_reads_from_char_code_and_is_nan_match_the_full_calls() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+            function unit(s,n){return s.charCodeAt(n);}
+            function fcc(n){return String.fromCharCode(n);}
+            function nan1(x){return isNaN(x);}
+            function nan2(x){return Number.isNaN(x);}
+            function nan3(o,x){return o.isNaN(x);}
+            var long='é'.repeat(40)+'abc', short='hé';
+            for (var w=0; w<300; w++){ unit(long, w%45); unit(short, w&1); fcc(w); nan1(w); nan2(w);
+                nan3(globalThis, w); nan3(Number, w); }
+            var r=[];
+            r.push(unit(long,0), unit(long,40), unit(long,42), unit(long,43), unit(long,-1),
+                unit(long,1.9), unit(long,NaN), unit(long,1e300), unit(short,1), unit(short,5),
+                unit(long,-0.5));
+            r.push(fcc(65).charCodeAt(0), fcc(-1).charCodeAt(0), fcc(65536+66).charCodeAt(0),
+                fcc(NaN).charCodeAt(0), fcc(Infinity).charCodeAt(0), fcc(97.9),
+                fcc(0xD800).charCodeAt(0), fcc(233), fcc(-0).length);
+            r.push(nan1(NaN), nan1(1), nan1('abc'), nan1('5'), nan2(NaN), nan2('abc'),
+                nan3(globalThis, NaN), nan3({isNaN: isNaN}, 3), nan3(Number, NaN), nan3(Number, 'x'),
+                nan1(undefined), nan1(-Infinity));
+            r.push(unit('é'.repeat(70)+String(w), 69), unit(String(w)+'é', 3));
+            var saved = String.fromCharCode; String.fromCharCode = function(){return 'patched'};
+            r.push(fcc(65)); String.fromCharCode = saved; r.push(fcc(66));
+            var savedNaN = isNaN; isNaN = function(){return 'p2'}; r.push(nan1(1));
+            isNaN = savedNaN; r.push(nan1(NaN));
+            r.join(',');
+        "#
+            ),
+            "233,97,99,NaN,NaN,233,233,NaN,233,NaN,233,65,65535,66,0,0,a,55296,\u{e9},1,\
+             true,false,true,false,true,false,true,false,true,false,true,false,233,233,patched,B,p2,true",
+            "{tier:?}"
+        );
+    }
+}

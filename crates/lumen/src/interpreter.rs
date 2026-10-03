@@ -9241,10 +9241,21 @@ impl Interp {
         if s.len() < 64 {
             return crate::jstr::unit_iter(s).nth(idx);
         }
-        match self.units_of(s) {
+        let read = |units: &StrUnits| match units {
             StrUnits::Ascii => s.as_bytes().get(idx).map(|&b| b as u16),
             StrUnits::Units(u) => u.get(idx).copied(),
+        };
+        // A warm entry answers without cloning the cached unit vector's ownership.
+        if let Some(unit) =
+            self.str_units
+                .get_mapped(&(s.as_ptr() as usize), |(cached, units, _)| {
+                    debug_assert!(crate::lstr::LStr::ptr_eq(cached, s));
+                    read(units)
+                })
+        {
+            return unit;
         }
+        read(&self.units_of(s))
     }
 
     /// CodePointAt after receiver/index coercions. Short Unicode strings use a

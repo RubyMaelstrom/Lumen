@@ -45,7 +45,9 @@ mod array_length_tests;
 mod array_shift_tests;
 
 pub(crate) use function_proto::nf_function_call;
+pub(crate) use globals::nf_is_nan;
 pub(crate) use math::nf_math_sqrt;
+pub(crate) use primitives::nf_number_is_nan;
 
 /// `args[i]` or `undefined`.
 fn arg(args: &[Value], i: usize) -> Value {
@@ -10168,6 +10170,42 @@ fn locale_upper(s: &str, lang: Option<&str>) -> String {
     }
 }
 
+/// The ToUint16 code unit of a Number (ECMA-262 §7.1.9), as `String.fromCharCode` applies it.
+pub(crate) fn uint16_of_number(num: f64) -> u16 {
+    if num.is_finite() {
+        num.trunc().rem_euclid(65536.0) as u16
+    } else {
+        0
+    }
+}
+
+/// `String.fromCharCode` (named so the JIT call cache can prove and tag its exact identity).
+pub(crate) fn nf_from_char_code(
+    i: &mut crate::interpreter::Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    // One Number argument is the decoder idiom (`String.fromCharCode(c)` per character):
+    // ToUint16 it and share the interned one-unit ASCII strings instead of allocating.
+    if let [Value::Num(num)] = args {
+        return Ok(Value::Str(crate::jstr::unit_lstr(uint16_of_number(*num))));
+    }
+    let mut units: Vec<u16> = Vec::with_capacity(args.len());
+    for a in args {
+        // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.
+        // ToNumber is the identity for Numbers (ECMA-262 §7.1.4); other inputs keep
+        // the full coercive path with its throws and valueOf ordering.
+        let num = match a {
+            Value::Num(num) => *num,
+            v => ab(i.to_number(v))?,
+        };
+        units.push(uint16_of_number(num));
+    }
+    // UTF-16 decode: a surrogate pair combines into one code point; a lone half is smuggled
+    // (see `jstr`), so the resulting string round-trips its exact unit sequence.
+    Ok(Value::from_string(crate::jstr::from_units(&units)))
+}
+
 /// `String.prototype.charCodeAt` (named: the JIT's call-IC fill compares the fn pointer to
 /// tag intrinsic entries — see `bytecode::INTRINSIC_CHAR_CODE_AT`).
 pub(crate) fn nf_char_code_at(
@@ -11401,36 +11439,7 @@ fn install_string(it: &mut Interp) {
     sp.borrow_mut()
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
-    it.def_method(&ctor, "fromCharCode", 1, |i, _this, args| {
-        // One Number argument is the decoder idiom (`String.fromCharCode(c)` per character):
-        // ToUint16 it and share the interned one-unit ASCII strings instead of allocating.
-        if let [Value::Num(num)] = args {
-            let unit = if num.is_finite() {
-                num.trunc().rem_euclid(65536.0) as u16
-            } else {
-                0
-            };
-            return Ok(Value::Str(crate::jstr::unit_lstr(unit)));
-        }
-        let mut units: Vec<u16> = Vec::with_capacity(args.len());
-        for a in args {
-            // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.
-            // ToNumber is the identity for Numbers (ECMA-262 §7.1.4); other inputs keep
-            // the full coercive path with its throws and valueOf ordering.
-            let num = match a {
-                Value::Num(num) => *num,
-                v => ab(i.to_number(v))?,
-            };
-            units.push(if num.is_finite() {
-                num.trunc().rem_euclid(65536.0) as u16
-            } else {
-                0
-            });
-        }
-        // UTF-16 decode: a surrogate pair combines into one code point; a lone half is smuggled
-        // (see `jstr`), so the resulting string round-trips its exact unit sequence.
-        Ok(Value::from_string(crate::jstr::from_units(&units)))
-    });
+    it.def_method(&ctor, "fromCharCode", 1, nf_from_char_code);
     it.def_method(&ctor, "raw", 1, |i, _this, args| {
         let template = arg(args, 0);
         let raw = ab(i.get_member(&template, "raw"))?;

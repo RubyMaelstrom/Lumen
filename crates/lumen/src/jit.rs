@@ -6004,8 +6004,11 @@ fn emit_call_inline(
             if with_this && *argc == 1 && rc_ok && layout.rc_strong_off == 0 {
                 let char_at = a.new_label();
                 let char_code = a.new_label();
+                let char_code_helper = a.new_label();
                 let code_point = a.new_label();
                 let sqrt = a.new_label();
+                let is_nan = a.new_label();
+                let from_char_code = a.new_label();
                 let regexp_exec = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
                 let string_split = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
                 let array_push = array_intrinsics_on.then(|| a.new_label());
@@ -6019,6 +6022,10 @@ fn emit_call_inline(
                 a.b_cond(C_EQ, code_point);
                 a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
                 a.b_cond(C_EQ, sqrt);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_IS_NAN as u32);
+                a.b_cond(C_EQ, is_nan);
+                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FROM_CHAR_CODE as u32);
+                a.b_cond(C_EQ, from_char_code);
                 if let Some(array_push) = array_push {
                     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32);
                     a.b_cond(C_EQ, array_push);
@@ -6070,34 +6077,36 @@ fn emit_call_inline(
                 a.b(done);
 
                 a.bind(char_code);
-                // receiver: Str with the ASCII hint
+                // receiver: Str; index: Num. Every other miss below (no ASCII hint, a
+                // fractional or out-of-range index, a last owner) is still a String
+                // receiver with a Number index, which the operand-only helper finishes.
                 emit_exec_word_load(a, 9, 20, -24);
                 emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
                 emit_exec_word_load(a, 11, 20, -24);
                 emit_exec_payload(a, 11, 11);
                 a.ldr_w_imm(14, 11, crate::lstr::CAP_OFF as u32);
                 a.lsr_imm(14, 14, 31);
-                a.cbz(14, false, hit_slow);
-                // index: exact u32 Num
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                a.cbz(14, false, char_code_helper);
+                // index: exact u32
                 a.ldur_d(0, 20, -8);
                 a.fcvtzu_w_d(9, 0);
                 a.ucvtf_d_w(1, 9);
                 a.fcmp(0, 1);
-                a.b_cond(C_NE, hit_slow);
+                a.b_cond(C_NE, char_code_helper);
                 // bounds (ASCII: byte index == unit index); OOB answers NaN in the
                 // helper
                 a.ldr_w_imm(14, 11, crate::lstr::LEN_OFF as u32);
                 a.cmp_reg_x(9, 14);
-                a.b_cond(C_HS, hit_slow);
+                a.b_cond(C_HS, char_code_helper);
                 // both refcounted operands must survive a bare dec
                 a.ldur(14, 11, 0);
                 a.cmp_imm_x(14, 1);
-                a.b_cond(C_LS, hit_slow);
+                a.b_cond(C_LS, char_code_helper);
                 a.ldur(13, 10, 0);
                 a.cmp_imm_x(13, 1);
-                a.b_cond(C_LS, hit_slow);
+                a.b_cond(C_LS, char_code_helper);
                 // ---- commit: byte load, decs, Num over the receiver slot ----
                 a.add_imm(16, 11, crate::lstr::DATA_OFF as u32);
                 a.ldrb_reg(16, 16, 9);
@@ -6108,6 +6117,75 @@ fn emit_call_inline(
                 a.stur(13, 10, 0);
                 emit_exec_number_store(a, 0, 20, -24, 9);
                 a.sub_imm(20, 20, 16);
+                a.b(done);
+
+                // String receiver, Number index: UTF-16 units of a non-ASCII receiver,
+                // truncation and out-of-range indices in the operand-only helper.
+                a.bind(char_code_helper);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+
+                // isNaN(number) / Number.isNaN(number): both answer SameValue(n, NaN) for a
+                // Number argument (ToNumber is the identity). The receiver is unused: an
+                // Undefined receiver needs no release, an object must survive a bare
+                // decrement, like the distinct function handle.
+                a.bind(is_nan);
+                {
+                    let receiver_ready = a.new_label();
+                    emit_exec_word_load(a, 9, 20, -8);
+                    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                    a.ldur(13, 10, 0);
+                    a.cmp_imm_x(13, 1);
+                    a.b_cond(C_LS, hit_slow);
+                    emit_exec_word_load(a, 9, 20, -24);
+                    a.movz(11, 0, 0); // no receiver release
+                    a.mov_imm64(16, crate::value::PACK_UNDEFINED);
+                    a.cmp_reg_x(9, 16);
+                    a.b_cond(C_EQ, receiver_ready);
+                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+                    emit_exec_payload(a, 9, 11);
+                    a.ldur(14, 11, 0);
+                    a.cmp_imm_x(14, 1);
+                    a.b_cond(C_LS, hit_slow);
+                    a.bind(receiver_ready);
+                    // ---- commit: decrements, Boolean over the receiver slot ----
+                    a.fcmp(0, 0);
+                    a.cset_w(9, C_VS);
+                    a.sub_imm(13, 13, 1);
+                    a.stur(13, 10, 0);
+                    let released = a.new_label();
+                    a.cbz(11, true, released);
+                    a.ldur(14, 11, 0);
+                    a.sub_imm(14, 14, 1);
+                    a.stur(14, 11, 0);
+                    a.bind(released);
+                    a.mov_imm64(16, crate::value::PACK_BOOL);
+                    a.logic_x(1, 9, 9, 16);
+                    emit_exec_word_store(a, 9, 20, -24);
+                    a.sub_imm(20, 20, 16);
+                    a.b(done);
+                }
+
+                // String.fromCharCode(number): ToUint16 and the interned one-unit strings in
+                // the operand-only helper.
+                a.bind(from_char_code);
+                emit_exec_word_load(a, 9, 20, -8);
+                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, crate::bytecode::INTRINSIC_FROM_CHAR_CODE as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
                 a.b(done);
 
                 // Math.sqrt(number): the call IC already proved builtin identity.

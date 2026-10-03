@@ -144,11 +144,7 @@ pub(super) fn install_number(it: &mut Interp) {
             .props
             .insert(name, Property::data(Value::Num(val), false, false, false));
     }
-    it.def_method(&ctor, "isNaN", 1, |_i, _this, args| {
-        Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Num(n) if n.is_nan()),
-        ))
-    });
+    it.def_method(&ctor, "isNaN", 1, nf_number_is_nan);
     it.def_method(&ctor, "isFinite", 1, |_i, _this, args| {
         Ok(Value::Bool(
             matches!(arg(args, 0), Value::Num(n) if n.is_finite()),
@@ -588,4 +584,15 @@ pub(super) fn install_bigint(it: &mut Interp) {
             Property::data(Value::from_string("BigInt".to_string()), false, false, true),
         );
     }
+}
+
+/// `Number.isNaN` (named so the JIT call cache can prove and tag its exact identity).
+pub(crate) fn nf_number_is_nan(
+    _i: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Num(n) if n.is_nan()),
+    ))
 }

@@ -50,14 +50,7 @@ pub(super) fn install_globals(it: &mut Interp) {
                 .insert("parseFloat", Property::builtin(pf));
         }
     }
-    global_fn(it, "isNaN", 1, |i, _t, a| {
-        // ToNumber identity for Numbers (§7.1.4); other inputs keep the full coercive path.
-        let n = match arg(a, 0) {
-            Value::Num(n) => n,
-            v => ab(i.to_number(&v))?,
-        };
-        Ok(Value::Bool(n.is_nan()))
-    });
+    global_fn(it, "isNaN", 1, nf_is_nan);
     global_fn(it, "isFinite", 1, |i, _t, a| {
         let n = match arg(a, 0) {
             Value::Num(n) => n,
@@ -283,4 +276,14 @@ fn parse_float(s: &str) -> f64 {
         }
     }
     t[..pos].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// Global `isNaN` (named so the JIT call cache can prove and tag its exact identity).
+pub(crate) fn nf_is_nan(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    // ToNumber identity for Numbers (§7.1.4); other inputs keep the full coercive path.
+    let n = match arg(args, 0) {
+        Value::Num(n) => n,
+        v => ab(i.to_number(&v))?,
+    };
+    Ok(Value::Bool(n.is_nan()))
 }
