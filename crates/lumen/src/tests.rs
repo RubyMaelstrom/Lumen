@@ -3147,6 +3147,16 @@ fn dates_follow_the_system_time_zone() {
 #[test]
 fn dates() {
     assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+    // Two-digit years in the implementation-specific formats, as V8 and
+    // SpiderMonkey read them (test262 staging/sm/Date/two-digit-years.js).
+    assert_eq!(
+        run("[new Date('1/2/50'), new Date('50/1/2'), new Date('may 1 49')].map(d => d.getFullYear()).join()"),
+        "1950,1950,2049"
+    );
+    assert_eq!(
+        run("[new Date('13/1/1'), new Date('99/1/99'), new Date('may 1999 1999'), new Date('may 0 0')].map(Number).join()"),
+        "NaN,NaN,NaN,NaN"
+    );
     assert_eq!(
         run("new Date(Date.UTC(2020, 0, 15)).getUTCFullYear()"),
         "2020"

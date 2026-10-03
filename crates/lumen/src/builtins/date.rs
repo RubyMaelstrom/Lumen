@@ -361,20 +361,22 @@ fn parse_rfc(s: &str) -> f64 {
         let low = tok.to_lowercase();
         // Slash dates, as in other engines: year first (`2027/01/31`) or the
         // US month/day/year order (`1/31/2027`).
+        // A first number above 31 can only be the year (`50/1/31`).
         if tok.contains('/') && year.is_none() && month.is_none() {
-            let parts: Vec<i64> = match tok.split('/').map(|p| p.parse()).collect() {
+            let fields: Vec<&str> = tok.split('/').collect();
+            let parts: Vec<i64> = match fields.iter().map(|p| p.parse()).collect() {
                 Ok(parts) => parts,
                 Err(_) => return f64::NAN,
             };
-            let (y, mo, d) = match parts[..] {
-                [y, mo, d] if tok.split('/').next().is_some_and(|p| p.len() >= 3) => (y, mo, d),
-                [mo, d, y] => (y, mo, d),
+            let (y, mo, d, y_field) = match parts[..] {
+                [y, mo, d] if fields[0].len() >= 3 || y > 31 => (y, mo, d, fields[0]),
+                [mo, d, y] => (y, mo, d, fields[2]),
                 _ => return f64::NAN,
             };
             if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
                 return f64::NAN;
             }
-            (year, month, day) = (Some(y), Some(mo - 1), Some(d));
+            (year, month, day) = (Some(expand_year(y_field, y)), Some(mo - 1), Some(d));
             continue;
         }
         if let Some(idx) = MONTHS.iter().position(|m| low.starts_with(m)) {
@@ -397,12 +399,16 @@ fn parse_rfc(s: &str) -> f64 {
             ss = p.next().and_then(|x| x.parse().ok()).unwrap_or(0);
             got_time = true;
         } else if let Ok(n) = tok.parse::<i64>() {
-            if tok.len() >= 4 || n > 31 {
-                year = Some(n);
-            } else if day.is_none() {
+            if (tok.len() >= 4 || n > 31 || day.is_some()) && year.is_some() {
+                // A second year (`may 1999 1999`).
+                return f64::NAN;
+            }
+            if tok.len() >= 4 || n > 31 || day.is_some() {
+                year = Some(expand_year(tok, n));
+            } else if (1..=31).contains(&n) {
                 day = Some(n);
-            } else if year.is_none() {
-                year = Some(n);
+            } else {
+                return f64::NAN;
             }
         } else if matches!(low.as_str(), "z" | "ut" | "utc") {
             zoned = true;
@@ -426,6 +432,16 @@ fn parse_rfc(s: &str) -> f64 {
             parts_to_ms(y, mo, d, hh, mm, ss, 0) - (offset as f64) * 60000.0
         }
         _ => f64::NAN,
+    }
+}
+
+/// A one- or two-digit year in the implementation-specific formats, as other
+/// engines read it: 0–49 are 2000–2049 and 50–99 are 1950–1999.
+fn expand_year(field: &str, y: i64) -> i64 {
+    match y {
+        0..=49 if field.len() <= 2 => 2000 + y,
+        50..=99 if field.len() <= 2 => 1900 + y,
+        _ => y,
     }
 }
 
