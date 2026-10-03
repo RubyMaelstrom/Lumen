@@ -427,7 +427,7 @@ impl Compiler {
             decls,
         }) = init
         {
-            let mut names = std::collections::HashSet::new();
+            let mut names = crate::fasthash::FastSet::default();
             for (pattern, _) in decls {
                 pat_idents(pattern, &mut names);
             }

@@ -2925,14 +2925,14 @@ struct CaptureScan {
     watched_budget: usize,
     /// Declared-name scopes, innermost last, each tagged with the function-nesting depth it
     /// belongs to (0 = the function being compiled) and its push serial.
-    scopes: Vec<(std::collections::HashSet<String>, u32, u32)>,
+    scopes: Vec<(crate::fasthash::FastSet<String>, u32, u32)>,
     fn_depth: u32,
     /// Names resolving from depth > 0 to a depth-0 scope.
-    captured: std::collections::HashSet<String>,
+    captured: crate::fasthash::FastSet<String>,
     /// Names declared by a depth-0 scope that is NOT the function's top scope (block lexicals,
     /// for-head lexicals, catch params). If one is captured, it must either qualify for safe
     /// once-per-call activation homing or have an exact resumable Environment Record candidate.
-    depth0_inner_decls: std::collections::HashSet<String>,
+    depth0_inner_decls: crate::fasthash::FastSet<String>,
     /// Activation-homing candidates: a `let`/`using` declared by a once-per-call depth-0 scope
     /// (a block/switch outside every loop — freshness never matters) with no ENCLOSING
     /// declaration of the same name (an enclosing slot would wrongly shadow the env binding
@@ -2941,18 +2941,18 @@ struct CaptureScan {
     /// any other same-name declaration poisons the entry. At the end a candidate homes only
     /// if every capture of the name resolved through ITS scope (see `captured_serials`) and
     /// the name was never a free/global reference.
-    candidates: std::collections::HashMap<String, (u32, bool)>,
+    candidates: crate::fasthash::FastMap<String, (u32, bool)>,
     /// Names that ever entered (or were disqualified from) candidacy — a second same-name
     /// once-per-call `let` cannot home (both would map to ONE activation binding).
-    ever_candidates: std::collections::HashSet<String>,
+    ever_candidates: crate::fasthash::FastSet<String>,
     /// Inner lexical declarations that can be represented by a real resumable Environment
     /// Record. The compiler currently admits statement-list blocks and lexical loop heads; the
     /// serial proves the capture and the one admitted declaration are the same binding.
-    runtime_candidates: std::collections::HashMap<String, Vec<u32>>,
+    runtime_candidates: crate::fasthash::FastMap<String, Vec<u32>>,
     /// For candidate names: the scope serials their captures resolved through.
-    captured_serials: std::collections::HashMap<String, std::collections::HashSet<u32>>,
+    captured_serials: crate::fasthash::FastMap<String, crate::fasthash::FastSet<u32>>,
     /// Names referenced somewhere they did NOT resolve to a scope (free/global uses).
-    free_refs: std::collections::HashSet<String>,
+    free_refs: crate::fasthash::FastSet<String>,
     /// Innermost loop nesting at the current walk position (for-head scopes and every scope
     /// pushed inside a loop body are never homable).
     loop_depth: u32,
@@ -2976,13 +2976,13 @@ struct CaptureScan {
     /// represent `with`; ordinary bytecode functions remain conservative.
     allow_with: bool,
     saw_with: bool,
-    top_names: std::collections::HashSet<String>,
+    top_names: crate::fasthash::FastSet<String>,
     /// Arrow-ness of each enclosing function on the current path (index 0 = the outer function).
     arrow_path: Vec<bool>,
 }
 
 /// Collect every binding a `Pattern` introduces.
-fn pat_idents(p: &Pattern, out: &mut std::collections::HashSet<String>) {
+fn pat_idents(p: &Pattern, out: &mut crate::fasthash::FastSet<String>) {
     match p {
         Pattern::Ident(n) => {
             out.insert(n.clone());
@@ -3016,7 +3016,7 @@ fn hoisted_vars(
     stmts: &[Stmt],
     top: bool,
     strict: bool,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut crate::fasthash::FastSet<String>,
 ) -> bool {
     for s in stmts {
         if !hoisted_vars_stmt(s, top, strict, out) {
@@ -3030,7 +3030,7 @@ fn hoisted_vars_stmt(
     s: &Stmt,
     top: bool,
     strict: bool,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut crate::fasthash::FastSet<String>,
 ) -> bool {
     match s {
         Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => {
@@ -3154,10 +3154,10 @@ impl CaptureScan {
         func: &Function,
         allow_direct_eval: bool,
     ) -> Option<(
-        std::collections::HashSet<String>,
+        crate::fasthash::FastSet<String>,
         bool,
         Vec<(String, bool)>,
-        std::collections::HashSet<String>,
+        crate::fasthash::FastSet<String>,
         bool,
     )> {
         let mut sc = CaptureScan::new(func, allow_direct_eval);
@@ -3217,8 +3217,8 @@ impl CaptureScan {
         // DIFFERENT binding, which one activation slot can't express), which the compiler
         // homes activation-wide instead.
         let mut homed: Vec<(String, bool)> = Vec::new();
-        let mut runtime = std::collections::HashSet::new();
-        let mut runtime_and_activation = std::collections::HashSet::new();
+        let mut runtime = crate::fasthash::FastSet::default();
+        let mut runtime_and_activation = crate::fasthash::FastSet::default();
         for n in &sc.captured {
             if sc.depth0_inner_decls.contains(n) {
                 let candidate = sc.candidates.get(n).copied();
@@ -3276,7 +3276,7 @@ impl CaptureScan {
         Some((sc.captured, sc.env_this, homed, runtime, sc.saw_direct_eval))
     }
 
-    fn push_scope(&mut self, names: std::collections::HashSet<String>) {
+    fn push_scope(&mut self, names: crate::fasthash::FastSet<String>) {
         self.push_scope_lets(names, Default::default(), false);
     }
 
@@ -3285,8 +3285,8 @@ impl CaptureScan {
     /// compiler can instead maintain an exact heap-owned Environment Record.
     fn push_scope_lets(
         &mut self,
-        names: std::collections::HashSet<String>,
-        homable: std::collections::HashMap<String, bool>,
+        names: crate::fasthash::FastSet<String>,
+        homable: crate::fasthash::FastMap<String, bool>,
         runtime_capable: bool,
     ) {
         let serial = self.next_serial;
@@ -3352,7 +3352,7 @@ impl CaptureScan {
             }
             return Some(());
         }
-        let mut names = std::collections::HashSet::new();
+        let mut names = crate::fasthash::FastSet::default();
         for p in &func.params {
             pat_idents(&p.pattern, &mut names);
         }
@@ -3401,15 +3401,15 @@ impl CaptureScan {
 
     /// Add a statement list's block-scoped declarations. `homable` additionally collects the
     /// `let`/`using` names whose once-per-call scope can safely share the activation.
-    fn declare_lexicals(&self, stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    fn declare_lexicals(&self, stmts: &[Stmt], out: &mut crate::fasthash::FastSet<String>) {
         self.declare_lexicals_lets(stmts, out, &mut Default::default());
     }
 
     fn declare_lexicals_lets(
         &self,
         stmts: &[Stmt],
-        out: &mut std::collections::HashSet<String>,
-        homable: &mut std::collections::HashMap<String, bool>,
+        out: &mut crate::fasthash::FastSet<String>,
+        homable: &mut crate::fasthash::FastMap<String, bool>,
     ) {
         for s in stmts {
             let s = lexical_declaration_statement(s);
@@ -3431,7 +3431,7 @@ impl CaptureScan {
                     };
                     if let Some(is_const) = homed_const {
                         for (p, _) in decls {
-                            let mut names = std::collections::HashSet::new();
+                            let mut names = crate::fasthash::FastSet::default();
                             pat_idents(p, &mut names);
                             homable.extend(names.into_iter().map(|name| (name, is_const)));
                         }
@@ -3465,8 +3465,8 @@ impl CaptureScan {
             }
             return Some(());
         }
-        let mut names = std::collections::HashSet::new();
-        let mut homable = std::collections::HashMap::new();
+        let mut names = crate::fasthash::FastSet::default();
+        let mut homable = crate::fasthash::FastMap::default();
         self.declare_lexicals_lets(stmts, &mut names, &mut homable);
         self.push_scope_lets(names, homable, true);
         for s in stmts {
@@ -3628,7 +3628,7 @@ impl CaptureScan {
                 body,
                 ..
             } => {
-                let mut names = std::collections::HashSet::new();
+                let mut names = crate::fasthash::FastSet::default();
                 if let Some(ForInit::VarDecl {
                     kind: DeclKind::Let | DeclKind::Const,
                     decls,
@@ -3674,7 +3674,7 @@ impl CaptureScan {
                 body,
                 ..
             } => {
-                let mut names = std::collections::HashSet::new();
+                let mut names = crate::fasthash::FastSet::default();
                 match decl {
                     Some(
                         DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing,
@@ -3717,7 +3717,7 @@ impl CaptureScan {
                         // evaluates the catch Block in its own nested block environment. Keep
                         // those scope serials distinct so a captured parameter or block lexical
                         // can receive the exact fresh runtime record it denotes.
-                        let mut names = std::collections::HashSet::new();
+                        let mut names = crate::fasthash::FastSet::default();
                         if self.watched_name.is_none() {
                             pat_idents(pattern, &mut names);
                         }
@@ -3742,8 +3742,8 @@ impl CaptureScan {
                 if self.watched_name.is_some() && cases.len() > 256 {
                     return None;
                 }
-                let mut names = std::collections::HashSet::new();
-                let mut homable = std::collections::HashMap::new();
+                let mut names = crate::fasthash::FastSet::default();
+                let mut homable = crate::fasthash::FastMap::default();
                 for c in cases {
                     if self.watched_name.is_none() {
                         self.declare_lexicals_lets(&c.body, &mut names, &mut homable);
@@ -3807,7 +3807,7 @@ impl CaptureScan {
         for d in &c.decorators {
             self.expr(d)?;
         }
-        let mut names = std::collections::HashSet::new();
+        let mut names = crate::fasthash::FastSet::default();
         if let Some(n) = &c.name {
             names.insert(n.clone());
         }
@@ -6048,7 +6048,7 @@ fn compile_inner(
         for statement in &func.body {
             match statement {
                 Stmt::VarDecl { kind, decls } if !matches!(kind, DeclKind::Var) => {
-                    let mut names = std::collections::HashSet::new();
+                    let mut names = crate::fasthash::FastSet::default();
                     for (pattern, _) in decls {
                         pat_idents(pattern, &mut names);
                     }
@@ -6140,7 +6140,7 @@ fn compile_inner(
                     names
                 })
                 .collect();
-            let banned_from = |k: usize| -> std::collections::HashSet<&str> {
+            let banned_from = |k: usize| -> crate::fasthash::FastSet<&str> {
                 bound[k..].iter().flatten().map(String::as_str).collect()
             };
             let mut inits: Vec<ParamInit> = Vec::new();
@@ -7085,8 +7085,8 @@ struct Compiler {
     module_body: bool,
     /// An already-instantiated Script Record. Global bindings are never compiler-local slots.
     script_body: bool,
-    script_vars: std::collections::HashSet<String>,
-    script_annexb: std::collections::HashSet<usize>,
+    script_vars: crate::fasthash::FastSet<String>,
+    script_annexb: crate::fasthash::FastSet<usize>,
     /// StatementList's last nonempty completion, initialized to undefined at script entry.
     script_completion: Option<u16>,
     /// This coroutine contains direct eval and CaptureScan proved every dynamically visible
@@ -7095,13 +7095,13 @@ struct Compiler {
     /// Inner lexical names whose closure- or eval-visible bindings must live in the resumable
     /// environment chain. Every admitted source scope receives its own Environment Record even
     /// when several declarations reuse the same spelling.
-    runtime_lexicals: std::collections::HashSet<String>,
+    runtime_lexicals: crate::fasthash::FastSet<String>,
     /// Captured once-per-call block `let`s homed in the activation (see CaptureScan's
     /// `candidates`). `homed_pending` holds the ones whose declaring block hasn't been reached
     /// yet: the FIRST block-level declaration of the name consumes it (skipping slot creation);
     /// any later same-name declaration is a nested shadow and binds a slot normally.
-    homed_lets: std::collections::HashSet<String>,
-    homed_pending: std::collections::HashSet<String>,
+    homed_lets: crate::fasthash::FastSet<String>,
+    homed_pending: crate::fasthash::FastSet<String>,
     ops: Vec<Op>,
     consts: Vec<Value>,
     names: Vec<Rc<str>>,
@@ -7112,7 +7112,7 @@ struct Compiler {
     scopes: Vec<Vec<(String, u16, bool)>>,
     /// Environment-backed bindings at each compiler scope, parallel to `scopes`. An entry blocks
     /// lookup of same-named outer slots and resolves through the VM's current environment cursor.
-    lexical_env_names: Vec<std::collections::HashMap<String, bool>>,
+    lexical_env_names: Vec<crate::fasthash::FastMap<String, bool>>,
     /// Scope-vector length at entry to each compiled `with` body. Bindings declared in scopes
     /// added after the innermost boundary shadow the with object; all earlier slot/activation
     /// homes must instead use dynamic Environment Record resolution.
@@ -7165,9 +7165,9 @@ struct Compiler {
     /// Slots that ever enter a temporal dead zone (an `Op::Tdz` was emitted for them). The fused
     /// element ops defer the base-slot read past key/value evaluation, which is only
     /// order-unobservable when the base can never TDZ-throw — params and `var`s qualify.
-    tdz_slots: std::collections::HashSet<u16>,
+    tdz_slots: crate::fasthash::FastSet<u16>,
     /// Captured (env-homed) function-scope-wide names → is_const. Slot scopes shadow these.
-    env_names: std::collections::HashMap<String, bool>,
+    env_names: crate::fasthash::FastMap<String, bool>,
     /// Annex B block FunctionDeclaration AST identity → its distinct function-scope var home.
     /// The current lexical home has the same spelling when the declaration statement executes.
     annexb_targets: crate::fasthash::FastMap<usize, Home>,
@@ -7455,7 +7455,7 @@ pub(crate) fn lazy_arguments_element(
 
 /// [`default_expr_safe`] for every expression inside a binding pattern: nested defaults and
 /// computed keys.
-fn pattern_exprs_safe(pattern: &Pattern, banned: &std::collections::HashSet<&str>) -> bool {
+fn pattern_exprs_safe(pattern: &Pattern, banned: &crate::fasthash::FastSet<&str>) -> bool {
     match pattern {
         Pattern::Ident(_) => true,
         Pattern::Member(_) => false,
@@ -7484,7 +7484,7 @@ fn pattern_exprs_safe(pattern: &Pattern, banned: &std::collections::HashSet<&str
     }
 }
 
-fn default_expr_safe(e: &Expr, banned: &std::collections::HashSet<&str>) -> bool {
+fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool {
     match e {
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -7966,7 +7966,7 @@ impl Compiler {
             self.emit(Op::ResetSlots(start, count));
             k += count as usize;
         }
-        let empty = std::collections::HashSet::new();
+        let empty = crate::fasthash::FastSet::default();
         self.declare_body_lexicals(&f.body, &empty)?;
         for stmt in &f.body {
             self.stmt(stmt)?;
@@ -8975,7 +8975,7 @@ impl Compiler {
     fn declare_body_lexicals(
         &mut self,
         stmts: &[Stmt],
-        captured: &std::collections::HashSet<String>,
+        captured: &crate::fasthash::FastSet<String>,
     ) -> CResult {
         for s in stmts {
             let s = match s {
@@ -9035,7 +9035,7 @@ impl Compiler {
         &mut self,
         pattern: &Pattern,
         is_const: bool,
-        captured: &std::collections::HashSet<String>,
+        captured: &crate::fasthash::FastSet<String>,
     ) -> CResult {
         match pattern {
             Pattern::Ident(name) if self.module_body && self.env_has(name) => Ok(()),
@@ -9927,7 +9927,7 @@ impl Compiler {
                     | DeclKind::AwaitUsing),
                 ) = decl
                 {
-                    let mut names = std::collections::HashSet::new();
+                    let mut names = crate::fasthash::FastSet::default();
                     pat_idents(left, &mut names);
                     let mut names: Vec<_> = names.into_iter().collect();
                     names.sort();
@@ -10041,7 +10041,7 @@ impl Compiler {
                         // Hoisting created every leaf home at function entry. Pattern binding is
                         // inside the loop-body handler so an abrupt iterator/destructuring step
                         // follows the same IteratorClose path as lexical patterns.
-                        let mut leaf_names = std::collections::HashSet::new();
+                        let mut leaf_names = crate::fasthash::FastSet::default();
                         pat_idents(pat, &mut leaf_names);
                         if leaf_names.iter().any(|name| {
                             !self.fragment_entry
@@ -10420,7 +10420,7 @@ impl Compiler {
     }
 
     fn projected_locals(&self) -> Vec<AssignmentLocal> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::fasthash::FastSet::default();
         let mut locals = Vec::new();
         for scope in self.scopes.iter().rev() {
             for (name, slot, is_const) in scope.iter().rev() {
@@ -11066,7 +11066,7 @@ impl Compiler {
         self.reset_script_completion();
         if let Some(pattern) = param {
             self.push_compile_scope();
-            let mut names = std::collections::HashSet::new();
+            let mut names = crate::fasthash::FastSet::default();
             pat_idents(pattern, &mut names);
             let mut bindings: Vec<_> = names
                 .into_iter()
@@ -11137,7 +11137,7 @@ impl Compiler {
     fn runtime_block_bindings(&self, body: &[Stmt]) -> Vec<(String, bool)> {
         let mut bindings = Vec::new();
         let mut add_pattern = |pattern: &Pattern, is_const: bool| {
-            let mut names = std::collections::HashSet::new();
+            let mut names = crate::fasthash::FastSet::default();
             pat_idents(pattern, &mut names);
             let mut names: Vec<_> = names.into_iter().collect();
             names.sort();
@@ -11403,7 +11403,7 @@ impl Compiler {
         }) = init
         {
             for (pattern, _) in decls {
-                let mut names = std::collections::HashSet::new();
+                let mut names = crate::fasthash::FastSet::default();
                 pat_idents(pattern, &mut names);
                 let mut names: Vec<_> = names.into_iter().collect();
                 names.sort();
@@ -11896,7 +11896,7 @@ impl Compiler {
         // newly created (TDZ) class environment rather than any outer declaration slot.
         let saved_strict = std::mem::replace(&mut self.strict, true);
         self.scopes.push(Vec::new());
-        let mut class_names = std::collections::HashMap::new();
+        let mut class_names = crate::fasthash::FastMap::default();
         if let Some(name) = &class.name {
             class_names.insert(name.clone(), true);
         }
