@@ -2935,11 +2935,26 @@ mod asm {
             let count = self.patches.len();
             // Inserting after instruction P moves labels strictly after P, not labels at P.
             // Unbound, unused labels are legal; only referenced/exported labels must be bound.
+            // One sweep over instruction positions counts the patches before each position;
+            // a binary search per label is several times slower on multi-megabyte bodies,
+            // which carry hundreds of thousands of labels and patches.
+            let mut patches_before = Vec::with_capacity(self.buf.len() + 1);
+            let mut next = 0usize;
+            for position in 0..=self.buf.len() {
+                while next < count && self.patches[next].0 < position {
+                    next += 1;
+                }
+                patches_before.push(next as u32);
+            }
             let cuts: Vec<_> = self
                 .labels
                 .iter()
-                .map(|label| label.map(|at| self.patches.partition_point(|p| p.0 < at)))
+                .map(|label| label.map(|at| patches_before[at] as usize))
                 .collect();
+            debug_assert!(self.labels.iter().zip(&cuts).all(|(label, cut)| {
+                *cut == label.map(|at| self.patches.partition_point(|p| p.0 < at))
+            }));
+            drop(patches_before);
             let mut wide = vec![false; count];
             let mut prefix = vec![0usize; count + 1];
             let rebuild = |prefix: &mut [usize], wide: &[bool]| {
