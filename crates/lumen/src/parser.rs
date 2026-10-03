@@ -73,7 +73,7 @@ fn parse_script_with(
     let mut p = Parser {
         toks: lexed.tokens,
         pos: 0,
-        src_chars: lexed.chars,
+        src: lexed.source,
         strict,
         depth: 0,
         in_generator: false,
@@ -155,7 +155,7 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
     let mut p = Parser {
         toks: lexed.tokens,
         pos: 0,
-        src_chars: lexed.chars,
+        src: lexed.source,
         strict: true,
         depth: 0,
         in_generator: false,
@@ -369,8 +369,8 @@ const MAX_PARSE_DEPTH: u32 = 1200;
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
-    /// The source as chars, for slicing function source text by token offsets.
-    src_chars: Rc<Vec<char>>,
+    /// The source text, for slicing function source text by token (byte) offsets.
+    src: Rc<str>,
     strict: bool,
     depth: u32,
     /// Whether the body currently being parsed is a generator / async function — controls whether
@@ -465,17 +465,13 @@ impl Parser {
             self.toks[self.pos - 1].end
         }
     }
-    /// The source text between two char offsets (a function's `toString` view).
+    /// The source text between two token byte offsets (a function's `toString` view).
     fn src_slice(&self, start: u32, end: u32) -> Option<Rc<str>> {
         if self.self_hosted {
             return None;
         }
         let (s, e) = (start as usize, end as usize);
-        if s <= e && e <= self.src_chars.len() {
-            Some(Rc::from(self.src_chars[s..e].iter().collect::<String>()))
-        } else {
-            None
-        }
+        self.src.get(s..e).filter(|_| s <= e).map(Rc::from)
     }
 
     fn cur(&self) -> &Tok {
@@ -2912,7 +2908,7 @@ impl Parser {
                     let mut sub = Parser {
                         toks: lexed.tokens,
                         pos: 0,
-                        src_chars: lexed.chars,
+                        src: lexed.source,
                         strict: self.strict,
                         depth: self.depth,
                         in_generator: self.in_generator,
@@ -2982,7 +2978,7 @@ impl Parser {
                     let mut sub = Parser {
                         toks: lexed.tokens,
                         pos: 0,
-                        src_chars: lexed.chars,
+                        src: lexed.source,
                         strict: self.strict,
                         depth: self.depth,
                         in_generator: self.in_generator,

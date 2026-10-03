@@ -1,8 +1,12 @@
 //! Hand-written tokenizer. Produces the full `Vec<Token>` up front (scripts are small enough that
 //! streaming buys nothing) and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
+//!
+//! The scanner reads the UTF-8 source in place. Positions are byte offsets that always fall on a
+//! code point boundary; runs of ASCII whitespace, comment text, identifier characters and plain
+//! string characters are consumed a byte (or word) at a time and copied as slices.
 
-use crate::token::{Tok, Token, TplPart, PUNCTUATORS};
+use crate::token::{Tok, Token, TplPart};
 use std::rc::Rc;
 
 pub struct LexError {
@@ -13,8 +17,10 @@ pub struct LexError {
     pub at_eof: bool,
 }
 
-struct Lexer {
-    chars: Rc<Vec<char>>,
+struct Lexer<'a> {
+    src: &'a str,
+    bytes: &'a [u8],
+    /// Byte offset of the next code point.
     pos: usize,
     line: u32,
     out: Vec<Token>,
@@ -28,7 +34,7 @@ struct Lexer {
     /// One entry per open `{`: `true` if it opened a block/function body (statement position),
     /// `false` if an object literal (expression position). Used to disambiguate a `/` after `}`.
     brace_stack: Vec<bool>,
-    /// Char offset where the token currently being scanned began.
+    /// Byte offset where the token currently being scanned began.
     tok_start: usize,
     /// Classification of the most recently closed `}` (`true` = a block). A `/` after a block-closing
     /// `}` begins a regex; after an object-literal-closing `}` it is division.
@@ -58,14 +64,14 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
 /// Tokenize with an explicit goal: `html_comments` is true for Scripts (Annex B `<!--`/`-->`
 /// comments apply) and false for Modules (where they are ordinary punctuation, i.e. errors).
 pub fn tokenize_goal(src: &str, html_comments: bool) -> Result<Vec<Token>, LexError> {
-    tokenize_goal_with_source(src, html_comments).map(|lexed| lexed.tokens)
+    lex(src, html_comments)
 }
 
-/// Token stream plus the one code-point index built while lexing. The parser shares this index for
-/// exact `[[SourceText]]` slices instead of scanning and allocating a second `Vec<char>`.
+/// Token stream plus the source it indexes. Token `start`/`end` are byte offsets into `source`,
+/// so the parser slices exact `[[SourceText]]` without a second scan.
 pub(crate) struct LexedSource {
     pub(crate) tokens: Vec<Token>,
-    pub(crate) chars: Rc<Vec<char>>,
+    pub(crate) source: Rc<str>,
 }
 
 pub(crate) fn tokenize_with_source(src: &str) -> Result<LexedSource, LexError> {
@@ -76,11 +82,19 @@ pub(crate) fn tokenize_goal_with_source(
     src: &str,
     html_comments: bool,
 ) -> Result<LexedSource, LexError> {
+    let tokens = lex(src, html_comments)?;
+    Ok(LexedSource {
+        tokens,
+        source: Rc::from(src),
+    })
+}
+
+fn lex(src: &str, html_comments: bool) -> Result<Vec<Token>, LexError> {
     // Diagnostic-only stage timing; the disabled path takes no timestamp and allocates nothing.
     let perf_started = crate::jit::perf_stage_start();
-    let chars: Rc<Vec<char>> = Rc::new(src.chars().collect());
     let mut lx = Lexer {
-        chars: chars.clone(),
+        src,
+        bytes: src.as_bytes(),
         pos: 0,
         line: 1,
         out: Vec::new(),
@@ -98,46 +112,50 @@ pub(crate) fn tokenize_goal_with_source(
         last_update_postfix: false,
     };
     let result = lx.run();
-    match result {
-        Ok(()) => {
-            crate::jit::perf_lex_end(perf_started, true);
-            Ok(LexedSource {
-                tokens: lx.out,
-                chars,
-            })
-        }
-        Err(error) => {
-            crate::jit::perf_lex_end(perf_started, false);
-            Err(error)
-        }
-    }
+    crate::jit::perf_lex_end(perf_started, result.is_ok());
+    result.map(|()| lx.out)
 }
 
-impl Lexer {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+impl Lexer<'_> {
+    /// The code point starting at byte offset `at` (a code point boundary).
+    #[inline]
+    fn char_at(&self, at: usize) -> Option<char> {
+        match self.bytes.get(at) {
+            Some(&b) if b < 0x80 => Some(b as char),
+            Some(_) => self.src[at..].chars().next(),
+            None => None,
+        }
     }
+    #[inline]
+    fn peek(&self) -> Option<char> {
+        self.char_at(self.pos)
+    }
+    #[inline]
     fn peek2(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
+        let c = self.peek()?;
+        self.char_at(self.pos + c.len_utf8())
     }
     fn peek_at(&self, ahead: usize) -> Option<char> {
-        self.chars.get(self.pos + ahead).copied()
-    }
-    fn bump(&mut self) -> Option<char> {
-        let c = self.chars.get(self.pos).copied();
-        if let Some(c) = c {
-            self.pos += 1;
-            if c == '\n' {
-                self.line += 1;
-            }
+        let mut at = self.pos;
+        for _ in 0..ahead {
+            at += self.char_at(at)?.len_utf8();
         }
-        c
+        self.char_at(at)
+    }
+    #[inline]
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += c.len_utf8();
+        if c == '\n' {
+            self.line += 1;
+        }
+        Some(c)
     }
     fn err(&self, message: impl Into<String>) -> LexError {
         LexError {
             message: message.into(),
             line: self.line,
-            at_eof: self.pos >= self.chars.len(),
+            at_eof: self.pos >= self.bytes.len(),
         }
     }
 
@@ -332,16 +350,30 @@ impl Lexer {
 
     fn run(&mut self) -> Result<(), LexError> {
         // Hashbang comment: `#!...` only at the very start of the source.
-        if self.peek() == Some('#') && self.peek2() == Some('!') {
-            while let Some(c) = self.peek() {
-                if is_line_terminator(c) {
-                    break;
-                }
-                self.bump();
-            }
+        if self.bytes.starts_with(b"#!") {
+            self.skip_line_comment();
         }
-        while let Some(c) = self.peek() {
+        while let Some(&b) = self.bytes.get(self.pos) {
             self.tok_start = self.pos;
+            match b {
+                b' ' | b'\t' | 0x0B | 0x0C => {
+                    self.skip_ascii_whitespace();
+                    continue;
+                }
+                b'\n' => {
+                    self.nl_pending = true;
+                    self.line += 1;
+                    self.pos += 1;
+                    continue;
+                }
+                b'\r' => {
+                    self.nl_pending = true;
+                    self.pos += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            let c = self.peek().expect("in bounds");
             if is_line_terminator(c) {
                 self.nl_pending = true;
                 self.bump();
@@ -352,18 +384,13 @@ impl Lexer {
                 self.skip_line_comment();
             } else if c == '/' && self.peek2() == Some('*') {
                 self.skip_block_comment()?;
-            } else if c == '<'
-                && self.html_comments
-                && self.peek_at(1) == Some('!')
-                && self.peek_at(2) == Some('-')
-                && self.peek_at(3) == Some('-')
+            } else if c == '<' && self.html_comments && self.bytes[self.pos..].starts_with(b"<!--")
             {
                 // Annex B HTML-like comment: `<!--` opens a single-line comment.
                 self.skip_line_comment();
             } else if c == '-'
                 && self.html_comments
-                && self.peek_at(1) == Some('-')
-                && self.peek_at(2) == Some('>')
+                && self.bytes[self.pos..].starts_with(b"-->")
                 && (self.nl_pending || self.out.is_empty())
             {
                 // Annex B: `-->` at the start of a line (or of the source) is a comment to EOL.
@@ -389,32 +416,101 @@ impl Lexer {
         Ok(())
     }
 
-    fn skip_line_comment(&mut self) {
-        while let Some(c) = self.peek() {
-            if is_line_terminator(c) {
+    /// Consume a run of ASCII WhiteSpace (SP, TAB, VT, FF). Long runs of spaces, as in indented
+    /// or padded source, are compared eight bytes at a time.
+    fn skip_ascii_whitespace(&mut self) {
+        const SPACES: u64 = u64::from_ne_bytes([b' '; 8]);
+        let bytes = self.bytes;
+        let mut i = self.pos;
+        while let Some(word) = bytes.get(i..i + 8) {
+            if u64::from_ne_bytes(word.try_into().expect("eight bytes")) != SPACES {
                 break;
             }
-            self.bump();
+            i += 8;
         }
+        while matches!(bytes.get(i), Some(b' ' | b'\t' | 0x0B | 0x0C)) {
+            i += 1;
+        }
+        self.pos = i;
+    }
+
+    /// Whether the code point at byte offset `at` (whose first byte is `0xE2`) is U+2028 or
+    /// U+2029, the only non-ASCII LineTerminators.
+    #[inline]
+    fn is_unicode_line_terminator_at(&self, at: usize) -> bool {
+        matches!(self.bytes.get(at..at + 3), Some([0xE2, 0x80, 0xA8 | 0xA9]))
+    }
+
+    /// Skip to (not past) the next LineTerminator. A comment holds no `\n`, so the line count is
+    /// unchanged; the scan stops only on ASCII or `0xE2` lead bytes, i.e. on code point boundaries.
+    fn skip_line_comment(&mut self) {
+        let bytes = self.bytes;
+        let mut i = self.pos;
+        while let Some(&b) = bytes.get(i) {
+            if b == b'\n' || b == b'\r' || (b == 0xE2 && self.is_unicode_line_terminator_at(i)) {
+                break;
+            }
+            i += 1;
+        }
+        self.pos = i;
     }
 
     fn skip_block_comment(&mut self) -> Result<(), LexError> {
-        self.bump();
-        self.bump();
+        let bytes = self.bytes;
+        let mut i = self.pos + 2;
         loop {
-            match self.bump() {
-                None => return Err(self.err("unterminated block comment")),
-                Some('*') if self.peek() == Some('/') => {
-                    self.bump();
+            match bytes.get(i) {
+                None => {
+                    self.pos = i;
+                    return Err(self.err("unterminated block comment"));
+                }
+                Some(b'*') if bytes.get(i + 1) == Some(&b'/') => {
+                    self.pos = i + 2;
                     return Ok(());
                 }
-                Some(c) if is_line_terminator(c) => self.nl_pending = true,
+                Some(b'\n') => {
+                    self.line += 1;
+                    self.nl_pending = true;
+                }
+                Some(b'\r') => self.nl_pending = true,
+                Some(0xE2) if self.is_unicode_line_terminator_at(i) => self.nl_pending = true,
                 _ => {}
             }
+            i += 1;
+        }
+    }
+
+    /// Push an identifier or reserved word spelled `word`.
+    fn push_word(&mut self, word: &str, had_escape: bool) {
+        // A reserved word is always a keyword — even spelled with a `\u` escape. An escaped reserved
+        // word can't be an Identifier (the parser rejects a keyword there), but it still works as a
+        // property name (keywords are accepted in those positions).
+        match crate::token::keyword(word) {
+            Some(kw) => self.push(Tok::Keyword(kw)),
+            None => self.push(Tok::Ident(word.to_owned())),
+        }
+        if had_escape {
+            self.mark_escaped();
         }
     }
 
     fn read_ident(&mut self) -> Result<(), LexError> {
+        // Fast path: an all-ASCII name without escapes is a slice of the source.
+        let bytes = self.bytes;
+        let start = self.pos;
+        let mut i = start + usize::from(bytes[start] == b'#');
+        if bytes.get(i).is_some_and(|&b| is_ascii_ident_start(b)) {
+            i += 1;
+            while bytes.get(i).is_some_and(|&b| is_ascii_ident_part(b)) {
+                i += 1;
+            }
+            if bytes.get(i).is_none_or(|&b| b != b'\\' && b < 0x80) {
+                self.pos = i;
+                let src = self.src;
+                self.push_word(&src[start..i], false);
+                return Ok(());
+            }
+        }
         let mut s = String::new();
         // A leading `#` (private name) is part of the identifier but not an ident-continue char.
         if self.peek() == Some('#') {
@@ -457,20 +553,7 @@ impl Lexer {
                 _ => break,
             }
         }
-        // A reserved word is always a keyword — even spelled with a `\u` escape. An escaped reserved
-        // word can't be an Identifier (the parser rejects a keyword there), but it still works as a
-        // property name (keywords are accepted in those positions).
-        if let Some(kw) = crate::token::keyword(&s) {
-            self.push(Tok::Keyword(kw));
-            if had_escape {
-                self.mark_escaped();
-            }
-            return Ok(());
-        }
-        self.push(Tok::Ident(s));
-        if had_escape {
-            self.mark_escaped();
-        }
+        self.push_word(&s, had_escape);
         Ok(())
     }
 
@@ -511,7 +594,21 @@ impl Lexer {
         let mut had_escape = false;
         self.pending_legacy = false;
         self.pending_lone_surrogate = false;
+        let quote_byte = quote as u8;
         loop {
+            // Copy the run of characters that need no interpretation. U+2028/U+2029 may appear
+            // literally in a string (json-superset); only CR/LF end it. The run stops only on
+            // ASCII bytes, so both ends are code point boundaries.
+            let run_start = self.pos;
+            let mut i = run_start;
+            while let Some(&b) = self.bytes.get(i) {
+                if b == quote_byte || b == b'\\' || b == b'\n' || b == b'\r' {
+                    break;
+                }
+                i += 1;
+            }
+            s.push_str(&self.src[run_start..i]);
+            self.pos = i;
             match self.bump() {
                 None => return Err(self.err("unterminated string literal")),
                 Some(c) if c == quote => break,
@@ -519,12 +616,7 @@ impl Lexer {
                     had_escape = true;
                     self.read_escape(&mut s)?
                 }
-                // U+2028/U+2029 may appear literally in a string (json-superset); only CR/LF end it.
-                Some(c @ ('\u{2028}' | '\u{2029}')) => s.push(c),
-                Some(c) if is_line_terminator(c) => {
-                    return Err(self.err("unterminated string literal"));
-                }
-                Some(c) => s.push(c),
+                Some(_) => return Err(self.err("unterminated string literal")),
             }
         }
         self.push(Tok::Str(s));
@@ -553,26 +645,26 @@ impl Lexer {
         let mut raw_start = self.pos; // raw source of the current chunk starts here
         loop {
             // The template's raw value normalizes line terminators: <CR><LF> and <CR> → <LF>.
-            let raw_of = |chars: &[char]| -> String {
-                let mut out = String::with_capacity(chars.len());
-                let mut k = 0;
-                while k < chars.len() {
-                    if chars[k] == '\r' {
+            let raw_of = |text: &str| -> String {
+                if !text.contains('\r') {
+                    return text.to_owned();
+                }
+                let mut out = String::with_capacity(text.len());
+                let mut chars = text.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\r' {
                         out.push('\n');
-                        if chars.get(k + 1) == Some(&'\n') {
-                            k += 1;
-                        }
+                        chars.next_if_eq(&'\n');
                     } else {
-                        out.push(chars[k]);
+                        out.push(c);
                     }
-                    k += 1;
                 }
                 out
             };
             match self.peek() {
                 None => return Err(self.err("unterminated template literal")),
                 Some('`') => {
-                    let raw = raw_of(&self.chars[raw_start..self.pos]);
+                    let raw = raw_of(&self.src[raw_start..self.pos]);
                     self.bump();
                     parts.push(TplPart::Str {
                         cooked: (!std::mem::take(&mut invalid))
@@ -581,8 +673,8 @@ impl Lexer {
                     });
                     break;
                 }
-                Some('$') if self.chars.get(self.pos + 1) == Some(&'{') => {
-                    let raw = raw_of(&self.chars[raw_start..self.pos]);
+                Some('$') if self.bytes.get(self.pos + 1) == Some(&b'{') => {
+                    let raw = raw_of(&self.src[raw_start..self.pos]);
                     parts.push(TplPart::Str {
                         cooked: (!std::mem::take(&mut invalid))
                             .then(|| std::mem::take(&mut cooked)),
@@ -823,7 +915,7 @@ impl Lexer {
     /// Whether the escape starting at the current `\` is valid in a template's cooked string:
     /// no octal / `\8` / `\9`, `\x` needs two hex digits, `\u` four (or a braced code point).
     fn template_escape_ok(&self) -> bool {
-        let at = |k: usize| self.chars.get(self.pos + k).copied();
+        let at = |k: usize| self.peek_at(k);
         let hex = |c: Option<char>| c.is_some_and(|c| c.is_ascii_hexdigit());
         match at(1) {
             Some('0') => !matches!(at(2), Some(c) if c.is_ascii_digit()),
@@ -1030,13 +1122,14 @@ impl Lexer {
 
     /// A numeric separator `_` is only legal immediately between two digits of the given radix.
     fn validate_seps(&self, lo: usize, hi: usize, radix: u32) -> Result<(), LexError> {
-        let s = &self.chars[lo..hi];
+        // Numeric literal text is ASCII.
+        let s = &self.bytes[lo..hi];
         for (i, &c) in s.iter().enumerate() {
-            if c == '_' {
+            if c == b'_' {
                 let prev = i.checked_sub(1).and_then(|j| s.get(j));
                 let next = s.get(i + 1);
-                let ok = prev.is_some_and(|p| p.is_digit(radix))
-                    && next.is_some_and(|n| n.is_digit(radix));
+                let ok = prev.is_some_and(|&p| (p as char).is_digit(radix))
+                    && next.is_some_and(|&n| (n as char).is_digit(radix));
                 if !ok {
                     return Err(self.err("invalid use of numeric separator"));
                 }
@@ -1080,9 +1173,9 @@ impl Lexer {
                 }
             }
             self.validate_seps(digits_start, self.pos, radix)?;
-            let digits: String = self.chars[digits_start..self.pos]
-                .iter()
-                .filter(|c| **c != '_')
+            let digits: String = self.src[digits_start..self.pos]
+                .chars()
+                .filter(|c| *c != '_')
                 .collect();
             if self.peek() == Some('n') {
                 self.bump();
@@ -1105,15 +1198,15 @@ impl Lexer {
         }
         // Legacy octal (`010`) / non-octal-decimal (`08`): a leading-zero integer with no fraction,
         // exponent, or `n` suffix. Octal value in sloppy mode; the parser rejects it in strict.
-        if self.chars[start] == '0'
+        if self.bytes[start] == b'0'
             && self.pos - start > 1
             && !matches!(self.peek(), Some('.' | 'e' | 'E' | 'n' | '_'))
         {
             // A leading-zero integer (legacy octal / non-octal decimal) admits no separators.
-            if self.chars[start..self.pos].contains(&'_') {
+            if self.bytes[start..self.pos].contains(&b'_') {
                 return Err(self.err("numeric separator not allowed in legacy literal"));
             }
-            let text: String = self.chars[start..self.pos].iter().collect();
+            let text = &self.src[start..self.pos];
             if text.chars().all(|c| ('0'..='7').contains(&c)) {
                 let n = i64::from_str_radix(&text, 8).unwrap_or(0);
                 self.push(Tok::Num(n as f64));
@@ -1129,13 +1222,13 @@ impl Lexer {
         // A BigInt literal is an integer immediately followed by `n` (no fraction/exponent).
         if self.peek() == Some('n') {
             // A leading-zero integer (legacy octal / non-octal decimal) admits no BigInt suffix.
-            if self.chars[start] == '0' && self.pos - start > 1 {
+            if self.bytes[start] == b'0' && self.pos - start > 1 {
                 return Err(self.err("invalid BigInt literal (leading zero)"));
             }
             self.validate_seps(start, self.pos, 10)?;
-            let text: String = self.chars[start..self.pos]
-                .iter()
-                .filter(|c| **c != '_')
+            let text: String = self.src[start..self.pos]
+                .chars()
+                .filter(|c| *c != '_')
                 .collect();
             self.bump(); // n
             let n = crate::bigint::JsBigInt::parse_radix(&text, 10)
@@ -1159,10 +1252,16 @@ impl Lexer {
             }
         }
         self.validate_seps(start, self.pos, 10)?;
-        let text: String = self.chars[start..self.pos]
-            .iter()
-            .filter(|c| **c != '_')
-            .collect();
+        let digits = &self.src[start..self.pos];
+        let text: std::borrow::Cow<'_, str> = if digits.contains('_') {
+            digits
+                .chars()
+                .filter(|c| *c != '_')
+                .collect::<String>()
+                .into()
+        } else {
+            digits.into()
+        };
         let n: f64 = text
             .parse()
             .map_err(|_| self.err("invalid numeric literal"))?;
@@ -1217,41 +1316,119 @@ impl Lexer {
     }
 
     fn read_punct(&mut self) -> Result<(), LexError> {
-        // Punctuators are ASCII and at most four long: compare against a stack copy of the
-        // ASCII lookahead, and only the punctuators sharing its first byte.
+        // Punctuators are ASCII and at most four long: decide on a stack copy of the ASCII
+        // lookahead.
         let mut buffer = [0u8; 4];
-        let mut len = 0;
-        for &c in self.chars[self.pos..].iter().take(4) {
-            if !c.is_ascii() {
+        for (slot, &b) in buffer.iter_mut().zip(&self.bytes[self.pos..]) {
+            if !b.is_ascii() {
                 break;
             }
-            buffer[len] = c as u8;
-            len += 1;
+            *slot = b;
         }
-        let rest = &buffer[..len];
         // `?.` followed by a digit is `?` then `.` (a conditional like `x ? .5 : .3`), not optional
         // chaining.
-        if rest.starts_with(b"?.") && rest.get(2).is_some_and(u8::is_ascii_digit) {
-            self.bump();
-            self.push(Tok::Punct("?"));
+        let p = if buffer.starts_with(b"?.") && buffer[2].is_ascii_digit() {
+            Some("?")
+        } else {
+            match_punct(buffer)
+        };
+        if let Some(p) = p {
+            self.pos += p.len();
+            self.push(Tok::Punct(p));
             return Ok(());
-        }
-        if let Some(&first) = rest.first() {
-            for p in PUNCTUATORS {
-                if p.as_bytes()[0] == first && rest.starts_with(p.as_bytes()) {
-                    for _ in 0..p.len() {
-                        self.bump();
-                    }
-                    self.push(Tok::Punct(p));
-                    return Ok(());
-                }
-            }
         }
         Err(self.err(format!(
             "unexpected character {:?}",
             self.peek().unwrap_or('\0')
         )))
     }
+}
+
+/// The longest punctuator (an entry of [`crate::token::PUNCTUATORS`]) that `rest` starts with.
+/// `rest` holds the ASCII lookahead, zero-padded (NUL begins no punctuator).
+fn match_punct(rest: [u8; 4]) -> Option<&'static str> {
+    let [b0, b1, b2, b3] = rest;
+    Some(match b0 {
+        b'{' => "{",
+        b'}' => "}",
+        b'(' => "(",
+        b')' => ")",
+        b'[' => "[",
+        b']' => "]",
+        b';' => ";",
+        b',' => ",",
+        b'~' => "~",
+        b':' => ":",
+        b'@' => "@",
+        b'.' if b1 == b'.' && b2 == b'.' => "...",
+        b'.' => ".",
+        b'<' => match (b1, b2) {
+            (b'<', b'=') => "<<=",
+            (b'<', _) => "<<",
+            (b'=', _) => "<=",
+            _ => "<",
+        },
+        b'>' => match (b1, b2, b3) {
+            (b'>', b'>', b'=') => ">>>=",
+            (b'>', b'>', _) => ">>>",
+            (b'>', b'=', _) => ">>=",
+            (b'>', _, _) => ">>",
+            (b'=', _, _) => ">=",
+            _ => ">",
+        },
+        b'=' => match (b1, b2) {
+            (b'=', b'=') => "===",
+            (b'=', _) => "==",
+            (b'>', _) => "=>",
+            _ => "=",
+        },
+        b'!' => match (b1, b2) {
+            (b'=', b'=') => "!==",
+            (b'=', _) => "!=",
+            _ => "!",
+        },
+        b'*' => match (b1, b2) {
+            (b'*', b'=') => "**=",
+            (b'*', _) => "**",
+            (b'=', _) => "*=",
+            _ => "*",
+        },
+        b'&' => match (b1, b2) {
+            (b'&', b'=') => "&&=",
+            (b'&', _) => "&&",
+            (b'=', _) => "&=",
+            _ => "&",
+        },
+        b'|' => match (b1, b2) {
+            (b'|', b'=') => "||=",
+            (b'|', _) => "||",
+            (b'=', _) => "|=",
+            _ => "|",
+        },
+        b'?' => match (b1, b2) {
+            (b'?', b'=') => "??=",
+            (b'?', _) => "??",
+            (b'.', _) => "?.",
+            _ => "?",
+        },
+        b'+' => match b1 {
+            b'+' => "++",
+            b'=' => "+=",
+            _ => "+",
+        },
+        b'-' => match b1 {
+            b'-' => "--",
+            b'=' => "-=",
+            _ => "-",
+        },
+        b'/' if b1 == b'=' => "/=",
+        b'/' => "/",
+        b'%' if b1 == b'=' => "%=",
+        b'%' => "%",
+        b'^' if b1 == b'=' => "^=",
+        b'^' => "^",
+        _ => return None,
+    })
 }
 
 /// Whether a `/` following `last` (the previous significant char) starts a regex rather than being
@@ -1285,6 +1462,12 @@ fn prop_has(name: &str, c: char) -> bool {
         })
         .unwrap_or(false)
 }
+fn is_ascii_ident_start(b: u8) -> bool {
+    b == b'_' || b == b'$' || b.is_ascii_alphabetic()
+}
+fn is_ascii_ident_part(b: u8) -> bool {
+    b == b'_' || b == b'$' || b.is_ascii_alphanumeric()
+}
 fn is_ident_start(c: char) -> bool {
     // IdentifierStart = ID_Start ∪ {$, _} (plus `\u` escapes, handled by the caller).
     if c.is_ascii() {
@@ -1298,4 +1481,69 @@ fn is_ident_part(c: char) -> bool {
         return c == '_' || c == '$' || c.is_ascii_alphanumeric();
     }
     c == '\u{200C}' || c == '\u{200D}' || prop_has("ID_Continue", c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table-driven maximal munch the punctuator matcher replaces.
+    fn munch(rest: &[u8]) -> Option<&'static str> {
+        crate::token::PUNCTUATORS
+            .iter()
+            .copied()
+            .find(|p| rest.starts_with(p.as_bytes()))
+    }
+
+    #[test]
+    fn punctuator_matcher_is_maximal_munch_over_the_punctuator_table() {
+        let alphabet: Vec<u8> = b"{}()[].;,<>+-*/%&|^!~?:=@a0 ".to_vec();
+        for &a in &alphabet {
+            for &b in &alphabet {
+                for &c in &alphabet {
+                    for &d in &alphabet {
+                        let rest = [a, b, c, d];
+                        assert_eq!(match_punct(rest), munch(&rest), "{:?}", rest);
+                    }
+                }
+            }
+        }
+        assert_eq!(match_punct([b'>', b'>', b'>', 0]), Some(">>>"));
+        assert_eq!(match_punct([b'.', b'.', 0, 0]), Some("."));
+    }
+
+    #[test]
+    fn token_offsets_are_utf8_byte_offsets() {
+        let src = "é /*π*/ 𝒳ab \"ü\" `t` x";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{}", e.message));
+        let spans: Vec<&str> = tokens
+            .iter()
+            .filter(|t| !matches!(t.kind, Tok::Eof))
+            .map(|t| &src[t.start as usize..t.end as usize])
+            .collect();
+        assert_eq!(spans, ["é", "𝒳ab", "\"ü\"", "`t`", "x"]);
+    }
+
+    #[test]
+    fn whitespace_runs_and_comments_track_lines_and_line_terminators() {
+        let src = format!("a{}\n\t b /* x\n y */ c // z\u{2028}d\r\ne", " ".repeat(37));
+        let tokens = tokenize(&src).unwrap_or_else(|e| panic!("{}", e.message));
+        let lines: Vec<(u32, bool)> = tokens.iter().map(|t| (t.line, t.nl_before)).collect();
+        assert_eq!(
+            lines,
+            [
+                (1, false),
+                (2, true),
+                (3, true),
+                (3, true),
+                (4, true),
+                (4, false)
+            ]
+        );
+        let error = tokenize("a /* never closed\n")
+            .err()
+            .expect("unterminated comment");
+        assert!(error.at_eof);
+        assert_eq!(error.line, 2);
+    }
 }

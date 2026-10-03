@@ -4083,6 +4083,53 @@ fn update_operators_preserve_division_and_regexp_lexical_goals() {
 }
 
 #[test]
+fn source_text_and_tokens_survive_utf8_scanning_in_all_tiers() {
+    // ECMA-262 §20.2.3.5 Function.prototype.toString returns the exact [[SourceText]] code
+    // points. Non-ASCII text (2- and 4-byte UTF-8) before and inside a function must not shift
+    // the slice; identifier, string, comment and whitespace scanning must agree on boundaries.
+    let cases = [
+        (
+            "var é = 'ü'; function fé(ä) { return ä + 'π\\u00e9'; } fé.toString()",
+            "function fé(ä) { return ä + 'π\\u00e9'; }",
+        ),
+        (
+            "'𝒳𝒴'; class 𝒞 { m𝒳() { return '𝒵' } } 𝒞.toString() + '|' + new 𝒞().m𝒳.toString()",
+            "class 𝒞 { m𝒳() { return '𝒵' } }|m𝒳() { return '𝒵' }",
+        ),
+        (
+            "let o = { get π() { return 'ü' } }; Object.getOwnPropertyDescriptor(o, 'π').get.toString()",
+            "get π() { return 'ü' }",
+        ),
+        ("var a\\u0062c = 1, abcé = 2; String(abc + abcé)", "3"),
+        ("class C { #x = 'p'; g() { return this.#x } } new C().g()", "p"),
+        ("'a\u{2028}b\u{2029}c'.length + ':' + `x\r\ny`.length + ':' + String.raw`x\r\ny`.length", "5:3:3"),
+        ("let n = 6; n /*\u{2028}*/ ++/x/.lastIndex === 1 && n === 6", "true"),
+        ("let n = 6; n // comment\u{2029}++/x/.lastIndex === 1 && n === 6", "true"),
+        ("\t\u{000B}\u{000C} \u{00A0}\u{FEFF}\u{3000}1 +\u{2003}2", "3"),
+        ("x = 0xF_F + 0o1_7 + 0b1_0 + 1_0.5e0_1; String(x)", "377"),
+        ("String(010 + 08 + .5 + 1e1)", "26.5"),
+        ("a = 5; a >>>= 1; a **= 2; a ??= 1; a ||= 0; a &&= a + 0.5; String(a ? .5 : .3)", "0.5"),
+    ];
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for (source, expected) in cases {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(run_in(&mut engine, source), expected, "{tier:?}: {source}");
+        }
+        // A padded indirect eval (Cloudflare's challenge evaluates megabyte-long space runs).
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let padded = format!("(0, eval)('{}0, 7' + ' '.repeat(9))", " ".repeat(100_003));
+        assert_eq!(run_in(&mut engine, &padded), "7", "{tier:?}");
+    }
+}
+
+#[test]
 fn regex_literal_can_begin_a_control_statement_body() {
     // ECMA-262 uses the InputElementRegExp lexical goal after a control-statement head. This exact
     // brace-free for-of shape is emitted by Archive.org's production bundle.
