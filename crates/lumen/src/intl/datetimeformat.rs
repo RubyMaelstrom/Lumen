@@ -426,7 +426,8 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     let time_zone = {
         let v = ab(i.get_member(&options, "timeZone"))?;
         if matches!(v, Value::Undefined) {
-            "UTC".to_string()
+            // ECMA-402 #sec-createdatetimeformat: SystemTimeZoneIdentifier().
+            crate::builtins::system_time_zone().to_string()
         } else {
             let raw = ab(i.to_string(&v))?.to_string();
             match canonicalize_time_zone(&raw) {
@@ -1562,6 +1563,7 @@ fn build_range_parts(
 }
 
 fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
+    let instant_sec = (ms / 1000.0).floor() as i64;
     // An absolute instant (number/Date kind 0, Temporal.Instant kind 6) is shifted into the
     // formatter's time zone; Temporal wall-clock values (kinds 1-5) already carry their local time.
     let ms = if kind == 0 || kind == 6 {
@@ -2015,10 +2017,19 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
     if let Some(style) = get("__dtf_tzname") {
         let tz = match o.borrow().props.get("__dtf_tz").map(|p| p.value()) {
             Some(Value::Str(s)) => s.to_string(),
-            _ => "UTC".to_string(),
+            _ => crate::builtins::system_time_zone().to_string(),
         };
-        let name = tz_display_name(&tz, &style);
-        if !parts.is_empty() {
+        let name = tz_display_name(&tz, &style, instant_sec);
+        // CLDR joins a zone name to a time with a space and to a date alone
+        // with ", " ("10/3/2026, Central European Summer Time").
+        let after_date = parts
+            .iter()
+            .rev()
+            .find(|(kind, _)| *kind != "literal")
+            .is_some_and(|(kind, _)| matches!(*kind, "year" | "month" | "day" | "weekday" | "era"));
+        if after_date {
+            lit(&mut parts, ", ");
+        } else if !parts.is_empty() {
             lit(&mut parts, " ");
         }
         parts.push(("timeZoneName", name));
@@ -2132,8 +2143,8 @@ fn day_period_word(h: u32, width: &str) -> &'static str {
     }
 }
 
-/// The time-zone display name for the (UTC) zone under a `timeZoneName` style.
-fn tz_display_name(tz: &str, style: &str) -> String {
+/// The time-zone display name for `tz` at `epoch_sec` under a `timeZoneName` style.
+fn tz_display_name(tz: &str, style: &str, epoch_sec: i64) -> String {
     if tz == "UTC" {
         return match style {
             "long" | "longGeneric" => "Coordinated Universal Time",
@@ -2157,36 +2168,40 @@ fn tz_display_name(tz: &str, style: &str) -> String {
             format!("GMT{sign}{h}:{m:02}")
         };
     }
-    // Named zones: the short styles render a generic GMT offset; the long styles use the CLDR
-    // standard-time metazone name where known, else the canonical identifier.
+    // Named zones: the short styles render the GMT offset at the instant; the long styles use
+    // the CLDR metazone name (standard or daylight at the instant) where known, else the
+    // canonical identifier.
     let canon = crate::tz::canonicalize(tz).unwrap_or(tz).to_string();
+    let off = crate::tz::offset_at(&canon, epoch_sec).unwrap_or(0) as i64;
+    let sign = if off < 0 { "-" } else { "+" };
+    let (h, m) = (off.abs() / 3600, (off.abs() % 3600) / 60);
+    if let Some(name) = crate::tz::long_name(&canon, epoch_sec) {
+        match style {
+            "long" => return name.to_string(),
+            "longGeneric" => {
+                return ["Standard Time", "Summer Time", "Daylight Time"]
+                    .iter()
+                    .find_map(|suffix| name.strip_suffix(suffix))
+                    .map_or_else(|| name.to_string(), |stem| format!("{stem}Time"));
+            }
+            _ => {}
+        }
+    }
     match style {
+        "longOffset" if off == 0 => "GMT".to_string(),
+        "longOffset" => format!("GMT{sign}{h:02}:{m:02}"),
         "short" | "shortOffset" | "shortGeneric" => {
-            let off = crate::tz::offset_at(&canon, 0).unwrap_or(0) as i64;
-            let sign = if off < 0 { "-" } else { "+" };
-            let a = off.abs();
-            let (h, m) = (a / 3600, (a % 3600) / 60);
-            if m == 0 {
+            if off == 0 {
+                "GMT".to_string()
+            } else if m == 0 {
                 format!("GMT{sign}{h}")
             } else {
                 format!("GMT{sign}{h}:{m:02}")
             }
         }
-        _ => match canon.as_str() {
-            "Europe/Vienna" | "Europe/Berlin" | "Europe/Paris" | "Europe/Rome"
-            | "Europe/Madrid" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Prague"
-            | "Europe/Warsaw" | "Europe/Budapest" | "Europe/Stockholm" | "Europe/Oslo"
-            | "Europe/Copenhagen" | "Europe/Zurich" => "Central European Standard Time".to_string(),
-            "Europe/London" => "Greenwich Mean Time".to_string(),
-            "America/New_York" => "Eastern Standard Time".to_string(),
-            "America/Chicago" => "Central Standard Time".to_string(),
-            "America/Denver" => "Mountain Standard Time".to_string(),
-            "America/Los_Angeles" => "Pacific Standard Time".to_string(),
-            "Asia/Tokyo" => "Japan Standard Time".to_string(),
-            "Asia/Shanghai" => "China Standard Time".to_string(),
-            "Asia/Kolkata" => "India Standard Time".to_string(),
-            _ => canon,
-        },
+        // A zone without a CLDR name: its GMT offset, as in other engines.
+        _ if off == 0 => "GMT".to_string(),
+        _ => format!("GMT{sign}{h:02}:{m:02}"),
     }
 }
 

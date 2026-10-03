@@ -3060,6 +3060,91 @@ fn map_hash_index_tracks_large_delete_and_reinsert_workloads() {
 }
 
 #[test]
+fn dates_follow_the_system_time_zone() {
+    // ECMA-262 #sec-localtime, #sec-utc-t, #sec-timezoneestring and
+    // #sec-date-time-string-format over SystemTimeZoneIdentifier; the expected
+    // values are V8's (Node) with TZ set to each zone.
+    struct Zone;
+    impl Drop for Zone {
+        fn drop(&mut self) {
+            crate::builtins::TEST_TIME_ZONE.with(|zone| zone.set(None));
+        }
+    }
+    let _reset = Zone;
+    crate::builtins::TEST_TIME_ZONE.with(|zone| zone.set(Some("Europe/Berlin")));
+    let d = "new Date(Date.UTC(2026, 9, 3, 12, 34, 56))";
+    assert_eq!(
+        run(&format!("{d}.toString()")),
+        "Sat Oct 03 2026 14:34:56 GMT+0200 (Central European Summer Time)"
+    );
+    assert_eq!(
+        run(&format!("{d}.getHours() + ':' + {d}.getUTCHours()")),
+        "14:12"
+    );
+    assert_eq!(run(&format!("{d}.getTimezoneOffset()")), "-120");
+    assert_eq!(run("new Date(2026, 0, 15).getTimezoneOffset()"), "-60");
+    assert_eq!(
+        run("new Date(2026, 9, 3, 12).toISOString()"),
+        "2026-10-03T10:00:00.000Z"
+    );
+    // A skipped local time reads with the earlier offset; a repeated one is
+    // its earlier instant.
+    assert_eq!(
+        run("new Date(2026, 2, 29, 2, 30).toString()"),
+        "Sun Mar 29 2026 03:30:00 GMT+0200 (Central European Summer Time)"
+    );
+    assert_eq!(
+        run("new Date(2026, 9, 25, 2, 30).toISOString()"),
+        "2026-10-25T00:30:00.000Z"
+    );
+    assert_eq!(run("Date.parse('2026-10-03T12:00:00')"), "1791021600000");
+    assert_eq!(run("Date.parse('2026-10-03')"), "1790985600000");
+    assert_eq!(run("Date.parse('Oct 3 2026 12:00:00')"), "1791021600000");
+    assert_eq!(
+        run("Date.parse('Sat, 03 Oct 2026 12:00:00 GMT')"),
+        "1791028800000"
+    );
+    assert_eq!(
+        run("var e = new Date(2026, 9, 3, 12); e.setHours(23); e.toISOString()"),
+        "2026-10-03T21:00:00.000Z"
+    );
+    assert_eq!(
+        run("var f = new Date(NaN); f.setFullYear(2020); f.toISOString()"),
+        "2019-12-31T23:00:00.000Z"
+    );
+    assert_eq!(
+        run("Intl.DateTimeFormat().resolvedOptions().timeZone"),
+        "Europe/Berlin"
+    );
+    assert_eq!(
+        run(&format!(
+            "new Intl.DateTimeFormat('en-US', {{timeZoneName: 'long'}}).format({d})"
+        )),
+        "10/3/2026, Central European Summer Time"
+    );
+    assert_eq!(
+        run(&format!(
+            "new Intl.DateTimeFormat('en-US', {{timeZoneName: 'short', hour: 'numeric'}}).format({d})"
+        )),
+        "2 PM GMT+2"
+    );
+    crate::builtins::TEST_TIME_ZONE.with(|zone| zone.set(Some("America/New_York")));
+    assert_eq!(
+        run("new Date(Date.UTC(2026, 2, 8, 7, 30)).toString()"),
+        "Sun Mar 08 2026 03:30:00 GMT-0400 (Eastern Daylight Time)"
+    );
+    assert_eq!(
+        run("new Date(2026, 2, 8, 2, 30).toISOString()"),
+        "2026-03-08T07:30:00.000Z"
+    );
+    assert_eq!(
+        run("new Date(2026, 10, 1, 1, 30).toISOString()"),
+        "2026-11-01T05:30:00.000Z"
+    );
+    assert_eq!(run("new Date(2026, 0, 15).getTimezoneOffset()"), "300");
+}
+
+#[test]
 fn dates() {
     assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
     assert_eq!(

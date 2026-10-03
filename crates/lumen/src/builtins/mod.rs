@@ -17,6 +17,9 @@ mod collections;
 pub(crate) use collections::{map_get, map_set, weak_map_get};
 mod dataview;
 mod date;
+pub(crate) use date::system_time_zone;
+#[cfg(test)]
+pub(crate) use date::TEST_TIME_ZONE;
 mod disposable;
 mod errors;
 mod function_proto;
