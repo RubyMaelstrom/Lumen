@@ -4083,6 +4083,43 @@ fn update_operators_preserve_division_and_regexp_lexical_goals() {
 }
 
 #[test]
+fn remainder_matches_number_remainder_in_all_tiers() {
+    // ECMA-262 §6.1.6.1.6 Number::remainder: the sign of a zero result is the dividend's, a zero
+    // divisor gives NaN, a ±0 dividend is returned unchanged, and non-integral or out-of-Int32
+    // operands use the exact real remainder. The loop makes the compiled tiers run each pair
+    // through their numeric path more than once.
+    let source = r#"
+        function rem(a, b) { return a % b; }
+        function show(v) { return Object.is(v, -0) ? '-0' : String(v); }
+        const pairs = [
+            [7, 3], [-7, 3], [7, -3], [-7, -3], [6, 3], [-6, 3], [6, -3], [-6, -3],
+            [0, 5], [-0, 5], [0, -5], [-0, -5], [5, 0], [5, -0], [0, 0], [-2147483648, -1],
+            [-2147483648, 2147483647], [2147483647, -2147483648], [2147483648, 7], [-4294967296, 3],
+            [5.5, 2], [-5.5, 2], [5, 2.5], [1e300, 7], [NaN, 3], [3, NaN], [Infinity, 2],
+            [2, Infinity], [-2, -Infinity], [true, 2], ['9', 4], [12, '5'], [1 << 30, 3],
+        ];
+        let out = [];
+        for (let round = 0; round < 3; round++) {
+            out = [];
+            for (const [a, b] of pairs) out.push(show(rem(a, b)));
+        }
+        out.join(',')
+    "#;
+    let expected = "1,-1,1,-1,0,-0,0,-0,0,-0,0,-0,NaN,NaN,NaN,-0,-1,2147483647,2,-1,\
+                    1.5,-1.5,0,1,NaN,NaN,NaN,2,-2,1,1,2,1";
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), expected, "{tier:?}");
+    }
+}
+
+#[test]
 fn string_length_counts_utf16_units_in_all_tiers() {
     // ECMA-262 §10.4.3.5 StringGetOwnProperty: `length` is the String value's own data property
     // (UTF-16 code units). It shadows String.prototype, whatever is defined there. Cover borrowed

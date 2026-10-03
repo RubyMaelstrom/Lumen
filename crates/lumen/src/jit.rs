@@ -2598,6 +2598,14 @@ mod asm {
         pub fn lsl_reg(&mut self, rd: u32, rn: u32, rm: u32) {
             self.emit(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd);
         }
+        /// sdiv wd, wn, wm (truncating; wn/0 = 0 and i32::MIN/-1 = i32::MIN, no trap)
+        pub fn sdiv_w(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x1AC0_0C00 | (rm << 16) | (rn << 5) | rd);
+        }
+        /// msub wd, wn, wm, wa  (wd = wa - wn*wm, wrapping)
+        pub fn msub_w(&mut self, rd: u32, rn: u32, rm: u32, ra: u32) {
+            self.emit(0x1B00_8000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+        }
         /// madd xd, xn, xm, xa  (xd = xn*xm + xa)
         pub fn madd(&mut self, rd: u32, rn: u32, rm: u32, ra: u32) {
             self.emit(0x9B00_0000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);

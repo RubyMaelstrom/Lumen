@@ -362,6 +362,42 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
+        Op::Mod if fast & 1 != 0 => {
+            // Number::remainder (ECMA-262 §6.1.6.1.6) of Int32-valued operands is the truncated
+            // integer remainder, except that a zero result takes the dividend's sign. Zero
+            // divisors (NaN), ±0 dividends (the result is the dividend itself), negative exact
+            // multiples (-0) and every non-Int32 operand keep the checked operation.
+            let slow = a.new_label();
+            let done = a.new_label();
+            let nonzero = a.new_label();
+            emit_exec_word_load(a, 9, 20, -16);
+            emit_exec_word_load(a, 10, 20, -8);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
+            emit_exec_number_guard(a, 10, 1, 11, slow);
+            a.fcvtzs_w_d(9, 0);
+            a.scvtf_d_w(2, 9);
+            a.fcmp(0, 2);
+            a.b_cond(C_NE, slow);
+            a.fcvtzs_w_d(10, 1);
+            a.scvtf_d_w(3, 10);
+            a.fcmp(1, 3);
+            a.b_cond(C_NE, slow);
+            a.cbz(10, false, slow);
+            a.cbz(9, false, slow);
+            a.sdiv_w(11, 9, 10);
+            a.msub_w(12, 11, 10, 9);
+            a.cbnz(12, false, nonzero);
+            a.cmp_imm_w(9, 0);
+            a.b_cond(C_MI, slow);
+            a.bind(nonzero);
+            a.scvtf_d_w(0, 12);
+            a.stur_d(0, 20, -16);
+            a.sub_imm(20, 20, 8);
+            a.b(done);
+            a.bind(slow);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
+        }
         Op::BitNot if fast & 1 != 0 => {
             let slow = a.new_label();
             let done = a.new_label();
