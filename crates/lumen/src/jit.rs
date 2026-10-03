@@ -2001,6 +2001,7 @@ mod shared_stub_tests {
         let mut keys = vec![
             SharedStub::NameValuePtr { packed_ok: false }.key(),
             SharedStub::NameValuePtr { packed_ok: true }.key(),
+            SharedStub::NameValuePtrIn.key(),
         ];
         #[cfg(all(
             target_arch = "aarch64",
@@ -4624,9 +4625,15 @@ fn compile_entry(
             } else {
                 Vec::new()
             },
-            needs_global: ops
-                .iter()
-                .any(|o| matches!(o, Op::LoadName(..) | Op::LoadNameForCall(..))),
+            needs_global: ops.iter().any(|o| {
+                matches!(
+                    o,
+                    Op::LoadName(..)
+                        | Op::LoadNameForCall(..)
+                        | Op::LoadNameIn(..)
+                        | Op::LoadNameForCallIn(..)
+                )
+            }),
             mem,
             len,
             pc_offsets,
@@ -9645,6 +9652,42 @@ fn emit_load_name_inline(
     a.bind(done);
 }
 
+/// `Op::LoadNameIn` / `Op::LoadNameForCallIn`: [`emit_load_name_inline`] resolving from a fixed
+/// inline target's [[Environment]] (`env`, an `Rc::as_ptr` scope address). Emitted at each site
+/// (in the chunk's shared fixed-environment name stub unless stubs are inlined).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_load_name_in_inline(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    cache_ptr: usize,
+    preferred_number: Option<u64>,
+    env: u64,
+    pc: u32,
+    l_unwind: usize,
+    for_call: bool,
+) {
+    let slow = a.new_label();
+    let done = a.new_label();
+    a.mov_imm64(12, cache_ptr as u64);
+    a.mov_imm64(9, env);
+    if use_shared_stub(a) {
+        let stub = a.shared_stub(SharedStub::NameValuePtrIn.key());
+        a.bl_label(stub);
+        a.cbz(9, false, slow);
+    } else {
+        emit_name_ic_value_ptr_in(a, layout, slow, true, NameEnv::InX9);
+    }
+    emit_load_name_value(a, layout, preferred_number, slow, for_call);
+    a.b(done);
+    a.bind(slow);
+    emit_exec(a, pc, l_unwind);
+    a.bind(done);
+}
+
 /// Clone from a checked x14 value address into the canonical operand stack (x7=storage kind).
 #[cfg(all(
     target_arch = "aarch64",
@@ -9707,6 +9750,9 @@ fn emit_load_name_value(
 enum SharedStub {
     /// [`emit_name_ic_value_ptr_body`]: x12 = `NameIc` cell → w9 = hit, x14 = value, x7 = kind.
     NameValuePtr { packed_ok: bool },
+    /// [`emit_name_ic_value_ptr_in`] from the fixed scope in x9 (`Op::LoadNameIn`), with the
+    /// outputs of [`SharedStub::NameValuePtr`].
+    NameValuePtrIn,
     /// [`emit_prop_way_loop`]: x8 = a site's first `IcState` cell, x10 = receiver → w9 = 0 or a
     /// `PROP_PROBE_*` landing, with x11 = holder base and x13 = slot for the data landings.
     #[cfg(all(
@@ -9786,10 +9832,12 @@ impl SharedStub {
     const PROP_WAYS: u32 = 0x100;
     const CALL_SECONDARY: u32 = 0x200;
     const DIRECT_CALL: u32 = 0x300;
+    const NAME_VALUE_PTR_IN: u32 = 0x400;
 
     fn key(self) -> u32 {
         match self {
             SharedStub::NameValuePtr { packed_ok } => Self::NAME_VALUE_PTR | u32::from(packed_ok),
+            SharedStub::NameValuePtrIn => Self::NAME_VALUE_PTR_IN,
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -9822,6 +9870,7 @@ impl SharedStub {
             Self::NAME_VALUE_PTR => SharedStub::NameValuePtr {
                 packed_ok: key & 1 != 0,
             },
+            Self::NAME_VALUE_PTR_IN => SharedStub::NameValuePtrIn,
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -9856,6 +9905,15 @@ impl SharedStub {
             SharedStub::NameValuePtr { packed_ok } => {
                 let miss = a.new_label();
                 emit_name_ic_value_ptr_body(a, layout, miss, packed_ok);
+                a.movz(9, 1, 0);
+                a.ret();
+                a.bind(miss);
+                a.movz(9, 0, 0);
+                a.ret();
+            }
+            SharedStub::NameValuePtrIn => {
+                let miss = a.new_label();
+                emit_name_ic_value_ptr_in(a, layout, miss, true, NameEnv::InX9);
                 a.movz(9, 1, 0);
                 a.ret();
                 a.bind(miss);
@@ -10057,6 +10115,33 @@ fn emit_name_ic_value_ptr_body(
     slow: usize,
     packed_ok: bool,
 ) {
+    emit_name_ic_value_ptr_in(a, layout, slow, packed_ok, NameEnv::Running);
+}
+
+/// Where a free-name cache probe starts its Environment Record walk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameEnv {
+    /// The running environment (`ctx.env_raw`).
+    Running,
+    /// A fixed scope (`Rc::as_ptr`) the site already placed in x9 (`Op::LoadNameIn`).
+    InX9,
+}
+
+/// [`emit_name_ic_value_ptr_body`] with the starting Environment Record either the running one
+/// or a fixed scope in x9 (`Op::LoadNameIn`: an inline target's [[Environment]], alive while
+/// its identity guard holds). A fixed scope derives the depth-1 parent from its live `parent`
+/// field rather than the frame's cached one.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_name_ic_value_ptr_in(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    slow: usize,
+    packed_ok: bool,
+    env: NameEnv,
+) {
     use crate::bytecode::{
         NAME_IC_OFF_ACT_GEN, NAME_IC_OFF_BINDING, NAME_IC_OFF_ENV, NAME_IC_OFF_GEN,
     };
@@ -10071,7 +10156,9 @@ fn emit_name_ic_value_ptr_body(
     let g_es = layout.entry_size as u64;
     let none_tag = layout.exotic_none_tag as u32;
 
-    a.ldr_imm(9, 19, 40); // ctx.env_raw
+    if env == NameEnv::Running {
+        a.ldr_imm(9, 19, 40); // ctx.env_raw
+    }
     a.ldrb_imm(17, 9, layout.scope_with as u32);
     a.cmp_imm_w(17, layout.scope_with_none as u32);
     a.b_cond(C_NE, slow);
@@ -10193,7 +10280,22 @@ fn emit_name_ic_value_ptr_body(
     a.bind(activation_not_saturated);
     a.cmp_reg_w(11, 15);
     a.b_cond(C_NE, slow);
-    a.ldr_imm(14, 19, std::mem::offset_of!(JitCtx, env_parent_raw) as u32);
+    if env == NameEnv::InX9 {
+        // The fixed scope's live parent (stored Rc pointer → `Rc::as_ptr`).
+        if layout.scope_parent_valid
+            && layout.scope_parent.is_multiple_of(8)
+            && layout.scope_parent / 8 < 4096
+            && layout.scope_data_off < 4096
+        {
+            a.ldr_imm(14, 9, layout.scope_parent as u32);
+            a.cbz(14, true, slow);
+            a.add_imm(14, 14, layout.scope_data_off as u32);
+        } else {
+            a.b(slow);
+        }
+    } else {
+        a.ldr_imm(14, 19, std::mem::offset_of!(JitCtx, env_parent_raw) as u32);
+    }
     a.cbz(14, true, slow);
     a.cbz(16, false, parent_tagged);
     a.sub_imm(10, 10, 4); // strip the optional layout tag

@@ -223,11 +223,12 @@ fn hot_self_hosted_methods_keep_their_intrinsics_when_spliced() {
     }
 }
 
-/// A splice compiles the callee's declarations in fresh slots without touching the caller's
-/// capture analysis: a callee `let n` spliced before the caller's own captured block `let n`
-/// must not consume that binding's homed declaration (even when the splice is abandoned).
+/// A spliced callee resolves its free names from its own [[Environment]] (ECMA-262
+/// PrepareForOrdinaryCall/ResolveBinding), never through the caller's scope chain: here the
+/// caller's enclosing activation captures its own `shadowed`, which a global-closure callee
+/// must not observe.
 #[test]
-fn spliced_lexicals_leave_the_callers_homed_block_bindings_alone() {
+fn spliced_global_closure_reads_ignore_caller_environment_bindings() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -236,9 +237,206 @@ fn spliced_lexicals_leave_the_callers_homed_block_bindings_alone() {
             evaluate(
                 &mut engine,
                 r#"
+            var shadowed = 1;
+            function globalRead() { return shadowed; }
+            var shadowCaller;
+            function outer() {
+                var shadowed = 2;
+                function peek() { return shadowed; }
+                shadowCaller = function () {
+                    var s = 0;
+                    for (var k = 0; k < 10; k++) s += globalRead();
+                    return s;
+                };
+                var r = 0;
+                for (var j = 0; j < 500; j++) r = shadowCaller();
+                return r + '|' + peek();
+            }
+            var first = outer();
+            shadowed = 5;
+            first + '|' + shadowCaller();
+        "#
+            ),
+            "10|2|50",
+            "{tier:?}"
+        );
+    }
+}
+
+/// The obfuscated string-table accessor: a callee that reads a binding of its defining
+/// function's scope, whose own callee was reassigned to a closure over another activation.
+/// Spliced reads stay live, and replacing either function falls back to the generic call.
+#[test]
+fn spliced_closures_over_non_global_environments_read_live_bindings() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            var table, setTable, decode, replaceTable;
+            (function () {
+                function I(Ns) {
+                    Ns = ['a', 'bb', 'ccc', 'dddd'];
+                    I = function () { return Ns; };
+                    setTable = function (next) { Ns = next; };
+                    return I();
+                }
+                function Q(q, n, B, Y) { return q = q - 218, B = I(), Y = B[q], Y; }
+                decode = function (k) { return Q(218 + (k & 3)).length; };
+                replaceTable = function () { I = function () { return ['zzzzz', 'z', 'z', 'z']; }; };
+            })();
+            function hotDecode() {
+                var s = 0;
+                for (var k = 0; k < 8; k++) s += decode(k);
+                return s;
+            }
+            var warm = 0;
+            for (var j = 0; j < 400; j++) warm += hotDecode();
+            setTable(['x', 'x', 'x', 'x']);
+            var live = hotDecode();
+            replaceTable();
+            var replaced = hotDecode();
+            warm + '|' + live + '|' + replaced;
+        "#
+            ),
+            "8000|8|16",
+            "{tier:?}"
+        );
+        if tier == Tier::Jit {
+            require_hot_native(&mut engine, "hotDecode", true);
+        }
+    }
+}
+
+/// Each closure instance has its own [[Environment]]: a splice guarded on one instance must
+/// not answer for another instance of the same function.
+#[test]
+fn spliced_closure_reads_follow_the_called_instance() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            function makeReader(v) { return function () { return v; }; }
+            var readers = [makeReader(1), makeReader(10)];
+            function readAt(i) { var f = readers[i & 1]; return f() + f(); }
+            var s = 0;
+            for (var k = 0; k < 1000; k++) s += readAt(k < 900 ? 0 : k);
+            s;
+        "#
+            ),
+            "2900",
+            "{tier:?}"
+        );
+    }
+}
+
+/// Free names a callee resolves through a `with` object keep their object Environment Record
+/// semantics when spliced, including the with-object receiver of a call.
+#[test]
+fn spliced_reads_through_with_environments_keep_object_bindings() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            var scopeObject = { base: 3, twice: function () { return this.base * 2; } };
+            var readBase, callTwice;
+            with (scopeObject) {
+                readBase = function () { return base; };
+                callTwice = function () { return twice(); };
+            }
+            function hotWith() { return readBase() + callTwice(); }
+            var s = 0;
+            for (var k = 0; k < 500; k++) s += hotWith();
+            scopeObject.base = 4;
+            s + '|' + hotWith();
+        "#
+            ),
+            "4500|12",
+            "{tier:?}"
+        );
+    }
+}
+
+/// Large callers exhaust the shared splice budget by their own size; small callees still
+/// splice from their separate budget.
+#[test]
+fn small_callees_splice_into_callers_beyond_the_shared_budget() {
+    let mut body = String::new();
+    for k in 0..48 {
+        body.push_str(&format!("acc = acc + get({k}) + (x & {k});\n"));
+    }
+    let source = format!(
+        r#"
+        var store = [];
+        for (var i = 0; i < 64; i++) store.push(i * 2);
+        function get(k) {{ return store[k]; }}
+        function bigCaller(x) {{ var acc = 0;
+        {body}
+        return acc; }}
+        var t = 0;
+        for (var j = 0; j < 400; j++) t += bigCaller(j);
+        t;
+    "#
+    );
+    let mut expected = 0f64;
+    for j in 0..400u32 {
+        for k in 0..48u32 {
+            expected += f64::from(k * 2) + f64::from(j & k);
+        }
+    }
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(&mut engine, &source),
+            expected.to_string(),
+            "{tier:?}"
+        );
+        if tier == Tier::Jit {
+            let caller = function(&mut engine, "bigCaller");
+            let chunk = caller
+                .code
+                .get()
+                .and_then(Option::as_ref)
+                .expect("compiled");
+            assert!(
+                chunk.jit_ops().len() > 320,
+                "the fixture must exceed the shared budget"
+            );
+            require_hot_native(&mut engine, "bigCaller", true);
+        }
+    }
+}
+
+/// A splice compiles the callee's declarations in fresh slots without touching the caller's
+/// capture analysis: a callee `let n` spliced before the caller's own captured block `let n`
+/// must not consume that binding's homed declaration (even when the splice is abandoned).
+#[test]
+fn spliced_lexicals_leave_the_callers_homed_block_bindings_alone() {
+    // A global callee, and the closure form Glimmer uses (inlinable since splices resolve
+    // free names from the callee's environment).
+    let definitions = [
+        "function Df(t){if(!Sf(t))return!1;let n=t[0];return n===30||n===35}",
+        "function Cf(e){return t=>{if(!Sf(t))return!1;let n=t[0];return n===30||n===e}}\n\
+         const Df=Cf(35);",
+    ];
+    for definition in definitions {
+        let source = r#"
             'use strict';
             function Sf(e){return Array.isArray(e)&&e.length===2}
-            function Df(t){if(!Sf(t))return!1;let n=t[0];return n===30||n===35}
+            DEFINITION
             var out = [];
             function mp(e,a){a()}
             var homedCaller=(e,t)=>{if(Df(t))e(1);else if(t[0]===6){let n=t[1];
@@ -252,9 +450,16 @@ fn spliced_lexicals_leave_the_callers_homed_block_bindings_alone() {
             }
             out.length + '|' + out.slice(-6).join(',');
         "#
-            ),
-            "8000|7,z,0,1,2,7,z,0",
-            "{tier:?}"
-        );
+        .replace("DEFINITION", definition);
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                evaluate(&mut engine, &source),
+                "8000|7,z,0,1,2,7,z,0",
+                "{tier:?} {definition}"
+            );
+        }
     }
 }

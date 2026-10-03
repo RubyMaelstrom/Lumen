@@ -12021,7 +12021,7 @@ impl Interp {
         let runs = chunk_ref.jit_runs.get().saturating_add(1);
         chunk_ref.jit_runs.set(runs);
         if chunk_ref.inline_retry_due(runs) {
-            self.try_inline_recompile(ic.func, chunk_ref, ic.env);
+            self.try_inline_recompile(ic.func, chunk_ref, ic.realm);
         }
     }
 
@@ -12391,7 +12391,8 @@ impl Interp {
         &mut self,
         func: *const crate::ast::Function,
         chunk: &crate::bytecode::Chunk,
-        caller_env: *const RefCell<Scope>,
+        // The function's [[Realm]] (`UserCallable::realm`), as its call cache recorded it.
+        realm: usize,
     ) {
         if func.is_null() {
             crate::jit::perf_inline_suppressed();
@@ -12410,8 +12411,7 @@ impl Interp {
             return;
         }
         crate::jit::perf_inline_attempt();
-        let global_env = self.global_env.clone();
-        let plan = crate::bytecode::plan_inlines(chunk, func, &global_env, caller_env);
+        let plan = crate::bytecode::plan_inlines(chunk, func, realm);
         if plan.is_empty() {
             crate::jit::perf_inline_empty_plan();
             if std::env::var_os("LUMEN_TIER_LOG").is_some() {

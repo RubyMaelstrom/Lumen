@@ -520,6 +520,8 @@ fn baseline_bytes(op: &Op) -> usize {
         Op::Call(..) | Op::CallWithThis(..) | Op::New(..) => 2048,
         Op::LoadName(..)
         | Op::LoadNameForCall(..)
+        | Op::LoadNameIn(..)
+        | Op::LoadNameForCallIn(..)
         | Op::LoadCap(..)
         | Op::StoreNameCached(..)
         | Op::UpdateNameCached(..)
@@ -575,6 +577,8 @@ fn frame_effect(op: &Op) -> FrameEffect {
         | Op::SetElemDrop
         | Op::LoadName(..)
         | Op::LoadNameForCall(..)
+        | Op::LoadNameIn(..)
+        | Op::LoadNameForCallIn(..)
         | Op::UpdateNameCached(..)
         | Op::StoreNameCached(..)
         | Op::LoadCap(..)

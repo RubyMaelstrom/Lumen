@@ -187,6 +187,25 @@ pub(super) fn emit(
                 false,
             );
         }
+        Op::LoadNameIn(_, cache, target) | Op::LoadNameForCallIn(_, cache, target)
+            if fast & 8192 != 0 && load_name_inlinable(layout) =>
+        {
+            // A dead pin's guard always takes the generic call; this site is then unreachable
+            // and keeps the checked operation.
+            let Some(env) = chunk.inline_target_env(*target) else {
+                return false;
+            };
+            emit_load_name_in_inline(
+                a,
+                layout,
+                chunk.jit_name_cache_ptr(*cache),
+                chunk.jit_name_number(*cache),
+                std::rc::Rc::as_ptr(&env) as u64,
+                pc as u32,
+                unwind,
+                matches!(op, Op::LoadNameForCallIn(..)),
+            );
+        }
         Op::LoadNameForCall(_, cache) if fast & 8192 != 0 && load_name_inlinable(layout) => {
             emit_load_name_inline(
                 a,

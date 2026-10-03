@@ -1147,9 +1147,15 @@ pub(super) fn compile_entry(
             Vec::new()
         },
         max_stack,
-        needs_global: ops
-            .iter()
-            .any(|o| matches!(o, Op::LoadName(..) | Op::LoadNameForCall(..))),
+        needs_global: ops.iter().any(|o| {
+            matches!(
+                o,
+                Op::LoadName(..)
+                    | Op::LoadNameForCall(..)
+                    | Op::LoadNameIn(..)
+                    | Op::LoadNameForCallIn(..)
+            )
+        }),
         executable,
         residency,
         #[cfg(feature = "optimizing-jit")]

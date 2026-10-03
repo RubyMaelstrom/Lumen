@@ -1682,6 +1682,16 @@ pub enum Op {
     /// on mismatch jump to the operand (the generic call op). Operands: `Chunk::inline_targets`
     /// index, jump target.
     InlineGuard(u32, u32),
+    /// [`Op::LoadName`] inside a spliced callee body: ResolveBinding starts at the callee's
+    /// [[Environment]] — the pinned function of `Chunk::inline_targets[target]`, whose identity
+    /// the dominating [`Op::InlineGuard`] proved — not at the caller's running environment.
+    /// A function's [[Environment]] never changes, so the splice reads exactly the binding its
+    /// own call would (ECMA-262 PrepareForOrdinaryCall, ResolveBinding). Operands: name index,
+    /// per-site [`NameIc`] index, inline-target index.
+    LoadNameIn(u32, u32, u32),
+    /// [`Op::LoadNameForCall`] resolved against an inline target's environment (see
+    /// [`Op::LoadNameIn`]).
+    LoadNameForCallIn(u32, u32, u32),
     /// Reset `count` slots starting at `start` to undefined (dropping old values): a spliced
     /// callee's hoisted vars start fresh on every pass through the site.
     ResetSlots(u16, u16),
@@ -6632,16 +6642,16 @@ pub(crate) fn direct_shared_context_enabled() -> bool {
 }
 
 /// Build the speculative-inline plan for a hot chunk: for each monomorphic, filled call site,
-/// the callee qualifies when it is a plain same-strictness function whose compiled body is
-/// small, needs no activation environment, touches no free names, and hides no control-flow
-/// the splice can't reproduce (handlers, closures). The plan keys are the sites' `CallIc`
+/// the callee qualifies when it is a plain same-strictness, same-Realm function whose compiled
+/// body is small, needs no activation environment, and hides no control-flow the splice can't
+/// reproduce (handlers, closures). Its free-name reads resolve from its own [[Environment]]. The plan keys are the sites' `CallIc`
 /// indices, which equal the second compile's caller-level site ordinals (same AST, same
 /// emission order).
 pub(crate) fn plan_inlines(
     chunk: &Chunk,
     caller: &Function,
-    global_env: &crate::interpreter::Env,
-    caller_env: *const std::cell::RefCell<crate::interpreter::Scope>,
+    // The optimized function's [[Realm]] (`UserCallable::realm` identity): splices run in it.
+    realm: usize,
 ) -> crate::fasthash::FastMap<u32, InlinePlanEntry> {
     // Bound the *whole* optimized body rather than stopping after one arbitrary nesting level.
     // OO hot loops tend to be call chains (dispatcher -> virtual method -> small scheduler
@@ -6653,8 +6663,80 @@ pub(crate) fn plan_inlines(
     let limit = env_value!("LUMEN_INLINE_BUDGET")
         .and_then(|v| v.parse().ok())
         .unwrap_or(INLINE_SOURCE_OP_BUDGET);
-    let mut budget = limit.saturating_sub(chunk.ops.len());
-    plan_inlines_at(chunk, caller, global_env, caller_env, 0, &mut budget)
+    let mut budget = InlineBudget {
+        shared: limit.saturating_sub(chunk.ops.len()),
+        small: env_value!("LUMEN_INLINE_SMALL_BUDGET")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(INLINE_SMALL_BUDGET),
+    };
+    plan_inlines_at(chunk, caller, realm, 0, false, &mut budget)
+}
+
+/// Source operations a callee may have to splice from the small-callee budget.
+const INLINE_SMALL_CALLEE_OPS: usize = 16;
+/// Source operations of small callees spliced into one optimized body after the shared budget
+/// is exhausted. Large obfuscated or generated callers (string-table accessors, operator
+/// wrappers) exhaust the shared budget by their own size, yet their hottest calls are to
+/// callees whose splice is no larger than the call sequence it replaces.
+const INLINE_SMALL_BUDGET: usize = 384;
+
+struct InlineBudget {
+    /// Shared by every splice of the optimized body (see [`plan_inlines`]).
+    shared: usize,
+    /// Reserved for callees of at most [`INLINE_SMALL_CALLEE_OPS`] operations.
+    small: usize,
+}
+
+impl InlineBudget {
+    /// Charge a callee of `cost` source operations, preferring the shared budget. The small
+    /// budget admits only splices that cannot grow straight-line code much: leaf callees (no
+    /// call of their own, hence no nested generic-call fallback) or sites that repeat in a loop.
+    /// Straight-line code in large run-few-times callers is instruction-fetch bound, and a
+    /// non-leaf splice there is several times the size of the call it replaces.
+    fn take(&mut self, cost: usize, leaf: bool, in_loop: bool) -> bool {
+        if cost <= self.shared {
+            self.shared -= cost;
+        } else if cost <= INLINE_SMALL_CALLEE_OPS && cost <= self.small && (leaf || in_loop) {
+            self.small -= cost;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn remaining(&self) -> bool {
+        self.shared > 0 || self.small > 0
+    }
+}
+
+/// For each call-cache site of `chunk`, whether its call lies inside a loop (between a backward
+/// branch's target and the branch).
+fn call_sites_in_loops(chunk: &Chunk) -> Vec<bool> {
+    let mut in_loop = vec![false; chunk.call_caches.len()];
+    let mut loops: Vec<(usize, usize)> = Vec::new();
+    for (pc, op) in chunk.ops.iter().enumerate() {
+        if let Op::Jump(t)
+        | Op::JumpIfFalse(t)
+        | Op::JumpIfFalsePeek(t)
+        | Op::JumpIfTruePeek(t)
+        | Op::JumpIfNotNullishPeek(t) = *op
+        {
+            if t as usize <= pc {
+                loops.push((t as usize, pc));
+            }
+        }
+    }
+    if loops.is_empty() {
+        return in_loop;
+    }
+    for (pc, op) in chunk.ops.iter().enumerate() {
+        if let Op::Call(_, c) | Op::CallWithThis(_, c) = *op {
+            if let Some(slot) = in_loop.get_mut(c as usize) {
+                *slot |= loops.iter().any(|&(start, end)| start <= pc && pc <= end);
+            }
+        }
+    }
+    in_loop
 }
 
 /// What the AST splice can preserve without constructing the callee's execution context.
@@ -6664,7 +6746,7 @@ pub(crate) fn plan_inlines(
 enum InlineCapability {
     /// Operands, local slots, constants, and branch targets are regenerated in the caller.
     RemappedFrame,
-    /// Reads require the planner's global/shared-closure proof and shadowing guard.
+    /// Free-name reads: the splice resolves them from the callee's [[Environment]].
     ClosureRead(u32),
     /// A real call is required until the splice explicitly remaps this context/state.
     RequiresCallContext,
@@ -6796,10 +6878,11 @@ fn inline_capability(op: &Op) -> InlineCapability {
 fn plan_inlines_at(
     chunk: &Chunk,
     caller: &Function,
-    global_env: &crate::interpreter::Env,
-    caller_env: *const std::cell::RefCell<crate::interpreter::Scope>,
+    realm: usize,
     depth: u32,
-    budget: &mut usize,
+    // The enclosing splice repeats in a loop of the optimized body.
+    outer_in_loop: bool,
+    budget: &mut InlineBudget,
 ) -> crate::fasthash::FastMap<u32, InlinePlanEntry> {
     const INLINE_MAX_DEPTH: u32 = 3;
     const INLINE_MAX_WAYS: usize = 4;
@@ -6817,7 +6900,9 @@ fn plan_inlines_at(
         }};
     }
     let pins = chunk.call_pins.borrow();
+    let sites_in_loops = call_sites_in_loops(chunk);
     for (idx, site) in chunk.call_caches.iter().enumerate() {
+        let in_loop = outer_in_loop || sites_in_loops[idx];
         let mut filled: Vec<CallIc> = site
             .entries
             .iter()
@@ -6840,13 +6925,13 @@ fn plan_inlines_at(
             let crate::value::Callable::User(user) = &b.call else {
                 continue;
             };
-            // Free names are spliceable when the callee closes directly over the global scope,
-            // or when caller and callee close over the exact same activation. The latter is
-            // guarded again in generated code because an optimized Chunk is shared by every
-            // closure instance created from the same Function AST.
-            let global_closure = Rc::ptr_eq(&user.env, global_env);
-            let callee_env = Rc::as_ptr(&user.env);
-            let shared_closure = !caller_env.is_null() && callee_env == caller_env;
+            // A splice runs in the caller's Realm: its literals, intrinsics and global object
+            // must be the callee's [[Realm]]'s. The callee's free names resolve from its own
+            // [[Environment]] (`Op::LoadNameIn`, behind the identity guard), so any same-Realm
+            // closure qualifies.
+            if user.realm != realm {
+                skip!(idx, "cross-realm callee");
+            }
             let f = &user.func;
             if f.is_strict != caller.is_strict {
                 skip!(idx, "strictness");
@@ -6882,6 +6967,14 @@ fn plan_inlines_at(
             {
                 skip!(idx, "callee operation requires an unremapped call context");
             }
+            // `typeof name` has no environment-redirected form (see `Compiler::inline_env_op`).
+            if callee_chunk
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::TypeofName(_)))
+            {
+                skip!(idx, "typeof of a free name");
+            }
             let mut free_names: Vec<Rc<str>> = Vec::new();
             for op in callee_chunk.ops.iter() {
                 if let InlineCapability::ClosureRead(n) = inline_capability(op) {
@@ -6891,20 +6984,29 @@ fn plan_inlines_at(
                     }
                 }
             }
-            if !free_names.is_empty() && !global_closure && !shared_closure {
-                skip!(idx, "free names in a non-global closure");
-            }
             let inline_cost = callee_chunk.ops.len();
-            if inline_cost > *budget {
+            let leaf = !callee_chunk.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Call(..)
+                        | Op::CallWithThis(..)
+                        | Op::CallSpread(_)
+                        | Op::CallSpreadThis(_)
+                        | Op::CallArgsArray
+                        | Op::CallArgsArrayThis
+                        | Op::New(..)
+                        | Op::NewArgsArray
+                )
+            });
+            if !budget.take(inline_cost, leaf, in_loop) {
                 skip!(idx, "optimized-body budget");
             }
-            *budget -= inline_cost;
             let uses_this = callee_chunk.uses_this();
             // Follow small hot call chains under the shared body budget.  This reaches through a
             // dispatcher into its virtual target and then into leaf helpers without allowing
             // unbounded recursive expansion.
-            let nested = if depth < INLINE_MAX_DEPTH && *budget > 0 {
-                plan_inlines_at(callee_chunk, f, global_env, callee_env, depth + 1, budget)
+            let nested = if depth < INLINE_MAX_DEPTH && budget.remaining() {
+                plan_inlines_at(callee_chunk, f, realm, depth + 1, in_loop, budget)
             } else {
                 Default::default()
             };
@@ -6916,11 +7018,7 @@ fn plan_inlines_at(
                 f,
                 obj,
                 free_names,
-                expected_env: if shared_closure {
-                    callee_env as usize
-                } else {
-                    0
-                },
+                expected_env: 0,
                 nested,
             });
         }
@@ -7196,6 +7294,12 @@ struct Compiler {
     /// `return` jumps inside the current spliced body, patched to the join point.
     inline_returns: Vec<usize>,
     inline_targets: Vec<InlineTarget>,
+    /// The inline target of each active splice, innermost last. Free-name reads emitted while
+    /// one is active resolve against that callee's [[Environment]] (`Op::LoadNameIn`).
+    inline_env_targets: Vec<u32>,
+    /// A splice emitted an operation that observes the running Environment Record (other than
+    /// the free-name reads `emit` redirects); the enclosing `try_emit_inline` bails.
+    inline_env_violation: bool,
 }
 
 /// Whether a call occurs in a tail position of a return operand.
@@ -7229,10 +7333,11 @@ pub struct InlineWay {
     pub obj: crate::value::Gc,
     pub check_this: bool,
     pub uses_this: bool,
-    /// Free names the callee reads (global-closure callees only): the splice refuses any that
-    /// the caller's scopes shadow, so the inlined LoadNames resolve identically.
+    /// Free names the callee reads. The splice resolves them from the callee's own
+    /// [[Environment]] (`Op::LoadNameIn`), so caller bindings never shadow them.
     pub free_names: Vec<Rc<str>>,
-    /// Exact shared closure environment required by non-global free-name inlines.
+    /// Exact caller environment required by the guard (zero: none). Splices no longer depend
+    /// on the caller's environment; retained for the guard's encoding.
     pub expected_env: usize,
     /// The callee's OWN inline plan (depth-capped recursion): call sites inside the spliced
     /// body splice too, keyed by the callee-frame ordinal — its first-compile cache numbering,
@@ -7592,8 +7697,30 @@ fn no_assign_to(e: &Expr, name: &str) -> bool {
 
 impl Compiler {
     fn emit(&mut self, op: Op) -> usize {
+        let op = match self.inline_env_targets.last() {
+            Some(&target) => self.inline_env_op(op, target),
+            None => op,
+        };
         self.ops.push(op);
         self.ops.len() - 1
+    }
+    /// Inside a splice, the callee's free-name reads resolve from its own [[Environment]], not
+    /// the caller's running one. Anything else that observes the running environment has no
+    /// remapping and makes the splice bail.
+    fn inline_env_op(&mut self, op: Op, target: u32) -> Op {
+        match op {
+            Op::LoadName(name, cache) => Op::LoadNameIn(name, cache, target),
+            Op::LoadNameForCall(name, cache) => Op::LoadNameForCallIn(name, cache, target),
+            Op::InlineGuard(..) => op,
+            _ => {
+                if inline_capability(&op) == InlineCapability::RequiresCallContext
+                    || matches!(op, Op::TypeofName(_))
+                {
+                    self.inline_env_violation = true;
+                }
+                op
+            }
+        }
     }
     /// Reserve a fresh inline-cache slot (starts empty) for a property-access op.
     fn new_cache(&mut self, name: u32) -> u32 {
@@ -7783,16 +7910,12 @@ impl Compiler {
         // Per-way gates: a plain `Call` site has no `this` beneath the callee (a this-using
         // callee needs the generic binding, and the guard's receiver peek would read past the
         // operands); a caller binding (slot or captured) would shadow a global free name.
+        // A spliced body's free names resolve from the callee's own [[Environment]]
+        // (`Op::LoadNameIn`), so caller bindings of the same spelling never shadow them.
         let ways: Vec<&InlineWay> = entry
             .ways
             .iter()
-            .filter(|w| {
-                (has_this || !w.uses_this)
-                    && (w.expected_env != 0
-                        || !w.free_names.iter().any(|name| {
-                            self.lookup(name).is_some() || self.env_names.contains_key(&**name)
-                        }))
-            })
+            .filter(|w| has_this || !w.uses_this)
             .collect();
         if ways.is_empty() {
             return Err(Bail);
@@ -7801,13 +7924,22 @@ impl Compiler {
         // mismatch falls to the next way, the last one to the generic call.
         let mut end_jumps: Vec<usize> = Vec::new();
         let mut pending_guard: Option<usize> = None;
+        let outer_violation = std::mem::replace(&mut self.inline_env_violation, false);
         for w in &ways {
             if let Some(g) = pending_guard.take() {
                 self.patch(g); // previous way's mismatch lands on this way's guard
             }
-            let guard = self.emit_inline_way(w, argc, has_this, &mut end_jumps)?;
+            let guard = self.emit_inline_way(w, argc, has_this, &mut end_jumps);
+            let guard = match guard {
+                Ok(guard) if !self.inline_env_violation => guard,
+                _ => {
+                    self.inline_env_violation = outer_violation;
+                    return Err(Bail);
+                }
+            };
             pending_guard = Some(guard);
         }
+        self.inline_env_violation = outer_violation;
         // ---- join: every way's result jumps here; the last mismatch runs the generic call.
         self.patch(pending_guard.take().expect("at least one way"));
         if has_this {
@@ -7923,7 +8055,9 @@ impl Compiler {
             };
             self.scope_bind(name, param_slots[k], false);
         }
+        self.inline_env_targets.push(t);
         let r = self.inline_body(f);
+        self.inline_env_targets.pop();
         self.call_seed_stack.pop();
         self.name_seed_stack.pop();
         self.cache_seed_stack.pop();
@@ -14106,6 +14240,15 @@ fn run_vm_inner<S: StoredValue>(
                 let v = chunk.load_name_ic(i, env, n, c)?;
                 stack.push(v);
             }
+            Op::LoadNameIn(n, c, t) => {
+                let (_, v) = chunk.load_name_in(i, n, c, t, false)?;
+                stack.push(v);
+            }
+            Op::LoadNameForCallIn(n, c, t) => {
+                let (this, callee) = chunk.load_name_in(i, n, c, t, true)?;
+                stack.push(this);
+                stack.push(callee);
+            }
             Op::StoreName(n) => {
                 let v = pop!();
                 i.assign_free_name(&chunk.names[n as usize], v, env)?;
@@ -17629,6 +17772,44 @@ impl Chunk {
         &self.inline_targets[t as usize]
     }
 
+    /// The [[Environment]] of an inline target's pinned function. `LoadNameIn` sites are
+    /// dominated by that target's identity guard, so the function (and therefore this
+    /// environment) is alive whenever they run; `None` only for a dead pin.
+    pub(crate) fn inline_target_env(&self, t: u32) -> Option<Env> {
+        let object = self.inline_targets[t as usize].pin.upgrade()?;
+        let object = object.borrow();
+        match &object.call {
+            crate::value::Callable::User(user) => Some(user.env.clone()),
+            _ => None,
+        }
+    }
+
+    /// `LoadNameIn`/`LoadNameForCallIn`: ResolveBinding from the inline target's environment.
+    fn load_name_in(
+        &self,
+        i: &mut Interp,
+        n: u32,
+        c: u32,
+        t: u32,
+        for_call: bool,
+    ) -> Result<(Value, Value), Abrupt> {
+        let env = self
+            .inline_target_env(t)
+            .expect("an inline name read runs only after its target's identity guard");
+        if !for_call {
+            return Ok((Value::Undefined, self.load_name_ic(i, &env, n, c)?));
+        }
+        // As for LoadNameForCall: a cache hit/fill never resolves through a `with` object.
+        if let Some(v) = self
+            .name_ic_hit(i, &env, c)
+            .or_else(|| self.name_ic_fill(i, &env, n, c))
+        {
+            return Ok((Value::Undefined, v));
+        }
+        let (callee, with_this) = i.get_var_with(&self.names[n as usize], &env)?;
+        Ok((with_this.unwrap_or(Value::Undefined), callee))
+    }
+
     /// The interned name a property op refers to (the emitter gates array-receiver inlining on
     /// whether it could be an element key).
     pub(crate) fn jit_name(&self, n: u32) -> &str {
@@ -18661,6 +18842,7 @@ impl Chunk {
             | Op::LoadLocal(_)
             | Op::LoadCap(_)
             | Op::LoadName(..)
+            | Op::LoadNameIn(..)
             | Op::LoadThis
             | Op::LoadLexicalThis
             | Op::MakeClosure(..) => (0, 1),
@@ -18792,7 +18974,7 @@ impl Chunk {
             Op::JumpIfFalse(_) => (1, 0),
             Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
             Op::Call(argc, _) => (*argc as usize + 1, 1),
-            Op::LoadNameForCall(..) => (0, 2),
+            Op::LoadNameForCall(..) | Op::LoadNameForCallIn(..) => (0, 2),
             Op::CallWithThis(argc, _) => (*argc as usize + 2, 1),
             Op::New(argc, _) => (*argc as usize + 1, 1),
             Op::NewArgsArray => (2, 1),
@@ -20524,7 +20706,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
         let runs = chunk_ref.jit_runs.get().saturating_add(1);
         chunk_ref.jit_runs.set(runs);
         if chunk_ref.inline_retry_due(runs) {
-            i.try_inline_recompile(ic.func, chunk_ref, ic.env);
+            i.try_inline_recompile(ic.func, chunk_ref, ic.realm);
         }
     }
     let args_ptr = sp.sub(argc);
@@ -22259,6 +22441,15 @@ unsafe fn jit_exec_inner(
         Op::LoadName(n, c) => {
             let v = chunk.load_name_ic(i, env, n, c)?;
             push!(v);
+        }
+        Op::LoadNameIn(n, c, t) => {
+            let (_, v) = chunk.load_name_in(i, n, c, t, false)?;
+            push!(v);
+        }
+        Op::LoadNameForCallIn(n, c, t) => {
+            let (this, callee) = chunk.load_name_in(i, n, c, t, true)?;
+            push!(this);
+            push!(callee);
         }
         Op::StoreName(n) => {
             let v = pop!();

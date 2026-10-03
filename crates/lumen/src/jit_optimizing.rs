@@ -1976,9 +1976,15 @@ fn compile_entry_with_limits(
         len: executable.len(),
         pc_offsets: Vec::new(),
         max_stack: cfg.jit_stack_capacity(),
-        needs_global: ops
-            .iter()
-            .any(|op| matches!(op, Op::LoadName(..) | Op::LoadNameForCall(..))),
+        needs_global: ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::LoadName(..)
+                    | Op::LoadNameForCall(..)
+                    | Op::LoadNameIn(..)
+                    | Op::LoadNameForCallIn(..)
+            )
+        }),
         resume_depths: Vec::new(),
         entry_kind: if continuation.is_some() {
             NativeEntryKind::OptimizingContinuation
