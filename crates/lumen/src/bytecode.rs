@@ -17198,6 +17198,10 @@ fn get_named_property(
     cache: &std::cell::Cell<IcState>,
 ) -> Result<Value, Abrupt> {
     if !chunk.feedback.detailed_enabled() {
+        // A String primitive's `length` is its own fixed data property (ECMA-262 §10.4.3.5).
+        if let (Value::Str(s), "length") = (base, name) {
+            return Ok(Value::Num(i.str_len(s) as f64));
+        }
         return i.get_prop_ic(base, name, cache);
     }
     let mut trace = crate::feedback::CurrentPropertyTrace::default();

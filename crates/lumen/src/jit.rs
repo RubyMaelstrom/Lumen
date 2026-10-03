@@ -5246,6 +5246,44 @@ fn emit_prop_way_loop(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+/// `str.length` for a String primitive in execution word `raw` whose flat buffer is known
+/// ASCII: one UTF-16 code unit per byte, so the byte length is the answer. Any other String
+/// (a view, or text that may hold non-ASCII code points) goes to `slow`, which counts code
+/// units; a non-String falls through with `raw` preserved. `consume` is the stack form: the
+/// receiver word at [x20-8] is replaced by the length after a decrement that cannot free
+/// (the last owner keeps its destructor on the checked path). Otherwise the receiver is a
+/// borrowed binding and the length is pushed. Clobbers x11-x14, d0 and NZCV.
+fn emit_ascii_string_length(a: &mut asm::Asm, raw: u32, consume: bool, done: usize, slow: usize) {
+    let not_string = a.new_label();
+    a.lsr_imm(11, raw, 48);
+    a.movz(12, (crate::value::PACK_STR >> 48) as u32, 0);
+    a.cmp_reg_w(11, 12);
+    a.b_cond(C_NE, not_string);
+    emit_exec_payload(a, raw, 11);
+    a.ldr_w_imm(14, 11, crate::lstr::CAP_OFF as u32);
+    a.lsr_imm(14, 14, 31);
+    a.cbz(14, false, slow);
+    a.ldr_w_imm(14, 11, crate::lstr::LEN_OFF as u32);
+    a.ucvtf_d_w(0, 14);
+    if consume {
+        a.ldur(13, 11, 0);
+        a.cmp_imm_x(13, 1);
+        a.b_cond(C_LS, slow);
+        a.sub_imm(13, 13, 1);
+        a.stur(13, 11, 0);
+        a.stur_d(0, 20, -8);
+    } else {
+        a.str_d_imm(0, 20, 0);
+        a.add_imm(20, 20, 8);
+    }
+    a.b(done);
+    a.bind(not_string);
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 fn emit_prop_load_inline(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
@@ -5305,9 +5343,15 @@ fn emit_prop_load_inline(
         && name != "length"
         && name != "description"
         && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
+    // `length` of a String primitive is its own non-writable, non-configurable data property
+    // (ECMA-262 §10.4.3.5 StringGetOwnProperty via ToObject), so no user code can intervene.
+    let string_length = !method && name == "length";
     match recv {
         PropRecv::Stack => {
             emit_exec_word_load(a, 9, 20, -8);
+            if string_length {
+                emit_ascii_string_length(a, 9, true, done, slow);
+            }
             if str_ok {
                 let obj_recv = a.new_label();
                 let probe_go = a.new_label();
@@ -5342,6 +5386,9 @@ fn emit_prop_load_inline(
         }
         PropRecv::Slot(off) => {
             emit_exec_word_load(a, 9, 22, off as i32);
+            if string_length {
+                emit_ascii_string_length(a, 9, false, done, slow);
+            }
             emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
             emit_exec_payload(a, 9, 10);
         }

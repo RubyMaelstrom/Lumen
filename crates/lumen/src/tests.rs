@@ -4083,6 +4083,43 @@ fn update_operators_preserve_division_and_regexp_lexical_goals() {
 }
 
 #[test]
+fn string_length_counts_utf16_units_in_all_tiers() {
+    // ECMA-262 §10.4.3.5 StringGetOwnProperty: `length` is the String value's own data property
+    // (UTF-16 code units). It shadows String.prototype, whatever is defined there. Cover borrowed
+    // locals, consumed temporaries (including a last owner), views and non-ASCII text.
+    let source = r#"
+        try {
+            Object.defineProperty(String.prototype, 'length', { get() { return 99; } });
+        } catch (e) {}
+        Object.defineProperty(Object.prototype, 'length', { get() { return 98; }, configurable: true });
+        function local(s) { return s.length; }
+        function temporary(s, i) { return (s + i).length; }
+        function viaCall(f) { return f().length; }
+        const big = 'x'.repeat(4000);
+        const view = big.slice(10, 3000);
+        const cases = ['', 'abc', 'é', 'aé', '𝒳', 'a𝒳b', view, big + 'é'];
+        let out = [];
+        for (let round = 0; round < 3; round++) {
+            out = [];
+            for (const s of cases) out.push(local(s), temporary(s, round), viaCall(() => s));
+            out.push(new String('wrap').length, 'lit'.length, `t${round}`.length);
+        }
+        out.join(',')
+    "#;
+    let expected = "0,1,0,3,4,3,1,2,1,2,3,2,2,3,2,4,5,4,2990,2991,2990,4001,4002,4001,4,3,2";
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), expected, "{tier:?}");
+    }
+}
+
+#[test]
 fn source_text_and_tokens_survive_utf8_scanning_in_all_tiers() {
     // ECMA-262 §20.2.3.5 Function.prototype.toString returns the exact [[SourceText]] code
     // points. Non-ASCII text (2- and 4-byte UTF-8) before and inside a function must not shift
