@@ -11394,6 +11394,16 @@ fn install_string(it: &mut Interp) {
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
     it.def_method(&ctor, "fromCharCode", 1, |i, _this, args| {
+        // One Number argument is the decoder idiom (`String.fromCharCode(c)` per character):
+        // ToUint16 it and share the interned one-unit ASCII strings instead of allocating.
+        if let [Value::Num(num)] = args {
+            let unit = if num.is_finite() {
+                num.trunc().rem_euclid(65536.0) as u16
+            } else {
+                0
+            };
+            return Ok(Value::Str(crate::jstr::unit_lstr(unit)));
+        }
         let mut units: Vec<u16> = Vec::with_capacity(args.len());
         for a in args {
             // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.

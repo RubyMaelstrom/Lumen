@@ -4083,6 +4083,25 @@ fn update_operators_preserve_division_and_regexp_lexical_goals() {
 }
 
 #[test]
+fn from_char_code_single_units_match_touint16() {
+    // ECMA-262 §22.1.2.1 String.fromCharCode applies ToUint16 to each argument; a lone
+    // surrogate stays a single code unit and later pairs with its partner by concatenation.
+    let source = r#"
+        const f = String.fromCharCode;
+        const out = [-1, 65601, NaN, Infinity, -Infinity, 0xd800, 0x41, 1.9, -0, 127, 128, 255,
+            0xffff, 0x10041, -65535.5].map(v => f(v).charCodeAt(0) + ':' + f(v).length);
+        out.push(f(0xd83d) + f(0xde00) === '\u{1F600}', (f(0xd83d) + f(0xde00)).length,
+            f(0x61) === 'a', f({ valueOf() { return 66; } }), f('67'), f(), f(72, 105));
+        out.join(',')
+    "#;
+    assert_eq!(
+        run(source),
+        "65535:1,65:1,0:1,0:1,0:1,55296:1,65:1,1:1,0:1,127:1,128:1,255:1,65535:1,65:1,1:1,\
+         true,2,true,B,C,,Hi"
+    );
+}
+
+#[test]
 fn remainder_matches_number_remainder_in_all_tiers() {
     // ECMA-262 §6.1.6.1.6 Number::remainder: the sign of a zero result is the dividend's, a zero
     // divisor gives NaN, a ±0 dividend is returned unchanged, and non-integral or out-of-Int32
