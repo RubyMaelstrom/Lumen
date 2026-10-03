@@ -7756,6 +7756,7 @@ impl Compiler {
             self.call_caches.truncate(snap.5);
             self.inline_targets.truncate(snap.6);
             self.slot_names.truncate(snap.7);
+            self.tdz_slots.retain(|&slot| usize::from(slot) < snap.7);
             self.funcs.truncate(snap.8);
             self.templates.truncate(snap.9);
             self.eval_exprs.truncate(snap.10);
@@ -7883,6 +7884,14 @@ impl Compiler {
         let saved_try = std::mem::replace(&mut self.try_depth, 0);
         let saved_this = std::mem::replace(&mut self.inline_this, this_slot);
         let saved_returns = std::mem::take(&mut self.inline_returns);
+        // The caller's own capture analysis must neither shadow nor be consumed by the callee's
+        // declarations: a callee `let n` would otherwise take the caller's pending homed block
+        // `let n` as its own declaration, and a failed splice cannot give it back. The callee
+        // needs no activation, so its bindings are all fresh slots. Its body has no `with`.
+        let saved_homed_lets = std::mem::take(&mut self.homed_lets);
+        let saved_homed_pending = std::mem::take(&mut self.homed_pending);
+        let saved_runtime_lexicals = std::mem::take(&mut self.runtime_lexicals);
+        let saved_with_floors = std::mem::take(&mut self.with_scope_floors);
         // The body compiles as its own function would: a self-hosted callee's intrinsics are
         // operations, never free names of the caller (the plan found none in its chunk).
         let saved_self_hosted = std::mem::replace(&mut self.self_hosted, f.self_hosted);
@@ -7922,6 +7931,10 @@ impl Compiler {
         self.inline_depth -= 1;
         self.self_hosted = saved_self_hosted;
         let returns = std::mem::replace(&mut self.inline_returns, saved_returns);
+        self.with_scope_floors = saved_with_floors;
+        self.runtime_lexicals = saved_runtime_lexicals;
+        self.homed_pending = saved_homed_pending;
+        self.homed_lets = saved_homed_lets;
         self.inline_this = saved_this;
         self.try_depth = saved_try;
         self.pending_labels = saved_labels;

@@ -222,3 +222,39 @@ fn hot_self_hosted_methods_keep_their_intrinsics_when_spliced() {
         }
     }
 }
+
+/// A splice compiles the callee's declarations in fresh slots without touching the caller's
+/// capture analysis: a callee `let n` spliced before the caller's own captured block `let n`
+/// must not consume that binding's homed declaration (even when the splice is abandoned).
+#[test]
+fn spliced_lexicals_leave_the_callers_homed_block_bindings_alone() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+            'use strict';
+            function Sf(e){return Array.isArray(e)&&e.length===2}
+            function Df(t){if(!Sf(t))return!1;let n=t[0];return n===30||n===35}
+            var out = [];
+            function mp(e,a){a()}
+            var homedCaller=(e,t)=>{if(Df(t))e(1);else if(t[0]===6){let n=t[1];
+                Df(n)?e(2):mp(e,()=>{e(n)})}else e(0)};
+            function rec(a) { out.push(String(a)); }
+            for (var i = 0; i < 2000; i++) {
+                homedCaller(rec, [35, 'x']);
+                homedCaller(rec, [6, [35, 'y']]);
+                homedCaller(rec, [6, [7, 'z']]);
+                homedCaller(rec, [9]);
+            }
+            out.length + '|' + out.slice(-6).join(',');
+        "#
+            ),
+            "8000|7,z,0,1,2,7,z,0",
+            "{tier:?}"
+        );
+    }
+}
