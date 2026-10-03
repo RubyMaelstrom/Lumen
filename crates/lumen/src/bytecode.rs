@@ -5741,9 +5741,7 @@ pub(crate) fn compile_with_inlines(
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
     hot: &Chunk,
 ) -> Option<Rc<Chunk>> {
-    let seed = std::env::var_os("LUMEN_JIT_NO_CACHE_SEED")
-        .is_none()
-        .then_some(hot);
+    let seed = (!env_flag!("LUMEN_JIT_NO_CACHE_SEED")).then_some(hot);
     let started = crate::jit::perf_stage_start();
     let result = compile_inner(func, plan, seed, None, false, false, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
@@ -6467,7 +6465,7 @@ fn finish_chunk(
         crate::feedback::FeedbackVector::new(layout, bindings)
     };
     if let Some(func) = source.filter(|_| {
-        std::env::var_os("LUMEN_NULLISH_TRACE").is_some()
+        env_flag!("LUMEN_NULLISH_TRACE")
             && c.ops.len() == 179
             && c.ops
                 .get(45)
@@ -6652,8 +6650,7 @@ pub(crate) fn plan_inlines(
     // conservative: an inline property op can expand to substantially more machine code than a
     // simple arithmetic op.
     const INLINE_SOURCE_OP_BUDGET: usize = 320;
-    let limit = std::env::var("LUMEN_INLINE_BUDGET")
-        .ok()
+    let limit = env_value!("LUMEN_INLINE_BUDGET")
         .and_then(|v| v.parse().ok())
         .unwrap_or(INLINE_SOURCE_OP_BUDGET);
     let mut budget = limit.saturating_sub(chunk.ops.len());
@@ -6806,12 +6803,11 @@ fn plan_inlines_at(
 ) -> crate::fasthash::FastMap<u32, InlinePlanEntry> {
     const INLINE_MAX_DEPTH: u32 = 3;
     const INLINE_MAX_WAYS: usize = 4;
-    let max_ops = std::env::var("LUMEN_INLINE_MAX_OPS")
-        .ok()
+    let max_ops = env_value!("LUMEN_INLINE_MAX_OPS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(96);
     let mut plan: crate::fasthash::FastMap<u32, InlinePlanEntry> = Default::default();
-    let log = std::env::var_os("LUMEN_TIER_LOG").is_some();
+    let log = env_flag!("LUMEN_TIER_LOG");
     macro_rules! skip {
         ($idx:expr, $why:expr) => {{
             if log {

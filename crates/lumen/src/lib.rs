@@ -20,6 +20,24 @@
 // realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
 #![allow(clippy::wrong_self_convention)]
 
+/// A process-lifetime diagnostic switch: whether environment variable `$name` is set. The first
+/// read is cached, because a libc environment lookup scans every variable under a lock and the
+/// compilers consult these switches per chunk and per candidate region.
+macro_rules! env_flag {
+    ($name:literal) => {{
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
+/// The cached value of a process-lifetime diagnostic environment variable (see [`env_flag`]).
+macro_rules! env_value {
+    ($name:literal) => {{
+        static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        VALUE.get_or_init(|| std::env::var($name).ok()).as_deref()
+    }};
+}
+
 mod array_binding;
 #[cfg(test)]
 mod array_binding_tests;

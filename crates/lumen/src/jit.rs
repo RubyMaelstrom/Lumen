@@ -3526,7 +3526,7 @@ fn compile_entry(
     let max_stack = cfg.jit_stack_capacity();
     // Debug: `LUMEN_JIT_DUMP=<substr>` prints the op stream of chunks whose leading slot names
     // contain the substring (empty value = all chunks) as they compile.
-    if let Ok(pat) = std::env::var("LUMEN_JIT_DUMP") {
+    if let Some(pat) = env_value!("LUMEN_JIT_DUMP") {
         let head: Vec<&str> = chunk
             .jit_slot_names()
             .iter()
@@ -3541,8 +3541,7 @@ fn compile_entry(
             }
         }
     }
-    let mut fast: u32 = std::env::var("LUMEN_JIT_FAST")
-        .ok()
+    let mut fast: u32 = env_value!("LUMEN_JIT_FAST")
         .and_then(|v| v.parse().ok())
         .unwrap_or(u32::MAX);
     // A slice borrows a continuation-owned activation. Calls remain native through their
@@ -3576,9 +3575,8 @@ fn compile_entry(
             | (1 << 20)
             | (1 << 21));
     }
-    let array_intrinsics_on = std::env::var_os("LUMEN_JIT_NO_ARRAY_INTRINSICS").is_none();
-    let function_call_intrinsic_on =
-        std::env::var_os("LUMEN_JIT_NO_FUNCTION_CALL_INTRINSIC").is_none();
+    let array_intrinsics_on = !env_flag!("LUMEN_JIT_NO_ARRAY_INTRINSICS");
+    let function_call_intrinsic_on = !env_flag!("LUMEN_JIT_NO_FUNCTION_CALL_INTRINSIC");
     // Direct shared-ctx calls, on by default like every other emitter feature (mask bit 20 off
     // for debugging). Requires the inline call probe (bit 524288) to emit at all. The readable
     // kill switch preserves an emergency layered-call path independently of the numeric mask.
@@ -3788,7 +3786,7 @@ fn compile_entry(
         if let Some(exit) =
             regexp_exec_loop_exit(ops, pc).filter(|_| !chunk.jit_detailed_feedback_enabled())
         {
-            if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+            if env_flag!("LUMEN_JIT_REGIONLOG") {
                 eprintln!("[jit-region] head {pc}: regexp exec loop -> {exit}");
             }
             a.mov(0, 19);
@@ -3851,7 +3849,7 @@ fn compile_entry(
         // accepted by the general CFG/SSA region builder. Do not key a lowering to benchmark
         // function names, class layouts, or fixture-specific object graphs.
         if fast & 32768 != 0 && rc_ok && targeted[pc] {
-            if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+            if env_flag!("LUMEN_JIT_REGIONLOG") {
                 match crate::jit_ir::RegionIr::build_loop(chunk, &cfg, pc) {
                     Ok(region) => {
                         let op_count: usize = region.blocks.iter().map(|b| b.insts.len()).sum();
@@ -3882,7 +3880,7 @@ fn compile_entry(
                     targeted[p] = true;
                 }
                 emitted_region = true;
-                if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                if env_flag!("LUMEN_JIT_REGIONLOG") {
                     eprintln!("[jit-region] head {pc}: EMITTED linked scan");
                 }
             } else if let Some(plan) = plan_numeric_diamond(chunk, ops, pc, &cfg, layout, fast) {
@@ -3893,7 +3891,7 @@ fn compile_entry(
                     targeted[p] = true;
                 }
                 emitted_region = true;
-                if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                if env_flag!("LUMEN_JIT_REGIONLOG") {
                     eprintln!("[jit-region] head {pc}: EMITTED numeric diamond");
                 }
             }
@@ -3931,12 +3929,12 @@ fn compile_entry(
                         region_copy_bytes += emission.bytes;
                         emission.publish(&mut targeted);
                         a.bind(emission.plain);
-                        if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                        if env_flag!("LUMEN_JIT_REGIONLOG") {
                             eprintln!("[jit-region] head {pc}: EMITTED general CFG ({} bytes, {} saved-work units)", emission.bytes, emission.saved_work);
                         }
                     } else {
                         a.rewind(checkpoint);
-                        if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                        if env_flag!("LUMEN_JIT_REGIONLOG") {
                             eprintln!("[jit-region] head {pc}: retained baseline ({} optional bytes, {} saved-work units)", emission.bytes, emission.saved_work);
                         }
                     }
@@ -3972,14 +3970,14 @@ fn compile_entry(
                     // speculative bailout destinations have been published: the mature
                     // baseline retains every independently legal span fusion.
                     a.rewind(checkpoint);
-                    if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                    if env_flag!("LUMEN_JIT_REGIONLOG") {
                         eprintln!("[jit-region] head {pc}: retained baseline ({added} optional bytes, {} saved-work units)", emission.saved_work);
                     }
                 } else {
                     region_copy_bytes += added;
                     emission.publish(&mut targeted);
                     a.bind(emission.plain);
-                    if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+                    if env_flag!("LUMEN_JIT_REGIONLOG") {
                         eprintln!("[jit-region] head {pc}: EMITTED acyclic CFG ({added} bytes, total {region_copy_bytes})");
                     }
                 }
@@ -4526,8 +4524,8 @@ fn compile_entry(
     // `clang -c` + `objdump -d` for a disassembly of exactly what runs. Any value also prints
     // a `[jit-map]` line per compiled chunk (runtime base + length), which joins a `sample`
     // profile's raw addresses to chunk-relative offsets.
-    let codedump_pat = std::env::var("LUMEN_JIT_CODEDUMP").ok();
-    if let Some(pat) = &codedump_pat {
+    let codedump_pat = env_value!("LUMEN_JIT_CODEDUMP");
+    if let Some(pat) = codedump_pat {
         let head: Vec<&str> = chunk
             .jit_slot_names()
             .iter()
@@ -4535,7 +4533,7 @@ fn compile_entry(
             .map(|s| &**s)
             .collect();
         let name = head.join(",");
-        if !pat.is_empty() && name.contains(pat.as_str()) {
+        if !pat.is_empty() && name.contains(pat) {
             eprintln!("[jit-codedump] fn({name}) {} words", words.len());
             for w in &words {
                 eprintln!("[jit-codedump] {w:08x}");
@@ -4562,7 +4560,7 @@ fn compile_entry(
                 mem as usize
             );
         }
-        if std::env::var_os("LUMEN_JIT_MAP").is_some() {
+        if env_flag!("LUMEN_JIT_MAP") {
             let head: Vec<&str> = chunk
                 .jit_slot_names()
                 .iter()
@@ -11507,7 +11505,7 @@ fn plan_linked_scan(
 ) -> Option<LinkedScanPlan> {
     use crate::bytecode::Op;
     if fast & (1 << 21) == 0
-        || std::env::var_os("LUMEN_JIT_NO_CFG_REGION").is_some()
+        || env_flag!("LUMEN_JIT_NO_CFG_REGION")
         || !get_prop_inlinable(layout)
         || layout.entry_accessor != layout.entry_value + 8
     {
@@ -11601,13 +11599,13 @@ fn plan_numeric_diamond(
     };
     macro_rules! reject {
         ($why:expr) => {{
-            if std::env::var_os("LUMEN_JIT_REGIONLOG").is_some() {
+            if env_flag!("LUMEN_JIT_REGIONLOG") {
                 eprintln!("[jit-region-plan] head {head}: reject {}", $why);
             }
             return None;
         }};
     }
-    if fast & (1 << 21) == 0 || std::env::var_os("LUMEN_JIT_NO_CFG_REGION").is_some() {
+    if fast & (1 << 21) == 0 || env_flag!("LUMEN_JIT_NO_CFG_REGION") {
         reject!("disabled");
     }
     if !get_prop_inlinable(layout)
@@ -11716,13 +11714,12 @@ fn build_chain(
     let in_range = |s: u16| (s as u32) * 8 + 8 < 4096;
     let elem_ok = fast & 1024 != 0 && get_elem_inlinable(layout);
     let name_ok = fast & 8192 != 0 && load_name_inlinable(layout);
-    let prop_ok = fast & 256 != 0
-        && get_prop_inlinable(layout)
-        && std::env::var_os("LUMEN_JIT_NO_PROP_CHAIN").is_none();
+    let prop_ok =
+        fast & 256 != 0 && get_prop_inlinable(layout) && !env_flag!("LUMEN_JIT_NO_PROP_CHAIN");
     let prop_store_ok = prop_ok
         && fast & 65536 != 0
         && set_prop_inlinable(layout)
-        && std::env::var_os("LUMEN_JIT_NO_PROP_STORE_CHAIN").is_none();
+        && !env_flag!("LUMEN_JIT_NO_PROP_STORE_CHAIN");
     let mut chain: Vec<(ChainOp, usize)> = Vec::new();
     let mut vdepth = 0usize;
     let mut pc = start;
@@ -12008,7 +12005,7 @@ fn build_chain(
             return None;
         }
     }
-    if std::env::var_os("LUMEN_JIT_PROP_CHAIN_LOG").is_some() && has_prop {
+    if env_flag!("LUMEN_JIT_PROP_CHAIN_LOG") && has_prop {
         let desc: Vec<String> = chain
             .iter()
             .map(|(_op, pc)| format!("{pc}:{:?}", ops[*pc]))
@@ -13331,7 +13328,7 @@ fn plan_loop(
     }
     macro_rules! reject {
         ($why:expr) => {{
-            if std::env::var_os("LUMEN_JIT_LOOPLOG").is_some() {
+            if env_flag!("LUMEN_JIT_LOOPLOG") {
                 eprintln!("[jit-loop] head {head}: reject: {}", $why);
             }
             return None;
@@ -14175,7 +14172,7 @@ fn plan_loop(
             }
             match demote {
                 Some(off) => {
-                    if std::env::var_os("LUMEN_JIT_LOOPLOG").is_some() {
+                    if env_flag!("LUMEN_JIT_LOOPLOG") {
                         eprintln!("[jit-loop] head {head}: demote I slot {}", off / 8);
                     }
                     i_slots.retain(|&o| o != off);
@@ -14223,7 +14220,7 @@ fn plan_loop(
                 .min_by_key(|&off| use_count(off, &chain));
             match victim {
                 Some(v) => {
-                    if std::env::var_os("LUMEN_JIT_LOOPLOG").is_some() {
+                    if env_flag!("LUMEN_JIT_LOOPLOG") {
                         eprintln!(
                             "[jit-loop] head {head}: demote I slot {} ({})",
                             v / 8,
@@ -14450,7 +14447,7 @@ fn plan_loop(
         }
     }
 
-    if std::env::var_os("LUMEN_JIT_LOOPLOG").is_some() {
+    if env_flag!("LUMEN_JIT_LOOPLOG") {
         let vec_pins: usize = receivers
             .iter()
             .map(|r| {
@@ -16159,8 +16156,7 @@ fn emit_loop_chain(
     // Keep hot-loop placement stable when cold preamble checks grow. The override is for
     // release A/B diagnostics, not a semantic switch; 0 disables padding. Large-branch
     // relaxation can still move this boundary, so correctness never depends on alignment.
-    let alignment = std::env::var("LUMEN_JIT_LOOP_ALIGNMENT")
-        .ok()
+    let alignment = env_value!("LUMEN_JIT_LOOP_ALIGNMENT")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value == 0 || (16..=128).contains(value) && value.is_power_of_two())
         .unwrap_or(64);
