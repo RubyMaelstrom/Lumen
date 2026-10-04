@@ -189,14 +189,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         let ok = ab(define_own_property(i, &o, &key, &arg(a, 2)))?;
         Ok(Value::Bool(ok))
     });
-    it.def_method(&r, "apply", 3, |i, _t, a| {
-        // IsCallable(target) is checked before the argument list is read.
-        if !arg(a, 0).is_callable() {
-            return Err(i.make_error("TypeError", "Reflect.apply target is not callable"));
-        }
-        let args = create_list_from_array_like(i, &arg(a, 2))?;
-        ab(i.call(arg(a, 0), arg(a, 1), &args))
-    });
+    it.def_method(&r, "apply", 3, nf_reflect_apply);
     it.def_method(&r, "construct", 2, |i, _t, a| {
         let target = arg(a, 0);
         if !is_constructor_value(&target) {
@@ -236,4 +229,14 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     set_to_string_tag(it, &r, "Reflect");
     set_builtin(&it.global, "Reflect", Value::Obj(r));
+}
+
+/// `Reflect.apply` (named so the JIT call cache can prove and tag its exact identity).
+pub(crate) fn nf_reflect_apply(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
+    // IsCallable(target) is checked before the argument list is read.
+    if !arg(a, 0).is_callable() {
+        return Err(i.make_error("TypeError", "Reflect.apply target is not callable"));
+    }
+    let args = create_list_from_array_like(i, &arg(a, 2))?;
+    ab(i.call(arg(a, 0), arg(a, 1), &args))
 }

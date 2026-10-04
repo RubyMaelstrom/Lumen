@@ -874,6 +874,18 @@ pub const INTRINSIC_CODE_POINT_AT: u8 = 13;
 pub const INTRINSIC_IS_NAN: u8 = 14;
 /// `String.fromCharCode` with one Number argument (the per-character decoder idiom).
 pub const INTRINSIC_FROM_CHAR_CODE: u8 = 15;
+/// A native whose complete algorithm runs no author code and reads no native-call boundary
+/// state (Map/Set/WeakMap/WeakSet get, has, set, add and delete; see
+/// `builtins::is_operand_only_native`). The hit helper calls it on moved operands without the
+/// boundary bookkeeping (depth, safepoints, construct state) of an arbitrary native.
+pub const INTRINSIC_OPERAND_ONLY: u8 = 16;
+/// A native that runs no author code when every argument is a Number (Math's numeric
+/// functions; see `builtins::is_numeric_only_native`). The hit helper takes the operand-only
+/// path for such calls and the full native call otherwise.
+pub const INTRINSIC_NUMERIC_ONLY: u8 = 17;
+/// `Reflect.apply(target, thisArg, list)`: an operand-only native target with a dense, ordinary
+/// argument list is called directly (see `jit_call_hit`).
+pub const INTRINSIC_REFLECT_APPLY: u8 = 18;
 
 impl CallIc {
     pub const EMPTY: CallIc = CallIc {
@@ -20691,6 +20703,103 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
 /// in the low 16), so this skips the probe loop — it re-reads that entry (nothing ran between
 /// the machine-code compare and this call), bumps the recompile counter, and enters the
 /// committed path directly. Same contract as [`jit_exec`].
+/// `Reflect.apply(target, thisArg, list)` from a proven call-cache hit, when `target` is an
+/// operand-only native in this Realm and `list` is an ordinary array-like whose length and
+/// elements are own data properties (CreateListFromArrayLike then observes nothing). Calls the
+/// target directly and consumes the call's operands; `None` (nothing consumed) otherwise.
+///
+/// # Safety
+/// As for [`jit_call_hit`]: `sp` is the live operand top of a `CallWithThis(3)`/`Call(3)` site.
+unsafe fn jit_reflect_apply_operand_only(
+    ctx: &mut crate::jit::JitCtx,
+    sp: *mut PackedValue,
+    with_this: bool,
+) -> Option<crate::jit::SpFlag> {
+    let i = &mut *ctx.interp;
+    let args_ptr = sp.sub(3);
+    let target = (*args_ptr).unpack();
+    let Value::Obj(target_object) = &target else {
+        return None;
+    };
+    let nf = {
+        let object = target_object.borrow();
+        match &object.call {
+            crate::value::Callable::Native(nf)
+                if object.ic_plain.get() && i.native_call_in_current_realm(target_object) =>
+            {
+                *nf
+            }
+            _ => return None,
+        }
+    };
+    let list = (*args_ptr.add(2)).unpack();
+    let numeric = crate::builtins::is_numeric_only_native(nf);
+    if !crate::builtins::is_operand_only_native(nf) && !numeric {
+        return None;
+    }
+    let values = dense_own_list(i, &list)?;
+    if numeric && !values.iter().all(|value| matches!(value, Value::Num(_))) {
+        return None;
+    }
+    drop((target, list));
+    let this_arg = args_ptr.add(1).read().into_value();
+    let r = nf(i, this_arg, &values);
+    // Release the target, the list, the Reflect.apply function and its receiver.
+    drop(args_ptr.read());
+    drop(args_ptr.add(2).read());
+    let mut base = args_ptr.sub(1);
+    drop(base.read());
+    if with_this {
+        base = base.sub(1);
+        drop(base.read());
+    }
+    Some(match r {
+        Ok(v) => {
+            base.write(PackedValue::pack(v));
+            crate::jit::SpFlag {
+                sp: base.add(1),
+                flag: 0,
+            }
+        }
+        Err(error) => {
+            ctx.error = Some(Abrupt::Throw(error));
+            crate::jit::SpFlag { sp: base, flag: 1 }
+        }
+    })
+}
+
+/// The elements of an ordinary array-like whose `length` and indices `0..length` are all own
+/// data properties: CreateListFromArrayLike's Gets then run no author code.
+fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(list) = list else {
+        return None;
+    };
+    if !i.ordinary_get_ptr(Rc::as_ptr(list) as usize)
+        || i.mapped_arguments
+            .contains_key(&(Rc::as_ptr(list) as usize))
+    {
+        return None;
+    }
+    let b = list.borrow();
+    let len = match b.props.get("length") {
+        Some(p) if !p.accessor() => match p.value() {
+            Value::Num(n) if n >= 0.0 && n.fract() == 0.0 && n <= 64.0 => n as usize,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut values = Vec::with_capacity(len);
+    for k in 0..len {
+        let value = b
+            .props
+            .get_index(k as u32)
+            .filter(|p| !p.accessor())
+            .map(|p| p.value())?;
+        values.push(value);
+    }
+    Some(values)
+}
+
 pub(crate) unsafe extern "C" fn jit_call_hit(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -20740,6 +20849,48 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
     // recompilation, which may now reclaim other inactive native code.
     let code = (ic.native == 0).then(|| crate::jit::cache::lease_raw(ic.code));
     jit_callstat(i, ctx, &ic, argc, with_this, sp);
+    let operand_only = ic.native != 0
+        && match ic.intrinsic {
+            INTRINSIC_OPERAND_ONLY => true,
+            INTRINSIC_NUMERIC_ONLY => (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some()),
+            _ => false,
+        };
+    if ic.native != 0 && ic.intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
+        if let Some(flag) = jit_reflect_apply_operand_only(ctx, sp, with_this) {
+            return flag;
+        }
+    }
+    if operand_only {
+        // The exact builtin is proven and runs no author code for these operands: move the
+        // receiver and arguments into it directly, without an arbitrary native's call boundary.
+        let nf: crate::value::NativeFn = std::mem::transmute(ic.native);
+        let args_ptr = sp.sub(argc);
+        let this = if with_this {
+            sp.sub(argc + 2).read().into_value()
+        } else {
+            Value::Undefined
+        };
+        let r =
+            crate::execution_storage::with_moved_values(args_ptr, argc, |args| nf(i, this, args));
+        sp = args_ptr.sub(1);
+        drop(sp.read());
+        if with_this {
+            sp = sp.sub(1);
+        }
+        return match r {
+            Ok(v) => {
+                sp.write(PackedValue::pack(v));
+                crate::jit::SpFlag {
+                    sp: sp.add(1),
+                    flag: 0,
+                }
+            }
+            Err(error) => {
+                ctx.error = Some(Abrupt::Throw(error));
+                crate::jit::SpFlag { sp, flag: 1 }
+            }
+        };
+    }
     if ic.native == 0 {
         let chunk_ref = &*ic.chunk;
         let runs = chunk_ref.jit_runs.get().saturating_add(1);
@@ -21958,6 +22109,18 @@ unsafe fn jit_call_inner(
                                                 as usize =>
                                         {
                                             INTRINSIC_FROM_CHAR_CODE
+                                        }
+                                        p if p
+                                            == crate::builtins::nf_reflect_apply as *const ()
+                                                as usize =>
+                                        {
+                                            INTRINSIC_REFLECT_APPLY
+                                        }
+                                        _ if crate::builtins::is_operand_only_native(nf) => {
+                                            INTRINSIC_OPERAND_ONLY
+                                        }
+                                        _ if crate::builtins::is_numeric_only_native(nf) => {
+                                            INTRINSIC_NUMERIC_ONLY
                                         }
                                         _ => 0,
                                     },

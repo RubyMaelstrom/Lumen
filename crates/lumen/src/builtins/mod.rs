@@ -14,7 +14,7 @@ use std::rc::Rc;
 // are reachable from each submodule via `use super::*`.
 mod atomics;
 mod collections;
-pub(crate) use collections::{map_get, map_set, weak_map_get};
+pub(crate) use collections::{is_operand_only_native, map_get, map_set, weak_map_get};
 mod dataview;
 mod date;
 pub(crate) use date::system_time_zone;
@@ -46,8 +46,9 @@ mod array_shift_tests;
 
 pub(crate) use function_proto::nf_function_call;
 pub(crate) use globals::nf_is_nan;
-pub(crate) use math::nf_math_sqrt;
+pub(crate) use math::{is_numeric_only_native, nf_math_sqrt};
 pub(crate) use primitives::nf_number_is_nan;
+pub(crate) use reflect::nf_reflect_apply;
 
 /// `args[i]` or `undefined`.
 fn arg(args: &[Value], i: usize) -> Value {

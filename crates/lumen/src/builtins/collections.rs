@@ -545,19 +545,7 @@ pub(super) fn install_map_like(
     let proto = Object::new(Some(it.object_proto.clone()));
     it.extra_protos.insert(name, proto.clone());
 
-    let adder: NativeFn = if is_set {
-        |i, this, a| {
-            let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
-            let key = canonicalize_map_key(arg(a, 0));
-            collection_set(i, ptr, key.clone(), key);
-            Ok(this)
-        }
-    } else {
-        |i, this, a| {
-            map_set(i, &this, arg(a, 0), arg(a, 1))?;
-            Ok(this)
-        }
-    };
+    let adder: NativeFn = if is_set { nf_set_add } else { nf_map_set };
     it.def_method(
         &proto,
         if is_set { "add" } else { "set" },
@@ -565,38 +553,14 @@ pub(super) fn install_map_like(
         adder,
     );
     if !is_set {
-        it.def_method(&proto, "get", 1, |i, this, a| map_get(i, &this, &arg(a, 0)));
+        it.def_method(&proto, "get", 1, nf_map_get);
     }
     // has/delete are shared but brand-check the exact kind via kind-specific fn pointers.
-    let has_fn: NativeFn = if is_set {
-        |i, this, a| {
-            let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
-            let key = canonicalize_map_key(arg(a, 0));
-            Ok(Value::Bool(collection_has(i, ptr, &key)))
-        }
-    } else {
-        |i, this, a| {
-            let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            let key = canonicalize_map_key(arg(a, 0));
-            Ok(Value::Bool(collection_has(i, ptr, &key)))
-        }
-    };
+    let has_fn: NativeFn = if is_set { nf_set_has } else { nf_map_has };
     it.def_method(&proto, "has", 1, has_fn);
     // Delete marks the matching entry with a tombstone (keeping its slot) so a concurrent forEach /
     // iterator sees stable positions; the entry is otherwise treated as absent everywhere.
-    let delete_fn: NativeFn = if is_set {
-        |i, this, a| {
-            let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
-            let key = canonicalize_map_key(arg(a, 0));
-            Ok(Value::Bool(collection_delete(i, ptr, &key)))
-        }
-    } else {
-        |i, this, a| {
-            let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            let key = canonicalize_map_key(arg(a, 0));
-            Ok(Value::Bool(collection_delete(i, ptr, &key)))
-        }
-    };
+    let delete_fn: NativeFn = if is_set { nf_set_delete } else { nf_map_delete };
     it.def_method(&proto, "delete", 1, delete_fn);
     // clear/forEach/values/keys/entries/size are shared shapes but must brand-check the exact kind
     // (Set.prototype.clear rejects a Map and vice-versa), so select a kind-specific fn pointer.
@@ -807,30 +771,9 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
     let proto = Object::new(Some(it.object_proto.clone()));
     it.extra_protos.insert(name, proto.clone());
     let adder: NativeFn = if is_set {
-        |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, CollectionKind::Set)?;
-            let key = arg(a, 0);
-            if !can_be_held_weakly(i, &key) {
-                return Err(i.make_error("TypeError", "Invalid value used in weak set"));
-            }
-            if weak_entry_index(i, ptr, &key).is_none() {
-                // ECMA-262 #sec-weakset.prototype.add stores only weak membership, unlike a
-                // WeakMap's ephemeron value. A strong dummy copy would keep acyclic symbols
-                // alive and make an old WeakSet conservatively root young objects in a minor GC.
-                weak_insert(i, ptr, key, Value::Undefined);
-            }
-            Ok(this)
-        }
+        nf_weak_set_add
     } else {
-        |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
-            let (key, val) = (arg(a, 0), arg(a, 1));
-            if !can_be_held_weakly(i, &key) {
-                return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
-            }
-            weak_insert(i, ptr, key, val);
-            Ok(this)
-        }
+        nf_weak_map_set
     };
     it.def_method(
         &proto,
@@ -839,9 +782,7 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
         adder,
     );
     if !is_set {
-        it.def_method(&proto, "get", 1, |i, this, a| {
-            weak_map_get(i, &this, &arg(a, 0))
-        });
+        it.def_method(&proto, "get", 1, nf_weak_map_get);
         // Upsert proposal: getOrInsert(key, value) / getOrInsertComputed(key, callbackfn).
         it.def_method(&proto, "getOrInsert", 2, |i, this, a| {
             let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
@@ -876,14 +817,14 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
         });
     }
     let has: NativeFn = if is_set {
-        |i, this, a| weak_has(i, this, a, CollectionKind::Set)
+        nf_weak_set_has
     } else {
-        |i, this, a| weak_has(i, this, a, CollectionKind::Map)
+        nf_weak_map_has
     };
     let delete: NativeFn = if is_set {
-        |i, this, a| weak_remove(i, this, a, CollectionKind::Set)
+        nf_weak_set_delete
     } else {
-        |i, this, a| weak_remove(i, this, a, CollectionKind::Map)
+        nf_weak_map_delete
     };
     it.def_method(&proto, "has", 1, has);
     it.def_method(&proto, "delete", 1, delete);
@@ -920,4 +861,170 @@ fn weak_remove(
 ) -> Result<Value, Value> {
     let ptr = weak_brand_ptr(i, &this, kind)?;
     Ok(Value::Bool(weak_delete(i, ptr, &arg(args, 0))))
+}
+
+// Named collection methods: the JIT's call cache recognizes their exact identity (see
+// `is_operand_only_native`). None of them can run author code: keys compare with
+// SameValueZero or by identity, and failures are TypeErrors created natively.
+
+/// One [[MapData]]/[[SetData]] lookup with the exact-kind brand check (`coll_ptr_kind`'s
+/// semantics and error), for the per-key methods below.
+fn collection_of_kind<'a>(
+    i: &'a Interp,
+    this: &Value,
+    kind: crate::ordered_collection::CollectionKind,
+) -> Result<&'a crate::ordered_collection::OrderedCollection, Value> {
+    this.as_obj()
+        .and_then(|object| i.map_data.get(&(Rc::as_ptr(object) as usize)))
+        .filter(|data| data.kind() == kind)
+        .ok_or_else(|| i.make_error("TypeError", "method called on an incompatible receiver"))
+}
+
+/// The key argument after CoerceKey's `-0` → `+0`, borrowed when unchanged.
+fn coerced_key(a: &[Value]) -> std::borrow::Cow<'_, Value> {
+    match a.first() {
+        Some(Value::Num(n)) if *n == 0.0 && n.is_sign_negative() => {
+            std::borrow::Cow::Owned(Value::Num(0.0))
+        }
+        Some(key) => std::borrow::Cow::Borrowed(key),
+        None => std::borrow::Cow::Owned(Value::Undefined),
+    }
+}
+
+pub(crate) fn nf_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let data = collection_of_kind(i, &this, crate::ordered_collection::CollectionKind::Map)?;
+    Ok(data
+        .get(&coerced_key(a))
+        .cloned()
+        .unwrap_or(Value::Undefined))
+}
+
+pub(crate) fn nf_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    // `map_set` with one [[MapData]] lookup (`insert` canonicalizes -0).
+    let data = this
+        .as_obj()
+        .and_then(|object| i.map_data.get_mut(&(Rc::as_ptr(object) as usize)))
+        .filter(|data| data.kind() == crate::ordered_collection::CollectionKind::Map);
+    match data {
+        Some(data) => data.insert(arg(a, 0), arg(a, 1)),
+        None => {
+            return Err(i.make_error("TypeError", "method called on an incompatible receiver"));
+        }
+    }
+    Ok(this)
+}
+
+pub(crate) fn nf_map_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let data = collection_of_kind(i, &this, crate::ordered_collection::CollectionKind::Map)?;
+    Ok(Value::Bool(data.has(&coerced_key(a))))
+}
+
+pub(crate) fn nf_map_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
+    let key = canonicalize_map_key(arg(a, 0));
+    Ok(Value::Bool(collection_delete(i, ptr, &key)))
+}
+
+pub(crate) fn nf_set_add(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+    let key = canonicalize_map_key(arg(a, 0));
+    collection_set(i, ptr, key.clone(), key);
+    Ok(this)
+}
+
+pub(crate) fn nf_set_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let data = collection_of_kind(i, &this, crate::ordered_collection::CollectionKind::Set)?;
+    Ok(Value::Bool(data.has(&coerced_key(a))))
+}
+
+pub(crate) fn nf_set_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+    let key = canonicalize_map_key(arg(a, 0));
+    Ok(Value::Bool(collection_delete(i, ptr, &key)))
+}
+
+pub(crate) fn nf_weak_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    // `weak_map_get` with one brand-and-entry index lookup.
+    let index = map_ptr(&this)
+        .and_then(|ptr| {
+            i.weak_collection_index
+                .get(&ptr)
+                .filter(|index| index.kind == CollectionKind::Map)
+                .map(|index| (ptr, index))
+        })
+        .ok_or_else(|| i.make_error("TypeError", "method called on incompatible receiver"))?;
+    let (ptr, index) = index;
+    let entry = a
+        .first()
+        .and_then(crate::interpreter::WeakKey::of)
+        .and_then(|identity| index.entries.get(&identity).copied());
+    Ok(entry
+        .and_then(|entry| i.weak_collection_data.get(&ptr)?.get(entry))
+        .map(|(_, value)| value.clone())
+        .unwrap_or(Value::Undefined))
+}
+
+pub(crate) fn nf_weak_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
+    let (key, val) = (arg(a, 0), arg(a, 1));
+    if !can_be_held_weakly(i, &key) {
+        return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
+    }
+    weak_insert(i, ptr, key, val);
+    Ok(this)
+}
+
+pub(crate) fn nf_weak_map_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    weak_has(i, this, a, CollectionKind::Map)
+}
+
+pub(crate) fn nf_weak_map_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    weak_remove(i, this, a, CollectionKind::Map)
+}
+
+pub(crate) fn nf_weak_set_add(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let ptr = weak_brand_ptr(i, &this, CollectionKind::Set)?;
+    let key = arg(a, 0);
+    if !can_be_held_weakly(i, &key) {
+        return Err(i.make_error("TypeError", "Invalid value used in weak set"));
+    }
+    if weak_entry_index(i, ptr, &key).is_none() {
+        // ECMA-262 #sec-weakset.prototype.add stores only weak membership, unlike a
+        // WeakMap's ephemeron value. A strong dummy copy would keep acyclic symbols
+        // alive and make an old WeakSet conservatively root young objects in a minor GC.
+        weak_insert(i, ptr, key, Value::Undefined);
+    }
+    Ok(this)
+}
+
+pub(crate) fn nf_weak_set_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    weak_has(i, this, a, CollectionKind::Set)
+}
+
+pub(crate) fn nf_weak_set_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    weak_remove(i, this, a, CollectionKind::Set)
+}
+
+/// Collection methods whose complete algorithm runs no author code and needs no native-call
+/// boundary state (see `bytecode::INTRINSIC_OPERAND_ONLY`).
+pub(crate) fn is_operand_only_native(f: NativeFn) -> bool {
+    let candidates: [NativeFn; 14] = [
+        nf_map_get,
+        nf_map_set,
+        nf_map_has,
+        nf_map_delete,
+        nf_set_add,
+        nf_set_has,
+        nf_set_delete,
+        nf_weak_map_get,
+        nf_weak_map_set,
+        nf_weak_map_has,
+        nf_weak_map_delete,
+        nf_weak_set_add,
+        nf_weak_set_has,
+        nf_weak_set_delete,
+    ];
+    candidates
+        .iter()
+        .any(|&candidate| std::ptr::eq(candidate as *const (), f as *const ()))
 }

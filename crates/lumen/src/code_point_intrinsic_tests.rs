@@ -165,3 +165,67 @@ fn unit_reads_from_char_code_and_is_nan_match_the_full_calls() {
         );
     }
 }
+
+/// Map/Set/WeakMap/WeakSet methods and Math's numeric functions called on moved operands
+/// without the native-call boundary, and Reflect.apply with such a target, keep the full
+/// algorithms: CoerceKey, brand checks, weak-key validation, ToNumber's order for non-Number
+/// arguments, and CreateListFromArrayLike's Gets for holes, getters and array-likes. Expected
+/// values are Node's.
+#[test]
+fn operand_only_natives_and_reflect_apply_match_the_full_calls() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+var log = [];
+function rec(x) { log.push(String(x)); }
+function err(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+var keys = [{}, {}, 'k', -0, NaN, 1];
+var m = new Map(), s = new Set(), wm = new WeakMap(), ws = new WeakSet();
+function mg(x, k) { return x.get(k); }
+function mh(x, k) { return x.has(k); }
+function ms(x, k, v) { return x.set(k, v); }
+function md(x, k) { return x.delete(k); }
+function sa(x, k) { return x.add(k); }
+function ab(x) { return Math.abs(x); }
+function fl(x) { return Math.floor(x); }
+function mx(a, b) { return Math.max(a, b); }
+function ra(f, t, l) { return Reflect.apply(f, t, l); }
+for (var i = 0; i < 400; i++) {
+  var k = keys[i % keys.length];
+  ms(m, k, i); mg(m, k); mh(m, k); sa(s, k); mh(s, k);
+  if (typeof k === 'object') { ms(wm, k, i); mg(wm, k); mh(wm, k); sa(ws, k); mh(ws, k); }
+  ab(i - 200); fl(i / 3); mx(i, 200 - i); ra(WeakMap.prototype.get, wm, [keys[0]]);
+}
+rec(mg(m, 0)); rec(mg(m, -0)); rec(mg(m, NaN)); rec(mg(m, 'k')); rec(mg(m, keys[1])); rec(mg(m, 'nope'));
+rec(mh(m, +0)); rec(md(m, -0)); rec(mh(m, 0)); rec(ms(m, 'x', 1) === m); rec(m.size);
+rec(mh(s, NaN)); rec(sa(s, 7) === s); rec(md(s, 7)); rec(s.size);
+rec(mg(wm, keys[0])); rec(mg(wm, 'prim')); rec(mh(wm, 3)); rec(err(function () { return ms(wm, 'prim', 1); }));
+rec(md(wm, keys[1])); rec(mh(wm, keys[1])); rec(mh(ws, keys[0])); rec(err(function () { return sa(ws, 5); }));
+var sym = Symbol('w'); ms(wm, sym, 'sv'); rec(mg(wm, sym));
+rec(err(function () { return mg({ get: Map.prototype.get }, 1); }));
+rec(err(function () { return mg(s, 1); }));
+rec(err(function () { return mh(m.has ? { has: Set.prototype.has } : 0, 1); }));
+rec(err(function () { return mg(wm.get ? { get: WeakMap.prototype.get } : 0, keys[0]); }));
+rec(err(function () { return mg(new WeakSet(), keys[0]); }));
+var order = []; var o1 = { valueOf: function () { order.push('a'); return -3; } }, o2 = { valueOf: function () { order.push('b'); return 4; } };
+rec(ab(o1)); rec(fl('2.7')); rec(mx(o1, o2)); rec(order.join('')); rec(ab(-0) === 0 && 1 / ab(-0)); rec(fl(-0.5)); rec(mx(NaN, 1)); rec(mx(-0, 0));
+rec(ra(WeakMap.prototype.get, wm, [keys[0]])); rec(ra(WeakMap.prototype.get, wm, [,])); rec(ra(Map.prototype.get, m, ['k']));
+var getterHits = 0; var arr = [0]; Object.defineProperty(arr, 0, { get: function () { getterHits++; return 'k'; } });
+rec(ra(Map.prototype.get, m, arr)); rec(getterHits);
+rec(ra(Map.prototype.get, m, { length: 1, 0: 'k' })); rec(err(function () { return ra(Map.prototype.get, s, ['k']); }));
+rec(err(function () { return ra(5, m, []); })); rec(ra(function (a, b) { return a + b + this.z; }, { z: 1 }, [2, 3]));
+rec(ra(Math.max, null, [3, 9, 4])); rec(ra(Math.max, null, [3, o2])); rec(order.join(''));
+Array.prototype[0] = 'k'; rec(ra(Map.prototype.get, m, [,])); delete Array.prototype[0];
+log.join(',');
+        "#
+            ),
+            "399,399,394,398,397,undefined,true,true,false,true,6,true,true,true,6,396,undefined,false,TypeError,true,false,true,TypeError,sv,TypeError,TypeError,TypeError,TypeError,TypeError,3,2,4,aab,Infinity,-1,NaN,0,396,undefined,398,398,1,398,TypeError,TypeError,6,9,4,aabb,398",
+            "{tier:?}"
+        );
+    }
+}

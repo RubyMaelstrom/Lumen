@@ -46,6 +46,31 @@ impl StoredValue for PackedValue {
     }
 }
 
+/// Move `argc` owned packed words starting at `args` into wide values for the duration of `f`
+/// (the caller forgets the words). Common arities stay on the Rust stack.
+///
+/// # Safety
+/// `args..args + argc` must be initialized, owned words that the caller never reads or drops
+/// again.
+pub(crate) unsafe fn with_moved_values<R>(
+    args: *mut PackedValue,
+    argc: usize,
+    f: impl FnOnce(&[Value]) -> R,
+) -> R {
+    let take = |k: usize| unsafe { args.add(k).read() }.into_value();
+    match argc {
+        0 => f(&[]),
+        1 => f(&[take(0)]),
+        2 => f(&[take(0), take(1)]),
+        3 => f(&[take(0), take(1), take(2)]),
+        4 => f(&[take(0), take(1), take(2), take(3)]),
+        _ => {
+            let values: Vec<Value> = (0..argc).map(take).collect();
+            f(&values)
+        }
+    }
+}
+
 pub(crate) trait SlotAccess {
     fn read_value(&self, index: usize) -> Value;
     fn write_value(&mut self, index: usize, value: Value);

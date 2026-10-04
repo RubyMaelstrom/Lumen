@@ -68,8 +68,8 @@ pub(super) fn install_math(it: &mut Interp) {
             .insert(key, Property::data(Value::str("Math"), false, false, true));
     }
     macro_rules! unary {
-        ($name:expr, $f:expr) => {
-            it.def_method(&math, $name, 1, |i, _t, a| {
+        ($name:expr, $f:expr) => {{
+            let f: NativeFn = |i, _t, a| {
                 // ECMA-262 ToNumber is the identity for Numbers with no observable effects
                 // (§7.1.4), so bypass the generic dispatch for the common numeric case.
                 // All other inputs retain the complete coercive path with its abrupt
@@ -79,8 +79,10 @@ pub(super) fn install_math(it: &mut Interp) {
                 }
                 let x = ab(i.to_number(&arg(a, 0)))?;
                 Ok(Value::Num($f(x)))
-            });
-        };
+            };
+            register_numeric_only_native(f);
+            it.def_method(&math, $name, 1, f);
+        }};
     }
     unary!("abs", f64::abs);
     unary!("floor", f64::floor);
@@ -268,7 +270,7 @@ pub(super) fn install_math(it: &mut Interp) {
             ab(i.to_number(&arg(a, 0)))?.atan2(ab(i.to_number(&arg(a, 1)))?),
         ))
     });
-    it.def_method(&math, "max", 2, |i, _t, a| {
+    let max_fn: NativeFn = |i, _t, a| {
         // Number arguments are already the result of ToNumber, so this branch can reduce them
         // without allocating the spec's intermediate List (ECMA-262 §21.3.2.25). If a non-Number
         // appears, restart through the complete coercion path so every argument is still coerced
@@ -291,8 +293,10 @@ pub(super) fn install_math(it: &mut Interp) {
             }
         }
         Ok(Value::Num(if saw_nan { f64::NAN } else { highest }))
-    });
-    it.def_method(&math, "min", 2, |i, _t, a| {
+    };
+    register_numeric_only_native(max_fn);
+    it.def_method(&math, "max", 2, max_fn);
+    let min_fn: NativeFn = |i, _t, a| {
         // See Math.max above: the all-Number case has no observable coercion work to perform
         // (ECMA-262 §21.3.2.26).
         let mut lowest = f64::INFINITY;
@@ -313,7 +317,9 @@ pub(super) fn install_math(it: &mut Interp) {
             }
         }
         Ok(Value::Num(if saw_nan { f64::NAN } else { lowest }))
-    });
+    };
+    register_numeric_only_native(min_fn);
+    it.def_method(&math, "min", 2, min_fn);
     set_to_string_tag(it, &math, "Math");
     set_builtin(&it.global, "Math", Value::Obj(math));
 }
@@ -467,4 +473,21 @@ fn fsum_exact(values: &[f64]) -> f64 {
         }
     }
     hi
+}
+
+thread_local! {
+    /// Natives whose complete algorithm runs no author code when every argument is a Number
+    /// (Math's numeric functions: ToNumber is then the identity). See
+    /// `bytecode::INTRINSIC_NUMERIC_ONLY`.
+    static NUMERIC_ONLY_NATIVES: std::cell::RefCell<crate::fasthash::FastSet<usize>> =
+        std::cell::RefCell::new(Default::default());
+}
+
+fn register_numeric_only_native(f: NativeFn) {
+    NUMERIC_ONLY_NATIVES.with(|set| set.borrow_mut().insert(f as *const () as usize));
+}
+
+/// Whether `f` was registered by [`register_numeric_only_native`].
+pub(crate) fn is_numeric_only_native(f: NativeFn) -> bool {
+    NUMERIC_ONLY_NATIVES.with(|set| set.borrow().contains(&(f as *const () as usize)))
 }
