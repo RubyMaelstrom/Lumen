@@ -287,3 +287,85 @@ log.join(',');
         );
     }
 }
+
+/// Method intrinsics at call sites outside loops run in the chunk's shared intrinsic stub; the
+/// same intrinsics inside a small loop keep their inline sequences. Both must complete, decline
+/// (other operand types, replaced builtins), throw and leave non-intrinsic calls to the ordinary
+/// call exactly as before. Expected values are Node's.
+#[test]
+fn shared_and_inline_call_intrinsics_agree() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+var log = [];
+function rec(x) { log[log.length] = (typeof x === 'number' && x !== x ? 'NaN' : String(x)); }
+function err(f) { try { return String(f()); } catch (e) { return e.constructor.name + (e instanceof RangeError ? ':' + e.message : ''); } }
+// One call site per helper, outside any loop (shared-stub dispatch); the callers loop.
+function ca(s, n) { return s.charAt(n); }
+function cc(s, n) { return s.charCodeAt(n); }
+function cp(s, n) { return s.codePointAt(n); }
+function sq(m, x) { return m.sqrt(x); }
+function nn(o, x) { return o.isNaN(x); }
+function fc(S, n) { return S.fromCharCode(n); }
+function pu(a, v) { return a.push(v); }
+function ex(re, s) { re.exec(s); return re.lastIndex; }
+function sp(s, sep) { s.split(sep); return s.length; }
+function sl(s, a, b) { return s.slice(a, b); }
+function ho(O, o, k) { return O.hasOwn(o, k); }
+function ap(f, t, args) { return f.apply(t, args); }
+function rp(s, re, w) { s.replace(re, w); return re.lastIndex; }
+function cl1(f, t) { return f.call(t); }
+function cl2(f, t, x) { return f.call(t, x); }
+function add(y) { return (this && this.base || 0) + (y === undefined ? 1 : y); }
+function thrower(y) { throw new RangeError('t' + y); }
+var ascii = 'hello world', uni = 'héllo \u{1F600}!';
+var acc = [];
+for (var r = 0; r < 300; r++) {
+  var k = r % 13;
+  acc.push(ca(ascii, k), cc(ascii, k), cc(uni, k % 9), cp(uni, k % 9), sq(Math, k * k), nn(globalThis, k), nn(Number, k),
+    fc(String, 97 + k), pu([1, 2], k), ex(/o/g, ascii), sp('a,b,c', ','), sl(ascii, 1, 1 + k % 5), ho(Object, { a: 1 }, 'a'),
+    ap(add, { base: 10 }, [k]), rp('aXbXc', /X/g, '-'), cl1(add, { base: 2 }), cl2(add, { base: 3 }, k));
+}
+rec(acc.length); rec(acc.slice(0, 17).join('|')); rec(acc.slice(-17).join('|'));
+// Declines and unusual operands through the same warmed sites.
+rec(ca(ascii, 1.7)); rec(ca(ascii, -1)); rec(ca(ascii, 99)); rec(ca(uni, 7).charCodeAt(0)); rec(err(() => ca(5, 0)));
+rec(cc(ascii, 2.9)); rec(cc(ascii, 400)); rec(cc(uni, 6)); rec(cc(ascii, '3')); rec(cc(new String('ab'), 1));
+rec(cp(uni, 7)); rec(cp(uni, 8)); rec(cp(ascii, 50));
+rec(sq(Math, '16')); rec(sq(Math, -1)); rec(sq({ sqrt: function (x) { return 'own' + x; } }, 4));
+rec(nn(globalThis, 'x')); rec(nn(Number, 'x')); rec(nn(globalThis, undefined));
+rec(fc(String, 65.9)); rec(fc(String, 65536 + 66)); rec(fc(String, '67'));
+rec(pu({ length: 1, push: Array.prototype.push }, 'v')); rec(err(() => pu(Object.freeze([1]), 2)));
+rec(ex(/x/g, ascii)); rec(sp('a1b2c', /\d/)); rec(sl(uni, 1, 3)); rec(sl(ascii, '1', '4'));
+rec(ho(Object, { b: 2 }, 'a')); rec(err(() => ho(Object, null, 'a')));
+rec(err(() => ap(thrower, null, [7]))); rec(ap(add, null, { length: 1, 0: 41 }));
+rec(err(() => cl1(thrower, null))); rec(err(() => cl2(thrower, null, 9))); rec(err(() => cl2(5, null, 1)));
+rec(rp('aaa', /a/g, function (m) { return m.toUpperCase(); }));
+// Replacing a builtin changes the call IC's identity proof.
+var savedCharAt = String.prototype.charAt; String.prototype.charAt = function () { return 'patched'; };
+rec(ca(ascii, 0)); String.prototype.charAt = savedCharAt; rec(ca(ascii, 0));
+var savedPush = Array.prototype.push; Array.prototype.push = function () { return -1; };
+rec(pu([1], 2)); Array.prototype.push = savedPush; rec(pu([1], 2));
+// The same intrinsics at sites inside a small loop keep their inline sequences.
+function hot(n) {
+  var t = 0, parts = [];
+  for (var q = 0; q < n; q++) {
+    t += ascii.charCodeAt(q % 11) + uni.charCodeAt(q % 9) + Math.sqrt(q) + (isNaN(q) ? 1 : 0) + ascii.codePointAt(q % 3);
+    parts.push(String.fromCharCode(97 + q % 26) + ascii.charAt(q % 11) + ascii.slice(q % 3, 5));
+    if (Object.hasOwn(parts, q)) t++;
+  }
+  return t + ':' + parts.length + ':' + parts[n - 1];
+}
+rec(hot(300)); rec(hot(7));
+log.join(',');
+"#
+            ),
+            "5100,h|104|104|104|0|false|false|a|3|5|5||true|10|0|3|3,h|104|104|104|0|false|false|a|3|5|5||true|10|0|3|3,e,,,56832,TypeError,108,NaN,55357,108,98,56832,33,undefined,4,NaN,own4,true,false,true,A,B,C,2,TypeError,0,5,él,ell,false,TypeError,RangeError:t7,41,RangeError:tundefined,RangeError:t9,TypeError,0,patched,h,-1,2,3792239.2358805016:300:nlllo,57483.83182209023:7:gwhello",
+            "{tier:?}"
+        );
+    }
+}

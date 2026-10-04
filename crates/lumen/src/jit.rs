@@ -6045,277 +6045,29 @@ fn emit_call_inline(
             // tag/hint, index shape, bounds, last-reference operands) takes the
             // H_CALL_HIT form, whose Rust side handles native entries generally.
             if with_this && *argc == 1 && rc_ok && layout.rc_strong_off == 0 {
-                let char_at = a.new_label();
-                let char_code = a.new_label();
-                let char_code_helper = a.new_label();
-                let code_point = a.new_label();
-                let sqrt = a.new_label();
-                let is_nan = a.new_label();
-                let from_char_code = a.new_label();
-                let regexp_exec = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
-                let string_split = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
-                let array_push = array_intrinsics_on.then(|| a.new_label());
+                let discard = matches!(ops.get(pc + 1), Some(Op::Pop));
                 let no_intr = a.new_label();
-                a.ldrb_imm(9, 12, 96); // ic.intrinsic (offset compile-asserted)
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_AT as u32);
-                a.b_cond(C_EQ, char_at);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32);
-                a.b_cond(C_EQ, char_code);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32);
-                a.b_cond(C_EQ, code_point);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
-                a.b_cond(C_EQ, sqrt);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_IS_NAN as u32);
-                a.b_cond(C_EQ, is_nan);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FROM_CHAR_CODE as u32);
-                a.b_cond(C_EQ, from_char_code);
-                if let Some(array_push) = array_push {
-                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32);
-                    a.b_cond(C_EQ, array_push);
+                if use_shared_stub(a) {
+                    let stub = a.shared_stub(
+                        SharedStub::Intrinsics1 {
+                            array_push: array_intrinsics_on,
+                            discard,
+                        }
+                        .key(),
+                    );
+                    emit_intrinsic_stub_call(a, pc as u32, stub, no_intr, hit_slow, done, l_unwind);
+                } else {
+                    emit_call_intrinsics1(
+                        a,
+                        IntrinsicPc::Imm(pc as u32),
+                        array_intrinsics_on,
+                        discard,
+                        no_intr,
+                        hit_slow,
+                        done,
+                        l_unwind,
+                    );
                 }
-                if let Some(regexp_exec) = regexp_exec {
-                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32);
-                    a.b_cond(C_EQ, regexp_exec);
-                }
-                if let Some(string_split) = string_split {
-                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32);
-                    a.b_cond(C_EQ, string_split);
-                }
-                a.b(no_intr);
-
-                // String#charAt(number): exact builtin identity is already proven.
-                // The dedicated helper handles truncation, UTF-16 units, and the
-                // interned ASCII result while consuming the three operands directly.
-                a.bind(char_at);
-                emit_exec_word_load(a, 9, 20, -24);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, crate::bytecode::INTRINSIC_CHAR_AT as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.b(done);
-
-                // Exact builtin identity is proven by the live call IC. Numeric
-                // indices need no author conversion; all UTF-16 cases use the
-                // compact helper with the established native activation boundaries.
-                a.bind(code_point);
-                emit_exec_word_load(a, 9, 20, -24);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.b(done);
-
-                a.bind(char_code);
-                // receiver: Str; index: Num. Every other miss below (no ASCII hint, a
-                // fractional or out-of-range index, a last owner) is still a String
-                // receiver with a Number index, which the operand-only helper finishes.
-                emit_exec_word_load(a, 9, 20, -24);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-                emit_exec_word_load(a, 11, 20, -24);
-                emit_exec_payload(a, 11, 11);
-                a.ldr_w_imm(14, 11, crate::lstr::CAP_OFF as u32);
-                a.lsr_imm(14, 14, 31);
-                a.cbz(14, false, char_code_helper);
-                // index: exact u32
-                a.ldur_d(0, 20, -8);
-                a.fcvtzu_w_d(9, 0);
-                a.ucvtf_d_w(1, 9);
-                a.fcmp(0, 1);
-                a.b_cond(C_NE, char_code_helper);
-                // bounds (ASCII: byte index == unit index); OOB answers NaN in the
-                // helper
-                a.ldr_w_imm(14, 11, crate::lstr::LEN_OFF as u32);
-                a.cmp_reg_x(9, 14);
-                a.b_cond(C_HS, char_code_helper);
-                // both refcounted operands must survive a bare dec
-                a.ldur(14, 11, 0);
-                a.cmp_imm_x(14, 1);
-                a.b_cond(C_LS, char_code_helper);
-                a.ldur(13, 10, 0);
-                a.cmp_imm_x(13, 1);
-                a.b_cond(C_LS, char_code_helper);
-                // ---- commit: byte load, decs, Num over the receiver slot ----
-                a.add_imm(16, 11, crate::lstr::DATA_OFF as u32);
-                a.ldrb_reg(16, 16, 9);
-                a.ucvtf_d_w(0, 16);
-                a.sub_imm(14, 14, 1);
-                a.stur(14, 11, 0);
-                a.sub_imm(13, 13, 1);
-                a.stur(13, 10, 0);
-                emit_exec_number_store(a, 0, 20, -24, 9);
-                a.sub_imm(20, 20, 16);
-                a.b(done);
-
-                // String receiver, Number index: UTF-16 units of a non-ASCII receiver,
-                // truncation and out-of-range indices in the operand-only helper.
-                a.bind(char_code_helper);
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.b(done);
-
-                // isNaN(number) / Number.isNaN(number): both answer SameValue(n, NaN) for a
-                // Number argument (ToNumber is the identity). The receiver is unused: an
-                // Undefined receiver needs no release, an object must survive a bare
-                // decrement, like the distinct function handle.
-                a.bind(is_nan);
-                {
-                    let receiver_ready = a.new_label();
-                    emit_exec_word_load(a, 9, 20, -8);
-                    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-                    a.ldur(13, 10, 0);
-                    a.cmp_imm_x(13, 1);
-                    a.b_cond(C_LS, hit_slow);
-                    emit_exec_word_load(a, 9, 20, -24);
-                    a.movz(11, 0, 0); // no receiver release
-                    a.mov_imm64(16, crate::value::PACK_UNDEFINED);
-                    a.cmp_reg_x(9, 16);
-                    a.b_cond(C_EQ, receiver_ready);
-                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                    emit_exec_payload(a, 9, 11);
-                    a.ldur(14, 11, 0);
-                    a.cmp_imm_x(14, 1);
-                    a.b_cond(C_LS, hit_slow);
-                    a.bind(receiver_ready);
-                    // ---- commit: decrements, Boolean over the receiver slot ----
-                    a.fcmp(0, 0);
-                    a.cset_w(9, C_VS);
-                    a.sub_imm(13, 13, 1);
-                    a.stur(13, 10, 0);
-                    let released = a.new_label();
-                    a.cbz(11, true, released);
-                    a.ldur(14, 11, 0);
-                    a.sub_imm(14, 14, 1);
-                    a.stur(14, 11, 0);
-                    a.bind(released);
-                    a.mov_imm64(16, crate::value::PACK_BOOL);
-                    a.logic_x(1, 9, 9, 16);
-                    emit_exec_word_store(a, 9, 20, -24);
-                    a.sub_imm(20, 20, 16);
-                    a.b(done);
-                }
-
-                // String.fromCharCode(number): ToUint16 and the interned one-unit strings in
-                // the operand-only helper.
-                a.bind(from_char_code);
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, crate::bytecode::INTRINSIC_FROM_CHAR_CODE as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.b(done);
-
-                // Math.sqrt(number): the call IC already proved builtin identity.
-                // The receiver is ignored semantically; require an object so it and
-                // the distinct function handle can be released by guarded decrements.
-                a.bind(sqrt);
-                emit_exec_word_load(a, 9, 20, -24);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-                emit_exec_word_load(a, 11, 20, -24);
-                emit_exec_payload(a, 11, 11);
-                a.ldur(14, 11, 0);
-                a.cmp_imm_x(14, 1);
-                a.b_cond(C_LS, hit_slow);
-                a.ldur(13, 10, 0);
-                a.cmp_imm_x(13, 1);
-                a.b_cond(C_LS, hit_slow);
-                a.ldur_d(0, 20, -8);
-                a.fsqrt(0, 0);
-                a.sub_imm(14, 14, 1);
-                a.stur(14, 11, 0);
-                a.sub_imm(13, 13, 1);
-                a.stur(13, 10, 0);
-                emit_exec_number_store(a, 0, 20, -24, 9);
-                a.sub_imm(20, 20, 16);
-                a.b(done);
-
-                // Array#push(value): builtin identity is proven by the call IC. The
-                // helper moves `value` into dense storage after live array/prototype/
-                // length guards, and restores the operand before the exact builtin on
-                // any miss.
-                if let Some(array_push) = array_push {
-                    a.bind(array_push);
-                    emit_exec_word_load(a, 9, 20, -24);
-                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                    a.mov(0, 19);
-                    a.movz(1, pc as u32, 0);
-                    a.movk(1, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32, 1);
-                    a.mov(2, 20);
-                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                    a.blr(16);
-                    a.mov(20, 0);
-                    a.cbnz(1, false, l_unwind);
-                    a.b(done);
-                }
-
-                if let Some(regexp_exec) = regexp_exec {
-                    a.bind(regexp_exec);
-                    // Exact built-in identity is already proven by the call IC.
-                    // The helper additionally validates the ordinary RegExp object
-                    // and lastIndex shape before taking its allocation-free path.
-                    emit_exec_word_load(a, 9, 20, -24);
-                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                    emit_exec_word_load(a, 9, 20, -8);
-                    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-                    a.mov(0, 19);
-                    a.movz(1, pc as u32, 0);
-                    a.movk(1, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32, 1);
-                    a.mov(2, 20);
-                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                    a.blr(16);
-                    a.mov(20, 0);
-                    a.cbnz(1, false, l_unwind);
-                    a.b(done);
-                }
-
-                if let Some(string_split) = string_split {
-                    a.bind(string_split);
-                    // The call IC proves String#split identity. The helper validates
-                    // the separator's complete RegExp protocol/species dependency
-                    // chain before eliding only the dead result allocations.
-                    emit_exec_word_load(a, 9, 20, -24);
-                    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-                    emit_exec_word_load(a, 9, 20, -8);
-                    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                    a.mov(0, 19);
-                    a.movz(1, pc as u32, 0);
-                    a.movk(1, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32, 1);
-                    a.mov(2, 20);
-                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                    a.blr(16);
-                    a.mov(20, 0);
-                    a.cbnz(1, false, l_unwind);
-                    a.b(done);
-                }
-
                 a.bind(no_intr);
             }
             if with_this && *argc == 0 && array_intrinsics_on {
@@ -6360,107 +6112,21 @@ fn emit_call_inline(
                 a.bind(no_intr);
             }
             if with_this && *argc == 2 {
-                let slice = a.new_label();
-                let has_own = a.new_label();
-                let apply = a.new_label();
-                let replace = matches!(ops.get(pc + 1), Some(Op::Pop)).then(|| a.new_label());
+                let discard = matches!(ops.get(pc + 1), Some(Op::Pop));
                 let no_intr = a.new_label();
-                a.ldrb_imm(9, 12, 96);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
-                a.b_cond(C_EQ, slice);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32);
-                a.b_cond(C_EQ, has_own);
-                a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32);
-                a.b_cond(C_EQ, apply);
-                if let Some(replace) = replace {
-                    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32);
-                    a.b_cond(C_EQ, replace);
-                }
-                a.b(no_intr);
-
-                // ASCII String#slice(start, end), both bounds already Numbers: no
-                // user code or exotic conversion can run in the dedicated helper.
-                a.bind(slice);
-                emit_exec_word_load(a, 9, 20, -32);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-                emit_exec_word_load(a, 11, 20, -32);
-                emit_exec_payload(a, 11, 11);
-                a.ldr_w_imm(9, 11, crate::lstr::CAP_OFF as u32);
-                a.lsr_imm(9, 9, 31);
-                a.cbz(9, false, hit_slow);
-                for off in [-16i32, -8] {
-                    emit_exec_word_load(a, 9, 20, off);
-                    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-                }
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, crate::bytecode::INTRINSIC_STRING_SLICE as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.b(done);
-
-                // Object.hasOwn(obj, string): the named intrinsic's implementation
-                // is exactly an own-map lookup for this non-coercing argument shape.
-                a.bind(has_own);
-                emit_exec_word_load(a, 9, 20, -16);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.b(done);
-
-                // Function#apply(targetThis, arguments): builtin identity is already
-                // proven. Restrict the intrinsic helper to an object target and
-                // object list; it performs the ordinary/unmapped/dense guards before
-                // moving entries directly into a compiled target frame.
-                a.bind(apply);
-                emit_exec_word_load(a, 9, 20, -32);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                emit_exec_word_load(a, 9, 20, -8);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-                a.mov(0, 19);
-                a.movz(1, pc as u32, 0);
-                a.movk(1, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32, 1);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                a.blr(16);
-                a.mov(20, 0);
-                a.cbnz(1, false, l_unwind);
-                a.b(done);
-
-                if let Some(replace) = replace {
-                    a.bind(replace);
-                    for (off, tag) in [
-                        (-32i32, crate::value::PACK_STR),
-                        (-16, crate::value::PACK_OBJ),
-                        (-8, crate::value::PACK_STR),
-                    ] {
-                        emit_exec_word_load(a, 9, 20, off);
-                        emit_exec_tag_guard(a, 9, tag, 16, hit_slow);
-                    }
-                    a.mov(0, 19);
-                    a.movz(1, pc as u32, 0);
-                    a.movk(
-                        1,
-                        crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32,
-                        1,
+                if use_shared_stub(a) {
+                    let stub = a.shared_stub(SharedStub::Intrinsics2 { discard }.key());
+                    emit_intrinsic_stub_call(a, pc as u32, stub, no_intr, hit_slow, done, l_unwind);
+                } else {
+                    emit_call_intrinsics2(
+                        a,
+                        IntrinsicPc::Imm(pc as u32),
+                        discard,
+                        no_intr,
+                        hit_slow,
+                        done,
+                        l_unwind,
                     );
-                    a.mov(2, 20);
-                    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
-                    a.blr(16);
-                    a.mov(20, 0);
-                    a.cbnz(1, false, l_unwind);
-                    a.b(done);
                 }
                 a.bind(no_intr);
             }
@@ -6546,6 +6212,470 @@ fn emit_call_inline(
     a.cbnz(1, false, l_unwind);
     a.bind(done);
 }
+/// Where an intrinsic block finds its call site's bytecode pc for the helper's operand word:
+/// an immediate in the site's own code, or w8 in the chunk's shared intrinsic stub.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+enum IntrinsicPc {
+    Imm(u32),
+    InW8,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_intrinsic_pc(a: &mut asm::Asm, pc: IntrinsicPc) {
+    match pc {
+        IntrinsicPc::Imm(pc) => a.movz(1, pc, 0),
+        IntrinsicPc::InW8 => a.mov(1, 8),
+    }
+}
+
+/// The one-argument method intrinsics of a `CallWithThis(1)` site after its live call-IC hit
+/// (x10 = callee payload, x12 = the hit way, x15 = its index; preserved on every exit except a
+/// completed or throwing intrinsic). `no_intr` continues with the ordinary call, `hit_slow` with
+/// the H_CALL_HIT form; `done`/`l_unwind` follow a completed/throwing intrinsic. `discard`: the
+/// result is popped (RegExp#exec and String#split elide it). Emitted at the site, or once per
+/// chunk in [`SharedStub::Intrinsics1`].
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_call_intrinsics1(
+    a: &mut asm::Asm,
+    pc: IntrinsicPc,
+    array_push: bool,
+    discard: bool,
+    no_intr: usize,
+    hit_slow: usize,
+    done: usize,
+    l_unwind: usize,
+) {
+    let char_at = a.new_label();
+    let char_code = a.new_label();
+    let char_code_helper = a.new_label();
+    let code_point = a.new_label();
+    let sqrt = a.new_label();
+    let is_nan = a.new_label();
+    let from_char_code = a.new_label();
+    let regexp_exec = discard.then(|| a.new_label());
+    let string_split = discard.then(|| a.new_label());
+    let array_push = array_push.then(|| a.new_label());
+    a.ldrb_imm(9, 12, 96); // ic.intrinsic (offset compile-asserted)
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_AT as u32);
+    a.b_cond(C_EQ, char_at);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32);
+    a.b_cond(C_EQ, char_code);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32);
+    a.b_cond(C_EQ, code_point);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_MATH_SQRT as u32);
+    a.b_cond(C_EQ, sqrt);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_IS_NAN as u32);
+    a.b_cond(C_EQ, is_nan);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FROM_CHAR_CODE as u32);
+    a.b_cond(C_EQ, from_char_code);
+    if let Some(array_push) = array_push {
+        a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32);
+        a.b_cond(C_EQ, array_push);
+    }
+    if let Some(regexp_exec) = regexp_exec {
+        a.cmp_imm_w(9, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32);
+        a.b_cond(C_EQ, regexp_exec);
+    }
+    if let Some(string_split) = string_split {
+        a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32);
+        a.b_cond(C_EQ, string_split);
+    }
+    a.b(no_intr);
+
+    // String#charAt(number): exact builtin identity is already proven.
+    // The dedicated helper handles truncation, UTF-16 units, and the
+    // interned ASCII result while consuming the three operands directly.
+    a.bind(char_at);
+    emit_exec_word_load(a, 9, 20, -24);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(1, crate::bytecode::INTRINSIC_CHAR_AT as u32, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
+
+    // Exact builtin identity is proven by the live call IC. Numeric
+    // indices need no author conversion; all UTF-16 cases use the
+    // compact helper with the established native activation boundaries.
+    a.bind(code_point);
+    emit_exec_word_load(a, 9, 20, -24);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(1, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
+
+    a.bind(char_code);
+    // receiver: Str; index: Num. Every other miss below (no ASCII hint, a
+    // fractional or out-of-range index, a last owner) is still a String
+    // receiver with a Number index, which the operand-only helper finishes.
+    emit_exec_word_load(a, 9, 20, -24);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    emit_exec_word_load(a, 11, 20, -24);
+    emit_exec_payload(a, 11, 11);
+    a.ldr_w_imm(14, 11, crate::lstr::CAP_OFF as u32);
+    a.lsr_imm(14, 14, 31);
+    a.cbz(14, false, char_code_helper);
+    // index: exact u32
+    a.ldur_d(0, 20, -8);
+    a.fcvtzu_w_d(9, 0);
+    a.ucvtf_d_w(1, 9);
+    a.fcmp(0, 1);
+    a.b_cond(C_NE, char_code_helper);
+    // bounds (ASCII: byte index == unit index); OOB answers NaN in the
+    // helper
+    a.ldr_w_imm(14, 11, crate::lstr::LEN_OFF as u32);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, char_code_helper);
+    // both refcounted operands must survive a bare dec
+    a.ldur(14, 11, 0);
+    a.cmp_imm_x(14, 1);
+    a.b_cond(C_LS, char_code_helper);
+    a.ldur(13, 10, 0);
+    a.cmp_imm_x(13, 1);
+    a.b_cond(C_LS, char_code_helper);
+    // ---- commit: byte load, decs, Num over the receiver slot ----
+    a.add_imm(16, 11, crate::lstr::DATA_OFF as u32);
+    a.ldrb_reg(16, 16, 9);
+    a.ucvtf_d_w(0, 16);
+    a.sub_imm(14, 14, 1);
+    a.stur(14, 11, 0);
+    a.sub_imm(13, 13, 1);
+    a.stur(13, 10, 0);
+    emit_exec_number_store(a, 0, 20, -24, 9);
+    a.sub_imm(20, 20, 16);
+    a.b(done);
+
+    // String receiver, Number index: UTF-16 units of a non-ASCII receiver,
+    // truncation and out-of-range indices in the operand-only helper.
+    a.bind(char_code_helper);
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(1, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
+
+    // isNaN(number) / Number.isNaN(number): both answer SameValue(n, NaN) for a
+    // Number argument (ToNumber is the identity). The receiver is unused: an
+    // Undefined receiver needs no release, an object must survive a bare
+    // decrement, like the distinct function handle.
+    a.bind(is_nan);
+    {
+        let receiver_ready = a.new_label();
+        emit_exec_word_load(a, 9, 20, -8);
+        emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+        a.ldur(13, 10, 0);
+        a.cmp_imm_x(13, 1);
+        a.b_cond(C_LS, hit_slow);
+        emit_exec_word_load(a, 9, 20, -24);
+        a.movz(11, 0, 0); // no receiver release
+        a.mov_imm64(16, crate::value::PACK_UNDEFINED);
+        a.cmp_reg_x(9, 16);
+        a.b_cond(C_EQ, receiver_ready);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+        emit_exec_payload(a, 9, 11);
+        a.ldur(14, 11, 0);
+        a.cmp_imm_x(14, 1);
+        a.b_cond(C_LS, hit_slow);
+        a.bind(receiver_ready);
+        // ---- commit: decrements, Boolean over the receiver slot ----
+        a.fcmp(0, 0);
+        a.cset_w(9, C_VS);
+        a.sub_imm(13, 13, 1);
+        a.stur(13, 10, 0);
+        let released = a.new_label();
+        a.cbz(11, true, released);
+        a.ldur(14, 11, 0);
+        a.sub_imm(14, 14, 1);
+        a.stur(14, 11, 0);
+        a.bind(released);
+        a.mov_imm64(16, crate::value::PACK_BOOL);
+        a.logic_x(1, 9, 9, 16);
+        emit_exec_word_store(a, 9, 20, -24);
+        a.sub_imm(20, 20, 16);
+        a.b(done);
+    }
+
+    // String.fromCharCode(number): ToUint16 and the interned one-unit strings in
+    // the operand-only helper.
+    a.bind(from_char_code);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(1, crate::bytecode::INTRINSIC_FROM_CHAR_CODE as u32, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
+
+    // Math.sqrt(number): the call IC already proved builtin identity.
+    // The receiver is ignored semantically; require an object so it and
+    // the distinct function handle can be released by guarded decrements.
+    a.bind(sqrt);
+    emit_exec_word_load(a, 9, 20, -24);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    emit_exec_word_load(a, 11, 20, -24);
+    emit_exec_payload(a, 11, 11);
+    a.ldur(14, 11, 0);
+    a.cmp_imm_x(14, 1);
+    a.b_cond(C_LS, hit_slow);
+    a.ldur(13, 10, 0);
+    a.cmp_imm_x(13, 1);
+    a.b_cond(C_LS, hit_slow);
+    a.ldur_d(0, 20, -8);
+    a.fsqrt(0, 0);
+    a.sub_imm(14, 14, 1);
+    a.stur(14, 11, 0);
+    a.sub_imm(13, 13, 1);
+    a.stur(13, 10, 0);
+    emit_exec_number_store(a, 0, 20, -24, 9);
+    a.sub_imm(20, 20, 16);
+    a.b(done);
+
+    // Array#push(value): builtin identity is proven by the call IC. The
+    // helper moves `value` into dense storage after live array/prototype/
+    // length guards, and restores the operand before the exact builtin on
+    // any miss.
+    if let Some(array_push) = array_push {
+        a.bind(array_push);
+        emit_exec_word_load(a, 9, 20, -24);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+        a.mov(0, 19);
+        emit_intrinsic_pc(a, pc);
+        a.movk(1, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32, 1);
+        a.mov(2, 20);
+        a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+        a.blr(16);
+        a.mov(20, 0);
+        a.cbnz(1, false, l_unwind);
+        a.b(done);
+    }
+
+    if let Some(regexp_exec) = regexp_exec {
+        a.bind(regexp_exec);
+        // Exact built-in identity is already proven by the call IC.
+        // The helper additionally validates the ordinary RegExp object
+        // and lastIndex shape before taking its allocation-free path.
+        emit_exec_word_load(a, 9, 20, -24);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+        emit_exec_word_load(a, 9, 20, -8);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+        a.mov(0, 19);
+        emit_intrinsic_pc(a, pc);
+        a.movk(1, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32, 1);
+        a.mov(2, 20);
+        a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+        a.blr(16);
+        a.mov(20, 0);
+        a.cbnz(1, false, l_unwind);
+        a.b(done);
+    }
+
+    if let Some(string_split) = string_split {
+        a.bind(string_split);
+        // The call IC proves String#split identity. The helper validates
+        // the separator's complete RegExp protocol/species dependency
+        // chain before eliding only the dead result allocations.
+        emit_exec_word_load(a, 9, 20, -24);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+        emit_exec_word_load(a, 9, 20, -8);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+        a.mov(0, 19);
+        emit_intrinsic_pc(a, pc);
+        a.movk(1, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32, 1);
+        a.mov(2, 20);
+        a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+        a.blr(16);
+        a.mov(20, 0);
+        a.cbnz(1, false, l_unwind);
+        a.b(done);
+    }
+
+    a.b(no_intr);
+}
+
+/// The two-argument method intrinsics of a `CallWithThis(2)` site; the register contract and
+/// exits are those of [`emit_call_intrinsics1`]. Emitted at the site, or once per chunk in
+/// [`SharedStub::Intrinsics2`].
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_call_intrinsics2(
+    a: &mut asm::Asm,
+    pc: IntrinsicPc,
+    discard: bool,
+    no_intr: usize,
+    hit_slow: usize,
+    done: usize,
+    l_unwind: usize,
+) {
+    let slice = a.new_label();
+    let has_own = a.new_label();
+    let apply = a.new_label();
+    let replace = discard.then(|| a.new_label());
+    a.ldrb_imm(9, 12, 96);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
+    a.b_cond(C_EQ, slice);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32);
+    a.b_cond(C_EQ, has_own);
+    a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32);
+    a.b_cond(C_EQ, apply);
+    if let Some(replace) = replace {
+        a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32);
+        a.b_cond(C_EQ, replace);
+    }
+    a.b(no_intr);
+
+    // ASCII String#slice(start, end), both bounds already Numbers: no
+    // user code or exotic conversion can run in the dedicated helper.
+    a.bind(slice);
+    emit_exec_word_load(a, 9, 20, -32);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+    emit_exec_word_load(a, 11, 20, -32);
+    emit_exec_payload(a, 11, 11);
+    a.ldr_w_imm(9, 11, crate::lstr::CAP_OFF as u32);
+    a.lsr_imm(9, 9, 31);
+    a.cbz(9, false, hit_slow);
+    for off in [-16i32, -8] {
+        emit_exec_word_load(a, 9, 20, off);
+        emit_exec_number_guard(a, 9, 0, 16, hit_slow);
+    }
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(1, crate::bytecode::INTRINSIC_STRING_SLICE as u32, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
+
+    // Object.hasOwn(obj, string): the named intrinsic's implementation
+    // is exactly an own-map lookup for this non-coercing argument shape.
+    a.bind(has_own);
+    emit_exec_word_load(a, 9, 20, -16);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, hit_slow);
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(1, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
+
+    // Function#apply(targetThis, arguments): builtin identity is already
+    // proven. Restrict the intrinsic helper to an object target and
+    // object list; it performs the ordinary/unmapped/dense guards before
+    // moving entries directly into a compiled target frame.
+    a.bind(apply);
+    emit_exec_word_load(a, 9, 20, -32);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+    emit_exec_word_load(a, 9, 20, -8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
+    a.mov(0, 19);
+    emit_intrinsic_pc(a, pc);
+    a.movk(1, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, l_unwind);
+    a.b(done);
+
+    if let Some(replace) = replace {
+        a.bind(replace);
+        for (off, tag) in [
+            (-32i32, crate::value::PACK_STR),
+            (-16, crate::value::PACK_OBJ),
+            (-8, crate::value::PACK_STR),
+        ] {
+            emit_exec_word_load(a, 9, 20, off);
+            emit_exec_tag_guard(a, 9, tag, 16, hit_slow);
+        }
+        a.mov(0, 19);
+        emit_intrinsic_pc(a, pc);
+        a.movk(
+            1,
+            crate::bytecode::INTRINSIC_STRING_REPLACE_DISCARD as u32,
+            1,
+        );
+        a.mov(2, 20);
+        a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+        a.blr(16);
+        a.mov(20, 0);
+        a.cbnz(1, false, l_unwind);
+        a.b(done);
+    }
+    a.b(no_intr);
+}
+
+/// Enter the chunk's shared intrinsic stub from a call site (w8 = the site's pc) and route its
+/// status: completed, no intrinsic (the ordinary call), declined (H_CALL_HIT) or thrown.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_intrinsic_stub_call(
+    a: &mut asm::Asm,
+    pc: u32,
+    stub: usize,
+    no_intr: usize,
+    hit_slow: usize,
+    done: usize,
+    l_unwind: usize,
+) {
+    a.movz(8, pc, 0);
+    a.bl_label(stub);
+    const _: () = assert!(INTRINSIC_DONE == 0);
+    a.cbz(9, false, done);
+    a.cmp_imm_w(9, INTRINSIC_NONE);
+    a.b_cond(C_EQ, no_intr);
+    a.cmp_imm_w(9, INTRINSIC_DECLINED);
+    a.b_cond(C_EQ, hit_slow);
+    a.b(l_unwind);
+}
+
 /// The call site's secondary probes after its primary identity ways miss: the engine-wide
 /// identity overflow cache, then the code-keyed ways (x6 = the site's first way). Inputs and hit
 /// outputs are those of the primary probe (see `emit_call_overflow_probe`,
@@ -9896,6 +10026,19 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     DirectCall { argc: u8, with_this: bool },
+    /// [`emit_call_intrinsics1`] for a `CallWithThis(1)` site's live call-IC hit, with w8 = the
+    /// site's pc → w9 = `INTRINSIC_*` (no-intrinsic and declined keep x10/x12/x15).
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    Intrinsics1 { array_push: bool, discard: bool },
+    /// [`emit_call_intrinsics2`] for a `CallWithThis(2)` site, with the same contract.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    Intrinsics2 { discard: bool },
 }
 
 /// Status codes of the shared direct-call stub. The common completion is zero, so a site pays
@@ -9916,6 +10059,28 @@ const DIRECT_CALL_DECLINED: u32 = 1;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 const DIRECT_CALL_THREW: u32 = 2;
+
+/// Status codes of the shared intrinsic stubs (see [`emit_intrinsic_stub_call`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const INTRINSIC_DONE: u32 = 0;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const INTRINSIC_NONE: u32 = 1;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const INTRINSIC_DECLINED: u32 = 2;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const INTRINSIC_THREW: u32 = 3;
 
 /// What shared stubs may need beyond the object layout (see [`SharedStub::emit`]).
 #[cfg(all(
@@ -9954,6 +10119,8 @@ impl SharedStub {
     const CALL_SECONDARY: u32 = 0x200;
     const DIRECT_CALL: u32 = 0x300;
     const NAME_VALUE_PTR_IN: u32 = 0x400;
+    const INTRINSICS1: u32 = 0x500;
+    const INTRINSICS2: u32 = 0x600;
 
     fn key(self) -> u32 {
         match self {
@@ -9983,6 +10150,19 @@ impl SharedStub {
                 debug_assert!(argc < 128);
                 Self::DIRECT_CALL | u32::from(argc) | u32::from(with_this) << 7
             }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::Intrinsics1 {
+                array_push,
+                discard,
+            } => Self::INTRINSICS1 | u32::from(array_push) | u32::from(discard) << 1,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::Intrinsics2 { discard } => Self::INTRINSICS2 | u32::from(discard),
         }
     }
 
@@ -10014,6 +10194,21 @@ impl SharedStub {
             Self::DIRECT_CALL => SharedStub::DirectCall {
                 argc: (key & 0x7f) as u8,
                 with_this: key & 0x80 != 0,
+            },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::INTRINSICS1 => SharedStub::Intrinsics1 {
+                array_push: key & 1 != 0,
+                discard: key & 2 != 0,
+            },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::INTRINSICS2 => SharedStub::Intrinsics2 {
+                discard: key & 1 != 0,
             },
             _ => unreachable!("shared stub keys are produced by SharedStub::key"),
         }
@@ -10080,6 +10275,55 @@ impl SharedStub {
                 a.bind(miss);
                 a.movz(9, 0, 0);
                 a.ret();
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::Intrinsics1 { .. } | SharedStub::Intrinsics2 { .. } => {
+                // The intrinsic helpers are calls: keep the site's return address in a frame of
+                // the stub's own, released before every status return.
+                a.stp_pre(29, 30, -16);
+                let none = a.new_label();
+                let declined = a.new_label();
+                let done = a.new_label();
+                let threw = a.new_label();
+                match self {
+                    SharedStub::Intrinsics1 {
+                        array_push,
+                        discard,
+                    } => emit_call_intrinsics1(
+                        a,
+                        IntrinsicPc::InW8,
+                        array_push,
+                        discard,
+                        none,
+                        declined,
+                        done,
+                        threw,
+                    ),
+                    SharedStub::Intrinsics2 { discard } => emit_call_intrinsics2(
+                        a,
+                        IntrinsicPc::InW8,
+                        discard,
+                        none,
+                        declined,
+                        done,
+                        threw,
+                    ),
+                    _ => unreachable!(),
+                }
+                for (landing, status) in [
+                    (done, INTRINSIC_DONE),
+                    (none, INTRINSIC_NONE),
+                    (declined, INTRINSIC_DECLINED),
+                    (threw, INTRINSIC_THREW),
+                ] {
+                    a.bind(landing);
+                    a.ldp_post(29, 30, 16);
+                    a.movz(9, status, 0);
+                    a.ret();
+                }
             }
             #[cfg(all(
                 target_arch = "aarch64",
