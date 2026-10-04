@@ -187,6 +187,15 @@ and retain checked fallbacks. Executable memory must follow platform write/execu
 protections and instruction-cache synchronization requirements. Do not describe
 the interpreter or VM as entirely safe Rust; they also contain unsafe code.
 
+An AST, and the bytecode and native code cached on its functions, can serve every
+Realm of an Agent: self-hosted built-ins and snapshots evaluated through
+`eval_shared_classic_snapshot_interruptible` (one decode per interpreter, used by
+browser Window Realms) share them. Compiled code must own no JavaScript objects and
+must take intrinsics, the global object and environments from the running Realm.
+Every cache keyed by an object, environment or Realm identity must validate it at
+use; inline splices also require their planning Realm's global environment. Never
+share an AST between interpreters: its caches hold one heap's shapes.
+
 The default-on `intl` feature supplies ECMA-402 and CLDR data. For the engine,
 `--no-default-features` removes `Intl` and gives `toLocale*` methods their
 locale-independent behavior. The `embed` feature exposes the host API; `bench`
