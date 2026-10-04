@@ -136,47 +136,63 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
     if let Some(proto) = instance_proto(i, "Intl.PluralRules")? {
         object.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&object, "__pr", Value::Bool(true));
-    set_builtin(&object, "__pr_locale", Value::from_string(resolved.locale));
-    set_builtin(&object, "__pr_type", Value::from_string(kind));
-    set_builtin(&object, "__pr_notation", Value::from_string(notation));
+    set_builtin(&object, "#\u{0}pr", Value::Bool(true));
     set_builtin(
         &object,
-        "__pr_compactdisplay",
+        "#\u{0}pr_locale",
+        Value::from_string(resolved.locale),
+    );
+    set_builtin(&object, "#\u{0}pr_type", Value::from_string(kind));
+    set_builtin(&object, "#\u{0}pr_notation", Value::from_string(notation));
+    set_builtin(
+        &object,
+        "#\u{0}pr_compactdisplay",
         Value::from_string(compact_display),
     );
-    set_builtin(&object, "__pr_minint", Value::Num(digits.min_int as f64));
-    set_builtin(&object, "__pr_minfrac", Value::Num(digits.min_frac as f64));
-    set_builtin(&object, "__pr_maxfrac", Value::Num(digits.max_frac as f64));
+    set_builtin(
+        &object,
+        "#\u{0}pr_minint",
+        Value::Num(digits.min_int as f64),
+    );
+    set_builtin(
+        &object,
+        "#\u{0}pr_minfrac",
+        Value::Num(digits.min_frac as f64),
+    );
+    set_builtin(
+        &object,
+        "#\u{0}pr_maxfrac",
+        Value::Num(digits.max_frac as f64),
+    );
     if let Some(value) = digits.min_sig {
-        set_builtin(&object, "__pr_minsig", Value::Num(value as f64));
+        set_builtin(&object, "#\u{0}pr_minsig", Value::Num(value as f64));
     }
     if let Some(value) = digits.max_sig {
-        set_builtin(&object, "__pr_maxsig", Value::Num(value as f64));
+        set_builtin(&object, "#\u{0}pr_maxsig", Value::Num(value as f64));
     }
     set_builtin(
         &object,
-        "__pr_roundingincrement",
+        "#\u{0}pr_roundingincrement",
         Value::Num(rounding_increment as f64),
     );
     set_builtin(
         &object,
-        "__pr_roundingmode",
+        "#\u{0}pr_roundingmode",
         Value::from_string(rounding_mode),
     );
     set_builtin(
         &object,
-        "__pr_roundingpriority",
+        "#\u{0}pr_roundingpriority",
         Value::from_string(rounding_priority),
     );
     set_builtin(
         &object,
-        "__pr_roundingtype",
+        "#\u{0}pr_roundingtype",
         Value::str(digits.rounding_type),
     );
     set_builtin(
         &object,
-        "__pr_trailingzero",
+        "#\u{0}pr_trailingzero",
         Value::from_string(trailing_zero_display),
     );
     Ok(Value::Obj(object))
@@ -244,15 +260,15 @@ fn resolve_plural(
         ));
     }
 
-    let min_int = number_slot(object, "__pr_minint").unwrap_or(1);
-    let min_frac = number_slot(object, "__pr_minfrac").unwrap_or(0);
-    let max_frac = number_slot(object, "__pr_maxfrac").unwrap_or(3);
-    let min_sig = number_slot(object, "__pr_minsig");
-    let max_sig = number_slot(object, "__pr_maxsig");
-    let increment = number_slot(object, "__pr_roundingincrement").unwrap_or(1);
-    let mode = string_slot(object, "__pr_roundingmode");
-    let rounding_type = string_slot(object, "__pr_roundingtype");
-    let notation = string_slot(object, "__pr_notation");
+    let min_int = number_slot(object, "#\u{0}pr_minint").unwrap_or(1);
+    let min_frac = number_slot(object, "#\u{0}pr_minfrac").unwrap_or(0);
+    let max_frac = number_slot(object, "#\u{0}pr_maxfrac").unwrap_or(3);
+    let min_sig = number_slot(object, "#\u{0}pr_minsig");
+    let max_sig = number_slot(object, "#\u{0}pr_maxsig");
+    let increment = number_slot(object, "#\u{0}pr_roundingincrement").unwrap_or(1);
+    let mode = string_slot(object, "#\u{0}pr_roundingmode");
+    let rounding_type = string_slot(object, "#\u{0}pr_roundingtype");
+    let notation = string_slot(object, "#\u{0}pr_notation");
     let decimal = exact
         .as_ref()
         .and_then(|exact| {
@@ -290,9 +306,9 @@ fn resolve_plural(
     } else {
         0
     };
-    let locale = string_slot(object, "__pr_locale");
+    let locale = string_slot(object, "#\u{0}pr_locale");
     let language = locale.split('-').next().unwrap_or("en");
-    let category = if string_slot(object, "__pr_type") == "ordinal" {
+    let category = if string_slot(object, "#\u{0}pr_type") == "ordinal" {
         crate::cldr_plurals::select_ordinal(language, &decimal, exponent)
     } else {
         crate::cldr_plurals::select_cardinal(language, &decimal, exponent)
@@ -301,13 +317,13 @@ fn resolve_plural(
 }
 
 fn select(i: &mut Interp, this: &Value, value: &Value) -> Result<Value, Value> {
-    let object = brand_slot(i, this, "__pr")?;
+    let object = brand_slot(i, this, "#\u{0}pr")?;
     let (category, _) = resolve_plural(i, &object, value)?;
     Ok(Value::str(category))
 }
 
 fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Result<Value, Value> {
-    let object = brand_slot(i, this, "__pr")?;
+    let object = brand_slot(i, this, "#\u{0}pr")?;
     if matches!(start, Value::Undefined) || matches!(end, Value::Undefined) {
         return Err(i.make_error("TypeError", "selectRange requires two values"));
     }
@@ -321,7 +337,7 @@ fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Res
     if start_decimal == end_decimal {
         return Ok(Value::str(start_category));
     }
-    let locale = string_slot(&object, "__pr_locale");
+    let locale = string_slot(&object, "#\u{0}pr_locale");
     let language = locale.split('-').next().unwrap_or("en");
     Ok(Value::str(crate::cldr_plurals::select_range(
         language,
@@ -331,7 +347,7 @@ fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Res
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let object = brand_slot(i, &this, "__pr")?;
+    let object = brand_slot(i, &this, "#\u{0}pr")?;
     let result = i.new_object();
     let get = |key: &str| {
         object
@@ -341,30 +357,38 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             .map(|property| property.value())
             .unwrap_or(Value::Undefined)
     };
-    set_data(&result, "locale", get("__pr_locale"));
-    set_data(&result, "type", get("__pr_type"));
-    set_data(&result, "notation", get("__pr_notation"));
-    if matches!(get("__pr_notation"), Value::Str(value) if &*value == "compact") {
-        set_data(&result, "compactDisplay", get("__pr_compactdisplay"));
+    set_data(&result, "locale", get("#\u{0}pr_locale"));
+    set_data(&result, "type", get("#\u{0}pr_type"));
+    set_data(&result, "notation", get("#\u{0}pr_notation"));
+    if matches!(get("#\u{0}pr_notation"), Value::Str(value) if &*value == "compact") {
+        set_data(&result, "compactDisplay", get("#\u{0}pr_compactdisplay"));
     }
-    set_data(&result, "minimumIntegerDigits", get("__pr_minint"));
-    set_data(&result, "minimumFractionDigits", get("__pr_minfrac"));
-    set_data(&result, "maximumFractionDigits", get("__pr_maxfrac"));
-    if !matches!(get("__pr_minsig"), Value::Undefined) {
-        set_data(&result, "minimumSignificantDigits", get("__pr_minsig"));
-        set_data(&result, "maximumSignificantDigits", get("__pr_maxsig"));
+    set_data(&result, "minimumIntegerDigits", get("#\u{0}pr_minint"));
+    set_data(&result, "minimumFractionDigits", get("#\u{0}pr_minfrac"));
+    set_data(&result, "maximumFractionDigits", get("#\u{0}pr_maxfrac"));
+    if !matches!(get("#\u{0}pr_minsig"), Value::Undefined) {
+        set_data(&result, "minimumSignificantDigits", get("#\u{0}pr_minsig"));
+        set_data(&result, "maximumSignificantDigits", get("#\u{0}pr_maxsig"));
     }
-    let locale = string_slot(&object, "__pr_locale");
+    let locale = string_slot(&object, "#\u{0}pr_locale");
     let language = locale.split('-').next().unwrap_or("en");
-    let kind = string_slot(&object, "__pr_type");
+    let kind = string_slot(&object, "#\u{0}pr_type");
     let categories = crate::cldr_plurals::categories(language, &kind)
         .iter()
         .map(|category| Value::str(*category))
         .collect();
     set_data(&result, "pluralCategories", i.make_array(categories));
-    set_data(&result, "roundingIncrement", get("__pr_roundingincrement"));
-    set_data(&result, "roundingMode", get("__pr_roundingmode"));
-    set_data(&result, "roundingPriority", get("__pr_roundingpriority"));
-    set_data(&result, "trailingZeroDisplay", get("__pr_trailingzero"));
+    set_data(
+        &result,
+        "roundingIncrement",
+        get("#\u{0}pr_roundingincrement"),
+    );
+    set_data(&result, "roundingMode", get("#\u{0}pr_roundingmode"));
+    set_data(
+        &result,
+        "roundingPriority",
+        get("#\u{0}pr_roundingpriority"),
+    );
+    set_data(&result, "trailingZeroDisplay", get("#\u{0}pr_trailingzero"));
     Ok(Value::Obj(result))
 }

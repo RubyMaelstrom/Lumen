@@ -28,15 +28,15 @@ pub fn install(it: &mut Interp, ns: &Gc) {
 
 fn install_compare_getter(it: &mut Interp, proto: &Gc) {
     let g = it.make_native("get compare", 0, |i, this, _| {
-        let o = brand_slot(i, &this, "__co")?;
-        if let Some(f) = o.borrow().props.get("__co_bound").map(|p| p.value()) {
+        let o = brand_slot(i, &this, "#\u{0}co")?;
+        if let Some(f) = o.borrow().props.get("#\u{0}co_bound").map(|p| p.value()) {
             return Ok(f);
         }
         let f = i.make_native("", 2, |i, that, a| {
             compare(i, &that, &arg(a, 0), &arg(a, 1))
         });
         let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), this.clone());
-        set_builtin(&o, "__co_bound", bound.clone());
+        set_builtin(&o, "#\u{0}co_bound", bound.clone());
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -169,19 +169,23 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.Collator")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "__co", Value::Bool(true));
-    set_builtin(&obj, "__co_locale", Value::from_string(locale));
-    set_builtin(&obj, "__co_usage", Value::from_string(usage));
-    set_builtin(&obj, "__co_sensitivity", Value::from_string(sensitivity));
-    set_builtin(&obj, "__co_ignorepunct", Value::Bool(ignore_punct));
-    set_builtin(&obj, "__co_numeric", Value::Bool(numeric));
-    set_builtin(&obj, "__co_collation", Value::from_string(collation));
-    set_builtin(&obj, "__co_casefirst", Value::from_string(case_first));
+    set_builtin(&obj, "#\u{0}co", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}co_locale", Value::from_string(locale));
+    set_builtin(&obj, "#\u{0}co_usage", Value::from_string(usage));
+    set_builtin(
+        &obj,
+        "#\u{0}co_sensitivity",
+        Value::from_string(sensitivity),
+    );
+    set_builtin(&obj, "#\u{0}co_ignorepunct", Value::Bool(ignore_punct));
+    set_builtin(&obj, "#\u{0}co_numeric", Value::Bool(numeric));
+    set_builtin(&obj, "#\u{0}co_collation", Value::from_string(collation));
+    set_builtin(&obj, "#\u{0}co_casefirst", Value::from_string(case_first));
     Ok(Value::Obj(obj))
 }
 
 fn compare(i: &mut Interp, this: &Value, a: &Value, b: &Value) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "__co")?;
+    let o = brand_slot(i, this, "#\u{0}co")?;
     let get = |k: &str| match o.borrow().props.get(k).map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => String::new(),
@@ -195,17 +199,18 @@ fn compare(i: &mut Interp, this: &Value, a: &Value, b: &Value) -> Result<Value, 
     let sa = ab(i.to_string(a))?.to_string();
     let sb = ab(i.to_string(b))?.to_string();
     let opts = CollateOpts {
-        locale: get("__co_locale"),
-        collation: get("__co_collation"),
-        sensitivity: get("__co_sensitivity"),
-        numeric: getb("__co_numeric"),
-        ignore_punct: getb("__co_ignorepunct"),
-        upper_first: get("__co_casefirst") == "upper",
+        locale: get("#\u{0}co_locale"),
+        collation: get("#\u{0}co_collation"),
+        sensitivity: get("#\u{0}co_sensitivity"),
+        numeric: getb("#\u{0}co_numeric"),
+        ignore_punct: getb("#\u{0}co_ignorepunct"),
+        upper_first: get("#\u{0}co_casefirst") == "upper",
         // German ä/ö/ü expand to ae/oe/ue under the phonebook collation and in search usage.
         expand_umlaut: {
-            let lang = get("__co_locale");
+            let lang = get("#\u{0}co_locale");
             let lang = lang.split('-').next().unwrap_or("");
-            lang == "de" && (get("__co_collation") == "phonebk" || get("__co_usage") == "search")
+            lang == "de"
+                && (get("#\u{0}co_collation") == "phonebk" || get("#\u{0}co_usage") == "search")
         },
     };
     let ord = match collate(&sa, &sb, &opts) {
@@ -587,7 +592,7 @@ fn collate(a: &str, b: &str, opts: &CollateOpts) -> std::cmp::Ordering {
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = brand_slot(i, &this, "__co")?;
+    let o = brand_slot(i, &this, "#\u{0}co")?;
     let get = |k: &str| {
         o.borrow()
             .props
@@ -596,13 +601,13 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
             .unwrap_or(Value::Undefined)
     };
     let res = i.new_object();
-    set_data(&res, "locale", get("__co_locale"));
-    set_data(&res, "usage", get("__co_usage"));
-    set_data(&res, "sensitivity", get("__co_sensitivity"));
-    set_data(&res, "ignorePunctuation", get("__co_ignorepunct"));
-    set_data(&res, "collation", get("__co_collation"));
-    set_data(&res, "numeric", get("__co_numeric"));
-    set_data(&res, "caseFirst", get("__co_casefirst"));
+    set_data(&res, "locale", get("#\u{0}co_locale"));
+    set_data(&res, "usage", get("#\u{0}co_usage"));
+    set_data(&res, "sensitivity", get("#\u{0}co_sensitivity"));
+    set_data(&res, "ignorePunctuation", get("#\u{0}co_ignorepunct"));
+    set_data(&res, "collation", get("#\u{0}co_collation"));
+    set_data(&res, "numeric", get("#\u{0}co_numeric"));
+    set_data(&res, "caseFirst", get("#\u{0}co_casefirst"));
     Ok(Value::Obj(res))
 }
 

@@ -3183,6 +3183,64 @@ fn dates() {
     assert_eq!(run("new Date(Date.UTC(2023,11,25)).getUTCDay()"), "1"); // Monday
 }
 
+#[test]
+fn internal_slots_are_not_properties() {
+    // Internal slots (ECMA-262 #sec-object-internal-methods-and-internal-slots) are not
+    // properties: reflection never lists them, author properties cannot forge them, and
+    // integrity levels ignore them. The expected values are Node's.
+    let source = r#"
+        var names = function (o) { return Object.getOwnPropertyNames(o).join(); };
+        /(a)(b)/.exec("xab");
+        var resolve;
+        Promise.all([{ then: function (r) { resolve = r; } }]);
+        var date = Object.freeze(new Date(5));
+        date.setTime(7);
+        var forged = Object.create(Date.prototype);
+        forged.__date_ms = 1;
+        var forgedOk;
+        try { forged.getTime(); forgedOk = true; } catch (e) { forgedOk = false; }
+        [
+            names(new Date(0)),
+            names(new Intl.NumberFormat()),
+            names(new Intl.DateTimeFormat()),
+            names(new Intl.Locale("en-US")),
+            names(new ArrayBuffer(4, { maxByteLength: 8 })),
+            names(new DataView(new ArrayBuffer(2))),
+            names([1].values().map(function (x) { return x; })),
+            names("ab".matchAll(/a/g)),
+            names(new DisposableStack()),
+            names(RegExp).indexOf("legacy") < 0,
+            RegExp.$1 + RegExp.$2 + RegExp.lastMatch,
+            date.getTime(),
+            Object.isFrozen(date),
+            Object.isFrozen(Object.preventExtensions(new Date())),
+            forgedOk,
+            new Intl.Locale("en-US", { hourCycle: "h23" }).hourCycle,
+        ].join("|")
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "|||||||||true|abab|7|true|true|false|h23",
+            "tier {tier:?}"
+        );
+        // PerformPromiseAll (#sec-performpromiseall) hands `then` its resolve element function
+        // from a later job.
+        assert_eq!(
+            run_in(&mut engine, "names(resolve)"),
+            "length,name",
+            "tier {tier:?}"
+        );
+    }
+}
+
 #[cfg(feature = "embed")]
 #[test]
 fn wall_clocks_are_mutable_and_realm_local() {

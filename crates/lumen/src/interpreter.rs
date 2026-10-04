@@ -4030,7 +4030,7 @@ impl Interp {
         // in this realm's global scope, not the caller's (see `call_inner`).
         if let Some(ef) = &self.eval_fn {
             ef.borrow_mut().props.insert(
-                "__eval_realm",
+                "#\u{0}eval_realm",
                 Property::data(Value::Obj(self.global.clone()), false, false, false),
             );
             self.eval_realm_fns.insert(Rc::as_ptr(ef) as usize);
@@ -6110,7 +6110,7 @@ impl Interp {
         }
         let buffer = self.ta_buffer.get(&ptr)?.as_obj()?.borrow();
         if !matches!(
-            buffer.props.get("__abResizable").map(|p| p.value()),
+            buffer.props.get("#\u{0}abResizable").map(|p| p.value()),
             Some(Value::Bool(false))
         ) {
             return None;
@@ -11067,7 +11067,11 @@ impl Interp {
         // native function can be a realm's `eval` — skip the property lookup for user calls,
         // which is every hot call (the main realm always registers, so the map is never empty).
         if self.multi_realm() && self.eval_realm_fns.contains(&(Rc::as_ptr(&obj) as usize)) {
-            let realm_g = obj.borrow().props.get("__eval_realm").map(|p| p.value());
+            let realm_g = obj
+                .borrow()
+                .props
+                .get("#\u{0}eval_realm")
+                .map(|p| p.value());
             if let Some(realm_g @ Value::Obj(_)) = realm_g {
                 return match args.first() {
                     Some(Value::Str(s)) => {

@@ -31,14 +31,14 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
     // evalScript runs in this $262's realm (the main realm's $262 keeps using the current global).
     let rg = realm_global.clone();
     if let Some(rg) = rg {
-        set_internal(&host, "__realm_global", rg);
+        set_internal(&host, "#\u{0}realm_global", rg);
     }
     it.def_method(&host, "evalScript", 1, |i, this, args| {
         let code = match arg(args, 0) {
             Value::Str(s) => s,
             other => return Ok(other),
         };
-        let rg = ab(i.get_member(&this, "__realm_global"))?;
+        let rg = ab(i.get_member(&this, "#\u{0}realm_global"))?;
         if let Value::Obj(_) = &rg {
             return ab(i.eval_in_realm(&rg, &code));
         }
@@ -132,9 +132,9 @@ fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
     i.gc_pin(&obj);
     i.array_buffers
         .insert(p, Rc::new(RefCell::new(vec![0u8; len]))); // length placeholder
-    set_internal(&obj, "__abMaxByteLength", Value::Num(len as f64));
-    set_internal(&obj, "__abResizable", Value::Bool(false));
-    set_internal(&obj, "__sab_id", Value::Num(id as f64));
+    set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(len as f64));
+    set_internal(&obj, "#\u{0}abResizable", Value::Bool(false));
+    set_internal(&obj, "#\u{0}sab_id", Value::Num(id as f64));
     i.shared_buffers.insert(p, id);
     Value::Obj(obj)
 }

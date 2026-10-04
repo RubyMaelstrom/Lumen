@@ -51,7 +51,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "DateTimeFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "formatToParts", 1, |i, this, a| {
-        let o = brand_slot(i, &this, "__dtf")?;
+        let o = brand_slot(i, &this, "#\u{0}dtf")?;
         let (ms, kind) = dtf_ms_kind(i, &o, &arg(a, 0))?;
         let nu = dtf_nu(&o);
         let parts = build_parts(&o, ms, kind);
@@ -73,7 +73,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     });
     it.def_method(&proto, "resolvedOptions", 0, resolved_options);
     it.def_method(&proto, "formatRange", 2, |i, this, a| {
-        let o = brand_slot(i, &this, "__dtf")?;
+        let o = brand_slot(i, &this, "#\u{0}dtf")?;
         let (s, e, kind) = range_dates(i, &o, &arg(a, 0), &arg(a, 1))?;
         let out: String = build_range_parts(&o, s, e, kind)
             .into_iter()
@@ -85,7 +85,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         )))
     });
     it.def_method(&proto, "formatRangeToParts", 2, |i, this, a| {
-        let o = brand_slot(i, &this, "__dtf")?;
+        let o = brand_slot(i, &this, "#\u{0}dtf")?;
         let (s, e, kind) = range_dates(i, &o, &arg(a, 0), &arg(a, 1))?;
         let nu = dtf_nu(&o);
         let mut arr: Vec<Value> = Vec::new();
@@ -208,15 +208,15 @@ fn range_type_tag(i: &Interp, v: &Value) -> u8 {
 
 fn install_format_getter(it: &mut Interp, proto: &Gc) {
     let g = it.make_native("get format", 0, |i, this, _| {
-        let o = crate::intl::brand_slot_legacy(i, &this, "__dtf", "Intl.DateTimeFormat")?;
-        if let Some(f) = o.borrow().props.get("__dtf_bound").map(|p| p.value()) {
+        let o = crate::intl::brand_slot_legacy(i, &this, "#\u{0}dtf", "Intl.DateTimeFormat")?;
+        if let Some(f) = o.borrow().props.get("#\u{0}dtf_bound").map(|p| p.value()) {
             return Ok(f);
         }
         let f = i.make_native("", 1, |i, that, a| {
             Ok(Value::from_string(do_format(i, &that, &arg(a, 0))?))
         });
         let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
-        set_builtin(&o, "__dtf_bound", bound.clone());
+        set_builtin(&o, "#\u{0}dtf_bound", bound.clone());
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -268,52 +268,52 @@ fn install_style_components(obj: &Gc, pattern: &str) {
             set_builtin(obj, slot, Value::str(value(width)));
         }
     };
-    put_width("__dtfx_weekday", "Eec", |width| match width {
+    put_width("#\u{0}dtfx_weekday", "Eec", |width| match width {
         4 => "long",
         5 => "narrow",
         _ => "short",
     });
-    put_width("__dtfx_era", "G", |width| match width {
+    put_width("#\u{0}dtfx_era", "G", |width| match width {
         4 => "long",
         5 => "narrow",
         _ => "short",
     });
-    put_width("__dtfx_year", "yYuUr", |width| {
+    put_width("#\u{0}dtfx_year", "yYuUr", |width| {
         if width == 2 {
             "2-digit"
         } else {
             "numeric"
         }
     });
-    put_width("__dtfx_month", "ML", |width| match width {
+    put_width("#\u{0}dtfx_month", "ML", |width| match width {
         2 => "2-digit",
         3 => "short",
         4 => "long",
         5 => "narrow",
         _ => "numeric",
     });
-    put_width("__dtfx_day", "d", |width| {
+    put_width("#\u{0}dtfx_day", "d", |width| {
         if width == 2 {
             "2-digit"
         } else {
             "numeric"
         }
     });
-    put_width("__dtfx_hour", "hHKk", |width| {
+    put_width("#\u{0}dtfx_hour", "hHKk", |width| {
         if width == 2 {
             "2-digit"
         } else {
             "numeric"
         }
     });
-    put_width("__dtfx_minute", "m", |width| {
+    put_width("#\u{0}dtfx_minute", "m", |width| {
         if width == 2 {
             "2-digit"
         } else {
             "numeric"
         }
     });
-    put_width("__dtfx_second", "s", |width| {
+    put_width("#\u{0}dtfx_second", "s", |width| {
         if width == 2 {
             "2-digit"
         } else {
@@ -323,7 +323,7 @@ fn install_style_components(obj: &Gc, pattern: &str) {
     if let Some(width) = dtf_pattern_width(pattern, "zZvVOXx") {
         set_builtin(
             obj,
-            "__dtfx_tzname",
+            "#\u{0}dtfx_tzname",
             Value::str(if width >= 4 { "long" } else { "short" }),
         );
     }
@@ -333,11 +333,11 @@ fn install_style_components(obj: &Gc, pattern: &str) {
 /// This avoids attaching a numeric locale suffix twice and makes `resolvedOptions()` describe the
 /// selected format (Japanese `month: "short"`, for example, resolves to numeric here).
 fn install_resolved_components(obj: &Gc, pattern: &str) {
-    if obj.borrow().props.contains("__dtf_month") {
+    if obj.borrow().props.contains("#\u{0}dtf_month") {
         if let Some(width) = dtf_pattern_width(pattern, "ML") {
             set_builtin(
                 obj,
-                "__dtf_month",
+                "#\u{0}dtf_month",
                 Value::str(match width {
                     2 => "2-digit",
                     3 => "short",
@@ -547,7 +547,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.DateTimeFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "__dtf", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}dtf", Value::Bool(true));
     let locale_lang = resolved_locale.split('-').next().unwrap_or("").to_string();
     // ResolveLocale for the `ca` key: the locale's -u-ca- extension value (if supported) is used and
     // reflected in the resolved locale, unless a supported calendar option overrides it with a
@@ -605,30 +605,34 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     } else {
         format!("{base}-u{ext}")
     };
-    set_builtin(&obj, "__dtf_locale", Value::from_string(resolved_locale));
-    set_builtin(&obj, "__dtf_ca", Value::from_string(eff_cal));
-    set_builtin(&obj, "__dtf_nu", Value::from_string(nu_final));
-    set_builtin(&obj, "__dtf_tz", Value::from_string(time_zone));
+    set_builtin(
+        &obj,
+        "#\u{0}dtf_locale",
+        Value::from_string(resolved_locale),
+    );
+    set_builtin(&obj, "#\u{0}dtf_ca", Value::from_string(eff_cal));
+    set_builtin(&obj, "#\u{0}dtf_nu", Value::from_string(nu_final));
+    set_builtin(&obj, "#\u{0}dtf_tz", Value::from_string(time_zone));
     let put = |obj: &Gc, k: &str, v: &Option<String>| {
         if let Some(v) = v {
             set_builtin(obj, k, Value::from_string(v.clone()));
         }
     };
-    put(&obj, "__dtf_weekday", &weekday);
-    put(&obj, "__dtf_era", &era);
-    put(&obj, "__dtf_year", &year);
-    put(&obj, "__dtf_month", &month);
-    put(&obj, "__dtf_day", &day);
-    put(&obj, "__dtf_dayperiod", &day_period);
-    put(&obj, "__dtf_hour", &hour);
-    put(&obj, "__dtf_minute", &minute);
-    put(&obj, "__dtf_second", &second);
+    put(&obj, "#\u{0}dtf_weekday", &weekday);
+    put(&obj, "#\u{0}dtf_era", &era);
+    put(&obj, "#\u{0}dtf_year", &year);
+    put(&obj, "#\u{0}dtf_month", &month);
+    put(&obj, "#\u{0}dtf_day", &day);
+    put(&obj, "#\u{0}dtf_dayperiod", &day_period);
+    put(&obj, "#\u{0}dtf_hour", &hour);
+    put(&obj, "#\u{0}dtf_minute", &minute);
+    put(&obj, "#\u{0}dtf_second", &second);
     if let Some(f) = frac_sec {
-        set_builtin(&obj, "__dtf_fracsec", Value::Num(f as f64));
+        set_builtin(&obj, "#\u{0}dtf_fracsec", Value::Num(f as f64));
     }
-    put(&obj, "__dtf_tzname", &tz_name);
-    put(&obj, "__dtf_datestyle", &date_style);
-    put(&obj, "__dtf_timestyle", &time_style);
+    put(&obj, "#\u{0}dtf_tzname", &tz_name);
+    put(&obj, "#\u{0}dtf_datestyle", &date_style);
+    put(&obj, "#\u{0}dtf_timestyle", &time_style);
     // ECMA-402 DateTime Style Formats selects locale-specific CLDR patterns. Derive the working
     // component set from those actual patterns rather than applying an English-shaped preset.
     let cldr_locale = dtf_cldr_locale(&obj);
@@ -668,31 +672,31 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
                 .unwrap_or_else(|| locale_hour_cycle.to_string())
         };
         let h12 = matches!(hc.as_str(), "h11" | "h12");
-        set_builtin(&obj, "__dtf_hourcycle", Value::from_string(hc));
-        set_builtin(&obj, "__dtf_hour12", Value::Bool(h12));
-        set_builtin(&obj, "__dtf_hourshown", Value::Bool(shows_hour));
+        set_builtin(&obj, "#\u{0}dtf_hourcycle", Value::from_string(hc));
+        set_builtin(&obj, "#\u{0}dtf_hour12", Value::Bool(h12));
+        set_builtin(&obj, "#\u{0}dtf_hourshown", Value::Bool(shows_hour));
     }
     // Default components when nothing was requested: year/month/day numeric. Flagged so a Temporal
     // receiver's compatibility check ignores them (only *explicit* options can conflict).
     if !has_explicit && date_style.is_none() && time_style.is_none() {
-        set_builtin(&obj, "__dtf_year", Value::str("numeric"));
-        set_builtin(&obj, "__dtf_month", Value::str("numeric"));
-        set_builtin(&obj, "__dtf_day", Value::str("numeric"));
-        set_builtin(&obj, "__dtf_defaults", Value::Bool(true));
+        set_builtin(&obj, "#\u{0}dtf_year", Value::str("numeric"));
+        set_builtin(&obj, "#\u{0}dtf_month", Value::str("numeric"));
+        set_builtin(&obj, "#\u{0}dtf_day", Value::str("numeric"));
+        set_builtin(&obj, "#\u{0}dtf_defaults", Value::Bool(true));
     }
     if date_style.is_none() && time_style.is_none() {
         let mut requested = Vec::new();
         for (slot, kind) in [
-            ("__dtf_weekday", "weekday"),
-            ("__dtf_era", "era"),
-            ("__dtf_year", "year"),
-            ("__dtf_month", "month"),
-            ("__dtf_day", "day"),
-            ("__dtf_dayperiod", "dayPeriod"),
-            ("__dtf_hour", "hour"),
-            ("__dtf_minute", "minute"),
-            ("__dtf_second", "second"),
-            ("__dtf_tzname", "timeZoneName"),
+            ("#\u{0}dtf_weekday", "weekday"),
+            ("#\u{0}dtf_era", "era"),
+            ("#\u{0}dtf_year", "year"),
+            ("#\u{0}dtf_month", "month"),
+            ("#\u{0}dtf_day", "day"),
+            ("#\u{0}dtf_dayperiod", "dayPeriod"),
+            ("#\u{0}dtf_hour", "hour"),
+            ("#\u{0}dtf_minute", "minute"),
+            ("#\u{0}dtf_second", "second"),
+            ("#\u{0}dtf_tzname", "timeZoneName"),
         ] {
             if obj.borrow().props.contains(slot) {
                 requested.push((kind, String::new()));
@@ -777,7 +781,7 @@ fn dtf_ms_kind(i: &mut Interp, o: &Gc, date: &Value) -> Result<(f64, u8), Value>
                 .get(&ptr)
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "iso8601".to_string());
-            let dcal = match o.borrow().props.get("__dtf_ca").map(|p| p.value()) {
+            let dcal = match o.borrow().props.get("#\u{0}dtf_ca").map(|p| p.value()) {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => "iso8601".to_string(),
             };
@@ -829,13 +833,14 @@ fn temporal_compat_check(
         _ => return Ok(()), // DateTime / Instant / Zoned overlap everything
     };
     // A fully-defaulted formatter adapts its fields to the receiver, so it always overlaps.
-    if o.borrow().props.contains("__dtf_defaults") {
+    if o.borrow().props.contains("#\u{0}dtf_defaults") {
         return Ok(());
     }
     // A field is requested if set explicitly (`__dtf_`) or via a dateStyle/timeStyle (`__dtfx_`).
     let present = |field: &str| {
         let b = o.borrow();
-        b.props.contains(&format!("__dtf_{field}")) || b.props.contains(&format!("__dtfx_{field}"))
+        b.props.contains(&format!("#\u{0}dtf_{field}"))
+            || b.props.contains(&format!("#\u{0}dtfx_{field}"))
     };
     const ALL: &[&str] = &[
         "weekday",
@@ -859,14 +864,14 @@ fn temporal_compat_check(
 }
 
 fn do_format(i: &mut Interp, this: &Value, date: &Value) -> Result<String, Value> {
-    let o = brand_slot(i, this, "__dtf")?;
+    let o = brand_slot(i, this, "#\u{0}dtf")?;
     let (ms, kind) = dtf_ms_kind(i, &o, date)?;
     Ok(do_format_ms(&o, ms, kind))
 }
 
 /// The formatter's numbering system id (`latn` unless set).
 fn dtf_nu(o: &Gc) -> String {
-    match o.borrow().props.get("__dtf_nu").map(|p| p.value()) {
+    match o.borrow().props.get("#\u{0}dtf_nu").map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => "latn".to_string(),
     }
@@ -876,7 +881,7 @@ fn dtf_cldr_locale(o: &Gc) -> &'static str {
     let locale = match o
         .borrow()
         .props
-        .get("__dtf_locale")
+        .get("#\u{0}dtf_locale")
         .map(|property| property.value())
     {
         Some(Value::Str(locale)) => locale.to_string(),
@@ -989,7 +994,7 @@ fn closest_available_pattern(locale: &str, skeleton: &str) -> Option<&'static st
 fn time_style_pattern(o: &Gc, locale: &str, style: &str) -> String {
     let pattern = crate::cldr_datetime_patterns::time_style(locale, style);
     if !matches!(
-        dtf_slot(o, "__dtf_hourcycle").as_deref(),
+        dtf_slot(o, "#\u{0}dtf_hourcycle").as_deref(),
         Some("h23" | "h24")
     ) {
         return pattern.to_string();
@@ -1035,8 +1040,8 @@ fn time_style_pattern(o: &Gc, locale: &str, style: &str) -> String {
 /// handles mixed date/time requests by matching each half and joining them with dateTimeFormats.
 fn resolved_dtf_pattern(o: &Gc, parts: &[(&'static str, String)]) -> Option<String> {
     let locale = dtf_cldr_locale(o);
-    let date_style = dtf_slot(o, "__dtf_datestyle");
-    let time_style = dtf_slot(o, "__dtf_timestyle");
+    let date_style = dtf_slot(o, "#\u{0}dtf_datestyle");
+    let time_style = dtf_slot(o, "#\u{0}dtf_timestyle");
     if date_style.is_some() || time_style.is_some() {
         let has_date = parts.iter().any(|part| {
             matches!(
@@ -1081,47 +1086,47 @@ fn resolved_dtf_pattern(o: &Gc, parts: &[(&'static str, String)]) -> Option<Stri
     let mut date = String::new();
     if has("era") {
         date.push_str(&skeleton_width(
-            &dtf_slot(o, "__dtf_era").unwrap_or_else(|| "short".to_string()),
+            &dtf_slot(o, "#\u{0}dtf_era").unwrap_or_else(|| "short".to_string()),
             'G',
             'G',
         ));
     }
     if has("year") {
         date.push_str(&skeleton_width(
-            &dtf_slot(o, "__dtf_year").unwrap_or_else(|| "numeric".to_string()),
+            &dtf_slot(o, "#\u{0}dtf_year").unwrap_or_else(|| "numeric".to_string()),
             'y',
             'y',
         ));
     }
     if has("month") {
         date.push_str(&skeleton_width(
-            &dtf_slot(o, "__dtf_month").unwrap_or_else(|| "numeric".to_string()),
+            &dtf_slot(o, "#\u{0}dtf_month").unwrap_or_else(|| "numeric".to_string()),
             'M',
             'M',
         ));
     }
     if has("weekday") {
         date.push_str(&skeleton_width(
-            &dtf_slot(o, "__dtf_weekday").unwrap_or_else(|| "short".to_string()),
+            &dtf_slot(o, "#\u{0}dtf_weekday").unwrap_or_else(|| "short".to_string()),
             'E',
             'E',
         ));
     }
     if has("day") {
         date.push_str(&skeleton_width(
-            &dtf_slot(o, "__dtf_day").unwrap_or_else(|| "numeric".to_string()),
+            &dtf_slot(o, "#\u{0}dtf_day").unwrap_or_else(|| "numeric".to_string()),
             'd',
             'd',
         ));
     }
 
     let mut time = String::new();
-    if dtf_slot(o, "__dtf_dayperiod").is_some() {
+    if dtf_slot(o, "#\u{0}dtf_dayperiod").is_some() {
         time.push('B');
     }
     if has("hour") {
         let hour = if matches!(
-            dtf_slot(o, "__dtf_hourcycle").as_deref(),
+            dtf_slot(o, "#\u{0}dtf_hourcycle").as_deref(),
             Some("h11" | "h12")
         ) {
             'h'
@@ -1356,7 +1361,7 @@ fn greatest_range_difference(
     } else if changed("hour") {
         Some(
             if matches!(
-                dtf_slot(o, "__dtf_hourcycle").as_deref(),
+                dtf_slot(o, "#\u{0}dtf_hourcycle").as_deref(),
                 Some("h11" | "h12")
             ) {
                 "h"
@@ -1567,7 +1572,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
     // An absolute instant (number/Date kind 0, Temporal.Instant kind 6) is shifted into the
     // formatter's time zone; Temporal wall-clock values (kinds 1-5) already carry their local time.
     let ms = if kind == 0 || kind == 6 {
-        match o.borrow().props.get("__dtf_tz").map(|p| p.value()) {
+        match o.borrow().props.get("#\u{0}dtf_tz").map(|p| p.value()) {
             Some(Value::Str(tz)) => {
                 let epoch_sec = (ms / 1000.0).floor() as i64;
                 let off_ms = crate::tz::offset_at(&tz, epoch_sec)
@@ -1587,7 +1592,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
         day: d as u8,
     };
     // A non-Gregorian calendar renders its own numeric year/month/day via the calendar tables.
-    let dcal = match o.borrow().props.get("__dtf_ca").map(|p| p.value()) {
+    let dcal = match o.borrow().props.get("#\u{0}dtf_ca").map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => "iso8601".to_string(),
     };
@@ -1632,9 +1637,9 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
         }
     };
     // Read a component slot (gated by `allow`), falling back to the dateStyle/timeStyle expansion.
-    let defaulted = o.borrow().props.contains("__dtf_defaults");
+    let defaulted = o.borrow().props.contains("#\u{0}dtf_defaults");
     let get = |k: &str| {
-        let field = k.trim_start_matches("__dtf_");
+        let field = k.trim_start_matches("#\u{0}dtf_");
         if !allow(field) {
             return None;
         }
@@ -1646,7 +1651,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
             Some(Value::Str(s)) => Some(s.to_string()),
             _ => None,
         };
-        read(k).or_else(|| read(&k.replacen("__dtf_", "__dtfx_", 1)))
+        read(k).or_else(|| read(&k.replacen("#\u{0}dtf_", "#\u{0}dtfx_", 1)))
     };
     let mut parts: Vec<(&'static str, String)> = Vec::new();
     let lit = |parts: &mut Vec<(&'static str, String)>, s: &str| {
@@ -1654,7 +1659,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
     };
     let cldr_loc = dtf_cldr_locale(o);
 
-    if let Some(w) = get("__dtf_weekday") {
+    if let Some(w) = get("#\u{0}dtf_weekday") {
         const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
         let name = crate::cldr_datetime_patterns::weekday(cldr_loc, &w, DAYS[wd as usize])
             .unwrap_or_else(|| {
@@ -1673,7 +1678,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
     let mut month_is_named = false;
     // ICU marks a chinese/dangi leap month with a "bis" suffix in numeric contexts.
     let bis = if leap_month { "bis" } else { "" };
-    let month_str = get("__dtf_month").map(|m| {
+    let month_str = get("#\u{0}dtf_month").map(|m| {
         // Hebrew months always render by name regardless of the requested width (CLDR-15510).
         if dcal == "hebrew" {
             if let Some(n) = crate::cldr_dates::month_name(cldr_loc, "hebrew", "long", mo as u8) {
@@ -1694,7 +1699,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
             _ => format!("{mo}{bis}"),
         }
     });
-    let day_str = get("__dtf_day").map(|dd| {
+    let day_str = get("#\u{0}dtf_day").map(|dd| {
         if dd == "2-digit" {
             format!("{d:02}")
         } else {
@@ -1702,12 +1707,12 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
         }
     });
     // When an era is shown for the Gregorian calendar, the year is the positive era year.
-    let disp_year = if greg_cal && get("__dtf_era").is_some() && y <= 0 {
+    let disp_year = if greg_cal && get("#\u{0}dtf_era").is_some() && y <= 0 {
         1 - y
     } else {
         y
     };
-    let year_str = get("__dtf_year").map(|yy| {
+    let year_str = get("#\u{0}dtf_year").map(|yy| {
         if yy == "2-digit" {
             format!("{:02}", (disp_year % 100 + 100) % 100)
         } else {
@@ -1765,7 +1770,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
         // Numeric date: field order and separator follow the locale's CLDR short pattern
         // (en: M/D/Y, de: D.M.Y, ja: Y/M/D, ...). Default is M/D/Y with "/".
         let lang = {
-            let loc = match o.borrow().props.get("__dtf_locale").map(|p| p.value()) {
+            let loc = match o.borrow().props.get("#\u{0}dtf_locale").map(|p| p.value()) {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => "en".to_string(),
             };
@@ -1827,7 +1832,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
         }
     }
     // The era follows the date (CLDR name for the calendar/locale; the code is the fallback).
-    if let (true, Some(width)) = (have_date, get("__dtf_era")) {
+    if let (true, Some(width)) = (have_date, get("#\u{0}dtf_era")) {
         let (code, _) =
             crate::temporal::cal_era(if greg_cal { "gregory" } else { &dcal }, iso_date);
         if let Some(code) = code {
@@ -1863,30 +1868,35 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
 
     // A PlainTime (kind 2), or a fully-defaulted formatter over a PlainDateTime (kind 3), shows the
     // natural h:m:s even without explicit time components (the PlainDateTime format defaults to all).
-    let dtf_defaulted = o.borrow().props.contains("__dtf_defaults");
-    let has_frac = o.borrow().props.contains("__dtf_fracsec");
-    let day_period = get("__dtf_dayperiod");
+    let dtf_defaulted = o.borrow().props.contains("#\u{0}dtf_defaults");
+    let has_frac = o.borrow().props.contains("#\u{0}dtf_fracsec");
+    let day_period = get("#\u{0}dtf_dayperiod");
     let time_defaulted = (kind == 2 || ((kind == 3 || kind == 6) && dtf_defaulted))
-        && get("__dtf_hour").is_none()
-        && get("__dtf_minute").is_none()
-        && get("__dtf_second").is_none()
+        && get("#\u{0}dtf_hour").is_none()
+        && get("#\u{0}dtf_minute").is_none()
+        && get("#\u{0}dtf_second").is_none()
         && day_period.is_none()
         && !has_frac;
     let have_time = time_defaulted
         || day_period.is_some()
         || has_frac
-        || get("__dtf_hour").is_some()
-        || get("__dtf_minute").is_some()
-        || get("__dtf_second").is_some();
+        || get("#\u{0}dtf_hour").is_some()
+        || get("#\u{0}dtf_minute").is_some()
+        || get("#\u{0}dtf_second").is_some();
     if have_time {
         if have_date {
             lit(&mut parts, ", ");
         }
-        let has_hour = time_defaulted || get("__dtf_hour").is_some();
+        let has_hour = time_defaulted || get("#\u{0}dtf_hour").is_some();
         // An explicit dayPeriod field replaces the AM/PM marker with a flexible period word; a plain
         // AM/PM marker only appears alongside a 12-hour clock. When the hour cycle wasn't resolved
         // (a default formatter over a PlainTime), use the locale default (en is 12-hour, others 24).
-        let cycle = match o.borrow().props.get("__dtf_hourcycle").map(|p| p.value()) {
+        let cycle = match o
+            .borrow()
+            .props
+            .get("#\u{0}dtf_hourcycle")
+            .map(|p| p.value())
+        {
             Some(Value::Str(s)) => Some(s.to_string()),
             _ => None,
         };
@@ -1894,7 +1904,7 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
             || match cycle.as_deref() {
                 Some("h11") | Some("h12") => true,
                 Some(_) => false,
-                None => match o.borrow().props.get("__dtf_hour12").map(|p| p.value()) {
+                None => match o.borrow().props.get("#\u{0}dtf_hour12").map(|p| p.value()) {
                     Some(Value::Bool(b)) => b,
                     _ => cldr_loc == "en",
                 },
@@ -1952,14 +1962,14 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
             None
         };
         let has_clock = time_defaulted
-            || get("__dtf_hour").is_some()
-            || get("__dtf_minute").is_some()
-            || get("__dtf_second").is_some();
+            || get("#\u{0}dtf_hour").is_some()
+            || get("#\u{0}dtf_minute").is_some()
+            || get("#\u{0}dtf_second").is_some();
         let mut first = true;
-        if time_defaulted || get("__dtf_hour").is_some() {
+        if time_defaulted || get("#\u{0}dtf_hour").is_some() {
             // A 24-hour cycle (h23/h24) renders 2-digit even for a numeric hour (CLDR "HH"); a
             // 12-hour cycle uses 1-digit unless "2-digit" was explicitly requested.
-            let pad = get("__dtf_hour").as_deref() == Some("2-digit") || !use12;
+            let pad = get("#\u{0}dtf_hour").as_deref() == Some("2-digit") || !use12;
             parts.push((
                 "hour",
                 if pad {
@@ -1970,28 +1980,32 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
             ));
             first = false;
         }
-        if time_defaulted || get("__dtf_minute").is_some() {
+        if time_defaulted || get("#\u{0}dtf_minute").is_some() {
             if !first {
                 lit(&mut parts, ":");
             }
             parts.push(("minute", format!("{mi:02}")));
             first = false;
         }
-        let frac_alone = has_frac && !(time_defaulted || get("__dtf_second").is_some());
+        let frac_alone = has_frac && !(time_defaulted || get("#\u{0}dtf_second").is_some());
         if frac_alone {
-            if let Some(Value::Num(fd)) = o.borrow().props.get("__dtf_fracsec").map(|p| p.value()) {
+            if let Some(Value::Num(fd)) =
+                o.borrow().props.get("#\u{0}dtf_fracsec").map(|p| p.value())
+            {
                 let ms_frac = (ms.rem_euclid(1000.0)) as u32;
                 let digits = format!("{ms_frac:03}");
                 parts.push(("fractionalSecond", digits[..fd as usize].to_string()));
             }
         }
-        if time_defaulted || get("__dtf_second").is_some() {
+        if time_defaulted || get("#\u{0}dtf_second").is_some() {
             if !first {
                 lit(&mut parts, ":");
             }
             parts.push(("second", format!("{s:02}")));
             // fractionalSecondDigits appends the leading digits of the millisecond fraction.
-            if let Some(Value::Num(fd)) = o.borrow().props.get("__dtf_fracsec").map(|p| p.value()) {
+            if let Some(Value::Num(fd)) =
+                o.borrow().props.get("#\u{0}dtf_fracsec").map(|p| p.value())
+            {
                 let ms_frac = (ms.rem_euclid(1000.0)) as u32;
                 let digits = format!("{ms_frac:03}");
                 // The fractional separator is the numbering system's decimal symbol (arab: U+066B).
@@ -2014,8 +2028,8 @@ fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
     }
 
     // Time-zone name (UTC only; the display form depends on the requested style).
-    if let Some(style) = get("__dtf_tzname") {
-        let tz = match o.borrow().props.get("__dtf_tz").map(|p| p.value()) {
+    if let Some(style) = get("#\u{0}dtf_tzname") {
+        let tz = match o.borrow().props.get("#\u{0}dtf_tz").map(|p| p.value()) {
             Some(Value::Str(s)) => s.to_string(),
             _ => crate::builtins::system_time_zone().to_string(),
         };
@@ -2206,7 +2220,7 @@ fn tz_display_name(tz: &str, style: &str, epoch_sec: i64) -> String {
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = crate::intl::brand_slot_legacy(i, &this, "__dtf", "Intl.DateTimeFormat")?;
+    let o = crate::intl::brand_slot_legacy(i, &this, "#\u{0}dtf", "Intl.DateTimeFormat")?;
     let res = i.new_object();
     let put = |i: &mut Interp, res: &Gc, k: &str, slot: &str| {
         if let Some(v) = o.borrow().props.get(slot).map(|p| p.value()) {
@@ -2214,31 +2228,34 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         }
         let _ = i;
     };
-    put(i, &res, "locale", "__dtf_locale");
-    put(i, &res, "calendar", "__dtf_ca");
-    put(i, &res, "numberingSystem", "__dtf_nu");
-    put(i, &res, "timeZone", "__dtf_tz");
+    put(i, &res, "locale", "#\u{0}dtf_locale");
+    put(i, &res, "calendar", "#\u{0}dtf_ca");
+    put(i, &res, "numberingSystem", "#\u{0}dtf_nu");
+    put(i, &res, "timeZone", "#\u{0}dtf_tz");
     // hourCycle/hour12 are resolved internally for every formatter but only surface in
     // resolvedOptions when the resolved pattern actually shows an hour.
     if matches!(
-        o.borrow().props.get("__dtf_hourshown").map(|p| p.value()),
+        o.borrow()
+            .props
+            .get("#\u{0}dtf_hourshown")
+            .map(|p| p.value()),
         Some(Value::Bool(true))
     ) {
-        put(i, &res, "hourCycle", "__dtf_hourcycle");
-        put(i, &res, "hour12", "__dtf_hour12");
+        put(i, &res, "hourCycle", "#\u{0}dtf_hourcycle");
+        put(i, &res, "hour12", "#\u{0}dtf_hour12");
     }
-    put(i, &res, "weekday", "__dtf_weekday");
-    put(i, &res, "era", "__dtf_era");
-    put(i, &res, "year", "__dtf_year");
-    put(i, &res, "month", "__dtf_month");
-    put(i, &res, "day", "__dtf_day");
-    put(i, &res, "dayPeriod", "__dtf_dayperiod");
-    put(i, &res, "hour", "__dtf_hour");
-    put(i, &res, "minute", "__dtf_minute");
-    put(i, &res, "second", "__dtf_second");
-    put(i, &res, "fractionalSecondDigits", "__dtf_fracsec");
-    put(i, &res, "timeZoneName", "__dtf_tzname");
-    put(i, &res, "dateStyle", "__dtf_datestyle");
-    put(i, &res, "timeStyle", "__dtf_timestyle");
+    put(i, &res, "weekday", "#\u{0}dtf_weekday");
+    put(i, &res, "era", "#\u{0}dtf_era");
+    put(i, &res, "year", "#\u{0}dtf_year");
+    put(i, &res, "month", "#\u{0}dtf_month");
+    put(i, &res, "day", "#\u{0}dtf_day");
+    put(i, &res, "dayPeriod", "#\u{0}dtf_dayperiod");
+    put(i, &res, "hour", "#\u{0}dtf_hour");
+    put(i, &res, "minute", "#\u{0}dtf_minute");
+    put(i, &res, "second", "#\u{0}dtf_second");
+    put(i, &res, "fractionalSecondDigits", "#\u{0}dtf_fracsec");
+    put(i, &res, "timeZoneName", "#\u{0}dtf_tzname");
+    put(i, &res, "dateStyle", "#\u{0}dtf_datestyle");
+    put(i, &res, "timeStyle", "#\u{0}dtf_timestyle");
     Ok(Value::Obj(res))
 }

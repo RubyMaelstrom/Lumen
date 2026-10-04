@@ -65,10 +65,14 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.DurationFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "__df", Value::Bool(true));
-    set_builtin(&obj, "__df_locale", Value::from_string(resolved_locale));
-    set_builtin(&obj, "__df_style", Value::from_string(base_style.clone()));
-    set_builtin(&obj, "__df_nu", Value::from_string(numbering));
+    set_builtin(&obj, "#\u{0}df", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}df_locale", Value::from_string(resolved_locale));
+    set_builtin(
+        &obj,
+        "#\u{0}df_style",
+        Value::from_string(base_style.clone()),
+    );
+    set_builtin(&obj, "#\u{0}df_nu", Value::from_string(numbering));
 
     // GetDurationUnitOptions for each unit, threading `prev_style`.
     let mut prev_style: Option<String> = None;
@@ -152,12 +156,12 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
 
         set_builtin(
             &obj,
-            Box::leak(format!("__df_u_{plural}").into_boxed_str()),
+            Box::leak(format!("#\u{0}df_u_{plural}").into_boxed_str()),
             Value::from_string(style.clone()),
         );
         set_builtin(
             &obj,
-            Box::leak(format!("__df_d_{plural}").into_boxed_str()),
+            Box::leak(format!("#\u{0}df_d_{plural}").into_boxed_str()),
             Value::from_string(display),
         );
         // prevStyle is updated only for hours..microseconds (nanoseconds and the calendar units do
@@ -184,7 +188,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         }
     };
     if let Some(f) = frac {
-        set_builtin(&obj, "__df_frac", Value::Num(f as f64));
+        set_builtin(&obj, "#\u{0}df_frac", Value::Num(f as f64));
     }
     Ok(Value::Obj(obj))
 }
@@ -407,12 +411,12 @@ fn partition(
     this: &Value,
     dur: &Value,
 ) -> Result<(Vec<Vec<DurPart>>, String, String), Value> {
-    let o = brand_slot(i, this, "__df")?;
+    let o = brand_slot(i, this, "#\u{0}df")?;
     let vals = read_duration(i, dur)?;
-    let locale = get_str(&o, "__df_locale");
-    let base_style = get_str(&o, "__df_style");
-    let numbering = get_str(&o, "__df_nu");
-    let frac_digits = match o.borrow().props.get("__df_frac").map(|p| p.value()) {
+    let locale = get_str(&o, "#\u{0}df_locale");
+    let base_style = get_str(&o, "#\u{0}df_style");
+    let numbering = get_str(&o, "#\u{0}df_nu");
+    let frac_digits = match o.borrow().props.get("#\u{0}df_frac").map(|p| p.value()) {
         Some(Value::Num(n)) => Some(n as u32),
         _ => None,
     };
@@ -425,8 +429,8 @@ fn partition(
     while idx < UNITS.len() {
         let (plural, sing) = UNITS[idx];
         let mut value = vals[idx];
-        let style = get_str(&o, &format!("__df_u_{plural}"));
-        let display = get_str(&o, &format!("__df_d_{plural}"));
+        let style = get_str(&o, &format!("#\u{0}df_u_{plural}"));
+        let display = get_str(&o, &format!("#\u{0}df_d_{plural}"));
         let need_separator = cur_group.is_some();
 
         // Seconds/ms/us absorb the smaller sub-second units into a single fractional value when the
@@ -437,7 +441,7 @@ fn partition(
         let mut nf_min_frac: Option<u32> = None;
         let mut nf_trunc = false;
         if matches!(plural, "seconds" | "milliseconds" | "microseconds") {
-            let next_style = get_str(&o, &format!("__df_u_{}", UNITS[idx + 1].0));
+            let next_style = get_str(&o, &format!("#\u{0}df_u_{}", UNITS[idx + 1].0));
             if next_style == "numeric" {
                 let exp = match plural {
                     "seconds" => 9,
@@ -456,7 +460,7 @@ fn partition(
         // minutes: display a zero numeric minute if seconds follow.
         let mut display_required = false;
         if plural == "minutes" && need_separator {
-            display_required = get_str(&o, "__df_d_seconds") == "always"
+            display_required = get_str(&o, "#\u{0}df_d_seconds") == "always"
                 || vals[6] != 0.0
                 || vals[7] != 0.0
                 || vals[8] != 0.0
@@ -557,7 +561,7 @@ fn partition(
         // A group ends when the next non-numeric unit begins; flush before a standalone unit.
         if cur_group.is_some() {
             let next_numeric = idx + 1 < UNITS.len() && {
-                let ns = get_str(&o, &format!("__df_u_{}", UNITS[idx + 1].0));
+                let ns = get_str(&o, &format!("#\u{0}df_u_{}", UNITS[idx + 1].0));
                 ns == "numeric" || ns == "2-digit"
             };
             if !next_numeric {
@@ -677,7 +681,7 @@ fn fractional_value(vals: &[f64; 10], exp: i32) -> f64 {
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = brand_slot(i, &this, "__df")?;
+    let o = brand_slot(i, &this, "#\u{0}df")?;
     let get = |k: &str| {
         o.borrow()
             .props
@@ -686,19 +690,19 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
             .unwrap_or(Value::Undefined)
     };
     let res = i.new_object();
-    set_data(&res, "locale", get("__df_locale"));
-    set_data(&res, "numberingSystem", get("__df_nu"));
-    set_data(&res, "style", get("__df_style"));
+    set_data(&res, "locale", get("#\u{0}df_locale"));
+    set_data(&res, "numberingSystem", get("#\u{0}df_nu"));
+    set_data(&res, "style", get("#\u{0}df_style"));
     for (plural, _sing) in UNITS {
-        set_data(&res, plural, get(&format!("__df_u_{plural}")));
+        set_data(&res, plural, get(&format!("#\u{0}df_u_{plural}")));
         set_data(
             &res,
             Box::leak(format!("{plural}Display").into_boxed_str()),
-            get(&format!("__df_d_{plural}")),
+            get(&format!("#\u{0}df_d_{plural}")),
         );
     }
-    if o.borrow().props.contains("__df_frac") {
-        set_data(&res, "fractionalDigits", get("__df_frac"));
+    if o.borrow().props.contains("#\u{0}df_frac") {
+        set_data(&res, "fractionalDigits", get("#\u{0}df_frac"));
     }
     Ok(Value::Obj(res))
 }

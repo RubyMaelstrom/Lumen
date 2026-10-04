@@ -149,9 +149,9 @@ pub(super) fn install_promise(it: &mut Interp) {
         };
         let results = i.make_array(vec![]);
         let state = i.new_object();
-        set_internal(&state, "__results", results.clone());
+        set_internal(&state, "#\u{0}results", results.clone());
         // remainingElementsCount starts at 1; each element increments, the loop end decrements once.
-        set_internal(&state, "__remaining", Value::Num(1.0));
+        set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
         let mut idx = 0usize;
         loop {
             let item = match i.iterator_step(&iter, &next) {
@@ -167,9 +167,9 @@ pub(super) fn install_promise(it: &mut Interp) {
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "__remaining"))?;
+            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
-            set_internal(&state, "__remaining", Value::Num(rem + 1.0));
+            set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
             let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
                 Ok(p) => p,
                 Err(e) => {
@@ -183,7 +183,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                 }
             };
             let already = i.new_object();
-            set_internal(&already, "__called", Value::Bool(false));
+            set_internal(&already, "#\u{0}called", Value::Bool(false));
             let on_f = make_bound(
                 i,
                 promise_all_element,
@@ -220,9 +220,9 @@ pub(super) fn install_promise(it: &mut Interp) {
         }
         // The values array's length is the element count (CreateDataProperty set each index).
         ab(i.set_member(&results, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "__remaining"))?;
+        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
-        set_internal(&state, "__remaining", Value::Num(rem - 1.0));
+        set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
             capability_resolve_or_reject(i, resolve_fn, reject_fn, results);
         }
@@ -320,8 +320,8 @@ pub(super) fn install_promise(it: &mut Interp) {
         };
         let results = i.make_array(vec![]);
         let state = i.new_object();
-        set_internal(&state, "__results", results.clone());
-        set_internal(&state, "__remaining", Value::Num(1.0));
+        set_internal(&state, "#\u{0}results", results.clone());
+        set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
         let mut idx = 0usize;
         loop {
             let item = match i.iterator_step(&iter, &next) {
@@ -336,9 +336,9 @@ pub(super) fn install_promise(it: &mut Interp) {
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "__remaining"))?;
+            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
-            set_internal(&state, "__remaining", Value::Num(rem + 1.0));
+            set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
             let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
                 Ok(p) => p,
                 Err(e) => {
@@ -353,7 +353,7 @@ pub(super) fn install_promise(it: &mut Interp) {
             };
             // The fulfill and reject element functions for one index share one [[AlreadyCalled]].
             let already = i.new_object();
-            set_internal(&already, "__called", Value::Bool(false));
+            set_internal(&already, "#\u{0}called", Value::Bool(false));
             let on_f = make_bound(
                 i,
                 promise_settled_fulfill,
@@ -398,9 +398,9 @@ pub(super) fn install_promise(it: &mut Interp) {
             idx += 1;
         }
         ab(i.set_member(&results, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "__remaining"))?;
+        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
-        set_internal(&state, "__remaining", Value::Num(rem - 1.0));
+        set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
             capability_resolve_or_reject(i, resolve_fn, reject_fn, results);
         }
@@ -428,8 +428,8 @@ pub(super) fn install_promise(it: &mut Interp) {
         };
         let errors = i.make_array(vec![]);
         let state = i.new_object();
-        set_internal(&state, "__errors", errors.clone());
-        set_internal(&state, "__remaining", Value::Num(1.0));
+        set_internal(&state, "#\u{0}errors", errors.clone());
+        set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
         let mut idx = 0usize;
         loop {
             let item = match i.iterator_step(&iter, &next) {
@@ -444,9 +444,9 @@ pub(super) fn install_promise(it: &mut Interp) {
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "__remaining"))?;
+            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
-            set_internal(&state, "__remaining", Value::Num(rem + 1.0));
+            set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
             let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
                 Ok(p) => p,
                 Err(e) => {
@@ -460,7 +460,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                 }
             };
             let already = i.new_object();
-            set_internal(&already, "__called", Value::Bool(false));
+            set_internal(&already, "#\u{0}called", Value::Bool(false));
             let on_r = make_bound(
                 i,
                 promise_any_reject,
@@ -496,9 +496,9 @@ pub(super) fn install_promise(it: &mut Interp) {
             idx += 1;
         }
         ab(i.set_member(&errors, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "__remaining"))?;
+        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
-        set_internal(&state, "__remaining", Value::Num(rem - 1.0));
+        set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
             let agg = make_aggregate_error(i, errors)?;
             let _ = i.call(reject_fn, Value::Undefined, &[agg]);

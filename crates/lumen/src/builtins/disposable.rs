@@ -15,17 +15,17 @@ fn ds_brand(i: &mut Interp, this: &Value, async_kind: bool) -> Result<Gc, Value>
     };
     let o = this_obj(this)
         .ok_or_else(|| i.make_error("TypeError", format!("receiver is not a {name}")))?;
-    let kind = o.borrow().props.get("__ds_kind").map(|p| p.value());
+    let kind = o.borrow().props.get("#\u{0}ds_kind").map(|p| p.value());
     match kind {
         Some(Value::Str(k)) if &*k == want => Ok(o),
         _ => Err(i.make_error("TypeError", format!("receiver is not a {name}"))),
     }
 }
 fn ds_list(i: &mut Interp, this: &Value) -> Result<Value, Value> {
-    ab(i.get_member(this, "__ds"))
+    ab(i.get_member(this, "#\u{0}ds"))
 }
 fn ds_disposed(i: &mut Interp, this: &Value) -> Result<bool, Value> {
-    let v = ab(i.get_member(this, "__ds_disposed"))?;
+    let v = ab(i.get_member(this, "#\u{0}ds_disposed"))?;
     Ok(i.to_boolean(&v))
 }
 fn ds_push(i: &mut Interp, this: &Value, entry: Value) -> Result<(), Value> {
@@ -216,7 +216,11 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         if ds_disposed(i, &this)? {
             return Ok(Value::Undefined);
         }
-        set_internal(this.as_obj().unwrap(), "__ds_disposed", Value::Bool(true));
+        set_internal(
+            this.as_obj().unwrap(),
+            "#\u{0}ds_disposed",
+            Value::Bool(true),
+        );
         let list = ds_list(i, &this)?;
         let len = ab(i.get_member(&list, "length"))?;
         let n = ab(i.to_number(&len))? as i64;
@@ -240,12 +244,16 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         let proto = i.extra_protos.get("DisposableStack").cloned();
         let fresh = Object::new(proto);
         let list = ds_list(i, &this)?;
-        set_internal(&fresh, "__ds", list);
-        set_internal(&fresh, "__ds_kind", Value::str("sync"));
-        set_internal(&fresh, "__ds_disposed", Value::Bool(false));
+        set_internal(&fresh, "#\u{0}ds", list);
+        set_internal(&fresh, "#\u{0}ds_kind", Value::str("sync"));
+        set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
-        set_internal(this.as_obj().unwrap(), "__ds", empty);
-        set_internal(this.as_obj().unwrap(), "__ds_disposed", Value::Bool(true));
+        set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
+        set_internal(
+            this.as_obj().unwrap(),
+            "#\u{0}ds_disposed",
+            Value::Bool(true),
+        );
         Ok(Value::Obj(fresh))
     });
     // `disposed` accessor + `[Symbol.dispose]` alias for `dispose`.
@@ -270,9 +278,9 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         }
         let obj = new_from_ctor(i, "DisposableStack")?;
         let list = i.make_array(Vec::new());
-        set_internal(&obj, "__ds", list);
-        set_internal(&obj, "__ds_kind", Value::str("sync"));
-        set_internal(&obj, "__ds_disposed", Value::Bool(false));
+        set_internal(&obj, "#\u{0}ds", list);
+        set_internal(&obj, "#\u{0}ds_kind", Value::str("sync"));
+        set_internal(&obj, "#\u{0}ds_disposed", Value::Bool(false));
         Ok(Value::Obj(obj))
     });
     ctor.borrow_mut().props.insert(
@@ -371,7 +379,11 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
             i.resolve_promise(&result, Value::Undefined);
             return Ok(result);
         }
-        set_internal(this.as_obj().unwrap(), "__ds_disposed", Value::Bool(true));
+        set_internal(
+            this.as_obj().unwrap(),
+            "#\u{0}ds_disposed",
+            Value::Bool(true),
+        );
         let list = ds_list(i, &this)?;
         let len = ab(i.get_member(&list, "length"))?;
         let n = ab(i.to_number(&len))? as i64;
@@ -385,12 +397,16 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         }
         let fresh = Object::new(i.extra_protos.get("AsyncDisposableStack").cloned());
         let list = ds_list(i, &this)?;
-        set_internal(&fresh, "__ds", list);
-        set_internal(&fresh, "__ds_kind", Value::str("async"));
-        set_internal(&fresh, "__ds_disposed", Value::Bool(false));
+        set_internal(&fresh, "#\u{0}ds", list);
+        set_internal(&fresh, "#\u{0}ds_kind", Value::str("async"));
+        set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
-        set_internal(this.as_obj().unwrap(), "__ds", empty);
-        set_internal(this.as_obj().unwrap(), "__ds_disposed", Value::Bool(true));
+        set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
+        set_internal(
+            this.as_obj().unwrap(),
+            "#\u{0}ds_disposed",
+            Value::Bool(true),
+        );
         Ok(Value::Obj(fresh))
     });
     let disposed_getter = it.make_native("get disposed", 0, |i, this, _| {
@@ -417,9 +433,9 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         }
         let obj = new_from_ctor(i, "AsyncDisposableStack")?;
         let list = i.make_array(Vec::new());
-        set_internal(&obj, "__ds", list);
-        set_internal(&obj, "__ds_kind", Value::str("async"));
-        set_internal(&obj, "__ds_disposed", Value::Bool(false));
+        set_internal(&obj, "#\u{0}ds", list);
+        set_internal(&obj, "#\u{0}ds_kind", Value::str("async"));
+        set_internal(&obj, "#\u{0}ds_disposed", Value::Bool(false));
         Ok(Value::Obj(obj))
     });
     ctor.borrow_mut().props.insert(

@@ -54,11 +54,11 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
     if let Some(proto) = instance_proto(i, "Intl.RelativeTimeFormat")? {
         object.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&object, "__rtf", Value::Bool(true));
-    set_builtin(&object, "__rtf_locale", Value::from_string(locale));
-    set_builtin(&object, "__rtf_numeric", Value::from_string(numeric));
-    set_builtin(&object, "__rtf_style", Value::from_string(style));
-    set_builtin(&object, "__rtf_nu", Value::from_string(numbering));
+    set_builtin(&object, "#\u{0}rtf", Value::Bool(true));
+    set_builtin(&object, "#\u{0}rtf_locale", Value::from_string(locale));
+    set_builtin(&object, "#\u{0}rtf_numeric", Value::from_string(numeric));
+    set_builtin(&object, "#\u{0}rtf_style", Value::from_string(style));
+    set_builtin(&object, "#\u{0}rtf_nu", Value::from_string(numbering));
     Ok(Value::Obj(object))
 }
 
@@ -105,7 +105,7 @@ fn format(
     unit: &Value,
     to_parts: bool,
 ) -> Result<Value, Value> {
-    let object = brand_slot(i, this, "__rtf")?;
+    let object = brand_slot(i, this, "#\u{0}rtf")?;
     let number = ab(i.to_number(value))?;
     if !number.is_finite() {
         return Err(i.make_error("RangeError", "value must be finite"));
@@ -113,10 +113,10 @@ fn format(
     let unit_string = ab(i.to_string(unit))?.to_string();
     let unit = singular(&unit_string)
         .ok_or_else(|| i.make_error("RangeError", format!("invalid unit: {unit_string}")))?;
-    let locale = string_slot(&object, "__rtf_locale", "en-US");
+    let locale = string_slot(&object, "#\u{0}rtf_locale", "en-US");
     let language = locale.split('-').next().unwrap_or("en");
-    let style = string_slot(&object, "__rtf_style", "long");
-    let numeric = string_slot(&object, "__rtf_numeric", "always");
+    let style = string_slot(&object, "#\u{0}rtf_style", "long");
+    let numeric = string_slot(&object, "#\u{0}rtf_numeric", "always");
 
     // PartitionRelativeTimePattern uses ToString(value) as the automatic phrase key. The CLDR keys
     // are small integers, so a fractional value must not truncate into an automatic phrase.
@@ -145,7 +145,7 @@ fn format(
 
     // ECMA-402's internal NumberFormat hides the sign and supplies both the displayed string and
     // the exact part records spliced by MakePartsList.
-    let numbering = string_slot(&object, "__rtf_nu", "latn");
+    let numbering = string_slot(&object, "#\u{0}rtf_nu", "latn");
     let nf_options = i.new_object();
     set_data(
         &nf_options,
@@ -211,7 +211,7 @@ fn new_service(i: &mut Interp, service: &str, locale: &str, options: Gc) -> Resu
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let object = brand_slot(i, &this, "__rtf")?;
+    let object = brand_slot(i, &this, "#\u{0}rtf")?;
     let get = |key: &str| {
         object
             .borrow()
@@ -221,9 +221,9 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             .unwrap_or(Value::Undefined)
     };
     let result = i.new_object();
-    set_data(&result, "locale", get("__rtf_locale"));
-    set_data(&result, "style", get("__rtf_style"));
-    set_data(&result, "numeric", get("__rtf_numeric"));
-    set_data(&result, "numberingSystem", get("__rtf_nu"));
+    set_data(&result, "locale", get("#\u{0}rtf_locale"));
+    set_data(&result, "style", get("#\u{0}rtf_style"));
+    set_data(&result, "numeric", get("#\u{0}rtf_numeric"));
+    set_data(&result, "numberingSystem", get("#\u{0}rtf_nu"));
     Ok(Value::Obj(result))
 }

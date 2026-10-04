@@ -113,7 +113,7 @@ pub(crate) fn canonicalize_locale_list(
     // and canonicalizing each element in turn (an element's ToString may mutate later indices).
     match locales {
         Value::Str(_) => process_locale_item(i, locales, &mut seen)?,
-        Value::Obj(o) if o.borrow().props.contains("__locale_tag") => {
+        Value::Obj(o) if o.borrow().props.contains("#\u{0}locale_tag") => {
             process_locale_item(i, locales, &mut seen)?
         }
         Value::Null => return Err(i.make_error("TypeError", "Cannot convert null to object")),
@@ -138,8 +138,8 @@ pub(crate) fn canonicalize_locale_list(
 /// Canonicalize one locale-list element (a String, Locale, or Object) and append it (deduplicated).
 fn process_locale_item(i: &mut Interp, item: &Value, seen: &mut Vec<String>) -> Result<(), Value> {
     let tag = match item {
-        Value::Obj(o) if o.borrow().props.contains("__locale_tag") => {
-            match o.borrow().props.get("__locale_tag").map(|p| p.value()) {
+        Value::Obj(o) if o.borrow().props.contains("#\u{0}locale_tag") => {
+            match o.borrow().props.get("#\u{0}locale_tag").map(|p| p.value()) {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => String::new(),
             }

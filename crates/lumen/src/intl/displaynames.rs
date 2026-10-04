@@ -66,16 +66,16 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     .unwrap();
     let resolved = resolve_locale(i, &requested, &[]);
 
-    set_builtin(&obj, "__dn", Value::Bool(true));
-    set_builtin(&obj, "__dn_locale", Value::from_string(resolved.locale));
-    set_builtin(&obj, "__dn_style", Value::from_string(style));
+    set_builtin(&obj, "#\u{0}dn", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}dn_locale", Value::from_string(resolved.locale));
+    set_builtin(&obj, "#\u{0}dn_style", Value::from_string(style));
     let is_language = kind == "language";
-    set_builtin(&obj, "__dn_type", Value::from_string(kind));
-    set_builtin(&obj, "__dn_fallback", Value::from_string(fallback));
+    set_builtin(&obj, "#\u{0}dn_type", Value::from_string(kind));
+    set_builtin(&obj, "#\u{0}dn_fallback", Value::from_string(fallback));
     if is_language {
         set_builtin(
             &obj,
-            "__dn_langdisplay",
+            "#\u{0}dn_langdisplay",
             Value::from_string(language_display),
         );
     }
@@ -95,9 +95,9 @@ fn string_slot(object: &Gc, key: &str, fallback: &str) -> String {
 }
 
 fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "__dn")?;
-    let kind = string_slot(&o, "__dn_type", "");
-    let fallback = string_slot(&o, "__dn_fallback", "code");
+    let o = brand_slot(i, this, "#\u{0}dn")?;
+    let kind = string_slot(&o, "#\u{0}dn_type", "");
+    let fallback = string_slot(&o, "#\u{0}dn_fallback", "code");
     let s = ab(i.to_string(code))?.to_string();
     // Validate the code per type.
     let canonical = match kind.as_str() {
@@ -171,11 +171,11 @@ fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
         }
         _ => s.clone(),
     };
-    let locale = string_slot(&o, "__dn_locale", "en-US");
+    let locale = string_slot(&o, "#\u{0}dn_locale", "en-US");
     let language = locale.split('-').next().unwrap_or("en");
-    let style = string_slot(&o, "__dn_style", "long");
+    let style = string_slot(&o, "#\u{0}dn_style", "long");
     let name = if kind == "language" {
-        let language_display = string_slot(&o, "__dn_langdisplay", "dialect");
+        let language_display = string_slot(&o, "#\u{0}dn_langdisplay", "dialect");
         display_language(language, &style, &language_display, &canonical)
     } else {
         crate::cldr_display_names::name(language, &kind, &style, &canonical).map(str::to_string)
@@ -310,7 +310,7 @@ fn apply_pattern(pattern: &str, first: &str, second: &str) -> String {
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = brand_slot(i, &this, "__dn")?;
+    let o = brand_slot(i, &this, "#\u{0}dn")?;
     let get = |k: &str| {
         o.borrow()
             .props
@@ -319,11 +319,11 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
             .unwrap_or(Value::Undefined)
     };
     let res = i.new_object();
-    set_data(&res, "locale", get("__dn_locale"));
-    set_data(&res, "style", get("__dn_style"));
-    set_data(&res, "type", get("__dn_type"));
-    set_data(&res, "fallback", get("__dn_fallback"));
-    let language_display = get("__dn_langdisplay");
+    set_data(&res, "locale", get("#\u{0}dn_locale"));
+    set_data(&res, "style", get("#\u{0}dn_style"));
+    set_data(&res, "type", get("#\u{0}dn_type"));
+    set_data(&res, "fallback", get("#\u{0}dn_fallback"));
+    let language_display = get("#\u{0}dn_langdisplay");
     if !matches!(language_display, Value::Undefined) {
         set_data(&res, "languageDisplay", language_display);
     }

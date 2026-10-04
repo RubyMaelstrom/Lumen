@@ -54,55 +54,55 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     let (_ctor, proto) = make_service(it, ns, "Locale", 1, locale_construct);
 
     def_getter(it, &proto, "baseName", |i, this, _| {
-        Ok(Value::from_string(slot(i, &this, "__locale_basename")?))
+        Ok(Value::from_string(slot(i, &this, "#\u{0}locale_basename")?))
     });
     def_getter(it, &proto, "language", |i, this, _| {
-        Ok(Value::from_string(slot(i, &this, "__locale_language")?))
+        Ok(Value::from_string(slot(i, &this, "#\u{0}locale_language")?))
     });
     def_getter(it, &proto, "script", |i, this, _| {
-        opt_slot(i, &this, "__locale_script")
+        opt_slot(i, &this, "#\u{0}locale_script")
     });
     def_getter(it, &proto, "region", |i, this, _| {
-        opt_slot(i, &this, "__locale_region")
+        opt_slot(i, &this, "#\u{0}locale_region")
     });
     def_getter(it, &proto, "variants", |i, this, _| {
-        opt_slot(i, &this, "__locale_variants")
+        opt_slot(i, &this, "#\u{0}locale_variants")
     });
     def_getter(it, &proto, "calendar", |i, this, _| {
-        opt_slot(i, &this, "__locale_ca")
+        opt_slot(i, &this, "#\u{0}locale_ca")
     });
     def_getter(it, &proto, "collation", |i, this, _| {
-        opt_slot(i, &this, "__locale_co")
+        opt_slot(i, &this, "#\u{0}locale_co")
     });
     def_getter(it, &proto, "hourCycle", |i, this, _| {
-        opt_slot(i, &this, "__locale_hc")
+        opt_slot(i, &this, "#\u{0}locale_hc")
     });
     def_getter(it, &proto, "caseFirst", |i, this, _| {
-        opt_slot(i, &this, "__locale_kf")
+        opt_slot(i, &this, "#\u{0}locale_kf")
     });
     def_getter(it, &proto, "firstDayOfWeek", |i, this, _| {
-        opt_slot(i, &this, "__locale_fw")
+        opt_slot(i, &this, "#\u{0}locale_fw")
     });
     def_getter(it, &proto, "numberingSystem", |i, this, _| {
-        opt_slot(i, &this, "__locale_nu")
+        opt_slot(i, &this, "#\u{0}locale_nu")
     });
     def_getter(it, &proto, "numeric", |i, this, _| {
         let o = this
             .as_obj()
             .ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-        if !o.borrow().props.contains("__locale_tag") {
+        if !o.borrow().props.contains("#\u{0}locale_tag") {
             return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
         }
-        let present = o.borrow().props.contains("__locale_kn");
+        let present = o.borrow().props.contains("#\u{0}locale_kn");
         let is_false = matches!(
-            o.borrow().props.get("__locale_kn").map(|p| p.value()),
+            o.borrow().props.get("#\u{0}locale_kn").map(|p| p.value()),
             Some(Value::Str(s)) if &*s == "false"
         );
         Ok(Value::Bool(present && !is_false))
     });
 
     it.def_method(&proto, "toString", 0, |i, this, _| {
-        Ok(Value::from_string(slot(i, &this, "__locale_tag")?))
+        Ok(Value::from_string(slot(i, &this, "#\u{0}locale_tag")?))
     });
     it.def_method(&proto, "maximize", 0, |i, this, _| relocale(i, &this, true));
     it.def_method(&proto, "minimize", 0, |i, this, _| {
@@ -122,16 +122,16 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         hour_cycles_of_locale(i, &this)
     });
     it.def_method(&proto, "getNumberingSystems", 0, |i, this, _| {
-        info_list(i, &this, "__locale_nu", &["latn"])
+        info_list(i, &this, "#\u{0}locale_nu", &["latn"])
     });
     it.def_method(&proto, "getTimeZones", 0, |i, this, _| {
         // Defined only for a locale with a region; otherwise `undefined`.
         let region = {
             let o = this.as_obj().ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-            if !o.borrow().props.contains("__locale_tag") {
+            if !o.borrow().props.contains("#\u{0}locale_tag") {
                 return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
             }
-            matches!(o.borrow().props.get("__locale_region").map(|p| p.value()), Some(Value::Str(s)) if !s.is_empty())
+            matches!(o.borrow().props.get("#\u{0}locale_region").map(|p| p.value()), Some(Value::Str(s)) if !s.is_empty())
         };
         if region {
             Ok(i.make_array(vec![Value::str("UTC")]))
@@ -140,7 +140,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         }
     });
     it.def_method(&proto, "getTextInfo", 0, |i, this, _| {
-        let _ = slot(i, &this, "__locale_tag")?;
+        let _ = slot(i, &this, "#\u{0}locale_tag")?;
         let o = i.new_object();
         set_data(&o, "direction", Value::str("ltr"));
         Ok(Value::Obj(o))
@@ -215,7 +215,7 @@ fn locale_keyword(i: &mut Interp, this: &Value, name: &str) -> Result<Option<Str
     let object = this
         .as_obj()
         .ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-    if !object.borrow().props.contains("__locale_tag") {
+    if !object.borrow().props.contains("#\u{0}locale_tag") {
         return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
     }
     Ok(match object.borrow().props.get(name).map(|p| p.value()) {
@@ -230,8 +230,8 @@ fn string_array<T: Into<crate::lstr::LStr>>(i: &mut Interp, values: Vec<T>) -> V
 
 /// ECMA-402 CalendarsOfLocale, using UTS #35 Calendar Preference Data.
 fn calendars_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
-    let tag = slot(i, this, "__locale_tag")?;
-    if let Some(calendar) = locale_keyword(i, this, "__locale_ca")? {
+    let tag = slot(i, this, "#\u{0}locale_tag")?;
+    if let Some(calendar) = locale_keyword(i, this, "#\u{0}locale_ca")? {
         return Ok(string_array(i, vec![calendar]));
     }
     let preference = region_preference(&tag);
@@ -252,8 +252,8 @@ fn calendars_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
 /// ECMA-402 CollationsOfLocale. Locale data is shared with `Intl.Collator`; unavailable languages
 /// use the specification's fixed root list.
 fn collations_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
-    let tag = slot(i, this, "__locale_tag")?;
-    if let Some(collation) = locale_keyword(i, this, "__locale_co")? {
+    let tag = slot(i, this, "#\u{0}locale_tag")?;
+    if let Some(collation) = locale_keyword(i, this, "#\u{0}locale_co")? {
         return Ok(string_array(i, vec![collation]));
     }
     let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
@@ -268,8 +268,8 @@ fn collations_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
 /// ECMA-402 HourCyclesOfLocale, using UTS #35 Time Data. Language-region entries take precedence
 /// over region-only entries, and the region override is attempted before the ordinary region.
 fn hour_cycles_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
-    let tag = slot(i, this, "__locale_tag")?;
-    if let Some(hour_cycle) = locale_keyword(i, this, "__locale_hc")? {
+    let tag = slot(i, this, "#\u{0}locale_tag")?;
+    if let Some(hour_cycle) = locale_keyword(i, this, "#\u{0}locale_hc")? {
         return Ok(string_array(i, vec![hour_cycle]));
     }
     let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
@@ -294,14 +294,14 @@ fn hour_cycles_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
 /// ECMA-402 WeekInfoOfLocale, using UTS #35 Week Data and applying an `fw` override only after the
 /// regional record has been selected.
 fn week_info_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
-    let tag = slot(i, this, "__locale_tag")?;
+    let tag = slot(i, this, "#\u{0}locale_tag")?;
     let preference = region_preference(&tag);
     let lookup_region = preference
         .region_override
         .as_deref()
         .unwrap_or(&preference.region);
     let (mut first_day, weekend) = crate::cldr_locale_info::week_info(lookup_region);
-    if let Some(first_day_override) = locale_keyword(i, this, "__locale_fw")? {
+    if let Some(first_day_override) = locale_keyword(i, this, "#\u{0}locale_fw")? {
         if let Some(value) = fw_to_num(&first_day_override) {
             first_day = value as u8;
         }
@@ -327,7 +327,7 @@ fn info_list(
     let o = this
         .as_obj()
         .ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-    if !o.borrow().props.contains("__locale_tag") {
+    if !o.borrow().props.contains("#\u{0}locale_tag") {
         return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
     }
     let kw = match o.borrow().props.get(slot_name).map(|p| p.value()) {
@@ -356,7 +356,7 @@ fn opt_slot(i: &mut Interp, this: &Value, name: &str) -> Result<Value, Value> {
     let o = this
         .as_obj()
         .ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-    if !o.borrow().props.contains("__locale_tag") {
+    if !o.borrow().props.contains("#\u{0}locale_tag") {
         return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
     }
     match o.borrow().props.get(name).map(|p| p.value()) {
@@ -393,8 +393,8 @@ fn locale_construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Val
     let tag_arg = super::arg(a, 0);
     let mut base = match &tag_arg {
         Value::Str(s) => s.to_string(),
-        Value::Obj(o) if o.borrow().props.contains("__locale_tag") => {
-            match o.borrow().props.get("__locale_tag").map(|p| p.value()) {
+        Value::Obj(o) if o.borrow().props.contains("#\u{0}locale_tag") => {
+            match o.borrow().props.get("#\u{0}locale_tag").map(|p| p.value()) {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => String::new(),
             }
@@ -606,37 +606,41 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
         b.private.clear();
         tags::render(&b)
     };
-    set_builtin(&obj, "__locale_tag", Value::from_string(tag.to_string()));
-    set_builtin(&obj, "__locale_basename", Value::from_string(base));
     set_builtin(
         &obj,
-        "__locale_language",
+        "#\u{0}locale_tag",
+        Value::from_string(tag.to_string()),
+    );
+    set_builtin(&obj, "#\u{0}locale_basename", Value::from_string(base));
+    set_builtin(
+        &obj,
+        "#\u{0}locale_language",
         Value::from_string(p.language.clone()),
     );
     if !p.script.is_empty() {
         set_builtin(
             &obj,
-            "__locale_script",
+            "#\u{0}locale_script",
             Value::from_string(p.script.clone()),
         );
     }
     if !p.region.is_empty() {
         set_builtin(
             &obj,
-            "__locale_region",
+            "#\u{0}locale_region",
             Value::from_string(p.region.clone()),
         );
     }
     if !p.variants.is_empty() {
         set_builtin(
             &obj,
-            "__locale_variants",
+            "#\u{0}locale_variants",
             Value::from_string(p.variants.join("-")),
         );
     }
     if let Some((_a, keywords)) = &p.unicode {
         for (k, types) in keywords {
-            let slot = format!("__locale_{k}");
+            let slot = format!("#\u{0}locale_{k}");
             set_builtin(
                 &obj,
                 Box::leak(slot.into_boxed_str()),
@@ -708,7 +712,7 @@ fn remove_likely(lang: &str, script: &str, region: &str) -> (String, String, Str
 /// Intl.Locale.prototype.maximize/minimize via the CLDR likelySubtags data. Only the core
 /// (language, script, region) is transformed; variants and extensions are preserved.
 fn relocale(i: &mut Interp, this: &Value, maximize: bool) -> Result<Value, Value> {
-    let tag = slot(i, this, "__locale_tag")?;
+    let tag = slot(i, this, "#\u{0}locale_tag")?;
     let mut t = match super::tags::parse(&tag) {
         Some(t) => t,
         None => return build_locale_object(i, &tag),

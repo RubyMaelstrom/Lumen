@@ -39,9 +39,13 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.Segmenter")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "__sg", Value::Bool(true));
-    set_builtin(&obj, "__sg_locale", Value::from_string(resolved.locale));
-    set_builtin(&obj, "__sg_granularity", Value::from_string(granularity));
+    set_builtin(&obj, "#\u{0}sg", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}sg_locale", Value::from_string(resolved.locale));
+    set_builtin(
+        &obj,
+        "#\u{0}sg_granularity",
+        Value::from_string(granularity),
+    );
     Ok(Value::Obj(obj))
 }
 
@@ -537,8 +541,13 @@ fn boundaries(s: &[u16], granularity: &str) -> Vec<(usize, bool)> {
 }
 
 fn segment(i: &mut Interp, this: &Value, input: &Value) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "__sg")?;
-    let granularity = match o.borrow().props.get("__sg_granularity").map(|p| p.value()) {
+    let o = brand_slot(i, this, "#\u{0}sg")?;
+    let granularity = match o
+        .borrow()
+        .props
+        .get("#\u{0}sg_granularity")
+        .map(|p| p.value())
+    {
         Some(Value::Str(s)) => s.to_string(),
         _ => "grapheme".to_string(),
     };
@@ -565,10 +574,10 @@ fn segment(i: &mut Interp, this: &Value, input: &Value) -> Result<Value, Value> 
     }
     // Make `segments` iterable by giving it a @@iterator returning an array iterator over records.
     let arr = i.make_array(records);
-    set_builtin(&segments, "__seg_records", arr.clone());
+    set_builtin(&segments, "#\u{0}seg_records", arr.clone());
     if let Some(sym) = i.iterator_sym.clone() {
         let f = i.make_native("[Symbol.iterator]", 0, |i, this, _| {
-            let recs = ab(i.get_member(&this, "__seg_records"))?;
+            let recs = ab(i.get_member(&this, "#\u{0}seg_records"))?;
             let itf = ab(i.get_member(&recs, "values"))?;
             ab(i.call(itf, recs, &[]))
         });
@@ -588,7 +597,7 @@ fn it_containing(i: &mut Interp, segments: &Gc) {
         if idx < 0.0 || idx == f64::INFINITY {
             return Ok(Value::Undefined);
         }
-        let recs = ab(i.get_member(&this, "__seg_records"))?;
+        let recs = ab(i.get_member(&this, "#\u{0}seg_records"))?;
         let len = ab(i.get_member(&recs, "length"))?;
         let len = ab(i.to_number(&len))? as usize;
         // Segment starts are strictly increasing. Find the first start greater than `idx`, then
@@ -626,7 +635,7 @@ fn it_containing(i: &mut Interp, segments: &Gc) {
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = brand_slot(i, &this, "__sg")?;
+    let o = brand_slot(i, &this, "#\u{0}sg")?;
     let get = |k: &str| {
         o.borrow()
             .props
@@ -635,8 +644,8 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
             .unwrap_or(Value::Undefined)
     };
     let res = i.new_object();
-    set_data(&res, "locale", get("__sg_locale"));
-    set_data(&res, "granularity", get("__sg_granularity"));
+    set_data(&res, "locale", get("#\u{0}sg_locale"));
+    set_data(&res, "granularity", get("#\u{0}sg_granularity"));
     Ok(Value::Obj(res))
 }
 

@@ -53,7 +53,7 @@ fn format_range(i: &mut Interp, this: &Value, x: &Value, y: &Value) -> Result<Va
     let (o, a, b) = range_endpoints(i, this, x, y)?;
     let sa = assemble_number_exact(i, &o, a, exact_of(x)).text;
     let sb = assemble_number_exact(i, &o, b, exact_of(y)).text;
-    let nu = get_str(&o, "__nf_nu");
+    let nu = get_str(&o, "#\u{0}nf_nu");
     // Endpoints that FORMAT identically collapse to a single approximate value.
     if sa == sb {
         return Ok(Value::from_string(format!(
@@ -74,9 +74,9 @@ fn format_range(i: &mut Interp, this: &Value, x: &Value, y: &Value) -> Result<Va
 /// The locale's range join: separator plus the ICU affix-collapsing rules (a prefix-sign start
 /// keeps only its own affixes; a suffix-currency locale drops the start's suffix).
 fn range_join(o: &Gc, sa: &str, sb: &str) -> (String, &'static str, String) {
-    let lang = get_str(o, "__nf_locale");
+    let lang = get_str(o, "#\u{0}nf_locale");
     let lang = lang.split('-').next().unwrap_or("en").to_string();
-    let currency = get_str(o, "__nf_style") == "currency";
+    let currency = get_str(o, "#\u{0}nf_style") == "currency";
     if lang == "pt" {
         // Suffix-currency: the start keeps only its digits ("3 - 5 €").
         let start = if currency {
@@ -115,7 +115,7 @@ fn format_range_to_parts(
     let (o, a, b) = range_endpoints(i, this, x, y)?;
     let stype = suffix_type_of(&o);
     let symbols = cldr_number_symbols(&o);
-    let nu = get_str(&o, "__nf_nu");
+    let nu = get_str(&o, "#\u{0}nf_nu");
     let mut out: Vec<Value> = Vec::new();
     let push_parts = |i: &mut Interp, whole: &str, source: &str, out: &mut Vec<Value>| {
         for (t, mut v) in decompose_parts(whole, &stype, &symbols) {
@@ -159,13 +159,18 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
     let g = it.make_native("get format", 0, |i, this, _| {
         let o = instance_unwrap(i, &this)?;
         // Cache a bound function on the instance so repeated reads return the same object.
-        if let Some(f) = o.borrow().props.get("__nf_boundformat").map(|p| p.value()) {
+        if let Some(f) = o
+            .borrow()
+            .props
+            .get("#\u{0}nf_boundformat")
+            .map(|p| p.value())
+        {
             return Ok(f);
         }
         let f = i.make_native("", 1, |i, that, a| format_number(i, &that, &arg(a, 0)));
         // Bind `this` = the (possibly unwrapped) NumberFormat instance.
         let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
-        set_builtin(&o, "__nf_boundformat", bound.clone());
+        set_builtin(&o, "#\u{0}nf_boundformat", bound.clone());
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -398,53 +403,81 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.NumberFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "__nf", Value::Bool(true));
-    set_builtin(&obj, "__nf_locale", Value::from_string(resolved_locale));
-    set_builtin(&obj, "__nf_nu", Value::from_string(numbering));
+    set_builtin(&obj, "#\u{0}nf", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}nf_locale", Value::from_string(resolved_locale));
+    set_builtin(&obj, "#\u{0}nf_nu", Value::from_string(numbering));
     set_builtin(
         &obj,
-        "__nf_roundingincrement",
+        "#\u{0}nf_roundingincrement",
         Value::Num(rounding_increment as f64),
     );
     set_builtin(
         &obj,
-        "__nf_roundingpriority",
+        "#\u{0}nf_roundingpriority",
         Value::from_string(rounding_priority),
     );
-    set_builtin(&obj, "__nf_trailingzero", Value::from_string(trailing_zero));
-    set_builtin(&obj, "__nf_style", Value::from_string(style));
-    if let Some(c) = currency.filter(|_| get_str(&obj, "__nf_style") == "currency") {
-        set_builtin(&obj, "__nf_currency", Value::from_string(c.to_uppercase()));
-        set_builtin(
-            &obj,
-            "__nf_currencydisplay",
-            Value::from_string(currency_display),
-        );
-        set_builtin(&obj, "__nf_currencysign", Value::from_string(currency_sign));
-    }
-    if let Some(u) = unit {
-        set_builtin(&obj, "__nf_unit", Value::from_string(u));
-        set_builtin(&obj, "__nf_unitdisplay", Value::from_string(unit_display));
-    }
-    set_builtin(&obj, "__nf_minint", Value::Num(digits.min_int as f64));
-    set_builtin(&obj, "__nf_minfrac", Value::Num(digits.min_frac as f64));
-    set_builtin(&obj, "__nf_maxfrac", Value::Num(digits.max_frac as f64));
-    if let Some(v) = digits.min_sig {
-        set_builtin(&obj, "__nf_minsig", Value::Num(v as f64));
-    }
-    if let Some(v) = digits.max_sig {
-        set_builtin(&obj, "__nf_maxsig", Value::Num(v as f64));
-    }
-    set_builtin(&obj, "__nf_notation", Value::from_string(notation));
     set_builtin(
         &obj,
-        "__nf_compactdisplay",
+        "#\u{0}nf_trailingzero",
+        Value::from_string(trailing_zero),
+    );
+    set_builtin(&obj, "#\u{0}nf_style", Value::from_string(style));
+    if let Some(c) = currency.filter(|_| get_str(&obj, "#\u{0}nf_style") == "currency") {
+        set_builtin(
+            &obj,
+            "#\u{0}nf_currency",
+            Value::from_string(c.to_uppercase()),
+        );
+        set_builtin(
+            &obj,
+            "#\u{0}nf_currencydisplay",
+            Value::from_string(currency_display),
+        );
+        set_builtin(
+            &obj,
+            "#\u{0}nf_currencysign",
+            Value::from_string(currency_sign),
+        );
+    }
+    if let Some(u) = unit {
+        set_builtin(&obj, "#\u{0}nf_unit", Value::from_string(u));
+        set_builtin(
+            &obj,
+            "#\u{0}nf_unitdisplay",
+            Value::from_string(unit_display),
+        );
+    }
+    set_builtin(&obj, "#\u{0}nf_minint", Value::Num(digits.min_int as f64));
+    set_builtin(&obj, "#\u{0}nf_minfrac", Value::Num(digits.min_frac as f64));
+    set_builtin(&obj, "#\u{0}nf_maxfrac", Value::Num(digits.max_frac as f64));
+    if let Some(v) = digits.min_sig {
+        set_builtin(&obj, "#\u{0}nf_minsig", Value::Num(v as f64));
+    }
+    if let Some(v) = digits.max_sig {
+        set_builtin(&obj, "#\u{0}nf_maxsig", Value::Num(v as f64));
+    }
+    set_builtin(&obj, "#\u{0}nf_notation", Value::from_string(notation));
+    set_builtin(
+        &obj,
+        "#\u{0}nf_compactdisplay",
         Value::from_string(compact_display),
     );
-    set_builtin(&obj, "__nf_grouping", use_grouping);
-    set_builtin(&obj, "__nf_signdisplay", Value::from_string(sign_display));
-    set_builtin(&obj, "__nf_roundingmode", Value::from_string(rounding_mode));
-    set_builtin(&obj, "__nf_roundingtype", Value::str(digits.rounding_type));
+    set_builtin(&obj, "#\u{0}nf_grouping", use_grouping);
+    set_builtin(
+        &obj,
+        "#\u{0}nf_signdisplay",
+        Value::from_string(sign_display),
+    );
+    set_builtin(
+        &obj,
+        "#\u{0}nf_roundingmode",
+        Value::from_string(rounding_mode),
+    );
+    set_builtin(
+        &obj,
+        "#\u{0}nf_roundingtype",
+        Value::str(digits.rounding_type),
+    );
     // Legacy "ChainNumberFormat" (see datetimeformat.rs).
     if !i.constructing {
         if let Some(chained) = crate::intl::legacy_chain(i, &t, "Intl.NumberFormat", &obj) {
@@ -659,12 +692,12 @@ fn is_well_formed_unit(u: &str) -> bool {
 // ---- formatting ------------------------------------------------------------------------------
 
 fn instance(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
-    brand_slot(i, this, "__nf")
+    brand_slot(i, this, "#\u{0}nf")
 }
 
 /// UnwrapNumberFormat: like `instance`, but follows a legacy chained receiver.
 fn instance_unwrap(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
-    crate::intl::brand_slot_legacy(i, this, "__nf", "Intl.NumberFormat")
+    crate::intl::brand_slot_legacy(i, this, "#\u{0}nf", "Intl.NumberFormat")
 }
 
 fn get_str(o: &Gc, k: &str) -> String {
@@ -675,7 +708,7 @@ fn get_str(o: &Gc, k: &str) -> String {
 }
 
 fn cldr_number_locale(o: &Gc) -> &'static str {
-    let locale = get_str(o, "__nf_locale");
+    let locale = get_str(o, "#\u{0}nf_locale");
     let mut parts = locale.split('-');
     let lang = parts.next().unwrap_or("en");
     let mut script = "";
@@ -698,7 +731,7 @@ fn cldr_number_locale(o: &Gc) -> &'static str {
 }
 
 fn cldr_number_symbols(o: &Gc) -> crate::cldr_numbers::Symbols {
-    crate::cldr_numbers::symbols(cldr_number_locale(o), &get_str(o, "__nf_nu"))
+    crate::cldr_numbers::symbols(cldr_number_locale(o), &get_str(o, "#\u{0}nf_nu"))
 }
 
 fn get_num(o: &Gc, k: &str) -> Option<u32> {
@@ -710,16 +743,16 @@ fn get_num(o: &Gc, k: &str) -> Option<u32> {
 
 /// Produce (sign_is_negative, digit-string) for |x| per digit options.
 fn format_magnitude(x: f64, o: &Gc) -> String {
-    let min_int = get_num(o, "__nf_minint").unwrap_or(1);
-    let min_frac = get_num(o, "__nf_minfrac").unwrap_or(0);
-    let max_frac = get_num(o, "__nf_maxfrac").unwrap_or(0);
-    let min_sig = get_num(o, "__nf_minsig");
-    let max_sig = get_num(o, "__nf_maxsig");
+    let min_int = get_num(o, "#\u{0}nf_minint").unwrap_or(1);
+    let min_frac = get_num(o, "#\u{0}nf_minfrac").unwrap_or(0);
+    let max_frac = get_num(o, "#\u{0}nf_maxfrac").unwrap_or(0);
+    let min_sig = get_num(o, "#\u{0}nf_minsig");
+    let max_sig = get_num(o, "#\u{0}nf_maxsig");
 
-    let increment = get_num(o, "__nf_roundingincrement").unwrap_or(1);
-    let mode = get_str(o, "__nf_roundingmode");
+    let increment = get_num(o, "#\u{0}nf_roundingincrement").unwrap_or(1);
+    let mode = get_str(o, "#\u{0}nf_roundingmode");
     let mode = if mode.is_empty() { "halfExpand" } else { &mode };
-    let rtype = get_str(o, "__nf_roundingtype");
+    let rtype = get_str(o, "#\u{0}nf_roundingtype");
     format_magnitude_options(
         x, min_int, min_frac, max_frac, min_sig, max_sig, increment, mode, &rtype,
     )
@@ -1139,14 +1172,14 @@ fn shift_exact(ed: &ExactDec, places: i32) -> ExactDec {
 fn exact_magnitude(ed: &ExactDec, o: &Gc) -> Option<String> {
     exact_magnitude_options(
         ed,
-        get_num(o, "__nf_minint").unwrap_or(1),
-        get_num(o, "__nf_minfrac").unwrap_or(0),
-        get_num(o, "__nf_maxfrac").unwrap_or(3),
-        get_num(o, "__nf_minsig"),
-        get_num(o, "__nf_maxsig"),
-        get_num(o, "__nf_roundingincrement").unwrap_or(1),
-        &get_str(o, "__nf_roundingmode"),
-        &get_str(o, "__nf_roundingtype"),
+        get_num(o, "#\u{0}nf_minint").unwrap_or(1),
+        get_num(o, "#\u{0}nf_minfrac").unwrap_or(0),
+        get_num(o, "#\u{0}nf_maxfrac").unwrap_or(3),
+        get_num(o, "#\u{0}nf_minsig"),
+        get_num(o, "#\u{0}nf_maxsig"),
+        get_num(o, "#\u{0}nf_roundingincrement").unwrap_or(1),
+        &get_str(o, "#\u{0}nf_roundingmode"),
+        &get_str(o, "#\u{0}nf_roundingtype"),
         "standard",
     )
 }
@@ -1298,9 +1331,9 @@ fn assemble_number_exact(
     x: f64,
     exact: Option<ExactDec>,
 ) -> FormattedNumber {
-    let style = get_str(o, "__nf_style");
+    let style = get_str(o, "#\u{0}nf_style");
     let cldr_locale = cldr_number_locale(o);
-    let number_system = get_str(o, "__nf_nu");
+    let number_system = get_str(o, "#\u{0}nf_nu");
     let symbols = crate::cldr_numbers::symbols(cldr_locale, &number_system);
     let mut value = x;
     let mut exact = exact;
@@ -1314,7 +1347,7 @@ fn assemble_number_exact(
         .map(|decimal| decimal.negative)
         .unwrap_or_else(|| value.is_sign_negative() && !value.is_nan());
     // scientific / engineering notation: mantissa in [1,10) or [1,1000), plus an exponent.
-    let notation = get_str(o, "__nf_notation");
+    let notation = get_str(o, "#\u{0}nf_notation");
     let mut exponent: Option<i32> = None;
     if (notation == "scientific" || notation == "engineering")
         && exact.as_ref().is_some_and(|decimal| !exact_zero(decimal))
@@ -1364,7 +1397,7 @@ fn assemble_number_exact(
                     0
                 }
             });
-        let display = get_str(o, "__nf_compactdisplay");
+        let display = get_str(o, "#\u{0}nf_compactdisplay");
         if let Some(pattern) = crate::cldr_numbers::compact(
             cldr_locale,
             &number_system,
@@ -1392,7 +1425,7 @@ fn assemble_number_exact(
     } else {
         // Compact notation rounds with the default "morePrecision" of 2 significant / 0 fraction
         // digits: keep max(0, 2 - integerDigits) fraction digits (unless digit options were given).
-        let has_sig = o.borrow().props.contains("__nf_minsig");
+        let has_sig = o.borrow().props.contains("#\u{0}nf_minsig");
         let mag = if let Some(magnitude) = exact.as_ref().and_then(|ed| exact_magnitude(ed, o)) {
             magnitude
         } else if compact.is_some() && !has_sig {
@@ -1432,7 +1465,7 @@ fn assemble_number_exact(
             if let Some(next) = crate::cldr_numbers::compact(
                 cldr_locale,
                 &number_system,
-                &get_str(o, "__nf_compactdisplay"),
+                &get_str(o, "#\u{0}nf_compactdisplay"),
                 next_magnitude,
                 "other",
                 false,
@@ -1449,7 +1482,7 @@ fn assemble_number_exact(
                     .and_then(|decimal| exact_magnitude(decimal, o))
                 {
                     magnitude
-                } else if o.borrow().props.contains("__nf_minsig") {
+                } else if o.borrow().props.contains("#\u{0}nf_minsig") {
                     format_magnitude(value, o)
                 } else {
                     let fraction = round_fraction_dec(value.abs(), 0, 0, 1, "halfExpand");
@@ -1484,7 +1517,7 @@ fn assemble_number_exact(
     let grouping = o
         .borrow()
         .props
-        .get("__nf_grouping")
+        .get("#\u{0}nf_grouping")
         .map(|p| p.value())
         .unwrap_or(Value::str("auto"));
     // Grouping is suppressed in scientific/engineering notation.
@@ -1529,7 +1562,7 @@ fn assemble_number_exact(
         let selected = crate::cldr_numbers::compact(
             cldr_locale,
             &number_system,
-            &get_str(o, "__nf_compactdisplay"),
+            &get_str(o, "#\u{0}nf_compactdisplay"),
             magnitude,
             category,
             exact_one,
@@ -1544,7 +1577,7 @@ fn assemble_number_exact(
 
     // Sign display. `auto`/`always` key off the sign bit (so -0 and values rounding to zero still
     // show "-0"); `exceptZero`/`negative` suppress the sign when the displayed value is zero or NaN.
-    let sign_display = get_str(o, "__nf_signdisplay");
+    let sign_display = get_str(o, "#\u{0}nf_signdisplay");
     let zeroish = rounded_zero || value.is_nan();
     let sign = match sign_display.as_str() {
         "never" => 0,
@@ -1603,8 +1636,8 @@ fn assemble_number_exact(
             );
         }
         "currency" => {
-            let code = get_str(o, "__nf_currency");
-            let display = get_str(o, "__nf_currencydisplay");
+            let code = get_str(o, "#\u{0}nf_currency");
+            let display = get_str(o, "#\u{0}nf_currencydisplay");
             let category =
                 quantity_plural_category(o_lang(o), &rounded, quantity_exponent, compact_exponent);
             let currency = crate::cldr_numbers::currency(cldr_locale, &code, category);
@@ -1626,7 +1659,7 @@ fn assemble_number_exact(
                     "narrowSymbol" => currency.map(|value| value.narrow).unwrap_or(&code),
                     _ => currency.map(|value| value.symbol).unwrap_or(&code),
                 };
-                let accounting = get_str(o, "__nf_currencysign") == "accounting";
+                let accounting = get_str(o, "#\u{0}nf_currencysign") == "accounting";
                 let base_kind = if accounting { "accounting" } else { "currency" };
                 let base_pattern =
                     crate::cldr_numbers::pattern(cldr_locale, &number_system, base_kind);
@@ -1670,8 +1703,8 @@ fn assemble_number_exact(
             num = match unit_pattern.as_deref() {
                 Some(p) => p.replace("{0}", &signed),
                 None => {
-                    let unit = get_str(o, "__nf_unit");
-                    let disp = get_str(o, "__nf_unitdisplay");
+                    let unit = get_str(o, "#\u{0}nf_unit");
+                    let disp = get_str(o, "#\u{0}nf_unitdisplay");
                     unit_wrap(&signed, &unit, &disp, category != "one")
                 }
             };
@@ -1829,17 +1862,17 @@ fn format_number(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value
     let s = assemble_number_exact(i, &o, n, exact_of(x)).text;
     Ok(Value::from_string(xlate_digits(
         &s,
-        &get_str(&o, "__nf_nu"),
+        &get_str(&o, "#\u{0}nf_nu"),
     )))
 }
 
 /// The trailing-affix classification for this formatter's parts (compact suffix vs plain).
 fn suffix_type_of(o: &Gc) -> String {
-    if get_str(o, "__nf_style") == "unit" {
+    if get_str(o, "#\u{0}nf_style") == "unit" {
         "unit".to_string()
-    } else if get_str(o, "__nf_style") == "currency" {
+    } else if get_str(o, "#\u{0}nf_style") == "currency" {
         "currency".to_string()
-    } else if get_str(o, "__nf_notation") == "compact" {
+    } else if get_str(o, "#\u{0}nf_notation") == "compact" {
         "compact".to_string()
     } else {
         "literal".to_string()
@@ -1861,11 +1894,11 @@ fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Val
         text: whole,
         unit_pattern,
     } = assemble_number_exact(i, &o, n, exact_of(x));
-    let nu = get_str(&o, "__nf_nu");
+    let nu = get_str(&o, "#\u{0}nf_nu");
     let symbols = cldr_number_symbols(&o);
     // Unit style: rebuild from the CLDR pattern so a unit prefix/suffix (e.g. ko "시속 {0}킬로미터")
     // is tagged as unit/literal around the number's own parts.
-    let parts = if get_str(&o, "__nf_style") == "unit" {
+    let parts = if get_str(&o, "#\u{0}nf_style") == "unit" {
         if let Some(pat) = unit_pattern {
             if !pat.contains("{0}") {
                 vec![("unit", whole)]
@@ -1915,8 +1948,8 @@ fn o_lang(o: &Gc) -> &'static str {
 /// The CLDR unit-display pattern ("{0} km/h") for the already-selected plural
 /// category; zh is split by script and en-IN has region-specific patterns.
 fn unit_pattern_for_category(o: &Gc, category: &str) -> Option<String> {
-    let unit = get_str(o, "__nf_unit");
-    let disp = get_str(o, "__nf_unitdisplay");
+    let unit = get_str(o, "#\u{0}nf_unit");
+    let disp = get_str(o, "#\u{0}nf_unitdisplay");
     let style = if disp.is_empty() {
         "short"
     } else {
@@ -2178,27 +2211,27 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         }
         let _ = i;
     };
-    put(i, &res, "locale", "__nf_locale");
-    put(i, &res, "numberingSystem", "__nf_nu");
-    put(i, &res, "style", "__nf_style");
-    put(i, &res, "currency", "__nf_currency");
-    put(i, &res, "currencyDisplay", "__nf_currencydisplay");
-    put(i, &res, "currencySign", "__nf_currencysign");
-    put(i, &res, "unit", "__nf_unit");
-    put(i, &res, "unitDisplay", "__nf_unitdisplay");
-    put(i, &res, "minimumIntegerDigits", "__nf_minint");
+    put(i, &res, "locale", "#\u{0}nf_locale");
+    put(i, &res, "numberingSystem", "#\u{0}nf_nu");
+    put(i, &res, "style", "#\u{0}nf_style");
+    put(i, &res, "currency", "#\u{0}nf_currency");
+    put(i, &res, "currencyDisplay", "#\u{0}nf_currencydisplay");
+    put(i, &res, "currencySign", "#\u{0}nf_currencysign");
+    put(i, &res, "unit", "#\u{0}nf_unit");
+    put(i, &res, "unitDisplay", "#\u{0}nf_unitdisplay");
+    put(i, &res, "minimumIntegerDigits", "#\u{0}nf_minint");
     {
         // Spec key order: fraction digits, then significant digits. Under a *Precision rounding
         // type (e.g. the compact-notation default) BOTH pairs are present.
-        let rtype = get_str(&o, "__nf_roundingtype");
-        let has_sig = o.borrow().props.contains("__nf_minsig");
+        let rtype = get_str(&o, "#\u{0}nf_roundingtype");
+        let has_sig = o.borrow().props.contains("#\u{0}nf_minsig");
         if !has_sig || rtype.contains("Precision") {
-            put(i, &res, "minimumFractionDigits", "__nf_minfrac");
-            put(i, &res, "maximumFractionDigits", "__nf_maxfrac");
+            put(i, &res, "minimumFractionDigits", "#\u{0}nf_minfrac");
+            put(i, &res, "maximumFractionDigits", "#\u{0}nf_maxfrac");
         }
         if has_sig {
-            put(i, &res, "minimumSignificantDigits", "__nf_minsig");
-            put(i, &res, "maximumSignificantDigits", "__nf_maxsig");
+            put(i, &res, "minimumSignificantDigits", "#\u{0}nf_minsig");
+            put(i, &res, "maximumSignificantDigits", "#\u{0}nf_maxsig");
         }
     }
     // useGrouping/notation/compactDisplay/signDisplay precede the rounding options in key order.
@@ -2207,21 +2240,21 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         "useGrouping",
         o.borrow()
             .props
-            .get("__nf_grouping")
+            .get("#\u{0}nf_grouping")
             .map(|p| p.value())
             .unwrap_or(Value::str("auto")),
     );
-    put(i, &res, "notation", "__nf_notation");
+    put(i, &res, "notation", "#\u{0}nf_notation");
     // compactDisplay only appears when notation is compact.
-    if matches!(o.borrow().props.get("__nf_notation").map(|p| p.value()), Some(Value::Str(s)) if &*s == "compact")
+    if matches!(o.borrow().props.get("#\u{0}nf_notation").map(|p| p.value()), Some(Value::Str(s)) if &*s == "compact")
     {
-        put(i, &res, "compactDisplay", "__nf_compactdisplay");
+        put(i, &res, "compactDisplay", "#\u{0}nf_compactdisplay");
     }
-    put(i, &res, "signDisplay", "__nf_signdisplay");
-    put(i, &res, "roundingIncrement", "__nf_roundingincrement");
-    put(i, &res, "roundingMode", "__nf_roundingmode");
-    put(i, &res, "roundingPriority", "__nf_roundingpriority");
-    put(i, &res, "trailingZeroDisplay", "__nf_trailingzero");
+    put(i, &res, "signDisplay", "#\u{0}nf_signdisplay");
+    put(i, &res, "roundingIncrement", "#\u{0}nf_roundingincrement");
+    put(i, &res, "roundingMode", "#\u{0}nf_roundingmode");
+    put(i, &res, "roundingPriority", "#\u{0}nf_roundingpriority");
+    put(i, &res, "trailingZeroDisplay", "#\u{0}nf_trailingzero");
     Ok(Value::Obj(res))
 }
 

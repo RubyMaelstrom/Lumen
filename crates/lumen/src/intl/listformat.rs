@@ -54,10 +54,10 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.ListFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "__lf", Value::Bool(true));
-    set_builtin(&obj, "__lf_locale", Value::from_string(resolved.locale));
-    set_builtin(&obj, "__lf_type", Value::from_string(kind));
-    set_builtin(&obj, "__lf_style", Value::from_string(style));
+    set_builtin(&obj, "#\u{0}lf", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}lf_locale", Value::from_string(resolved.locale));
+    set_builtin(&obj, "#\u{0}lf_type", Value::from_string(kind));
+    set_builtin(&obj, "#\u{0}lf_style", Value::from_string(style));
     Ok(Value::Obj(obj))
 }
 
@@ -175,12 +175,16 @@ fn assemble_segments(parts: &[String], patterns: [&'static str; 4], lang: &str) 
 }
 
 fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "__lf")?;
+    let o = brand_slot(i, this, "#\u{0}lf")?;
     let get = |k: &str| match o.borrow().props.get(k).map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => String::new(),
     };
-    let (locale, kind, style) = (get("__lf_locale"), get("__lf_type"), get("__lf_style"));
+    let (locale, kind, style) = (
+        get("#\u{0}lf_locale"),
+        get("#\u{0}lf_type"),
+        get("#\u{0}lf_style"),
+    );
     let lang = locale.split('-').next().unwrap_or("en");
     let parts = string_list(i, list)?;
     let patterns = crate::cldr_lists::patterns(lang, &kind, &style);
@@ -204,7 +208,7 @@ fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let o = brand_slot(i, &this, "__lf")?;
+    let o = brand_slot(i, &this, "#\u{0}lf")?;
     let get = |k: &str| {
         o.borrow()
             .props
@@ -213,8 +217,8 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
             .unwrap_or(Value::Undefined)
     };
     let res = i.new_object();
-    set_data(&res, "locale", get("__lf_locale"));
-    set_data(&res, "type", get("__lf_type"));
-    set_data(&res, "style", get("__lf_style"));
+    set_data(&res, "locale", get("#\u{0}lf_locale"));
+    set_data(&res, "type", get("#\u{0}lf_type"));
+    set_data(&res, "style", get("#\u{0}lf_style"));
     Ok(Value::Obj(res))
 }

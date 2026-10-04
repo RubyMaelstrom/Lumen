@@ -8642,12 +8642,12 @@ fn dec_add_initializer(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
 /// The resolver pair's shared [[AlreadyResolved]] cell (`args[0]`): true (and mark) on first use.
 fn promise_mark_already(flag: &Value) -> bool {
     if let Value::Obj(o) = flag {
-        let used = o.borrow().props.contains("__called");
+        let used = o.borrow().props.contains("#\u{0}called");
         if used {
             return false;
         }
         o.borrow_mut().props.insert(
-            "__called",
+            "#\u{0}called",
             crate::value::Property::data(Value::Bool(true), true, false, true),
         );
         return true;

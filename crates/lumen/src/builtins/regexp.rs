@@ -547,20 +547,20 @@ macro_rules! legacy_getter {
         }
     };
 }
-legacy_getter!(lg_input, "__legacy_input");
-legacy_getter!(lg_last_match, "__legacy_lastMatch");
-legacy_getter!(lg_last_paren, "__legacy_lastParen");
-legacy_getter!(lg_left, "__legacy_leftContext");
-legacy_getter!(lg_right, "__legacy_rightContext");
-legacy_getter!(lg_d1, "__legacy_$1");
-legacy_getter!(lg_d2, "__legacy_$2");
-legacy_getter!(lg_d3, "__legacy_$3");
-legacy_getter!(lg_d4, "__legacy_$4");
-legacy_getter!(lg_d5, "__legacy_$5");
-legacy_getter!(lg_d6, "__legacy_$6");
-legacy_getter!(lg_d7, "__legacy_$7");
-legacy_getter!(lg_d8, "__legacy_$8");
-legacy_getter!(lg_d9, "__legacy_$9");
+legacy_getter!(lg_input, "#\u{0}legacy_input");
+legacy_getter!(lg_last_match, "#\u{0}legacy_lastMatch");
+legacy_getter!(lg_last_paren, "#\u{0}legacy_lastParen");
+legacy_getter!(lg_left, "#\u{0}legacy_leftContext");
+legacy_getter!(lg_right, "#\u{0}legacy_rightContext");
+legacy_getter!(lg_d1, "#\u{0}legacy_$1");
+legacy_getter!(lg_d2, "#\u{0}legacy_$2");
+legacy_getter!(lg_d3, "#\u{0}legacy_$3");
+legacy_getter!(lg_d4, "#\u{0}legacy_$4");
+legacy_getter!(lg_d5, "#\u{0}legacy_$5");
+legacy_getter!(lg_d6, "#\u{0}legacy_$6");
+legacy_getter!(lg_d7, "#\u{0}legacy_$7");
+legacy_getter!(lg_d8, "#\u{0}legacy_$8");
+legacy_getter!(lg_d9, "#\u{0}legacy_$9");
 
 fn lg_set_input(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     regexp_legacy_brand(i, &this)?;
@@ -569,7 +569,7 @@ fn lg_set_input(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value
     // Materialize any deferred match first so this write isn't later clobbered by its flush.
     super::flush_regexp_legacy(i);
     c.borrow_mut().props.insert(
-        "__legacy_input",
+        "#\u{0}legacy_input",
         Property::data(Value::Str(v), true, false, false),
     );
     Ok(Value::Undefined)
