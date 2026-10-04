@@ -45,6 +45,8 @@ mod ast;
 mod bigint;
 #[cfg(test)]
 mod binding_reference_tests;
+#[cfg(test)]
+mod bootstrap_operation_tests;
 mod builtins;
 pub mod bytecode;
 mod cache;

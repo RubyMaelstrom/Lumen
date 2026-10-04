@@ -10765,6 +10765,28 @@ impl Compiler {
         locals
     }
 
+    /// The slot locals a retained expression can observe, projected into its evaluation
+    /// scope and written back afterwards. Only identifier references outside every nested
+    /// function can reach a slot: CaptureScan homes any depth-0 binding that a function,
+    /// arrow, method or field initializer names in the activation, never in a slot. Projecting
+    /// only those references keeps every visible binding while avoiding a full copy of a
+    /// large function's locals for each retained class (platform bootstraps evaluate hundreds).
+    /// A direct eval can name any binding, so it keeps the complete projection.
+    fn retained_expr_locals(&self, expr: &Expr) -> Vec<AssignmentLocal> {
+        let locals = self.projected_locals();
+        if self.direct_eval {
+            return locals;
+        }
+        let mut names = crate::fasthash::FastSet::default();
+        if !retained_expr_names(expr, &mut names) {
+            return locals;
+        }
+        locals
+            .into_iter()
+            .filter(|local| names.contains(&*local.name))
+            .collect()
+    }
+
     fn retain_eval_expr(&mut self, expr: &Expr) -> CResult {
         self.retain_named_eval_expr(expr, None)
     }
@@ -10790,7 +10812,7 @@ impl Compiler {
         let plan = self.eval_exprs.len() as u32;
         self.eval_exprs.push(EvalExprPlan {
             expr: expr.clone(),
-            locals: self.projected_locals(),
+            locals: self.retained_expr_locals(expr),
             strict: self.strict,
             name: name.map(str::to_string),
         });
@@ -14121,6 +14143,109 @@ fn eval_expr_with_slots<S: StoredValue>(
         );
     }
     result
+}
+
+/// Collect the identifiers `e` references outside nested function bodies (see
+/// `Compiler::retained_expr_locals`). Returns false for a direct `eval` call, which can name
+/// any binding. Field initializers are scanned too although they run as methods; that only
+/// over-approximates. The match is exhaustive so a new expression form must decide here.
+fn retained_expr_names(e: &Expr, out: &mut crate::fasthash::FastSet<String>) -> bool {
+    fn elems(items: &[crate::ast::ArrayElem], out: &mut crate::fasthash::FastSet<String>) -> bool {
+        items.iter().all(|item| match item {
+            crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => {
+                retained_expr_names(e, out)
+            }
+            crate::ast::ArrayElem::Hole => true,
+        })
+    }
+    fn key(k: &PropKey, out: &mut crate::fasthash::FastSet<String>) -> bool {
+        match k {
+            PropKey::Computed(e) => retained_expr_names(e, out),
+            PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_) => true,
+        }
+    }
+    match e {
+        Expr::Ident(name) => {
+            out.insert(name.clone());
+            true
+        }
+        Expr::Num(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::This
+        | Expr::Super
+        | Expr::Regex { .. }
+        | Expr::ImportMeta
+        | Expr::NewTarget
+        // Function bodies (arrows included) reach outer locals only through captures.
+        | Expr::Func(_) => true,
+        Expr::Paren(inner) | Expr::ToStr(inner) | Expr::Await(inner) | Expr::OptionalChain(inner) => {
+            retained_expr_names(inner, out)
+        }
+        Expr::Array(items) => elems(items, out),
+        Expr::Object(props) => props.iter().all(|p| match p {
+            PropDef::KeyValue { key: k, value } | PropDef::Cover { key: k, value } => {
+                key(k, out) && retained_expr_names(value, out)
+            }
+            PropDef::Method { key: k, .. }
+            | PropDef::Getter { key: k, .. }
+            | PropDef::Setter { key: k, .. } => key(k, out),
+            PropDef::Spread(e) | PropDef::Proto(e) => retained_expr_names(e, out),
+        }),
+        Expr::Class(class) => {
+            if let Some(name) = &class.name {
+                out.insert(name.clone());
+            }
+            class.decorators.iter().all(|d| retained_expr_names(d, out))
+                && class
+                    .superclass
+                    .as_ref()
+                    .is_none_or(|heritage| retained_expr_names(heritage, out))
+                && class.members.iter().all(|member| {
+                    key(&member.key, out)
+                        && member.decorators.iter().all(|d| retained_expr_names(d, out))
+                        && member
+                            .value
+                            .as_ref()
+                            .is_none_or(|value| retained_expr_names(value, out))
+                })
+        }
+        Expr::Yield { arg, .. } => arg.as_ref().is_none_or(|a| retained_expr_names(a, out)),
+        Expr::Unary { arg, .. } | Expr::Update { arg, .. } => retained_expr_names(arg, out),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            retained_expr_names(left, out) && retained_expr_names(right, out)
+        }
+        Expr::Assign { target, value, .. } => {
+            retained_expr_names(target, out) && retained_expr_names(value, out)
+        }
+        Expr::Cond { test, cons, alt } => {
+            retained_expr_names(test, out)
+                && retained_expr_names(cons, out)
+                && retained_expr_names(alt, out)
+        }
+        Expr::Call { callee, args, .. } => {
+            !matches!(&**callee, Expr::Ident(name) if name == "eval")
+                && retained_expr_names(callee, out)
+                && elems(args, out)
+        }
+        Expr::New { callee, args } => retained_expr_names(callee, out) && elems(args, out),
+        Expr::Member { obj, .. } => retained_expr_names(obj, out),
+        Expr::Index { obj, index, .. } => {
+            retained_expr_names(obj, out) && retained_expr_names(index, out)
+        }
+        Expr::Seq(items) => items.iter().all(|e| retained_expr_names(e, out)),
+        Expr::TaggedTemplate { tag, subs, .. } => {
+            retained_expr_names(tag, out) && subs.iter().all(|e| retained_expr_names(e, out))
+        }
+        Expr::PrivateIn { obj, .. } => retained_expr_names(obj, out),
+        Expr::ImportCall { spec, options, .. } => {
+            retained_expr_names(spec, out)
+                && options.as_ref().is_none_or(|o| retained_expr_names(o, out))
+        }
+    }
 }
 
 fn rejected_intrinsic_promise(i: &mut Interp, reason: Value) -> Value {
