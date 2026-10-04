@@ -64,6 +64,13 @@ The default tier is JIT. Useful diagnostic controls:
   calls in line). It is a code-size/performance ablation with the same behavior.
 - `LUMEN_JIT_NO_JSCVT=1` makes ARM64 code use the portable guarded ToInt32 sequence even
   when the CPU implements FEAT_JSCVT (`fjcvtzs`).
+- `LUMEN_TAIL_CALL_DEPTH=N` sets the execution-context depth below which a strict
+  tail call runs as an ordinary call (default 1024); at or past it the call is staged as a
+  proper tail call, so unbounded tail recursion stays bounded. `0` stages every tail call.
+- `LUMEN_JIT_HOT_LOOP_OPS=N` changes the 512-op bound on loops that keep ARM64 name checks
+  and direct-call sequences in line; larger (flattened dispatch) loops use shared stubs.
+- `LUMEN_JIT_CHUNK_STUBS=1` gives each ARM64 chunk its own copy of the shared stubs instead
+  of veneers to the process-wide stub table. It is a code-size ablation with the same behavior.
 - `LUMEN_TIER_LOG=1` helps diagnose compilation bailouts.
 - On GNU/Linux, `LUMEN_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
