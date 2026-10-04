@@ -1081,9 +1081,11 @@ fn retained_str_units_bytes(
 
 /// Raw state of the last successful regex match, deferred for the legacy `RegExp.$1` statics.
 /// `ctor` is the %RegExp% constructor the statics belong to (the realm active at match time).
+/// It is weak: a pending match must not keep that constructor's Realm alive, and once the
+/// Realm is gone its statics can no longer be observed.
 #[derive(Clone)]
 pub(crate) struct RegexpLastMatch {
-    pub ctor: Gc,
+    pub ctor: std::rc::Weak<RefCell<crate::value::Object>>,
     pub input: crate::lstr::LStr,
     pub text: Rc<crate::regex::ReText>,
     pub caps: Vec<Option<(usize, usize)>>,

@@ -395,3 +395,40 @@ fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
         }
     }
 }
+
+/// The legacy `RegExp.$1` statics are recorded lazily against the matching Realm's %RegExp%.
+/// That pending record must not keep the Realm alive: a dropped Realm whose code ran the last
+/// regular expression is collected, and the statics of live Realms are unaffected.
+#[test]
+fn a_dropped_realm_that_ran_the_last_regexp_is_collected() {
+    for tier in TIERS {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        assert_eq!(eval_string(it, "/(b)c/.exec('abcd'); RegExp.$1"), "b");
+        let child = it.create_realm();
+        let Value::Obj(global) = &child else {
+            unreachable!()
+        };
+        let address = Rc::as_ptr(global) as usize;
+        let child_statics = in_realm(it, &child, |it| {
+            eval_string(
+                it,
+                "(function () { let n = 0; for (let i = 0; i < 300; i++) n += /(x+)y/.test('axxy'); \
+                 return n + ':' + RegExp.$1 + ':' + RegExp.lastMatch; })()",
+            )
+        });
+        assert_eq!(child_statics, "300:xx:xxy", "{tier:?}");
+        // The child ran the most recent match, so its %RegExp% holds the pending statics.
+        in_realm(it, &child, |it| {
+            assert_eq!(eval_string(it, "/(q)/.test('q') && typeof RegExp"), "function");
+        });
+        drop(child);
+        it.gc_collect();
+        assert!(
+            !it.realms.contains_key(&address),
+            "{tier:?}: the Realm of the last regexp match is still live"
+        );
+        assert_eq!(eval_string(it, "RegExp.$1 + RegExp.lastMatch"), "bbc", "{tier:?}");
+    }
+}

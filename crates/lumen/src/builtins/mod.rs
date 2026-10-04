@@ -2886,14 +2886,14 @@ fn update_regexp_legacy_statics(
         None => return,
     };
     if let Some(prev) = &i.regexp_last {
-        if !Rc::ptr_eq(&prev.ctor, &ctor) {
+        if prev.ctor.as_ptr() != Rc::as_ptr(&ctor) {
             flush_regexp_legacy(i);
         }
     }
     if let Some(previous) = i
         .regexp_last
         .as_mut()
-        .filter(|previous| Rc::ptr_eq(&previous.ctor, &ctor))
+        .filter(|previous| previous.ctor.as_ptr() == Rc::as_ptr(&ctor))
     {
         previous.input = input.clone();
         previous.text = text.clone();
@@ -2904,7 +2904,7 @@ fn update_regexp_legacy_statics(
         return;
     }
     i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
-        ctor,
+        ctor: Rc::downgrade(&ctor),
         input: input.clone(),
         text: text.clone(),
         caps: caps.to_vec(),
@@ -2926,14 +2926,14 @@ fn update_regexp_legacy_statics_lazy(
         None => return,
     };
     if let Some(prev) = &i.regexp_last {
-        if !Rc::ptr_eq(&prev.ctor, &ctor) {
+        if prev.ctor.as_ptr() != Rc::as_ptr(&ctor) {
             flush_regexp_legacy(i);
         }
     }
     if let Some(previous) = i
         .regexp_last
         .as_mut()
-        .filter(|previous| Rc::ptr_eq(&previous.ctor, &ctor))
+        .filter(|previous| previous.ctor.as_ptr() == Rc::as_ptr(&ctor))
     {
         previous.input = input.clone();
         previous.text = text.clone();
@@ -2944,7 +2944,7 @@ fn update_regexp_legacy_statics_lazy(
         return;
     }
     i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
-        ctor,
+        ctor: Rc::downgrade(&ctor),
         input: input.clone(),
         text: text.clone(),
         caps: vec![Some(whole)],
@@ -2959,6 +2959,10 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
     let Some(mut m) = i.regexp_last.take() else {
         return;
     };
+    // The constructor's Realm was collected: nothing can observe its statics.
+    let Some(ctor) = m.ctor.upgrade() else {
+        return;
+    };
     if let Some((re, start)) = m.lazy_captures.take() {
         let matched = regexp_exec_text_shared(i, &re, &m.text, start);
         if let Ok(Some(captures)) = matched {
@@ -2966,7 +2970,7 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
             m.caps.extend_from_slice(&captures);
         }
     }
-    let (caps, text, ctor) = (&m.caps, &m.text, &m.ctor);
+    let (caps, text, ctor) = (&m.caps, &m.text, &ctor);
     let put = |k: &'static str, v: String| {
         ctor.borrow_mut()
             .props
