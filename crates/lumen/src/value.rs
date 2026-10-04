@@ -3814,7 +3814,7 @@ mod key_interning_tests {
     use super::*;
 
     #[test]
-    fn integer_key_text_matches_number_to_string() {
+    fn key_text_matches_number_to_string_and_symbol_keys() {
         for (n, text) in [
             (0.0, "0"),
             (-0.0, "0"),
@@ -3825,7 +3825,7 @@ mod key_interning_tests {
             (-9007199254740991.0, "-9007199254740991"),
         ] {
             assert_eq!(
-                IntegerKeyText::new(n)
+                KeyText::integer(n)
                     .map(|t| t.as_str().to_owned())
                     .as_deref(),
                 Some(text)
@@ -3840,7 +3840,10 @@ mod key_interning_tests {
             9007199254740992.0,
             1e21,
         ] {
-            assert!(IntegerKeyText::new(n).is_none(), "{n}");
+            assert!(KeyText::integer(n).is_none(), "{n}");
+        }
+        for id in [0, 7, 1234, u64::MAX] {
+            assert_eq!(KeyText::symbol(id).as_str(), format!("\u{0}{id}"));
         }
     }
 
@@ -3885,45 +3888,57 @@ mod key_interning_tests {
     }
 }
 
-/// The decimal text of an integral Number, formatted on the stack: what ToString (and so
-/// ToPropertyKey) produces for it. Only exact integers below 2^53 in magnitude qualify (their
-/// text has no exponent or fraction); `-0` is `"0"`. Lets computed member accesses with a
-/// Number key build their key without a temporary string allocation.
-pub(crate) struct IntegerKeyText {
-    bytes: [u8; 20],
+/// A property key's text formatted on the stack, for computed member accesses whose key needs
+/// no owned string: an integral Number's ToString, or a Symbol's internal encoded key.
+pub(crate) struct KeyText {
+    bytes: [u8; 24],
     start: u8,
 }
 
-impl IntegerKeyText {
-    pub(crate) fn new(n: f64) -> Option<IntegerKeyText> {
+impl KeyText {
+    /// The decimal text of an integral Number: what ToString (and so ToPropertyKey) produces
+    /// for it. Only exact integers below 2^53 in magnitude qualify (their text has no exponent
+    /// or fraction); `-0` is `"0"`.
+    pub(crate) fn integer(n: f64) -> Option<KeyText> {
         const LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
         if n.abs() >= LIMIT || n.trunc() != n {
             return None;
         }
-        let negative = n < 0.0;
-        let mut magnitude = n.abs() as u64;
-        let mut bytes = [0u8; 20];
+        let mut text = KeyText::digits(n.abs() as u64);
+        if n < 0.0 && text.as_str() != "0" {
+            text.start -= 1;
+            text.bytes[text.start as usize] = b'-';
+        }
+        Some(text)
+    }
+
+    /// The encoded key of the Symbol with this id (see `Interp::sym_key`).
+    pub(crate) fn symbol(id: u64) -> KeyText {
+        let mut text = KeyText::digits(id);
+        text.start -= 1;
+        text.bytes[text.start as usize] = 0;
+        text
+    }
+
+    fn digits(mut value: u64) -> KeyText {
+        let mut bytes = [0u8; 24];
         let mut start = bytes.len();
         loop {
             start -= 1;
-            bytes[start] = b'0' + (magnitude % 10) as u8;
-            magnitude /= 10;
-            if magnitude == 0 {
+            bytes[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
                 break;
             }
         }
-        if negative && !(start == bytes.len() - 1 && bytes[start] == b'0') {
-            start -= 1;
-            bytes[start] = b'-';
-        }
-        Some(IntegerKeyText {
+        KeyText {
             bytes,
             start: start as u8,
-        })
+        }
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        // SAFETY: only ASCII digits and '-' are written from `start` on.
+        // SAFETY: only ASCII digits, '-' and NUL are written from `start` on.
         unsafe { std::str::from_utf8_unchecked(&self.bytes[self.start as usize..]) }
     }
 }

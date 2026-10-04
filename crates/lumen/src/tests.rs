@@ -20042,6 +20042,38 @@ fn cross_realm_calls_keep_shared_intrinsic_tables_exact_across_collections() {
 }
 
 #[test]
+fn computed_symbol_reads_keep_symbol_identity_in_all_tiers() {
+    // ECMA-262 ToPropertyKey of a Symbol is the Symbol itself: ordinary reads find
+    // Symbol-keyed properties and proxy traps receive the same Symbol, snapshot e28783d5fc9d.
+    let source = r#"
+        var s = Symbol("s"), log = [];
+        var o = {[s]: 1, [Symbol.iterator]: 2};
+        var p = new Proxy(o, {get(t, k, r) { log.push(typeof k === "symbol" ? k.toString() : k); return Reflect.get(t, k, r); }});
+        var keys = [s, Symbol.iterator, Symbol("missing"), Symbol.for("reg")];
+        o[Symbol.for("reg")] = 4;
+        var r = keys.map(k => o[k]);
+        var q = keys.map(k => p[k]);
+        var arr = [1, 2, 3]; var it = arr[Symbol.iterator];
+        [r.join(","), q.join(","), log.join(","), typeof it, String(it === Array.prototype.values),
+         "x"[Symbol.iterator] === String.prototype[Symbol.iterator]].join("|")
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "1,2,,4|1,2,,4|Symbol(s),Symbol(Symbol.iterator),Symbol(missing),Symbol(reg)|function|true|true",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn computed_number_keys_use_number_to_string_in_all_tiers() {
     // ECMA-262 ToPropertyKey / Number::toString, snapshot e28783d5fc9d: integral keys (including
     // -0 and values near 2^53) and non-integral ones reach [[Get]]/[[Set]] as their decimal text.

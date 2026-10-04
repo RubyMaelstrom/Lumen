@@ -4073,7 +4073,7 @@ fn install_object(it: &mut Interp) {
             let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
             return has_own_property_trapped(i, &Value::Obj(o), key.as_str()).map(Value::Bool);
         }
-        if let Some(text) = key.as_num_opt().and_then(crate::value::IntegerKeyText::new) {
+        if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
             let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
             return has_own_property_trapped(i, &Value::Obj(o), text.as_str()).map(Value::Bool);
         }

@@ -22072,9 +22072,13 @@ fn get_computed_element(
             return Ok(value);
         }
     }
-    // ToPropertyKey of an integral Number is its decimal text; skip the temporary strings.
-    if let Some(text) = key.as_num_opt().and_then(crate::value::IntegerKeyText::new) {
+    // ToPropertyKey of an integral Number is its decimal text, and of a Symbol its encoded
+    // key; skip the temporary strings. The Symbol stays owned by `key` during the read.
+    if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
         return i.get_member(obj, text.as_str());
+    }
+    if let Value::Sym(symbol) = key {
+        return i.get_member(obj, crate::value::KeyText::symbol(symbol.id).as_str());
     }
     let key = i.to_property_key(key)?;
     i.get_member(obj, &key)
@@ -22113,7 +22117,7 @@ fn set_computed_element(
     if let Value::Str(key) = key {
         return i.set_member(object, key.as_str(), value);
     }
-    if let Some(text) = key.as_num_opt().and_then(crate::value::IntegerKeyText::new) {
+    if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
         return i.set_member(object, text.as_str(), value);
     }
     let key = i.to_property_key(key)?;
