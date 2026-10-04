@@ -2912,7 +2912,7 @@ impl Interp {
             let Some(trap) =
                 self.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_HAS, "has")?
             else {
-                return self.js_has_property(&target, key);
+                return self.proxy_forward(|me| me.js_has_property(&target, key));
             };
             // The trap receives the original property key — a symbol stays a symbol.
             let key_val = self
@@ -3700,10 +3700,7 @@ impl Interp {
                             .unwrap_or(Value::Undefined)
                     })
                     .collect();
-                let raw: Vec<Value> = quasis
-                    .iter()
-                    .map(|(_, r)| Value::lstr(r.clone()))
-                    .collect();
+                let raw: Vec<Value> = quasis.iter().map(|(_, r)| Value::lstr(r.clone())).collect();
                 let strings = self.make_array(cooked);
                 let raw_arr = self.make_array(raw);
                 self.freeze_object(&raw_arr);
@@ -5875,12 +5872,7 @@ impl Interp {
             let prefix = if is_get { "get " } else { "set " };
             b.props.insert(
                 "name",
-                Property::data(
-                    Value::lstr(format!("{prefix}{name}")),
-                    false,
-                    false,
-                    true,
-                ),
+                Property::data(Value::lstr(format!("{prefix}{name}")), false, false, true),
             );
             b.props.insert(
                 "length",

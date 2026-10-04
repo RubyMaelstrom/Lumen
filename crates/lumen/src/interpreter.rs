@@ -8077,7 +8077,8 @@ impl Interp {
                         let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")?
                         else {
                             // Forward to the target's [[Get]], preserving the original Receiver.
-                            return self.get_member_recv(&target, key, receiver);
+                            return self
+                                .proxy_forward(|me| me.get_member_recv(&target, key, receiver));
                         };
                         let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                         let res = self.proxy_call_trap(
@@ -8208,7 +8209,8 @@ impl Interp {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
                 }
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
-                    return self.get_member_recv(&target, key, receiver.clone());
+                    return self
+                        .proxy_forward(|me| me.get_member_recv(&target, key, receiver.clone()));
                 };
                 let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                 let res = self.proxy_call_trap(
@@ -8697,7 +8699,8 @@ impl Interp {
                 }
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
                     // Forward to the target's [[Set]], preserving the original Receiver.
-                    return self.set_member_recv(&target, key, value, receiver);
+                    return self
+                        .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
                 };
                 let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                 let ok = self.proxy_call_trap(
@@ -8765,7 +8768,8 @@ impl Interp {
                     return Err(self.throw("TypeError", "cannot perform 'set' on a revoked proxy"));
                 }
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
-                    return self.set_member_recv(&target, key, value, receiver);
+                    return self
+                        .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
                 };
                 let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                 let ok = self.proxy_call_trap(
@@ -14652,6 +14656,24 @@ impl Interp {
 
     /// Like `construct`, but with an explicit `new.target` (for `Reflect.construct`'s third argument
     /// and a proxy's `[[Construct]]` forwarding, where new.target differs from the callee).
+    /// A trapless Proxy forwards the operation to its target (ECMA-262 §10.5), and the target's
+    /// prototype chain may lead back to the same Proxy: [[SetPrototypeOf]]'s cycle check stops
+    /// at Proxies. Account each forward like a call, so an unbounded chain throws RangeError
+    /// on the execution-stack limit instead of exhausting the native stack.
+    pub(crate) fn proxy_forward<R>(
+        &mut self,
+        forward: impl FnOnce(&mut Self) -> Result<R, Abrupt>,
+    ) -> Result<R, Abrupt> {
+        self.depth += 1;
+        if execution_stack_exhausted(self.depth) {
+            self.depth -= 1;
+            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+        }
+        let result = with_execution_stack(self.depth, || forward(self));
+        self.depth -= 1;
+        result
+    }
+
     pub(crate) fn construct_nt(
         &mut self,
         callee: Value,

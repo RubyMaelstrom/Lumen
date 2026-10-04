@@ -169,7 +169,9 @@ fn write_key(key: &Expr, out: &mut String, depth: usize) {
         }
         Expr::Str(text)
             if text.chars().count() <= 24
-                && !text.chars().any(|c| c == '"' || c == '\\' || c.is_control()) =>
+                && !text
+                    .chars()
+                    .any(|c| c == '"' || c == '\\' || c.is_control()) =>
         {
             out.push('"');
             out.push_str(text);

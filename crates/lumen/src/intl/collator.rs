@@ -172,11 +172,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     set_builtin(&obj, "#\u{0}co", Value::Bool(true));
     set_builtin(&obj, "#\u{0}co_locale", Value::lstr(locale));
     set_builtin(&obj, "#\u{0}co_usage", Value::lstr(usage));
-    set_builtin(
-        &obj,
-        "#\u{0}co_sensitivity",
-        Value::lstr(sensitivity),
-    );
+    set_builtin(&obj, "#\u{0}co_sensitivity", Value::lstr(sensitivity));
     set_builtin(&obj, "#\u{0}co_ignorepunct", Value::Bool(ignore_punct));
     set_builtin(&obj, "#\u{0}co_numeric", Value::Bool(numeric));
     set_builtin(&obj, "#\u{0}co_collation", Value::lstr(collation));

@@ -41,11 +41,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     }
     set_builtin(&obj, "#\u{0}sg", Value::Bool(true));
     set_builtin(&obj, "#\u{0}sg_locale", Value::lstr(resolved.locale));
-    set_builtin(
-        &obj,
-        "#\u{0}sg_granularity",
-        Value::lstr(granularity),
-    );
+    set_builtin(&obj, "#\u{0}sg_granularity", Value::lstr(granularity));
     Ok(Value::Obj(obj))
 }
 

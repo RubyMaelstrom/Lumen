@@ -14,20 +14,25 @@ use crate::{Completion, Engine};
 
 /// `hostText(n)`: a string a host built from Rust text.
 fn host_text(_: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(match args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32 {
-        0 => Value::from_string("\u{10FFFD}".to_string()),
-        1 => Value::str("\u{10BFF}\u{10FFFD}"),
-        2 => Value::from_string("a\u{10F800}b\u{10FFFF}".to_string()),
-        3 => Value::from_utf16(&[0xD800, 0x61, 0xDBFF, 0xDFFD, 0xDC00]),
-        _ => Value::str("plain ascii"),
-    })
+    Ok(
+        match args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u32 {
+            0 => Value::from_string("\u{10FFFD}".to_string()),
+            1 => Value::str("\u{10BFF}\u{10FFFD}"),
+            2 => Value::from_string("a\u{10F800}b\u{10FFFF}".to_string()),
+            3 => Value::from_utf16(&[0xD800, 0x61, 0xDBFF, 0xDFFD, 0xDC00]),
+            _ => Value::str("plain ascii"),
+        },
+    )
 }
 
 /// `hostRead(s)`: the host's Rust text for `s`, reported as space-separated scalar values.
 fn host_read(it: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
     let text = it.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
     if let Some(as_text) = args.first().and_then(Value::as_text) {
-        assert_eq!(&*text, &*as_text, "coerce_string and as_text agree on strings");
+        assert_eq!(
+            &*text, &*as_text,
+            "coerce_string and as_text agree on strings"
+        );
     }
     let scalars: Vec<String> = text.chars().map(|c| format!("{:x}", c as u32)).collect();
     Ok(Value::from_string(scalars.join(" ")))
@@ -127,7 +132,12 @@ fn host_reads_return_characters_and_replace_lone_surrogates() {
 fn host_values_round_trip_through_rust_text() {
     let mut engine = Engine::new();
     let it = &mut *engine.interp;
-    for text in ["\u{10FFFD}", "\u{10BFF}\u{10FFFD}", "a\u{10F800}\u{10FBFF}\u{10FC00}z", "é😀"] {
+    for text in [
+        "\u{10FFFD}",
+        "\u{10BFF}\u{10FFFD}",
+        "a\u{10F800}\u{10FBFF}\u{10FC00}z",
+        "é😀",
+    ] {
         let value = Value::str(text);
         assert_eq!(value.as_text().as_deref(), Some(text));
         assert_eq!(it.coerce_string(&value).ok().as_deref(), Some(text));
@@ -149,7 +159,10 @@ fn host_values_round_trip_through_rust_text() {
     }
     let lone = Value::from_utf16(&[0x61, 0xDFFD, 0xD800]);
     assert_eq!(lone.as_text().as_deref(), Some("a\u{FFFD}\u{FFFD}"));
-    assert_eq!(it.coerce_utf16(&lone).ok(), Some(vec![0x61, 0xDFFD, 0xD800]));
+    assert_eq!(
+        it.coerce_utf16(&lone).ok(),
+        Some(vec![0x61, 0xDFFD, 0xD800])
+    );
     assert_eq!(Value::Num(1.0).as_text(), None);
 }
 
@@ -170,8 +183,7 @@ fn host_source_text_keeps_plane_16_private_use_characters() {
         );
         match engine.eval(&script, false) {
             Ok(Completion::Value(value)) => assert_eq!(
-                value,
-                "2|dbff dffd|dbfe dc00|dbff|dbff dffd",
+                value, "2|dbff dffd|dbfe dc00|dbff|dbff dffd",
                 "{tier:?} script"
             ),
             _ => panic!("{tier:?}: script failed"),
@@ -261,7 +273,8 @@ fn engine_text_round_trips_every_code_unit() {
     let decoded = "x\u{10FFFD}\u{10F800}";
     let stored = crate::jstr::from_text(decoded).into_owned();
     assert_eq!(
-        it.coerce_utf16(&Value::from_engine_text(stored.clone())).ok(),
+        it.coerce_utf16(&Value::from_engine_text(stored.clone()))
+            .ok(),
         Some(vec![0x78, 0xDBFF, 0xDFFD, 0xDBFE, 0xDC00])
     );
     assert_eq!(crate::jstr::to_text(&stored), decoded);

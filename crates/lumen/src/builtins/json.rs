@@ -349,11 +349,7 @@ fn internalize_json_property(
     ab(i.call(
         reviver.clone(),
         holder.clone(),
-        &[
-            Value::lstr(name.to_string()),
-            val,
-            Value::Obj(context),
-        ],
+        &[Value::lstr(name.to_string()), val, Value::Obj(context)],
     ))
 }
 
@@ -371,11 +367,7 @@ fn json_str(
     if matches!(value, Value::Obj(_) | Value::BigInt(_)) {
         let tojson = ab(i.get_member(&value, "toJSON"))?;
         if tojson.is_callable() {
-            value = ab(i.call(
-                tojson,
-                value.clone(),
-                &[Value::lstr(key.to_string())],
-            ))?;
+            value = ab(i.call(tojson, value.clone(), &[Value::lstr(key.to_string())]))?;
         }
     }
     if let Some(func) = &opts.func {

@@ -6096,9 +6096,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 out.push_str(&ab(i.to_string(&v))?);
             }
         }
-        Ok(Value::lstr(
-            crate::jstr::canonicalize(&out).unwrap_or(out),
-        ))
+        Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
     it.def_method(&ap, "concat", 1, |i, this, args| {
         // ToObject(this): a primitive receiver is boxed (and spread/appended as its wrapper).
@@ -11192,9 +11190,7 @@ fn install_string(it: &mut Interp) {
             return Ok(Value::Str(s.repeat_direct(count)));
         }
         let out = s.repeat(count);
-        Ok(Value::lstr(
-            crate::jstr::canonicalize(&out).unwrap_or(out),
-        ))
+        Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
     it.def_method(&sp, "split", 2, nf_string_split);
     it.def_method(&sp, "at", 1, |i, this, args| {
@@ -11443,9 +11439,7 @@ fn install_string(it: &mut Interp) {
                     out.push_str(&crate::jstr::unit_str(unit));
                 }
             }
-            return Ok(Value::lstr(
-                crate::jstr::canonicalize(&out).unwrap_or(out),
-            ));
+            return Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)));
         }
         let source_ascii = s.ascii_hint();
         let pattern_ascii = pat.ascii_hint();
@@ -11519,9 +11513,7 @@ fn install_string(it: &mut Interp) {
             pos = cursor + next;
         }
         out.push_str(&crate::jstr::from_units(&source_units[cursor..]));
-        Ok(Value::lstr(
-            crate::jstr::canonicalize(&out).unwrap_or(out),
-        ))
+        Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
 
     let ctor = it.make_native("String", 1, |i, _this, args| {

@@ -2273,6 +2273,41 @@ fn nested_default_constructors_restore_super_forwarding() {
 /// ECMA-262 §10.2.2 [[Construct]] allocates only for a base constructor, and the default
 /// derived constructor (ClassDefinitionEvaluation step 14.a) is a built-in closure. Expected
 /// values come from Node 24.
+/// ECMA-262 §10.5: a trapless Proxy forwards to its target, and [[SetPrototypeOf]]'s cycle
+/// check stops at Proxies, so a Proxy can be its own target's prototype. Reads, writes and `in`
+/// then recurse without bound; like V8 (Node 24), throw a catchable RangeError instead of
+/// exhausting the native stack. Own-property queries do not walk the chain.
+#[test]
+fn proxy_prototype_cycles_throw_range_error_instead_of_overflowing() {
+    let source = r#"
+        const t = {}; const p = new Proxy(t, {}); Object.setPrototypeOf(t, p);
+        const r = [];
+        for (const [n, f] of [['get', () => p.x], ['set', () => { p.x = 1; }], ['has', () => 'x' in p],
+            ['getOwn', () => Object.getOwnPropertyDescriptor(p, 'x')], ['keys', () => Object.keys(p)]]) {
+            try { const v = f(); r.push(n + ':ok:' + v); } catch (e) { r.push(n + ':' + e.constructor.name); }
+        }
+        r.push('after:' + (1 + 1));
+        r.join(' ')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(v) => assert_eq!(
+                v,
+                "get:RangeError set:RangeError has:RangeError getOwn:ok:undefined keys:ok: after:2",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
 #[test]
 fn derived_construction_follows_base_allocation_and_default_constructor_steps() {
     let source = r#"

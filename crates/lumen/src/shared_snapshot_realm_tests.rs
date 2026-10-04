@@ -384,7 +384,11 @@ fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
                 unreachable!()
             };
             addresses.push(Rc::as_ptr(global) as usize);
-            assert_eq!(in_realm(it, &child, run), expected, "{tier:?} child {round}");
+            assert_eq!(
+                in_realm(it, &child, run),
+                expected,
+                "{tier:?} child {round}"
+            );
         }
         it.gc_collect();
         for (round, address) in addresses.iter().enumerate() {
@@ -421,7 +425,10 @@ fn a_dropped_realm_that_ran_the_last_regexp_is_collected() {
         assert_eq!(child_statics, "300:xx:xxy", "{tier:?}");
         // The child ran the most recent match, so its %RegExp% holds the pending statics.
         in_realm(it, &child, |it| {
-            assert_eq!(eval_string(it, "/(q)/.test('q') && typeof RegExp"), "function");
+            assert_eq!(
+                eval_string(it, "/(q)/.test('q') && typeof RegExp"),
+                "function"
+            );
         });
         drop(child);
         it.gc_collect();
@@ -429,6 +436,10 @@ fn a_dropped_realm_that_ran_the_last_regexp_is_collected() {
             !it.realms.contains_key(&address),
             "{tier:?}: the Realm of the last regexp match is still live"
         );
-        assert_eq!(eval_string(it, "RegExp.$1 + RegExp.lastMatch"), "bbc", "{tier:?}");
+        assert_eq!(
+            eval_string(it, "RegExp.$1 + RegExp.lastMatch"),
+            "bbc",
+            "{tier:?}"
+        );
     }
 }

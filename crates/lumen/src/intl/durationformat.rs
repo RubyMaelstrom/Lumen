@@ -67,11 +67,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     }
     set_builtin(&obj, "#\u{0}df", Value::Bool(true));
     set_builtin(&obj, "#\u{0}df_locale", Value::lstr(resolved_locale));
-    set_builtin(
-        &obj,
-        "#\u{0}df_style",
-        Value::lstr(base_style.clone()),
-    );
+    set_builtin(&obj, "#\u{0}df_style", Value::lstr(base_style.clone()));
     set_builtin(&obj, "#\u{0}df_nu", Value::lstr(numbering));
 
     // GetDurationUnitOptions for each unit, threading `prev_style`.
@@ -374,10 +370,7 @@ fn get_str(o: &Gc, k: &str) -> String {
 fn new_service(i: &mut Interp, service: &str, locale: &str, opts: Gc) -> Result<Value, Value> {
     let intl = ab(i.get_member(&Value::Obj(i.global.clone()), "Intl"))?;
     let ctor = ab(i.get_member(&intl, service))?;
-    ab(i.construct(
-        ctor,
-        &[Value::lstr(locale.to_string()), Value::Obj(opts)],
-    ))
+    ab(i.construct(ctor, &[Value::lstr(locale.to_string()), Value::Obj(opts)]))
 }
 
 /// One formatted piece: NumberFormat part `type`/`value`, plus the singular `unit` it belongs to
@@ -481,11 +474,7 @@ fn partition(
 
             // Build the NumberFormat options for this unit.
             let nf_opts = i.new_object();
-            set_data(
-                &nf_opts,
-                "numberingSystem",
-                Value::lstr(numbering.clone()),
-            );
+            set_data(&nf_opts, "numberingSystem", Value::lstr(numbering.clone()));
             if sign_never {
                 set_data(&nf_opts, "signDisplay", Value::lstr("never"));
             }
@@ -513,9 +502,7 @@ fn partition(
             let ftp = ab(i.get_member(&nf, "formatToParts"))?;
             let nf_arg = match &exact_arg {
                 // A negative-zero fold still needs its sign for the display rules.
-                Some(sd) if !(value == 0.0 && value.is_sign_negative()) => {
-                    Value::lstr(sd.clone())
-                }
+                Some(sd) if !(value == 0.0 && value.is_sign_negative()) => Value::lstr(sd.clone()),
                 _ => Value::Num(value),
             };
             let parts_arr = ab(i.call(ftp, nf.clone(), &[nf_arg]))?;

@@ -687,10 +687,8 @@ impl Interp {
         };
         {
             let mut b = meta.borrow_mut();
-            b.props.insert(
-                "url",
-                Property::data(Value::lstr(url), true, true, true),
-            );
+            b.props
+                .insert("url", Property::data(Value::lstr(url), true, true, true));
             if is_path {
                 b.props.insert(
                     "filename",
@@ -1001,12 +999,7 @@ impl Interp {
         if let Some(tag) = crate::builtins::to_string_tag_key(self) {
             ns.borrow_mut().props.insert(
                 tag,
-                Property::data(
-                    Value::lstr("Module".to_string()),
-                    false,
-                    false,
-                    false,
-                ),
+                Property::data(Value::lstr("Module".to_string()), false, false, false),
             );
         }
         ns.borrow_mut().extensible = false;

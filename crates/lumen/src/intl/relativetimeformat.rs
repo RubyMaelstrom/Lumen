@@ -147,11 +147,7 @@ fn format(
     // the exact part records spliced by MakePartsList.
     let numbering = string_slot(&object, "#\u{0}rtf_nu", "latn");
     let nf_options = i.new_object();
-    set_data(
-        &nf_options,
-        "numberingSystem",
-        Value::lstr(numbering),
-    );
+    set_data(&nf_options, "numberingSystem", Value::lstr(numbering));
     set_data(&nf_options, "signDisplay", Value::lstr("never"));
     if language == "pl" {
         // CLDR's Polish number pattern has minimumGroupingDigits=2.

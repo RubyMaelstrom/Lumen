@@ -605,11 +605,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     } else {
         format!("{base}-u{ext}")
     };
-    set_builtin(
-        &obj,
-        "#\u{0}dtf_locale",
-        Value::lstr(resolved_locale),
-    );
+    set_builtin(&obj, "#\u{0}dtf_locale", Value::lstr(resolved_locale));
     set_builtin(&obj, "#\u{0}dtf_ca", Value::lstr(eff_cal));
     set_builtin(&obj, "#\u{0}dtf_nu", Value::lstr(nu_final));
     set_builtin(&obj, "#\u{0}dtf_tz", Value::lstr(time_zone));

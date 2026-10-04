@@ -5551,12 +5551,15 @@ mod feedback_layout_tests {
             .collect::<Vec<_>>();
         let mut trace = crate::feedback::CurrentPropertyTrace::default();
 
-        let result =
-            match interp.get_prop_ic_profiled(&Value::lstr("abc"), "length", &caches[0], &mut trace)
-            {
-                Ok(value) => value,
-                Err(_) => panic!("string length must complete"),
-            };
+        let result = match interp.get_prop_ic_profiled(
+            &Value::lstr("abc"),
+            "length",
+            &caches[0],
+            &mut trace,
+        ) {
+            Ok(value) => value,
+            Err(_) => panic!("string length must complete"),
+        };
 
         assert!(matches!(result, Value::Num(3.0)));
         assert_eq!(trace.outcome, Some(PropertyOutcome::Exotic));
@@ -21964,7 +21967,14 @@ pub(crate) unsafe extern "C" fn jit_new(
             Ok(value) => value,
             Err(abrupt) => {
                 let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
-                ctx.error = Some(name_call_error(i, chunk, pc as usize, &callee, true, abrupt));
+                ctx.error = Some(name_call_error(
+                    i,
+                    chunk,
+                    pc as usize,
+                    &callee,
+                    true,
+                    abrupt,
+                ));
                 return crate::jit::SpFlag { sp, flag: 1 };
             }
         };
@@ -23047,10 +23057,7 @@ fn not_callable_error(
 ) -> Abrupt {
     let message = match chunk.call_name(pc) {
         Some(name) => crate::callee_name::named_message(name, construct),
-        None => crate::callee_name::named_message(
-            crate::interpreter::type_name(callee),
-            construct,
-        ),
+        None => crate::callee_name::named_message(crate::interpreter::type_name(callee), construct),
     };
     interpreter.throw("TypeError", message)
 }
@@ -23935,12 +23942,11 @@ unsafe fn jit_exec_inner(
                 let args = &*args_values;
                 let method = (*sp.sub(argc + 1)).unpack();
                 let this = (*sp.sub(argc + 2)).unpack();
-                let value = call_profiled(i, chunk, pc as usize, method, this, args).map_err(
-                    |error| {
+                let value =
+                    call_profiled(i, chunk, pc as usize, method, this, args).map_err(|error| {
                         let method = (*sp.sub(argc + 1)).unpack();
                         name_call_error(i, chunk, pc as usize, &method, false, error)
-                    },
-                )?;
+                    })?;
                 *sp = jit_consume(*sp, argc + 2);
                 push!(value);
                 return Ok(());
@@ -23987,12 +23993,11 @@ unsafe fn jit_exec_inner(
                 let callee = (*sp.sub(argc + 1)).unpack();
                 let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
                 let args = &*args_values;
-                let value = construct_profiled(i, chunk, pc as usize, callee, args).map_err(
-                    |error| {
+                let value =
+                    construct_profiled(i, chunk, pc as usize, callee, args).map_err(|error| {
                         let callee = (*sp.sub(argc + 1)).unpack();
                         name_call_error(i, chunk, pc as usize, &callee, true, error)
-                    },
-                )?;
+                    })?;
                 *sp = jit_consume(*sp, argc + 1);
                 push!(value);
             } else {

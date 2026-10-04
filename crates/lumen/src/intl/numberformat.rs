@@ -416,36 +416,20 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
         "#\u{0}nf_roundingpriority",
         Value::lstr(rounding_priority),
     );
-    set_builtin(
-        &obj,
-        "#\u{0}nf_trailingzero",
-        Value::lstr(trailing_zero),
-    );
+    set_builtin(&obj, "#\u{0}nf_trailingzero", Value::lstr(trailing_zero));
     set_builtin(&obj, "#\u{0}nf_style", Value::lstr(style));
     if let Some(c) = currency.filter(|_| get_str(&obj, "#\u{0}nf_style") == "currency") {
-        set_builtin(
-            &obj,
-            "#\u{0}nf_currency",
-            Value::lstr(c.to_uppercase()),
-        );
+        set_builtin(&obj, "#\u{0}nf_currency", Value::lstr(c.to_uppercase()));
         set_builtin(
             &obj,
             "#\u{0}nf_currencydisplay",
             Value::lstr(currency_display),
         );
-        set_builtin(
-            &obj,
-            "#\u{0}nf_currencysign",
-            Value::lstr(currency_sign),
-        );
+        set_builtin(&obj, "#\u{0}nf_currencysign", Value::lstr(currency_sign));
     }
     if let Some(u) = unit {
         set_builtin(&obj, "#\u{0}nf_unit", Value::lstr(u));
-        set_builtin(
-            &obj,
-            "#\u{0}nf_unitdisplay",
-            Value::lstr(unit_display),
-        );
+        set_builtin(&obj, "#\u{0}nf_unitdisplay", Value::lstr(unit_display));
     }
     set_builtin(&obj, "#\u{0}nf_minint", Value::Num(digits.min_int as f64));
     set_builtin(&obj, "#\u{0}nf_minfrac", Value::Num(digits.min_frac as f64));
@@ -463,16 +447,8 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
         Value::lstr(compact_display),
     );
     set_builtin(&obj, "#\u{0}nf_grouping", use_grouping);
-    set_builtin(
-        &obj,
-        "#\u{0}nf_signdisplay",
-        Value::lstr(sign_display),
-    );
-    set_builtin(
-        &obj,
-        "#\u{0}nf_roundingmode",
-        Value::lstr(rounding_mode),
-    );
+    set_builtin(&obj, "#\u{0}nf_signdisplay", Value::lstr(sign_display));
+    set_builtin(&obj, "#\u{0}nf_roundingmode", Value::lstr(rounding_mode));
     set_builtin(
         &obj,
         "#\u{0}nf_roundingtype",
@@ -1860,10 +1836,7 @@ fn format_number(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value
     let o = instance(i, this)?;
     let n = to_intl_number(i, x)?;
     let s = assemble_number_exact(i, &o, n, exact_of(x)).text;
-    Ok(Value::lstr(xlate_digits(
-        &s,
-        &get_str(&o, "#\u{0}nf_nu"),
-    )))
+    Ok(Value::lstr(xlate_digits(&s, &get_str(&o, "#\u{0}nf_nu"))))
 }
 
 /// The trailing-affix classification for this formatter's parts (compact suffix vs plain).

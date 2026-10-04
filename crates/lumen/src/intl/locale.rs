@@ -606,11 +606,7 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
         b.private.clear();
         tags::render(&b)
     };
-    set_builtin(
-        &obj,
-        "#\u{0}locale_tag",
-        Value::lstr(tag.to_string()),
-    );
+    set_builtin(&obj, "#\u{0}locale_tag", Value::lstr(tag.to_string()));
     set_builtin(&obj, "#\u{0}locale_basename", Value::lstr(base));
     set_builtin(
         &obj,
@@ -618,18 +614,10 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
         Value::lstr(p.language.clone()),
     );
     if !p.script.is_empty() {
-        set_builtin(
-            &obj,
-            "#\u{0}locale_script",
-            Value::lstr(p.script.clone()),
-        );
+        set_builtin(&obj, "#\u{0}locale_script", Value::lstr(p.script.clone()));
     }
     if !p.region.is_empty() {
-        set_builtin(
-            &obj,
-            "#\u{0}locale_region",
-            Value::lstr(p.region.clone()),
-        );
+        set_builtin(&obj, "#\u{0}locale_region", Value::lstr(p.region.clone()));
     }
     if !p.variants.is_empty() {
         set_builtin(

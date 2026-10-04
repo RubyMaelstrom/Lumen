@@ -106,11 +106,7 @@ pub(super) fn install_number(it: &mut Interp) {
         let digits = d as usize;
         // The sign is `-` only for a strictly-negative value (not -0), and the magnitude is rounded.
         let body = to_fixed_magnitude(n.abs(), digits);
-        Ok(Value::lstr(if n < 0.0 {
-            format!("-{body}")
-        } else {
-            body
-        }))
+        Ok(Value::lstr(if n < 0.0 { format!("-{body}") } else { body }))
     });
 
     let ctor = it.make_native("Number", 1, |i, _this, args| {

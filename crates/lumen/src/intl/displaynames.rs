@@ -73,11 +73,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     set_builtin(&obj, "#\u{0}dn_type", Value::lstr(kind));
     set_builtin(&obj, "#\u{0}dn_fallback", Value::lstr(fallback));
     if is_language {
-        set_builtin(
-            &obj,
-            "#\u{0}dn_langdisplay",
-            Value::lstr(language_display),
-        );
+        set_builtin(&obj, "#\u{0}dn_langdisplay", Value::lstr(language_display));
     }
     Ok(Value::Obj(obj))
 }

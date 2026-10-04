@@ -1344,8 +1344,6 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         }
         q = p;
     }
-    out.push(Value::lstr(crate::jstr::from_units(
-        &sunits[p..size],
-    )));
+    out.push(Value::lstr(crate::jstr::from_units(&sunits[p..size])));
     Ok(i.make_array(out))
 }

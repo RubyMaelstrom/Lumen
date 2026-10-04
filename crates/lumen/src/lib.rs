@@ -401,8 +401,8 @@ fn parse_host_script(src: &str, strict: bool) -> Result<Vec<ast::Stmt>, parser::
 /// re-parsed, on every boot. Decode it at runtime with [`Engine::eval_snapshot`]. `Err` is a
 /// parse-error message.
 pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
-    let body = parse_host_script(src, false)
-        .map_err(|e| format!("{} (line {})", e.message, e.line))?;
+    let body =
+        parse_host_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
     Ok(snapshot::encode(&body))
 }
 
@@ -414,8 +414,8 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 /// their source. This does not alter execution, constructibility, or descriptors,
 /// and does not by itself implement the rest of Web IDL's function-object rules.
 pub fn compile_host_snapshot(src: &str) -> Result<Vec<u8>, String> {
-    let body = parse_host_script(src, false)
-        .map_err(|e| format!("{} (line {})", e.message, e.line))?;
+    let body =
+        parse_host_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
     Ok(snapshot::encode_host(&body))
 }
 

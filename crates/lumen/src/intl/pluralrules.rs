@@ -137,11 +137,7 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
         object.borrow_mut().proto = Some(proto);
     }
     set_builtin(&object, "#\u{0}pr", Value::Bool(true));
-    set_builtin(
-        &object,
-        "#\u{0}pr_locale",
-        Value::lstr(resolved.locale),
-    );
+    set_builtin(&object, "#\u{0}pr_locale", Value::lstr(resolved.locale));
     set_builtin(&object, "#\u{0}pr_type", Value::lstr(kind));
     set_builtin(&object, "#\u{0}pr_notation", Value::lstr(notation));
     set_builtin(
@@ -175,11 +171,7 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
         "#\u{0}pr_roundingincrement",
         Value::Num(rounding_increment as f64),
     );
-    set_builtin(
-        &object,
-        "#\u{0}pr_roundingmode",
-        Value::lstr(rounding_mode),
-    );
+    set_builtin(&object, "#\u{0}pr_roundingmode", Value::lstr(rounding_mode));
     set_builtin(
         &object,
         "#\u{0}pr_roundingpriority",
