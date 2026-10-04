@@ -1208,7 +1208,7 @@ impl Lexer<'_> {
             }
             let text = &self.src[start..self.pos];
             if text.chars().all(|c| ('0'..='7').contains(&c)) {
-                let n = i64::from_str_radix(&text, 8).unwrap_or(0);
+                let n = i64::from_str_radix(text, 8).unwrap_or(0);
                 self.push(Tok::Num(n as f64));
                 self.mark_legacy_octal();
                 return Ok(());
@@ -1540,9 +1540,7 @@ mod tests {
                 (4, false)
             ]
         );
-        let error = tokenize("a /* never closed\n")
-            .err()
-            .expect("unterminated comment");
+        let error = tokenize("a /* never closed\n").expect_err("unterminated comment");
         assert!(error.at_eof);
         assert_eq!(error.line, 2);
     }

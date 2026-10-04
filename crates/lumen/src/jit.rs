@@ -3628,7 +3628,7 @@ fn compile_entry(
             .map(|s| &**s)
             .collect();
         let name = head.join(",");
-        if pat.is_empty() || name.contains(&pat) {
+        if pat.is_empty() || name.contains(pat) {
             eprintln!("[jit-dump] fn({name}) {} ops", ops.len());
             for (pc, op) in ops.iter().enumerate() {
                 eprintln!("[jit-dump]   {pc:>4}  {op:?}");
