@@ -945,6 +945,88 @@ pub(crate) fn invalidate_call_caches() {
     let _ = CALL_IC_EPOCH.fetch_update(Relaxed, Relaxed, |epoch| epoch.checked_add(1));
 }
 
+/// One private-name operation site's cache (`Op::GetPrivate` and its siblings index
+/// `Chunk::private_sites`). ResolvePrivateIdentifier (ECMA-262 §9.2.1.1) depends only on the
+/// running environment's chain, and that chain's Private Names are fixed: Lumen binds a class
+/// evaluation's runtime keys in its class scope before any of its code runs, never adds a
+/// `#` binding afterwards, and never re-links a live scope. So the key resolved from one
+/// environment is the key for that environment for as long as it lives; a weak pin keeps its
+/// address from being recycled into another scope while cached. The slot is only a hint for
+/// PrivateElementFind: a hit re-reads the receiver's live entry at that slot and compares its
+/// key text, so shapes, exotics and later definitions never make it unsound.
+pub(crate) struct PrivateSite {
+    env: std::cell::Cell<usize>,
+    pin: std::cell::RefCell<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>,
+    key: std::cell::RefCell<Option<crate::lstr::LStr>>,
+    slot: std::cell::Cell<u32>,
+    /// The entry key last found for `key`. Instances that share a property layout share this
+    /// allocation, so a pointer match answers the key comparison without reading its text.
+    entry_key: std::cell::RefCell<Option<Rc<str>>>,
+}
+
+impl PrivateSite {
+    pub(crate) fn new() -> Self {
+        Self {
+            env: std::cell::Cell::new(0),
+            pin: std::cell::RefCell::new(std::rc::Weak::new()),
+            key: std::cell::RefCell::new(None),
+            slot: std::cell::Cell::new(u32::MAX),
+            entry_key: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The runtime key `name` resolves to from `env`, resolving and caching it on a miss.
+    #[inline]
+    pub(crate) fn key(
+        &self,
+        env: &Env,
+        resolve: impl FnOnce() -> crate::lstr::LStr,
+    ) -> crate::lstr::LStr {
+        let raw = Rc::as_ptr(env) as usize;
+        if self.env.get() == raw {
+            if let Some(key) = self.key.borrow().as_ref() {
+                return key.clone();
+            }
+        }
+        let key = resolve();
+        let changed = self
+            .key
+            .borrow()
+            .as_ref()
+            .is_none_or(|old| old.as_str() != key.as_str());
+        if changed {
+            self.slot.set(u32::MAX);
+            *self.entry_key.borrow_mut() = None;
+        }
+        *self.key.borrow_mut() = Some(key.clone());
+        *self.pin.borrow_mut() = Rc::downgrade(env);
+        self.env.set(raw);
+        key
+    }
+
+    /// The `entries` slot of `key` in `props`, via the cached hint (validated by key text).
+    #[inline]
+    pub(crate) fn find(&self, props: &crate::value::Props, key: &str) -> Option<usize> {
+        let hint = self.slot.get() as usize;
+        if let Some((k, _)) = props.entry_at(hint) {
+            let same = self
+                .entry_key
+                .borrow()
+                .as_ref()
+                .is_some_and(|cached| Rc::ptr_eq(cached, k));
+            if same || &**k == key {
+                return Some(hint);
+            }
+        }
+        let slot = props.slot_of(key)?;
+        if let Ok(slot32) = u32::try_from(slot) {
+            self.slot.set(slot32);
+            *self.entry_key.borrow_mut() = props.entry_at(slot).map(|(k, _)| k.clone());
+        }
+        Some(slot)
+    }
+}
+
 /// A call site's cache: 4-way set-associative over callee identity. Method-dispatch sites are
 /// routinely polymorphic (DeltaBlue rotates a handful of `execute` implementations through one
 /// loop), so a single entry thrashes; four entries filled round-robin stabilize any site with up
@@ -1747,11 +1829,12 @@ pub enum Op {
     ImportMeta,
     NewTarget,
     DynamicImport(ImportPhase, bool),
-    PrivateIn(u32),
-    GetPrivate(u32),
-    GetPrivateKeep(u32),
-    GetPrivateMethod(u32),
-    SetPrivate(u32),
+    /// Private-name operations: (`names` index of the source spelling, `private_sites` index).
+    PrivateIn(u32, u32),
+    GetPrivate(u32, u32),
+    GetPrivateKeep(u32, u32),
+    GetPrivateMethod(u32, u32),
+    SetPrivate(u32, u32),
     UpdatePrivate(u32, UpdKind),
     /// SuperCall steps 1–3: push the lexically inherited new.target and live superclass before
     /// ArgumentListEvaluation. Both values stay on the continuation stack across suspension.
@@ -2121,6 +2204,8 @@ pub struct Chunk {
     call_caches: Vec<CallSite>,
     /// One monomorphic identity cache per `New` site.
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
+    /// One [`PrivateSite`] per private-name operation (`Op::GetPrivate` and its siblings).
+    pub(crate) private_sites: Box<[PrivateSite]>,
     /// Weak handles pinning every callee address a call cache has ever recorded (see [`CallIc`]),
     /// keyed by that address — one pin per distinct callee no matter how often sites refill, so a
     /// megamorphic site can't exhaust the budget for the whole chunk.
@@ -2319,6 +2404,7 @@ impl Chunk {
             ))
             .saturating_add(vec_bytes!(call_caches, CallSite))
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
+            .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
         if matches!(self.record_getter.get(), Some(Some(_))) {
@@ -6608,6 +6694,7 @@ fn finish_chunk(
         regexp_literals: (0..op_count).map(|_| std::cell::OnceCell::new()).collect(),
         call_caches: c.call_caches,
         construct_caches: c.construct_caches,
+        private_sites: (0..c.private_sites).map(|_| PrivateSite::new()).collect(),
         call_pins: std::cell::RefCell::new(c.call_pins),
         inline_targets: c.inline_targets,
         jit_runs: std::cell::Cell::new(0),
@@ -7257,6 +7344,8 @@ struct Compiler {
     name_seed_stack: Vec<(Vec<NameSeed>, usize)>,
     call_caches: Vec<CallSite>,
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
+    /// Number of private-name operation sites (`Chunk::private_sites`).
+    private_sites: u32,
     call_pins: crate::fasthash::FastMap<usize, CallPin>,
     /// Polymorphic call feedback for the source frame currently being recompiled. Like property
     /// seeds, this is a compile-time stack: speculative child splices consume their own original
@@ -7851,6 +7940,11 @@ impl Compiler {
         self.call_caches.push(site);
         (self.call_caches.len() - 1) as u32
     }
+    /// Reserve a [`PrivateSite`] for one private-name operation.
+    fn new_private_site(&mut self) -> u32 {
+        self.private_sites += 1;
+        self.private_sites - 1
+    }
     fn new_construct_cache(&mut self) -> u32 {
         let cache = self.construct_caches.len() as u32;
         self.construct_caches
@@ -7887,6 +7981,7 @@ impl Compiler {
             self.eval_exprs.len(),
             self.class_plans.len(),
             self.assignment_targets.len(),
+            self.private_sites,
         );
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
             self.ops.truncate(snap.0);
@@ -7906,6 +8001,7 @@ impl Compiler {
             self.eval_exprs.truncate(snap.10);
             self.class_plans.truncate(snap.11);
             self.assignment_targets.truncate(snap.12);
+            self.private_sites = snap.13;
             if has_this {
                 self.emit(Op::CallWithThis(argc, cc));
             } else {
@@ -8673,7 +8769,8 @@ impl Compiler {
                 }
                 let name = self.name_idx(prop);
                 if prop.starts_with('#') {
-                    self.emit(Op::GetPrivateMethod(name));
+                    let site = self.new_private_site();
+                    self.emit(Op::GetPrivateMethod(name, site));
                     Ok((true, false))
                 } else {
                     let cache = self.new_cache(name);
@@ -8883,7 +8980,8 @@ impl Compiler {
                     self.opt_link(1, shorts);
                 }
                 let name = self.name_idx(prop);
-                self.emit(Op::GetPrivate(name));
+                let site = self.new_private_site();
+                self.emit(Op::GetPrivate(name, site));
                 Ok(())
             }
             Expr::Index {
@@ -10796,7 +10894,8 @@ impl Compiler {
                 self.emit(Op::StoreLocal(value));
                 self.emit(Op::LoadLocal(base));
                 self.emit(Op::LoadLocal(value));
-                self.emit(Op::SetPrivate(name));
+                let site = self.new_private_site();
+                self.emit(Op::SetPrivate(name, site));
                 self.emit(Op::Pop);
             }
             PreparedAssignmentRef::Super {
@@ -12147,7 +12246,8 @@ impl Compiler {
                 self.expr(obj)?;
                 let name = self.name_idx(prop);
                 if prop.starts_with('#') {
-                    self.emit(Op::GetPrivateMethod(name));
+                    let site = self.new_private_site();
+                    self.emit(Op::GetPrivateMethod(name, site));
                 } else {
                     let cache = self.new_cache(name);
                     self.emit(Op::GetMethod(name, cache));
@@ -12360,7 +12460,8 @@ impl Compiler {
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
                 let name = self.name_idx(prop);
-                self.emit(Op::GetPrivate(name));
+                let site = self.new_private_site();
+                self.emit(Op::GetPrivate(name, site));
                 Ok(())
             }
             Expr::Index {
@@ -12563,7 +12664,8 @@ impl Compiler {
             Expr::PrivateIn { name, obj } => {
                 self.expr(obj)?;
                 let name = self.name_idx(name);
-                self.emit(Op::PrivateIn(name));
+                let site = self.new_private_site();
+                self.emit(Op::PrivateIn(name, site));
                 Ok(())
             }
             Expr::TaggedTemplate {
@@ -13088,11 +13190,13 @@ impl Compiler {
                 if op == "=" {
                     self.expr(value)?;
                 } else {
-                    self.emit(Op::GetPrivateKeep(name));
+                    let site = self.new_private_site();
+                    self.emit(Op::GetPrivateKeep(name, site));
                     self.expr(value)?;
                     self.emit_compound(op)?;
                 }
-                self.emit(Op::SetPrivate(name));
+                let site = self.new_private_site();
+                self.emit(Op::SetPrivate(name, site));
                 Ok(())
             }
             Expr::Member {
@@ -13292,12 +13396,14 @@ impl Compiler {
                 self.emit(Op::StoreLocal(base));
                 let name = self.name_idx(prop);
                 self.emit(Op::LoadLocal(base));
-                self.emit(Op::GetPrivate(name));
+                let site = self.new_private_site();
+                self.emit(Op::GetPrivate(name, site));
                 let done = short_jump(self, op)?;
                 self.emit(Op::Pop);
                 self.emit(Op::LoadLocal(base));
                 self.expr(value)?;
-                self.emit(Op::SetPrivate(name));
+                let site = self.new_private_site();
+                self.emit(Op::SetPrivate(name, site));
                 self.patch(done);
                 Ok(())
             }
@@ -15598,38 +15704,40 @@ fn run_vm_inner<S: StoredValue>(
                 let specifier = pop!();
                 stack.push(i.import_call_vm(specifier, options, phase, env)?);
             }
-            Op::PrivateIn(name) => {
+            Op::PrivateIn(name, site) => {
                 let value = pop!();
-                stack.push(i.private_in_vm(&chunk.names[name as usize], value, env)?);
+                let site = &chunk.private_sites[site as usize];
+                let name = &chunk.names[name as usize];
+                stack.push(i.private_in_vm(name, value, env, Some(site))?);
             }
-            Op::GetPrivate(name) => {
+            Op::GetPrivate(name, site) => {
                 let base = pop!();
-                stack.push(i.private_get_vm(&chunk.names[name as usize], &base, env)?);
+                let site = &chunk.private_sites[site as usize];
+                let name = &chunk.names[name as usize];
+                stack.push(i.private_get_vm(name, &base, env, Some(site))?);
             }
-            Op::GetPrivateKeep(name) => {
+            Op::GetPrivateKeep(name, site) | Op::GetPrivateMethod(name, site) => {
                 let base = pop!();
-                let value = i.private_get_vm(&chunk.names[name as usize], &base, env)?;
+                let site = &chunk.private_sites[site as usize];
+                let name = &chunk.names[name as usize];
+                let value = i.private_get_vm(name, &base, env, Some(site))?;
                 stack.push(base);
                 stack.push(value);
             }
-            Op::GetPrivateMethod(name) => {
-                let base = pop!();
-                let method = i.private_get_vm(&chunk.names[name as usize], &base, env)?;
-                stack.push(base);
-                stack.push(method);
-            }
-            Op::SetPrivate(name) => {
+            Op::SetPrivate(name, site) => {
                 let value = pop!();
                 let base = pop!();
-                i.private_set_vm(&chunk.names[name as usize], &base, value.clone(), env)?;
+                let site = &chunk.private_sites[site as usize];
+                let name = &chunk.names[name as usize];
+                i.private_set_vm(name, &base, value.clone(), env, Some(site))?;
                 stack.push(value);
             }
             Op::UpdatePrivate(name, kind) => {
                 let base = pop!();
-                let old = i.private_get_vm(&chunk.names[name as usize], &base, env)?;
+                let old = i.private_get_vm(&chunk.names[name as usize], &base, env, None)?;
                 if let Some(value) =
                     step_value(i, &chunk.feedback, op_pc, kind, old, |i, value| {
-                        i.private_set_vm(&chunk.names[name as usize], &base, value, env)
+                        i.private_set_vm(&chunk.names[name as usize], &base, value, env, None)
                     })?
                 {
                     stack.push(value);
@@ -19005,10 +19113,10 @@ impl Chunk {
             Op::Abstract(op) => op.stack_effect(),
             Op::ImportMeta | Op::NewTarget | Op::TemplateObject(_) => (0, 1),
             Op::DynamicImport(_, has_options) => (usize::from(*has_options) + 1, 1),
-            Op::PrivateIn(_) => (1, 1),
-            Op::GetPrivate(_) => (1, 1),
-            Op::GetPrivateKeep(_) | Op::GetPrivateMethod(_) => (1, 2),
-            Op::SetPrivate(_) => (2, 1),
+            Op::PrivateIn(..) => (1, 1),
+            Op::GetPrivate(..) => (1, 1),
+            Op::GetPrivateKeep(..) | Op::GetPrivateMethod(..) => (1, 2),
+            Op::SetPrivate(..) => (2, 1),
             Op::UpdatePrivate(_, kind) => (1, upd(kind)),
             Op::SuperCallStart => (0, 2),
             Op::SuperCallArgsArray => (3, 1),
@@ -19564,12 +19672,102 @@ unsafe fn jit_vm_operation(
     }
 }
 
+/// Private-name operations from machine code, without the generic operation decoder. The
+/// Private Name resolves from the running environment: a materialized activation's (which
+/// follows the block/class scopes its bridge operations push), else the frame's.
+unsafe fn jit_private_op_inner(
+    ctx: &mut crate::jit::JitCtx,
+    pc: u32,
+    sp: &mut *mut PackedValue,
+) -> Result<(), Abrupt> {
+    let i = &mut *ctx.interp;
+    let chunk = &*ctx.chunk;
+    // As in `jit_exec_inner`: the swapped `env_raw` names this activation's environment.
+    let env_h = std::mem::ManuallyDrop::new(unsafe {
+        Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+    });
+    let private_env: &Env = match ctx.activation.as_ref() {
+        Some(activation) if activation.chunk == ctx.chunk => &activation.env,
+        _ if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk => {
+            &*(*ctx.resume_activation).env
+        }
+        _ => &env_h,
+    };
+    let op = chunk.ops[pc as usize];
+    let (Op::PrivateIn(name, site)
+    | Op::GetPrivate(name, site)
+    | Op::GetPrivateKeep(name, site)
+    | Op::GetPrivateMethod(name, site)
+    | Op::SetPrivate(name, site)) = op
+    else {
+        unreachable!("private-name operation helper");
+    };
+    let name = &chunk.names[name as usize];
+    let site = Some(&chunk.private_sites[site as usize]);
+    macro_rules! pop {
+        () => {{
+            *sp = sp.sub(1);
+            sp.read().into_value()
+        }};
+    }
+    macro_rules! push {
+        ($v:expr) => {{
+            let v = $v;
+            sp.write(PackedValue::pack(v));
+            *sp = sp.add(1);
+        }};
+    }
+    match op {
+        Op::PrivateIn(..) => {
+            let value = pop!();
+            let result = i.private_in_vm(name, value, private_env, site)?;
+            push!(result);
+        }
+        Op::GetPrivate(..) => {
+            let base = pop!();
+            let value = i.private_get_vm(name, &base, private_env, site)?;
+            push!(value);
+        }
+        Op::GetPrivateKeep(..) | Op::GetPrivateMethod(..) => {
+            let base = pop!();
+            let value = i.private_get_vm(name, &base, private_env, site)?;
+            push!(base);
+            push!(value);
+        }
+        _ => {
+            let value = pop!();
+            let base = pop!();
+            i.private_set_vm(name, &base, value.clone(), private_env, site)?;
+            push!(value);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) unsafe extern "C" fn jit_exec(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
     mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let chunk = &*(*ctx).chunk;
+    if matches!(
+        chunk.ops[pc as usize],
+        Op::PrivateIn(..)
+            | Op::GetPrivate(..)
+            | Op::GetPrivateKeep(..)
+            | Op::GetPrivateMethod(..)
+            | Op::SetPrivate(..)
+    ) {
+        let ctx = &mut *ctx;
+        jit_opstat(ctx, pc);
+        return match jit_private_op_inner(ctx, pc, &mut sp) {
+            Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+            Err(error) => {
+                ctx.error = Some(error);
+                crate::jit::SpFlag { sp, flag: 1 }
+            }
+        };
+    }
     if matches!(
         chunk.ops[pc as usize],
         Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_)
@@ -22656,48 +22854,11 @@ unsafe fn jit_exec_inner(
             push!(this);
             push!(callee);
         }
-        // Private names resolve from the running environment: a materialized activation's
-        // (which follows the block/class scopes its bridge operations push), else the frame's.
-        Op::PrivateIn(name)
-        | Op::GetPrivate(name)
-        | Op::GetPrivateKeep(name)
-        | Op::GetPrivateMethod(name)
-        | Op::SetPrivate(name) => {
-            let private_env: &Env = match ctx.activation.as_ref() {
-                Some(activation) if activation.chunk == ctx.chunk => &activation.env,
-                _ if !ctx.resume_activation.is_null()
-                    && (*ctx.resume_activation).chunk == ctx.chunk =>
-                {
-                    &*(*ctx.resume_activation).env
-                }
-                _ => env,
-            };
-            let name = &chunk.names[name as usize];
-            match chunk.ops[pc as usize] {
-                Op::PrivateIn(_) => {
-                    let value = pop!();
-                    let result = i.private_in_vm(name, value, private_env)?;
-                    push!(result);
-                }
-                Op::GetPrivate(_) => {
-                    let base = pop!();
-                    let value = i.private_get_vm(name, &base, private_env)?;
-                    push!(value);
-                }
-                Op::GetPrivateKeep(_) | Op::GetPrivateMethod(_) => {
-                    let base = pop!();
-                    let value = i.private_get_vm(name, &base, private_env)?;
-                    push!(base);
-                    push!(value);
-                }
-                _ => {
-                    let value = pop!();
-                    let base = pop!();
-                    i.private_set_vm(name, &base, value.clone(), private_env)?;
-                    push!(value);
-                }
-            }
-        }
+        Op::PrivateIn(..)
+        | Op::GetPrivate(..)
+        | Op::GetPrivateKeep(..)
+        | Op::GetPrivateMethod(..)
+        | Op::SetPrivate(..) => jit_private_op_inner(ctx, pc, sp)?,
         Op::StoreName(n) => {
             let v = pop!();
             i.assign_free_name(&chunk.names[n as usize], v, env)?;

@@ -3124,7 +3124,7 @@ impl Interp {
             }
             Expr::PrivateIn { name, obj } => {
                 let o = self.eval(obj, env)?;
-                self.private_in_vm(name, o, env)
+                self.private_in_vm(name, o, env, None)
             }
             Expr::OptionalChain(inner) => {
                 let saved = self.short_circuit;
@@ -3312,16 +3312,37 @@ impl Interp {
         }
     }
 
+    /// ResolvePrivateIdentifier from `env`, through the operation site's cache when it has one.
+    #[inline]
+    fn private_key_vm(
+        &self,
+        name: &str,
+        env: &Env,
+        site: Option<&crate::bytecode::PrivateSite>,
+    ) -> crate::lstr::LStr {
+        match site {
+            Some(site) => site.key(env, || self.resolve_private_key(name, env)),
+            None => self.resolve_private_key(name, env),
+        }
+    }
+
     pub(crate) fn private_in_vm(
         &mut self,
         name: &str,
         value: Value,
         env: &Env,
+        site: Option<&crate::bytecode::PrivateSite>,
     ) -> Result<Value, Abrupt> {
-        let key = self.resolve_private_key(name, env);
+        let key = self.private_key_vm(name, env, site);
         match value {
             // Private fields, methods and accessors are all own properties.
-            Value::Obj(object) => Ok(Value::Bool(object.borrow().props.contains(&key))),
+            Value::Obj(object) => {
+                let object = object.borrow();
+                Ok(Value::Bool(match site {
+                    Some(site) => site.find(&object.props, &key).is_some(),
+                    None => object.props.contains(&key),
+                }))
+            }
             _ => Err(self.throw("TypeError", "the right-hand side of 'in' must be an object")),
         }
     }
@@ -3331,8 +3352,22 @@ impl Interp {
         name: &str,
         value: &Value,
         env: &Env,
+        site: Option<&crate::bytecode::PrivateSite>,
     ) -> Result<Value, Abrupt> {
-        let key = self.resolve_private_key(name, env);
+        let key = self.private_key_vm(name, env, site);
+        // PrivateGet on a private field or method is the element's value; an accessor (and a
+        // missing element's TypeError) takes the general path, after this borrow ends.
+        if let (Some(site), Value::Obj(object)) = (site, value) {
+            let object = object.borrow();
+            if let Some(property) = site
+                .find(&object.props, &key)
+                .and_then(|slot| object.props.property_at(slot))
+            {
+                if !property.accessor() {
+                    return Ok(property.value());
+                }
+            }
+        }
         self.get_private_member(value, &key)
     }
 
@@ -3342,8 +3377,22 @@ impl Interp {
         base: &Value,
         value: Value,
         env: &Env,
+        site: Option<&crate::bytecode::PrivateSite>,
     ) -> Result<(), Abrupt> {
-        let key = self.resolve_private_key(name, env);
+        let key = self.private_key_vm(name, env, site);
+        // PrivateSet on a private field writes it in place; a method (not writable), an accessor
+        // and a missing element take the general path with its TypeErrors and setter call.
+        if let (Some(site), Value::Obj(object)) = (site, base) {
+            let mut object = object.borrow_mut();
+            if let Some(slot) = site.find(&object.props, &key) {
+                if let Some((_, property)) = object.props.entry_at_mut(slot) {
+                    if !property.accessor() && property.writable() {
+                        property.set_value(value);
+                        return Ok(());
+                    }
+                }
+            }
+        }
         self.set_private_member(base, &key, value)
     }
 
