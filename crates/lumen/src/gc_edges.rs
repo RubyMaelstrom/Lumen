@@ -117,6 +117,21 @@ impl GcSlotOwnerMask {
     }
 }
 
+/// Receives the strong graph edges of one heap node, borrowed from their owner. Each stored
+/// handle is reported once per occurrence (do not deduplicate). The owner stays borrowed while
+/// the sink runs, so a sink may read collector scratch cells but must never mutably borrow an
+/// object or environment, allocate JavaScript values or run author code.
+pub(crate) trait GcEdgeSink {
+    fn object(&mut self, object: &Gc);
+    fn scope(&mut self, scope: &Env);
+    #[inline]
+    fn value(&mut self, value: &Value) {
+        if let Value::Obj(object) = value {
+            self.object(object);
+        }
+    }
+}
+
 /// Direct, owning edges of one internal-slot payload, appended to the collector's
 /// existing scratch handles. Do not deduplicate: two stored Rc handles are two
 /// internal owners even when both point to the same object or environment.
@@ -137,6 +152,18 @@ impl DirectGcEdges<'_> {
     }
 
     pub fn scope(&mut self, scope: &Env) {
+        self.scopes.push(scope.clone());
+    }
+}
+
+impl GcEdgeSink for DirectGcEdges<'_> {
+    #[inline]
+    fn object(&mut self, object: &Gc) {
+        self.objects.push(object.clone());
+    }
+
+    #[inline]
+    fn scope(&mut self, scope: &Env) {
         self.scopes.push(scope.clone());
     }
 }

@@ -339,17 +339,22 @@ impl PackedValue {
         }
     }
 
+    /// Lend the strong object edge this word owns (an object, or a deferred prototype's single
+    /// stored edge) without a reference-count round trip. Never materializes a prototype.
     #[inline]
-    fn object(&self) -> Option<Gc> {
+    fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
         match self.tag() {
-            PACK_OBJ => Some(unsafe { self.clone_word() }),
+            PACK_OBJ => {
+                let object = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
+                f(&object)
+            }
             PACK_LAZY_PROTO => {
                 let lazy = std::mem::ManuallyDrop::new(unsafe {
                     self.read_word::<Rc<LazyFunctionPrototype>>()
                 });
-                Some(lazy.gc_edge())
+                lazy.with_gc_edge(f)
             }
-            _ => None,
+            _ => {}
         }
     }
 
@@ -2899,12 +2904,13 @@ impl Property {
             self.packed.number()
         }
     }
-    /// Collector-only owning edge. A deferred prototype owns its realm parent until first
-    /// observation; afterward it owns the materialized prototype instead. Do not allocate or
-    /// change the reference graph during collector counting/marking.
+    /// Collector-only owning edge, lent without a reference-count round trip. A deferred
+    /// prototype owns its realm parent until first observation; afterward it owns the
+    /// materialized prototype instead. Do not allocate or change the reference graph during
+    /// collector counting/marking.
     #[inline]
-    pub(crate) fn object_value(&self) -> Option<Gc> {
-        self.packed.object()
+    pub(crate) fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
+        self.packed.with_object_edge(f)
     }
     pub(crate) fn visit_retained_value(&self, visitor: &mut crate::memory::Visitor) {
         if self.packed.tag() == PACK_LAZY_PROTO {

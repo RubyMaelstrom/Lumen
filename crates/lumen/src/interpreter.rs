@@ -3510,6 +3510,29 @@ pub struct PromiseState {
 }
 
 /// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
+/// The pointer-keyed `Interp` tables whose values are strong internal-slot edges of their key
+/// object, as walked by `Interp::visit_object_edges`. Expands `$callback!(table, ...)`. Keep
+/// this list and that walker identical; debug builds assert that a collector never skips an
+/// owner of one of these tables.
+macro_rules! gc_side_slot_tables {
+    ($callback:ident) => {
+        $callback!(
+            class_info,
+            module_ns,
+            map_data,
+            collection_iterators,
+            ta_buffer,
+            proxies,
+            host_indexed,
+            promises,
+            promise_forward,
+            async_gen_queue,
+            finalization_registries,
+            mapped_arguments,
+        )
+    };
+}
+
 pub struct ClassInfo {
     /// Instance fields (and auto-accessor backing fields), in declaration order.
     pub fields: Vec<FieldInit>,
@@ -9574,28 +9597,6 @@ impl Interp {
         t
     }
 
-    /// Append object references held directly by `o` into a reusable scratch vector. The source
-    /// borrow is released before callers follow the collected edges, which remains essential for
-    /// self-referential objects; reusing the allocation avoids one fresh Vec per object per GC
-    /// pass.
-    fn push_value_object(value: &Value, refs: &mut Vec<Gc>) {
-        if let Value::Obj(object) = value {
-            refs.push(object.clone());
-        }
-    }
-
-    fn push_property_objects(property: &Property, refs: &mut Vec<Gc>) {
-        if let Some(object) = property.object_value() {
-            refs.push(object);
-        }
-        if let Some(getter) = property.getter() {
-            Self::push_value_object(getter, refs);
-        }
-        if let Some(setter) = property.setter() {
-            Self::push_value_object(setter, refs);
-        }
-    }
-
     /// All strong side-table families used by the two object edge walkers.
     /// Keep this inventory paired with those walkers when adding a new family.
     /// The existing snapshot index is reused; no second owner hash map or
@@ -9676,172 +9677,241 @@ impl Interp {
         )
     }
 
-    pub(crate) fn obj_refs_into(&self, o: &Gc, refs: &mut Vec<Gc>) {
-        refs.clear();
-        let b = o.borrow();
-        if let Some(p) = &b.proto {
-            refs.push(p.clone());
-        }
-        for prop in b.props.values() {
-            if let Some(p) = prop.object_value() {
-                refs.push(p);
+    /// Report every strong graph edge `o` owns to `sink`: its prototype, property values and
+    /// accessor functions, the internal slots stored in the object itself, and (when
+    /// `side_slots`) the pointer-keyed internal-slot tables listed in
+    /// [`Interp::side_slot_owners`]. Coroutine continuations are traced separately by each
+    /// collector. Both collectors and the diagnostics walker share this one inventory.
+    ///
+    /// `side_slots` may be false only when the caller has proven that `o` keys none of those
+    /// tables during this collection (see [`Interp::side_slot_owners`]).
+    pub(crate) fn visit_object_edges(
+        &self,
+        o: &Gc,
+        side_slots: bool,
+        sink: &mut impl crate::gc_edges::GcEdgeSink,
+    ) {
+        {
+            let b = o.borrow();
+            if let Some(p) = &b.proto {
+                sink.object(p);
             }
-            if let Some(Value::Obj(p)) = prop.getter() {
-                refs.push(p.clone());
-            }
-            if let Some(Value::Obj(p)) = prop.setter() {
-                refs.push(p.clone());
-            }
-        }
-        // [[IteratedArrayLike]] is a graph edge owned by the iterator, even
-        // though it is deliberately absent from the ordinary property map.
-        if let Exotic::ArrayIterator(state) = &b.exotic {
-            Self::push_value_object(&state.target, refs);
-        }
-        match &b.call {
-            Callable::Bound(bound) => {
-                refs.push(bound.target.clone());
-                if let Value::Obj(p) = &bound.this {
-                    refs.push(p.clone());
+            for prop in b.props.values() {
+                prop.with_object_edge(|p| sink.object(p));
+                if let Some(Value::Obj(p)) = prop.getter() {
+                    sink.object(p);
                 }
-                for a in &bound.args {
-                    if let Value::Obj(p) = a {
-                        refs.push(p.clone());
+                if let Some(Value::Obj(p)) = prop.setter() {
+                    sink.object(p);
+                }
+            }
+            // [[IteratedArrayLike]] is a graph edge owned by the iterator, even
+            // though it is deliberately absent from the ordinary property map.
+            if let Exotic::ArrayIterator(state) = &b.exotic {
+                sink.value(&state.target);
+            }
+            match &b.call {
+                // A user function's closure environment.
+                Callable::User(user) => sink.scope(&user.env),
+                Callable::Bound(bound) => {
+                    sink.object(&bound.target);
+                    sink.value(&bound.this);
+                    for a in &bound.args {
+                        sink.value(a);
                     }
                 }
+                // ShadowRealm and cross-Realm callable wrappers own their target
+                // as an internal slot. Keep that target graph edge visible to the
+                // cycle collector; otherwise a live wrapper can retain a callable
+                // whose object is swept and later reports "value is not a
+                // function" when invoked. (ECMA-262 [[Call]] wrapper target.)
+                Callable::WrappedShadow(shadow) => sink.value(&shadow.target),
+                Callable::WrappedCross(cross) => sink.value(&cross.target),
+                _ => {}
             }
-            // ShadowRealm and cross-Realm callable wrappers own their target
-            // as an internal slot. Keep that target graph edge visible to the
-            // cycle collector; otherwise a live wrapper can retain a callable
-            // whose object is swept and later reports "value is not a
-            // function" when invoked. (ECMA-262 [[Call]] wrapper target.)
-            Callable::WrappedShadow(shadow) => {
-                Self::push_value_object(&shadow.target, refs);
-            }
-            Callable::WrappedCross(cross) => {
-                Self::push_value_object(&cross.target, refs);
-            }
-            _ => {}
         }
-        drop(b);
 
         // Pointer-keyed tables implement internal slots. Their strong values are graph edges from
         // the owner object, not collector roots merely because Rust stores them in `Interp`.
+        // Keep this list identical to `side_slot_owners`.
         let ptr = Rc::as_ptr(o) as usize;
+        if !side_slots {
+            debug_assert!(
+                !self.has_side_slots(ptr),
+                "collector skipped an internal-slot table owner"
+            );
+            return;
+        }
         if let Some(class) = self.class_info.get(&ptr) {
             for field in &class.fields {
                 for transform in &field.transforms {
-                    Self::push_value_object(transform, refs);
+                    sink.value(transform);
                 }
             }
             for initializer in &class.instance_initializers {
-                Self::push_value_object(initializer, refs);
+                sink.value(initializer);
             }
             for (_, property) in &class.private_members {
-                Self::push_property_objects(property, refs);
+                property.with_object_edge(|p| sink.object(p));
+                if let Some(getter) = property.getter() {
+                    sink.value(getter);
+                }
+                if let Some(setter) = property.setter() {
+                    sink.value(setter);
+                }
             }
+            // A class constructor's field-initializer environment.
+            sink.scope(&class.field_env);
         }
         if let Some(bindings) = self.module_ns.get(&ptr) {
             for binding in bindings.values() {
-                if let crate::modules::NsBinding::Static(value) = binding {
-                    Self::push_value_object(value, refs);
+                match binding {
+                    crate::modules::NsBinding::Static(value) => sink.value(value),
+                    crate::modules::NsBinding::Live(env, _) => sink.scope(env),
                 }
             }
         }
         if let Some(entries) = self.map_data.get(&ptr) {
             for (key, value) in entries.iter() {
-                Self::push_value_object(key, refs);
-                Self::push_value_object(value, refs);
+                sink.value(key);
+                sink.value(value);
             }
         }
         if let Some(iterator) = self.collection_iterators.get(&ptr) {
             if let Some(target) = &iterator.target {
-                refs.push(target.clone());
+                sink.object(target);
             }
         }
         if let Some(value) = self.ta_buffer.get(&ptr) {
-            Self::push_value_object(value, refs);
+            sink.value(value);
         }
         if let Some((target, handler)) = self.proxies.get(&ptr) {
-            Self::push_value_object(target, refs);
-            Self::push_value_object(handler, refs);
+            sink.value(target);
+            sink.value(handler);
         }
         if let Some(properties) = self.host_indexed.get(&ptr) {
-            Self::push_value_object(&properties.getter, refs);
+            sink.value(&properties.getter);
             if let Some(live) = &properties.live {
-                Self::push_value_object(&live.state, refs);
+                sink.value(&live.state);
                 if let Some(getter) = &live.named_getter {
-                    Self::push_value_object(getter, refs);
+                    sink.value(getter);
                 }
             }
         }
         if let Some(promise) = self.promises.get(&ptr) {
-            Self::push_value_object(&promise.value, refs);
+            sink.value(&promise.value);
             for (fulfilled, rejected, result, _) in &promise.reactions {
-                Self::push_value_object(&fulfilled.callback, refs);
-                Self::push_value_object(&rejected.callback, refs);
+                sink.value(&fulfilled.callback);
+                sink.value(&rejected.callback);
                 if let Some(global) = &fulfilled.script_caller {
-                    refs.push(global.clone());
+                    sink.object(global);
                 }
                 if let Some(global) = &rejected.script_caller {
-                    refs.push(global.clone());
+                    sink.object(global);
                 }
-                Self::push_value_object(result, refs);
+                sink.value(result);
             }
         }
         if let Some(value) = self.promise_forward.get(&ptr) {
-            Self::push_value_object(value, refs);
+            sink.value(value);
         }
         if let Some(queue) = self.async_gen_queue.get(&ptr) {
             for (promise, resume) in queue {
-                Self::push_value_object(promise, refs);
+                sink.value(promise);
                 match resume {
                     crate::coroutine::Resume::Next(value)
                     | crate::coroutine::Resume::Return(value)
-                    | crate::coroutine::Resume::Throw(value) => {
-                        Self::push_value_object(value, refs)
-                    }
+                    | crate::coroutine::Resume::Throw(value) => sink.value(value),
                     crate::coroutine::Resume::Terminate => {}
                 }
             }
         }
         if let Some(registry) = self.finalization_registries.get(&ptr) {
-            Self::push_value_object(&registry.cleanup_callback.callback, refs);
+            sink.value(&registry.cleanup_callback.callback);
             if let Some(global) = &registry.cleanup_callback.script_caller {
-                refs.push(global.clone());
+                sink.object(global);
             }
             for cell in registry.cells.iter() {
-                Self::push_value_object(&cell.held_value, refs);
+                sink.value(&cell.held_value);
             }
+        }
+        // A mapped `arguments` object's aliased parameter scope.
+        if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
+            sink.scope(env);
         }
     }
 
-    /// Refcount-based cycle collector. An object whose `Rc::strong_count` exceeds the references it
-    /// receives from other heap objects has an *external* holder — the Rust stack, a scope, the
-    /// global, or a side table — so it (and everything it reaches) is live. Everything else is
-    /// referenced only from within unreachable cycles and is reclaimed by breaking its references.
-    /// This needs no root enumeration, so it is safe to run in the middle of evaluation.
+    /// Whether `ptr` keys any internal-slot table walked by [`Interp::visit_object_edges`].
+    fn has_side_slots(&self, ptr: usize) -> bool {
+        macro_rules! any_table {
+            ($($table:ident),+ $(,)?) => { false $(|| self.$table.contains_key(&ptr))+ };
+        }
+        gc_side_slot_tables!(any_table)
+    }
+
+    /// Snapshot members (by `index`, pointer → position) that key any internal-slot table
+    /// walked by [`Interp::visit_object_edges`], plus coroutine owners when `generators`.
+    /// Every other member can skip those probes for this collection: the tables are not
+    /// modified while a collector runs, and the flags are rebuilt from the actual entries
+    /// each time, never from a persistent per-object bit. Returns `None` (probe everything)
+    /// when the tables are large relative to the snapshot, so that collections of a small
+    /// nursery never scale with long-lived side-table state.
+    pub(crate) fn side_slot_owners(
+        &self,
+        index: &crate::fasthash::FastMap<usize, usize>,
+        len: usize,
+        generators: bool,
+    ) -> Option<Vec<bool>> {
+        macro_rules! entries {
+            ($($table:ident),+ $(,)?) => { 0usize $(.saturating_add(self.$table.len()))+ };
+        }
+        let mut entries = gc_side_slot_tables!(entries);
+        if generators {
+            entries = entries.saturating_add(self.generators.len());
+        }
+        if len == 0 || entries > len.saturating_mul(2) {
+            return None;
+        }
+        let mut owners = vec![false; len];
+        macro_rules! flag {
+            ($($table:ident),+ $(,)?) => {
+                $(for owner in self.$table.keys() {
+                    if let Some(&position) = index.get(owner) {
+                        owners[position] = true;
+                    }
+                })+
+            };
+        }
+        gc_side_slot_tables!(flag);
+        if generators {
+            flag!(generators);
+        }
+        Some(owners)
+    }
+
+    /// Append object and environment references held directly by `o` into reusable scratch
+    /// vectors (cleared first). Each vector receives its own handle clones.
+    pub(crate) fn object_edges_into(&self, o: &Gc, objects: &mut Vec<Gc>, scopes: &mut Vec<Env>) {
+        objects.clear();
+        scopes.clear();
+        self.visit_object_edges(
+            o,
+            true,
+            &mut crate::gc_edges::DirectGcEdges { objects, scopes },
+        );
+    }
+
+    pub(crate) fn obj_refs_into(&self, o: &Gc, refs: &mut Vec<Gc>) {
+        let mut scopes = Vec::new();
+        self.object_edges_into(o, refs, &mut scopes);
+    }
+
     /// The scopes `o` refers to: a user function's closure environment, a mapped `arguments`
-    /// object's aliased parameter scope, and a class constructor's field-initializer environment.
+    /// object's aliased parameter scope, a class constructor's field-initializer environment
+    /// and a module namespace's live bindings.
     pub(crate) fn obj_scope_refs_into(&self, o: &Gc, out: &mut Vec<Env>) {
-        out.clear();
-        if let Callable::User(user) = &o.borrow().call {
-            out.push(user.env.clone());
-        }
-        let ptr = Rc::as_ptr(o) as usize;
-        if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
-            out.push(env.clone());
-        }
-        if let Some(ci) = self.class_info.get(&ptr) {
-            out.push(ci.field_env.clone());
-        }
-        if let Some(bindings) = self.module_ns.get(&ptr) {
-            for binding in bindings.values() {
-                if let crate::modules::NsBinding::Live(env, _) = binding {
-                    out.push(env.clone());
-                }
-            }
-        }
+        let mut objects = Vec::new();
+        self.object_edges_into(o, &mut objects, out);
     }
 
     /// Sweep one already-proven non-live set. Full and nursery collectors share atomic weak
@@ -9985,14 +10055,29 @@ impl Interp {
             b.gc_mark.set(false);
             b.gc_internal.set(0);
         }
+        let live_index: crate::fasthash::FastMap<usize, usize> = live
+            .iter()
+            .enumerate()
+            .map(|(index, object)| (Rc::as_ptr(object) as usize, index))
+            .collect();
+        // Most objects key no internal-slot table; skip those probes for them.
+        let side_slots = self.side_slot_owners(&live_index, live.len(), false);
         let mut object_refs = Vec::new();
         let mut scope_refs = Vec::new();
         let mut edge_cache = crate::gc_edges::GcEdgeCache::new(live.len(), edge_budget);
         let mut native_captures = crate::native_captures::NativeCaptureSnapshot::empty();
-        for o in &live {
+        for (index, o) in live.iter().enumerate() {
             native_captures.observe(o, cells(o));
-            self.obj_refs_into(o, &mut object_refs);
-            self.obj_scope_refs_into(o, &mut scope_refs);
+            object_refs.clear();
+            scope_refs.clear();
+            self.visit_object_edges(
+                o,
+                side_slots.as_ref().is_none_or(|owners| owners[index]),
+                &mut crate::gc_edges::DirectGcEdges {
+                    objects: &mut object_refs,
+                    scopes: &mut scope_refs,
+                },
+            );
             let cached = edge_cache.prepare(object_refs.len(), scope_refs.len());
             // A retained scratch handle is an extra collector-owned edge, NOT an external
             // root. Count both it and the actual graph edge before comparing strong counts.
@@ -10031,12 +10116,6 @@ impl Interp {
                 }
             }
         }
-
-        let live_index: crate::fasthash::FastMap<usize, usize> = live
-            .iter()
-            .enumerate()
-            .map(|(index, object)| (Rc::as_ptr(object) as usize, index))
-            .collect();
 
         // ECMAScript's GetTemplateObject cache is a per-Realm internal slot.  The cache is
         // stored on the interpreter for fast lookup, so account for its values as internal
@@ -10532,14 +10611,22 @@ impl Interp {
                     }
                 } else {
                     // Budget overflow or a foreign-heap object: preserve the original trace.
-                    self.obj_refs_into(&o, &mut object_refs);
+                    object_refs.clear();
+                    scope_refs.clear();
+                    self.visit_object_edges(
+                        &o,
+                        !in_snapshot || side_slots.as_ref().is_none_or(|owners| owners[index]),
+                        &mut crate::gc_edges::DirectGcEdges {
+                            objects: &mut object_refs,
+                            scopes: &mut scope_refs,
+                        },
+                    );
                     for p in object_refs.drain(..) {
                         if !p.borrow().gc_mark.get() {
                             p.borrow().gc_mark.set(true);
                             stack.push(p);
                         }
                     }
-                    self.obj_scope_refs_into(&o, &mut scope_refs);
                     for e in scope_refs.drain(..) {
                         if let Some(&k) = sidx.get(&(Rc::as_ptr(&e) as usize)) {
                             if !s_mark[k] {

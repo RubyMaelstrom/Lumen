@@ -61,10 +61,10 @@ impl LazyFunctionPrototype {
         prototype
     }
 
-    pub(super) fn gc_edge(&self) -> Gc {
+    pub(super) fn with_gc_edge(&self, f: impl FnOnce(&Gc)) {
         match &*self.state.borrow() {
-            State::Parent(parent) => parent.clone(),
-            State::Materialized(prototype) => prototype.clone(),
+            State::Parent(parent) => f(parent),
+            State::Materialized(prototype) => f(prototype),
         }
     }
 

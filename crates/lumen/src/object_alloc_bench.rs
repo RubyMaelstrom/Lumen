@@ -98,3 +98,60 @@ fn object_layout_sizes() {
         std::mem::size_of::<std::cell::RefCell<Object>>()
     );
 }
+
+/// Collector throughput on a mixed heap: a retained old generation, then young objects, arrays,
+/// closures (environment records) and cyclic garbage. Run with
+/// `cargo test --release -p lumen --lib gc_collection_bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn gc_collection_bench() {
+    use crate::value::GcCause;
+    use crate::{Completion, Engine};
+    fn run(engine: &mut Engine, source: &str) {
+        match engine.eval(source, false).expect("benchmark source parses") {
+            Completion::Value(_) => {}
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+    let mut engine = Engine::new();
+    run(
+        &mut engine,
+        r#"
+        var old = [];
+        for (var i = 0; i < 200000; i++) old.push({id: i, next: null, tag: 'x', list: [i, i + 1]});
+        for (var i = 1; i < old.length; i++) old[i].next = old[i - 1];
+        function maker(n) { var captured = {n: n}; return function () { return captured.n; }; }
+        var closures = [];
+        for (var i = 0; i < 20000; i++) closures.push(maker(i));
+        true
+    "#,
+    );
+    engine.interp.gc_collect();
+    let young_source = r#"
+        var young = [];
+        for (var i = 0; i < 60000; i++) {
+            var o = {a: i, b: {c: i, d: 'y'}, e: [i]};
+            if (i % 3 == 0) { o.self = o; o.b.parent = o; } else { young.push(o); }
+            if (i % 10 == 0) young.push(maker(i));
+        }
+        true
+    "#;
+    let mut minor = Vec::new();
+    for _ in 0..5 {
+        run(&mut engine, young_source);
+        let started = std::time::Instant::now();
+        engine.interp.gc_collect_young(GcCause::Explicit);
+        minor.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    let mut major = Vec::new();
+    for _ in 0..3 {
+        run(&mut engine, young_source);
+        let started = std::time::Instant::now();
+        engine.interp.gc_collect();
+        major.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    let live = crate::value::heap_live_objects(&engine.interp.gc_heap);
+    println!("gc bench: live objects after {live}");
+    println!("minor ms {minor:.2?}");
+    println!("major ms {major:.2?}");
+}

@@ -13,6 +13,7 @@
 //! atomically. Both collectors use the same weak clearing and internal-slot sweep.
 
 use crate::fasthash::{FastMap, FastSet};
+use crate::gc_edges::GcEdgeSink;
 use crate::host::HostGcVisitor;
 use crate::interpreter::{Env, Interp};
 use crate::value::{Callable, Exotic, Gc, Value};
@@ -41,6 +42,9 @@ enum Node {
     Scope(usize),
 }
 
+/// Marks an environment-record target in [`Nursery::edges`]; object targets are plain indices.
+const SCOPE_EDGE: u32 = 1 << 31;
+
 struct Nursery {
     objects: Vec<Gc>,
     scopes: Vec<Env>,
@@ -53,6 +57,12 @@ struct Nursery {
     pending: Vec<Node>,
     host_edges: FastMap<usize, Vec<usize>>,
     native: crate::gc_native::NativeGcGraph,
+    /// Young-to-young strong edges found while counting internal references, replayed while
+    /// marking. No graph mutation or JS runs in between, so both passes see the same graph;
+    /// only identities are stored (never extra Rc owners). Node `k` (objects first, then
+    /// scopes) owns `edges[edge_starts[k]..edge_starts[k + 1]]`.
+    edge_starts: Vec<usize>,
+    edges: Vec<u32>,
 }
 
 impl Nursery {
@@ -75,6 +85,8 @@ impl Nursery {
             pending: Vec::new(),
             host_edges: FastMap::default(),
             native: crate::gc_native::NativeGcGraph::default(),
+            edge_starts: Vec::with_capacity(objects.len() + scopes.len() + 1),
+            edges: Vec::new(),
             objects,
             scopes,
         }
@@ -91,24 +103,91 @@ impl Nursery {
         }
     }
 
-    fn visit(&mut self, objects: &mut Vec<Gc>, scopes: &mut Vec<Env>, counting: bool) {
-        for object in objects.drain(..) {
-            if let Some(&index) = self.object_index.get(&(Rc::as_ptr(&object) as usize)) {
-                if counting {
-                    self.object_internal[index] += 1;
-                } else {
-                    self.mark(Node::Object(index));
-                }
+    /// Count and record young node `index`'s edges (objects first, then scopes). Edges to old
+    /// or foreign nodes are irrelevant to a minor collection: those nodes are not candidates.
+    fn count_object(
+        &mut self,
+        interp: &Interp,
+        index: usize,
+        side_slots: bool,
+        captures: &mut crate::native_captures::NativeCaptureSnapshot,
+        scratch: (&mut Vec<Gc>, &mut Vec<Env>),
+    ) {
+        self.edge_starts.push(self.edges.len());
+        let object = &self.objects[index];
+        captures.observe(object, &object.borrow());
+        let mut recorder = YoungEdges {
+            object_index: &self.object_index,
+            scope_index: &self.scope_index,
+            object_internal: &mut self.object_internal,
+            scope_internal: &mut self.scope_internal,
+            edges: &mut self.edges,
+        };
+        interp.visit_object_edges(object, side_slots, &mut recorder);
+        if !side_slots {
+            return;
+        }
+        if let Some(coroutine) = interp.generators.get(&(Rc::as_ptr(object) as usize)) {
+            let (objects, scopes) = scratch;
+            coroutine.trace_gc(&mut crate::gc_edges::DirectGcEdges { objects, scopes });
+            for object in objects.drain(..) {
+                recorder.object(&object);
+            }
+            for scope in scopes.drain(..) {
+                recorder.scope(&scope);
             }
         }
-        for scope in scopes.drain(..) {
-            if let Some(&index) = self.scope_index.get(&(Rc::as_ptr(&scope) as usize)) {
-                if counting {
-                    self.scope_internal[index] += 1;
-                } else {
-                    self.mark(Node::Scope(index));
-                }
-            }
+    }
+
+    fn count_scope(&mut self, index: usize) {
+        self.edge_starts.push(self.edges.len());
+        let mut recorder = YoungEdges {
+            object_index: &self.object_index,
+            scope_index: &self.scope_index,
+            object_internal: &mut self.object_internal,
+            scope_internal: &mut self.scope_internal,
+            edges: &mut self.edges,
+        };
+        visit_scope_edges(&self.scopes[index], &mut recorder);
+    }
+
+    /// Mark the young targets recorded for node `k`.
+    fn mark_recorded(&mut self, k: usize) {
+        let (start, end) = (self.edge_starts[k], self.edge_starts[k + 1]);
+        for slot in start..end {
+            let target = self.edges[slot];
+            self.mark(if target & SCOPE_EDGE != 0 {
+                Node::Scope((target & !SCOPE_EDGE) as usize)
+            } else {
+                Node::Object(target as usize)
+            });
+        }
+    }
+}
+
+/// Counts internal references to young nodes and records the edge for marking.
+struct YoungEdges<'a> {
+    object_index: &'a FastMap<usize, usize>,
+    scope_index: &'a FastMap<usize, usize>,
+    object_internal: &'a mut [usize],
+    scope_internal: &'a mut [usize],
+    edges: &'a mut Vec<u32>,
+}
+
+impl GcEdgeSink for YoungEdges<'_> {
+    #[inline]
+    fn object(&mut self, object: &Gc) {
+        if let Some(&index) = self.object_index.get(&(Rc::as_ptr(object) as usize)) {
+            self.object_internal[index] += 1;
+            self.edges.push(index as u32);
+        }
+    }
+
+    #[inline]
+    fn scope(&mut self, scope: &Env) {
+        if let Some(&index) = self.scope_index.get(&(Rc::as_ptr(scope) as usize)) {
+            self.scope_internal[index] += 1;
+            self.edges.push(index as u32 | SCOPE_EDGE);
         }
     }
 }
@@ -175,69 +254,88 @@ impl HostGcVisitor for Nursery {
     }
 }
 
-fn scope_edges(scope: &Env, objects: &mut Vec<Gc>, scopes: &mut Vec<Env>) {
+/// Every strong edge an environment record owns: its parent, a `with` object, binding values
+/// and live module-import environments.
+fn visit_scope_edges(scope: &Env, sink: &mut impl GcEdgeSink) {
     let scope = scope.borrow();
     if let Some(parent) = &scope.parent {
-        scopes.push(parent.clone());
+        sink.scope(parent);
     }
-    if let Some(Value::Obj(object)) = &scope.with_obj {
-        objects.push(object.clone());
+    if let Some(with) = &scope.with_obj {
+        sink.value(with);
     }
     for binding in scope.vars.values() {
-        if let Value::Obj(object) = &binding.value {
-            objects.push(object.clone());
-        }
+        sink.value(&binding.value);
         if let Some((scope, _)) = binding.import_ref.as_deref() {
-            scopes.push(scope.clone());
+            sink.scope(scope);
         }
     }
 }
 
 impl Interp {
-    fn nursery_object_edges(&self, object: &Gc, objects: &mut Vec<Gc>, scopes: &mut Vec<Env>) {
-        self.obj_refs_into(object, objects);
-        self.obj_scope_refs_into(object, scopes);
-        if let Some(coroutine) = self.generators.get(&(Rc::as_ptr(object) as usize)) {
-            coroutine.trace_gc(&mut crate::gc_edges::DirectGcEdges { objects, scopes });
-        }
-    }
-
     pub(crate) fn gc_collect_young(&mut self, cause: crate::value::GcCause) {
+        let (objects, scopes) = crate::value::heap_young_snapshot(&self.gc_heap);
+        if objects.len() >= SCOPE_EDGE as usize || scopes.len() >= SCOPE_EDGE as usize {
+            // Edge identities are 31-bit; such a nursery is far beyond any live-object limit.
+            drop((objects, scopes));
+            self.gc_collect_with_edge_budget(cause, crate::gc_edges::EDGE_CACHE_BYTES);
+            return;
+        }
         let started = crate::value::gc_performance_metrics_start();
         let total_objects_before = crate::value::heap_live_objects(&self.gc_heap).max(0) as usize;
         let total_scopes_before =
             started.map(|_| crate::value::gc_scope_registry_prune(&self.gc_heap));
-        let (objects, scopes) = crate::value::heap_young_snapshot(&self.gc_heap);
         let mut nursery = Nursery::new(objects, scopes);
+        let (object_count, scope_count) = (nursery.objects.len(), nursery.scopes.len());
+        // Most young objects key no internal-slot table (or coroutine); skip those probes.
+        let side_slots = self.side_slot_owners(&nursery.object_index, object_count, true);
+        let mut native_captures = crate::native_captures::NativeCaptureSnapshot::empty();
         let mut object_edges = Vec::new();
         let mut scope_refs = Vec::new();
-        for index in 0..nursery.objects.len() {
-            self.nursery_object_edges(&nursery.objects[index], &mut object_edges, &mut scope_refs);
-            nursery.visit(&mut object_edges, &mut scope_refs, true);
+        for index in 0..object_count {
+            let side = side_slots.as_ref().is_none_or(|owners| owners[index]);
+            nursery.count_object(
+                self,
+                index,
+                side,
+                &mut native_captures,
+                (&mut object_edges, &mut scope_refs),
+            );
         }
-        for index in 0..nursery.scopes.len() {
-            scope_edges(&nursery.scopes[index], &mut object_edges, &mut scope_refs);
-            nursery.visit(&mut object_edges, &mut scope_refs, true);
+        for index in 0..scope_count {
+            nursery.count_scope(index);
         }
+        nursery.edge_starts.push(nursery.edges.len());
         // Pins represent side-table bookkeeping, not externally reachable JS handles. Actual
         // outgoing strong side-table edges were counted alongside their owning young objects.
-        // Test only young identities. Walking every old pinned side-table owner
-        // would make each nursery collection scale with the stable platform heap.
-        for (index, object) in nursery.objects.iter().enumerate() {
-            if self.gc_pins.contains_key(&(Rc::as_ptr(object) as usize)) {
-                nursery.object_internal[index] += 1;
+        // Test only young identities, from whichever side is smaller: walking every old pinned
+        // side-table owner would make each nursery collection scale with the stable platform
+        // heap.
+        if self.gc_pins.len() < object_count {
+            for owner in self.gc_pins.keys() {
+                if let Some(&index) = nursery.object_index.get(owner) {
+                    nursery.object_internal[index] += 1;
+                }
+            }
+        } else {
+            for (index, object) in nursery.objects.iter().enumerate() {
+                if self.gc_pins.contains_key(&(Rc::as_ptr(object) as usize)) {
+                    nursery.object_internal[index] += 1;
+                }
             }
         }
         self.host_state.trace_gc(&mut nursery);
-        let native_captures = crate::native_captures::NativeCaptureSnapshot::new(&nursery.objects);
         native_captures.trace(&mut nursery);
         let mut native_js = Vec::new();
         nursery.native.trace_roots(&mut native_js);
-        let old_owners: Vec<_> = nursery
-            .native
-            .js_owners()
-            .filter(|owner| !nursery.object_index.contains_key(owner))
-            .collect();
+        let mut native_owners = vec![false; object_count];
+        let mut old_owners = Vec::new();
+        for owner in nursery.native.js_owners() {
+            match nursery.object_index.get(&owner) {
+                Some(&index) => native_owners[index] = true,
+                None => old_owners.push(owner),
+            }
+        }
         for owner in old_owners {
             nursery.native.trace_js(owner, &mut native_js);
         }
@@ -246,12 +344,12 @@ impl Interp {
                 nursery.mark(Node::Object(index));
             }
         }
-        for index in 0..nursery.objects.len() {
+        for index in 0..object_count {
             if Rc::strong_count(&nursery.objects[index]) > nursery.object_internal[index] + 1 {
                 nursery.mark(Node::Object(index));
             }
         }
-        for index in 0..nursery.scopes.len() {
+        for index in 0..scope_count {
             if Rc::strong_count(&nursery.scopes[index]) > nursery.scope_internal[index] + 1 {
                 nursery.mark(Node::Scope(index));
             }
@@ -259,30 +357,26 @@ impl Interp {
         while let Some(node) = nursery.pending.pop() {
             match node {
                 Node::Object(index) => {
-                    nursery
-                        .native
-                        .trace_js(Rc::as_ptr(&nursery.objects[index]) as usize, &mut native_js);
-                    for target in native_js.drain(..) {
-                        if let Some(&index) = nursery.object_index.get(&target) {
-                            nursery.mark(Node::Object(index));
+                    if native_owners[index] {
+                        nursery
+                            .native
+                            .trace_js(Rc::as_ptr(&nursery.objects[index]) as usize, &mut native_js);
+                        for target in native_js.drain(..) {
+                            if let Some(&index) = nursery.object_index.get(&target) {
+                                nursery.mark(Node::Object(index));
+                            }
                         }
                     }
-                    self.nursery_object_edges(
-                        &nursery.objects[index],
-                        &mut object_edges,
-                        &mut scope_refs,
-                    );
-                    nursery.visit(&mut object_edges, &mut scope_refs, false);
-                    if let Some(targets) = nursery.host_edges.remove(&index) {
-                        for target in targets {
-                            nursery.mark(Node::Object(target));
+                    nursery.mark_recorded(index);
+                    if !nursery.host_edges.is_empty() {
+                        if let Some(targets) = nursery.host_edges.remove(&index) {
+                            for target in targets {
+                                nursery.mark(Node::Object(target));
+                            }
                         }
                     }
                 }
-                Node::Scope(index) => {
-                    scope_edges(&nursery.scopes[index], &mut object_edges, &mut scope_refs);
-                    nursery.visit(&mut object_edges, &mut scope_refs, false);
-                }
+                Node::Scope(index) => nursery.mark_recorded(object_count + index),
             }
         }
         let dead: FastSet<_> = nursery
@@ -320,7 +414,7 @@ impl Interp {
                 drop(detached);
             }
         }
-        let scanned = (nursery.objects.len(), nursery.scopes.len());
+        let scanned = (object_count, scope_count);
         drop(nursery);
         self.gc_drain_weak_deaths();
         self.gc_schedule_finalization_cleanup(&dead);
@@ -501,5 +595,69 @@ mod tests {
         young(&mut engine.interp);
         eval(&mut engine, "true", "true");
         eval(&mut engine, "[first.deref() === undefined, second.deref() === undefined, finalized.join(',')].join(':')", "true:true:91");
+    }
+
+    /// Young owners of every internal-slot family keep their table edges across a nursery
+    /// collection, and cycles that pass only through those tables (or a suspended coroutine)
+    /// are reclaimed. Covers both the owner-flag path (few table entries) and the conservative
+    /// probe-everything path (old table entries outnumber the nursery), on every tier.
+    #[test]
+    fn nursery_side_slot_owners_keep_table_edges_with_and_without_owner_flags() {
+        for dense_old_tables in [false, true] {
+            for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                let mut engine = Engine::new();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                if dense_old_tables {
+                    eval(
+                        &mut engine,
+                        "var oldMaps = []; for (var i = 0; i < 4000; i++) oldMaps.push(new Map([[i, {i}]])); true",
+                        "true",
+                    );
+                }
+                engine.interp.gc_collect();
+                eval(
+                    &mut engine,
+                    r#"
+                    var weak = [];
+                    var keep = (function () {
+                        var m = new Map(), key = {k: 1}; m.set(key, {v: 2});
+                        var s = new Set([{s: 3}]);
+                        var proxy = new Proxy({t: 5}, {});
+                        function* gen() { var held = {g: 6}; yield held.g; yield held.g + 1; }
+                        var it = gen(); it.next();
+                        class C { x = {f: 7}; #p = {q: 9}; q() { return this.#p.q; } }
+                        var args = (function (a) { return arguments; })({a: 8});
+                        var pending = new Promise(function () {});
+                        var reaction = {r: 4};
+                        pending.then(function () { return reaction; });
+                        var ta = new Uint8Array([10]);
+                        return {m, key, s, proxy, it, C, args, ta};
+                    })();
+                    (function () {
+                        var cyclic = new Map(); cyclic.set('self', cyclic);
+                        var set = new Set(); set.add(set);
+                        var it2 = (function* () { var me = it2; yield 1; })(); it2.next();
+                        var target = {}; var p = new Proxy(target, {h: target}); target.p = p;
+                        weak.push(new WeakRef(cyclic), new WeakRef(set), new WeakRef(it2),
+                                  new WeakRef(target));
+                    })();
+                    true
+                "#,
+                    "true",
+                );
+                young(&mut engine.interp);
+                eval(&mut engine, "true", "true");
+                eval(
+                    &mut engine,
+                    r#"[keep.m.get(keep.key).v, [...keep.s][0].s, keep.proxy.t,
+                        keep.it.next().value, new keep.C().x.f, new keep.C().q(),
+                        keep.args[0].a, keep.ta[0],
+                        weak.map(function (w) { return w.deref() === undefined; }).join('/')
+                       ].join(',')"#,
+                    "2,3,5,7,7,9,8,10,true/true/true/true",
+                );
+            }
+        }
     }
 }

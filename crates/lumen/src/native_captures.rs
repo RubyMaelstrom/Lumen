@@ -20,14 +20,6 @@ pub(crate) struct NativeCaptureSnapshot {
 }
 
 impl NativeCaptureSnapshot {
-    pub(crate) fn new(objects: &[Gc]) -> Self {
-        let mut snapshot = Self::empty();
-        for owner in objects {
-            snapshot.observe(owner, &owner.borrow());
-        }
-        snapshot
-    }
-
     pub(crate) fn empty() -> Self {
         Self {
             groups: FastMap::default(),
