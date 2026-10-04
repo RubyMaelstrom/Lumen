@@ -2759,6 +2759,9 @@ pub struct Interp {
     /// ordinary insertion on first use. Keys and shape only; every result object is fresh and
     /// takes the active Realm's %Object.prototype%.
     pub(crate) descriptor_maps: [std::cell::OnceCell<Props>; 2],
+    /// Pre-shaped property map of CreateIterResultObject results (`value`, `done`), built by
+    /// ordinary insertion on first use. Keys and shape only, like `descriptor_maps`.
+    pub(crate) iter_result_map: std::cell::OnceCell<Props>,
     pub(crate) computed_reads: crate::bytecode::ComputedReadCache,
     /// Quiescent source-scoped loop plans; executing plans have only weak cache entries.
     pub(crate) fragment_cache: crate::bytecode::fragment_cache::Cache,
@@ -3241,6 +3244,7 @@ interp_memory_inventory! {
     stub_cache => "measured",
     arguments_shapes => "measured",
     descriptor_maps => "measured",
+    iter_result_map => "measured",
     stub_cache_names => "measured",
     computed_reads => "measured",
     fragment_cache => "measured",
@@ -3391,7 +3395,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 156);
+    assert_eq!(names.len(), 157);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4303,6 +4307,7 @@ impl Interp {
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             arguments_shapes: None,
             descriptor_maps: Default::default(),
+            iter_result_map: Default::default(),
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
             computed_reads: Default::default(),
             fragment_cache: Default::default(),

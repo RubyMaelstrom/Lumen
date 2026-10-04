@@ -8816,10 +8816,21 @@ fn iterator_proto_weird_set(
 }
 
 fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
-    let o = i.new_object();
-    set_data(&o, "value", value);
-    set_data(&o, "done", Value::Bool(done));
-    Value::Obj(o)
+    // CreateIterResultObject (ECMA-262): an ordinary object of the current Realm whose own data
+    // properties `value` then `done` are created by CreateDataPropertyOrThrow. The key sequence
+    // is fixed, so the finished map is built once per Agent and instantiated.
+    let map = i.iter_result_map.get_or_init(|| {
+        let mut map = Props::new();
+        map.insert("value", Property::plain(Value::Undefined));
+        map.insert("done", Property::plain(Value::Undefined));
+        map
+    });
+    let props = map.instantiate_plain([value, Value::Bool(done)].into_iter());
+    Value::Obj(Object::new_with_parts(
+        Some(i.object_proto.clone()),
+        props,
+        Exotic::None,
+    ))
 }
 
 /// `Iterator.zip` / `Iterator.zipKeyed`: validate options, open every input iterator eagerly

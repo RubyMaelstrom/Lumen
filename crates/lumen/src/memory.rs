@@ -1329,7 +1329,11 @@ fn scan_realm(
             visitor.rc_str(key);
         }
     }
-    for map in &interp.descriptor_maps {
+    for map in interp
+        .descriptor_maps
+        .iter()
+        .chain(std::iter::once(&interp.iter_result_map))
+    {
         if let Some(map) = map.get() {
             visitor.props(map);
         }

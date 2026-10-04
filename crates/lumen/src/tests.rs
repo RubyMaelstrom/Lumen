@@ -19996,6 +19996,40 @@ fn iterator_take_closes_on_bad_limit() {
 }
 
 #[test]
+fn iterator_results_are_fresh_ordered_objects_in_all_tiers() {
+    // ECMA-262 CreateIterResultObject, snapshot e28783d5fc9d: a fresh ordinary object of the
+    // current Realm with data properties `value` then `done`, all attributes true. Results built
+    // from one shared map template must stay independent.
+    let source = r#"
+        var it = [1, 2].values();
+        var a = it.next(), b = it.next(), c = it.next();
+        a.extra = 1;
+        var m = new Map([[1, "one"]]).entries().next();
+        function* g() { yield 7; } var gi = g(); var g1 = gi.next(), g2 = gi.next();
+        var s = new Set(["s"]).values().next();
+        [Object.keys(a).join(","), Object.keys(b).join(","), "extra" in b, a !== b,
+         Object.getPrototypeOf(c) === Object.prototype,
+         JSON.stringify(Object.getOwnPropertyDescriptor(b, "done")), c.value === undefined && c.done,
+         m.value.join(":"), m.done, g1.value, g1.done, g2.done, Object.keys(g2).join(","),
+         s.value, Object.keys(s).join(",")].join("|")
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            r#"value,done,extra|value,done|false|true|true|{"value":false,"writable":true,"enumerable":true,"configurable":true}|true|1:one|false|7|false|true|value,done|s|value,done"#,
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn class_field_initializers_keep_own_environments_in_all_tiers() {
     // ECMA-262 ClassFieldDefinitionEvaluation / DefineField, snapshot e28783d5fc9d: each
     // initializer is a method body with its own `this`; a field without an initializer is
