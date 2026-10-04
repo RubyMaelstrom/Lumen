@@ -6418,6 +6418,9 @@ impl Interp {
             for field in fields.iter() {
                 let key = &field.key;
                 let mut v = match &field.init {
+                    // An initializer that reads no binding (not even `this`), declares nothing
+                    // and creates no closure cannot observe which environment it runs in.
+                    Some(e) if env_free_initializer(e) => me.eval(e, &field_env)?,
                     Some(e) => {
                         // Each initializer evaluates in its own environment (it is a method
                         // body in ClassFieldDefinitionEvaluation); one without an initializer
@@ -8301,6 +8304,36 @@ enum LoopStep {
     Continue(Value),
     /// Stop looping; the value is the final iteration's body completion value (or undefined).
     Done(Value),
+}
+
+/// A field initializer whose evaluation reads no binding (not even `this` or `undefined`'s
+/// resolution, which the parser already folds), declares nothing and creates no closure:
+/// primitive literals, and array/object literals built only from them.
+fn env_free_initializer(e: &Expr) -> bool {
+    match e {
+        Expr::Num(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined => true,
+        Expr::Paren(inner) => env_free_initializer(inner),
+        Expr::Array(items) => items.iter().all(|item| match item {
+            ArrayElem::Item(e) => env_free_initializer(e),
+            ArrayElem::Hole => true,
+            ArrayElem::Spread(_) => false,
+        }),
+        Expr::Object(props) => props.iter().all(|prop| {
+            matches!(
+                prop,
+                PropDef::KeyValue {
+                    key: PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_),
+                    value,
+                } if env_free_initializer(value)
+            )
+        }),
+        _ => false,
+    }
 }
 
 /// [`bind`] with an already shared name, which the binding map adopts without copying.

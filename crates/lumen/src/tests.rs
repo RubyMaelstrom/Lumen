@@ -20153,9 +20153,14 @@ fn class_field_initializers_keep_own_environments_in_all_tiers() {
             try { eval("class E { x = eval('arguments'); } new E()"); return 'none'; }
             catch (error) { return error.constructor.name; }
         })();
+        class L { a = []; b = {k: 1, 2: [3]}; c = 1n; d = "s"; e = undefined; f = (null); g = [1, , 2]; }
+        var l1 = new L(), l2 = new L();
         [Object.getOwnPropertyNames(o).join(':'), o.a === undefined, 'a' in o,
          o.b() === o, p.b() === p, o.c === o.b, o.b !== p.b, p.q(),
-         Object.getOwnPropertyNames(r).join(':'), r.d, 'e' in r, e].join(',')
+         Object.getOwnPropertyNames(r).join(':'), r.d, 'e' in r, e,
+         Object.keys(l1).join(":"), l1.a !== l2.a, l1.b !== l2.b, l1.b[2] !== l2.b[2], l1.b.k,
+         typeof l1.c, l1.d, l1.e, l1.f, l1.g.length, 1 in l1.g,
+         Object.getPrototypeOf(l1.a) === Array.prototype].join(',')
     "#;
     for tier in [
         crate::bytecode::Tier::Interp,
@@ -20167,7 +20172,7 @@ fn class_field_initializers_keep_own_environments_in_all_tiers() {
         engine.set_tier_threshold(0);
         assert_eq!(
             run_in(&mut engine, source),
-            "a:b:c,true,true,true,true,true,true,3,a:b:c:d:e,true,true,SyntaxError",
+            "a:b:c,true,true,true,true,true,true,3,a:b:c:d:e,true,true,SyntaxError,a:b:c:d:e:f:g,true,true,true,1,bigint,s,,,3,false,true",
             "{tier:?}"
         );
     }
