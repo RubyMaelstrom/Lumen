@@ -98,3 +98,52 @@ fn removing_early_keys_from_large_objects_keeps_lookups_and_order() {
         "0again4678910111213141516181920212223242526272829303132333435363739|34|k4,k6,k7,k8|k37,k39,k1|false|4|39|3000|59again",
     );
 }
+
+/// ToPropertyDescriptor reads enumerable, configurable, value, writable, get, set with
+/// HasProperty/Get, in that order, through the descriptor's prototype chain. Ordinary data
+/// properties, inherited fields, accessors, proxies and exotic descriptors must all agree.
+#[test]
+fn property_descriptor_conversion_keeps_field_order_and_inheritance() {
+    all_tiers(
+        r#"
+        const log = [];
+        let results = [];
+        for (let round = 0; round < 30; round++) {
+            log.length = 0;
+            const target = {};
+            Object.defineProperty(target, "plain", { value: 1, enumerable: true });
+            const inherited = Object.create({ value: 2, writable: true });
+            Object.defineProperty(target, "inherited", inherited);
+            const accessor = {
+                get enumerable() { log.push("enumerable"); return true; },
+                get value() { log.push("value"); return 3; },
+            };
+            Object.defineProperty(target, "accessor", accessor);
+            const proxy = new Proxy({ value: 4, configurable: true }, {
+                has(t, k) { log.push("has:" + String(k)); return k in t; },
+                get(t, k) { log.push("get:" + String(k)); return t[k]; },
+            });
+            Object.defineProperty(target, "proxy", proxy);
+            Object.defineProperty(target, "array", Object.assign([], { value: 5 }));
+            Object.prototype.configurable = true;
+            Object.defineProperty(target, "fromObjectPrototype", { value: 6 });
+            delete Object.prototype.configurable;
+            let threw = "";
+            try { Object.defineProperty(target, "bad", { get: 1 }); } catch (e) { threw += e.constructor.name; }
+            try { Object.defineProperty(target, "mixed", { get() {}, value: 1 }); } catch (e) { threw += "," + e.constructor.name; }
+            const d = name => {
+                const x = Object.getOwnPropertyDescriptor(target, name);
+                return name + ":" + x.value + (x.writable ? "w" : "") + (x.enumerable ? "e" : "") + (x.configurable ? "c" : "");
+            };
+            results = [
+                ["plain", "inherited", "accessor", "proxy", "array", "fromObjectPrototype"].map(d).join(" "),
+                log.join(","), threw,
+            ];
+        }
+        results.join("|")
+        "#,
+        "plain:1e inherited:2w accessor:3e proxy:4c array:5 fromObjectPrototype:6c\
+|enumerable,value,has:enumerable,has:configurable,get:configurable,has:value,get:value,has:writable,has:get,has:set\
+|TypeError,TypeError",
+    );
+}

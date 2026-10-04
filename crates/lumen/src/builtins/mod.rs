@@ -4838,12 +4838,59 @@ impl PartialDesc {
     }
 }
 
+/// ToPropertyDescriptor's six HasProperty/Get pairs, answered without running code when
+/// every object on `o`'s prototype chain is ordinary (no Proxy, typed array, namespace,
+/// Web IDL indexed or exotic behavior) and every field found is a data property: then each
+/// HasProperty is the first own lookup along the chain and each Get returns that slot's value,
+/// exactly what the generic reads observe. Returns the fields in the generic path's order,
+/// or `None` to take that path (an accessor, an exotic object, or a borrowed one).
+fn plain_descriptor_fields(o: &Gc) -> Option<[Option<Value>; 6]> {
+    const FIELDS: [&str; 6] = [
+        "enumerable",
+        "configurable",
+        "value",
+        "writable",
+        "get",
+        "set",
+    ];
+    let mut fields: [Option<Value>; 6] = Default::default();
+    let mut current = Some(o.clone());
+    while let Some(object) = current {
+        let body = object.try_borrow().ok()?;
+        if !body.ic_plain.get() || !matches!(body.exotic, Exotic::None) {
+            return None;
+        }
+        for (field, name) in fields.iter_mut().zip(FIELDS) {
+            if field.is_none() {
+                if let Some(property) = body.props.get(name) {
+                    if property.accessor() {
+                        return None;
+                    }
+                    *field = Some(property.value());
+                }
+            }
+        }
+        if fields.iter().all(Option::is_some) {
+            break;
+        }
+        current = body.proto.clone();
+    }
+    Some(fields)
+}
+
 /// Read + validate a descriptor object into a PartialDesc (ToPropertyDescriptor).
 fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
     let o = match desc {
         Value::Obj(o) => o.clone(),
         _ => return Err(i.throw("TypeError", "Property description must be an object")),
     };
+    if let Some([enumerable, configurable, value, writable, get, set]) = plain_descriptor_fields(&o)
+    {
+        let enumerable = enumerable.map(|v| i.to_boolean(&v));
+        let configurable = configurable.map(|v| i.to_boolean(&v));
+        let writable = writable.map(|v| i.to_boolean(&v));
+        return validated_partial(i, value, get, set, writable, enumerable, configurable);
+    }
     // ToPropertyDescriptor reads each field with HasProperty/Get (both trap-aware — the
     // descriptor may itself be a proxy), in the spec's field order: enumerable, configurable,
     // value, writable, get, set.
@@ -4874,6 +4921,19 @@ fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
     } else {
         None
     };
+    validated_partial(i, value, get, set, writable, enumerable, configurable)
+}
+
+/// ToPropertyDescriptor's validation steps after the field reads.
+fn validated_partial(
+    i: &mut Interp,
+    value: Option<Value>,
+    get: Option<Value>,
+    set: Option<Value>,
+    writable: Option<bool>,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+) -> Result<PartialDesc, Abrupt> {
     if (get.is_some() || set.is_some()) && (value.is_some() || writable.is_some()) {
         return Err(i.throw(
             "TypeError",
