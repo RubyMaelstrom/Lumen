@@ -487,6 +487,10 @@ fn regexp_escape_cp(cp: u32, first: bool) -> String {
     if (0xD800..0xE000).contains(&cp) {
         return format!("\\u{cp:04x}");
     }
+    if cp >= crate::jstr::SMUGGLE_BASE {
+        // Private-use characters are returned unescaped, in the engine's pair form.
+        return crate::jstr::from_code_point(cp);
+    }
     let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
     // The first character, if alphanumeric, is hex-escaped so the result can't start an identifier.
     if first && c.is_ascii_alphanumeric() {

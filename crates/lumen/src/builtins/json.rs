@@ -931,7 +931,7 @@ fn json_parse_string(
                                 if (0xDC00..0xE000).contains(&n2) {
                                     *pos += 6;
                                     let c = 0x10000 + ((n - 0xD800) << 10) + (n2 - 0xDC00);
-                                    s.push(char::from_u32(c).unwrap());
+                                    crate::jstr::push_code_point(&mut s, c);
                                     continue;
                                 }
                             }

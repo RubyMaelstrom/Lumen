@@ -201,3 +201,36 @@ fn host_source_text_keeps_plane_16_private_use_characters() {
         }
     }
 }
+
+/// Built-ins that assemble strings from code points store a private-use character as its pair.
+#[test]
+fn built_ins_assemble_plane_16_characters_as_surrogate_pairs() {
+    for tier in TIERS {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        let source = format!(
+            r#"{UNITS}
+            (function () {{
+                let result;
+                for (let round = 0; round < 300; round++) {{
+                    result = [
+                        units(JSON.parse('"\\udbff\\udffd"')),
+                        units(JSON.parse('"\\udbfe\\udc00x"')),
+                        units(JSON.parse('"\\ud800"')),
+                        units(RegExp.escape("\u{{10FFFD}}")),
+                        units(RegExp.escape("x\u{{10F800}}")),
+                        units(String.fromCodePoint(0x10FFFD)),
+                        units(decodeURIComponent("%F4%8F%BF%BD")),
+                    ].join("|");
+                }}
+                return result;
+            }})()"#
+        );
+        assert_eq!(
+            eval_string(it, &source),
+            "dbff dffd|dbfe dc00 78|d800|dbff dffd|5c 78 37 38 dbfe dc00|dbff dffd|dbff dffd",
+            "{tier:?}"
+        );
+    }
+}

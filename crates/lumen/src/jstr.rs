@@ -487,6 +487,20 @@ pub fn code_points(s: &str) -> Vec<u32> {
     CodePointIter::new(s).collect()
 }
 
+/// Append one ECMAScript code point to an engine string: a surrogate value as a lone surrogate,
+/// a smuggle-range character as its canonical smuggled pair, any other character as itself.
+pub(crate) fn push_code_point(out: &mut String, cp: u32) {
+    if (0xD800..0xE000).contains(&cp) {
+        out.push(smuggle(cp as u16));
+    } else if cp >= SMUGGLE_BASE {
+        let v = cp - 0x10000;
+        out.push(smuggle(0xD800 + (v >> 10) as u16));
+        out.push(smuggle(0xDC00 + (v & 0x3FF) as u16));
+    } else {
+        out.push(char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER));
+    }
+}
+
 /// Rebuild the engine representation of one ECMAScript code point. Surrogate values remain lone
 /// code units and real characters in the smuggling range retain the canonical two-scalar form.
 pub fn from_code_point(cp: u32) -> String {
