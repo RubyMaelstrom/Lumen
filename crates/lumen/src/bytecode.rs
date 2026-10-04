@@ -21337,7 +21337,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
 /// under construction (ECMA-262 §13.2.5.5): NamedEvaluation's SetFunctionName for an anonymous
 /// function definition, then CreateDataPropertyOrThrow, which cannot fail on the fresh,
 /// extensible ordinary object. Runs no author code.
-fn literal_define_data<K: AsRef<str> + Into<Rc<str>>>(
+fn literal_define_data<K: AsRef<str> + crate::value::IntoPropKey>(
     i: &mut Interp,
     object: &crate::value::Gc,
     key: K,
@@ -21360,7 +21360,7 @@ fn literal_define_data<K: AsRef<str> + Into<Rc<str>>>(
 /// running LexicalEnvironment `env`. MakeMethod binds the literal as [[HomeObject]] only for a
 /// method that can observe it (see `Function::observes_home_object`). Runs no author code and
 /// cannot fail.
-fn literal_define_method<K: AsRef<str> + Into<Rc<str>>>(
+fn literal_define_method<K: AsRef<str> + crate::value::IntoPropKey>(
     i: &mut Interp,
     object: &crate::value::Gc,
     env: &Env,

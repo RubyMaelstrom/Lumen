@@ -1998,7 +1998,16 @@ pub(crate) fn scan_gc_heap_retained_memory(
             .saturating_mul(std::mem::size_of::<((u32, Rc<str>), u32)>()),
     );
     bytes = bytes.saturating_add(shapes.layouts.allocated_bytes());
+    bytes = bytes.saturating_add(
+        shapes
+            .recent
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<(u32, Rc<str>, u32)>>()),
+    );
     for (_, key) in shapes.transitions.keys() {
+        visitor.rc_str(key);
+    }
+    for (_, key, _) in shapes.recent.iter().flatten() {
         visitor.rc_str(key);
     }
     for layout in shapes.layouts.iter() {
@@ -3556,6 +3565,21 @@ struct ShapeTable {
     transitions: crate::fasthash::FastMap<(u32, Rc<str>), u32>,
     /// Bounded tagged lookup: process-wide IDs are never dense within a particular heap.
     layouts: ShapeLayouts,
+    /// Direct-mapped memo of recent `transitions` hits keyed by parent shape and key *identity*
+    /// (allocated on first use). Insertion sites reuse a few shared key strings (interned
+    /// names, a chunk's constant keys), so most transitions skip hashing and comparing the key
+    /// text. Each entry holds its key, so the identity cannot be reused by another string, and
+    /// `transitions` is append-only, so an entry never disagrees with it.
+    recent: Vec<Option<(u32, Rc<str>, u32)>>,
+}
+
+const RECENT_TRANSITIONS: usize = 512;
+
+#[inline]
+fn recent_transition_slot(parent: u32, key: &Rc<str>) -> usize {
+    let identity = Rc::as_ptr(key) as *const u8 as usize;
+    let mixed = (identity >> 4) ^ (identity >> 13) ^ (parent as usize).wrapping_mul(0x9E37_79B9);
+    mixed % RECENT_TRANSITIONS
 }
 
 // Eager prefix sharing is bounded independently of the existing shape identity table. Larger or
@@ -3568,6 +3592,7 @@ impl ShapeTable {
         ShapeTable {
             transitions: Default::default(),
             layouts: ShapeLayouts::default(),
+            recent: Vec::new(),
         }
     }
 
@@ -3589,13 +3614,30 @@ fn shape_transition(
         if !is_cacheable_shape(parent) {
             return (SHAPE_UNCACHEABLE, None);
         }
-        let pair = (parent, key.clone());
-        let id = if let Some(&id) = shapes.transitions.get(&pair) {
+        let slot = recent_transition_slot(parent, key);
+        let recent = shapes.recent.get(slot).and_then(Option::as_ref).and_then(
+            |(cached_parent, cached_key, child)| {
+                (*cached_parent == parent && Rc::ptr_eq(cached_key, key)).then_some(*child)
+            },
+        );
+        let id = if let Some(id) = recent {
             id
         } else {
-            let id = shapes.fresh();
+            let pair = (parent, key.clone());
+            let id = if let Some(&id) = shapes.transitions.get(&pair) {
+                id
+            } else {
+                let id = shapes.fresh();
+                if is_cacheable_shape(id) {
+                    shapes.transitions.insert(pair, id);
+                }
+                id
+            };
             if is_cacheable_shape(id) {
-                shapes.transitions.insert(pair, id);
+                if shapes.recent.is_empty() {
+                    shapes.recent.resize(RECENT_TRANSITIONS, None);
+                }
+                shapes.recent[slot] = Some((parent, key.clone(), id));
             }
             id
         };
@@ -3690,6 +3732,138 @@ fn array_length_shape(length_key: &Rc<str>) -> u32 {
         heap.array_length_shape.set(shape);
         shape
     })
+}
+
+/// A property key accepted by [`Props::insert`]. Owned and shared strings are adopted as they
+/// are; a borrowed `&str` goes through [`intern_key`] instead of allocating a fresh copy for
+/// every new property.
+pub(crate) trait IntoPropKey {
+    fn into_prop_key(self) -> Rc<str>;
+}
+
+impl IntoPropKey for Rc<str> {
+    #[inline]
+    fn into_prop_key(self) -> Rc<str> {
+        self
+    }
+}
+
+impl IntoPropKey for &Rc<str> {
+    #[inline]
+    fn into_prop_key(self) -> Rc<str> {
+        self.clone()
+    }
+}
+
+impl IntoPropKey for String {
+    #[inline]
+    fn into_prop_key(self) -> Rc<str> {
+        Rc::from(self)
+    }
+}
+
+impl IntoPropKey for &String {
+    #[inline]
+    fn into_prop_key(self) -> Rc<str> {
+        intern_key(self)
+    }
+}
+
+impl IntoPropKey for &str {
+    #[inline]
+    fn into_prop_key(self) -> Rc<str> {
+        intern_key(self)
+    }
+}
+
+const KEY_CACHE_SLOTS: usize = 512;
+/// Longer keys are rare and are not worth comparing on every lookup.
+const KEY_CACHE_MAX_LEN: usize = 48;
+
+thread_local! {
+    /// Recently created property-key strings, indexed by content hash. Host and built-in code
+    /// creates most properties from borrowed text (`set_data`, CreateDataProperty, `[[Set]]`
+    /// creating a property, JSON.parse), the same few names over and over. Each slot owns one
+    /// strong reference, released when the slot is replaced. The table has no destructor, so
+    /// a pooled coroutine thread's exit never touches the counts of keys still in use by
+    /// objects elsewhere; at most these few hundred short strings stay allocated.
+    static KEY_CACHE: [Cell<std::mem::ManuallyDrop<Option<Rc<str>>>>; KEY_CACHE_SLOTS] =
+        const { [const { Cell::new(std::mem::ManuallyDrop::new(None)) }; KEY_CACHE_SLOTS] };
+}
+
+/// An `Rc<str>` with `key`'s text, shared with a recent identical key when possible. Canonical
+/// array-index text is not cached: such keys usually become elements and their text is
+/// discarded, and their cardinality would only evict reusable names.
+pub(crate) fn intern_key(key: &str) -> Rc<str> {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > KEY_CACHE_MAX_LEN || bytes[0].is_ascii_digit() {
+        return Rc::from(key);
+    }
+    let mut hasher = crate::fasthash::FxHasher::default();
+    std::hash::Hasher::write(&mut hasher, bytes);
+    let slot = (std::hash::Hasher::finish(&hasher) as usize) % KEY_CACHE_SLOTS;
+    let Ok(interned) = KEY_CACHE.try_with(|slots| {
+        let cell = &slots[slot];
+        let cached =
+            std::mem::ManuallyDrop::into_inner(cell.replace(std::mem::ManuallyDrop::new(None)));
+        let interned = match cached {
+            Some(cached) if &*cached == key => cached,
+            evicted => {
+                drop(evicted);
+                Rc::from(key)
+            }
+        };
+        cell.set(std::mem::ManuallyDrop::new(Some(interned.clone())));
+        interned
+    }) else {
+        return Rc::from(key);
+    };
+    interned
+}
+
+#[cfg(test)]
+mod key_interning_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_keys_share_text_and_transitions_by_content_only() {
+        let heap = new_gc_heap();
+        let symbols = new_symbol_agent();
+        let _active = enter_agent(&heap, &symbols);
+        let (first, second) = (String::from("alpha"), String::from("alpha"));
+        assert!(Rc::ptr_eq(&intern_key(&first), &intern_key(&second)));
+        assert_eq!(&*intern_key("alphb"), "alphb");
+        let long = "x".repeat(KEY_CACHE_MAX_LEN + 1);
+        for text in ["", "0", "12", "7up", long.as_str()] {
+            assert_eq!(&*intern_key(text), text);
+        }
+        let texts: Vec<String> = (0..5000).map(|n| format!("k{n}")).collect();
+        for text in &texts {
+            assert_eq!(&*intern_key(text), text.as_str());
+        }
+        // Equal key text reaches one shape whatever string identity carries it; a different
+        // order does not. The recent-transition memo always agrees with the full table, also
+        // after other transitions have replaced its entries.
+        let build = |keys: &[&str], shared: bool| {
+            let mut props = Props::new();
+            for key in keys {
+                if shared {
+                    props.insert(*key, Property::plain(Value::Undefined));
+                } else {
+                    props.insert(Rc::<str>::from(*key), Property::plain(Value::Undefined));
+                }
+            }
+            props.shape()
+        };
+        let shape = build(&["x", "y", "z"], false);
+        assert_eq!(build(&["x", "y", "z"], true), shape);
+        assert_ne!(build(&["y", "x", "z"], true), shape);
+        for text in &texts[..2000] {
+            build(&["x", text.as_str()], true);
+        }
+        assert_eq!(build(&["x", "y", "z"], false), shape);
+        assert_eq!(build(&["x", "y", "z"], true), shape);
+    }
 }
 
 /// The property key for array index `n`, interned for small `n`.
@@ -5090,8 +5264,8 @@ impl Props {
         self.shape = shape;
     }
 
-    pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
-        let key = key.into();
+    pub(crate) fn insert(&mut self, key: impl IntoPropKey, prop: Property) {
+        let key = key.into_prop_key();
         self.elems.retain_symbol_key(&key);
         if let Some(n) = canonical_index(&key) {
             if self.can_start_packed_elements(n as usize) {
