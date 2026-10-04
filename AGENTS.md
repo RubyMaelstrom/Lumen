@@ -196,6 +196,19 @@ Every cache keyed by an object, environment or Realm identity must validate it a
 use; inline splices also require their planning Realm's global environment. Never
 share an AST between interpreters: its caches hold one heap's shapes.
 
+Engine strings store a lone surrogate as the scalar U+10F800 + (unit − 0xD800) and a
+character in U+10F800..=U+10FFFF as its pair of such scalars (`jstr.rs`). Rust text
+enters through `Value::str`, `Value::from_string` and the host source entry points,
+which store those characters as pairs, and leaves through `Ctx::coerce_string` and
+`Value::as_text`, the USVString conversion (lone surrogates become U+FFFD).
+`Value::from_utf16` and `Ctx::coerce_utf16` keep lone surrogates. Engine code builds
+strings already in the engine representation with `Value::lstr` and appends code points
+through `jstr`, never through `Value::str`.
+
+TypeErrors for non-callable call or `new` targets name the target's source expression
+(`callee_name.rs`). Compiled chunks keep these names in a side table read only when such
+an error is thrown; every tier must produce the same message.
+
 The default-on `intl` feature supplies ECMA-402 and CLDR data. For the engine,
 `--no-default-features` removes `Intl` and gives `toLocale*` methods their
 locale-independent behavior. The `embed` feature exposes the host API; `bench`
