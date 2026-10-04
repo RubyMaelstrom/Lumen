@@ -1993,6 +1993,56 @@ mod shared_stub_tests {
         assert!(mask[3] && mask[4] && mask[5]);
     }
 
+    /// Chunks compiled separately branch to one process-wide copy of each shared stub, and code
+    /// running through those copies (free names, property ways, direct calls, intrinsics)
+    /// computes what the tree-walker does.
+    #[test]
+    fn shared_stub_bodies_are_assembled_once_per_process() {
+        let source = r#"
+            var base = 40, text = 'abc';
+            function name() { return base + 1; }
+            function prop(o) { return o.x + o.y; }
+            function leaf(v) { return v * 2; }
+            function direct(v) { var r = leaf(v); return r; }
+            function intr(s, n) { return s.charCodeAt(n); }
+            var t = 0;
+            for (var k = 0; k < 50; k++) {
+                t += name() + prop({ x: k, y: 1 }) + direct(k) + intr(text, k % 3);
+            }
+            t
+        "#;
+        let mut results = Vec::new();
+        for tier in [crate::bytecode::Tier::Interp, crate::bytecode::Tier::Jit] {
+            let mut engine = crate::Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            match engine.eval(source, false).expect("stub fixture parses") {
+                crate::Completion::Value(value) => results.push(value),
+                crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
+            }
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], "10674");
+        if env_flag!("LUMEN_JIT_CHUNK_STUBS") || !shared_stubs_enabled() {
+            return;
+        }
+        let keys: Vec<u32> = with_global_stubs(|table| {
+            table
+                .as_ref()
+                .expect("compiled chunks requested shared stubs")
+                .addresses
+                .keys()
+                .copied()
+                .collect()
+        })
+        .unwrap();
+        let name_stub = SharedStub::NameValuePtr { packed_ok: true }.key();
+        assert!(keys.contains(&name_stub));
+        assert!(keys
+            .iter()
+            .any(|&key| matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. })));
+    }
+
     #[test]
     fn shared_stubs_are_requested_once_and_forgotten_with_a_rewound_emission() {
         let mut a = asm::Asm::new();
@@ -2364,6 +2414,10 @@ mod asm {
                 stubs: Vec::new(),
                 hot: false,
             }
+        }
+        /// Whether any emitted branch targets `label`.
+        pub fn label_referenced(&self, label: usize) -> bool {
+            self.patches.iter().any(|&(_, target, _)| target == label)
         }
         /// Mark the following code as (not) running once per loop iteration.
         pub fn set_hot(&mut self, hot: bool) {
@@ -4562,11 +4616,6 @@ fn compile_entry(
     a.ldp_post(29, 30, FRAME_SIZE);
     a.ret();
 
-    // ---- direct-call teardown stub (only reachable from emitted direct sequences) ----
-    a.bind(l_direct_finish);
-    if direct_on {
-        emit_direct_finish_stub(&mut a, ilayout, rc_ok && layout.rc_strong_off == 0);
-    }
     // ---- shared out-of-line stubs requested by this chunk's sites ----
     a.set_hot(false);
     emit_shared_stubs(
@@ -4582,6 +4631,13 @@ fn compile_entry(
             }),
         },
     );
+    // ---- direct-call teardown stub (only reachable from emitted direct sequences) ----
+    // In-line direct sequences and per-chunk direct-call stubs reach it; process-wide stubs
+    // carry their own, so a chunk with neither omits it.
+    a.bind(l_direct_finish);
+    if direct_on && a.label_referenced(l_direct_finish) {
+        emit_direct_finish_stub(&mut a, ilayout, rc_ok && layout.rc_strong_off == 0);
+    }
 
     // The unwinder (ECMA-262 14.15.3) needs the same final catch addresses as patched
     // branches, including every word inserted while relaxing long conditional branches.
@@ -10455,7 +10511,9 @@ fn loop_body_mask(ops: &[crate::bytecode::Op]) -> Vec<bool> {
         .collect()
 }
 
-/// Emit every shared stub the chunk's sites requested (a stub may itself request others).
+/// Emit every shared stub the chunk's sites requested (a stub may itself request others). A
+/// stub with a process-wide copy (see [`global_stub_address`]) gets a two-word-target veneer
+/// instead of its body.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -10468,9 +10526,160 @@ fn emit_shared_stubs(a: &mut asm::Asm, context: &StubContext<'_>) {
         }
         for (key, label) in requested {
             a.bind(label);
-            SharedStub::from_key(key).emit(a, context);
+            match global_stub_address(key, context) {
+                // Every stub's contract lets it clobber x16, and `br` keeps the site's return
+                // address in x30 for the stub's own `ret`.
+                Some(address) => {
+                    a.mov_imm64(16, address);
+                    a.br(16);
+                }
+                None => SharedStub::from_key(key).emit(a, context),
+            }
         }
     }
+}
+
+/// The inputs a shared stub's body is assembled from. They are process constants (probed type
+/// layouts and `Chunk` field offsets); a context that differs from the first one keeps its
+/// stubs per chunk.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+struct GlobalStubTable {
+    layout: crate::value::JitLayout,
+    ilayout: crate::interpreter::InterpLayout,
+    direct: Option<(usize, usize, usize)>,
+    addresses: crate::fasthash::FastMap<u32, u64>,
+}
+
+#[cfg(all(
+    not(test),
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+static GLOBAL_STUBS: std::sync::Mutex<Option<GlobalStubTable>> = std::sync::Mutex::new(None);
+
+// Test builds instrument some stub bodies with the addresses of thread-local counters, so a
+// body is only valid on the thread that assembled it: keep one table per thread there.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    static GLOBAL_STUBS: std::cell::RefCell<Option<GlobalStubTable>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn with_global_stubs<R>(f: impl FnOnce(&mut Option<GlobalStubTable>) -> R) -> Option<R> {
+    #[cfg(not(test))]
+    {
+        let mut table = GLOBAL_STUBS.lock().ok()?;
+        Some(f(&mut table))
+    }
+    #[cfg(test)]
+    {
+        GLOBAL_STUBS.with(|table| Some(f(&mut table.borrow_mut())))
+    }
+}
+
+/// Shared stubs read no chunk state: their inputs arrive in registers and their outputs are
+/// status codes, and the direct-call stub's finish stub is equally chunk-independent. So each
+/// stub body is assembled once per process into executable memory that is never reclaimed, and
+/// chunks branch to it through a veneer instead of carrying a copy each (the Cloudflare
+/// challenge emitted about 8 MB of such copies per load). `LUMEN_JIT_CHUNK_STUBS=1` keeps
+/// per-chunk copies for diagnosis.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn global_stub_address(key: u32, context: &StubContext<'_>) -> Option<u64> {
+    if env_flag!("LUMEN_JIT_CHUNK_STUBS") {
+        return None;
+    }
+    let ilayout = *context.ilayout?;
+    let direct = context
+        .direct
+        .map(|direct| (direct.attempted_off, direct.runs_off, direct.retry_off));
+    let is_direct = matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. });
+    if is_direct && direct.is_none() {
+        return None;
+    }
+    with_global_stubs(|table| {
+        let table = table.get_or_insert_with(|| GlobalStubTable {
+            layout: *context.layout,
+            ilayout,
+            direct,
+            addresses: Default::default(),
+        });
+        if table.layout != *context.layout || table.ilayout != ilayout {
+            return None;
+        }
+        if is_direct {
+            match table.direct {
+                Some(known) if Some(known) != direct => return None,
+                Some(_) => {}
+                None => table.direct = direct,
+            }
+        }
+        if let Some(&address) = table.addresses.get(&key) {
+            return Some(address);
+        }
+        let address = assemble_global_stub(key, context)?;
+        table.addresses.insert(key, address);
+        Some(address)
+    })?
+}
+
+/// Assemble one shared stub (with any stubs it requests, and the direct-call finish stub) into
+/// its own permanent executable buffer; the entry address, or `None` when memory is refused.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
+    let mut a = asm::Asm::new();
+    let entry = a.new_label();
+    let finish = a.new_label();
+    let local = StubContext {
+        layout: context.layout,
+        ilayout: context.ilayout,
+        direct: context.direct.map(|direct| DirectCallContext {
+            finish_stub: finish,
+            ..direct
+        }),
+    };
+    a.bind(entry);
+    SharedStub::from_key(key).emit(&mut a, &local);
+    loop {
+        let requested = a.take_shared_stubs();
+        if requested.is_empty() {
+            break;
+        }
+        for (nested, label) in requested {
+            a.bind(label);
+            SharedStub::from_key(nested).emit(&mut a, &local);
+        }
+    }
+    a.bind(finish);
+    if matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. }) {
+        let layout = context.layout;
+        let rc_ok = layout.valid && layout.rc_strong_off < 256;
+        emit_direct_finish_stub(&mut a, context.ilayout?, rc_ok && layout.rc_strong_off == 0);
+    }
+    let (words, offsets) = a.finish_with_offsets(&[entry]);
+    let executable = ExecutableBuffer::from_bytes(unsafe {
+        std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
+    })?;
+    let address = executable.as_ptr() as u64 + u64::from(offsets[0]);
+    // Permanent: any compiled chunk may branch here for the rest of the process.
+    std::mem::forget(executable);
+    Some(address)
 }
 
 fn emit_name_ic_value_ptr(

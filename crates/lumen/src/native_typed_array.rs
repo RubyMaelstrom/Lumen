@@ -130,7 +130,7 @@ impl Interp {
 
 /// Layout of std types used by native templates. No RcBox offsets are assumed here: metadata
 /// stores Rc::as_ptr addresses, and its owning Rcs keep those addresses alive.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub object_view: usize,
     pub refcell_value: usize,

@@ -2560,7 +2560,7 @@ mod computed_key_cache_tests {
 /// compile-time stable — every offset is measured against a live instance, and `valid` fails
 /// closed. Vec word offsets (`ptr`/`len`/`cap` order) are probed per instantiation, same as
 /// [`crate::value::JitLayout`]'s.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 #[allow(dead_code)] // consumed incrementally as the asm thunk lands
 pub(crate) struct InterpLayout {
     pub depth: usize,

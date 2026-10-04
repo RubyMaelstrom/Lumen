@@ -924,7 +924,7 @@ pub(crate) fn new_symbol_agent() -> SymbolAgent {
 /// in an `Option<Gc>` (proto) field, which points at the `RcBox` header (`{strong, weak, value}`),
 /// NOT at `Rc::as_ptr` (which is the inner `value`, `rcbox_data` bytes further on). The inline
 /// templates only ever have the stored pointer, so measuring from it is what makes them correct.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct JitLayout {
     /// Stored `Rc` pointer → the `Object` (through the `RcBox` header and the `RefCell` wrapper).
     pub obj_from_rc: usize,
