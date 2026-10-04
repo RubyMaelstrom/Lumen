@@ -840,6 +840,14 @@ impl Interp {
                 if let Some(e) = arg {
                     if self.tco_ok && !self.using_stack.iter().any(|f| !f.is_empty()) {
                         return match self.eval_return_expr(e, env)? {
+                            // A shallow tail call runs as an ordinary call; deep or unbounded
+                            // tail recursion still retires this frame first, as compiled code
+                            // does (see `bytecode::Op::TailDeep`).
+                            TailEval::Tail(f, t, a)
+                                if self.depth < crate::bytecode::ordinary_tail_call_depth() =>
+                            {
+                                Err(Abrupt::Return(self.call(f, t, &a)?))
+                            }
                             TailEval::Tail(f, t, a) => {
                                 self.pending_tail = Some(Box::new((f, t, a)));
                                 Err(Abrupt::Return(Value::Undefined))

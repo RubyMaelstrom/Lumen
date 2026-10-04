@@ -4390,6 +4390,33 @@ fn compile_entry(
             }
             // Speculative-inline guard: the callee (argc+1 deep) must be the pinned function —
             // a tag compare and a pointer compare; mismatch branches to the generic call.
+            // Shallow tail positions run their ordinary call (see `Op::TailDeep`): compare the
+            // live execution-context depth and, when the following JumpIfFalse cannot be entered
+            // on its own, branch straight to the ordinary form.
+            Op::TailDeep
+                if ilayout.depth.is_multiple_of(4)
+                    && ilayout.depth / 4 < 4096
+                    && !chunk.jit_detailed_feedback_enabled() =>
+            {
+                let limit = crate::bytecode::ordinary_tail_call_depth();
+                a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+                a.ldr_w_imm(9, 9, ilayout.depth as u32);
+                a.mov_imm64(10, u64::from(limit));
+                a.cmp_reg_w(9, 10);
+                match ops.get(pc + 1) {
+                    Some(Op::JumpIfFalse(t)) if !targeted[pc + 1] => {
+                        a.b_cond(C_LO, pc_labels[*t as usize]);
+                        skip = 1;
+                    }
+                    _ => {
+                        a.cset_w(9, C_HS);
+                        a.mov_imm64(10, crate::value::PACK_BOOL);
+                        a.logic_x(1, 9, 9, 10); // orr: tag the 0/1 payload
+                        emit_exec_word_store(&mut a, 9, 20, 0);
+                        a.add_imm(20, 20, 8);
+                    }
+                }
+            }
             Op::InlineGuard(t, target) => {
                 let it = chunk.jit_inline_target(*t);
                 // A Value::Obj payload holds the STORED Rc pointer (the RcBox base), not

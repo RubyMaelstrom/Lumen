@@ -45,14 +45,17 @@ fn bounded_depth(
     _this: crate::value::Value,
     _args: &[crate::value::Value],
 ) -> Result<crate::value::Value, crate::value::Value> {
-    // Detect retained logical frames early instead of risking a host stack exhaustion.
+    // Detect retained logical frames early instead of risking a host stack exhaustion. Shallow
+    // tail calls are ordinary calls (`Op::TailDeep`); past that depth every tail call retires
+    // its caller, so a chain of any length stays within a fixed bound.
+    let bound = crate::bytecode::ordinary_tail_call_depth() + 16;
     assert!(
-        interp.depth <= 16,
+        interp.depth <= bound,
         "tail chain grew logical call depth to {}",
         interp.depth
     );
     assert!(
-        interp.fn_frames.len() <= 16,
+        interp.fn_frames.len() as u32 <= bound,
         "tail chain retained function frames"
     );
     Ok(crate::value::Value::Undefined)
@@ -374,5 +377,61 @@ fn compiled_tail_optional_super_calls_preserve_the_reference_receiver() {
         assert_compiled(&mut engine, "step", false);
         assert_compiled(&mut engine, "computed", false);
         assert_compiled(&mut engine, "missing", false);
+    }
+}
+
+/// Shallow tail calls run as ordinary calls, so their ordinary form shares call caches,
+/// direct calls and speculative splices; a splice's guard still falls back when the target
+/// changes. Past `ordinary_tail_call_depth` (here below 1500 non-tail frames, and along an
+/// unbounded mutual recursion) every tail call retires its caller, keeping the logical depth
+/// bounded. Shallow expected values are Node's; Node has no proper tail calls, so the deep
+/// results are the closed forms (30000, and 100001 is odd).
+#[test]
+fn shallow_tail_calls_are_ordinary_and_deep_ones_stay_bounded() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+'use strict';
+var log = [];
+class P { constructor(i) { this.id = i } tw() { return this.id * 2 } twice() { return this.tw() } }
+var objs = []; for (var k = 0; k < 16; k++) objs.push(new P(k));
+var s = 0; for (var r = 0; r < 300; r++) for (var k = 0; k < 16; k++) s += objs[k].twice();
+log.push(s);
+P.prototype.tw = function () { return -this.id; };
+s = 0; for (var k = 0; k < 16; k++) s += objs[k].twice();
+log.push(s);
+function idf(x) { return x; }
+function viaCond(x) { return idf(x) === x ? idf(x * 3) : -1; }
+function viaLogical(x) { return x > 5 && idf(x + 1); }
+function viaSeq(x) { return (idf(0), idf(x - 1)); }
+function spread(a) { return Math.max(...a); }
+var t = 0;
+for (var k = 0; k < 400; k++) t += viaCond(k) + viaLogical(k) + viaSeq(k) + spread([k, 2, 3]);
+log.push(t);
+function thrower() { throw new RangeError('x'); }
+function callsThrower() { return thrower(); }
+try { callsThrower(); } catch (e) { log.push(e.name); }
+function notCallable() { var o = {}; return o.missing(); }
+try { notCallable(); } catch (e) { log.push(e.constructor.name); }
+function argsOrder() { var order = []; function f(a, b) { return order.join('') + a + b; } return f(order.push('a') && 'x', order.push('b') && 'y'); }
+log.push(argsOrder());
+{
+  function down(n, m) { return n === 0 ? loop(m, 0) : 1 + down(n - 1, m) - 1; }
+  function loop(m, acc) { return m === 0 ? acc : loop(m - 1, acc + 1); }
+  log.push(down(1500, 30000));
+  function even(n) { checkTailDepth(); return n === 0 ? 'even' : odd(n - 1); }
+  function odd(n) { return n === 0 ? 'odd' : even(n - 1); }
+  log.push(even(100001));
+}
+log.join(',');
+"#
+            ),
+            "72000,-120,478785,RangeError,TypeError,abxy,30000,odd",
+            "{tier:?}"
+        );
+        assert!(engine.interp.pending_tail.is_none());
     }
 }

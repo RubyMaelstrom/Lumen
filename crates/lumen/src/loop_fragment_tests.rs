@@ -320,6 +320,9 @@ fn fragment_tail_return_preserves_pending_trampoline_transfer() {
         engine.interp.strict = true;
         engine.interp.tco_ok = true;
         let env = engine.interp.global_env.clone();
+        // Past the ordinary-call depth (see `Op::TailDeep`) the tail call must be staged.
+        let depth = engine.interp.depth;
+        engine.interp.depth = crate::bytecode::ordinary_tail_call_depth();
         let outcome = enter(
             &mut engine.interp,
             site,
@@ -332,6 +335,7 @@ fn fragment_tail_return_preserves_pending_trampoline_transfer() {
         .ok()
         .expect("admitted")
         .expect("compiled");
+        engine.interp.depth = depth;
         assert!(matches!(outcome, Err(Abrupt::Return(Value::Undefined))));
         let pending = engine
             .interp
@@ -350,6 +354,26 @@ fn fragment_tail_return_preserves_pending_trampoline_transfer() {
         assert!(matches!(
             engine.interp.get_var("called", &env),
             Ok(Value::Num(1.0))
+        ));
+        // A shallow tail call runs as an ordinary call and returns its result directly.
+        engine.eval("k=0", false).unwrap();
+        let outcome = enter(
+            &mut engine.interp,
+            site,
+            Source::While(test, body),
+            &[],
+            &env,
+            &Value::Undefined,
+            Seed::None,
+        )
+        .ok()
+        .expect("admitted")
+        .expect("compiled");
+        assert!(matches!(outcome, Err(Abrupt::Return(Value::Num(9.0)))));
+        assert!(engine.interp.pending_tail.is_none());
+        assert!(matches!(
+            engine.interp.get_var("called", &env),
+            Ok(Value::Num(2.0))
         ));
     }
 }

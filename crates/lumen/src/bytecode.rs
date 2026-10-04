@@ -1674,6 +1674,13 @@ pub enum Op {
     /// placeholder for the immediately enclosing return. No target code runs before this
     /// activation is retired. Constructors retain their ordinary result-processing path.
     TailCall(CallArgsMode, bool),
+    /// Push whether the running execution-context stack is deep enough that a proper tail call
+    /// must retire this activation first ([`ordinary_tail_call_depth`]). Each tail position
+    /// lowers to `TailDeep; JumpIfFalse(ordinary); TailCall; Jump(join); ordinary: <call>`: a
+    /// shallow tail call runs as an ordinary call, while deep or unbounded tail recursion keeps
+    /// reusing a bounded number of contexts (ECMA-262 §15.10.3 PrepareForTailCall bounds the
+    /// storage of tail calls; it does not make them observable otherwise).
+    TailDeep,
     /// Direct eval must execute in this activation; a non-intrinsic eval target transfers.
     TailEvalCallArgsArray,
     /// Statement-position `obj.name += v` (pops v, the compound-read lval, obj): appends IN
@@ -7363,6 +7370,12 @@ struct Compiler {
     /// Keep the final call opcode available while lowering a tail expression. Nested calls
     /// still execute normally; no inline splice may hide the call being converted.
     lowering_tail: bool,
+    /// The `Expr::Call` node of the tail call being lowered (its address), until its own call
+    /// arm claims it; `tail_finish` then hands the claim to that node's `finish_call`.
+    tail_call_node: usize,
+    tail_finish: bool,
+    /// `finish_call` emitted the tail call's complete depth-selected lowering.
+    tail_lowered: bool,
     /// Active `finally` handler depths. A break/continue may discard ordinary catch/iterator
     /// handlers, but it must never jump across a finalizer without executing it.
     finally_depths: Vec<u32>,
@@ -8679,12 +8692,25 @@ impl Compiler {
     }
 
     fn finish_call(&mut self, args: &[ArrayElem], with_this: bool, allow_inline: bool) -> CResult {
+        let tail = std::mem::take(&mut self.tail_finish) && ordinary_tail_call_depth() != 0;
         match self.call_args(args)? {
             CallArgsMode::Fixed(argc) => {
-                let plan_hit = (allow_inline && !self.lowering_tail)
+                // Other calls inside a tail expression stay plain calls, never splices; the
+                // tail call itself is depth-selected below, so its ordinary form may splice.
+                let plan_hit = (allow_inline && (tail || !self.lowering_tail))
                     .then(|| self.plan_hit())
                     .flatten();
                 let cache = self.new_call_cache();
+                // [operands] TailDeep; JumpIfFalse(ordinary); TailCall; Jump(join);
+                // ordinary: <call or splice>; join: (see `Op::TailDeep`).
+                let join = tail.then(|| {
+                    self.emit(Op::TailDeep);
+                    let shallow = self.emit(Op::JumpIfFalse(0));
+                    self.emit(Op::TailCall(CallArgsMode::Fixed(argc), with_this));
+                    let join = self.emit(Op::Jump(0));
+                    self.patch(shallow);
+                    join
+                });
                 match plan_hit {
                     Some(entry) => self.emit_call_with_inline(entry, argc, cache, with_this),
                     None if with_this => {
@@ -8693,6 +8719,10 @@ impl Compiler {
                     None => {
                         self.emit(Op::Call(argc, cache));
                     }
+                }
+                if let Some(join) = join {
+                    self.patch(join);
+                    self.tail_lowered = true;
                 }
             }
             CallArgsMode::FinalSpread(argc) if with_this => {
@@ -9495,9 +9525,16 @@ impl Compiler {
             Expr::Call { callee, .. } if matches!(&**callee, Expr::Super) => self.expr(expression),
             Expr::Call { .. } | Expr::TaggedTemplate { .. } => {
                 let saved = std::mem::replace(&mut self.lowering_tail, true);
+                let node =
+                    std::mem::replace(&mut self.tail_call_node, expression as *const Expr as usize);
+                self.tail_lowered = false;
                 let result = self.expr(expression);
                 self.lowering_tail = saved;
+                self.tail_call_node = node;
                 result?;
+                if std::mem::take(&mut self.tail_lowered) {
+                    return Ok(());
+                }
                 self.transfer_last_call()
             }
             other => self.expr(other),
@@ -9505,17 +9542,34 @@ impl Compiler {
     }
 
     fn transfer_last_call(&mut self) -> CResult {
-        let operation = self.ops.last_mut().ok_or(Bail)?;
-        *operation = match *operation {
+        let at = self.ops.len().checked_sub(1).ok_or(Bail)?;
+        let call = self.ops[at];
+        let tail = match call {
             Op::Call(argc, _) => Op::TailCall(CallArgsMode::Fixed(argc), false),
             Op::CallWithThis(argc, _) => Op::TailCall(CallArgsMode::Fixed(argc), true),
             Op::CallSpread(argc) => Op::TailCall(CallArgsMode::FinalSpread(argc), false),
             Op::CallSpreadThis(argc) => Op::TailCall(CallArgsMode::FinalSpread(argc), true),
             Op::CallArgsArray => Op::TailCall(CallArgsMode::Array, false),
             Op::CallArgsArrayThis => Op::TailCall(CallArgsMode::Array, true),
-            Op::EvalCallArgsArray => Op::TailEvalCallArgsArray,
+            Op::EvalCallArgsArray => {
+                self.ops[at] = Op::TailEvalCallArgsArray;
+                return Ok(());
+            }
             _ => return Err(Bail),
         };
+        if ordinary_tail_call_depth() == 0 {
+            self.ops[at] = tail;
+            return Ok(());
+        }
+        // The operands stay where the call left them on both paths; a jump to `at` (from the
+        // argument list) lands on the depth test, ahead of either form.
+        self.ops[at] = Op::TailDeep;
+        let shallow = self.emit(Op::JumpIfFalse(0));
+        self.emit(tail);
+        let join = self.emit(Op::Jump(0));
+        self.patch(shallow);
+        self.emit(call);
+        self.patch(join);
         Ok(())
     }
 
@@ -12775,7 +12829,14 @@ impl Compiler {
                         self.emit(Op::SuperCallArgsArray);
                     }
                     other => {
+                        // Only this node's own call is in tail position: calls in its callee
+                        // and arguments are not (ECMA-262 §15.10.2 HasCallInTailPosition).
+                        let tail = self.tail_call_node == e as *const Expr as usize;
+                        if tail {
+                            self.tail_call_node = 0;
+                        }
                         let (with_this, allow_inline) = self.callee_reference(other)?;
+                        self.tail_finish = tail;
                         self.finish_call(args, with_this, allow_inline)?;
                     }
                 }
@@ -14879,6 +14940,7 @@ fn run_vm_inner<S: StoredValue>(
             Op::DeleteSuper => {
                 return Err(i.throw("ReferenceError", "cannot delete a super property"));
             }
+            Op::TailDeep => stack.push(Value::Bool(i.depth >= ordinary_tail_call_depth())),
             Op::TailCall(mode, with_this) => {
                 let args = match mode {
                     CallArgsMode::Fixed(argc) => stack.split_off(stack.len() - argc as usize),
@@ -19028,6 +19090,7 @@ impl Chunk {
             Op::CallArgsArray => (2, 1),
             Op::CallArgsArrayThis => (3, 1),
             Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => (3, 1),
+            Op::TailDeep => (0, 1),
             Op::TailCall(mode, with_this) => {
                 let count = match mode {
                     CallArgsMode::Fixed(count) | CallArgsMode::FinalSpread(count) => {
@@ -22655,6 +22718,19 @@ fn jit_method_operand_stat(obj: &Value, key: &Value) {
 /// EvaluateCall checks callability after argument evaluation and before PrepareForTailCall.
 /// The owned tuple is a live interpreter root until the frame-retiring trampoline takes it.
 /// No callee or callback may run between publishing this transfer and leaving the activation.
+/// Execution-context depth from which a tail call is staged for the trampoline instead of made
+/// as an ordinary call (see [`Op::TailDeep`]). Zero stages every tail call; the diagnostic
+/// override `LUMEN_TAIL_CALL_DEPTH` is read once per process.
+pub(crate) fn ordinary_tail_call_depth() -> u32 {
+    static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("LUMEN_TAIL_CALL_DEPTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024)
+    })
+}
+
 fn stage_tail_call(
     interpreter: &mut Interp,
     chunk: &Chunk,
@@ -23067,6 +23143,7 @@ unsafe fn jit_exec_inner(
         Op::DeleteSuper => {
             return Err(i.throw("ReferenceError", "cannot delete a super property"));
         }
+        Op::TailDeep => push!(Value::Bool(i.depth >= ordinary_tail_call_depth())),
         Op::TailCall(mode, with_this) => {
             let args = match mode {
                 CallArgsMode::Fixed(argc) => {
