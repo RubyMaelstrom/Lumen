@@ -19996,6 +19996,52 @@ fn iterator_take_closes_on_bad_limit() {
 }
 
 #[test]
+fn cross_realm_calls_keep_shared_intrinsic_tables_exact_across_collections() {
+    // Realm switching shares each Realm's intrinsic tables by reference. Collections during
+    // nested cross-Realm calls must keep both Realms' intrinsics, and a Realm that becomes
+    // unreachable must still be reclaimed with its intrinsics (ECMA-262 #sec-liveness).
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let setup = r#"
+            var other = $262.createRealm().global;
+            var ok = 0, total = 0;
+            var fn = other.eval("(function (f) { var o = {}; o.self = o; f(); return Object.getPrototypeOf([]) === Array.prototype && (new Error('x') instanceof Error) && typeof Map === 'function'; })");
+            for (var i = 0; i < 40; i++) {
+                var arr = other.Array.of(1, 2);
+                total += 2;
+                if (Object.getPrototypeOf(arr) === other.Array.prototype && Object.getPrototypeOf(arr) !== Array.prototype) ok++;
+                if (fn(function () { $262.gc(); }) && Object.getPrototypeOf([]) === Array.prototype) ok++;
+            }
+            var weak = [];
+            (function () {
+                var dead = $262.createRealm().global;
+                dead.eval("var keep = {a: [1, 2, 3]}; keep.self = keep;");
+                weak.push(new WeakRef(dead.Array.prototype), new WeakRef(dead.keep), new WeakRef(dead));
+            })();
+            ok + "/" + total
+        "#;
+        assert_eq!(run_in(&mut engine, setup), "80/80", "{tier:?}");
+        assert_eq!(run_in(&mut engine, "$262.gc(); 'collected'"), "collected");
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "[weak.map(function (w) { return w.deref() === undefined; }).join('/'), \
+                 Object.getPrototypeOf(other.Array.of(1)) === other.Array.prototype, \
+                 other.eval('[].concat([1]).length'), new other.Error('e') instanceof other.Error].join(',')"
+            ),
+            "true/true/true,true,1,true",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn computed_number_keys_use_number_to_string_in_all_tiers() {
     // ECMA-262 ToPropertyKey / Number::toString, snapshot e28783d5fc9d: integral keys (including
     // -0 and values near 2^53) and non-integral ones reach [[Get]]/[[Set]] as their decimal text.

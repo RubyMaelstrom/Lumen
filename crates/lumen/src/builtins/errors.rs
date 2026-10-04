@@ -155,7 +155,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             true,
         ),
     );
-    it.error_protos.insert("Error", error_proto.clone());
+    Rc::make_mut(&mut it.error_protos).insert("Error", error_proto.clone());
 
     let mut error_ctor: Option<Gc> = None;
     for name in names {
@@ -165,7 +165,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             let p = Object::new(Some(error_proto.clone()));
             set_builtin(&p, "name", Value::str(name));
             set_builtin(&p, "message", Value::str(""));
-            it.error_protos.insert(name, p.clone());
+            Rc::make_mut(&mut it.error_protos).insert(name, p.clone());
             p
         };
         // A distinct native constructor per error kind (fn pointers can't capture the name).
@@ -206,7 +206,7 @@ pub(super) fn install_errors(it: &mut Interp) {
     let agg_proto = Object::new(Some(error_proto.clone()));
     set_builtin(&agg_proto, "name", Value::str("AggregateError"));
     set_builtin(&agg_proto, "message", Value::str(""));
-    it.error_protos.insert("AggregateError", agg_proto.clone());
+    Rc::make_mut(&mut it.error_protos).insert("AggregateError", agg_proto.clone());
     let agg_ctor = it.make_native("AggregateError", 2, |i, _t, a| {
         let err = i.make_error("AggregateError", "");
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
@@ -259,7 +259,7 @@ pub(super) fn install_errors(it: &mut Interp) {
     let sup_proto = Object::new(Some(error_proto.clone()));
     set_builtin(&sup_proto, "name", Value::str("SuppressedError"));
     set_builtin(&sup_proto, "message", Value::str(""));
-    it.error_protos.insert("SuppressedError", sup_proto.clone());
+    Rc::make_mut(&mut it.error_protos).insert("SuppressedError", sup_proto.clone());
     let sup_ctor = it.make_native("SuppressedError", 3, |i, _t, a| {
         let err = i.make_error("SuppressedError", "");
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).

@@ -168,8 +168,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
             .insert("name", Property::data(Value::str(""), false, false, false));
         b.extensible = false;
     }
-    it.extra_protos
-        .insert("%ThrowTypeError%", throw_type_error.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%ThrowTypeError%", throw_type_error.clone());
     // Function.prototype.caller / .arguments: accessor properties whose getter AND setter are
     // the single %ThrowTypeError% intrinsic (the spec requires the same function object).
     for name in ["caller", "arguments"] {
@@ -245,7 +244,7 @@ pub(super) fn install_generator_function_ctors(it: &mut Interp) {
         let kind_proto = Object::new(Some(fp.clone()));
         set_to_string_tag(it, &kind_proto, tag);
         let key: &'static str = Box::leak(format!("%{tag}.prototype%").into_boxed_str());
-        it.extra_protos.insert(key, kind_proto.clone());
+        Rc::make_mut(&mut it.extra_protos).insert(key, kind_proto.clone());
         let kind_ctor = it.make_native(tag, 1, make_fn);
         kind_ctor.borrow_mut().proto = Some(function_ctor.clone()); // [[Prototype]] is %Function%
         kind_ctor.borrow_mut().props.insert(

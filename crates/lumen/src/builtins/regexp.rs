@@ -278,7 +278,7 @@ fn regexp_flags_arg(i: &mut Interp, a: &[Value]) -> Result<String, Value> {
 
 pub(super) fn install_regexp(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("RegExp", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("RegExp", proto.clone());
     // source/flags/global/... accessor getters (computed from the matcher).
     let add_getter = |it: &mut Interp, proto: &Gc, name: &str, f: NativeFn| {
         let g = it.make_native(&format!("get {name}"), 0, f);
@@ -437,7 +437,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         };
         ab(i.make_regexp_with_proto(&source, &flags, alloc_proto))
     });
-    it.extra_protos.insert("%RegExpCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%RegExpCtor%", ctor.clone());
     install_regexp_legacy_statics(it, &ctor);
     ctor.borrow_mut().props.insert(
         "prototype",

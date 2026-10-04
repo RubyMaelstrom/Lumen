@@ -46,7 +46,7 @@ pub fn install(it: &mut Interp) {
         .borrow_mut()
         .props
         .insert("sym", Property::data(fsym, false, false, false));
-    it.extra_protos.insert("%IntlFallbackSymbol%", holder);
+    Rc::make_mut(&mut it.extra_protos).insert("%IntlFallbackSymbol%", holder);
 
     // Intl.getCanonicalLocales(locales) — returns a fresh Array of canonicalized tags.
     let f = it.make_native("getCanonicalLocales", 1, |i, _t, a| {
@@ -89,7 +89,7 @@ pub fn install(it: &mut Interp) {
         let ctor = intl.borrow().props.get(svc).map(|p| p.value());
         if let Some(Value::Obj(c)) = ctor {
             let key: &'static str = Box::leak(format!("%Intl.{svc}%").into_boxed_str());
-            it.extra_protos.insert(key, c);
+            Rc::make_mut(&mut it.extra_protos).insert(key, c);
         }
     }
     it.global
@@ -275,7 +275,7 @@ pub(crate) fn make_service(
             Property::data(Value::str(format!("Intl.{name}")), false, false, true),
         );
     }
-    it.extra_protos.insert(
+    Rc::make_mut(&mut it.extra_protos).insert(
         Box::leak(format!("Intl.{name}").into_boxed_str()),
         proto.clone(),
     );

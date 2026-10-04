@@ -390,7 +390,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
 
     // The intrinsic %Symbol% is cached so well-known-symbol lookups survive `globalThis.Symbol`
     // being replaced by user code.
-    it.extra_protos.insert("%SymbolCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%SymbolCtor%", ctor.clone());
     // Well-known symbols (each a unique, frozen instance on the constructor).
     for name in [
         "iterator",
@@ -473,7 +473,7 @@ fn this_bigint(i: &mut Interp, this: &Value) -> Result<crate::bigint::JsBigInt, 
 
 pub(super) fn install_bigint(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("BigInt", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("BigInt", proto.clone());
     it.def_method(&proto, "toString", 0, |i, this, a| {
         let n = this_bigint(i, &this)?;
         let radix = match arg(a, 0) {

@@ -2704,7 +2704,7 @@ pub struct Interp {
     pub(crate) number_proto: Gc,
     pub(crate) boolean_proto: Gc,
     pub(crate) symbol_proto: Gc,
-    pub(crate) error_protos: crate::fasthash::FastMap<&'static str, Gc>,
+    pub(crate) error_protos: IntrinsicMap,
     pub(crate) console: Vec<String>,
     /// Realm-local implementation of HTML `HostSystemUTCEpochNanoseconds(global)`, expressed in
     /// milliseconds for ECMAScript `Date`. Each Window/Worker realm owns its own time origin and
@@ -2957,7 +2957,7 @@ pub struct Interp {
         crate::fasthash::FastMap<usize, crate::weak_metadata::WeakCollectionIndex>,
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
-    pub(crate) extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
+    pub(crate) extra_protos: IntrinsicMap,
     /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer. The indirection lets an
     /// embedder identify the same Data Block with an external resource such as wasm linear memory.
     pub(crate) array_buffers: crate::fasthash::FastMap<usize, ArrayBufferBytes>,
@@ -3537,6 +3537,12 @@ macro_rules! gc_side_slot_tables {
     };
 }
 
+/// A Realm's named intrinsic table. Shared, not copied, between the active Realm fields and
+/// its saved `RealmState`: a cross-Realm call swaps Realms by reference count instead of
+/// cloning these tables several times. Realm setup mutates through `Rc::make_mut`, which
+/// copies only a table that another snapshot still shares.
+pub(crate) type IntrinsicMap = Rc<crate::fasthash::FastMap<&'static str, Gc>>;
+
 pub struct ClassInfo {
     /// Instance fields (and auto-accessor backing fields), in declaration order. Shared so each
     /// construction reads the list without copying keys, initializer ASTs or transforms.
@@ -3802,9 +3808,9 @@ pub struct RealmState {
     pub number_proto: Gc,
     pub boolean_proto: Gc,
     pub symbol_proto: Gc,
-    pub error_protos: crate::fasthash::FastMap<&'static str, Gc>,
+    pub error_protos: IntrinsicMap,
     pub eval_fn: Option<Gc>,
-    pub extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
+    pub extra_protos: IntrinsicMap,
 }
 
 impl RealmState {
@@ -10140,6 +10146,9 @@ impl Interp {
         // realm global (the table key) is swept with the rest of the group.
         let mut realm_members: crate::fasthash::FastMap<usize, usize> = Default::default();
         let mut realm_scope_members: crate::fasthash::FastMap<usize, usize> = Default::default();
+        // Intrinsic tables are shared by reference (see `IntrinsicMap`): each distinct table
+        // owns one handle per intrinsic, however many Realm states point at it.
+        let mut counted_tables: crate::fasthash::FastSet<usize> = Default::default();
         for (realm_key, realm) in &self.realms {
             let fixed = [
                 &realm.global,
@@ -10151,19 +10160,27 @@ impl Interp {
                 &realm.boolean_proto,
                 &realm.symbol_proto,
             ];
-            for object in fixed
+            let tables = [&realm.error_protos, &realm.extra_protos];
+            let owned =
+                tables.map(|table| counted_tables.insert(Rc::as_ptr(table) as *const () as usize));
+            let fixed = fixed
                 .into_iter()
                 .chain(realm.array_ctor.iter())
-                .chain(realm.error_protos.values())
                 .chain(realm.eval_fn.iter())
-                .chain(realm.extra_protos.values())
-            {
+                .map(|object| (object, true));
+            let tabled = tables
+                .into_iter()
+                .zip(owned)
+                .flat_map(|(table, owned)| table.values().map(move |object| (object, owned)));
+            for (object, owned) in fixed.chain(tabled) {
                 let ptr = Rc::as_ptr(object) as usize;
                 realm_members.insert(ptr, *realm_key);
-                let borrowed = object.borrow();
-                borrowed
-                    .gc_scratch
-                    .set(borrowed.gc_scratch.get().saturating_add(1));
+                if owned {
+                    let borrowed = object.borrow();
+                    borrowed
+                        .gc_scratch
+                        .set(borrowed.gc_scratch.get().saturating_add(1));
+                }
             }
             let scope_ptr = Rc::as_ptr(&realm.global_env) as usize;
             realm_scope_members.insert(scope_ptr, *realm_key);

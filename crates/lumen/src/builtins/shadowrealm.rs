@@ -6,7 +6,7 @@ use super::*;
 /// only lets primitive completion values cross back (callables are wrapped; objects are a TypeError).
 pub(super) fn install_shadow_realm(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("ShadowRealm", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("ShadowRealm", proto.clone());
     set_to_string_tag(it, &proto, "ShadowRealm");
     it.def_method(&proto, "evaluate", 1, shadow_evaluate);
     it.def_method(&proto, "importValue", 2, shadow_import_value);

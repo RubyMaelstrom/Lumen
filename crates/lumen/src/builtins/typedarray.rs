@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     // Modeled as a plain ArrayBuffer (no real sharing) — enough for tests that just need the type.
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("SharedArrayBuffer", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("SharedArrayBuffer", proto.clone());
     // byteLength/maxByteLength/growable accessor getters on the prototype.
     // SharedArrayBuffer.prototype accessors require a shared buffer: reject a plain ArrayBuffer
     // `this` with a TypeError (the shared side table is the discriminator).
@@ -311,7 +311,7 @@ fn make_array_buffer_from_bytes(i: &mut Interp, bytes: Vec<u8>) -> (Value, usize
 
 pub(super) fn install_array_buffer(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("ArrayBuffer", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("ArrayBuffer", proto.clone());
     set_to_string_tag(it, &proto, "ArrayBuffer");
     // byteLength/maxByteLength/resizable/detached are accessor getters on the prototype.
     // ArrayBuffer.prototype accessors/methods require a non-shared buffer: reject a SharedArrayBuffer
@@ -2089,7 +2089,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
     ];
     for (kind, ctor_fn) in kinds {
         let proto = Object::new(Some(ta_proto.clone()));
-        it.extra_protos.insert(kind.name(), proto.clone());
+        Rc::make_mut(&mut it.extra_protos).insert(kind.name(), proto.clone());
         // BYTES_PER_ELEMENT is a non-writable, non-enumerable, non-configurable constant.
         proto.borrow_mut().props.insert(
             "BYTES_PER_ELEMENT",

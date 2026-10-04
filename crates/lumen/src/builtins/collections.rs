@@ -20,7 +20,7 @@ pub(super) fn install_collections(it: &mut Interp) {
             map_iter_next
         };
         it.def_method(&proto, "next", 0, next);
-        it.extra_protos.insert(key, proto);
+        Rc::make_mut(&mut it.extra_protos).insert(key, proto);
     }
     install_map_like(it, "Map", false, map_ctor);
     install_map_like(it, "Set", true, set_ctor);
@@ -543,7 +543,7 @@ pub(super) fn install_map_like(
     ctor_fn: NativeFn,
 ) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert(name, proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert(name, proto.clone());
 
     let adder: NativeFn = if is_set { nf_set_add } else { nf_map_set };
     it.def_method(
@@ -769,7 +769,7 @@ fn weak_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
 
 pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ctor_fn: NativeFn) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert(name, proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert(name, proto.clone());
     let adder: NativeFn = if is_set {
         nf_weak_set_add
     } else {

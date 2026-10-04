@@ -114,9 +114,8 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
     // `.prototype` is non-writable, non-enumerable, non-configurable. A host-defined concrete
     // module-source prototype inherits from it; ModuleSource instances inherit from that concrete
     // prototype (Source Phase Imports §28.1).
-    it.extra_protos
-        .insert("%AbstractModuleSourceProto%", proto.clone());
-    it.extra_protos
+    Rc::make_mut(&mut it.extra_protos).insert("%AbstractModuleSourceProto%", proto.clone());
+    Rc::make_mut(&mut it.extra_protos)
         .insert("%HostModuleSourceProto%", Object::new(Some(proto.clone())));
     ctor.borrow_mut().props.insert(
         "prototype",

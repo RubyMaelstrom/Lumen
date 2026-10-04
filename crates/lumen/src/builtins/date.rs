@@ -700,7 +700,7 @@ fn iso_string(t: f64) -> Option<String> {
 
 pub(super) fn install_date(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("Date", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Date", proto.clone());
 
     it.def_method(&proto, "getTime", 0, |i, this, _| {
         Ok(Value::Num(date_ms(i, &this)?))

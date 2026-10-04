@@ -216,7 +216,7 @@ fn dv_set_big(i: &mut Interp, this: &Value, args: &[Value]) -> Result<Value, Val
 
 pub(super) fn install_dataview(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("DataView", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("DataView", proto.clone());
     // buffer / byteLength / byteOffset are brand-checked accessor getters; byteLength/byteOffset
     // additionally throw if the backing buffer has been detached.
     for (name, getter) in [

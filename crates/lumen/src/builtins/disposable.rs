@@ -164,7 +164,7 @@ fn ds_sync_dispose_wrapper(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Val
 
 pub(super) fn install_disposable_stack(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("DisposableStack", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("DisposableStack", proto.clone());
     set_to_string_tag(it, &proto, "DisposableStack");
 
     it.def_method(&proto, "use", 1, |i, this, a| {
@@ -300,8 +300,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
 /// a promise, awaiting each disposer result through real microtasks.
 pub(super) fn install_async_disposable_stack(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos
-        .insert("AsyncDisposableStack", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("AsyncDisposableStack", proto.clone());
     set_to_string_tag(it, &proto, "AsyncDisposableStack");
 
     it.def_method(&proto, "use", 1, |i, this, a| {

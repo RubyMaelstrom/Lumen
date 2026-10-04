@@ -2801,7 +2801,7 @@ fn require_new(i: &Interp) -> Result<(), Value> {
 
 fn install_plain_date(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("Temporal.PlainDate", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainDate", proto.clone());
 
     def_getter(it, &proto, "year", |i, t, _| {
         let d = as_date(i, &t)?;
@@ -4382,7 +4382,7 @@ fn dt_add(
 
 fn install_plain_time(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("Temporal.PlainTime", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainTime", proto.clone());
 
     def_getter(it, &proto, "hour", |i, t, _| {
         Ok(Value::Num(as_time(i, &t)?.hour as f64))
@@ -4636,8 +4636,7 @@ fn to_time(i: &mut Interp, v: &Value, opts: &Value) -> Result<IsoTime, Value> {
 
 fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos
-        .insert("Temporal.PlainDateTime", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainDateTime", proto.clone());
 
     def_getter(it, &proto, "year", |i, t, _| {
         let d = as_datetime(i, &t)?.0;
@@ -5248,8 +5247,7 @@ fn to_datetime_cal(i: &mut Interp, v: &Value, opts: &Value) -> Result<DtParts, V
 
 fn install_year_month(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos
-        .insert("Temporal.PlainYearMonth", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainYearMonth", proto.clone());
     def_getter(it, &proto, "year", |i, t, _| {
         let d = as_yearmonth(i, &t)?;
         Ok(Value::Num(cal_year_num(&cal_of(i, &t), d) as f64))
@@ -5658,8 +5656,7 @@ fn to_yearmonth_cal(
 
 fn install_month_day(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos
-        .insert("Temporal.PlainMonthDay", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainMonthDay", proto.clone());
     def_getter(it, &proto, "monthCode", |i, t, _| {
         let d = as_monthday(i, &t)?;
         Ok(Value::from_string(cal_month_code(&cal_of(i, &t), d)))
@@ -7751,7 +7748,7 @@ fn diff_zdt_total(
 
 fn install_duration(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("Temporal.Duration", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.Duration", proto.clone());
     def_getter(it, &proto, "years", |i, t, _| {
         Ok(Value::Num(as_duration(i, &t)?.years))
     });
@@ -8539,7 +8536,7 @@ fn parse_duration_str(s: &str) -> Option<IsoDuration> {
 
 fn install_instant(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("Temporal.Instant", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.Instant", proto.clone());
     def_getter(it, &proto, "epochMilliseconds", |i, t, _| {
         Ok(Value::Num(
             (as_instant(i, &t)?.div_euclid(1_000_000)) as f64,
@@ -9757,8 +9754,7 @@ fn zdt_until_since(i: &mut Interp, t: &Value, a: &[Value], dir: i64) -> Result<V
 
 fn install_zoned(it: &mut Interp, ns: &Gc) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos
-        .insert("Temporal.ZonedDateTime", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Temporal.ZonedDateTime", proto.clone());
 
     macro_rules! date_get {
         ($name:literal, $f:expr) => {

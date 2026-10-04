@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) fn install_promise(it: &mut Interp) {
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("Promise", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("Promise", proto.clone());
     if let Some(key) = to_string_tag_key(it) {
         proto.borrow_mut().props.insert(
             key,

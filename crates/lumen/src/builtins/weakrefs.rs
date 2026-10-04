@@ -46,7 +46,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         i.weak_refs.insert(ptr, Some(target));
         Ok(Value::Obj(obj))
     });
-    it.extra_protos.insert("WeakRef", wr_proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("WeakRef", wr_proto.clone());
     wr_ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(wr_proto.clone()), false, false, false),
@@ -151,8 +151,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         );
         Ok(Value::Obj(obj))
     });
-    it.extra_protos
-        .insert("FinalizationRegistry", fr_proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("FinalizationRegistry", fr_proto.clone());
     fr_ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(fr_proto.clone()), false, false, false),

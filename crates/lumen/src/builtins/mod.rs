@@ -4312,7 +4312,7 @@ fn install_object(it: &mut Interp) {
             other => box_primitive(i, other),
         })
     });
-    it.extra_protos.insert("%ObjectCtor%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%ObjectCtor%", ctor.clone());
     ctor.borrow_mut().props.insert(
         "prototype",
         Property::data(Value::Obj(op.clone()), false, false, false),
@@ -6555,7 +6555,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     // property holds later.
     let values_intrinsic = ap.borrow().props.get("values").map(|p| p.value());
     if let Some(Value::Obj(values)) = values_intrinsic {
-        it.extra_protos.insert("%Array.prototype.values%", values);
+        Rc::make_mut(&mut it.extra_protos).insert("%Array.prototype.values%", values);
     }
     it.def_method(&ap, "keys", 0, |i, this, _| {
         arr_require_coercible(i, &this)?;
@@ -7206,7 +7206,7 @@ fn install_iterator(it: &mut Interp) {
     // %IteratorPrototype%: the common prototype of all built-in iterators; `[@@iterator]()` is the
     // identity function so an iterator is itself iterable.
     let proto = Object::new(Some(it.object_proto.clone()));
-    it.extra_protos.insert("%IteratorPrototype%", proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%IteratorPrototype%", proto.clone());
     if let Some(sym) = it.iterator_sym.clone() {
         let f = it.make_native("[Symbol.iterator]", 0, return_this);
         proto
@@ -7382,8 +7382,7 @@ fn install_iterator(it: &mut Interp) {
             }
             ab(i.call(rm, iter, &[]))
         });
-        it.extra_protos
-            .insert("%WrapForValidIteratorPrototype%", wrap_proto);
+        Rc::make_mut(&mut it.extra_protos).insert("%WrapForValidIteratorPrototype%", wrap_proto);
     }
 
     // %IteratorHelperPrototype%: the shared prototype of every map/filter/take/drop/flatMap
@@ -7393,8 +7392,7 @@ fn install_iterator(it: &mut Interp) {
         it.def_method(&helper_proto, "next", 0, iter_helper_next);
         it.def_method(&helper_proto, "return", 0, iter_helper_return);
         set_to_string_tag(it, &helper_proto, "Iterator Helper");
-        it.extra_protos
-            .insert("%IteratorHelperPrototype%", helper_proto);
+        Rc::make_mut(&mut it.extra_protos).insert("%IteratorHelperPrototype%", helper_proto);
     }
 
     let ctor = it.make_native("Iterator", 0, |i, t, _a| {
@@ -7424,7 +7422,7 @@ fn install_iterator(it: &mut Interp) {
         Ok(Value::Obj(Object::new(proto)))
     });
     ctor.borrow_mut().is_constructor = true;
-    it.extra_protos.insert("%IteratorCtorMarker%", ctor.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%IteratorCtorMarker%", ctor.clone());
     it.def_method(&ctor, "from", 1, |i, _t, a| {
         let v = arg(a, 0);
         // GetIteratorFlattenable (strings allowed): a string/iterable via @@iterator, or an iterator
@@ -7543,8 +7541,7 @@ fn install_iterator(it: &mut Interp) {
     // the value; the setter throws for the prototype itself as receiver but defines an own data
     // property on any other receiver (SetterThatIgnoresPrototypeProperties).
     {
-        it.extra_protos
-            .insert("%IteratorProtoMarker%", proto.clone());
+        Rc::make_mut(&mut it.extra_protos).insert("%IteratorProtoMarker%", proto.clone());
         let getter_ctor = it.make_native("get constructor", 0, |i, _t, _a| {
             Ok(i.global
                 .borrow()
@@ -7584,24 +7581,21 @@ fn install_iterator(it: &mut Interp) {
     let arr_iter_proto = Object::new(it.extra_protos.get("%IteratorPrototype%").cloned());
     set_to_string_tag(it, &arr_iter_proto, "Array Iterator");
     it.def_method(&arr_iter_proto, "next", 0, array_iter_next);
-    it.extra_protos
-        .insert("%ArrayIteratorPrototype%", arr_iter_proto);
+    Rc::make_mut(&mut it.extra_protos).insert("%ArrayIteratorPrototype%", arr_iter_proto);
 
     // %StringIteratorPrototype%: the prototype of `String.prototype[@@iterator]()` iterators, which
     // walk the string lazily by code point.
     let str_iter_proto = Object::new(it.extra_protos.get("%IteratorPrototype%").cloned());
     set_to_string_tag(it, &str_iter_proto, "String Iterator");
     it.def_method(&str_iter_proto, "next", 0, string_iter_next);
-    it.extra_protos
-        .insert("%StringIteratorPrototype%", str_iter_proto);
+    Rc::make_mut(&mut it.extra_protos).insert("%StringIteratorPrototype%", str_iter_proto);
 
     // %RegExpStringIteratorPrototype%: the prototype of the iterator returned by
     // `RegExp.prototype[@@matchAll]` and `String.prototype.matchAll`.
     let rsi_proto = Object::new(it.extra_protos.get("%IteratorPrototype%").cloned());
     set_to_string_tag(it, &rsi_proto, "RegExp String Iterator");
     it.def_method(&rsi_proto, "next", 0, regexp_string_iterator_next);
-    it.extra_protos
-        .insert("%RegExpStringIteratorPrototype%", rsi_proto);
+    Rc::make_mut(&mut it.extra_protos).insert("%RegExpStringIteratorPrototype%", rsi_proto);
 
     // %AsyncIteratorPrototype%: [@@asyncIterator]() returns this, plus [@@asyncDispose] (which calls
     // the iterator's return()). The prototype of every built-in async iterator.
@@ -7620,8 +7614,7 @@ fn install_iterator(it: &mut Interp) {
             .props
             .insert(k, Property::builtin(Value::Obj(f)));
     }
-    it.extra_protos
-        .insert("%AsyncIteratorPrototype%", async_iter_proto.clone());
+    Rc::make_mut(&mut it.extra_protos).insert("%AsyncIteratorPrototype%", async_iter_proto.clone());
 
     // %GeneratorPrototype% (proto %IteratorPrototype%) and %AsyncGeneratorPrototype% (proto
     // %AsyncIteratorPrototype%): the [[Prototype]] of a generator function's `.prototype`, carrying
@@ -7634,15 +7627,14 @@ fn install_iterator(it: &mut Interp) {
     // %Generator% (= %GeneratorFunction.prototype%) .prototype === %GeneratorPrototype%, and the
     // latter's .constructor points back — both { writable: false, enumerable: false, configurable: true }.
     link_generator_proto(it, "%GeneratorFunction.prototype%", &gen_proto);
-    it.extra_protos.insert("%GeneratorPrototype%", gen_proto);
+    Rc::make_mut(&mut it.extra_protos).insert("%GeneratorPrototype%", gen_proto);
     let async_gen_proto = Object::new(Some(async_iter_proto));
     set_to_string_tag(it, &async_gen_proto, "AsyncGenerator");
     it.def_method(&async_gen_proto, "next", 1, async_generator_next);
     it.def_method(&async_gen_proto, "return", 1, async_generator_return);
     it.def_method(&async_gen_proto, "throw", 1, async_generator_throw);
     link_generator_proto(it, "%AsyncGeneratorFunction.prototype%", &async_gen_proto);
-    it.extra_protos
-        .insert("%AsyncGeneratorPrototype%", async_gen_proto);
+    Rc::make_mut(&mut it.extra_protos).insert("%AsyncGeneratorPrototype%", async_gen_proto);
 }
 
 /// Wire the `.prototype` ↔ `.constructor` pair between a `%(Async)GeneratorFunction.prototype%`
