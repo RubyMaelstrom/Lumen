@@ -19996,6 +19996,41 @@ fn iterator_take_closes_on_bad_limit() {
 }
 
 #[test]
+fn class_field_initializers_keep_own_environments_in_all_tiers() {
+    // ECMA-262 ClassFieldDefinitionEvaluation / DefineField, snapshot e28783d5fc9d: each
+    // initializer is a method body with its own `this`; a field without an initializer is
+    // still defined (as undefined); direct eval inside an initializer may not name
+    // `arguments`. Shared field lists and shared hidden binding names must not change any
+    // of these across constructions.
+    let source = r#"
+        class A { a; b = () => this; c = this.b; #p = {n: 3}; q() { return this.#p.n; } }
+        class B extends A { d = this.c() === this; e; }
+        var o = new A(), p = new A(), r = new B();
+        var e = (function () {
+            try { eval("class E { x = eval('arguments'); } new E()"); return 'none'; }
+            catch (error) { return error.constructor.name; }
+        })();
+        [Object.getOwnPropertyNames(o).join(':'), o.a === undefined, 'a' in o,
+         o.b() === o, p.b() === p, o.c === o.b, o.b !== p.b, p.q(),
+         Object.getOwnPropertyNames(r).join(':'), r.d, 'e' in r, e].join(',')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "a:b:c,true,true,true,true,true,true,3,a:b:c:d:e,true,true,SyntaxError",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn field_initializer_new_target() {
     assert_eq!(run("class C{x=new.target}String(new C().x)"), "undefined");
     assert_eq!(

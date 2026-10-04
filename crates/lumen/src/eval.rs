@@ -5745,7 +5745,7 @@ impl Interp {
         self.class_info.insert(
             Rc::as_ptr(&ctor_obj) as usize,
             ClassInfo {
-                fields: inst_fields,
+                fields: inst_fields.into(),
                 field_env: inst_env,
                 derived,
                 instance_initializers: instance_inits,
@@ -6378,10 +6378,7 @@ impl Interp {
         let ptr = Rc::as_ptr(&obj) as usize;
         let (fields, field_env, initializers, priv_members) = match self.class_info.get(&ptr) {
             Some(i) => (
-                i.fields
-                    .iter()
-                    .map(|f| (f.key.clone(), f.init.clone(), f.transforms.clone()))
-                    .collect::<Vec<_>>(),
+                i.fields.clone(),
                 i.field_env.clone(),
                 i.instance_initializers.clone(),
                 i.private_members.clone(),
@@ -6418,27 +6415,31 @@ impl Interp {
         self.super_call_ok = false;
         self.in_field_init_code = true;
         let result = (|me: &mut Self| -> Result<(), Abrupt> {
-            for (key, init, transforms) in fields {
-                let scope = new_scope(Some(field_env.clone()));
-                bind(&scope, "this", this.clone());
-                // Field-initializer code: a direct eval from here (or from an arrow created
-                // here) may not reference `arguments`.
-                bind(&scope, "%fieldinit%", Value::Bool(true));
-                let mut v = match init {
+            for field in fields.iter() {
+                let key = &field.key;
+                let mut v = match &field.init {
                     Some(e) => {
-                        let v = me.eval(&e, &scope)?;
-                        if is_anonymous_fn(&e) {
-                            me.set_fn_name(&v, private_display(&key));
+                        // Each initializer evaluates in its own environment (it is a method
+                        // body in ClassFieldDefinitionEvaluation); one without an initializer
+                        // evaluates nothing, so it needs none.
+                        let scope = new_scope(Some(field_env.clone()));
+                        bind_shared_name(&scope, field_init_name(0), this.clone());
+                        // Field-initializer code: a direct eval from here (or from an arrow
+                        // created here) may not reference `arguments`.
+                        bind_shared_name(&scope, field_init_name(1), Value::Bool(true));
+                        let v = me.eval(e, &scope)?;
+                        if is_anonymous_fn(e) {
+                            me.set_fn_name(&v, private_display(key));
                         }
                         v
                     }
                     None => Value::Undefined,
                 };
                 // Decorator-supplied field initializers transform the value in turn.
-                for t in &transforms {
+                for t in &field.transforms {
                     v = me.call(t.clone(), this.clone(), &[v])?;
                 }
-                if Interp::is_private_key(&key) {
+                if Interp::is_private_key(key) {
                     // PrivateFieldAdd: stamped directly on the object (bypassing proxy traps);
                     // a second add or a non-extensible receiver is a TypeError.
                     let Value::Obj(o) = this else {
@@ -6463,7 +6464,7 @@ impl Interp {
                 } else {
                     // DefineField: CreateDataPropertyOrThrow (an own data property, even over a
                     // setter — and a [[DefineOwnProperty]] on a deferred namespace receiver).
-                    crate::builtins::cdp_or_throw(me, this, &key, v).map_err(Abrupt::Throw)?;
+                    crate::builtins::cdp_or_throw(me, this, key, v).map_err(Abrupt::Throw)?;
                 }
             }
             // Decorator addInitializer callbacks run after the fields, with `this` = the instance.
@@ -8300,6 +8301,36 @@ enum LoopStep {
     Continue(Value),
     /// Stop looping; the value is the final iteration's body completion value (or undefined).
     Done(Value),
+}
+
+/// [`bind`] with an already shared name, which the binding map adopts without copying.
+fn bind_shared_name(env: &Env, name: Rc<str>, value: Value) {
+    env.borrow_mut().vars.insert(
+        name,
+        Binding {
+            value,
+            mutable: true,
+            strict_immutable: false,
+            initialized: true,
+            import_ref: None,
+            imported: false,
+            deletable: false,
+        },
+    );
+}
+
+/// The hidden binding names of a class field initializer's environment (`0` = `this`,
+/// `1` = `%fieldinit%`), shared instead of allocated for every field of every instance. The
+/// thread-local has no destructor: its single reference per name is never released, so a
+/// pooled coroutine thread's exit cannot touch counts of names still in use elsewhere.
+fn field_init_name(which: usize) -> Rc<str> {
+    thread_local! {
+        static NAMES: [std::mem::ManuallyDrop<Rc<str>>; 2] = [
+            std::mem::ManuallyDrop::new(Rc::from("this")),
+            std::mem::ManuallyDrop::new(Rc::from("%fieldinit%")),
+        ];
+    }
+    NAMES.with(|names| Rc::clone(&names[which]))
 }
 
 /// Insert an initialized, mutable binding into `env` (used for the hidden `%super*%`/`this` slots).

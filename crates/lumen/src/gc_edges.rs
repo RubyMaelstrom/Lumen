@@ -398,7 +398,7 @@ mod tests {
         engine.interp.class_info.insert(
             key(0),
             ClassInfo {
-                fields: Vec::new(),
+                fields: Rc::from([]),
                 field_env: engine.interp.global_env.clone(),
                 derived: false,
                 instance_initializers: Vec::new(),

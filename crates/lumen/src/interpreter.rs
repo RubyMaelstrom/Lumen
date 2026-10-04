@@ -3534,8 +3534,9 @@ macro_rules! gc_side_slot_tables {
 }
 
 pub struct ClassInfo {
-    /// Instance fields (and auto-accessor backing fields), in declaration order.
-    pub fields: Vec<FieldInit>,
+    /// Instance fields (and auto-accessor backing fields), in declaration order. Shared so each
+    /// construction reads the list without copying keys, initializer ASTs or transforms.
+    pub fields: Rc<[FieldInit]>,
     /// The environment field initializers evaluate in (carries the class's super bindings).
     pub field_env: Env,
     /// True if the class has an `extends` clause (derived: `this` is set up by `super()`).
@@ -3552,7 +3553,7 @@ impl ClassInfo {
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         let mut bytes = self
             .fields
-            .capacity()
+            .len()
             .saturating_mul(std::mem::size_of::<FieldInit>())
             .saturating_add(
                 self.instance_initializers
@@ -3564,7 +3565,7 @@ impl ClassInfo {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(String, crate::value::Property)>()),
             );
-        for field in &self.fields {
+        for field in self.fields.iter() {
             bytes = bytes.saturating_add(field.key.scan_retained_memory(visitor));
             if let Some(initializer) = &field.init {
                 let ast_bytes = crate::ast::scan_expr_retained_memory(initializer, visitor);
@@ -9743,7 +9744,7 @@ impl Interp {
             return;
         }
         if let Some(class) = self.class_info.get(&ptr) {
-            for field in &class.fields {
+            for field in class.fields.iter() {
                 for transform in &field.transforms {
                     sink.value(transform);
                 }
