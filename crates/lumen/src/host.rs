@@ -251,7 +251,9 @@ impl HostRetainedMemory {
 /// each keep their state (timer heap, fd table, ...) under their own type.
 #[derive(Default)]
 pub struct OpState {
-    map: HashMap<TypeId, Box<dyn Any>>,
+    /// Looked up on every host call that reaches typed state; `TypeId` keys are fixed program
+    /// constants, so the default DoS-resistant SipHash only adds latency.
+    map: crate::fasthash::FastMap<TypeId, Box<dyn Any>>,
     retained_reporters: HashMap<TypeId, RetainedReporter>,
     managed_reporters: HashMap<TypeId, ManagedReporter>,
     external_reporters: HashMap<TypeId, ExternalReporter>,
