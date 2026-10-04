@@ -50,6 +50,8 @@ pub mod bytecode;
 mod cache;
 mod callback;
 #[cfg(test)]
+mod chain_bail_tests;
+#[cfg(test)]
 mod code_point_intrinsic_tests;
 #[cfg(test)]
 mod computed_reference_tests;

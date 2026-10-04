@@ -13658,26 +13658,37 @@ fn emit_chain(
     }
     a.b(done);
     // ---- bail paths: spill the pre-op virtual stack, then re-run the rest via the helper ----
+    // Every bail replays the same suffix of the chain from its op onward, and each replay step
+    // depends only on its pc and the live operand stack. One shared ladder of replay steps
+    // serves all bails (each enters at its own op), keeping fallback code linear in the chain
+    // length rather than quadratic.
+    let Some(first) = bails.iter().map(|&(idx, _, _)| idx).min() else {
+        a.bind(done);
+        return;
+    };
+    let rungs: Vec<usize> = (first..chain.len()).map(|_| a.new_label()).collect();
     for (idx, label, snap) in bails {
         a.bind(label);
         for &(r, _) in &snap {
             emit_exec_number_store(a, r, 20, 0, 9);
             a.add_imm(20, 20, 8);
         }
-        for (cop2, pc2) in &chain[idx..] {
-            match cop2 {
-                ChainOp::GetElem(_) => emit_op_helper(a, H_GET_ELEM, *pc2 as u32, l_unwind),
-                ChainOp::CmpBranch(_, target) => {
-                    // generic compare (pushes a bool) + pop-and-branch, like the unfused pair
-                    emit_exec(a, *pc2 as u32, l_unwind);
-                    emit_cond(a, COND_POP_TRUTHY, l_unwind);
-                    a.cbz(1, false, pc_labels[*target]);
-                }
-                _ => emit_exec(a, *pc2 as u32, l_unwind),
-            }
-        }
-        a.b(done);
+        a.b(rungs[idx - first]);
     }
+    for (k, (cop2, pc2)) in chain.iter().enumerate().skip(first) {
+        a.bind(rungs[k - first]);
+        match cop2 {
+            ChainOp::GetElem(_) => emit_op_helper(a, H_GET_ELEM, *pc2 as u32, l_unwind),
+            ChainOp::CmpBranch(_, target) => {
+                // generic compare (pushes a bool) + pop-and-branch, like the unfused pair
+                emit_exec(a, *pc2 as u32, l_unwind);
+                emit_cond(a, COND_POP_TRUTHY, l_unwind);
+                a.cbz(1, false, pc_labels[*target]);
+            }
+            _ => emit_exec(a, *pc2 as u32, l_unwind),
+        }
+    }
+    a.b(done);
     a.bind(done);
 }
 
