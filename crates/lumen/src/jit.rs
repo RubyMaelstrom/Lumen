@@ -1977,6 +1977,22 @@ mod shared_stub_tests {
         assert_eq!(loop_body_mask(&ops), expected);
     }
 
+    /// A loop body longer than the hot-loop bound (a flattened dispatch loop) keeps its
+    /// sites on the shared stubs; a small loop nested inside it is still hot.
+    #[test]
+    fn loop_body_mask_leaves_oversized_loop_bodies_cold() {
+        use crate::bytecode::Op;
+        let span = hot_loop_ops() + 8;
+        let mut ops = vec![Op::Undef; span + 2];
+        ops[3] = Op::JumpIfFalsePeek(6); // inner header
+        ops[5] = Op::Jump(3); // inner backedge
+        ops[span] = Op::Jump(1); // outer backedge spanning more than the bound
+        ops[span + 1] = Op::ReturnUndef;
+        let mask = loop_body_mask(&ops);
+        assert!(!mask[1] && !mask[2] && !mask[6] && !mask[span]);
+        assert!(mask[3] && mask[4] && mask[5]);
+    }
+
     #[test]
     fn shared_stubs_are_requested_once_and_forgotten_with_a_rewound_emission() {
         let mut a = asm::Asm::new();
@@ -10137,14 +10153,39 @@ fn use_shared_stub(a: &asm::Asm) -> bool {
     shared_stubs_enabled() && !a.hot()
 }
 
-/// The operations of `ops` inside a loop body: from a backward branch's target through the
-/// branch itself (nested and overlapping loops alike).
+/// Loops whose bodies span at most this many operations keep their sites' shared-stub
+/// sequences in line (see [`loop_body_mask`]). A larger body, such as the dispatch loop of
+/// control-flow-flattened code, spends far more per iteration than a stub call and return, and
+/// inlining every site in it multiplies the emitted code. `LUMEN_JIT_HOT_LOOP_OPS` overrides it.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn hot_loop_ops() -> usize {
+    static OPS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OPS.get_or_init(|| {
+        std::env::var("LUMEN_JIT_HOT_LOOP_OPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(HOT_LOOP_OPS)
+    })
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const HOT_LOOP_OPS: usize = 512;
+
+/// The operations of `ops` inside a loop body of at most [`hot_loop_ops`] operations: from a
+/// backward branch's target through the branch itself (nested and overlapping loops alike).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn loop_body_mask(ops: &[crate::bytecode::Op]) -> Vec<bool> {
     use crate::bytecode::Op;
+    let limit = hot_loop_ops();
     let mut depth = vec![0i32; ops.len() + 1];
     for (pc, op) in ops.iter().enumerate() {
         if let Op::Jump(target)
@@ -10154,7 +10195,7 @@ fn loop_body_mask(ops: &[crate::bytecode::Op]) -> Vec<bool> {
         | Op::JumpIfTruePeek(target)
         | Op::JumpIfNotNullishPeek(target) = *op
         {
-            if target as usize <= pc {
+            if target as usize <= pc && pc - target as usize <= limit {
                 depth[target as usize] += 1;
                 depth[pc + 1] -= 1;
             }
