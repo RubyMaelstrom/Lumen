@@ -116,6 +116,8 @@ mod parser;
 #[cfg(test)]
 mod private_name_cache_tests;
 #[cfg(test)]
+mod realm_inline_guard_tests;
+#[cfg(test)]
 mod record_enumeration_tests;
 mod regex;
 mod regex_emoji;

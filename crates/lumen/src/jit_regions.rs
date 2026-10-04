@@ -1483,6 +1483,11 @@ pub(super) fn emit(
                             a.cmp_reg_x(9, 10);
                             a.b_cond(C_NE, bailout);
                         }
+                        // Same-Realm proof (see `InlineTarget::expected_genv`).
+                        a.ldr_imm(9, 19, std::mem::offset_of!(crate::jit::JitCtx, genv) as u32);
+                        a.mov_imm64(10, guard.expected_genv as u64);
+                        a.cmp_reg_x(9, 10);
+                        a.b_cond(C_NE, bailout);
                         let callee = depth - guard.argc as usize - 1;
                         guard_operand(a, &stack, physical, callee, bailout);
                         a.mov_imm64(10, crate::value::PACK_OBJ | stored as u64);

@@ -975,6 +975,13 @@ pub(super) fn compile_entry(
                             a.bytes(&[0x49, 0x39, 0x44, 0x24, 0x28]); // cmp [r12+40],rax
                             a.jcc(0x85, pcs[*target as usize]);
                         }
+                        // Same-Realm proof: the splice runs in the planning Realm only
+                        // (see `InlineTarget::expected_genv`). JitCtx::genv is at [r12+64].
+                        const _: () = assert!(std::mem::offset_of!(crate::jit::JitCtx, genv) == 64);
+                        a.bytes(&[0x48, 0xb8]); // movabs rax, expected global environment
+                        a.bytes(&(it.expected_genv as u64).to_le_bytes());
+                        a.bytes(&[0x49, 0x39, 0x44, 0x24, 0x40]); // cmp [r12+64],rax
+                        a.jcc(0x85, pcs[*target as usize]);
                         let callee = -((it.argc as i32 + 1) * SLOT_BYTES);
                         a.mov_word_imm(PACK_OBJ | stored as u64);
                         a.cmp_qword_r13_rax(callee); // exact tag and callee identity

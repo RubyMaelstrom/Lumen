@@ -4506,6 +4506,11 @@ fn compile_entry(
                             a.cmp_reg_x(11, 12);
                             a.b_cond(C_NE, pc_labels[*target as usize]);
                         }
+                        // Same-Realm proof: the splice runs in the planning Realm only.
+                        a.ldr_imm(11, 19, std::mem::offset_of!(JitCtx, genv) as u32);
+                        a.mov_imm64(12, it.expected_genv as u64);
+                        a.cmp_reg_x(11, 12);
+                        a.b_cond(C_NE, pc_labels[*target as usize]);
                         let dm = (it.argc as i32 + 1) * 8;
                         // Inline plans bound arity; a far-negative address is materialized
                         // once rather than truncating an unscaled load displacement.

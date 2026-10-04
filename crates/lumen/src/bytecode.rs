@@ -921,6 +921,12 @@ pub struct InlineTarget {
     /// Exact shared closure environment required by a non-global free-name inline. Zero means
     /// the callee has no such dependency.
     pub expected_env: usize,
+    /// `Rc::as_ptr` of the global Environment Record of the Realm the plan was made in (the
+    /// same-Realm proof call caches use). A splice evaluates the callee's literals, intrinsics
+    /// and global references in the running Realm, so it is only the callee's own evaluation
+    /// while that Realm is active. Code cached on a shared AST runs in other Realms too, where
+    /// a closure from the planning Realm may reach the site; the guard then takes the call.
+    pub expected_genv: usize,
     pub argc: u16,
     /// Sloppy callee that reads `this`: the receiver must already be an object (the generic
     /// path would box a primitive or substitute the global object).
@@ -6763,6 +6769,8 @@ pub(crate) fn plan_inlines(
     caller: &Function,
     // The optimized function's [[Realm]] (`UserCallable::realm` identity): splices run in it.
     realm: usize,
+    // That Realm's global environment, which every splice's guard requires at run time.
+    genv: usize,
 ) -> crate::fasthash::FastMap<u32, InlinePlanEntry> {
     // Bound the *whole* optimized body rather than stopping after one arbitrary nesting level.
     // OO hot loops tend to be call chains (dispatcher -> virtual method -> small scheduler
@@ -6780,7 +6788,7 @@ pub(crate) fn plan_inlines(
             .and_then(|v| v.parse().ok())
             .unwrap_or(INLINE_SMALL_BUDGET),
     };
-    plan_inlines_at(chunk, caller, realm, 0, false, &mut budget)
+    plan_inlines_at(chunk, caller, realm, genv, 0, false, &mut budget)
 }
 
 /// Source operations a callee may have to splice from the small-callee budget.
@@ -6990,6 +6998,7 @@ fn plan_inlines_at(
     chunk: &Chunk,
     caller: &Function,
     realm: usize,
+    genv: usize,
     depth: u32,
     // The enclosing splice repeats in a loop of the optimized body.
     outer_in_loop: bool,
@@ -7117,7 +7126,7 @@ fn plan_inlines_at(
             // dispatcher into its virtual target and then into leaf helpers without allowing
             // unbounded recursive expansion.
             let nested = if depth < INLINE_MAX_DEPTH && budget.remaining() {
-                plan_inlines_at(callee_chunk, f, realm, depth + 1, in_loop, budget)
+                plan_inlines_at(callee_chunk, f, realm, genv, depth + 1, in_loop, budget)
             } else {
                 Default::default()
             };
@@ -7130,6 +7139,7 @@ fn plan_inlines_at(
                 obj,
                 free_names,
                 expected_env: 0,
+                expected_genv: genv,
                 nested,
             });
         }
@@ -7458,6 +7468,8 @@ pub struct InlineWay {
     /// Exact caller environment required by the guard (zero: none). Splices no longer depend
     /// on the caller's environment; retained for the guard's encoding.
     pub expected_env: usize,
+    /// The planning Realm's global environment (see [`InlineTarget::expected_genv`]).
+    pub expected_genv: usize,
     /// The callee's OWN inline plan (depth-capped recursion): call sites inside the spliced
     /// body splice too, keyed by the callee-frame ordinal — its first-compile cache numbering,
     /// which the splice reproduces by walking the same AST in the same order.
@@ -8095,6 +8107,7 @@ impl Compiler {
             expected: Rc::as_ptr(&w.obj) as usize,
             pin: Rc::downgrade(&w.obj),
             expected_env: w.expected_env,
+            expected_genv: w.expected_genv,
             argc,
             check_this: has_this && w.check_this,
         });
@@ -15402,7 +15415,8 @@ fn run_vm_inner<S: StoredValue>(
                 let this_ok = !it.check_this
                     || matches!(stack.read_value(stack.len() - d - 1), Value::Obj(_));
                 let env_ok = it.expected_env == 0 || Rc::as_ptr(env) as usize == it.expected_env;
-                if !(callee_ok && this_ok && env_ok) {
+                let realm_ok = Rc::as_ptr(&i.global_env) as usize == it.expected_genv;
+                if !(callee_ok && this_ok && env_ok && realm_ok) {
                     *pc = target as usize;
                 }
             }
@@ -21147,7 +21161,7 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
         let runs = chunk_ref.jit_runs.get().saturating_add(1);
         chunk_ref.jit_runs.set(runs);
         if chunk_ref.inline_retry_due(runs) {
-            i.try_inline_recompile(ic.func, chunk_ref, ic.realm);
+            i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
         }
     }
     let args_ptr = sp.sub(argc);
