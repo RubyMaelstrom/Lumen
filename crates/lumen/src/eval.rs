@@ -2537,6 +2537,21 @@ impl Interp {
     /// Resolve a source-level private name (`#x`) to this class evaluation's runtime key through
     /// the scope chain (each class evaluation binds its private names in its class scope — the
     /// spec's PrivateEnvironment). An unresolved name keeps its literal spelling.
+    /// [`Self::resolve_private`] without copying the bound key string.
+    fn resolve_private_key(&self, name: &str, env: &Env) -> crate::lstr::LStr {
+        let mut cur = Some(env.clone());
+        while let Some(s) = cur {
+            let b = s.borrow();
+            if let Some(binding) = b.vars.get(name) {
+                if let Value::Str(k) = &binding.value {
+                    return k.clone();
+                }
+            }
+            cur = b.parent.clone();
+        }
+        crate::lstr::LStr::from(name)
+    }
+
     fn resolve_private(&self, name: &str, env: &Env) -> String {
         let mut cur = Some(env.clone());
         while let Some(s) = cur {
@@ -3303,10 +3318,10 @@ impl Interp {
         value: Value,
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        let key = self.resolve_private(name, env);
+        let key = self.resolve_private_key(name, env);
         match value {
             // Private fields, methods and accessors are all own properties.
-            Value::Obj(object) => Ok(Value::Bool(object.borrow().props.contains(key.as_str()))),
+            Value::Obj(object) => Ok(Value::Bool(object.borrow().props.contains(&key))),
             _ => Err(self.throw("TypeError", "the right-hand side of 'in' must be an object")),
         }
     }
@@ -3317,7 +3332,7 @@ impl Interp {
         value: &Value,
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        let key = self.resolve_private(name, env);
+        let key = self.resolve_private_key(name, env);
         self.get_private_member(value, &key)
     }
 
@@ -3328,7 +3343,7 @@ impl Interp {
         value: Value,
         env: &Env,
     ) -> Result<(), Abrupt> {
-        let key = self.resolve_private(name, env);
+        let key = self.resolve_private_key(name, env);
         self.set_private_member(base, &key, value)
     }
 

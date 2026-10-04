@@ -229,3 +229,61 @@ log.join(',');
         );
     }
 }
+
+/// Private field, method and accessor operations run in the JIT's operation helper rather than
+/// through a materialized activation; they still resolve each Private Name from the running
+/// environment (ECMA-262 ResolvePrivateIdentifier), so nested classes and computed keys see
+/// their own `#x`, block scopes do not disturb it, and brand checks throw. Expected values are
+/// Node's.
+#[test]
+fn private_names_resolve_from_the_running_environment_in_compiled_code() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+var log = [];
+function rec(x) { log.push(String(x)); }
+function err(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+class A {
+  #x = 1; static #count = 0; #m() { return this.#x * 10; } get #acc() { return this.#x + 100; } set #acc(v) { this.#x = v; }
+  constructor(v) { this.#x = v; A.#count++; }
+  get x() { return this.#x; }
+  bump() { this.#x = this.#x + 1; return this.#x; }
+  callM() { return this.#m(); }
+  acc() { this.#acc = this.#acc; return this.#x; }
+  static count() { return A.#count; }
+  static has(o) { return #x in o; }
+  static peek(o) { return o.#x; }
+  blocky(fs) { for (let k = 0; k < 2; k++) { fs.push(() => k + this.#x); } { let z = this.#x; fs.push(() => z); } return this.#x; }
+  nested() {
+    class B { #x = 'inner'; read(o) { return o.#x; } static key(o) { return #x in o; } }
+    const b = new B();
+    return [b.read(b), err(() => b.read(this)), B.key(this), B.key(b), this.#x].join('/');
+  }
+  computed(o) { const self = this; class C { #x = 'c'; [o.#x]() { return 1; } static k = Object.getOwnPropertyNames(C.prototype).join(); } return C.k; }
+}
+var objs = []; for (var i = 0; i < 200; i++) objs.push(new A(i));
+var s = 0;
+for (var r = 0; r < 30; r++) for (var i = 0; i < 200; i++) { var o = objs[i]; s += o.x + (A.has(o) ? 1 : 0) + A.peek(o) + o.callM(); }
+rec(s); rec(A.count());
+rec(objs[3].bump()); rec(objs[3].x); rec(objs[3].callM()); rec(objs[3].acc());
+rec(A.has({})); rec(err(() => A.peek({}))); rec(err(() => A.has(5))); rec(err(() => Object.getOwnPropertyDescriptor(A.prototype, 'x').get.call({})));
+var fs = []; rec(objs[5].blocky(fs)); rec(fs.map(f => f()).join(','));
+rec(objs[7].nested());
+rec(err(() => objs[2].computed(objs[9])));
+for (var r = 0; r < 300; r++) objs[r % 200].bump();
+rec(objs[0].x); rec(objs[199].x);
+class P { #v; constructor(v) { this.#v = v } static get(o) { return o.#v } }
+var proxy = new Proxy(new P(1), {}); rec(err(() => P.get(proxy)));
+log.join(',');
+        "#
+            ),
+            "7170000,200,4,4,40,104,false,TypeError,TypeError,TypeError,5,5,6,5,inner/TypeError/false/true/7,TypeError,2,200,TypeError",
+            "{tier:?}"
+        );
+    }
+}

@@ -18808,11 +18808,6 @@ impl Chunk {
                 | Op::NewArgsArray
                 | Op::ImportMeta
                 | Op::DynamicImport(..)
-                | Op::PrivateIn(_)
-                | Op::GetPrivate(_)
-                | Op::GetPrivateKeep(_)
-                | Op::GetPrivateMethod(_)
-                | Op::SetPrivate(_)
                 | Op::UpdatePrivate(..)
                 | Op::SuperCallStart
                 | Op::SuperCallArgsArray
@@ -19144,11 +19139,6 @@ fn jit_bridge_op(op: &Op) -> bool {
             | Op::NewArgsArray
             | Op::ImportMeta
             | Op::DynamicImport(..)
-            | Op::PrivateIn(_)
-            | Op::GetPrivate(_)
-            | Op::GetPrivateKeep(_)
-            | Op::GetPrivateMethod(_)
-            | Op::SetPrivate(_)
             | Op::UpdatePrivate(..)
             | Op::SuperCallStart
             | Op::SuperCallArgsArray
@@ -22666,6 +22656,48 @@ unsafe fn jit_exec_inner(
             push!(this);
             push!(callee);
         }
+        // Private names resolve from the running environment: a materialized activation's
+        // (which follows the block/class scopes its bridge operations push), else the frame's.
+        Op::PrivateIn(name)
+        | Op::GetPrivate(name)
+        | Op::GetPrivateKeep(name)
+        | Op::GetPrivateMethod(name)
+        | Op::SetPrivate(name) => {
+            let private_env: &Env = match ctx.activation.as_ref() {
+                Some(activation) if activation.chunk == ctx.chunk => &activation.env,
+                _ if !ctx.resume_activation.is_null()
+                    && (*ctx.resume_activation).chunk == ctx.chunk =>
+                {
+                    &*(*ctx.resume_activation).env
+                }
+                _ => env,
+            };
+            let name = &chunk.names[name as usize];
+            match chunk.ops[pc as usize] {
+                Op::PrivateIn(_) => {
+                    let value = pop!();
+                    let result = i.private_in_vm(name, value, private_env)?;
+                    push!(result);
+                }
+                Op::GetPrivate(_) => {
+                    let base = pop!();
+                    let value = i.private_get_vm(name, &base, private_env)?;
+                    push!(value);
+                }
+                Op::GetPrivateKeep(_) | Op::GetPrivateMethod(_) => {
+                    let base = pop!();
+                    let value = i.private_get_vm(name, &base, private_env)?;
+                    push!(base);
+                    push!(value);
+                }
+                _ => {
+                    let value = pop!();
+                    let base = pop!();
+                    i.private_set_vm(name, &base, value.clone(), private_env)?;
+                    push!(value);
+                }
+            }
+        }
         Op::StoreName(n) => {
             let v = pop!();
             i.assign_free_name(&chunk.names[n as usize], v, env)?;
@@ -23518,11 +23550,6 @@ unsafe fn jit_exec_inner(
         | Op::TailEvalCallArgsArray
         | Op::ImportMeta
         | Op::DynamicImport(..)
-        | Op::PrivateIn(_)
-        | Op::GetPrivate(_)
-        | Op::GetPrivateKeep(_)
-        | Op::GetPrivateMethod(_)
-        | Op::SetPrivate(_)
         | Op::UpdatePrivate(..)
         | Op::SuperCallStart
         | Op::SuperCallArgsArray
