@@ -490,12 +490,12 @@ impl Parser {
     fn at_eof(&self) -> bool {
         matches!(self.cur(), Tok::Eof)
     }
-    fn advance(&mut self) -> Tok {
-        let t = self.toks[self.pos].kind.clone();
+    /// Step past the current token (never past the final Eof). Callers that need the token's
+    /// payload read it through `cur()` first; stepping copies nothing.
+    fn advance(&mut self) {
         if self.pos + 1 < self.toks.len() {
             self.pos += 1;
         }
-        t
     }
     /// A parse error at the current token. `at_eof` (the "more input could fix this" signal a
     /// REPL keys on) is set when that token is Eof — right for expectation failures ("expected
@@ -997,11 +997,9 @@ impl Parser {
         }
     }
 
-    fn peek_kind(&self, ahead: usize) -> Tok {
-        self.toks
-            .get(self.pos + ahead)
-            .map(|t| t.kind.clone())
-            .unwrap_or(Tok::Eof)
+    fn peek_kind(&self, ahead: usize) -> &Tok {
+        const EOF: &Tok = &Tok::Eof;
+        self.toks.get(self.pos + ahead).map_or(EOF, |t| &t.kind)
     }
 
     /// After `let`, decide whether this is a `let` declaration (vs `let` used as an identifier).
@@ -3900,6 +3898,7 @@ impl Parser {
             if matches!(self.peek_kind(base + 1), Tok::Punct("=>"))
                 && !self.toks[self.pos + base + 1].nl_before
             {
+                let name = name.clone();
                 for _ in 0..=base {
                     self.advance(); // (async) ident
                 }
