@@ -305,3 +305,27 @@ fn proxies_do_not_weaken_realm_or_class_call_guards() {
         "true|true|true|true|TypeError|true",
     );
 }
+
+/// ECMA-262 ProxyCreate step 5 and Call step 2: a proxy of a non-callable target has no
+/// [[Call]], so calling it throws a TypeError without reading the handler's `apply` trap, on
+/// every tier and at plain, method and spread call sites.
+#[test]
+fn calling_a_proxy_of_a_non_callable_target_never_reads_its_trap() {
+    check(
+        r#"
+        var reads=0, handler={get apply(){reads++;return function(){return 'trap'}}};
+        var p=new Proxy({}, handler), o={p:p}, out=[];
+        function plain(){return p()}
+        function method(){return o.p()}
+        function spread(){return p(...[1])}
+        for(var n=0;n<3;n++){
+            for(var f of [plain,method,spread]){
+                try{out.push(f())}catch(e){out.push(e instanceof TypeError)}
+            }
+        }
+        out.push(reads, typeof p, typeof new Proxy(function(){}, {}));
+        out.join('|')
+    "#,
+        "true|true|true|true|true|true|true|true|true|0|object|function",
+    );
+}

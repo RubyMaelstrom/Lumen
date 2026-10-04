@@ -11266,6 +11266,11 @@ impl Interp {
         if !self.proxies.is_empty() {
             if let Some((target, handler)) = self.proxies.get(&(Rc::as_ptr(&obj) as usize)).cloned()
             {
+                // ProxyCreate step 5 gives a proxy [[Call]] only when its target is callable,
+                // and Call step 2 throws before any trap is read (ECMA-262, local e28783d).
+                if matches!(obj.borrow().call, Callable::None) {
+                    return Err(self.throw("TypeError", "value is not a function"));
+                }
                 let trap = self.get_member(&handler, "apply")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     return self.call(target, this, args);
