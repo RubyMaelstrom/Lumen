@@ -86,6 +86,8 @@ mod heap;
 mod host;
 mod host_collections;
 mod host_memory;
+#[cfg(test)]
+mod host_string_tests;
 mod interpreter;
 mod interrupt;
 #[cfg(feature = "intl")]
@@ -386,13 +388,20 @@ pub(crate) fn host_now_ms() -> Option<f64> {
     HOST_CLOCK.get().map(|f| f())
 }
 
+/// Parse Script source text supplied by the host. The text is Rust text, so a character in the
+/// range the engine reserves for lone surrogates is a real character (see `Value::str`); eval
+/// and the Function constructor parse engine strings directly.
+fn parse_host_script(src: &str, strict: bool) -> Result<Vec<ast::Stmt>, parser::ParseError> {
+    parser::parse_script(&jstr::from_text(src), strict)
+}
+
 /// Parse `src` as a script and encode its AST to a snapshot blob — a build-time helper (used
 /// from op crates' `build.rs`) so static JS glue is parsed once at build and decoded, not
 /// re-parsed, on every boot. Decode it at runtime with [`Engine::eval_snapshot`]. `Err` is a
 /// parse-error message.
 pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
-    let body =
-        parser::parse_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
+    let body = parse_host_script(src, false)
+        .map_err(|e| format!("{} (line {})", e.message, e.line))?;
     Ok(snapshot::encode(&body))
 }
 
@@ -404,8 +413,8 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 /// their source. This does not alter execution, constructibility, or descriptors,
 /// and does not by itself implement the rest of Web IDL's function-object rules.
 pub fn compile_host_snapshot(src: &str) -> Result<Vec<u8>, String> {
-    let body =
-        parser::parse_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
+    let body = parse_host_script(src, false)
+        .map_err(|e| format!("{} (line {})", e.message, e.line))?;
     Ok(snapshot::encode_host(&body))
 }
 
@@ -535,7 +544,7 @@ impl Engine {
         src: &str,
         strict: bool,
     ) -> Result<ExecutionOutcome, ParseError> {
-        let body = parser::parse_script(src, strict).map_err(|e| ParseError {
+        let body = parse_host_script(src, strict).map_err(|e| ParseError {
             message: e.message,
             line: e.line,
             at_eof: e.at_eof,
@@ -791,15 +800,22 @@ impl Engine {
         self.interp.live_object_limit as u64
     }
 
-    /// Drain anything written to `console.*` since the last call.
+    /// Drain anything written to `console.*` since the last call, as Rust text (lone
+    /// surrogates become U+FFFD).
     pub fn take_console(&mut self) -> Vec<String> {
         std::mem::take(&mut self.interp.console)
+            .into_iter()
+            .map(|line| match jstr::to_text(&line) {
+                std::borrow::Cow::Borrowed(_) => line,
+                std::borrow::Cow::Owned(text) => text,
+            })
+            .collect()
     }
 
     fn render(&mut self, v: &Value) -> String {
         self.interp
             .to_string(v)
-            .map(|s| s.to_string())
+            .map(|s| jstr::to_text(&s).into_owned())
             .unwrap_or_default()
     }
 
@@ -904,7 +920,7 @@ impl interpreter::Interp {
         &mut self,
         src: &str,
     ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        let body = parser::parse_script(src, false).map_err(|error| ParseError {
+        let body = parse_host_script(src, false).map_err(|error| ParseError {
             message: error.message,
             line: error.line,
             at_eof: error.at_eof,
@@ -1073,7 +1089,7 @@ impl Engine {
         &mut self,
         src: &str,
     ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        let body = parser::parse_script(src, false).map_err(|e| ParseError {
+        let body = parse_host_script(src, false).map_err(|e| ParseError {
             message: e.message,
             line: e.line,
             at_eof: e.at_eof,

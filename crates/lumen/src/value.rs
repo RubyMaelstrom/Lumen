@@ -113,6 +113,11 @@ pub enum Value {
     Num(f64) = 4,
     /// Arbitrary-precision BigInt (sign plus little-endian base-2^64 magnitude).
     BigInt(crate::bigint::JsBigInt) = 5,
+    /// A string in the engine representation: UTF-8 in which a lone surrogate is the scalar
+    /// U+10F800 + (unit − 0xD800) and a character in U+10F800..=U+10FFFF is its surrogate pair
+    /// of such scalars. Embedders exchange text with [`Value::str`], [`Value::from_string`],
+    /// [`Value::as_text`] and `Ctx::coerce_string`, or code units with [`Value::from_utf16`]
+    /// and `Ctx::coerce_utf16`, rather than reading or building this payload directly.
     Str(crate::lstr::LStr) = 6,
     Sym(Rc<SymbolData>) = 7,
     Obj(Gc) = 8,
@@ -1368,16 +1373,40 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
 }
 
 impl Value {
-    pub fn str(s: impl Into<crate::lstr::LStr>) -> Value {
-        Value::Str(s.into())
+    /// The JS string whose code points are the characters of the Rust text `s`.
+    ///
+    /// The engine stores a lone surrogate as a scalar in U+10F800..=U+10FFFF (see
+    /// `Value::Str`), so a character of `s` in that range is stored as its surrogate pair: a
+    /// native function returning `Value::str("\u{10FFFD}")` gives a string of length 2. A Rust
+    /// string cannot hold a lone surrogate; build one from code units with
+    /// [`Value::from_utf16`].
+    pub fn str(s: impl AsRef<str>) -> Value {
+        Value::Str(crate::jstr::from_text(s.as_ref()).as_ref().into())
     }
+    /// [`Value::str`] for an owned `String`, reusing its buffer when no character needs the
+    /// surrogate-pair form.
     pub fn from_string(s: String) -> Value {
-        Value::Str(s.into())
+        match crate::jstr::from_text(&s) {
+            std::borrow::Cow::Borrowed(_) => Value::Str(s.into()),
+            std::borrow::Cow::Owned(converted) => Value::Str(converted.into()),
+        }
     }
-    /// A string already in the engine representation (see `crate::jstr`): engine strings and
+    /// The JS string with exactly these UTF-16 code units, lone surrogates included.
+    pub fn from_utf16(units: &[u16]) -> Value {
+        Value::Str(crate::jstr::from_units(units).into())
+    }
+    /// A string already in the engine representation (see `Value::Str`): engine strings and
     /// their slices, property keys, and ASCII literals.
     pub(crate) fn lstr(s: impl Into<crate::lstr::LStr>) -> Value {
         Value::Str(s.into())
+    }
+    /// A string value as Rust text: the conversion to a Web IDL `USVString`, in which every lone
+    /// surrogate becomes U+FFFD. `None` for any other value; see `Ctx::coerce_string` for ToString.
+    pub fn as_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self {
+            Value::Str(s) => Some(crate::jstr::to_text(s)),
+            _ => None,
+        }
     }
     /// A BigInt from an `i64` (for the embedder's 64-bit integer bridge, e.g. wasm i64).
     pub fn bigint_from_i64(v: i64) -> Value {

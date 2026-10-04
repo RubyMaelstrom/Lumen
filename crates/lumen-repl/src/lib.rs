@@ -150,7 +150,7 @@ impl Repl {
         let _ = ctx.set_member(&global, "_", v.clone());
         let text = match &v {
             // Quote strings so `"42"` and `42` are distinguishable, as every REPL does.
-            Value::Str(s) => format!("'{s}'"),
+            Value::Str(_) => format!("'{}'", v.as_text().unwrap_or_default()),
             other => render_value(ctx, other),
         };
         Step::Done(text)

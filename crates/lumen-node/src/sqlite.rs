@@ -586,8 +586,8 @@ fn op_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
                 Value::BigInt(_) => {
                     (api.bind_int64)(stmt, index, value.bigint_as_i64().unwrap_or(0))
                 }
-                Value::Str(s) => {
-                    let text = s.to_string();
+                Value::Str(_) => {
+                    let text = value.as_text().unwrap_or_default().into_owned();
                     (api.bind_text)(
                         stmt,
                         index,

@@ -6100,36 +6100,35 @@ impl Interp {
             .map_err(abrupt_value)
     }
 
-    /// ToString with the abrupt completion lowered to the thrown value (see [`invoke`]).
+    /// ToString as Rust text, with the abrupt completion lowered to the thrown value (see
+    /// [`invoke`]). A Rust string holds only Unicode scalar values, so this is the Web IDL
+    /// `USVString` conversion: surrogate pairs become their characters and every lone surrogate
+    /// becomes U+FFFD. Use [`Interp::coerce_utf16`] where lone surrogates must survive.
     pub fn coerce_string(&mut self, v: &Value) -> Result<Rc<str>, Value> {
-        self.to_string(v).map(|s| (&s).into()).map_err(abrupt_value)
+        self.to_string(v)
+            .map(|s| match crate::jstr::to_text(&s) {
+                std::borrow::Cow::Borrowed(text) => Rc::from(text),
+                std::borrow::Cow::Owned(text) => Rc::from(text),
+            })
+            .map_err(abrupt_value)
     }
 
-    /// Web IDL `USVString`: run ECMAScript ToString, combine valid surrogate pairs, and replace
-    /// every unpaired surrogate with U+FFFD. WHATWG Encoding's `TextEncoder` consumes exactly this
-    /// scalar-value sequence rather than the engine's internal surrogate-smuggling UTF-8.
+    /// Web IDL `USVString`: [`Interp::coerce_string`] as an owned `String`. WHATWG Encoding's
+    /// `TextEncoder` consumes exactly this scalar-value sequence.
     pub fn coerce_usv_string(&mut self, v: &Value) -> Result<String, Value> {
         let value = self.to_string(v).map_err(abrupt_value)?;
-        if value.is_ascii() {
-            return Ok(value.to_string());
-        }
-        let mut result = String::with_capacity(value.len());
-        for point in crate::jstr::CodePointIter::new(&value) {
-            result.push(char::from_u32(point).unwrap_or(char::REPLACEMENT_CHARACTER));
-        }
-        Ok(result)
+        Ok(crate::jstr::to_text(&value).into_owned())
     }
 
-    /// Convert a Rust UTF-8 string into Lumen's canonical ECMAScript string representation.
-    /// Plane-16 private-use scalars overlap the internal lone-surrogate encoding and therefore
-    /// need an explicit UTF-16 round trip at host boundaries.
+    /// ToString as UTF-16 code units, lone surrogates included (a Web IDL `DOMString`).
+    pub fn coerce_utf16(&mut self, v: &Value) -> Result<Vec<u16>, Value> {
+        let value = self.to_string(v).map_err(abrupt_value)?;
+        Ok(crate::jstr::units(&value))
+    }
+
+    /// The JS string with the characters of Rust text; the same as [`Value::from_string`].
     pub fn string_from_utf8(&self, value: String) -> Value {
-        if value.chars().any(|c| crate::jstr::smuggled(c).is_some()) {
-            let points: Vec<u32> = value.chars().map(|c| c as u32).collect();
-            Value::lstr(crate::jstr::from_code_points(&points))
-        } else {
-            Value::lstr(value)
-        }
+        Value::from_string(value)
     }
 
     /// The bytes a TypedArray view covers (`None` when `v` isn't a typed array or its buffer

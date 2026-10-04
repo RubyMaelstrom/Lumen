@@ -447,8 +447,10 @@ impl Interp {
             Some(s) => s,
             None => return Err(self.throw("TypeError", format!("module not found: {key}"))),
         };
-        let body =
-            crate::parser::parse_module(&src).map_err(|e| self.throw("SyntaxError", e.message))?;
+        // Module source text comes from the host (its loaders and entry points): Rust text, in
+        // which a character of the engine's lone-surrogate range is a real character.
+        let body = crate::parser::parse_module(&crate::jstr::from_text(&src))
+            .map_err(|e| self.throw("SyntaxError", e.message))?;
         let body = Rc::new(body);
 
         // Resolve every dependency specifier to a canonical key up front (fetching its source), so

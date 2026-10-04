@@ -47,7 +47,7 @@ impl Default for ConsoleOut {
 /// throws prints as its typeof. (A real `util.inspect` is future work.)
 fn render(ctx: &mut Ctx, v: &Value) -> String {
     match v {
-        Value::Str(s) => s.to_string(),
+        Value::Str(_) => v.as_text().unwrap_or_default().into_owned(),
         Value::Sym(s) => match &s.description {
             Some(d) => format!("Symbol({d})"),
             None => "Symbol()".into(),

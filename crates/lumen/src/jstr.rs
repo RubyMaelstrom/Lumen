@@ -31,6 +31,48 @@ pub fn smuggle(unit: u16) -> char {
     char::from_u32(SMUGGLE_BASE + (unit as u32 - 0xD800)).unwrap()
 }
 
+/// Whether `s` may hold a scalar in the smuggle range. Each such scalar's UTF-8 form begins with
+/// byte 0xF4 (U+10F800 is `F4 8F A0 80`), so most strings are cleared by one byte search.
+#[inline]
+fn may_hold_smuggle_range(s: &str) -> bool {
+    s.as_bytes().contains(&0xF4)
+}
+
+/// Host text (a Rust `str`, which holds Unicode scalar values only) in the engine
+/// representation: every character in the smuggle range becomes its canonical smuggled pair, so
+/// the JS string has the same code points as `s`. The result never contains a lone surrogate.
+/// Script source and string values supplied by an embedder enter the engine through this.
+pub(crate) fn from_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if !may_hold_smuggle_range(s) || !s.chars().any(|c| smuggled(c).is_some()) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if smuggled(c).is_some() {
+            let v = c as u32 - 0x10000;
+            out.push(smuggle(0xD800 + (v >> 10) as u16));
+            out.push(smuggle(0xDC00 + (v & 0x3FF) as u16));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// An engine string as host text: the conversion of a JS string to a Web IDL `USVString`
+/// (§3.2.11). Surrogate pairs, including the smuggled pairs of smuggle-range characters, become
+/// their characters, and every lone surrogate becomes U+FFFD.
+pub(crate) fn to_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if !may_hold_smuggle_range(s) || !s.chars().any(|c| smuggled(c).is_some()) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        CodePointIter::new(s)
+            .map(|point| char::from_u32(point).unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect(),
+    )
+}
+
 /// The UTF-16 code units of `s` (smuggled scalars decode to their lone surrogates).
 pub fn units(s: &str) -> Vec<u16> {
     // ASCII fast path: units are exactly the bytes (no surrogates, no smuggling possible).

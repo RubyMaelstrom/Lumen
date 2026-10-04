@@ -101,7 +101,7 @@ fn stdio_for(name: &str) -> Stdio {
 
 fn opt_string(ctx: &mut Ctx, v: Option<&Value>) -> Option<String> {
     match v {
-        Some(Value::Str(s)) => Some(s.to_string()),
+        Some(text @ Value::Str(_)) => text.as_text().map(|text| text.into_owned()),
         Some(v) if !matches!(v, Value::Undefined | Value::Null) => {
             ctx.coerce_string(v).ok().map(|s| s.to_string())
         }
