@@ -4788,17 +4788,43 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
 /// Build a property descriptor from a JS descriptor object.
 /// Build a descriptor object (`{value, writable, enumerable, configurable}` or `{get, set, ...}`).
 fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
-    let d = i.new_object();
-    if p.accessor() {
-        set_data(&d, "get", p.getter().cloned().unwrap_or(Value::Undefined));
-        set_data(&d, "set", p.setter().cloned().unwrap_or(Value::Undefined));
+    // FromPropertyDescriptor (ECMA-262): an ordinary object of the current Realm with the
+    // fields created by CreateDataPropertyOrThrow in this order. The two possible key
+    // sequences are fixed, so the finished map is built once per Agent and instantiated.
+    let accessor = p.accessor();
+    let values = if accessor {
+        [
+            p.getter().cloned().unwrap_or(Value::Undefined),
+            p.setter().cloned().unwrap_or(Value::Undefined),
+            Value::Bool(p.enumerable()),
+            Value::Bool(p.configurable()),
+        ]
     } else {
-        set_data(&d, "value", p.take_value());
-        set_data(&d, "writable", Value::Bool(p.writable()));
-    }
-    set_data(&d, "enumerable", Value::Bool(p.enumerable()));
-    set_data(&d, "configurable", Value::Bool(p.configurable()));
-    Value::Obj(d)
+        [
+            p.take_value(),
+            Value::Bool(p.writable()),
+            Value::Bool(p.enumerable()),
+            Value::Bool(p.configurable()),
+        ]
+    };
+    let keys: [&str; 4] = if accessor {
+        ["get", "set", "enumerable", "configurable"]
+    } else {
+        ["value", "writable", "enumerable", "configurable"]
+    };
+    let map = i.descriptor_maps[usize::from(accessor)].get_or_init(|| {
+        let mut map = Props::new();
+        for key in keys {
+            map.insert(key, Property::plain(Value::Undefined));
+        }
+        map
+    });
+    let props = map.instantiate_plain(values.into_iter());
+    Value::Obj(Object::new_with_parts(
+        Some(i.object_proto.clone()),
+        props,
+        Exotic::None,
+    ))
 }
 
 /// A property descriptor with only the explicitly-present fields populated.

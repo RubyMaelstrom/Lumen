@@ -2755,6 +2755,10 @@ pub struct Interp {
     /// `callee`) appended to empty or packed element storage, derived once by ordinary insertion
     /// into this interpreter's heap. Holds only keys and shape ids: no JS value or Realm.
     pub(crate) arguments_shapes: Option<([Rc<str>; 3], [u32; 3])>,
+    /// Pre-shaped property maps of FromPropertyDescriptor results: `[data, accessor]`, built by
+    /// ordinary insertion on first use. Keys and shape only; every result object is fresh and
+    /// takes the active Realm's %Object.prototype%.
+    pub(crate) descriptor_maps: [std::cell::OnceCell<Props>; 2],
     pub(crate) computed_reads: crate::bytecode::ComputedReadCache,
     /// Quiescent source-scoped loop plans; executing plans have only weak cache entries.
     pub(crate) fragment_cache: crate::bytecode::fragment_cache::Cache,
@@ -3236,6 +3240,7 @@ interp_memory_inventory! {
     native_arg_pool => "measured",
     stub_cache => "measured",
     arguments_shapes => "measured",
+    descriptor_maps => "measured",
     stub_cache_names => "measured",
     computed_reads => "measured",
     fragment_cache => "measured",
@@ -3386,7 +3391,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 155);
+    assert_eq!(names.len(), 156);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4273,6 +4278,7 @@ impl Interp {
             native_arg_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
             arguments_shapes: None,
+            descriptor_maps: Default::default(),
             stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
             computed_reads: Default::default(),
             fragment_cache: Default::default(),

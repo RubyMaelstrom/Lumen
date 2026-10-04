@@ -1329,6 +1329,11 @@ fn scan_realm(
             visitor.rc_str(key);
         }
     }
+    for map in &interp.descriptor_maps {
+        if let Some(map) = map.get() {
+            visitor.props(map);
+        }
+    }
     if !interp.creation_pins.is_empty() {
         totals
             .engine_caches

@@ -147,3 +147,67 @@ fn property_descriptor_conversion_keeps_field_order_and_inheritance() {
 |TypeError,TypeError",
     );
 }
+
+/// FromPropertyDescriptor creates a fresh ordinary object of the current Realm whose own data
+/// properties appear in the specification's order with all attributes true.
+#[test]
+fn property_descriptor_results_are_fresh_ordered_objects() {
+    all_tiers(
+        r#"
+        const o = { a: 1 };
+        Object.defineProperty(o, "g", { get() { return 1; }, enumerable: false, configurable: true });
+        let report;
+        for (let i = 0; i < 30; i++) {
+            const data = Object.getOwnPropertyDescriptor(o, "a");
+            const accessor = Reflect.getOwnPropertyDescriptor(o, "g");
+            const again = Object.getOwnPropertyDescriptor(o, "a");
+            data.extra = i;
+            const attributes = Object.getOwnPropertyDescriptor(data, "value");
+            report = [
+                Object.keys(data).join(","), Object.keys(accessor).join(","),
+                data !== again, "extra" in again, Object.getPrototypeOf(data) === Object.prototype,
+                typeof accessor.get, accessor.set, accessor.enumerable, accessor.configurable,
+                attributes.writable && attributes.enumerable && attributes.configurable,
+                Object.keys(Object.getOwnPropertyDescriptors(o)).join(","),
+            ].join("|");
+        }
+        report
+        "#,
+        "value,writable,enumerable,configurable,extra|get,set,enumerable,configurable|true|false|true|function||false|true|true|a,g",
+    );
+}
+
+/// A descriptor returned by another Realm's built-in belongs to that Realm (the active Realm
+/// while its function runs), and a descriptor object from another Realm is read like any other.
+#[test]
+fn property_descriptor_objects_follow_the_running_realm() {
+    use crate::realm_inline_guard_tests::{eval_string, in_realm, set_global};
+    use crate::value::Value;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        let child = it.create_realm();
+        set_global(it, "child", child.clone());
+        let main = Value::Obj(it.global.clone());
+        in_realm(it, &child, |it| set_global(it, "main", main.clone()));
+        let result = eval_string(
+            it,
+            r#"(function () {
+                const o = { a: 1 };
+                let ok = 0;
+                for (let i = 0; i < 20; i++) {
+                    const own = Object.getOwnPropertyDescriptor(o, "a");
+                    const foreign = child.Object.getOwnPropertyDescriptor(o, "a");
+                    if (Object.getPrototypeOf(own) === Object.prototype) ok++;
+                    if (Object.getPrototypeOf(foreign) === child.Object.prototype) ok++;
+                    const target = {};
+                    Object.defineProperty(target, "x", child.eval("({ value: 7, enumerable: true })"));
+                    if (target.x === 7 && Object.keys(target).join() === "x") ok++;
+                }
+                return ok;
+            })()"#,
+        );
+        assert_eq!(result, "60", "{tier:?}");
+    }
+}
