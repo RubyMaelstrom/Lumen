@@ -3814,6 +3814,37 @@ mod key_interning_tests {
     use super::*;
 
     #[test]
+    fn integer_key_text_matches_number_to_string() {
+        for (n, text) in [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (7.0, "7"),
+            (-7.0, "-7"),
+            (4294967295.0, "4294967295"),
+            (9007199254740991.0, "9007199254740991"),
+            (-9007199254740991.0, "-9007199254740991"),
+        ] {
+            assert_eq!(
+                IntegerKeyText::new(n)
+                    .map(|t| t.as_str().to_owned())
+                    .as_deref(),
+                Some(text)
+            );
+        }
+        for n in [
+            0.5,
+            -1.5,
+            f64::NAN,
+            f64::INFINITY,
+            -f64::INFINITY,
+            9007199254740992.0,
+            1e21,
+        ] {
+            assert!(IntegerKeyText::new(n).is_none(), "{n}");
+        }
+    }
+
+    #[test]
     fn borrowed_keys_share_text_and_transitions_by_content_only() {
         let heap = new_gc_heap();
         let symbols = new_symbol_agent();
@@ -3851,6 +3882,49 @@ mod key_interning_tests {
         }
         assert_eq!(build(&["x", "y", "z"], false), shape);
         assert_eq!(build(&["x", "y", "z"], true), shape);
+    }
+}
+
+/// The decimal text of an integral Number, formatted on the stack: what ToString (and so
+/// ToPropertyKey) produces for it. Only exact integers below 2^53 in magnitude qualify (their
+/// text has no exponent or fraction); `-0` is `"0"`. Lets computed member accesses with a
+/// Number key build their key without a temporary string allocation.
+pub(crate) struct IntegerKeyText {
+    bytes: [u8; 20],
+    start: u8,
+}
+
+impl IntegerKeyText {
+    pub(crate) fn new(n: f64) -> Option<IntegerKeyText> {
+        const LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+        if n.abs() >= LIMIT || n.trunc() != n {
+            return None;
+        }
+        let negative = n < 0.0;
+        let mut magnitude = n.abs() as u64;
+        let mut bytes = [0u8; 20];
+        let mut start = bytes.len();
+        loop {
+            start -= 1;
+            bytes[start] = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        if negative && !(start == bytes.len() - 1 && bytes[start] == b'0') {
+            start -= 1;
+            bytes[start] = b'-';
+        }
+        Some(IntegerKeyText {
+            bytes,
+            start: start as u8,
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // SAFETY: only ASCII digits and '-' are written from `start` on.
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[self.start as usize..]) }
     }
 }
 

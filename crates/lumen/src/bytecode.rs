@@ -22072,6 +22072,10 @@ fn get_computed_element(
             return Ok(value);
         }
     }
+    // ToPropertyKey of an integral Number is its decimal text; skip the temporary strings.
+    if let Some(text) = key.as_num_opt().and_then(crate::value::IntegerKeyText::new) {
+        return i.get_member(obj, text.as_str());
+    }
     let key = i.to_property_key(key)?;
     i.get_member(obj, &key)
 }
@@ -22104,6 +22108,9 @@ fn set_computed_element(
     } else {
         value
     };
+    if let Some(text) = key.as_num_opt().and_then(crate::value::IntegerKeyText::new) {
+        return i.set_member(object, text.as_str(), value);
+    }
     let key = i.to_property_key(key)?;
     i.set_member(object, &key, value)
 }

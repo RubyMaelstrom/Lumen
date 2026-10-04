@@ -19996,6 +19996,38 @@ fn iterator_take_closes_on_bad_limit() {
 }
 
 #[test]
+fn computed_number_keys_use_number_to_string_in_all_tiers() {
+    // ECMA-262 ToPropertyKey / Number::toString, snapshot e28783d5fc9d: integral keys (including
+    // -0 and values near 2^53) and non-integral ones reach [[Get]]/[[Set]] as their decimal text.
+    let source = r#"
+        var log = [];
+        var p = new Proxy({}, {
+            get(t, k) { log.push("g:" + String(k)); return t[k]; },
+            set(t, k, v) { log.push("s:" + String(k)); t[k] = v; return true; }
+        });
+        var keys = [-0, 0, 7, -3, 1.5, 2 ** 53, 2 ** 53 - 1, -(2 ** 53 - 1), 1e21, NaN, Infinity];
+        var o = {};
+        for (var k of keys) { o[k] = String(k); p[k] = 1; p[k]; }
+        var s = "abc";
+        [Object.keys(o).join(","), log.join(","), s[-0], s[1], s[-1], [5, 6][-0], o[-3], o[2 ** 53]].join("|")
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "0,7,-3,1.5,9007199254740992,9007199254740991,-9007199254740991,1e+21,NaN,Infinity|s:0,g:0,s:0,g:0,s:7,g:7,s:-3,g:-3,s:1.5,g:1.5,s:9007199254740992,g:9007199254740992,s:9007199254740991,g:9007199254740991,s:-9007199254740991,g:-9007199254740991,s:1e+21,g:1e+21,s:NaN,g:NaN,s:Infinity,g:Infinity|a|b||5|-3|9007199254740992",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn iterator_results_are_fresh_ordered_objects_in_all_tiers() {
     // ECMA-262 CreateIterResultObject, snapshot e28783d5fc9d: a fresh ordinary object of the
     // current Realm with data properties `value` then `done`, all attributes true. Results built
