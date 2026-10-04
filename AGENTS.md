@@ -201,9 +201,13 @@ character in U+10F800..=U+10FFFF as its pair of such scalars (`jstr.rs`). Rust t
 enters through `Value::str`, `Value::from_string` and the host source entry points,
 which store those characters as pairs, and leaves through `Ctx::coerce_string` and
 `Value::as_text`, the USVString conversion (lone surrogates become U+FFFD).
-`Value::from_utf16` and `Ctx::coerce_utf16` keep lone surrogates. Engine code builds
-strings already in the engine representation with `Value::lstr` and appends code points
-through `jstr`, never through `Value::str`.
+`Value::from_utf16` and `Ctx::coerce_utf16` keep lone surrogates. A host that stores
+Web IDL `DOMString`s as Rust strings (a DOM) keeps them as engine text instead:
+`Ctx::coerce_engine_text`, `Value::as_engine_text` and `Value::from_engine_text` pass it
+unchanged, and `embed::text_to_engine`/`embed::engine_to_text` convert at that host's own
+text boundaries (decoded documents in, rendering and USVString consumers out). Engine code
+builds strings already in the engine representation with `Value::lstr` and appends code
+points through `jstr`, never through `Value::str`.
 
 TypeErrors for non-callable call or `new` targets name the target's source expression
 (`callee_name.rs`). Compiled chunks keep these names in a side table read only when such

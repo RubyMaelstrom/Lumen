@@ -6126,6 +6126,15 @@ impl Interp {
         Ok(crate::jstr::units(&value))
     }
 
+    /// ToString as engine text, lone surrogates included (a Web IDL `DOMString` kept as a Rust
+    /// string): [`Value::from_engine_text`] rebuilds exactly the same JS string. This is not
+    /// Rust text; see [`Value::as_engine_text`].
+    pub fn coerce_engine_text(&mut self, v: &Value) -> Result<Rc<str>, Value> {
+        self.to_string(v)
+            .map(|s| Rc::from(s.as_str()))
+            .map_err(abrupt_value)
+    }
+
     /// The JS string with the characters of Rust text; the same as [`Value::from_string`].
     pub fn string_from_utf8(&self, value: String) -> Value {
         Value::from_string(value)

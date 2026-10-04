@@ -890,6 +890,19 @@ pub mod embed {
         NativeRetainedMemoryVisitor, RetainedManagedAllocation, Value,
     };
 
+    /// Rust text in the engine representation used by [`Value::from_engine_text`]: every
+    /// character in U+10F800..=U+10FFFF becomes its pair of private-use scalars. Use it where
+    /// a host stores decoded text (a parsed document, a network message) beside engine text.
+    pub fn text_to_engine(text: &str) -> std::borrow::Cow<'_, str> {
+        crate::jstr::from_text(text)
+    }
+
+    /// Engine text (from [`Value::as_engine_text`] or `Ctx::coerce_engine_text`) as Rust text:
+    /// the Web IDL `USVString` conversion, in which every lone surrogate becomes U+FFFD.
+    pub fn engine_to_text(engine_text: &str) -> std::borrow::Cow<'_, str> {
+        crate::jstr::to_text(engine_text)
+    }
+
     /// Non-parse failure from an interrupt-aware embedding entry point.
     pub enum EvalError {
         Throw(Value),

@@ -234,3 +234,41 @@ fn built_ins_assemble_plane_16_characters_as_surrogate_pairs() {
         );
     }
 }
+
+/// Engine text is the lossless Rust-string form of a JS string (a host's `DOMString` storage):
+/// lone surrogates and private-use characters survive a round trip, and the text conversions
+/// map Rust text into it and out of it.
+#[test]
+fn engine_text_round_trips_every_code_unit() {
+    let mut engine = Engine::new();
+    let it = &mut *engine.interp;
+    let original = Value::from_utf16(&[0x61, 0xD800, 0xDBFF, 0xDFFD, 0xDC00, 0x10, 0xDBFE]);
+    let Ok(engine_text) = it.coerce_engine_text(&original) else {
+        panic!("a string converts");
+    };
+    let engine_text = engine_text.to_string();
+    assert_eq!(original.as_engine_text(), Some(engine_text.as_str()));
+    let rebuilt = Value::from_engine_text(engine_text.clone());
+    assert_eq!(
+        it.coerce_utf16(&rebuilt).ok(),
+        Some(vec![0x61, 0xD800, 0xDBFF, 0xDFFD, 0xDC00, 0x10, 0xDBFE])
+    );
+    assert_eq!(
+        crate::jstr::to_text(&engine_text),
+        "a\u{FFFD}\u{10FFFD}\u{FFFD}\u{10}\u{FFFD}"
+    );
+    // Rust text enters engine text with its private-use characters as pairs.
+    let decoded = "x\u{10FFFD}\u{10F800}";
+    let stored = crate::jstr::from_text(decoded).into_owned();
+    assert_eq!(
+        it.coerce_utf16(&Value::from_engine_text(stored.clone())).ok(),
+        Some(vec![0x78, 0xDBFF, 0xDFFD, 0xDBFE, 0xDC00])
+    );
+    assert_eq!(crate::jstr::to_text(&stored), decoded);
+    assert_eq!(Value::Num(1.0).as_engine_text(), None);
+    #[cfg(feature = "embed")]
+    {
+        assert_eq!(crate::embed::text_to_engine(decoded), stored);
+        assert_eq!(crate::embed::engine_to_text(&stored), decoded);
+    }
+}

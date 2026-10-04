@@ -116,8 +116,10 @@ pub enum Value {
     /// A string in the engine representation: UTF-8 in which a lone surrogate is the scalar
     /// U+10F800 + (unit − 0xD800) and a character in U+10F800..=U+10FFFF is its surrogate pair
     /// of such scalars. Embedders exchange text with [`Value::str`], [`Value::from_string`],
-    /// [`Value::as_text`] and `Ctx::coerce_string`, or code units with [`Value::from_utf16`]
-    /// and `Ctx::coerce_utf16`, rather than reading or building this payload directly.
+    /// [`Value::as_text`] and `Ctx::coerce_string`, code units with [`Value::from_utf16`] and
+    /// `Ctx::coerce_utf16`, or engine text with [`Value::from_engine_text`],
+    /// [`Value::as_engine_text`] and `Ctx::coerce_engine_text`, rather than reading or building
+    /// this payload directly.
     Str(crate::lstr::LStr) = 6,
     Sym(Rc<SymbolData>) = 7,
     Obj(Gc) = 8,
@@ -1399,6 +1401,23 @@ impl Value {
     /// their slices, property keys, and ASCII literals.
     pub(crate) fn lstr(s: impl Into<crate::lstr::LStr>) -> Value {
         Value::Str(s.into())
+    }
+    /// The JS string whose engine text is `s` (see `Value::Str`), with no conversion: the
+    /// lossless path for a host that keeps JS strings as Rust strings, such as a DOM storing
+    /// Web IDL `DOMString`s. `s` must come from [`Value::as_engine_text`],
+    /// `Ctx::coerce_engine_text`, or Rust text converted by `embed::text_to_engine`; Rust text
+    /// passed here directly loses characters in U+10F800..=U+10FFFF to lone surrogates.
+    pub fn from_engine_text(s: impl Into<String>) -> Value {
+        Value::Str(s.into().into())
+    }
+    /// A string value's engine text, unchanged: every code unit survives a round trip through
+    /// [`Value::from_engine_text`]. Convert it with `embed::engine_to_text` before treating it
+    /// as Rust text. `None` for any other value; see `Ctx::coerce_engine_text` for ToString.
+    pub fn as_engine_text(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
     }
     /// A string value as Rust text: the conversion to a Web IDL `USVString`, in which every lone
     /// surrogate becomes U+FFFD. `None` for any other value; see `Ctx::coerce_string` for ToString.
