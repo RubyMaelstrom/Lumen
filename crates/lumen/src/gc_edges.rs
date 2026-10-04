@@ -1,7 +1,7 @@
 //! Bounded, collection-local strong-edge snapshots. No graph mutation or JS runs between
 //! reference counting and marking. Reusing those edges avoids decoding every live object's
-//! properties and interpreter side tables twice. These are temporary collector owners, not
-//! roots: the counting pass must account for BOTH the real edge and its cached Rc clone.
+//! properties and interpreter side tables twice. The cache records identities only, never
+//! extra Rc owners, so it cannot distort the strong counts that classify roots.
 
 use crate::fasthash::FastMap;
 #[cfg(test)]
@@ -168,6 +168,41 @@ impl GcEdgeSink for DirectGcEdges<'_> {
     }
 }
 
+/// Identity of a counted object edge. It owns nothing: it stays valid only while the
+/// collection that recorded it holds its snapshot, during which no graph mutation or JS runs,
+/// so every recorded target is still owned by the snapshot object that held the edge.
+pub(crate) type ObjectEdge = *const std::cell::RefCell<crate::value::Object>;
+
+/// The full collector's counting sink: adds each edge to its target's internal-reference count
+/// and records it (an object identity, or a snapshot environment index) for marking. Foreign
+/// environments are not candidates and were never counted.
+pub(crate) struct CountedEdges<'a> {
+    pub objects: &'a mut Vec<ObjectEdge>,
+    pub scopes: &'a mut Vec<u32>,
+    pub scope_index: &'a FastMap<usize, usize>,
+    pub scope_internal: &'a mut [u32],
+}
+
+impl GcEdgeSink for CountedEdges<'_> {
+    #[inline]
+    fn object(&mut self, object: &Gc) {
+        // SAFETY: as in the collector's `cells`: only a scratch Cell is touched, and no mutable
+        // object borrow exists while the collector runs (an outstanding one panics).
+        let target =
+            unsafe { object.try_borrow_unguarded() }.expect("object mutably borrowed during GC");
+        target.gc_scratch.set(target.gc_scratch.get() + 1);
+        self.objects.push(Rc::as_ptr(object));
+    }
+
+    #[inline]
+    fn scope(&mut self, scope: &Env) {
+        if let Some(&index) = self.scope_index.get(&(Rc::as_ptr(scope) as usize)) {
+            self.scope_internal[index] += 1;
+            self.scopes.push(index as u32);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Edges {
     object_start: u32,
@@ -187,8 +222,8 @@ impl Edges {
 
 pub(crate) struct GcEdgeCache {
     entries: Vec<Edges>,
-    objects: Vec<Gc>,
-    scopes: Vec<(usize, Env)>,
+    objects: Vec<ObjectEdge>,
+    scopes: Vec<u32>,
     budget: usize,
     enabled: bool,
 }
@@ -227,8 +262,8 @@ impl GcEdgeCache {
             .entries
             .capacity()
             .saturating_mul(size_of::<Edges>())
-            .saturating_add(object_cap.saturating_mul(size_of::<Gc>()))
-            .saturating_add(scope_cap.saturating_mul(size_of::<(usize, Env)>()));
+            .saturating_add(object_cap.saturating_mul(size_of::<ObjectEdge>()))
+            .saturating_add(scope_cap.saturating_mul(size_of::<u32>()));
         if bytes > self.budget || object_cap >= u32::MAX as usize || scope_cap >= u32::MAX as usize
         {
             return false;
@@ -242,24 +277,19 @@ impl GcEdgeCache {
         true
     }
 
-    /// Move the scratch handles, never clone them again. Missing scope indices are foreign to
-    /// this snapshot and were ignored by the original collector too.
+    /// Keep one owner's counted edges for marking, or mark it uncached (re-traced while
+    /// marking). The scratch vectors are emptied either way.
     pub(crate) fn record(
         &mut self,
         cached: bool,
-        objects: &mut Vec<Gc>,
-        scopes: &mut Vec<Env>,
-        scope_indices: &FastMap<usize, usize>,
+        objects: &mut Vec<ObjectEdge>,
+        scopes: &mut Vec<u32>,
     ) {
         if cached {
             let object_start = self.objects.len();
             let scope_start = self.scopes.len();
             self.objects.append(objects);
-            self.scopes.extend(scopes.drain(..).filter_map(|env| {
-                scope_indices
-                    .get(&(Rc::as_ptr(&env) as usize))
-                    .map(|&index| (index, env))
-            }));
+            self.scopes.append(scopes);
             self.entries.push(Edges {
                 object_start: object_start as u32,
                 object_len: (self.objects.len() - object_start) as u32,
@@ -275,7 +305,7 @@ impl GcEdgeCache {
         }
     }
 
-    pub(crate) fn get(&self, index: usize) -> Option<(&[Gc], &[(usize, Env)])> {
+    pub(crate) fn get(&self, index: usize) -> Option<(&[ObjectEdge], &[u32])> {
         let entry = self.entries.get(index)?;
         if entry.object_len == u32::MAX {
             return None;
@@ -718,40 +748,38 @@ mod tests {
     }
 
     #[test]
-    fn cache_moves_handles_and_falls_back_within_its_capacity_budget() {
+    fn cache_records_identities_without_owners_and_falls_back_within_its_budget() {
         let object = Object::new(None);
-        let env = crate::interpreter::new_scope(None);
-        let indices = [(Rc::as_ptr(&env) as usize, 0)].into_iter().collect();
         let mut cache = GcEdgeCache::new(3, 160);
-        let mut objects = vec![object.clone()];
-        let mut scopes = vec![env.clone()];
+        let mut objects: Vec<ObjectEdge> = vec![Rc::as_ptr(&object)];
+        let mut scopes = vec![0u32];
         let count = Rc::strong_count(&object);
         assert!(cache.prepare(objects.len(), scopes.len()));
-        cache.record(true, &mut objects, &mut scopes, &indices);
+        cache.record(true, &mut objects, &mut scopes);
         assert!(objects.is_empty() && scopes.is_empty());
         assert_eq!(Rc::strong_count(&object), count);
-        assert!(Rc::ptr_eq(&cache.get(0).unwrap().0[0], &object));
-        assert_eq!(cache.get(0).unwrap().1[0].0, 0);
-        objects.extend((0..20).map(|_| object.clone()));
+        assert_eq!(cache.get(0).unwrap().0, &[Rc::as_ptr(&object)][..]);
+        assert_eq!(cache.get(0).unwrap().1, &[0][..]);
+        objects.extend((0..20).map(|_| Rc::as_ptr(&object)));
         assert!(!cache.prepare(objects.len(), 0));
-        cache.record(false, &mut objects, &mut scopes, &indices);
+        cache.record(false, &mut objects, &mut scopes);
+        assert!(objects.is_empty());
         assert!(cache.get(1).is_none());
-        assert_eq!(Rc::strong_count(&object), count);
         assert!(cache.prepare(0, 0));
-        cache.record(true, &mut objects, &mut scopes, &indices);
+        cache.record(true, &mut objects, &mut scopes);
         assert!(cache.get(2).unwrap().0.is_empty());
         drop(cache);
-        assert_eq!(Rc::strong_count(&object), count - 1);
+        assert_eq!(Rc::strong_count(&object), count);
     }
 
     #[test]
     fn zero_budget_never_retains_edges() {
         let object = Object::new(None);
         let mut cache = GcEdgeCache::new(1, 0);
-        let mut objects = vec![object.clone()];
+        let mut objects: Vec<ObjectEdge> = vec![Rc::as_ptr(&object)];
         let mut scopes = Vec::new();
         assert!(!cache.prepare(1, 0));
-        cache.record(false, &mut objects, &mut scopes, &FastMap::default());
+        cache.record(false, &mut objects, &mut scopes);
         assert!(cache.get(0).is_none());
         assert_eq!(Rc::strong_count(&object), 1);
     }

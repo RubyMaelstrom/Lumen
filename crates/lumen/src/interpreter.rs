@@ -10059,7 +10059,7 @@ impl Interp {
         for o in &live {
             let b = cells(o);
             b.gc_mark.set(false);
-            b.gc_internal.set(0);
+            b.gc_scratch.set(0);
         }
         let live_index: crate::fasthash::FastMap<usize, usize> = live
             .iter()
@@ -10070,34 +10070,24 @@ impl Interp {
         let side_slots = self.side_slot_owners(&live_index, live.len(), false);
         let mut object_refs = Vec::new();
         let mut scope_refs = Vec::new();
+        let mut edge_objects = Vec::new();
+        let mut edge_scopes = Vec::new();
         let mut edge_cache = crate::gc_edges::GcEdgeCache::new(live.len(), edge_budget);
         let mut native_captures = crate::native_captures::NativeCaptureSnapshot::empty();
         for (index, o) in live.iter().enumerate() {
             native_captures.observe(o, cells(o));
-            object_refs.clear();
-            scope_refs.clear();
             self.visit_object_edges(
                 o,
                 side_slots.as_ref().is_none_or(|owners| owners[index]),
-                &mut crate::gc_edges::DirectGcEdges {
-                    objects: &mut object_refs,
-                    scopes: &mut scope_refs,
+                &mut crate::gc_edges::CountedEdges {
+                    objects: &mut edge_objects,
+                    scopes: &mut edge_scopes,
+                    scope_index: &sidx,
+                    scope_internal: &mut s_internal,
                 },
             );
-            let cached = edge_cache.prepare(object_refs.len(), scope_refs.len());
-            // A retained scratch handle is an extra collector-owned edge, NOT an external
-            // root. Count both it and the actual graph edge before comparing strong counts.
-            let owners = if cached { 2 } else { 1 };
-            for p in &object_refs {
-                let pb = cells(p);
-                pb.gc_internal.set(pb.gc_internal.get() + owners);
-            }
-            for e in &scope_refs {
-                if let Some(&k) = sidx.get(&(Rc::as_ptr(e) as usize)) {
-                    s_internal[k] += owners;
-                }
-            }
-            edge_cache.record(cached, &mut object_refs, &mut scope_refs, &sidx);
+            let cached = edge_cache.prepare(edge_objects.len(), edge_scopes.len());
+            edge_cache.record(cached, &mut edge_objects, &mut edge_scopes);
         }
         for e in &scopes {
             let b = e.borrow();
@@ -10108,12 +10098,12 @@ impl Interp {
             }
             if let Some(Value::Obj(o)) = &b.with_obj {
                 let ob = o.borrow();
-                ob.gc_internal.set(ob.gc_internal.get() + 1);
+                ob.gc_scratch.set(ob.gc_scratch.get() + 1);
             }
             for bind in b.vars.values() {
                 if let Value::Obj(o) = &bind.value {
                     let ob = o.borrow();
-                    ob.gc_internal.set(ob.gc_internal.get() + 1);
+                    ob.gc_scratch.set(ob.gc_scratch.get() + 1);
                 }
                 if let Some((ie, _)) = bind.import_ref.as_deref() {
                     if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
@@ -10135,8 +10125,8 @@ impl Interp {
                 let ptr = Rc::as_ptr(object) as usize;
                 object
                     .borrow()
-                    .gc_internal
-                    .set(object.borrow().gc_internal.get().saturating_add(1));
+                    .gc_scratch
+                    .set(object.borrow().gc_scratch.get().saturating_add(1));
                 template_cache_members
                     .entry(*realm_key)
                     .or_default()
@@ -10172,8 +10162,8 @@ impl Interp {
                 realm_members.insert(ptr, *realm_key);
                 let borrowed = object.borrow();
                 borrowed
-                    .gc_internal
-                    .set(borrowed.gc_internal.get().saturating_add(1));
+                    .gc_scratch
+                    .set(borrowed.gc_scratch.get().saturating_add(1));
             }
             let scope_ptr = Rc::as_ptr(&realm.global_env) as usize;
             realm_scope_members.insert(scope_ptr, *realm_key);
@@ -10192,7 +10182,7 @@ impl Interp {
         // pinned-but-unreachable object is still collectable (the sweep evicts its entries).
         for o in self.gc_pins.values() {
             let b = o.borrow();
-            b.gc_internal.set(b.gc_internal.get() + 1);
+            b.gc_scratch.set(b.gc_scratch.get() + 1);
         }
         // WeakMap values are ephemeron edges: their Rust handles must not look like external
         // roots, but marking them is deferred until both their owner and weak key are live.
@@ -10200,7 +10190,7 @@ impl Interp {
             for (_, value) in entries {
                 if let Value::Obj(object) = value {
                     let b = object.borrow();
-                    b.gc_internal.set(b.gc_internal.get() + 1);
+                    b.gc_scratch.set(b.gc_scratch.get() + 1);
                 }
             }
         }
@@ -10232,7 +10222,7 @@ impl Interp {
             fn internal(&mut self, value: &Value) {
                 if let Value::Obj(object) = value {
                     let b = object.borrow();
-                    b.gc_internal.set(b.gc_internal.get().saturating_add(1));
+                    b.gc_scratch.set(b.gc_scratch.get().saturating_add(1));
                 }
             }
             fn edge(&mut self, owner: &Value, value: &Value) {
@@ -10265,7 +10255,7 @@ impl Interp {
             });
             for object in object_refs.drain(..) {
                 let b = object.borrow();
-                b.gc_internal.set(b.gc_internal.get().saturating_add(1));
+                b.gc_scratch.set(b.gc_scratch.get().saturating_add(1));
             }
             for scope in scope_refs.drain(..) {
                 if let Some(&index) = sidx.get(&(Rc::as_ptr(&scope) as usize)) {
@@ -10285,9 +10275,9 @@ impl Interp {
         let index_during_roots = !gc_dump;
         for (index, o) in live.iter().enumerate() {
             let b = cells(o);
-            let internal = b.gc_internal.get() as usize;
+            let internal = b.gc_scratch.get() as usize;
             if index_during_roots {
-                b.gc_internal.set(index as u32);
+                b.gc_scratch.set(index as u32);
             }
             if Rc::strong_count(o) > internal + 1 {
                 b.gc_mark.set(true);
@@ -10427,7 +10417,7 @@ impl Interp {
                 if !b.gc_mark.get() {
                     continue;
                 }
-                let internal = b.gc_internal.get() as usize;
+                let internal = b.gc_scratch.get() as usize;
                 let strong = Rc::strong_count(o);
                 let keys: Vec<&str> = b.props.iter().take(4).map(|(k, _)| &**k).collect();
                 // Both the heap snapshot and the already classified mark stack
@@ -10474,7 +10464,7 @@ impl Interp {
 
         if !index_during_roots {
             for (index, object) in live.iter().enumerate() {
-                cells(object).gc_internal.set(index as u32);
+                cells(object).gc_scratch.set(index as u32);
             }
         }
 
@@ -10593,7 +10583,7 @@ impl Interp {
         // until the owner and key have independently acquired a mark.
         loop {
             if let Some(o) = stack.pop() {
-                let index = cells(&o).gc_internal.get() as usize;
+                let index = cells(&o).gc_scratch.get() as usize;
                 let in_snapshot = live.get(index).is_some_and(|entry| Rc::ptr_eq(entry, &o));
                 let aux = if in_snapshot {
                     aux_flags[index]
@@ -10601,18 +10591,26 @@ impl Interp {
                     AUX_ALL
                 };
                 let cached = in_snapshot.then(|| edge_cache.get(index)).flatten();
-                if let Some((objects, scopes)) = cached {
-                    for p in objects {
-                        let pb = cells(p);
+                if let Some((edge_objects, edge_scopes)) = cached {
+                    for &p in edge_objects {
+                        // SAFETY: a counted edge of a snapshot object (see `ObjectEdge`); the
+                        // snapshot still owns that object and nothing has mutated the graph.
+                        let pb = unsafe { (*p).try_borrow_unguarded() }
+                            .expect("object mutably borrowed during GC");
                         if !pb.gc_mark.get() {
                             pb.gc_mark.set(true);
-                            stack.push(p.clone());
+                            // SAFETY: as above; the new handle owns its own strong reference.
+                            stack.push(unsafe {
+                                Rc::increment_strong_count(p);
+                                Gc::from_raw(p)
+                            });
                         }
                     }
-                    for (k, e) in scopes {
-                        if !s_mark[*k] {
-                            s_mark[*k] = true;
-                            sstack.push(e.clone());
+                    for &k in edge_scopes {
+                        let k = k as usize;
+                        if !s_mark[k] {
+                            s_mark[k] = true;
+                            sstack.push(scopes[k].clone());
                         }
                     }
                 } else {
@@ -10815,9 +10813,6 @@ impl Interp {
             }
         }
 
-        // `gc_internal` doubles as the O(1) weak-registry slot outside collection. Restore it
-        // before the sweep clears any property/side-table edge that could drop an object.
-        crate::value::gc_restore_registry_slots(&self.gc_heap);
         drop(edge_cache);
 
         // One pass finds the unmarked objects; the clearing pass below visits only those.

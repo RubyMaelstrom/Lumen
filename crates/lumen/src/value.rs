@@ -1655,12 +1655,15 @@ pub struct Object {
     pub(crate) native_typed_array: Option<Box<crate::native_typed_array::NativeTypedArray>>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
-    /// GC scratch: internal-reference count during root classification, then snapshot index
-    /// during marking. Between collections this holds the object's weak-registry slot; the
-    /// collector restores every slot before sweeping can drop an object.
     pub(crate) gc_mark: Cell<bool>,
     gc_weak_observed: Cell<bool>,
+    /// The object's slot in its heap's registry, fixed for its lifetime (`Object::drop` and
+    /// weak-target watches key on it).
     pub(crate) gc_internal: Cell<u32>,
+    /// Full-collection scratch: internal-reference count during root classification, then
+    /// snapshot index during marking. Kept apart from `gc_internal` (it fits in existing
+    /// padding), so the registry slot is never overwritten and needs no restoring pass.
+    pub(crate) gc_scratch: Cell<u32>,
     /// Opt-in central-heap identity used during the `heap-bridge` migration. The existing Rc
     /// object remains authoritative until all fields and roots have relocation-aware descriptors.
     #[cfg(feature = "heap-bridge")]
@@ -1728,6 +1731,7 @@ impl Object {
                 gc_mark: Cell::new(false),
                 gc_weak_observed: Cell::new(false),
                 gc_internal: Cell::new(slot_u32),
+                gc_scratch: Cell::new(0),
                 #[cfg(feature = "heap-bridge")]
                 central_ref: Cell::new(Some(central_ref)),
             }));
@@ -2478,8 +2482,6 @@ pub(crate) fn destroy_gc_heap(heap: &GcHeap) {
     // peer edges are removed. Side-table/host owners drop with the interpreter next.
     let objects = heap_gc_snapshot(heap);
     let scopes = gc_scope_snapshot(heap);
-    // Also handle unwinding from an interrupted collector's scratch-count phase.
-    gc_restore_registry_slots(heap);
     for object in &objects {
         let detached = {
             let mut object = object.borrow_mut();
@@ -2507,20 +2509,6 @@ pub(crate) fn destroy_gc_heap(heap: &GcHeap) {
             )
         };
         drop(detached);
-    }
-}
-
-/// Restore `gc_internal` from scratch reference counts to registry-slot ids. Collection calls
-/// this after marking and before sweeping side tables/properties can release the final owner of
-/// any object, so `Object::drop` always sees its stable slot.
-pub(crate) fn gc_restore_registry_slots(heap: &GcHeap) {
-    let reg = heap.registry.borrow();
-    for (slot, &object) in reg.entries.iter().enumerate() {
-        if !object.is_null() {
-            let slot: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-            // SAFETY: a non-null entry names a live object (see `upgrade_registered`).
-            unsafe { &*object }.borrow().gc_internal.set(slot);
-        }
     }
 }
 
