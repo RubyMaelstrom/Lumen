@@ -9926,6 +9926,18 @@ impl Interp {
         cause: crate::value::GcCause,
         edge_budget: usize,
     ) {
+        // Read-only collector passes touch every object's scratch cells. Borrowing through the
+        // RefCell flag would write (and dirty) each object's header twice per pass; the
+        // collector holds no mutable object borrow during these passes, so read the cells
+        // without the guard.
+        #[inline(always)]
+        fn cells(object: &Gc) -> &Object {
+            // SAFETY: the reference only reads or sets `Cell` scratch fields and is dropped
+            // before any `borrow_mut` of the object; an outstanding mutable borrow panics
+            // exactly as `borrow()` would.
+            unsafe { object.try_borrow_unguarded() }.expect("object mutably borrowed during GC")
+        }
+        let gc_dump = std::env::var_os("LUMEN_GC_DUMP").is_some();
         let performance_started = crate::value::gc_performance_metrics_start();
         let live = crate::value::heap_gc_snapshot(&self.gc_heap);
         // Scopes are graph nodes too: a closure's captured environment references objects (its
@@ -9943,14 +9955,16 @@ impl Interp {
 
         // Reset scratch, then count references between heap nodes (objects and scopes).
         for o in &live {
-            let b = o.borrow();
+            let b = cells(o);
             b.gc_mark.set(false);
             b.gc_internal.set(0);
         }
         let mut object_refs = Vec::new();
         let mut scope_refs = Vec::new();
         let mut edge_cache = crate::gc_edges::GcEdgeCache::new(live.len(), edge_budget);
+        let mut native_captures = crate::native_captures::NativeCaptureSnapshot::empty();
         for o in &live {
+            native_captures.observe(o, cells(o));
             self.obj_refs_into(o, &mut object_refs);
             self.obj_scope_refs_into(o, &mut scope_refs);
             let cached = edge_cache.prepare(object_refs.len(), scope_refs.len());
@@ -9958,7 +9972,7 @@ impl Interp {
             // root. Count both it and the actual graph edge before comparing strong counts.
             let owners = if cached { 2 } else { 1 };
             for p in &object_refs {
-                let pb = p.borrow();
+                let pb = cells(p);
                 pb.gc_internal.set(pb.gc_internal.get() + owners);
             }
             for e in &scope_refs {
@@ -10126,7 +10140,7 @@ impl Interp {
         }
         let mut auxiliary_edges = AuxiliaryEdges::default();
         self.host_state.trace_gc(&mut auxiliary_edges);
-        crate::native_captures::NativeCaptureSnapshot::new(&live).trace(&mut auxiliary_edges);
+        native_captures.trace(&mut auxiliary_edges);
         // A continuation owns its stored values/environments on behalf of its generator
         // or result promise. Count the actual payloads once, instead of probing this table
         // for every ordinary object. The existing auxiliary-owner lookup also dispatches
@@ -10153,10 +10167,19 @@ impl Interp {
         // includes exactly one clone held by the snapshot, so external refs == strong - internal - 1.
         let mut stack: Vec<Gc> = Vec::new();
         let mut sstack: Vec<Env> = Vec::new();
-        for o in &live {
-            let internal = o.borrow().gc_internal.get() as usize;
+        // The reference counts are no longer needed after root classification (unless a debug
+        // dump reports them below). Reuse that scratch word to locate cached edges without
+        // another per-node hash lookup; the strong heap snapshot keeps every object alive until
+        // registry slots are restored.
+        let index_during_roots = !gc_dump;
+        for (index, o) in live.iter().enumerate() {
+            let b = cells(o);
+            let internal = b.gc_internal.get() as usize;
+            if index_during_roots {
+                b.gc_internal.set(index as u32);
+            }
             if Rc::strong_count(o) > internal + 1 {
-                o.borrow().gc_mark.set(true);
+                b.gc_mark.set(true);
                 stack.push(o.clone());
             }
         }
@@ -10192,7 +10215,7 @@ impl Interp {
         }
         // Debug: `LUMEN_GC_DUMP=1` prints each external-rooted object's shape (its first prop
         // names) with strong/internal counts — the fastest way to see WHAT pins a leaked graph.
-        if std::env::var_os("LUMEN_GC_DUMP").is_some()
+        if gc_dump
             && live.len()
                 >= std::env::var("LUMEN_GC_DUMP_MIN_OBJECTS")
                     .ok()
@@ -10338,11 +10361,10 @@ impl Interp {
             }
         }
 
-        // The reference counts are no longer needed after root classification/debug dumping.
-        // Reuse that scratch word to locate cached edges without another per-node hash lookup.
-        // The strong heap snapshot keeps every object alive until registry slots are restored.
-        for (index, object) in live.iter().enumerate() {
-            object.borrow().gc_internal.set(index as u32);
+        if !index_during_roots {
+            for (index, object) in live.iter().enumerate() {
+                cells(object).gc_internal.set(index as u32);
+            }
         }
 
         // Root classification is complete, so temporary clones can no longer distort it. These
@@ -10418,20 +10440,61 @@ impl Interp {
             }
         }
 
+        // Which snapshot objects key any of the per-owner side tables consulted while marking.
+        // Most objects key none, so marking skips those hash probes; an object outside the
+        // snapshot (no valid index) probes every table as before.
+        const AUX_NATIVE: u8 = 1;
+        const AUX_EDGES: u8 = 2;
+        const AUX_REALM: u8 = 4;
+        const AUX_TEMPLATES: u8 = 8;
+        const AUX_EPHEMERON_OWNER: u8 = 16;
+        const AUX_EPHEMERON_KEY: u8 = 32;
+        const AUX_ALL: u8 = 63;
+        let mut aux_flags = vec![0u8; live.len()];
+        {
+            let mut flag = |ptr: usize, bit: u8| {
+                if let Some(&index) = live_index.get(&ptr) {
+                    aux_flags[index] |= bit;
+                }
+            };
+            for owner in auxiliary_edges.native.js_owners() {
+                flag(owner, AUX_NATIVE);
+            }
+            for &owner in auxiliary_edges.edges.keys() {
+                flag(owner, AUX_EDGES);
+            }
+            for &member in realm_members.keys() {
+                flag(member, AUX_REALM);
+            }
+            for &realm in template_cache_members.keys() {
+                flag(realm, AUX_TEMPLATES);
+            }
+            for &owner in ephemerons_by_owner.keys() {
+                flag(owner, AUX_EPHEMERON_OWNER);
+            }
+            for &key in ephemerons_by_key.keys() {
+                flag(key, AUX_EPHEMERON_KEY);
+            }
+        }
+
         // Mark everything reachable from roots across object/scope nodes and ephemeron edges. A
         // value->key cycle cannot bootstrap itself because neither directional index activates
         // until the owner and key have independently acquired a mark.
         loop {
             if let Some(o) = stack.pop() {
-                let index = o.borrow().gc_internal.get() as usize;
-                let cached = live
-                    .get(index)
-                    .filter(|entry| Rc::ptr_eq(entry, &o))
-                    .and_then(|_| edge_cache.get(index));
+                let index = cells(&o).gc_internal.get() as usize;
+                let in_snapshot = live.get(index).is_some_and(|entry| Rc::ptr_eq(entry, &o));
+                let aux = if in_snapshot {
+                    aux_flags[index]
+                } else {
+                    AUX_ALL
+                };
+                let cached = in_snapshot.then(|| edge_cache.get(index)).flatten();
                 if let Some((objects, scopes)) = cached {
                     for p in objects {
-                        if !p.borrow().gc_mark.get() {
-                            p.borrow().gc_mark.set(true);
+                        let pb = cells(p);
+                        if !pb.gc_mark.get() {
+                            pb.gc_mark.set(true);
                             stack.push(p.clone());
                         }
                     }
@@ -10462,10 +10525,15 @@ impl Interp {
                 }
 
                 let ptr = Rc::as_ptr(&o) as usize;
+                if aux == 0 {
+                    continue;
+                }
                 auxiliary_edges.roots.clear();
-                auxiliary_edges
-                    .native
-                    .trace_js(ptr, &mut auxiliary_edges.roots);
+                if aux & AUX_NATIVE != 0 {
+                    auxiliary_edges
+                        .native
+                        .trace_js(ptr, &mut auxiliary_edges.roots);
+                }
                 for target in &auxiliary_edges.roots {
                     if let Some(&index) = live_index.get(target) {
                         let object = &live[index];
@@ -10475,7 +10543,10 @@ impl Interp {
                         }
                     }
                 }
-                if let Some(targets) = auxiliary_edges.edges.get(&ptr) {
+                if let Some(targets) = (aux & AUX_EDGES != 0)
+                    .then(|| auxiliary_edges.edges.get(&ptr))
+                    .flatten()
+                {
                     for target in targets {
                         if let Some(&index) = live_index.get(target) {
                             let object = &live[index];
@@ -10506,7 +10577,10 @@ impl Interp {
                         }
                     }
                 }
-                if let Some(&realm_key) = realm_members.get(&ptr) {
+                if let Some(&realm_key) = (aux & AUX_REALM != 0)
+                    .then(|| realm_members.get(&ptr))
+                    .flatten()
+                {
                     if activated_realms.insert(realm_key) {
                         if let Some((objects, env)) = realm_groups.get(&realm_key) {
                             for object in objects {
@@ -10527,7 +10601,10 @@ impl Interp {
                 // A live Realm owns the frozen template arrays cached for its parse sites.  Use
                 // the snapshot index rather than cloning another Rc during root classification;
                 // the cache itself is the sole internal edge for these values.
-                if let Some(template_objects) = template_cache_members.get(&ptr) {
+                if let Some(template_objects) = (aux & AUX_TEMPLATES != 0)
+                    .then(|| template_cache_members.get(&ptr))
+                    .flatten()
+                {
                     for template_ptr in template_objects {
                         if let Some(&index) = live_index.get(template_ptr) {
                             let template = &live[index];
@@ -10538,7 +10615,10 @@ impl Interp {
                         }
                     }
                 }
-                if let Some(entries) = ephemerons_by_owner.get(&ptr) {
+                if let Some(entries) = (aux & AUX_EPHEMERON_OWNER != 0)
+                    .then(|| ephemerons_by_owner.get(&ptr))
+                    .flatten()
+                {
                     for (key, value) in entries {
                         let key_live = key.as_ref().is_none_or(|key| key.borrow().gc_mark.get());
                         if key_live && !value.borrow().gc_mark.get() {
@@ -10547,7 +10627,10 @@ impl Interp {
                         }
                     }
                 }
-                if let Some(entries) = ephemerons_by_key.get(&ptr) {
+                if let Some(entries) = (aux & AUX_EPHEMERON_KEY != 0)
+                    .then(|| ephemerons_by_key.get(&ptr))
+                    .flatten()
+                {
                     for (owner, value) in entries {
                         let owner_live = self
                             .gc_pins
@@ -10618,28 +10701,26 @@ impl Interp {
         crate::value::gc_restore_registry_slots(&self.gc_heap);
         drop(edge_cache);
 
-        let garbage_objects: crate::fasthash::FastSet<usize> = live
+        // One pass finds the unmarked objects; the clearing pass below visits only those.
+        let dead: Vec<&Gc> = live
             .iter()
-            .filter(|object| !object.borrow().gc_mark.get())
+            .filter(|object| !cells(object).gc_mark.get())
+            .collect();
+        let garbage_objects: crate::fasthash::FastSet<usize> = dead
+            .iter()
             .map(|object| Rc::as_ptr(object) as usize)
             .collect();
 
         self.gc_sweep_dead_objects(&garbage_objects, &auxiliary_edges.native);
         #[cfg(not(target_arch = "wasm32"))]
-        let mut garbage = 0usize;
-        for o in &live {
-            if !o.borrow().gc_mark.get() {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    garbage += 1;
-                }
-                let mut b = o.borrow_mut();
-                b.props.clear();
-                b.proto = None;
-                b.call = Callable::None;
-                b.exotic = Exotic::None;
-                b.native_typed_array = None;
-            }
+        let garbage = dead.len();
+        for o in dead {
+            let mut b = o.borrow_mut();
+            b.props.clear();
+            b.proto = None;
+            b.call = Callable::None;
+            b.exotic = Exotic::None;
+            b.native_typed_array = None;
         }
         // Sweep garbage scopes the same way: emptying them breaks env-involving cycles.
         for (k, e) in scopes.iter().enumerate() {

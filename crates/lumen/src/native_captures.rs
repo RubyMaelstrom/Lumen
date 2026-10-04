@@ -21,28 +21,39 @@ pub(crate) struct NativeCaptureSnapshot {
 
 impl NativeCaptureSnapshot {
     pub(crate) fn new(objects: &[Gc]) -> Self {
-        let mut groups = FastMap::<usize, CaptureGroup>::default();
+        let mut snapshot = Self::empty();
         for owner in objects {
-            let object = owner.borrow();
-            let Callable::NativeData(callable) = &object.call else {
-                continue;
-            };
-            let NativeCallableBody::Captured { captures, .. } = &callable.body else {
-                continue;
-            };
-            if captures.is_empty() {
-                continue;
-            }
-            groups
-                .entry(Rc::as_ptr(callable) as usize)
-                .or_insert_with(|| CaptureGroup {
-                    callable: callable.clone(),
-                    owners: Vec::new(),
-                })
-                .owners
-                .push(owner.clone());
+            snapshot.observe(owner, &owner.borrow());
         }
-        Self { groups }
+        snapshot
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            groups: FastMap::default(),
+        }
+    }
+
+    /// Record `owner` (whose body is `object`) if it is a native function with explicit
+    /// captures. Lets a collector pass that already visits every object build the snapshot.
+    pub(crate) fn observe(&mut self, owner: &Gc, object: &crate::value::Object) {
+        let Callable::NativeData(callable) = &object.call else {
+            return;
+        };
+        let NativeCallableBody::Captured { captures, .. } = &callable.body else {
+            return;
+        };
+        if captures.is_empty() {
+            return;
+        }
+        self.groups
+            .entry(Rc::as_ptr(callable) as usize)
+            .or_insert_with(|| CaptureGroup {
+                callable: callable.clone(),
+                owners: Vec::new(),
+            })
+            .owners
+            .push(owner.clone());
     }
 
     /// Consume the snapshot before the collector classifies ordinary Rc roots:
