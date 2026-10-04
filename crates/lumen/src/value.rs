@@ -5227,9 +5227,14 @@ impl Props {
         self.proto_slot.set(NO_SLOT);
         if let Some(index) = self.elems.index_mut() {
             index.remove(key);
-            // Re-index everything after the removed slot.
-            for (j, (k, _)) in self.entries.iter().enumerate().skip(i) {
-                index.insert(k.clone(), j);
+            // Every later entry moved down one slot. The index covers every entry, so
+            // adjust positions in place instead of rehashing and reinserting each later key:
+            // removing the early keys of a large map (a Window bootstrap deleting its host
+            // bindings from a global with a thousand properties) stays linear and cheap.
+            for slot in index.values_mut() {
+                if *slot > i {
+                    *slot -= 1;
+                }
             }
         }
         if self.mirror_flags & MIRROR_OK != 0 {

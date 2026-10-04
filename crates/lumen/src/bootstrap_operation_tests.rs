@@ -66,3 +66,35 @@ fn retained_class_expressions_see_and_update_the_locals_they_name() {
         "constructor,m3940,w|sstring|50|written|base|captured|26,constructor|3|127",
     );
 }
+
+/// Removing keys from an indexed (hashed) property map keeps every later key at its moved
+/// position: lookups, enumeration order, inline caches and later insertions agree.
+#[test]
+fn removing_early_keys_from_large_objects_keeps_lookups_and_order() {
+    all_tiers(
+        r#"
+        const o = {};
+        for (let i = 0; i < 40; i++) o["k" + i] = i;
+        function read(object) {
+            let sum = 0;
+            for (let i = 0; i < 40; i++) {
+                const v = object["k" + i];
+                if (v !== undefined) sum += v;
+            }
+            return sum;
+        }
+        function readFixed(object) { return object.k39 + object.k20 + object.k1; }
+        let fixed = 0;
+        for (let i = 0; i < 50; i++) fixed += readFixed(o);
+        const deleted = [0, 1, 2, 5, 17, 38];
+        for (const i of deleted) delete o["k" + i];
+        o.k1 = "again";
+        Reflect.deleteProperty(o, "k3");
+        let after = 0;
+        for (let i = 0; i < 50; i++) after = readFixed(o);
+        [read(o), Object.keys(o).length, Object.keys(o).slice(0, 4).join(","),
+            Object.keys(o).slice(-3).join(","), "k3" in o, o.k4, o.k39, fixed, after].join("|")
+        "#,
+        "0again4678910111213141516181920212223242526272829303132333435363739|34|k4,k6,k7,k8|k37,k39,k1|false|4|39|3000|59again",
+    );
+}
