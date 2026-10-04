@@ -29,7 +29,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "DurationFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "format", 1, |i, this, a| {
-        Ok(Value::from_string(format_string(i, &this, &arg(a, 0))?))
+        Ok(Value::lstr(format_string(i, &this, &arg(a, 0))?))
     });
     it.def_method(&proto, "formatToParts", 1, |i, this, a| {
         format_to_parts(i, &this, &arg(a, 0))
@@ -66,13 +66,13 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         obj.borrow_mut().proto = Some(proto);
     }
     set_builtin(&obj, "#\u{0}df", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}df_locale", Value::from_string(resolved_locale));
+    set_builtin(&obj, "#\u{0}df_locale", Value::lstr(resolved_locale));
     set_builtin(
         &obj,
         "#\u{0}df_style",
-        Value::from_string(base_style.clone()),
+        Value::lstr(base_style.clone()),
     );
-    set_builtin(&obj, "#\u{0}df_nu", Value::from_string(numbering));
+    set_builtin(&obj, "#\u{0}df_nu", Value::lstr(numbering));
 
     // GetDurationUnitOptions for each unit, threading `prev_style`.
     let mut prev_style: Option<String> = None;
@@ -157,12 +157,12 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         set_builtin(
             &obj,
             Box::leak(format!("#\u{0}df_u_{plural}").into_boxed_str()),
-            Value::from_string(style.clone()),
+            Value::lstr(style.clone()),
         );
         set_builtin(
             &obj,
             Box::leak(format!("#\u{0}df_d_{plural}").into_boxed_str()),
-            Value::from_string(display),
+            Value::lstr(display),
         );
         // prevStyle is updated only for hours..microseconds (nanoseconds and the calendar units do
         // not propagate).
@@ -376,7 +376,7 @@ fn new_service(i: &mut Interp, service: &str, locale: &str, opts: Gc) -> Result<
     let ctor = ab(i.get_member(&intl, service))?;
     ab(i.construct(
         ctor,
-        &[Value::from_string(locale.to_string()), Value::Obj(opts)],
+        &[Value::lstr(locale.to_string()), Value::Obj(opts)],
     ))
 }
 
@@ -391,10 +391,10 @@ fn format_string(i: &mut Interp, this: &Value, dur: &Value) -> Result<String, Va
         .map(|g| g.iter().map(|(_, v, _)| v.as_str()).collect::<String>())
         .collect();
     let lf_opts = i.new_object();
-    set_data(&lf_opts, "type", Value::str("unit"));
-    set_data(&lf_opts, "style", Value::from_string(list_style));
+    set_data(&lf_opts, "type", Value::lstr("unit"));
+    set_data(&lf_opts, "style", Value::lstr(list_style));
     let lf = new_service(i, "ListFormat", &locale, lf_opts)?;
-    let arr = i.make_array(strings.into_iter().map(Value::from_string).collect());
+    let arr = i.make_array(strings.into_iter().map(Value::lstr).collect());
     let fmt = ab(i.get_member(&lf, "format"))?;
     let out = ab(i.call(fmt, lf, &[arr]))?;
     Ok(if let Value::Str(s) = out {
@@ -484,18 +484,18 @@ fn partition(
             set_data(
                 &nf_opts,
                 "numberingSystem",
-                Value::from_string(numbering.clone()),
+                Value::lstr(numbering.clone()),
             );
             if sign_never {
-                set_data(&nf_opts, "signDisplay", Value::str("never"));
+                set_data(&nf_opts, "signDisplay", Value::lstr("never"));
             }
             if style == "2-digit" {
                 set_data(&nf_opts, "minimumIntegerDigits", Value::Num(2.0));
             }
             if style != "numeric" && style != "2-digit" {
-                set_data(&nf_opts, "style", Value::str("unit"));
-                set_data(&nf_opts, "unit", Value::str(sing));
-                set_data(&nf_opts, "unitDisplay", Value::from_string(style.clone()));
+                set_data(&nf_opts, "style", Value::lstr("unit"));
+                set_data(&nf_opts, "unit", Value::lstr(sing));
+                set_data(&nf_opts, "unitDisplay", Value::lstr(style.clone()));
             } else {
                 set_data(&nf_opts, "useGrouping", Value::Bool(false));
             }
@@ -506,7 +506,7 @@ fn partition(
                 set_data(&nf_opts, "minimumFractionDigits", Value::Num(m as f64));
             }
             if nf_trunc {
-                set_data(&nf_opts, "roundingMode", Value::str("trunc"));
+                set_data(&nf_opts, "roundingMode", Value::lstr("trunc"));
             }
 
             let nf = new_service(i, "NumberFormat", &locale, nf_opts)?;
@@ -514,7 +514,7 @@ fn partition(
             let nf_arg = match &exact_arg {
                 // A negative-zero fold still needs its sign for the display rules.
                 Some(sd) if !(value == 0.0 && value.is_sign_negative()) => {
-                    Value::from_string(sd.clone())
+                    Value::lstr(sd.clone())
                 }
                 _ => Value::Num(value),
             };
@@ -591,10 +591,10 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
     // Run the group strings through ListFormat.formatToParts; each "element" part expands to that
     // group's typed sub-parts, while list "literal" parts are kept verbatim.
     let lf_opts = i.new_object();
-    set_data(&lf_opts, "type", Value::str("unit"));
-    set_data(&lf_opts, "style", Value::from_string(list_style));
+    set_data(&lf_opts, "type", Value::lstr("unit"));
+    set_data(&lf_opts, "style", Value::lstr(list_style));
     let lf = new_service(i, "ListFormat", &locale, lf_opts)?;
-    let arr = i.make_array(strings.into_iter().map(Value::from_string).collect());
+    let arr = i.make_array(strings.into_iter().map(Value::lstr).collect());
     let ftp = ab(i.get_member(&lf, "formatToParts"))?;
     let list_parts = ab(i.call(ftp, lf, &[arr]))?;
     let len = match ab(i.get_member(&list_parts, "length"))? {
@@ -613,10 +613,10 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
             if let Some(group) = giter.next() {
                 for (pty, pval, unit) in group {
                     let ob = i.new_object();
-                    set_data(&ob, "type", Value::from_string(pty));
-                    set_data(&ob, "value", Value::from_string(pval));
+                    set_data(&ob, "type", Value::lstr(pty));
+                    set_data(&ob, "value", Value::lstr(pval));
                     if let Some(u) = unit {
-                        set_data(&ob, "unit", Value::from_string(u));
+                        set_data(&ob, "unit", Value::lstr(u));
                     }
                     out.push(Value::Obj(ob));
                 }
@@ -624,7 +624,7 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
         } else {
             let va = ab(i.get_member(&el, "value"))?;
             let ob = i.new_object();
-            set_data(&ob, "type", Value::from_string(ty));
+            set_data(&ob, "type", Value::lstr(ty));
             set_data(&ob, "value", va);
             out.push(Value::Obj(ob));
         }

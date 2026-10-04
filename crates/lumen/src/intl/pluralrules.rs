@@ -140,14 +140,14 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
     set_builtin(
         &object,
         "#\u{0}pr_locale",
-        Value::from_string(resolved.locale),
+        Value::lstr(resolved.locale),
     );
-    set_builtin(&object, "#\u{0}pr_type", Value::from_string(kind));
-    set_builtin(&object, "#\u{0}pr_notation", Value::from_string(notation));
+    set_builtin(&object, "#\u{0}pr_type", Value::lstr(kind));
+    set_builtin(&object, "#\u{0}pr_notation", Value::lstr(notation));
     set_builtin(
         &object,
         "#\u{0}pr_compactdisplay",
-        Value::from_string(compact_display),
+        Value::lstr(compact_display),
     );
     set_builtin(
         &object,
@@ -178,22 +178,22 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
     set_builtin(
         &object,
         "#\u{0}pr_roundingmode",
-        Value::from_string(rounding_mode),
+        Value::lstr(rounding_mode),
     );
     set_builtin(
         &object,
         "#\u{0}pr_roundingpriority",
-        Value::from_string(rounding_priority),
+        Value::lstr(rounding_priority),
     );
     set_builtin(
         &object,
         "#\u{0}pr_roundingtype",
-        Value::str(digits.rounding_type),
+        Value::lstr(digits.rounding_type),
     );
     set_builtin(
         &object,
         "#\u{0}pr_trailingzero",
-        Value::from_string(trailing_zero_display),
+        Value::lstr(trailing_zero_display),
     );
     Ok(Value::Obj(object))
 }
@@ -319,7 +319,7 @@ fn resolve_plural(
 fn select(i: &mut Interp, this: &Value, value: &Value) -> Result<Value, Value> {
     let object = brand_slot(i, this, "#\u{0}pr")?;
     let (category, _) = resolve_plural(i, &object, value)?;
-    Ok(Value::str(category))
+    Ok(Value::lstr(category))
 }
 
 fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Result<Value, Value> {
@@ -335,11 +335,11 @@ fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Res
     // ResolvePluralRange returns the first category immediately when both formatted strings are
     // equal; only distinct formatted endpoints enter the CLDR plural-range table.
     if start_decimal == end_decimal {
-        return Ok(Value::str(start_category));
+        return Ok(Value::lstr(start_category));
     }
     let locale = string_slot(&object, "#\u{0}pr_locale");
     let language = locale.split('-').next().unwrap_or("en");
-    Ok(Value::str(crate::cldr_plurals::select_range(
+    Ok(Value::lstr(crate::cldr_plurals::select_range(
         language,
         start_category,
         end_category,
@@ -375,7 +375,7 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
     let kind = string_slot(&object, "#\u{0}pr_type");
     let categories = crate::cldr_plurals::categories(language, &kind)
         .iter()
-        .map(|category| Value::str(*category))
+        .map(|category| Value::lstr(*category))
         .collect();
     set_data(&result, "pluralCategories", i.make_array(categories));
     set_data(

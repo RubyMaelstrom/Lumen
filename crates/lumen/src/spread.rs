@@ -143,7 +143,7 @@ impl Interp {
                     let value = if point < 0x80 {
                         Value::Str(crate::jstr::unit_lstr(point as u16))
                     } else {
-                        Value::from_string(crate::jstr::from_code_point(point))
+                        Value::lstr(crate::jstr::from_code_point(point))
                     };
                     append(self, value)?;
                     count += 1;

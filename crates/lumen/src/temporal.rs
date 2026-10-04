@@ -2518,7 +2518,7 @@ pub fn install(it: &mut Interp) {
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         ns.borrow_mut().props.insert(
             key,
-            Property::data(Value::str("Temporal"), false, false, true),
+            Property::data(Value::lstr("Temporal"), false, false, true),
         );
     }
     install_plain_date(it, &ns);
@@ -2693,14 +2693,14 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
             ("minute", "numeric"),
             ("second", "numeric"),
         ] {
-            set_data(&opts, k, Value::str(v));
+            set_data(&opts, k, Value::lstr(v));
         }
         let user_tzname = match &user_obj {
             Some(_) => i.get_member(&user_opts, "timeZoneName").map_err(unab)?,
             None => Value::Undefined,
         };
         if matches!(user_tzname, Value::Undefined) {
-            set_data(&opts, "timeZoneName", Value::str("short"));
+            set_data(&opts, "timeZoneName", Value::lstr("short"));
         }
     }
     // Intl.DateTimeFormat canonicalizes the zone (Asia/Calcutta -> Asia/Kolkata); do it here so the
@@ -2708,7 +2708,7 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
     let tz_canon = crate::tz::canonicalize(&tz)
         .map(|s| s.to_string())
         .unwrap_or_else(|| tz.to_string());
-    set_data(&opts, "timeZone", Value::from_string(tz_canon));
+    set_data(&opts, "timeZone", Value::lstr(tz_canon));
 
     let intl = i
         .get_member(&Value::Obj(i.global.clone()), "Intl")
@@ -2755,7 +2755,7 @@ fn add_ctor(
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         proto.borrow_mut().props.insert(
             key,
-            Property::data(Value::str(format!("Temporal.{name}")), false, false, true),
+            Property::data(Value::lstr(format!("Temporal.{name}")), false, false, true),
         );
     }
     ns.borrow_mut()
@@ -2811,7 +2811,7 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
         let d = as_date(i, &t)?;
         Ok(cal_era(&cal_of(i, &t), d)
             .0
-            .map(Value::str)
+            .map(Value::lstr)
             .unwrap_or(Value::Undefined))
     });
     def_getter(it, &proto, "eraYear", |i, t, _| {
@@ -2831,13 +2831,13 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
     });
     def_getter(it, &proto, "monthCode", |i, t, _| {
         let d = as_date(i, &t)?;
-        Ok(Value::from_string(cal_month_code(&cal_of(i, &t), d)))
+        Ok(Value::lstr(cal_month_code(&cal_of(i, &t), d)))
     });
     def_getter(it, &proto, "calendarId", |i, t, _| {
         if get(i, &t).is_none() {
             return Err(i.make_error("TypeError", "calendarId called on a non-Temporal receiver"));
         }
-        Ok(Value::from_string(cal_of(i, &t).to_string()))
+        Ok(Value::lstr(cal_of(i, &t).to_string()))
     });
     def_getter(it, &proto, "dayOfWeek", |i, t, _| {
         Ok(Value::Num(iso_day_of_week(as_date(i, &t)?) as f64))
@@ -2884,14 +2884,14 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
 
     it.def_method(&proto, "toString", 0, |i, t, a| {
         let d = as_date(i, &t)?;
-        Ok(Value::str(format!(
+        Ok(Value::lstr(format!(
             "{}{}",
             fmt_date(d),
             cal_suffix(i, &arg(a, 0), &cal_of(i, &t))?
         )))
     });
     it.def_method(&proto, "toJSON", 0, |i, t, _| {
-        Ok(Value::str(fmt_date(as_date(i, &t)?)))
+        Ok(Value::lstr(fmt_date(as_date(i, &t)?)))
     });
     it.def_method(&proto, "valueOf", 0, |i, _t, _| {
         Err(i.make_error(
@@ -3039,7 +3039,7 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
             }
             if let Some(e2) = &era {
                 b.props
-                    .insert("era", Property::builtin(Value::str(e2.as_str())));
+                    .insert("era", Property::builtin(Value::lstr(e2.as_str())));
             }
             if let Some(ey) = era_year {
                 b.props
@@ -3049,7 +3049,7 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
                 (None, None) => {
                     b.props.insert(
                         "monthCode",
-                        Property::builtin(Value::str(cal_month_code(&cal, d))),
+                        Property::builtin(Value::lstr(cal_month_code(&cal, d))),
                     );
                 }
                 _ => {
@@ -3141,7 +3141,7 @@ fn install_plain_date(it: &mut Interp, ns: &Gc) {
             setm(
                 &snap,
                 "monthCode",
-                Value::str(cal_month_code(&cal, d).as_str()),
+                Value::lstr(cal_month_code(&cal, d).as_str()),
             );
             setm(&snap, "day", Value::Num(cal_fields(&cal, d).2 as f64));
             cal_month_day_reference(i, &cal, &snap, false, Overflow::Constrain)?
@@ -4409,10 +4409,10 @@ fn install_plain_time(it: &mut Interp, ns: &Gc) {
         let (prec, inc, mode) = time_display_opts(i, &opts)?;
         // Rounding can carry across midnight; a PlainTime wraps around.
         let rounded = round_ns(time_to_ns(x) as i128, inc, &mode).rem_euclid(NS_PER_DAY);
-        Ok(Value::str(fmt_time_prec(ns_to_time(rounded), prec)))
+        Ok(Value::lstr(fmt_time_prec(ns_to_time(rounded), prec)))
     });
     it.def_method(&proto, "toJSON", 0, |i, t, _| {
-        Ok(Value::str(fmt_time(as_time(i, &t)?)))
+        Ok(Value::lstr(fmt_time(as_time(i, &t)?)))
     });
     it.def_method(&proto, "valueOf", 0, |i, _t, _| {
         Err(i.make_error(
@@ -4646,7 +4646,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
         let d = as_datetime(i, &t)?.0;
         Ok(cal_era(&cal_of(i, &t), d)
             .0
-            .map(Value::str)
+            .map(Value::lstr)
             .unwrap_or(Value::Undefined))
     });
     def_getter(it, &proto, "eraYear", |i, t, _| {
@@ -4666,13 +4666,13 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
     });
     def_getter(it, &proto, "monthCode", |i, t, _| {
         let d = as_datetime(i, &t)?.0;
-        Ok(Value::from_string(cal_month_code(&cal_of(i, &t), d)))
+        Ok(Value::lstr(cal_month_code(&cal_of(i, &t), d)))
     });
     def_getter(it, &proto, "calendarId", |i, t, _| {
         if get(i, &t).is_none() {
             return Err(i.make_error("TypeError", "calendarId called on a non-Temporal receiver"));
         }
-        Ok(Value::from_string(cal_of(i, &t).to_string()))
+        Ok(Value::lstr(cal_of(i, &t).to_string()))
     });
     def_getter(it, &proto, "hour", |i, t, _| {
         Ok(Value::Num(as_datetime(i, &t)?.1.hour as f64))
@@ -4748,7 +4748,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
         if !iso_datetime_within_limits(nd, ntm) {
             return Err(i.make_error("RangeError", "date-time is outside the representable range"));
         }
-        Ok(Value::str(format!(
+        Ok(Value::lstr(format!(
             "{}T{}{}",
             fmt_date(nd),
             fmt_time_prec(ntm, prec),
@@ -4757,7 +4757,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
     });
     it.def_method(&proto, "toJSON", 0, |i, t, _| {
         let (d, tm) = as_datetime(i, &t)?;
-        Ok(Value::str(format!("{}T{}", fmt_date(d), fmt_time(tm))))
+        Ok(Value::lstr(format!("{}T{}", fmt_date(d), fmt_time(tm))))
     });
     it.def_method(&proto, "valueOf", 0, |i, _t, _| {
         Err(i.make_error(
@@ -5002,7 +5002,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
             }
             if let Some(e2) = &era {
                 b.props
-                    .insert("era", Property::builtin(Value::str(e2.as_str())));
+                    .insert("era", Property::builtin(Value::lstr(e2.as_str())));
             }
             if let Some(ey) = era_year {
                 b.props
@@ -5012,7 +5012,7 @@ fn install_plain_datetime(it: &mut Interp, ns: &Gc) {
                 (None, None) => {
                     b.props.insert(
                         "monthCode",
-                        Property::builtin(Value::str(cal_month_code(&cal, d))),
+                        Property::builtin(Value::lstr(cal_month_code(&cal, d))),
                     );
                 }
                 _ => {
@@ -5256,7 +5256,7 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
         let d = as_yearmonth(i, &t)?;
         Ok(cal_era(&cal_of(i, &t), d)
             .0
-            .map(Value::str)
+            .map(Value::lstr)
             .unwrap_or(Value::Undefined))
     });
     def_getter(it, &proto, "eraYear", |i, t, _| {
@@ -5272,13 +5272,13 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
     });
     def_getter(it, &proto, "monthCode", |i, t, _| {
         let d = as_yearmonth(i, &t)?;
-        Ok(Value::from_string(cal_month_code(&cal_of(i, &t), d)))
+        Ok(Value::lstr(cal_month_code(&cal_of(i, &t), d)))
     });
     def_getter(it, &proto, "calendarId", |i, t, _| {
         if get(i, &t).is_none() {
             return Err(i.make_error("TypeError", "calendarId called on a non-Temporal receiver"));
         }
-        Ok(Value::from_string(cal_of(i, &t).to_string()))
+        Ok(Value::lstr(cal_of(i, &t).to_string()))
     });
     it.def_method(&proto, "toPlainDate", 1, |i, t, a| {
         let ym = as_yearmonth(i, &t)?;
@@ -5302,7 +5302,7 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
             setm(
                 &merged,
                 "monthCode",
-                Value::str(cal_month_code(&cal, ym).as_str()),
+                Value::lstr(cal_month_code(&cal, ym).as_str()),
             );
             setm(&merged, "day", Value::Num(day as f64));
             let raw = read_date_raw_cal(i, &Value::Obj(merged), &cal, Overflow::Constrain)?;
@@ -5336,12 +5336,12 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
         } else {
             format!("{}-{:02}-{:02}{}", pad_year(d.year), d.month, d.day, suffix)
         };
-        Ok(Value::str(s))
+        Ok(Value::lstr(s))
     });
     it.def_method(&proto, "toJSON", 0, |i, t, _| {
         let d = as_yearmonth(i, &t)?;
         let cal = cal_of(i, &t);
-        Ok(Value::str(if &*cal == "iso8601" {
+        Ok(Value::lstr(if &*cal == "iso8601" {
             format!("{}-{:02}", pad_year(d.year), d.month)
         } else {
             format!(
@@ -5483,7 +5483,7 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
             }
             if let Some(e2) = &era {
                 b.props
-                    .insert("era", Property::builtin(Value::str(e2.as_str())));
+                    .insert("era", Property::builtin(Value::lstr(e2.as_str())));
             }
             if let Some(ey) = era_year {
                 b.props
@@ -5493,7 +5493,7 @@ fn install_year_month(it: &mut Interp, ns: &Gc) {
                 (None, None) => {
                     b.props.insert(
                         "monthCode",
-                        Property::builtin(Value::str(cal_month_code(&cal, d))),
+                        Property::builtin(Value::lstr(cal_month_code(&cal, d))),
                     );
                 }
                 _ => {
@@ -5659,7 +5659,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
     Rc::make_mut(&mut it.extra_protos).insert("Temporal.PlainMonthDay", proto.clone());
     def_getter(it, &proto, "monthCode", |i, t, _| {
         let d = as_monthday(i, &t)?;
-        Ok(Value::from_string(cal_month_code(&cal_of(i, &t), d)))
+        Ok(Value::lstr(cal_month_code(&cal_of(i, &t), d)))
     });
     def_getter(it, &proto, "day", |i, t, _| {
         let d = as_monthday(i, &t)?;
@@ -5669,7 +5669,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         if get(i, &t).is_none() {
             return Err(i.make_error("TypeError", "calendarId called on a non-Temporal receiver"));
         }
-        Ok(Value::from_string(cal_of(i, &t).to_string()))
+        Ok(Value::lstr(cal_of(i, &t).to_string()))
     });
     it.def_method(&proto, "toString", 0, |i, t, a| {
         let d = as_monthday(i, &t)?;
@@ -5682,12 +5682,12 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
         } else {
             format!("{}-{:02}-{:02}{}", pad_year(d.year), d.month, d.day, suffix)
         };
-        Ok(Value::str(s))
+        Ok(Value::lstr(s))
     });
     it.def_method(&proto, "toJSON", 0, |i, t, _| {
         let d = as_monthday(i, &t)?;
         let cal = cal_of(i, &t);
-        Ok(Value::str(if &*cal == "iso8601" {
+        Ok(Value::lstr(if &*cal == "iso8601" {
             format!("{:02}-{:02}", d.month, d.day)
         } else {
             format!(
@@ -5833,7 +5833,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
             (None, None) => setm(
                 &snap,
                 "monthCode",
-                Value::str(cal_month_code(&cal, md).as_str()),
+                Value::lstr(cal_month_code(&cal, md).as_str()),
             ),
             _ => {
                 if let Some(m) = month {
@@ -5848,7 +5848,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
             setm(&snap, "year", Value::Num(y as f64));
         }
         if let Some(e2) = &era {
-            setm(&snap, "era", Value::str(e2.as_str()));
+            setm(&snap, "era", Value::lstr(e2.as_str()));
         }
         if let Some(ey) = era_year {
             setm(&snap, "eraYear", Value::Num(ey as f64));
@@ -5935,7 +5935,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
                 setm(&merged, "year", Value::Num(y as f64));
             }
             if let Some(e2) = &era {
-                setm(&merged, "era", Value::str(e2.as_str()));
+                setm(&merged, "era", Value::lstr(e2.as_str()));
             }
             if let Some(ey) = era_year {
                 setm(&merged, "eraYear", Value::Num(ey as f64));
@@ -5943,7 +5943,7 @@ fn install_month_day(it: &mut Interp, ns: &Gc) {
             setm(
                 &merged,
                 "monthCode",
-                Value::str(cal_month_code(&cal, md).as_str()),
+                Value::lstr(cal_month_code(&cal, md).as_str()),
             );
             setm(&merged, "day", Value::Num(md.day as f64));
             let raw = read_date_raw_cal(i, &Value::Obj(merged), &cal, Overflow::Constrain)?;
@@ -6225,7 +6225,7 @@ fn cal_month_day_reference(
     // Resolve (year, monthCode, day) strictly — the round-trip must reproduce the code and day.
     let resolve_at = |i: &mut Interp, cy: i64, code: &str, day: i64| -> Option<IsoDate> {
         let merged = i.new_object();
-        setm(&merged, "monthCode", Value::str(code));
+        setm(&merged, "monthCode", Value::lstr(code));
         setm(&merged, "day", Value::Num(day as f64));
         setm(&merged, "year", Value::Num(cy as f64));
         let raw = read_date_raw_cal(i, &Value::Obj(merged), cal, Overflow::Constrain).ok()?;
@@ -6320,7 +6320,7 @@ fn to_monthday_cal(
                 setm(
                     &snap,
                     "monthCode",
-                    Value::str(cal_month_code(&cal, full).as_str()),
+                    Value::lstr(cal_month_code(&cal, full).as_str()),
                 );
                 setm(&snap, "day", Value::Num(cal_fields(&cal, full).2 as f64));
                 let d = cal_month_day_reference(i, &cal, &snap, false, Overflow::Constrain)?;
@@ -6374,7 +6374,7 @@ fn to_monthday_cal(
                 if !matches!(ev, Value::Undefined) {
                     has_year = true;
                     let e2 = i.to_string(&ev).map_err(unab)?.to_lowercase();
-                    setm(&snap, "era", Value::str(e2.as_str()));
+                    setm(&snap, "era", Value::lstr(e2.as_str()));
                 }
                 let eyv = getm(i, v, "eraYear")?;
                 if !matches!(eyv, Value::Undefined) {
@@ -6817,7 +6817,7 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
                 let f = getm(i, &v, "monthCode")?;
                 match f {
                     Value::Undefined => Value::Undefined,
-                    _ => Value::str(i.to_string(&f).map_err(unab)?.to_string()),
+                    _ => Value::lstr(i.to_string(&f).map_err(unab)?.to_string()),
                 }
             };
             let ns_f = field_int(i, &v, "nanosecond", 0)?;
@@ -6869,7 +6869,7 @@ fn read_relative_to2(i: &mut Interp, opts: &Value) -> Result<Option<RelTo>, Valu
                 }
                 if let Some(e) = &era {
                     b.props
-                        .insert("era", Property::builtin(Value::str(e.as_str())));
+                        .insert("era", Property::builtin(Value::lstr(e.as_str())));
                 }
                 if let Some(ey) = era_year {
                     b.props
@@ -7829,10 +7829,10 @@ fn install_duration(it: &mut Interp, ns: &Gc) {
             };
             d = dur_from_internal(i, &internal, out_largest)?;
         }
-        Ok(Value::str(fmt_duration_prec(d, prec)))
+        Ok(Value::lstr(fmt_duration_prec(d, prec)))
     });
     it.def_method(&proto, "toJSON", 0, |i, t, _| {
-        Ok(Value::str(fmt_duration(as_duration(i, &t)?)))
+        Ok(Value::lstr(fmt_duration(as_duration(i, &t)?)))
     });
     it.def_method(&proto, "valueOf", 0, |i, _t, _| {
         Err(i.make_error("TypeError", "Temporal.Duration has no valueOf; use compare"))
@@ -8609,7 +8609,7 @@ fn install_instant(it: &mut Interp, ns: &Gc) {
         };
         let z = local.div_euclid(NS_PER_DAY) as i64;
         let tm = ns_to_time(local.rem_euclid(NS_PER_DAY));
-        Ok(Value::str(format!(
+        Ok(Value::lstr(format!(
             "{}T{}{}",
             fmt_date(civil_of(z)),
             fmt_time_prec(tm, prec),
@@ -8624,7 +8624,7 @@ fn install_instant(it: &mut Interp, ns: &Gc) {
         let z = ns.div_euclid(86_400_000_000_000) as i64;
         let rem = ns.rem_euclid(86_400_000_000_000);
         let (y, mo, da) = civil_from_days(z);
-        Ok(Value::str(format!(
+        Ok(Value::lstr(format!(
             "{}T{}Z",
             fmt_date(IsoDate {
                 year: y,
@@ -9246,7 +9246,7 @@ fn read_dt_bag(
         }
         if let Some(e) = &era {
             b.props
-                .insert("era", Property::builtin(Value::str(e.as_str())));
+                .insert("era", Property::builtin(Value::lstr(e.as_str())));
         }
         if let Some(ey) = era_year {
             b.props
@@ -9793,7 +9793,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         let (e, o, _) = as_zoned(i, &t)?;
         Ok(cal_era(&cal_of(i, &t), zoned_local(e, o).0)
             .0
-            .map(Value::str)
+            .map(Value::lstr)
             .unwrap_or(Value::Undefined))
     });
     def_getter(it, &proto, "eraYear", |i, t, _| {
@@ -9808,7 +9808,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
     calf_get!("day", |f: CF| Value::Num(f.2 as f64));
     def_getter(it, &proto, "monthCode", |i, t, _| {
         let (e, o, _) = as_zoned(i, &t)?;
-        Ok(Value::from_string(cal_month_code(
+        Ok(Value::lstr(cal_month_code(
             &cal_of(i, &t),
             zoned_local(e, o).0,
         )))
@@ -9856,7 +9856,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         if get(i, &t).is_none() {
             return Err(i.make_error("TypeError", "calendarId called on a non-Temporal receiver"));
         }
-        Ok(Value::from_string(cal_of(i, &t).to_string()))
+        Ok(Value::lstr(cal_of(i, &t).to_string()))
     });
     def_getter(it, &proto, "epochMilliseconds", |i, t, _| {
         Ok(Value::Num(as_zoned(i, &t)?.0.div_euclid(1_000_000) as f64))
@@ -9868,7 +9868,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         Ok(Value::Num(as_zoned(i, &t)?.1 as f64))
     });
     def_getter(it, &proto, "offset", |i, t, _| {
-        Ok(Value::str(offset_string(as_zoned(i, &t)?.1)))
+        Ok(Value::lstr(offset_string(as_zoned(i, &t)?.1)))
     });
     def_getter(it, &proto, "timeZoneId", |i, t, _| {
         Ok(Value::Str(as_zoned(i, &t)?.2.into()))
@@ -9938,7 +9938,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "toJSON", 0, |i, t, _| {
         let (e, o, tz) = as_zoned(i, &t)?;
         let (d, tm) = zoned_local(e, o);
-        Ok(Value::str(format!(
+        Ok(Value::lstr(format!(
             "{}T{}{}[{}]",
             fmt_date(d),
             fmt_time(tm),
@@ -10050,7 +10050,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                 }
             }
         }
-        Ok(Value::str(out))
+        Ok(Value::lstr(out))
     });
     it.def_method(&proto, "add", 1, |i, t, a| {
         let (e, _, tz) = as_zoned(i, &t)?;
@@ -10254,7 +10254,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
             }
             if let Some(e2) = &era {
                 b.props
-                    .insert("era", Property::builtin(Value::str(e2.as_str())));
+                    .insert("era", Property::builtin(Value::lstr(e2.as_str())));
             }
             if let Some(ey) = era_year {
                 b.props
@@ -10264,7 +10264,7 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
                 (None, None) => {
                     b.props.insert(
                         "monthCode",
-                        Property::builtin(Value::str(cal_month_code(&cal, d))),
+                        Property::builtin(Value::lstr(cal_month_code(&cal, d))),
                     );
                 }
                 _ => {
@@ -10637,7 +10637,7 @@ fn install_now(it: &mut Interp, ns: &Gc) {
     });
     // #sec-temporal.now.timezoneid: SystemTimeZoneIdentifier().
     it.def_method(&now, "timeZoneId", 0, |_i, _t, _| {
-        Ok(Value::str(crate::builtins::system_time_zone()))
+        Ok(Value::lstr(crate::builtins::system_time_zone()))
     });
     it.def_method(&now, "zonedDateTimeISO", 0, |i, _t, a| {
         let tz = now_zone(i, &arg(a, 0))?;
@@ -10675,7 +10675,7 @@ fn install_now(it: &mut Interp, ns: &Gc) {
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         now.borrow_mut().props.insert(
             key,
-            Property::data(Value::str("Temporal.Now"), false, false, true),
+            Property::data(Value::lstr("Temporal.Now"), false, false, true),
         );
     }
     ns.borrow_mut()

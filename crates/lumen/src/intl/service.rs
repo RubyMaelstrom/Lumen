@@ -202,7 +202,7 @@ pub fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
                     .map(|p| supported_language(&p.language))
                     .unwrap_or(false)
             })
-            .map(Value::from_string)
+            .map(Value::lstr)
             .collect();
         Ok(i.make_array(out))
     });

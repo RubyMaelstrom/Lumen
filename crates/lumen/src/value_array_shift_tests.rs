@@ -31,7 +31,7 @@ fn array(values: Vec<Value>, packed: bool, reverse: bool, named_tail: bool) -> P
         props
     };
     if named_tail {
-        properties.insert("named", Property::plain(Value::str("preserved")));
+        properties.insert("named", Property::plain(Value::lstr("preserved")));
         properties.insert("01", Property::plain(Value::Num(71.0)));
         properties.insert("4294967295", Property::plain(Value::Num(72.0)));
     }

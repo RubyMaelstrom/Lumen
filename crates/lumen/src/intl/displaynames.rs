@@ -67,16 +67,16 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let resolved = resolve_locale(i, &requested, &[]);
 
     set_builtin(&obj, "#\u{0}dn", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}dn_locale", Value::from_string(resolved.locale));
-    set_builtin(&obj, "#\u{0}dn_style", Value::from_string(style));
+    set_builtin(&obj, "#\u{0}dn_locale", Value::lstr(resolved.locale));
+    set_builtin(&obj, "#\u{0}dn_style", Value::lstr(style));
     let is_language = kind == "language";
-    set_builtin(&obj, "#\u{0}dn_type", Value::from_string(kind));
-    set_builtin(&obj, "#\u{0}dn_fallback", Value::from_string(fallback));
+    set_builtin(&obj, "#\u{0}dn_type", Value::lstr(kind));
+    set_builtin(&obj, "#\u{0}dn_fallback", Value::lstr(fallback));
     if is_language {
         set_builtin(
             &obj,
             "#\u{0}dn_langdisplay",
-            Value::from_string(language_display),
+            Value::lstr(language_display),
         );
     }
     Ok(Value::Obj(obj))
@@ -181,10 +181,10 @@ fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
         crate::cldr_display_names::name(language, &kind, &style, &canonical).map(str::to_string)
     };
     match name {
-        Some(name) => Ok(Value::from_string(name)),
+        Some(name) => Ok(Value::lstr(name)),
         None => {
             if fallback == "code" {
-                Ok(Value::from_string(canonical))
+                Ok(Value::lstr(canonical))
             } else {
                 Ok(Value::Undefined)
             }

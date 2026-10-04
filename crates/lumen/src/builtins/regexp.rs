@@ -8,14 +8,14 @@ fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Va
         if let Some(re) = i.regexps.get(&ptr) {
             return Ok(match flag {
                 Some(c) => Value::Bool(re.flags.contains(c)),
-                None => Value::from_string(re.flags.clone()),
+                None => Value::lstr(re.flags.clone()),
             });
         }
         // The %RegExp.prototype% object itself has default values rather than throwing.
         if i.extra_protos.get("RegExp").map(|p| Rc::as_ptr(p) as usize) == Some(ptr) {
             return Ok(match flag {
                 Some(_) => Value::Undefined,
-                None => Value::str(""),
+                None => Value::lstr(""),
             });
         }
     }
@@ -28,7 +28,7 @@ fn re_source_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
     if let Some(ptr) = map_ptr(&this) {
         if let Some(re) = i.regexps.get(&ptr) {
             if re.source.is_empty() {
-                return Ok(Value::str("(?:)"));
+                return Ok(Value::lstr("(?:)"));
             }
             // EscapeRegExpPattern only needs to alter solidus and line terminators for a
             // non-empty source. When none occur, the original source is already a valid literal
@@ -85,10 +85,10 @@ fn re_source_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
                     c => out.push(c),
                 }
             }
-            return Ok(Value::from_string(out));
+            return Ok(Value::lstr(out));
         }
         if i.extra_protos.get("RegExp").map(|p| Rc::as_ptr(p) as usize) == Some(ptr) {
-            return Ok(Value::str("(?:)"));
+            return Ok(Value::lstr("(?:)"));
         }
     }
     Err(i.make_error(
@@ -120,7 +120,7 @@ fn re_flags_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Valu
             out.push(ch);
         }
     }
-    Ok(Value::from_string(out))
+    Ok(Value::lstr(out))
 }
 
 macro_rules! regexp_flag_getter {
@@ -411,10 +411,10 @@ pub(super) fn install_regexp(it: &mut Interp) {
                 _ => unreachable!(),
             };
             let fl = match flags_arg {
-                Value::Undefined => Value::from_string(re.flags.clone()),
+                Value::Undefined => Value::lstr(re.flags.clone()),
                 v => v,
             };
-            (Value::from_string(re.source.clone()), fl)
+            (Value::lstr(re.source.clone()), fl)
         } else if pattern_is_regexp {
             // A regexp-like object: read its `source` and `flags` properties.
             let src = ab(i.get_member(&pattern, "source"))?;
@@ -476,7 +476,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         for (idx, cp) in crate::jstr::code_points(&s).into_iter().enumerate() {
             out.push_str(&regexp_escape_cp(cp, idx == 0));
         }
-        Ok(Value::from_string(out))
+        Ok(Value::lstr(out))
     });
     set_builtin(&it.global, "RegExp", Value::Obj(ctor));
 }
@@ -537,7 +537,7 @@ fn regexp_legacy_get(i: &mut Interp, this: &Value, slot: &str) -> Result<Value, 
     // Materialize the deferred last-match state (if any) before reading.
     super::flush_regexp_legacy(i);
     let v = c.borrow().props.get(slot).map(|p| p.value());
-    Ok(v.unwrap_or_else(|| Value::str("")))
+    Ok(v.unwrap_or_else(|| Value::lstr("")))
 }
 
 macro_rules! legacy_getter {
@@ -969,7 +969,7 @@ fn re_sym_replace_impl(
     if next_pos < size {
         accumulated.push_str(&crate::jstr::from_units(&sunits[next_pos..]));
     }
-    Ok(Value::from_string(
+    Ok(Value::lstr(
         crate::jstr::canonicalize(&accumulated).unwrap_or(accumulated),
     ))
 }
@@ -1284,7 +1284,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     } else {
         format!("{flags}y")
     };
-    let splitter = ab(i.construct(c, &[this.clone(), Value::from_string(new_flags)]))?;
+    let splitter = ab(i.construct(c, &[this.clone(), Value::lstr(new_flags)]))?;
     let limit = match arg(a, 1) {
         Value::Undefined => u32::MAX as usize,
         v => {
@@ -1324,7 +1324,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
             q = advance_string_index(q, &s, unicode);
             continue;
         }
-        out.push(Value::from_string(crate::jstr::from_units(&sunits[p..q])));
+        out.push(Value::lstr(crate::jstr::from_units(&sunits[p..q])));
         if out.len() == limit {
             return Ok(i.make_array(out));
         }
@@ -1340,7 +1340,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         }
         q = p;
     }
-    out.push(Value::from_string(crate::jstr::from_units(
+    out.push(Value::lstr(crate::jstr::from_units(
         &sunits[p..size],
     )));
     Ok(i.make_array(out))

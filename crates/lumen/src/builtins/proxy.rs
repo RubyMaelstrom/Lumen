@@ -60,7 +60,7 @@ pub(super) fn install_proxy(it: &mut Interp) {
             );
             ro.borrow_mut()
                 .props
-                .insert("name", Property::data(Value::str(""), false, false, true));
+                .insert("name", Property::data(Value::lstr(""), false, false, true));
         }
         let result = i.new_object();
         set_data(&result, "proxy", proxy);

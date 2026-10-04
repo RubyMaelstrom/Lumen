@@ -5324,10 +5324,10 @@ fn embedder_can_settle_a_host_promise_after_an_external_task() {
     // the promise itself leaves Rust scope. This models an I/O completion arriving on a later task.
     engine.collect_garbage_at_idle();
     engine
-        .call_function(&resolve, Value::Undefined, &[Value::str("done")])
+        .call_function(&resolve, Value::Undefined, &[Value::lstr("done")])
         .unwrap_or_else(|_| panic!("resolve succeeds"));
     engine
-        .call_function(&reject, Value::Undefined, &[Value::str("too late")])
+        .call_function(&reject, Value::Undefined, &[Value::lstr("too late")])
         .unwrap_or_else(|_| panic!("second settlement is a no-op"));
 
     match engine.eval("hostResult", false).expect("result parses") {

@@ -45,7 +45,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
             Property::data(Value::Num(0.0), false, false, true),
         );
         b.props
-            .insert("name", Property::data(Value::str(""), false, false, true));
+            .insert("name", Property::data(Value::lstr(""), false, false, true));
     }
     it.register_native_realm(&fp);
     it.def_method(&fp, "call", 1, nf_function_call);
@@ -96,7 +96,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
             .insert("length", Property::data(Value::Num(l), false, false, true));
         obj.borrow_mut().props.insert(
             "name",
-            Property::data(Value::from_string(name), false, false, true),
+            Property::data(Value::lstr(name), false, false, true),
         );
         Ok(Value::Obj(obj))
     });
@@ -146,7 +146,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
                 "() { [native code] }",
             )));
         }
-        Ok(Value::str("function () { [native code] }"))
+        Ok(Value::lstr("function () { [native code] }"))
     });
 
     // The %ThrowTypeError% poison pill: a single frozen function (length 0, name "") reused as the
@@ -165,7 +165,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
             Property::data(Value::Num(0.0), false, false, false),
         );
         b.props
-            .insert("name", Property::data(Value::str(""), false, false, false));
+            .insert("name", Property::data(Value::lstr(""), false, false, false));
         b.extensible = false;
     }
     Rc::make_mut(&mut it.extra_protos).insert("%ThrowTypeError%", throw_type_error.clone());

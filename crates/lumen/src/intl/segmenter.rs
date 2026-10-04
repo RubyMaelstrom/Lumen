@@ -40,11 +40,11 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         obj.borrow_mut().proto = Some(proto);
     }
     set_builtin(&obj, "#\u{0}sg", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}sg_locale", Value::from_string(resolved.locale));
+    set_builtin(&obj, "#\u{0}sg_locale", Value::lstr(resolved.locale));
     set_builtin(
         &obj,
         "#\u{0}sg_granularity",
-        Value::from_string(granularity),
+        Value::lstr(granularity),
     );
     Ok(Value::Obj(obj))
 }
@@ -564,9 +564,9 @@ fn segment(i: &mut Interp, this: &Value, input: &Value) -> Result<Value, Value> 
         let end = bnds.get(k + 1).map(|&(e, _)| e).unwrap_or(units.len());
         let seg: String = crate::jstr::from_units(&units[start..end]);
         let rec = i.new_object();
-        set_data(&rec, "segment", Value::from_string(seg));
+        set_data(&rec, "segment", Value::lstr(seg));
         set_data(&rec, "index", Value::Num(start as f64));
-        set_data(&rec, "input", Value::from_string(s.clone()));
+        set_data(&rec, "input", Value::lstr(s.clone()));
         if granularity == "word" {
             set_data(&rec, "isWordLike", Value::Bool(wordlike));
         }

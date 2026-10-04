@@ -687,12 +687,12 @@ impl Interp {
             let mut b = meta.borrow_mut();
             b.props.insert(
                 "url",
-                Property::data(Value::from_string(url), true, true, true),
+                Property::data(Value::lstr(url), true, true, true),
             );
             if is_path {
                 b.props.insert(
                     "filename",
-                    Property::data(Value::from_string(key.to_string()), true, true, true),
+                    Property::data(Value::lstr(key.to_string()), true, true, true),
                 );
                 let dir = std::path::Path::new(key)
                     .parent()
@@ -700,7 +700,7 @@ impl Interp {
                     .unwrap_or_default();
                 b.props.insert(
                     "dirname",
-                    Property::data(Value::from_string(dir), true, true, true),
+                    Property::data(Value::lstr(dir), true, true, true),
                 );
             }
         }
@@ -1000,7 +1000,7 @@ impl Interp {
             ns.borrow_mut().props.insert(
                 tag,
                 Property::data(
-                    Value::from_string("Module".to_string()),
+                    Value::lstr("Module".to_string()),
                     false,
                     false,
                     false,
@@ -1040,7 +1040,7 @@ impl Interp {
                 if Interp::is_sym_key(k) {
                     if let Value::Str(tag) = p.value() {
                         if &*tag == "Module" {
-                            p.set_value(Value::from_string("Deferred Module".to_string()));
+                            p.set_value(Value::lstr("Deferred Module".to_string()));
                         }
                     }
                 }
@@ -1093,7 +1093,7 @@ impl Interp {
                                     if Interp::is_sym_key(k) {
                                         if let Value::Str(tag) = p.value() {
                                             if &*tag == "Module" {
-                                                p.set_value(Value::from_string(
+                                                p.set_value(Value::lstr(
                                                     "Deferred Module".to_string(),
                                                 ));
                                             }

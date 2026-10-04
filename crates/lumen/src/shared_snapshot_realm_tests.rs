@@ -145,7 +145,7 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
         let child = it.create_realm();
         let main = Value::Obj(it.global.clone());
 
-        set_global(it, "realmTag", Value::str("main"));
+        set_global(it, "realmTag", Value::lstr("main"));
         run_shared(it);
         // The first Realm warms the shared functions: bytecode and native code now exist.
         assert_eq!(
@@ -155,7 +155,7 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
         );
 
         in_realm(it, &child, |it| {
-            set_global(it, "realmTag", Value::str("child"));
+            set_global(it, "realmTag", Value::lstr("child"));
             set_global(it, "realmOnly", Value::Num(1.0));
             run_shared(it);
             assert_eq!(

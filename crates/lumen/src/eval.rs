@@ -1952,7 +1952,7 @@ impl Interp {
                         if point < 0x80 {
                             Value::Str(crate::jstr::unit_lstr(point as u16))
                         } else {
-                            Value::from_string(crate::jstr::from_code_point(point))
+                            Value::lstr(crate::jstr::from_code_point(point))
                         }
                     })
                     .collect());
@@ -2404,9 +2404,9 @@ impl Interp {
     pub(crate) fn typeof_name_vm(&mut self, name: &str, env: &Env) -> Result<Value, Abrupt> {
         let (value, _) = self.get_var_with_mode::<true>(name, env)?;
         if self.is_htmldda(&value) {
-            Ok(Value::str("undefined"))
+            Ok(Value::lstr("undefined"))
         } else {
-            Ok(Value::str(value.type_of()))
+            Ok(Value::lstr(value.type_of()))
         }
     }
 
@@ -2917,7 +2917,7 @@ impl Interp {
             // The trap receives the original property key — a symbol stays a symbol.
             let key_val = self
                 .sym_from_key(key)
-                .unwrap_or_else(|| Value::from_string(key.to_string()));
+                .unwrap_or_else(|| Value::lstr(key.to_string()));
             let res = self.proxy_call_trap(
                 crate::interpreter::PROXY_TRAP_HAS,
                 &trap,
@@ -3493,7 +3493,7 @@ impl Interp {
             if empty {
                 o.borrow_mut().props.insert(
                     "name".to_string(),
-                    Property::data(Value::from_string(name.to_string()), false, false, true),
+                    Property::data(Value::lstr(name.to_string()), false, false, true),
                 );
             }
         }
@@ -3683,13 +3683,13 @@ impl Interp {
                     .iter()
                     .map(|(c, _)| {
                         c.as_ref()
-                            .map(|s| Value::from_string(s.clone()))
+                            .map(|s| Value::lstr(s.clone()))
                             .unwrap_or(Value::Undefined)
                     })
                     .collect();
                 let raw: Vec<Value> = quasis
                     .iter()
-                    .map(|(_, r)| Value::from_string(r.clone()))
+                    .map(|(_, r)| Value::lstr(r.clone()))
                     .collect();
                 let strings = self.make_array(cooked);
                 let raw_arr = self.make_array(raw);
@@ -4147,7 +4147,7 @@ impl Interp {
         );
         bound.borrow_mut().props.insert(
             "name",
-            crate::value::Property::data(Value::str(""), false, false, true),
+            crate::value::Property::data(Value::lstr(""), false, false, true),
         );
         Value::Obj(bound)
     }
@@ -4419,7 +4419,7 @@ impl Interp {
             while i < self.pending_async_waits.len() {
                 if let Ok(res) = self.pending_async_waits[i].1.try_recv() {
                     let (promise, _) = self.pending_async_waits.remove(i);
-                    self.resolve_promise(&promise, Value::str(res));
+                    self.resolve_promise(&promise, Value::lstr(res));
                     resolved_any = true;
                 } else {
                     i += 1;
@@ -5224,7 +5224,7 @@ impl Interp {
             if !class_env.borrow().vars.contains_key(source.as_str()) {
                 self.accessor_seq += 1;
                 let runtime = format!("{}\u{1}{}", source, self.accessor_seq);
-                bind(&class_env, &source, Value::str(runtime.as_str()));
+                bind(&class_env, &source, Value::lstr(runtime.as_str()));
             }
         }
         PreparedClassEvaluation {
@@ -5443,7 +5443,7 @@ impl Interp {
             if let Some(n) = &class.name {
                 b.props.insert(
                     "name",
-                    Property::data(Value::from_string(n.clone()), false, false, true),
+                    Property::data(Value::lstr(n.clone()), false, false, true),
                 );
             }
         }
@@ -5581,7 +5581,7 @@ impl Interp {
                         let name = self.fn_name_for_key(private_display(&key));
                         fo.borrow_mut().props.insert(
                             "name",
-                            Property::data(Value::from_string(name), false, false, true),
+                            Property::data(Value::lstr(name), false, false, true),
                         );
                     }
                     if !m.decorators.is_empty() {
@@ -5626,7 +5626,7 @@ impl Interp {
                         fo.borrow_mut().props.insert(
                             "name",
                             Property::data(
-                                Value::from_string(format!("{prefix}{name}")),
+                                Value::lstr(format!("{prefix}{name}")),
                                 false,
                                 false,
                                 true,
@@ -5855,7 +5855,7 @@ impl Interp {
             b.props.insert(
                 "name",
                 Property::data(
-                    Value::from_string(format!("{prefix}{name}")),
+                    Value::lstr(format!("{prefix}{name}")),
                     false,
                     false,
                     true,
@@ -5906,7 +5906,7 @@ impl Interp {
             b.call = call;
             b.props.insert(
                 "name",
-                Property::data(Value::from_string(name.to_string()), false, false, true),
+                Property::data(Value::lstr(name.to_string()), false, false, true),
             );
             b.props.insert(
                 "length",
@@ -5932,7 +5932,7 @@ impl Interp {
             self.sym_from_key(key).unwrap_or(Value::Undefined)
         } else {
             // A private member's context name is its source spelling, not the runtime key.
-            Value::from_string(private_display(key).to_string())
+            Value::lstr(private_display(key).to_string())
         };
         let access = self.new_object();
         if matches!(kind, "method" | "getter" | "field" | "accessor") {
@@ -5946,7 +5946,7 @@ impl Interp {
         let add_init = self.make_native("addInitializer", 1, dec_add_initializer);
         {
             let mut b = ctx.borrow_mut();
-            b.props.insert("kind", Property::plain(Value::str(kind)));
+            b.props.insert("kind", Property::plain(Value::lstr(kind)));
             b.props.insert("name", Property::plain(name));
             b.props
                 .insert("static", Property::plain(Value::Bool(is_static)));
@@ -6354,7 +6354,7 @@ impl Interp {
                     if is_excluded(&k) {
                         continue;
                     }
-                    set_data(rest, &k, Value::from_string(ch.to_string()));
+                    set_data(rest, &k, Value::lstr(ch.to_string()));
                 }
             }
             // Other primitives wrap to an object with no own enumerable properties.
@@ -6492,9 +6492,9 @@ impl Interp {
     pub(crate) fn eval_unary_vm(&mut self, op: &str, v: Value) -> Result<Value, Abrupt> {
         if op == "typeof" {
             if self.is_htmldda(&v) {
-                return Ok(Value::str("undefined"));
+                return Ok(Value::lstr("undefined"));
             }
-            return Ok(Value::str(v.type_of()));
+            return Ok(Value::lstr(v.type_of()));
         }
         let v = if matches!(op, "-" | "~") && matches!(v, Value::Obj(_)) {
             self.to_primitive(&v, Hint::Number)?
@@ -6610,9 +6610,9 @@ impl Interp {
             }
             let v = self.eval(arg, env)?;
             if self.is_htmldda(&v) {
-                return Ok(Value::str("undefined"));
+                return Ok(Value::lstr("undefined"));
             }
-            return Ok(Value::str(v.type_of()));
+            return Ok(Value::lstr(v.type_of()));
         }
         if op == "delete" {
             return self.eval_delete(arg, env);
@@ -6943,7 +6943,7 @@ impl Interp {
         };
         let kv = self
             .sym_from_key(key)
-            .unwrap_or_else(|| Value::from_string(key.to_string()));
+            .unwrap_or_else(|| Value::lstr(key.to_string()));
         let res = self.proxy_call_trap(
             crate::interpreter::PROXY_TRAP_DELETE,
             &trap,
@@ -8106,7 +8106,7 @@ impl Interp {
                         Hint::Number => "number",
                         Hint::Default => "default",
                     };
-                    let r = self.call(f, v.clone(), &[Value::str(hint_str)])?;
+                    let r = self.call(f, v.clone(), &[Value::lstr(hint_str)])?;
                     if matches!(r, Value::Obj(_)) {
                         return Err(
                             self.throw("TypeError", "Cannot convert object to a primitive value")

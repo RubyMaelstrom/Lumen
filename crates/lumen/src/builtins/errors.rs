@@ -15,8 +15,8 @@ pub(super) fn install_errors(it: &mut Interp) {
     ];
     // Create Error.prototype.
     let error_proto = Object::new(Some(it.object_proto.clone()));
-    set_builtin(&error_proto, "name", Value::str("Error"));
-    set_builtin(&error_proto, "message", Value::str(""));
+    set_builtin(&error_proto, "name", Value::lstr("Error"));
+    set_builtin(&error_proto, "message", Value::lstr(""));
     it.def_method(&error_proto, "toString", 0, |i, this, _| {
         if !matches!(this, Value::Obj(_)) {
             return Err(i.make_error(
@@ -75,7 +75,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             format!("{name}: {msg}")
         };
         crate::jit::perf_error_stack_format_end(perf_started);
-        Ok(Value::from_string(format!("{head}{frames}")))
+        Ok(Value::lstr(format!("{head}{frames}")))
     });
     // set stack: SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v).
     let set_stack = it.make_native("set stack", 1, |i, this, a| {
@@ -115,7 +115,7 @@ pub(super) fn install_errors(it: &mut Interp) {
                     let res = ab(i.call(
                         trap,
                         h.clone(),
-                        &[t.clone(), Value::str("stack"), v.clone(), this.clone()],
+                        &[t.clone(), Value::lstr("stack"), v.clone(), this.clone()],
                     ))?;
                     if !i.to_boolean(&res) {
                         return Err(
@@ -163,8 +163,8 @@ pub(super) fn install_errors(it: &mut Interp) {
             error_proto.clone()
         } else {
             let p = Object::new(Some(error_proto.clone()));
-            set_builtin(&p, "name", Value::str(name));
-            set_builtin(&p, "message", Value::str(""));
+            set_builtin(&p, "name", Value::lstr(name));
+            set_builtin(&p, "message", Value::lstr(""));
             Rc::make_mut(&mut it.error_protos).insert(name, p.clone());
             p
         };
@@ -204,8 +204,8 @@ pub(super) fn install_errors(it: &mut Interp) {
 
     // AggregateError(errors, message): an Error subclass carrying an `errors` array.
     let agg_proto = Object::new(Some(error_proto.clone()));
-    set_builtin(&agg_proto, "name", Value::str("AggregateError"));
-    set_builtin(&agg_proto, "message", Value::str(""));
+    set_builtin(&agg_proto, "name", Value::lstr("AggregateError"));
+    set_builtin(&agg_proto, "message", Value::lstr(""));
     Rc::make_mut(&mut it.error_protos).insert("AggregateError", agg_proto.clone());
     let agg_ctor = it.make_native("AggregateError", 2, |i, _t, a| {
         let err = i.make_error("AggregateError", "");
@@ -257,8 +257,8 @@ pub(super) fn install_errors(it: &mut Interp) {
     // SuppressedError(error, suppressed, message): an Error subclass carrying `error` and
     // `suppressed` (the error thrown during disposal and the one it superseded).
     let sup_proto = Object::new(Some(error_proto.clone()));
-    set_builtin(&sup_proto, "name", Value::str("SuppressedError"));
-    set_builtin(&sup_proto, "message", Value::str(""));
+    set_builtin(&sup_proto, "name", Value::lstr("SuppressedError"));
+    set_builtin(&sup_proto, "message", Value::lstr(""));
     Rc::make_mut(&mut it.error_protos).insert("SuppressedError", sup_proto.clone());
     let sup_ctor = it.make_native("SuppressedError", 3, |i, _t, a| {
         let err = i.make_error("SuppressedError", "");

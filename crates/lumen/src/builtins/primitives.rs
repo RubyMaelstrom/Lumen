@@ -32,9 +32,9 @@ pub(super) fn install_number(it: &mut Interp) {
             return Err(i.make_error("RangeError", "toString() radix must be between 2 and 36"));
         }
         if radix == 10.0 {
-            Ok(Value::from_string(i.num_to_str(n)))
+            Ok(Value::lstr(i.num_to_str(n)))
         } else {
-            Ok(Value::from_string(to_radix_string(n, radix as u32)))
+            Ok(Value::lstr(to_radix_string(n, radix as u32)))
         }
     });
     it.def_method(&np, "valueOf", 0, |i, this, _| {
@@ -46,10 +46,10 @@ pub(super) fn install_number(it: &mut Interp) {
         let f = ab(i.to_number(&fd))?;
         let f = if f.is_nan() { 0.0 } else { f.trunc() };
         if x.is_nan() {
-            return Ok(Value::str("NaN"));
+            return Ok(Value::lstr("NaN"));
         }
         if x.is_infinite() {
-            return Ok(Value::str(if x > 0.0 { "Infinity" } else { "-Infinity" }));
+            return Ok(Value::lstr(if x > 0.0 { "Infinity" } else { "-Infinity" }));
         }
         if !(0.0..=100.0).contains(&f) {
             return Err(i.make_error(
@@ -58,7 +58,7 @@ pub(super) fn install_number(it: &mut Interp) {
             ));
         }
         let f = f as usize;
-        Ok(Value::from_string(to_exponential(
+        Ok(Value::lstr(to_exponential(
             x,
             f,
             matches!(fd, Value::Undefined),
@@ -67,14 +67,14 @@ pub(super) fn install_number(it: &mut Interp) {
     it.def_method(&np, "toPrecision", 1, |i, this, args| {
         let n = this_number(i, &this)?;
         if matches!(arg(args, 0), Value::Undefined) {
-            return Ok(Value::from_string(i.num_to_str(n)));
+            return Ok(Value::lstr(i.num_to_str(n)));
         }
         let p = ab(i.to_number(&arg(args, 0)))?;
         if n.is_nan() {
-            return Ok(Value::str("NaN"));
+            return Ok(Value::lstr("NaN"));
         }
         if n.is_infinite() {
-            return Ok(Value::from_string(i.num_to_str(n)));
+            return Ok(Value::lstr(i.num_to_str(n)));
         }
         if !(1.0..=100.0).contains(&p) {
             return Err(i.make_error(
@@ -82,7 +82,7 @@ pub(super) fn install_number(it: &mut Interp) {
                 "toPrecision() argument must be between 1 and 100",
             ));
         }
-        Ok(Value::from_string(to_precision(n, p as usize)))
+        Ok(Value::lstr(to_precision(n, p as usize)))
     });
     it.def_method(&np, "toFixed", 1, |i, this, args| {
         let n = this_number(i, &this)?;
@@ -97,16 +97,16 @@ pub(super) fn install_number(it: &mut Interp) {
             ));
         }
         if n.is_nan() {
-            return Ok(Value::str("NaN"));
+            return Ok(Value::lstr("NaN"));
         }
         // For magnitudes ≥ 1e21 toFixed falls back to Number::toString.
         if n.abs() >= 1e21 {
-            return Ok(Value::from_string(i.num_to_str(n)));
+            return Ok(Value::lstr(i.num_to_str(n)));
         }
         let digits = d as usize;
         // The sign is `-` only for a strictly-negative value (not -0), and the magnitude is rounded.
         let body = to_fixed_magnitude(n.abs(), digits);
-        Ok(Value::from_string(if n < 0.0 {
+        Ok(Value::lstr(if n < 0.0 {
             format!("-{body}")
         } else {
             body
@@ -280,7 +280,7 @@ fn to_radix_string(n: f64, radix: u32) -> String {
 pub(super) fn install_boolean(it: &mut Interp) {
     let bp = it.boolean_proto.clone();
     it.def_method(&bp, "toString", 0, |i, this, _| {
-        Ok(Value::str(if this_boolean(i, &this)? {
+        Ok(Value::lstr(if this_boolean(i, &this)? {
             "true"
         } else {
             "false"
@@ -357,7 +357,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
             Ok(s) => Ok(s
                 .description
                 .as_deref()
-                .map(|d| Value::from_string(d.to_string()))
+                .map(|d| Value::lstr(d.to_string()))
                 .unwrap_or(Value::Undefined)),
             _ => Err(i.make_error(
                 "TypeError",
@@ -430,7 +430,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
             return Err(i.make_error("TypeError", "Symbol.keyFor: argument is not a Symbol"));
         };
         Ok(i.symbol_key_for(&s)
-            .map(Value::from_string)
+            .map(Value::lstr)
             .unwrap_or(Value::Undefined))
     });
     set_builtin(&it.global, "Symbol", Value::Obj(ctor));
@@ -449,7 +449,7 @@ pub(super) fn install_symbol(it: &mut Interp) {
     if let Some(key) = well_known_key(it, "toStringTag") {
         sp.borrow_mut().props.insert(
             key,
-            Property::data(Value::from_string("Symbol".to_string()), false, false, true),
+            Property::data(Value::lstr("Symbol".to_string()), false, false, true),
         );
     }
 }
@@ -488,7 +488,7 @@ pub(super) fn install_bigint(it: &mut Interp) {
                 r as u32
             }
         };
-        Ok(Value::from_string(n.to_string_radix(radix)))
+        Ok(Value::lstr(n.to_string_radix(radix)))
     });
     it.def_method(&proto, "valueOf", 0, |i, this, _| {
         Ok(Value::BigInt(this_bigint(i, &this)?))
@@ -581,7 +581,7 @@ pub(super) fn install_bigint(it: &mut Interp) {
     if let Some(key) = well_known_key(it, "toStringTag") {
         proto.borrow_mut().props.insert(
             key,
-            Property::data(Value::from_string("BigInt".to_string()), false, false, true),
+            Property::data(Value::lstr("BigInt".to_string()), false, false, true),
         );
     }
 }

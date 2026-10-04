@@ -55,9 +55,9 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         obj.borrow_mut().proto = Some(proto);
     }
     set_builtin(&obj, "#\u{0}lf", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}lf_locale", Value::from_string(resolved.locale));
-    set_builtin(&obj, "#\u{0}lf_type", Value::from_string(kind));
-    set_builtin(&obj, "#\u{0}lf_style", Value::from_string(style));
+    set_builtin(&obj, "#\u{0}lf_locale", Value::lstr(resolved.locale));
+    set_builtin(&obj, "#\u{0}lf_type", Value::lstr(kind));
+    set_builtin(&obj, "#\u{0}lf_style", Value::lstr(style));
     Ok(Value::Obj(obj))
 }
 
@@ -190,7 +190,7 @@ fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<
     let patterns = crate::cldr_lists::patterns(lang, &kind, &style);
     let segments = assemble_segments(&parts, patterns, lang);
     if !to_parts {
-        return Ok(Value::from_string(
+        return Ok(Value::lstr(
             segments.iter().map(|(_, s)| s.as_str()).collect::<String>(),
         ));
     }
@@ -199,8 +199,8 @@ fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<
         .map(|(is_elem, v)| {
             let ob = i.new_object();
             let t = if is_elem { "element" } else { "literal" };
-            set_data(&ob, "type", Value::from_string(t.to_string()));
-            set_data(&ob, "value", Value::from_string(v));
+            set_data(&ob, "type", Value::lstr(t.to_string()));
+            set_data(&ob, "value", Value::lstr(v));
             Value::Obj(ob)
         })
         .collect();

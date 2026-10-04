@@ -25,7 +25,7 @@ fn packed(length: usize) -> Props {
 fn packed_mirror_storage_only_adds_numeric_words_and_preserves_canonical_addresses() {
     for length in [3, 16] {
         let mut props = packed(length);
-        props.insert("named", Property::plain(Value::str("kept")));
+        props.insert("named", Property::plain(Value::lstr("kept")));
         let before = props.retained_requested_storage_bytes().0;
         let pointer = props.elems.packed_ref().unwrap().as_ptr();
         let shape = props.shape();
@@ -79,7 +79,7 @@ fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
             assert!(p.jit_packed_numeric_slots(3).is_some());
         }),
         ("non-number", |p| {
-            assert!(p.set_index_value(0, Value::str("changed")).is_ok())
+            assert!(p.set_index_value(0, Value::lstr("changed")).is_ok())
         }),
     ];
     for (name, edit) in edits {
@@ -109,7 +109,7 @@ fn packed_mirror_numbers_preserve_bits_and_refused_states_recover_after_mutation
     props
         .get_mut("0")
         .unwrap()
-        .set_value(Value::str("not numeric"));
+        .set_value(Value::lstr("not numeric"));
     let before = props.retained_requested_storage_bytes().0;
     assert!(!props.prepare_packed_numeric_mirror());
     assert_eq!(props.mirror_flags, MIRROR_PACKED_FAILED);
@@ -134,7 +134,7 @@ fn packed_mirror_numbers_preserve_bits_and_refused_states_recover_after_mutation
 #[test]
 fn packed_mirror_clone_is_independent_and_preparation_work_is_bounded() {
     let mut original = packed(3);
-    original.insert("named", Property::plain(Value::str("kept")));
+    original.insert("named", Property::plain(Value::lstr("kept")));
     assert!(original.prepare_packed_numeric_mirror());
     let mut copy = original.clone();
     assert_ne!(original.elems.mirror.as_ptr(), copy.elems.mirror.as_ptr());
@@ -144,7 +144,7 @@ fn packed_mirror_clone_is_independent_and_preparation_work_is_bounded() {
     original
         .get_mut("1")
         .unwrap()
-        .set_value(Value::str("changed"));
+        .set_value(Value::lstr("changed"));
     drop(original);
     assert_eq!(copy.mirror_get(1), Some(1.0));
     assert!(matches!(copy.get("named").unwrap().value(), Value::Str(value) if &*value == "kept"));

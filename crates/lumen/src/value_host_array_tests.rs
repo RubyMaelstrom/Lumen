@@ -56,7 +56,7 @@ fn host_arrays_keep_holes_getters_length_and_numeric_values_across_tiers() {
             held.clone(),
             Value::Num(-0.0),
             Value::Num(f64::NAN),
-            Value::str("text"),
+            Value::lstr("text"),
             Value::Undefined,
         ]);
         engine

@@ -340,7 +340,7 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         Value::Num(f64::NAN),
         Value::Num(f64::INFINITY),
         Value::Num(f64::NEG_INFINITY),
-        Value::str("owned reference λ"),
+        Value::lstr("owned reference λ"),
         Value::BigInt(crate::bigint::JsBigInt::from_i128(i128::MAX)),
         engine.interp.new_symbol(Some(Rc::from("reference-symbol"))),
         Value::Obj(Object::new(None)),

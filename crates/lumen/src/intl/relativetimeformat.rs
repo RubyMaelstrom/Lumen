@@ -55,10 +55,10 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
         object.borrow_mut().proto = Some(proto);
     }
     set_builtin(&object, "#\u{0}rtf", Value::Bool(true));
-    set_builtin(&object, "#\u{0}rtf_locale", Value::from_string(locale));
-    set_builtin(&object, "#\u{0}rtf_numeric", Value::from_string(numeric));
-    set_builtin(&object, "#\u{0}rtf_style", Value::from_string(style));
-    set_builtin(&object, "#\u{0}rtf_nu", Value::from_string(numbering));
+    set_builtin(&object, "#\u{0}rtf_locale", Value::lstr(locale));
+    set_builtin(&object, "#\u{0}rtf_numeric", Value::lstr(numeric));
+    set_builtin(&object, "#\u{0}rtf_style", Value::lstr(style));
+    set_builtin(&object, "#\u{0}rtf_nu", Value::lstr(numbering));
     Ok(Value::Obj(object))
 }
 
@@ -90,11 +90,11 @@ fn string_slot(object: &Gc, key: &str, fallback: &str) -> String {
 
 fn literal_result(i: &mut Interp, value: &str, to_parts: bool) -> Value {
     if !to_parts {
-        return Value::from_string(value.to_string());
+        return Value::lstr(value.to_string());
     }
     let part = i.new_object();
-    set_data(&part, "type", Value::str("literal"));
-    set_data(&part, "value", Value::from_string(value.to_string()));
+    set_data(&part, "type", Value::lstr("literal"));
+    set_data(&part, "value", Value::lstr(value.to_string()));
     i.make_array(vec![Value::Obj(part)])
 }
 
@@ -150,12 +150,12 @@ fn format(
     set_data(
         &nf_options,
         "numberingSystem",
-        Value::from_string(numbering),
+        Value::lstr(numbering),
     );
-    set_data(&nf_options, "signDisplay", Value::str("never"));
+    set_data(&nf_options, "signDisplay", Value::lstr("never"));
     if language == "pl" {
         // CLDR's Polish number pattern has minimumGroupingDigits=2.
-        set_data(&nf_options, "useGrouping", Value::str("min2"));
+        set_data(&nf_options, "useGrouping", Value::lstr("min2"));
     }
     let number_format = new_service(i, "NumberFormat", &locale, nf_options)?;
     let format = ab(i.get_member(&number_format, "format"))?;
@@ -164,7 +164,7 @@ fn format(
         _ => magnitude.to_string(),
     };
     if !to_parts {
-        return Ok(Value::from_string(format!(
+        return Ok(Value::lstr(format!(
             "{}{}{}",
             &pattern[..marker],
             formatted,
@@ -178,8 +178,8 @@ fn format(
             return;
         }
         let part = i.new_object();
-        set_data(&part, "type", Value::str("literal"));
-        set_data(&part, "value", Value::from_string(text.to_string()));
+        set_data(&part, "type", Value::lstr("literal"));
+        set_data(&part, "value", Value::lstr(text.to_string()));
         output.push(Value::Obj(part));
     };
     push_literal(i, &mut output, &pattern[..marker]);
@@ -194,7 +194,7 @@ fn format(
         let part = i.new_object();
         set_data(&part, "type", ab(i.get_member(&source, "type"))?);
         set_data(&part, "value", ab(i.get_member(&source, "value"))?);
-        set_data(&part, "unit", Value::str(unit));
+        set_data(&part, "unit", Value::lstr(unit));
         output.push(Value::Obj(part));
     }
     push_literal(i, &mut output, &pattern[marker + 3..]);
@@ -206,7 +206,7 @@ fn new_service(i: &mut Interp, service: &str, locale: &str, options: Gc) -> Resu
     let constructor = ab(i.get_member(&intl, service))?;
     ab(i.construct(
         constructor,
-        &[Value::from_string(locale.to_string()), Value::Obj(options)],
+        &[Value::lstr(locale.to_string()), Value::Obj(options)],
     ))
 }
 

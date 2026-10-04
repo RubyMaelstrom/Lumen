@@ -54,10 +54,10 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     let (_ctor, proto) = make_service(it, ns, "Locale", 1, locale_construct);
 
     def_getter(it, &proto, "baseName", |i, this, _| {
-        Ok(Value::from_string(slot(i, &this, "#\u{0}locale_basename")?))
+        Ok(Value::lstr(slot(i, &this, "#\u{0}locale_basename")?))
     });
     def_getter(it, &proto, "language", |i, this, _| {
-        Ok(Value::from_string(slot(i, &this, "#\u{0}locale_language")?))
+        Ok(Value::lstr(slot(i, &this, "#\u{0}locale_language")?))
     });
     def_getter(it, &proto, "script", |i, this, _| {
         opt_slot(i, &this, "#\u{0}locale_script")
@@ -102,7 +102,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     });
 
     it.def_method(&proto, "toString", 0, |i, this, _| {
-        Ok(Value::from_string(slot(i, &this, "#\u{0}locale_tag")?))
+        Ok(Value::lstr(slot(i, &this, "#\u{0}locale_tag")?))
     });
     it.def_method(&proto, "maximize", 0, |i, this, _| relocale(i, &this, true));
     it.def_method(&proto, "minimize", 0, |i, this, _| {
@@ -134,7 +134,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
             matches!(o.borrow().props.get("#\u{0}locale_region").map(|p| p.value()), Some(Value::Str(s)) if !s.is_empty())
         };
         if region {
-            Ok(i.make_array(vec![Value::str("UTC")]))
+            Ok(i.make_array(vec![Value::lstr("UTC")]))
         } else {
             Ok(Value::Undefined)
         }
@@ -142,7 +142,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
     it.def_method(&proto, "getTextInfo", 0, |i, this, _| {
         let _ = slot(i, &this, "#\u{0}locale_tag")?;
         let o = i.new_object();
-        set_data(&o, "direction", Value::str("ltr"));
+        set_data(&o, "direction", Value::lstr("ltr"));
         Ok(Value::Obj(o))
     });
     it.def_method(&proto, "getWeekInfo", 0, |i, this, _| {
@@ -225,7 +225,7 @@ fn locale_keyword(i: &mut Interp, this: &Value, name: &str) -> Result<Option<Str
 }
 
 fn string_array<T: Into<crate::lstr::LStr>>(i: &mut Interp, values: Vec<T>) -> Value {
-    i.make_array(values.into_iter().map(Value::str).collect())
+    i.make_array(values.into_iter().map(Value::lstr).collect())
 }
 
 /// ECMA-402 CalendarsOfLocale, using UTS #35 Calendar Preference Data.
@@ -335,8 +335,8 @@ fn info_list(
         _ => None,
     };
     let items: Vec<Value> = match kw {
-        Some(v) => vec![Value::from_string(v)],
-        None => default.iter().map(|s| Value::str(*s)).collect(),
+        Some(v) => vec![Value::lstr(v)],
+        None => default.iter().map(|s| Value::lstr(*s)).collect(),
     };
     Ok(i.make_array(items))
 }
@@ -609,33 +609,33 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
     set_builtin(
         &obj,
         "#\u{0}locale_tag",
-        Value::from_string(tag.to_string()),
+        Value::lstr(tag.to_string()),
     );
-    set_builtin(&obj, "#\u{0}locale_basename", Value::from_string(base));
+    set_builtin(&obj, "#\u{0}locale_basename", Value::lstr(base));
     set_builtin(
         &obj,
         "#\u{0}locale_language",
-        Value::from_string(p.language.clone()),
+        Value::lstr(p.language.clone()),
     );
     if !p.script.is_empty() {
         set_builtin(
             &obj,
             "#\u{0}locale_script",
-            Value::from_string(p.script.clone()),
+            Value::lstr(p.script.clone()),
         );
     }
     if !p.region.is_empty() {
         set_builtin(
             &obj,
             "#\u{0}locale_region",
-            Value::from_string(p.region.clone()),
+            Value::lstr(p.region.clone()),
         );
     }
     if !p.variants.is_empty() {
         set_builtin(
             &obj,
             "#\u{0}locale_variants",
-            Value::from_string(p.variants.join("-")),
+            Value::lstr(p.variants.join("-")),
         );
     }
     if let Some((_a, keywords)) = &p.unicode {
@@ -644,7 +644,7 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
             set_builtin(
                 &obj,
                 Box::leak(slot.into_boxed_str()),
-                Value::from_string(types.join("-")),
+                Value::lstr(types.join("-")),
             );
         }
     }

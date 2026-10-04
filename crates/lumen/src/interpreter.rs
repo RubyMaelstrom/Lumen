@@ -439,7 +439,7 @@ mod bound_trace_tests {
         let borrowed = object.borrow_mut();
         assert!(bound_trace_preview(&value, 0).contains("(borrowed)"));
         drop(borrowed);
-        let text = Value::from_string("é".repeat(100_000));
+        let text = Value::lstr("é".repeat(100_000));
         assert!(bound_trace_preview(&text, 0).len() < 200);
     }
 
@@ -4473,7 +4473,7 @@ impl Interp {
         if !msg.is_empty() {
             obj.borrow_mut()
                 .props
-                .insert("message", Property::builtin(Value::from_string(msg)));
+                .insert("message", Property::builtin(Value::lstr(msg)));
         }
         let value = Value::Obj(obj);
         // Opt-in, bounded diagnostics include caught native errors without
@@ -5978,7 +5978,7 @@ impl Interp {
             );
             b.props.insert(
                 "name",
-                Property::data(Value::from_string(name.to_string()), false, false, true),
+                Property::data(Value::lstr(name.to_string()), false, false, true),
             );
         }
         self.register_native_realm(&obj);
@@ -5997,7 +5997,7 @@ impl Interp {
             );
             b.props.insert(
                 "name",
-                Property::data(Value::from_string(name.to_string()), false, false, true),
+                Property::data(Value::lstr(name.to_string()), false, false, true),
             );
         }
         self.register_native_realm(&obj);
@@ -6126,9 +6126,9 @@ impl Interp {
     pub fn string_from_utf8(&self, value: String) -> Value {
         if value.chars().any(|c| crate::jstr::smuggled(c).is_some()) {
             let points: Vec<u32> = value.chars().map(|c| c as u32).collect();
-            Value::from_string(crate::jstr::from_code_points(&points))
+            Value::lstr(crate::jstr::from_code_points(&points))
         } else {
-            Value::from_string(value)
+            Value::lstr(value)
         }
     }
 
@@ -6507,7 +6507,7 @@ impl Interp {
             );
             p.insert(
                 crate::value::fn_key(1), // "name"
-                Property::data(Value::from_string(name), false, false, true),
+                Property::data(Value::lstr(name), false, false, true),
             );
             if has_prototype {
                 p.insert(
@@ -6556,7 +6556,7 @@ impl Interp {
                             .entry_at_mut(1)
                             .expect("function name slot")
                             .1
-                            .set_value(Value::from_string(name.to_string()));
+                            .set_value(Value::lstr(name.to_string()));
                         if named.is_none() {
                             *named = Some((name.clone(), props.clone()));
                         }
@@ -8069,7 +8069,7 @@ impl Interp {
                             // Forward to the target's [[Get]], preserving the original Receiver.
                             return self.get_member_recv(&target, key, receiver);
                         };
-                        let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                        let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                         let res = self.proxy_call_trap(
                             PROXY_TRAP_GET,
                             &trap,
@@ -8200,7 +8200,7 @@ impl Interp {
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
                     return self.get_member_recv(&target, key, receiver.clone());
                 };
-                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                 let res = self.proxy_call_trap(
                     PROXY_TRAP_GET,
                     &trap,
@@ -8689,7 +8689,7 @@ impl Interp {
                     // Forward to the target's [[Set]], preserving the original Receiver.
                     return self.set_member_recv(&target, key, value, receiver);
                 };
-                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                 let ok = self.proxy_call_trap(
                     PROXY_TRAP_SET,
                     &trap,
@@ -8757,7 +8757,7 @@ impl Interp {
                 let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
                     return self.set_member_recv(&target, key, value, receiver);
                 };
-                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::str(key));
+                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
                 let ok = self.proxy_call_trap(
                     PROXY_TRAP_SET,
                     &trap,
@@ -11574,7 +11574,7 @@ impl Interp {
             );
             b.props.insert(
                 "name",
-                Property::data(Value::from_string(name), false, false, true),
+                Property::data(Value::lstr(name), false, false, true),
             );
         }
         Ok(Value::Obj(f))
@@ -11680,7 +11680,7 @@ impl Interp {
         );
         f.borrow_mut()
             .props
-            .insert("name", Property::data(Value::str(""), false, false, true));
+            .insert("name", Property::data(Value::lstr(""), false, false, true));
         Value::Obj(f)
     }
 

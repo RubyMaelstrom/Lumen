@@ -58,7 +58,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
     if let Some(key) = well_known_key(it, "toStringTag") {
         wr_proto.borrow_mut().props.insert(
             key,
-            Property::data(Value::str("WeakRef"), false, false, true),
+            Property::data(Value::lstr("WeakRef"), false, false, true),
         );
     }
     set_builtin(&it.global, "WeakRef", Value::Obj(wr_ctor));
@@ -163,7 +163,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
     if let Some(key) = well_known_key(it, "toStringTag") {
         fr_proto.borrow_mut().props.insert(
             key,
-            Property::data(Value::str("FinalizationRegistry"), false, false, true),
+            Property::data(Value::lstr("FinalizationRegistry"), false, false, true),
         );
     }
     set_builtin(&it.global, "FinalizationRegistry", Value::Obj(fr_ctor));

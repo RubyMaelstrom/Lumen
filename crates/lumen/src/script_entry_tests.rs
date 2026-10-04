@@ -345,7 +345,7 @@ fn compiled_script_nested_host_entry_masks_outer_function_caller_and_restores_it
             match result {
                 Ok(Ok(value)) => Ok(value),
                 Ok(Err(crate::embed::EvalError::Throw(error))) => Err(error),
-                _ => Err(Value::from_string("nested Script failed".to_owned())),
+                _ => Err(Value::lstr("nested Script failed".to_owned())),
             }
         });
         let root = engine.global_this();

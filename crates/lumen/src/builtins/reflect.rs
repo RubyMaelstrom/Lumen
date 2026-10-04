@@ -44,7 +44,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
                     &[
                         ptarget.clone(),
                         i.sym_from_key(&key)
-                            .unwrap_or_else(|| Value::from_string(key.to_string())),
+                            .unwrap_or_else(|| Value::lstr(key.to_string())),
                         value.clone(),
                         receiver,
                     ],

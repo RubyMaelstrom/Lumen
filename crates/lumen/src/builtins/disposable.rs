@@ -245,7 +245,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         let fresh = Object::new(proto);
         let list = ds_list(i, &this)?;
         set_internal(&fresh, "#\u{0}ds", list);
-        set_internal(&fresh, "#\u{0}ds_kind", Value::str("sync"));
+        set_internal(&fresh, "#\u{0}ds_kind", Value::lstr("sync"));
         set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
         set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
@@ -279,7 +279,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         let obj = new_from_ctor(i, "DisposableStack")?;
         let list = i.make_array(Vec::new());
         set_internal(&obj, "#\u{0}ds", list);
-        set_internal(&obj, "#\u{0}ds_kind", Value::str("sync"));
+        set_internal(&obj, "#\u{0}ds_kind", Value::lstr("sync"));
         set_internal(&obj, "#\u{0}ds_disposed", Value::Bool(false));
         Ok(Value::Obj(obj))
     });
@@ -397,7 +397,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         let fresh = Object::new(i.extra_protos.get("AsyncDisposableStack").cloned());
         let list = ds_list(i, &this)?;
         set_internal(&fresh, "#\u{0}ds", list);
-        set_internal(&fresh, "#\u{0}ds_kind", Value::str("async"));
+        set_internal(&fresh, "#\u{0}ds_kind", Value::lstr("async"));
         set_internal(&fresh, "#\u{0}ds_disposed", Value::Bool(false));
         let empty = i.make_array(Vec::new());
         set_internal(this.as_obj().unwrap(), "#\u{0}ds", empty);
@@ -433,7 +433,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         let obj = new_from_ctor(i, "AsyncDisposableStack")?;
         let list = i.make_array(Vec::new());
         set_internal(&obj, "#\u{0}ds", list);
-        set_internal(&obj, "#\u{0}ds_kind", Value::str("async"));
+        set_internal(&obj, "#\u{0}ds_kind", Value::lstr("async"));
         set_internal(&obj, "#\u{0}ds_disposed", Value::Bool(false));
         Ok(Value::Obj(obj))
     });

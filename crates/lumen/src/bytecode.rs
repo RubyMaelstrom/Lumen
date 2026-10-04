@@ -4807,7 +4807,7 @@ mod feedback_layout_tests {
         assert!(matches!(result, Value::Num(value) if value == 3.5));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_binary(&Value::str("x"), &Value::Num(2.0), &add).is_none());
+        assert!(try_tagged_numeric_binary(&Value::lstr("x"), &Value::Num(2.0), &add).is_none());
         assert!(try_tagged_numeric_binary(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             &Value::Num(2.0),
@@ -4856,7 +4856,7 @@ mod feedback_layout_tests {
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_cmp(&Value::str("x"), &Value::Num(2.0), &lt).is_none());
+        assert!(try_tagged_numeric_cmp(&Value::lstr("x"), &Value::Num(2.0), &lt).is_none());
         assert!(try_tagged_numeric_cmp(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             &Value::Num(2.0),
@@ -4960,7 +4960,7 @@ mod feedback_layout_tests {
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_i32(&Value::str("x"), &Value::Num(2.0), &band).is_none());
+        assert!(try_tagged_numeric_i32(&Value::lstr("x"), &Value::Num(2.0), &band).is_none());
         assert!(try_tagged_numeric_i32(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(1)),
             &Value::Num(2.0),
@@ -5013,7 +5013,7 @@ mod feedback_layout_tests {
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_unary(&Value::str("x"), |n| -n).is_none());
+        assert!(try_tagged_numeric_unary(&Value::lstr("x"), |n| -n).is_none());
         assert!(try_tagged_numeric_unary(&Value::Obj(interp.new_object()), |n| -n).is_none());
     }
 
@@ -5063,7 +5063,7 @@ mod feedback_layout_tests {
         ));
 
         let interp = Interp::new();
-        assert!(try_tagged_numeric_pow(&Value::str("x"), &Value::Num(2.0)).is_none());
+        assert!(try_tagged_numeric_pow(&Value::lstr("x"), &Value::Num(2.0)).is_none());
         assert!(try_tagged_numeric_pow(
             &Value::BigInt(crate::bigint::JsBigInt::from_u64(2)),
             &Value::Num(2.0),
@@ -5080,7 +5080,7 @@ mod feedback_layout_tests {
         let feedback = FeedbackVector::new_with_enabled(layout, bindings, true);
         let mut interp = Interp::new();
         let mut stack = ValueStack::<PackedValue>::default();
-        stack.extend([Value::str("left"), Value::Num(1.0)]);
+        stack.extend([Value::lstr("left"), Value::Num(1.0)]);
 
         assert!(bin_num(&mut interp, &mut stack, &feedback, 0, "+", |a, b| a + b).is_ok());
         assert!(matches!(stack.last(), Some(Value::Str(value)) if &*value == "left1"));
@@ -5192,7 +5192,7 @@ mod feedback_layout_tests {
             &feedback,
             0,
             UpdKind::PostInc,
-            Value::str("4"),
+            Value::lstr("4"),
             |_, value| {
                 stored = Some(value);
                 Ok(())
@@ -5477,7 +5477,7 @@ mod feedback_layout_tests {
         let mut trace = crate::feedback::CurrentPropertyTrace::default();
 
         let result =
-            match interp.get_prop_ic_profiled(&Value::str("abc"), "length", &caches[0], &mut trace)
+            match interp.get_prop_ic_profiled(&Value::lstr("abc"), "length", &caches[0], &mut trace)
             {
                 Ok(value) => value,
                 Err(_) => panic!("string length must complete"),
@@ -5730,7 +5730,7 @@ mod feedback_layout_tests {
             1,
             Rc::new(move |_, _, _| {
                 setter_calls.set(setter_calls.get() + 1);
-                Err(Value::str("setter failed"))
+                Err(Value::lstr("setter failed"))
             }),
         );
         interp.define_accessor_value(&object, "value", None, Some(setter), true);
@@ -11026,7 +11026,7 @@ impl Compiler {
         self.emit(Op::LoadLocal(source));
         match key {
             PropKey::Ident(key) => {
-                let value = self.const_idx(Value::from_string(key.clone()));
+                let value = self.const_idx(Value::lstr(key.clone()));
                 self.emit(Op::Const(value));
             }
             PropKey::Str(key) => {
@@ -12358,7 +12358,7 @@ impl Compiler {
     fn object_literal_key(&mut self, key: &PropKey) -> CResult {
         match key {
             PropKey::Ident(key) => {
-                let value = self.const_idx(Value::from_string(key.clone()));
+                let value = self.const_idx(Value::lstr(key.clone()));
                 self.emit(Op::Const(value));
             }
             PropKey::Str(key) => {
@@ -12377,7 +12377,7 @@ impl Compiler {
 
     fn super_named_reference(&mut self, name: &str) {
         self.emit_super_this();
-        let key = self.const_idx(Value::from_string(name.to_string()));
+        let key = self.const_idx(Value::lstr(name.to_string()));
         self.emit(Op::Const(key));
         self.emit(Op::SuperBase);
     }
@@ -20251,11 +20251,11 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         };
                         let idx = if n.is_nan() { 0.0 } else { n.trunc() };
                         Ok(if idx < 0.0 || !idx.is_finite() {
-                            Value::str("")
+                            Value::lstr("")
                         } else {
                             match i.unit_at(s, idx as usize) {
                                 Some(unit) => Value::Str(crate::jstr::unit_lstr(unit)),
-                                None => Value::str(""),
+                                None => Value::lstr(""),
                             }
                         })
                     }
@@ -20311,7 +20311,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
                         Ok(if start < end {
                             Value::Str(s.slice_bytes(start as usize, end as usize))
                         } else {
-                            Value::str("")
+                            Value::lstr("")
                         })
                     }
                     INTRINSIC_OBJECT_HAS_OWN => {

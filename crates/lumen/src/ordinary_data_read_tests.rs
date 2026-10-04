@@ -64,7 +64,7 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
         Value::Num(f64::NAN),
         Value::Num(f64::INFINITY),
         Value::Num(f64::NEG_INFINITY),
-        Value::str("owned λ string"),
+        Value::lstr("owned λ string"),
         Value::BigInt(crate::bigint::JsBigInt::from_i128(i128::MAX)),
         engine.interp.new_symbol(Some(Rc::from("read-symbol"))),
         Value::Obj(Object::new(None)),
@@ -192,7 +192,7 @@ fn ordinary_data_read_returned_last_owner_survives_removal_and_gc() {
         assert!(weak_symbol.upgrade().is_none());
 
         for payload in [
-            Value::str("last string λ"),
+            Value::lstr("last string λ"),
             Value::bigint_from_i64(-123456789),
         ] {
             let holder = Object::new(None);

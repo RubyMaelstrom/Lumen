@@ -65,7 +65,7 @@ pub(super) fn install_math(it: &mut Interp) {
     if let Some(key) = well_known_key(it, "toStringTag") {
         math.borrow_mut()
             .props
-            .insert(key, Property::data(Value::str("Math"), false, false, true));
+            .insert(key, Property::data(Value::lstr("Math"), false, false, true));
     }
     macro_rules! unary {
         ($name:expr, $f:expr) => {{

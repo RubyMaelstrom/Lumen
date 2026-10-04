@@ -8,7 +8,7 @@ pub(super) fn install_promise(it: &mut Interp) {
     if let Some(key) = to_string_tag_key(it) {
         proto.borrow_mut().props.insert(
             key,
-            Property::data(Value::str("Promise"), false, false, true),
+            Property::data(Value::lstr("Promise"), false, false, true),
         );
     }
     it.def_method(&proto, "then", 2, |i, this, a| {

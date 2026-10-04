@@ -219,7 +219,7 @@ fn date_style_default(i: &mut Interp, options: &Value, date: bool) -> Result<Val
             &["hour", "minute", "second"]
         };
         for k in defs {
-            set_data(&o, k, Value::str("numeric"));
+            set_data(&o, k, Value::lstr("numeric"));
         }
     }
     Ok(Value::Obj(o))
@@ -260,7 +260,7 @@ fn date_all_default(i: &mut Interp, options: &Value) -> Result<Value, Value> {
     }
     if need {
         for k in ["year", "month", "day", "hour", "minute", "second"] {
-            set_data(&o, k, Value::str("numeric"));
+            set_data(&o, k, Value::lstr("numeric"));
         }
     }
     Ok(Value::Obj(o))
@@ -298,7 +298,7 @@ pub(crate) fn intl_delegate(
                 Value::Num(t) => t,
                 other => ab(i.to_number(&other))?,
             };
-            Ok(Value::from_string(date::date_to_string(t)))
+            Ok(Value::lstr(date::date_to_string(t)))
         }
         _ => Err(i.make_error(
             "TypeError",
@@ -342,7 +342,7 @@ pub(crate) fn object_own_property_keys(i: &mut Interp, o: &Gc) -> Result<Vec<Val
     }
     let mut out: Vec<Value> = if let Some(info) = ta_info(i, o) {
         (0..i.ta_len(&info).unwrap_or(0))
-            .map(|k| Value::from_string(k.to_string()))
+            .map(|k| Value::lstr(k.to_string()))
             .collect()
     } else {
         Vec::new()
@@ -353,7 +353,7 @@ pub(crate) fn object_own_property_keys(i: &mut Interp, o: &Gc) -> Result<Vec<Val
                 out.push(s);
             }
         } else {
-            out.push(Value::from_string(k));
+            out.push(Value::lstr(k));
         }
     }
     Ok(out)
@@ -863,7 +863,7 @@ fn proxy_get_own_property(
     }
     let key_val = i
         .sym_from_key(key)
-        .unwrap_or_else(|| Value::from_string(key.to_string()));
+        .unwrap_or_else(|| Value::lstr(key.to_string()));
     let result = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
     if !matches!(result, Value::Obj(_) | Value::Undefined) {
         return Err(i.make_error(
@@ -1017,7 +1017,7 @@ fn proxy_key_enumerable(
     if trap.is_callable() {
         let kv = i
             .sym_from_key(key)
-            .unwrap_or_else(|| Value::from_string(key.to_string()));
+            .unwrap_or_else(|| Value::lstr(key.to_string()));
         let res = ab(i.call(trap, handler.clone(), &[target.clone(), kv]))?;
         if matches!(res, Value::Undefined) {
             return Ok(false);
@@ -1064,7 +1064,7 @@ fn proxy_define_property(
     }
     let key_val = i
         .sym_from_key(key)
-        .unwrap_or_else(|| Value::from_string(key.to_string()));
+        .unwrap_or_else(|| Value::lstr(key.to_string()));
     // The trap receives FromPropertyDescriptor(desc): a fresh object holding only the present
     // fields, in the spec's order (value, writable, get, set, enumerable, configurable).
     let pd = build_partial(i, desc)?;
@@ -1297,7 +1297,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             }
             let value = ab(i.get_member(o, &key))?;
             out.push(if entries {
-                i.make_array(vec![Value::from_string(key), value])
+                i.make_array(vec![Value::lstr(key), value])
             } else {
                 value
             });
@@ -1308,7 +1308,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
         for idx in 0..n {
             let v = i.ta_read(&info, idx);
             out.push(if entries {
-                i.make_array(vec![Value::from_string(idx.to_string()), v])
+                i.make_array(vec![Value::lstr(idx.to_string()), v])
             } else {
                 v
             });
@@ -2260,10 +2260,10 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                 )?;
             }
             update_regexp_legacy_statics(i, &re, &caps, &text, &input);
-            let mut items = vec![Value::from_string(text.slice(start, end))];
+            let mut items = vec![Value::lstr(text.slice(start, end))];
             for g in 1..=re.ngroups {
                 items.push(match caps[g] {
-                    Some((a, b)) => Value::from_string(text.slice(a, b)),
+                    Some((a, b)) => Value::lstr(text.slice(a, b)),
                     None => Value::Undefined,
                 });
             }
@@ -2287,7 +2287,7 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                         .iter()
                         .filter(|(n, _)| n == name)
                         .find_map(|(_, idx)| caps.get(*idx).copied().flatten())
-                        .map(|(a, b)| Value::from_string(text.slice(a, b)))
+                        .map(|(a, b)| Value::lstr(text.slice(a, b)))
                         .unwrap_or(Value::Undefined);
                     set_data(&g, name, v);
                 }
@@ -2970,7 +2970,7 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
     let put = |k: &'static str, v: String| {
         ctor.borrow_mut()
             .props
-            .insert(k, Property::data(Value::from_string(v), true, false, false));
+            .insert(k, Property::data(Value::lstr(v), true, false, false));
     };
     let (start, end) = caps[0].unwrap();
     put("#\u{0}legacy_input", m.input.to_string());
@@ -3338,7 +3338,7 @@ pub(crate) fn set_to_string_tag(i: &Interp, obj: &Gc, tag: &str) {
     if let Some(key) = to_string_tag_key(i) {
         obj.borrow_mut().props.insert(
             key,
-            Property::data(Value::from_string(tag.to_string()), false, false, true),
+            Property::data(Value::lstr(tag.to_string()), false, false, true),
         );
     }
 }
@@ -3567,7 +3567,7 @@ pub(crate) fn make_bound_len(
             Property::data(Value::Num(length), false, false, true),
         );
         b.props
-            .insert("name", Property::data(Value::str(""), false, false, true));
+            .insert("name", Property::data(Value::lstr(""), false, false, true));
     }
     Value::Obj(obj)
 }
@@ -3824,7 +3824,7 @@ fn promise_keyed_combinator(
     };
     let state = i.new_object();
     let values = i.make_array(vec![Value::Undefined; keys.len()]);
-    let keys_arr = i.make_array(keys.iter().map(|k| Value::from_string(k.clone())).collect());
+    let keys_arr = i.make_array(keys.iter().map(|k| Value::lstr(k.clone())).collect());
     set_internal(&state, "#\u{0}values", values);
     set_internal(&state, "#\u{0}keys", keys_arr);
     set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
@@ -3937,7 +3937,7 @@ fn promise_keyed_settle(i: &mut Interp, args: &[Value], fulfilled: bool) -> Resu
     set_data(
         &status,
         "status",
-        Value::str(if fulfilled { "fulfilled" } else { "rejected" }),
+        Value::lstr(if fulfilled { "fulfilled" } else { "rejected" }),
     );
     set_data(&status, if fulfilled { "value" } else { "reason" }, value);
     promise_keyed_record(i, args, Value::Obj(status))
@@ -3970,7 +3970,7 @@ fn promise_settled(i: &mut Interp, args: &[Value], fulfilled: bool) -> Result<Va
     set_data(
         &status,
         "status",
-        Value::str(if fulfilled { "fulfilled" } else { "rejected" }),
+        Value::lstr(if fulfilled { "fulfilled" } else { "rejected" }),
     );
     set_data(&status, if fulfilled { "value" } else { "reason" }, value);
     let results = ab(i.get_member(&state, "#\u{0}results"))?;
@@ -4223,10 +4223,10 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&op, "toString", 0, |i, this, _args| {
         if matches!(this, Value::Undefined) {
-            return Ok(Value::str("[object Undefined]"));
+            return Ok(Value::lstr("[object Undefined]"));
         }
         if matches!(this, Value::Null) {
-            return Ok(Value::str("[object Null]"));
+            return Ok(Value::lstr("[object Null]"));
         }
         // IsArray pierces proxies (a revoked proxy throws).
         let builtin = if json_is_array(i, &this)? {
@@ -4389,7 +4389,7 @@ fn install_object(it: &mut Interp) {
                         .is_some_and(|property| property.enumerable())
                 };
                 if enumerable {
-                    keys.push(Value::from_string(key));
+                    keys.push(Value::lstr(key));
                 }
             }
             return Ok(i.make_array(keys));
@@ -4397,7 +4397,7 @@ fn install_object(it: &mut Interp) {
         // A TypedArray's enumerable own keys are its integer indices plus string expandos.
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
-            let mut keys: Vec<Value> = (0..n).map(|k| Value::from_string(k.to_string())).collect();
+            let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
             for k in ordered_enum_keys(&o) {
                 if k.parse::<usize>().is_err() && !TA_META_KEYS.contains(&&*k) {
                     keys.push(Value::Str(k.into()));
@@ -4434,7 +4434,7 @@ fn install_object(it: &mut Interp) {
         // length/buffer/... metadata are inherited, not own).
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
-            let mut keys: Vec<Value> = (0..n).map(|k| Value::from_string(k.to_string())).collect();
+            let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
             for k in o.borrow().props.keys() {
                 if !Interp::is_sym_key(&k)
                     && k.parse::<usize>().is_err()
@@ -4449,7 +4449,7 @@ fn install_object(it: &mut Interp) {
         let keys: Vec<Value> = ordinary_own_keys_ordered(i, &o)?
             .into_iter()
             .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
-            .map(Value::from_string)
+            .map(Value::lstr)
             .collect();
         Ok(i.make_array(keys))
     });
@@ -6092,7 +6092,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 out.push_str(&ab(i.to_string(&v))?);
             }
         }
-        Ok(Value::from_string(
+        Ok(Value::lstr(
             crate::jstr::canonicalize(&out).unwrap_or(out),
         ))
     });
@@ -6227,7 +6227,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 out.push_str(&ab(i.to_string(&s))?);
             }
         }
-        Ok(Value::from_string(out))
+        Ok(Value::lstr(out))
     });
     it.def_method(&ap, "at", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
@@ -7562,7 +7562,7 @@ fn install_iterator(it: &mut Interp) {
                 .unwrap_or(Value::Undefined))
         });
         let getter_tag = it.make_native("get [Symbol.toStringTag]", 0, |_i, _t, _a| {
-            Ok(Value::str("Iterator"))
+            Ok(Value::lstr("Iterator"))
         });
         let set_ctor = it.make_native("set constructor", 1, |i, this, a| {
             iterator_proto_weird_set(i, this, arg(a, 0), "constructor")
@@ -8616,7 +8616,7 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
             }
         }
     }
-    Ok(Value::from_string(
+    Ok(Value::lstr(
         crate::jstr::canonicalize(&result).unwrap_or(result),
     ))
 }
@@ -8680,7 +8680,7 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
     let next = ab(i.get_member(&source, "next"))?;
     set_builtin(&obj, "#\u{0}ih_next", next);
     set_builtin(&obj, "#\u{0}ih_src", source);
-    set_builtin(&obj, "#\u{0}ih_kind", Value::str(kind));
+    set_builtin(&obj, "#\u{0}ih_kind", Value::lstr(kind));
     set_builtin(&obj, "#\u{0}ih_fn", f.clone());
     if let Some(n) = limit {
         set_builtin(&obj, "#\u{0}ih_n", Value::Num(n));
@@ -8735,11 +8735,11 @@ fn make_chunking_helper(
     set_builtin(
         &obj,
         "#\u{0}ih_kind",
-        Value::str(if is_windows { "windows" } else { "chunks" }),
+        Value::lstr(if is_windows { "windows" } else { "chunks" }),
     );
     set_builtin(&obj, "#\u{0}ih_fn", Value::Undefined);
     set_builtin(&obj, "#\u{0}ih_size", Value::Num(size));
-    set_builtin(&obj, "#\u{0}ih_undersized", Value::str(mode));
+    set_builtin(&obj, "#\u{0}ih_undersized", Value::lstr(mode));
     set_builtin(&obj, "#\u{0}ih_buf", i.make_array(Vec::new()));
     set_builtin(&obj, "#\u{0}ih_source_done", Value::Bool(false));
     set_builtin(&obj, "#\u{0}ih_count", Value::Num(0.0));
@@ -9037,7 +9037,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         "#\u{0}zip_state",
         i.make_array(vec![Value::Bool(false); n_iters]),
     );
-    set_builtin(&obj, "#\u{0}zip_mode", Value::from_string(mode.clone()));
+    set_builtin(&obj, "#\u{0}zip_mode", Value::lstr(mode.clone()));
     set_builtin(&obj, "#\u{0}zip_pad", i.make_array(padding));
     set_builtin(&obj, "#\u{0}zip_finished", Value::Bool(false));
     if keyed {
@@ -9764,11 +9764,11 @@ fn string_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value>
             let mut both = String::new();
             both.push(ch);
             both.push(next);
-            return Ok(Some(Value::from_string(both)));
+            return Ok(Some(Value::lstr(both)));
         }
     }
     state.index = idx + ch.len_utf8();
-    Ok(Some(Value::from_string(ch.to_string())))
+    Ok(Some(Value::lstr(ch.to_string())))
 }
 
 /// `next()` for a generator object built by `make_generator`: walk the buffered values, then throw
@@ -10304,7 +10304,7 @@ pub(crate) fn nf_from_char_code(
     }
     // UTF-16 decode: a surrogate pair combines into one code point; a lone half is smuggled
     // (see `jstr`), so the resulting string round-trips its exact unit sequence.
-    Ok(Value::from_string(crate::jstr::from_units(&units)))
+    Ok(Value::lstr(crate::jstr::from_units(&units)))
 }
 
 /// `String.prototype.charCodeAt` (named: the JIT's call-IC fill compares the fn pointer to
@@ -10336,11 +10336,11 @@ pub(crate) fn nf_char_at(
     let n = ab(i.to_number(&arg(args, 0)))?;
     let idx = if n.is_nan() { 0.0 } else { n.trunc() };
     if idx < 0.0 || !idx.is_finite() {
-        return Ok(Value::str(""));
+        return Ok(Value::lstr(""));
     }
     Ok(match i.unit_at(&s, idx as usize) {
         Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
-        None => Value::str(""),
+        None => Value::lstr(""),
     })
 }
 
@@ -10423,7 +10423,7 @@ fn create_html(
         let v = ab(i.to_string(value))?;
         p.push_str(&format!(" {attr}=\"{}\"", v.replace('"', "&quot;")));
     }
-    Ok(Value::from_string(format!("{p}>{s}</{tag}>")))
+    Ok(Value::lstr(format!("{p}>{s}</{tag}>")))
 }
 
 pub(crate) fn nf_string_replace(
@@ -10467,7 +10467,7 @@ pub(crate) fn nf_string_replace(
         };
         let matched = &s[pos..pos + pat.len()];
         let rep = string_replacement(i, &repl, matched, &s, pos)?;
-        return Ok(Value::from_string(format!(
+        return Ok(Value::lstr(format!(
             "{}{}{}",
             &s[..pos],
             rep,
@@ -10496,7 +10496,7 @@ pub(crate) fn nf_string_replace(
     let after = crate::jstr::from_units(&source_units[end..]);
     let rep = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
     let joined = crate::jstr::concat(&crate::jstr::concat(&before, &rep), &after);
-    Ok(Value::from_string(
+    Ok(Value::lstr(
         crate::jstr::canonicalize(&joined).unwrap_or(joined),
     ))
 }
@@ -10590,13 +10590,13 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 if a == b && (b == 0 || a >= text.len()) {
                     continue;
                 }
-                parts.push(Value::from_string(text.slice(last, a)));
+                parts.push(Value::lstr(text.slice(last, a)));
                 if parts.len() >= limit {
                     break;
                 }
                 for g in 1..=re.ngroups {
                     parts.push(match caps[g] {
-                        Some((x, y)) => Value::from_string(text.slice(x, y)),
+                        Some((x, y)) => Value::lstr(text.slice(x, y)),
                         None => Value::Undefined,
                     });
                     if parts.len() >= limit {
@@ -10606,7 +10606,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 last = b;
             }
             if parts.len() < limit {
-                parts.push(Value::from_string(text.slice(last, text.len())));
+                parts.push(Value::lstr(text.slice(last, text.len())));
             }
             parts.truncate(limit);
             return Ok(i.make_array(parts));
@@ -10627,7 +10627,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                 // substring as an LStr directly instead of allocating a Rust String before the
                 // engine copies it; `.take(limit)` preserves Split's post-processing truncation
                 // (unlike `splitn`, whose final remainder would be incorrect here).
-                s.split(sep.as_ref()).take(limit).map(Value::str).collect()
+                s.split(sep.as_ref()).take(limit).map(Value::lstr).collect()
             } else {
                 // String separators are matched by UTF-16 code units (ECMA-262 §22.1.3.23),
                 // not Rust scalar values. This matters when a separator is one half of an astral
@@ -10645,10 +10645,10 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
                         .position(|window| window == sep_units.as_slice())
                         .map(|offset| start + offset);
                     let Some(position) = found else {
-                        parts.push(Value::from_string(crate::jstr::from_units(&units[start..])));
+                        parts.push(Value::lstr(crate::jstr::from_units(&units[start..])));
                         break;
                     };
-                    parts.push(Value::from_string(crate::jstr::from_units(
+                    parts.push(Value::lstr(crate::jstr::from_units(
                         &units[start..position],
                     )));
                     start = position + sep_units.len();
@@ -10791,12 +10791,12 @@ fn install_string(it: &mut Interp) {
     it.def_method(&sp, "toLocaleLowerCase", 0, |i, this, args| {
         let s = this_string(i, &this)?;
         let lang = locale_case_lang(i, &arg(args, 0))?;
-        Ok(Value::from_string(locale_lower(&s, lang.as_deref())))
+        Ok(Value::lstr(locale_lower(&s, lang.as_deref())))
     });
     it.def_method(&sp, "toLocaleUpperCase", 0, |i, this, args| {
         let s = this_string(i, &this)?;
         let lang = locale_case_lang(i, &arg(args, 0))?;
-        Ok(Value::from_string(locale_upper(&s, lang.as_deref())))
+        Ok(Value::lstr(locale_upper(&s, lang.as_deref())))
     });
     it.def_method(&sp, "normalize", 0, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -10812,7 +10812,7 @@ fn install_string(it: &mut Interp) {
         }
         let cps = crate::jstr::code_points(&s);
         let out = crate::unicode_norm_impl::normalize(&cps, &form);
-        Ok(Value::from_string(crate::jstr::from_code_points(&out)))
+        Ok(Value::lstr(crate::jstr::from_code_points(&out)))
     });
     it.def_method(&sp, "includes", 1, |i, this, args| {
         let s = this_string(i, &this)?;
@@ -10945,7 +10945,7 @@ fn install_string(it: &mut Interp) {
             };
             let count = len.min(size - start).max(0);
             if count <= 0 {
-                return Ok(Value::str(""));
+                return Ok(Value::lstr(""));
             }
             if start < 0 {
                 start = 0;
@@ -10977,7 +10977,7 @@ fn install_string(it: &mut Interp) {
         };
         let count = len.min(size - start).max(0);
         if count <= 0 {
-            return Ok(Value::from_string(String::new()));
+            return Ok(Value::lstr(String::new()));
         }
         if start < 0 {
             start = 0;
@@ -11040,7 +11040,7 @@ fn install_string(it: &mut Interp) {
             }
             return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, true)));
         }
-        Ok(Value::from_string(s.to_uppercase()))
+        Ok(Value::lstr(s.to_uppercase()))
     });
     it.def_method(&sp, "toLowerCase", 0, |i, this, _| {
         let s = this_string(i, &this)?;
@@ -11052,7 +11052,7 @@ fn install_string(it: &mut Interp) {
             }
             return Ok(Value::Str(crate::lstr::LStr::map_ascii_case(&s, false)));
         }
-        Ok(Value::from_string(s.to_lowercase()))
+        Ok(Value::lstr(s.to_lowercase()))
     });
     // lumen strings are valid UTF-8, so they're always well-formed.
     it.def_method(&sp, "isWellFormed", 0, |i, this, _| {
@@ -11074,7 +11074,7 @@ fn install_string(it: &mut Interp) {
                 }
             })
             .collect();
-        Ok(Value::from_string(fixed))
+        Ok(Value::lstr(fixed))
     });
     it.def_method(&sp, "trim", 0, |i, this, _| {
         let s = this_string(i, &this)?;
@@ -11087,7 +11087,7 @@ fn install_string(it: &mut Interp) {
             return Ok(if trimmed.len() == s.len() {
                 Value::Str(s)
             } else {
-                Value::str(trimmed)
+                Value::lstr(trimmed)
             });
         }
         let trimmed = s.trim_matches(is_js_ws);
@@ -11157,7 +11157,7 @@ fn install_string(it: &mut Interp) {
                         return Err(i.make_error("RangeError", "Invalid string length"));
                     }
                 }
-                return Ok(Value::from_string(out));
+                return Ok(Value::lstr(out));
             }
             total = total
                 .checked_add(next.len())
@@ -11188,7 +11188,7 @@ fn install_string(it: &mut Interp) {
             return Ok(Value::Str(s.repeat_direct(count)));
         }
         let out = s.repeat(count);
-        Ok(Value::from_string(
+        Ok(Value::lstr(
             crate::jstr::canonicalize(&out).unwrap_or(out),
         ))
     });
@@ -11234,7 +11234,7 @@ fn install_string(it: &mut Interp) {
             return Ok(if trimmed.len() == s.len() {
                 Value::Str(s)
             } else {
-                Value::str(trimmed)
+                Value::lstr(trimmed)
             });
         }
         let trimmed = s.trim_start_matches(is_js_ws);
@@ -11251,7 +11251,7 @@ fn install_string(it: &mut Interp) {
             return Ok(if trimmed.len() == s.len() {
                 Value::Str(s)
             } else {
-                Value::str(trimmed)
+                Value::lstr(trimmed)
             });
         }
         let trimmed = s.trim_end_matches(is_js_ws);
@@ -11416,7 +11416,7 @@ fn install_string(it: &mut Interp) {
                     byte += ch.len_utf8();
                 }
                 out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
-                return Ok(Value::from_string(out));
+                return Ok(Value::lstr(out));
             }
             let units = i.units_full(&s);
             let needs_context = replacement_needs_context(&repl);
@@ -11439,7 +11439,7 @@ fn install_string(it: &mut Interp) {
                     out.push_str(&crate::jstr::unit_str(unit));
                 }
             }
-            return Ok(Value::from_string(
+            return Ok(Value::lstr(
                 crate::jstr::canonicalize(&out).unwrap_or(out),
             ));
         }
@@ -11451,7 +11451,7 @@ fn install_string(it: &mut Interp) {
             };
             if let Repl::Text(template) = &repl {
                 if !template.as_bytes().contains(&b'$') {
-                    return Ok(Value::from_string(replace_all_ascii_literal(
+                    return Ok(Value::lstr(replace_all_ascii_literal(
                         &s, &pat, template, first,
                     )));
                 }
@@ -11469,7 +11469,7 @@ fn install_string(it: &mut Interp) {
                 base += pos + pat.len();
             }
             out.push_str(rest);
-            return Ok(Value::from_string(out));
+            return Ok(Value::lstr(out));
         }
         // A pure-ASCII receiver cannot contain a non-ASCII search string. Avoid allocating a
         // UTF-16 view when the result is necessarily the original string.
@@ -11515,17 +11515,17 @@ fn install_string(it: &mut Interp) {
             pos = cursor + next;
         }
         out.push_str(&crate::jstr::from_units(&source_units[cursor..]));
-        Ok(Value::from_string(
+        Ok(Value::lstr(
             crate::jstr::canonicalize(&out).unwrap_or(out),
         ))
     });
 
     let ctor = it.make_native("String", 1, |i, _this, args| {
         let s = match args.first() {
-            None => Value::str(""),
+            None => Value::lstr(""),
             // `String(sym)` stringifies a symbol to its descriptive string; `new String(sym)`
             // instead throws (via ToString below).
-            Some(Value::Sym(s)) if !i.constructing => Value::from_string(format!(
+            Some(Value::Sym(s)) if !i.constructing => Value::lstr(format!(
                 "Symbol({})",
                 s.description.as_deref().unwrap_or("")
             )),
@@ -11557,7 +11557,7 @@ fn install_string(it: &mut Interp) {
                 }
             }
         }
-        Ok(Value::from_string(out))
+        Ok(Value::lstr(out))
     });
     it.def_method(&ctor, "fromCodePoint", 1, |i, _this, args| {
         let mut s = String::new();
@@ -11599,7 +11599,7 @@ fn install_string(it: &mut Interp) {
                 s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
             }
         }
-        Ok(Value::from_string(s))
+        Ok(Value::lstr(s))
     });
     set_builtin(&it.global, "String", Value::Obj(ctor));
 }
@@ -11625,7 +11625,7 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
         return Ok(if start < end {
             Value::Str(s.slice_bytes(start as usize, end as usize))
         } else {
-            Value::str("")
+            Value::lstr("")
         });
     }
     let chars = i.units_full(&s);
@@ -11744,7 +11744,7 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     let pad_units = crate::jstr::units(&pad);
     let fill_units: Vec<u16> = pad_units.iter().copied().cycle().take(need).collect();
     let fill = crate::jstr::from_units(&fill_units);
-    Ok(Value::from_string(if at_start {
+    Ok(Value::lstr(if at_start {
         format!("{fill}{s}")
     } else {
         format!("{s}{fill}")
@@ -11855,9 +11855,9 @@ fn string_replacement_parts(
             f.clone(),
             Value::Undefined,
             &[
-                Value::from_string(matched.to_string()),
+                Value::lstr(matched.to_string()),
                 Value::Num(unit_pos as f64),
-                Value::from_string(whole.to_string()),
+                Value::lstr(whole.to_string()),
             ],
         ))?;
         return Ok(ab(i.to_string(&r))?.to_string());

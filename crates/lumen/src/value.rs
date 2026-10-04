@@ -681,7 +681,7 @@ mod packed_value_tests {
                 Some(number.to_bits())
             );
         }
-        assert_eq!(PackedValue::scalar_bits(&Value::str("not copyable")), None);
+        assert_eq!(PackedValue::scalar_bits(&Value::lstr("not copyable")), None);
     }
 
     #[test]
@@ -855,7 +855,7 @@ impl PropertyKey {
     pub(crate) fn into_value(self) -> Value {
         match self.symbol {
             Some(symbol) => Value::Sym(symbol),
-            None => Value::from_string(self.text),
+            None => Value::lstr(self.text),
         }
     }
 }
@@ -1372,6 +1372,11 @@ impl Value {
         Value::Str(s.into())
     }
     pub fn from_string(s: String) -> Value {
+        Value::Str(s.into())
+    }
+    /// A string already in the engine representation (see `crate::jstr`): engine strings and
+    /// their slices, property keys, and ASCII literals.
+    pub(crate) fn lstr(s: impl Into<crate::lstr::LStr>) -> Value {
         Value::Str(s.into())
     }
     /// A BigInt from an `i64` (for the embedder's 64-bit integer bridge, e.g. wasm i64).

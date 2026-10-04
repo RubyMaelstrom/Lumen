@@ -196,11 +196,11 @@ pub(super) fn install_atomics(it: &mut Interp) {
             ));
         }
         if read_i128(i, &info, idx) != expected {
-            return Ok(Value::str("not-equal"));
+            return Ok(Value::lstr("not-equal"));
         }
         let byte_index = info.offset + idx * info.kind.elsize();
         let woken = crate::interpreter::futex_wait(id, byte_index, timeout);
-        Ok(Value::str(if woken { "ok" } else { "timed-out" }))
+        Ok(Value::lstr(if woken { "ok" } else { "timed-out" }))
     });
     it.def_method(&atomics, "notify", 3, |i, _t, a| {
         require_waitable(i, &arg(a, 0))?;
@@ -255,13 +255,13 @@ pub(super) fn install_atomics(it: &mut Interp) {
         // The value already differs ⇒ resolved synchronously (not async).
         if read_i128(i, &info, idx) != expected {
             set_data(&result, "async", Value::Bool(false));
-            set_data(&result, "value", Value::str("not-equal"));
+            set_data(&result, "value", Value::lstr("not-equal"));
             return Ok(Value::Obj(result));
         }
         // A zero timeout times out immediately (still synchronous).
         if matches!(timeout, Some(d) if d.is_zero()) {
             set_data(&result, "async", Value::Bool(false));
-            set_data(&result, "value", Value::str("timed-out"));
+            set_data(&result, "value", Value::lstr("timed-out"));
             return Ok(Value::Obj(result));
         }
         // Otherwise wait asynchronously: a waiter thread reports the outcome, which the event loop

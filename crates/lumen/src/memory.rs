@@ -2908,7 +2908,7 @@ mod tests {
         callable.borrow_mut().props.insert(
             "name",
             crate::value::Property::data(
-                Value::from_string("authorRenamed".to_string()),
+                Value::lstr("authorRenamed".to_string()),
                 true,
                 false,
                 true,
@@ -3168,7 +3168,7 @@ mod tests {
 
         engine
             .interp
-            .resolve_promise(&source, Value::str("settled payload"));
+            .resolve_promise(&source, Value::lstr("settled payload"));
         let queued_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let queued_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let queued = measure(&engine.interp, &queued_objects, &queued_scopes);
@@ -3257,8 +3257,8 @@ mod tests {
             .entry(request_key)
             .or_default()
             .push_back((
-                Value::str("queued request promise"),
-                crate::coroutine::Resume::Throw(Value::str("queued request signal")),
+                Value::lstr("queued request promise"),
+                crate::coroutine::Resume::Throw(Value::lstr("queued request signal")),
             ));
         let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let after_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
@@ -3337,20 +3337,20 @@ mod tests {
             coro: 0,
             strict: false,
             extra: Some(Box::new(crate::interpreter::FrameExtra {
-                args_obj: Value::str("materialized frame arguments"),
+                args_obj: Value::lstr("materialized frame arguments"),
                 lazy: None,
             })),
         });
         engine.interp.pending_fn_name = Some("pending inferred function name".to_string());
         engine.interp.pending_tail = Some(Box::new((
-            Value::str("tail callee"),
-            Value::str("tail receiver"),
-            vec![Value::str("tail argument")],
+            Value::lstr("tail callee"),
+            Value::lstr("tail receiver"),
+            vec![Value::lstr("tail argument")],
         )));
         let mut resources = Vec::with_capacity(4);
         resources.push(crate::interpreter::Disposable {
-            value: Value::str("disposable value"),
-            method: Value::str("dispose method"),
+            value: Value::lstr("disposable value"),
+            method: Value::lstr("dispose method"),
             kind_is_async: false,
             method_is_async: false,
         });
@@ -3360,11 +3360,11 @@ mod tests {
         engine
             .interp
             .decorator_initializers
-            .push(Value::str("decorator initializer"));
-        engine.interp.new_target = Value::str("active new target");
-        engine.interp.pending_new_target = Value::str("pending new target");
+            .push(Value::lstr("decorator initializer"));
+        engine.interp.new_target = Value::lstr("active new target");
+        engine.interp.pending_new_target = Value::lstr("pending new target");
 
-        let shared_values: Rc<[Value]> = vec![Value::str("lazy frame argument")].into();
+        let shared_values: Rc<[Value]> = vec![Value::lstr("lazy frame argument")].into();
         let mut visitor = Visitor::default();
         assert!(visitor.value_slice(&shared_values) > 0);
         assert_eq!(visitor.value_slice(&shared_values), 0);
@@ -3394,21 +3394,21 @@ mod tests {
             identity,
             crate::interpreter::HostIndexedProperties {
                 length: 1,
-                getter: Value::str("host indexed getter payload"),
+                getter: Value::lstr("host indexed getter payload"),
                 live: None,
             },
         );
         engine
             .interp
             .template_cache
-            .insert((identity, 7), Value::str("template cache payload"));
+            .insert((identity, 7), Value::lstr("template cache payload"));
         engine
             .interp
             .deferred_ns
             .insert(identity, "deferred/module.js".to_string());
         engine.interp.deferred_ns_objs.insert(
             "deferred/module.js".to_string(),
-            Value::str("deferred namespace payload"),
+            Value::lstr("deferred namespace payload"),
         );
         let mut mapped_names = Vec::with_capacity(5);
         mapped_names.push(Some("mappedParameterWithCapacity".to_string()));
@@ -3418,7 +3418,7 @@ mod tests {
             .insert(identity, (engine.interp.global_env.clone(), mapped_names));
         engine.interp.module_source_objs.insert(
             "source/module.js".to_string(),
-            Value::str("module source payload"),
+            Value::lstr("module source payload"),
         );
 
         let after_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
@@ -3513,10 +3513,10 @@ mod tests {
         engine
             .interp
             .pending_async_waits
-            .push((Value::str("wait promise payload"), wait_rx));
+            .push((Value::lstr("wait promise payload"), wait_rx));
         engine.interp.pending_timers.reserve(4);
         engine.interp.pending_timers.push((
-            Value::str("timer callback payload"),
+            Value::lstr("timer callback payload"),
             std::time::Instant::now(),
         ));
 

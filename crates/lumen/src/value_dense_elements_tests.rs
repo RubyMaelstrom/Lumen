@@ -31,7 +31,7 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
     assert_eq!(grown.entries.len(), 1);
     assert!(grown.elems.elems.is_empty());
     assert_eq!(grown.mirror_get(8191), Some(8191.0));
-    assert!(grown.set_index_value(12, Value::str("mixed")).is_ok());
+    assert!(grown.set_index_value(12, Value::lstr("mixed")).is_ok());
     assert_eq!(grown.mirror_get(12), None);
     assert!(matches!(grown.get_index(12).unwrap().value(), Value::Str(s) if s.as_str() == "mixed"));
 }

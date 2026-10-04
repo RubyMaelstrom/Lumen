@@ -170,17 +170,17 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         obj.borrow_mut().proto = Some(proto);
     }
     set_builtin(&obj, "#\u{0}co", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}co_locale", Value::from_string(locale));
-    set_builtin(&obj, "#\u{0}co_usage", Value::from_string(usage));
+    set_builtin(&obj, "#\u{0}co_locale", Value::lstr(locale));
+    set_builtin(&obj, "#\u{0}co_usage", Value::lstr(usage));
     set_builtin(
         &obj,
         "#\u{0}co_sensitivity",
-        Value::from_string(sensitivity),
+        Value::lstr(sensitivity),
     );
     set_builtin(&obj, "#\u{0}co_ignorepunct", Value::Bool(ignore_punct));
     set_builtin(&obj, "#\u{0}co_numeric", Value::Bool(numeric));
-    set_builtin(&obj, "#\u{0}co_collation", Value::from_string(collation));
-    set_builtin(&obj, "#\u{0}co_casefirst", Value::from_string(case_first));
+    set_builtin(&obj, "#\u{0}co_collation", Value::lstr(collation));
+    set_builtin(&obj, "#\u{0}co_casefirst", Value::lstr(case_first));
     Ok(Value::Obj(obj))
 }
 

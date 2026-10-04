@@ -77,7 +77,7 @@ pub(super) fn install_json(it: &mut Interp) {
         set_data(&wrapper, "", value);
         let mut seen = Vec::new();
         match json_str(i, &Value::Obj(wrapper), "", &opts, &gap, "", &mut seen)? {
-            Some(s) => Ok(Value::from_string(s)),
+            Some(s) => Ok(Value::lstr(s)),
             None => Ok(Value::Undefined),
         }
     });
@@ -138,8 +138,8 @@ pub(super) fn install_json(it: &mut Interp) {
         }
         let o = i.new_object();
         o.borrow_mut().proto = None;
-        set_data(&o, "rawJSON", Value::from_string(text.clone()));
-        set_internal(&o, "\u{0}raw_json", Value::from_string(text));
+        set_data(&o, "rawJSON", Value::lstr(text.clone()));
+        set_internal(&o, "\u{0}raw_json", Value::lstr(text));
         i.freeze_object(&Value::Obj(o.clone()));
         Ok(Value::Obj(o))
     });
@@ -343,14 +343,14 @@ fn internalize_json_property(
     let context = i.new_object();
     if let Some(JsonRecord::Prim(src, parsed)) = record {
         if !matches!(val, Value::Obj(_)) && same_value(&val, parsed) {
-            set_data(&context, "source", Value::from_string(src.clone()));
+            set_data(&context, "source", Value::lstr(src.clone()));
         }
     }
     ab(i.call(
         reviver.clone(),
         holder.clone(),
         &[
-            Value::from_string(name.to_string()),
+            Value::lstr(name.to_string()),
             val,
             Value::Obj(context),
         ],
@@ -374,7 +374,7 @@ fn json_str(
             value = ab(i.call(
                 tojson,
                 value.clone(),
-                &[Value::from_string(key.to_string())],
+                &[Value::lstr(key.to_string())],
             ))?;
         }
     }
@@ -382,7 +382,7 @@ fn json_str(
         value = ab(i.call(
             func.clone(),
             holder.clone(),
-            &[Value::from_string(key.to_string()), value],
+            &[Value::lstr(key.to_string()), value],
         ))?;
     }
     // A JSON.rawJSON object serializes as its stored raw text, verbatim.
@@ -676,7 +676,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
             }
             Ok(i.make_array(items))
         }
-        '"' => Ok(Value::from_string(json_parse_string(i, input, pos)?)),
+        '"' => Ok(Value::lstr(json_parse_string(i, input, pos)?)),
         't' => json_parse_lit(i, input, pos, "true", Value::Bool(true)),
         'f' => json_parse_lit(i, input, pos, "false", Value::Bool(false)),
         'n' => json_parse_lit(i, input, pos, "null", Value::Null),

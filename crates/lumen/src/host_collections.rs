@@ -91,7 +91,7 @@ impl Interp {
         self.call_callback(
             getter,
             Value::Obj(object.clone()),
-            &[Value::from_string(key.to_owned())],
+            &[Value::lstr(key.to_owned())],
         )
         .map(Some)
     }

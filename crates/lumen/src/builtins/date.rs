@@ -627,7 +627,7 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
     // Called as a function (no `new`), Date ignores its arguments and returns the
     // current time as a string.
     if !matches!(i.new_target, Value::Obj(_)) {
-        return Ok(Value::from_string(date_to_string(now_ms(i))));
+        return Ok(Value::lstr(date_to_string(now_ms(i))));
     }
     let ms = match args.len() {
         0 => now_ms(i),
@@ -829,7 +829,7 @@ pub(super) fn install_date(it: &mut Interp) {
     it.def_method(&proto, "toISOString", 0, |i, this, _| {
         let t = date_ms(i, &this)?;
         match iso_string(t) {
-            Some(s) => Ok(Value::from_string(s)),
+            Some(s) => Ok(Value::lstr(s)),
             None => Err(i.make_error("RangeError", "Invalid time value")),
         }
     });
@@ -851,23 +851,23 @@ pub(super) fn install_date(it: &mut Interp) {
     });
     it.def_method(&proto, "toString", 0, |i, this, _| {
         let t = date_ms(i, &this)?;
-        Ok(Value::from_string(date_to_string(t)))
+        Ok(Value::lstr(date_to_string(t)))
     });
     it.def_method(&proto, "toDateString", 0, |i, this, _| {
         let t = date_ms(i, &this)?;
-        Ok(Value::from_string(
+        Ok(Value::lstr(
             date_str_part(local_time(t)).unwrap_or_else(|| "Invalid Date".to_string()),
         ))
     });
     it.def_method(&proto, "toTimeString", 0, |i, this, _| {
         let t = date_ms(i, &this)?;
-        Ok(Value::from_string(
+        Ok(Value::lstr(
             time_str_part(t).unwrap_or_else(|| "Invalid Date".to_string()),
         ))
     });
     it.def_method(&proto, "toUTCString", 0, |i, this, _| {
         let t = date_ms(i, &this)?;
-        Ok(Value::from_string(
+        Ok(Value::lstr(
             utc_string(t).unwrap_or_else(|| "Invalid Date".to_string()),
         ))
     });
@@ -880,7 +880,7 @@ pub(super) fn install_date(it: &mut Interp) {
     it.def_method(&proto, "toLocaleString", 0, |i, this, args| {
         let t = date_ms(i, &this)?;
         if !t.is_finite() {
-            return Ok(Value::str("Invalid Date"));
+            return Ok(Value::lstr("Invalid Date"));
         }
         // ToDateTimeOptions(options, "any", "all"): default to date AND time unless the caller
         // already requested a date or time component (or a dateStyle/timeStyle).
@@ -897,7 +897,7 @@ pub(super) fn install_date(it: &mut Interp) {
     it.def_method(&proto, "toLocaleDateString", 0, |i, this, args| {
         let t = date_ms(i, &this)?;
         if !t.is_finite() {
-            return Ok(Value::str("Invalid Date"));
+            return Ok(Value::lstr("Invalid Date"));
         }
         let opts = date_style_default(i, &arg(args, 1), true)?;
         intl_delegate(
@@ -912,7 +912,7 @@ pub(super) fn install_date(it: &mut Interp) {
     it.def_method(&proto, "toLocaleTimeString", 0, |i, this, args| {
         let t = date_ms(i, &this)?;
         if !t.is_finite() {
-            return Ok(Value::str("Invalid Date"));
+            return Ok(Value::lstr("Invalid Date"));
         }
         let opts = date_style_default(i, &arg(args, 1), false)?;
         intl_delegate(

@@ -479,7 +479,7 @@ mod tests {
                         2 => format!("{index:08} common suffix for a collection key"),
                         _ => format!("é中🦀-{index:08}-é中🦀"),
                     };
-                    let hash = key_hash(&Value::from_string(text));
+                    let hash = key_hash(&Value::lstr(text));
                     let bucket =
                         data.index.hasher().hash_one(hash) as usize & (occupancy.len() - 1);
                     occupancy[bucket] += 1;
@@ -504,8 +504,8 @@ mod tests {
                 Value::Num(f64::from_bits(0xfff8_ffff_ffff_ffff)),
             ),
             (
-                Value::from_string("equal separate string allocations".to_owned()),
-                Value::from_string("equal separate string allocations".to_owned()),
+                Value::lstr("equal separate string allocations".to_owned()),
+                Value::lstr("equal separate string allocations".to_owned()),
             ),
             (
                 Value::BigInt(crate::bigint::JsBigInt::from(123456789i64)),
@@ -531,7 +531,7 @@ mod tests {
             Value::Null,
             Value::Bool(false),
             Value::Num(123456789.0),
-            Value::from_string("123456789".to_owned()),
+            Value::lstr("123456789".to_owned()),
         ] {
             let previous = data.len();
             data.insert(key, Value::Undefined);
@@ -628,8 +628,8 @@ mod tests {
 
         // Equal separately allocated strings hit the original entry, not a second bucket.
         let text = "wide string key ".repeat(128);
-        let first_key = Value::from_string(text.clone());
-        let another_key = Value::from_string(text);
+        let first_key = Value::lstr(text.clone());
+        let another_key = Value::lstr(text);
         data.insert(first_key, Value::Num(7.0));
         let before = KEY_HASH_CALLS.with(Cell::get);
         data.insert(another_key.clone(), Value::Num(8.0));

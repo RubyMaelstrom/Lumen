@@ -132,7 +132,7 @@ fn array_creation_preserves_proxy_defines_and_non_index_boundaries() {
 #[test]
 fn named_copy_shares_only_keys_and_normalizes_flags() {
     let mut source = Props::new();
-    source.insert("a", Property::data(Value::str("owned"), false, true, false));
+    source.insert("a", Property::data(Value::lstr("owned"), false, true, false));
     source.insert("length", Property::plain(Value::Num(3.0)));
     let mut target = Props::new();
     assert!(target.try_copy_named_data_from(&source));
@@ -143,7 +143,7 @@ fn named_copy_shares_only_keys_and_normalizes_flags() {
     ));
     let property = target.get("a").unwrap();
     assert!(property.writable() && property.enumerable() && property.configurable());
-    target.insert("a", Property::plain(Value::str("changed")));
+    target.insert("a", Property::plain(Value::lstr("changed")));
     target.insert("tail", Property::plain(Value::Num(7.0)));
     assert!(matches!(source.get("a").unwrap().value(),Value::Str(s) if &*s == "owned"));
     assert!(!source.contains("tail"));

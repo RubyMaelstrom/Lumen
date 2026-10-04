@@ -199,7 +199,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         if let Some(ag) = &i.agent {
             if let Some(rx) = &ag.report_rx {
                 return Ok(match rx.recv_timeout(std::time::Duration::from_secs(4)) {
-                    Ok(s) => Value::from_string(s),
+                    Ok(s) => Value::lstr(s),
                     Err(_) => Value::Null,
                 });
             }

@@ -35,7 +35,7 @@ pub fn install(it: &mut Interp) {
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         intl.borrow_mut()
             .props
-            .insert(key, Property::data(Value::str("Intl"), false, false, true));
+            .insert(key, Property::data(Value::lstr("Intl"), false, false, true));
     }
 
     // The per-realm %Intl%.[[FallbackSymbol]] backing the legacy constructed-instance behavior
@@ -51,7 +51,7 @@ pub fn install(it: &mut Interp) {
     // Intl.getCanonicalLocales(locales) — returns a fresh Array of canonicalized tags.
     let f = it.make_native("getCanonicalLocales", 1, |i, _t, a| {
         let list = canonicalize_locale_list(i, &arg(a, 0))?;
-        Ok(i.make_array(list.into_iter().map(Value::from_string).collect()))
+        Ok(i.make_array(list.into_iter().map(Value::lstr).collect()))
     });
     set_builtin(&intl, "getCanonicalLocales", Value::Obj(f));
 
@@ -183,7 +183,7 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
         }
         zs.sort_unstable();
         zs.dedup();
-        return Ok(i.make_array(zs.iter().map(|s| Value::str(*s)).collect()));
+        return Ok(i.make_array(zs.iter().map(|s| Value::lstr(*s)).collect()));
     }
     if &*k == "numberingSystem" {
         // Every numeric system with a simple digit mapping, plus latn.
@@ -193,13 +193,13 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
             .collect();
         ns.push("latn");
         ns.sort_unstable();
-        return Ok(i.make_array(ns.iter().map(|s| Value::str(*s)).collect()));
+        return Ok(i.make_array(ns.iter().map(|s| Value::lstr(*s)).collect()));
     }
     if &*k == "currency" {
         // ECMA-402 AvailableCurrencies contains every canonical ISO 4217 code for which both
         // NumberFormat and DisplayNames provide functionality. The generated CLDR table is sorted.
         let currencies = crate::cldr_numbers::currency_codes()
-            .map(Value::str)
+            .map(Value::lstr)
             .collect();
         return Ok(i.make_array(currencies));
     }
@@ -237,7 +237,7 @@ fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
     let mut v: Vec<&str> = vals.to_vec();
     v.sort_unstable();
     v.dedup();
-    Ok(i.make_array(v.iter().map(|s| Value::str(*s)).collect()))
+    Ok(i.make_array(v.iter().map(|s| Value::lstr(*s)).collect()))
 }
 
 // ----- shared helpers used across the intl services --------------------------------------------
@@ -272,7 +272,7 @@ pub(crate) fn make_service(
     if let Some(key) = crate::builtins::to_string_tag_key(it) {
         proto.borrow_mut().props.insert(
             key,
-            Property::data(Value::str(format!("Intl.{name}")), false, false, true),
+            Property::data(Value::lstr(format!("Intl.{name}")), false, false, true),
         );
     }
     Rc::make_mut(&mut it.extra_protos).insert(
@@ -435,7 +435,7 @@ pub(crate) fn install_service_common(it: &mut Interp, ctor: &Gc, proto: &Gc) {
         let out: Vec<Value> = requested
             .into_iter()
             .filter(|t| locale::is_supported(t))
-            .map(Value::from_string)
+            .map(Value::lstr)
             .collect();
         Ok(i.make_array(out))
     });

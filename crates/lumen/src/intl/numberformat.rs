@@ -56,14 +56,14 @@ fn format_range(i: &mut Interp, this: &Value, x: &Value, y: &Value) -> Result<Va
     let nu = get_str(&o, "#\u{0}nf_nu");
     // Endpoints that FORMAT identically collapse to a single approximate value.
     if sa == sb {
-        return Ok(Value::from_string(format!(
+        return Ok(Value::lstr(format!(
             "{}{}",
             cldr_number_symbols(&o).approximately,
             xlate_digits(&sa, &nu)
         )));
     }
     let (start, sep, end) = range_join(&o, &sa, &sb);
-    Ok(Value::from_string(format!(
+    Ok(Value::lstr(format!(
         "{}{}{}",
         xlate_digits(&start, &nu),
         sep,
@@ -120,12 +120,12 @@ fn format_range_to_parts(
     let push_parts = |i: &mut Interp, whole: &str, source: &str, out: &mut Vec<Value>| {
         for (t, mut v) in decompose_parts(whole, &stype, &symbols) {
             let ob = i.new_object();
-            set_data(&ob, "type", Value::str(t));
+            set_data(&ob, "type", Value::lstr(t));
             if matches!(t, "integer" | "fraction" | "exponentInteger") {
                 v = xlate_digits(&v, &nu);
             }
-            set_data(&ob, "value", Value::from_string(v));
-            set_data(&ob, "source", Value::str(source));
+            set_data(&ob, "value", Value::lstr(v));
+            set_data(&ob, "source", Value::lstr(source));
             out.push(Value::Obj(ob));
         }
     };
@@ -133,13 +133,13 @@ fn format_range_to_parts(
     let sb = assemble_number_exact(i, &o, b, exact_of(y)).text;
     if sa == sb {
         let approx = i.new_object();
-        set_data(&approx, "type", Value::str("approximatelySign"));
+        set_data(&approx, "type", Value::lstr("approximatelySign"));
         set_data(
             &approx,
             "value",
-            Value::str(cldr_number_symbols(&o).approximately),
+            Value::lstr(cldr_number_symbols(&o).approximately),
         );
-        set_data(&approx, "source", Value::str("shared"));
+        set_data(&approx, "source", Value::lstr("shared"));
         out.push(Value::Obj(approx));
         push_parts(i, &sa, "shared", &mut out);
         return Ok(i.make_array(out));
@@ -147,9 +147,9 @@ fn format_range_to_parts(
     let (start, sep, end) = range_join(&o, &sa, &sb);
     push_parts(i, &start, "startRange", &mut out);
     let lit = i.new_object();
-    set_data(&lit, "type", Value::str("literal"));
-    set_data(&lit, "value", Value::str(sep));
-    set_data(&lit, "source", Value::str("shared"));
+    set_data(&lit, "type", Value::lstr("literal"));
+    set_data(&lit, "value", Value::lstr(sep));
+    set_data(&lit, "source", Value::lstr("shared"));
     out.push(Value::Obj(lit));
     push_parts(i, &end, "endRange", &mut out);
     Ok(i.make_array(out))
@@ -188,7 +188,7 @@ pub(crate) fn bind_this(i: &mut Interp, target: Value, this_arg: Value) -> Value
                 o.borrow_mut().is_constructor = false;
                 o.borrow_mut().props.insert(
                     "name",
-                    crate::value::Property::data(Value::str(""), false, false, true),
+                    crate::value::Property::data(Value::lstr(""), false, false, true),
                 );
             }
             return bound;
@@ -404,8 +404,8 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
         obj.borrow_mut().proto = Some(proto);
     }
     set_builtin(&obj, "#\u{0}nf", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}nf_locale", Value::from_string(resolved_locale));
-    set_builtin(&obj, "#\u{0}nf_nu", Value::from_string(numbering));
+    set_builtin(&obj, "#\u{0}nf_locale", Value::lstr(resolved_locale));
+    set_builtin(&obj, "#\u{0}nf_nu", Value::lstr(numbering));
     set_builtin(
         &obj,
         "#\u{0}nf_roundingincrement",
@@ -414,37 +414,37 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     set_builtin(
         &obj,
         "#\u{0}nf_roundingpriority",
-        Value::from_string(rounding_priority),
+        Value::lstr(rounding_priority),
     );
     set_builtin(
         &obj,
         "#\u{0}nf_trailingzero",
-        Value::from_string(trailing_zero),
+        Value::lstr(trailing_zero),
     );
-    set_builtin(&obj, "#\u{0}nf_style", Value::from_string(style));
+    set_builtin(&obj, "#\u{0}nf_style", Value::lstr(style));
     if let Some(c) = currency.filter(|_| get_str(&obj, "#\u{0}nf_style") == "currency") {
         set_builtin(
             &obj,
             "#\u{0}nf_currency",
-            Value::from_string(c.to_uppercase()),
+            Value::lstr(c.to_uppercase()),
         );
         set_builtin(
             &obj,
             "#\u{0}nf_currencydisplay",
-            Value::from_string(currency_display),
+            Value::lstr(currency_display),
         );
         set_builtin(
             &obj,
             "#\u{0}nf_currencysign",
-            Value::from_string(currency_sign),
+            Value::lstr(currency_sign),
         );
     }
     if let Some(u) = unit {
-        set_builtin(&obj, "#\u{0}nf_unit", Value::from_string(u));
+        set_builtin(&obj, "#\u{0}nf_unit", Value::lstr(u));
         set_builtin(
             &obj,
             "#\u{0}nf_unitdisplay",
-            Value::from_string(unit_display),
+            Value::lstr(unit_display),
         );
     }
     set_builtin(&obj, "#\u{0}nf_minint", Value::Num(digits.min_int as f64));
@@ -456,27 +456,27 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(v) = digits.max_sig {
         set_builtin(&obj, "#\u{0}nf_maxsig", Value::Num(v as f64));
     }
-    set_builtin(&obj, "#\u{0}nf_notation", Value::from_string(notation));
+    set_builtin(&obj, "#\u{0}nf_notation", Value::lstr(notation));
     set_builtin(
         &obj,
         "#\u{0}nf_compactdisplay",
-        Value::from_string(compact_display),
+        Value::lstr(compact_display),
     );
     set_builtin(&obj, "#\u{0}nf_grouping", use_grouping);
     set_builtin(
         &obj,
         "#\u{0}nf_signdisplay",
-        Value::from_string(sign_display),
+        Value::lstr(sign_display),
     );
     set_builtin(
         &obj,
         "#\u{0}nf_roundingmode",
-        Value::from_string(rounding_mode),
+        Value::lstr(rounding_mode),
     );
     set_builtin(
         &obj,
         "#\u{0}nf_roundingtype",
-        Value::str(digits.rounding_type),
+        Value::lstr(digits.rounding_type),
     );
     // Legacy "ChainNumberFormat" (see datetimeformat.rs).
     if !i.constructing {
@@ -651,7 +651,7 @@ fn read_use_grouping(i: &mut Interp, options: &Value, notation: &str) -> Result<
     // otherwise ToString and validate against ["min2","auto","always"] (so the string "true" is a
     // RangeError, not "always"). The fallback is "auto" (or "min2" for compact notation).
     let v = ab(i.get_member(options, "useGrouping"))?;
-    let default = Value::str(if notation == "compact" {
+    let default = Value::lstr(if notation == "compact" {
         "min2"
     } else {
         "auto"
@@ -660,7 +660,7 @@ fn read_use_grouping(i: &mut Interp, options: &Value, notation: &str) -> Result<
         return Ok(default);
     }
     if matches!(v, Value::Bool(true)) {
-        return Ok(Value::str("always"));
+        return Ok(Value::lstr("always"));
     }
     if !i.to_boolean(&v) {
         return Ok(Value::Bool(false));
@@ -674,7 +674,7 @@ fn read_use_grouping(i: &mut Interp, options: &Value, notation: &str) -> Result<
     if !["always", "auto", "min2"].contains(&s.as_str()) {
         return Err(i.make_error("RangeError", format!("invalid useGrouping: {s}")));
     }
-    Ok(Value::from_string(s))
+    Ok(Value::lstr(s))
 }
 
 fn is_well_formed_currency(c: &str) -> bool {
@@ -1519,7 +1519,7 @@ fn assemble_number_exact(
         .props
         .get("#\u{0}nf_grouping")
         .map(|p| p.value())
-        .unwrap_or(Value::str("auto"));
+        .unwrap_or(Value::lstr("auto"));
     // Grouping is suppressed in scientific/engineering notation.
     let grouped = if exponent.is_some() || (!value.is_finite() && exact.is_none()) {
         int_part.clone()
@@ -1860,7 +1860,7 @@ fn format_number(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value
     let o = instance(i, this)?;
     let n = to_intl_number(i, x)?;
     let s = assemble_number_exact(i, &o, n, exact_of(x)).text;
-    Ok(Value::from_string(xlate_digits(
+    Ok(Value::lstr(xlate_digits(
         &s,
         &get_str(&o, "#\u{0}nf_nu"),
     )))
@@ -1923,14 +1923,14 @@ fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Val
         .into_iter()
         .map(|(t, v)| {
             let ob = i.new_object();
-            set_data(&ob, "type", Value::str(t));
+            set_data(&ob, "type", Value::lstr(t));
             // Localize the digits of numeric parts to the numbering system.
             let v = if matches!(t, "integer" | "fraction" | "exponentInteger") {
                 xlate_digits(&v, &nu)
             } else {
                 v
             };
-            set_data(&ob, "value", Value::from_string(v));
+            set_data(&ob, "value", Value::lstr(v));
             Value::Obj(ob)
         })
         .collect();
@@ -2242,7 +2242,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
             .props
             .get("#\u{0}nf_grouping")
             .map(|p| p.value())
-            .unwrap_or(Value::str("auto")),
+            .unwrap_or(Value::lstr("auto")),
     );
     put(i, &res, "notation", "#\u{0}nf_notation");
     // compactDisplay only appears when notation is compact.

@@ -59,12 +59,12 @@ pub fn install(it: &mut Interp, ns: &Gc) {
             .into_iter()
             .map(|(t, v)| {
                 let ob = i.new_object();
-                set_data(&ob, "type", Value::str(t));
+                set_data(&ob, "type", Value::lstr(t));
                 // Localize digits to the numbering system (name/literal parts have no ASCII digits).
                 set_data(
                     &ob,
                     "value",
-                    Value::from_string(crate::intl::numberformat::xlate_digits(&v, &nu)),
+                    Value::lstr(crate::intl::numberformat::xlate_digits(&v, &nu)),
                 );
                 Value::Obj(ob)
             })
@@ -79,7 +79,7 @@ pub fn install(it: &mut Interp, ns: &Gc) {
             .into_iter()
             .map(|(_, value, _)| value)
             .collect();
-        Ok(Value::from_string(crate::intl::numberformat::xlate_digits(
+        Ok(Value::lstr(crate::intl::numberformat::xlate_digits(
             &out,
             &dtf_nu(&o),
         )))
@@ -91,13 +91,13 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         let mut arr: Vec<Value> = Vec::new();
         let emit = |i: &mut Interp, arr: &mut Vec<Value>, ty: &str, val: &str, src: &str| {
             let ob = i.new_object();
-            set_data(&ob, "type", Value::str(ty));
+            set_data(&ob, "type", Value::lstr(ty));
             set_data(
                 &ob,
                 "value",
-                Value::from_string(crate::intl::numberformat::xlate_digits(val, &nu)),
+                Value::lstr(crate::intl::numberformat::xlate_digits(val, &nu)),
             );
-            set_data(&ob, "source", Value::str(src));
+            set_data(&ob, "source", Value::lstr(src));
             arr.push(Value::Obj(ob));
         };
         for (kind, value, source) in build_range_parts(&o, s, e, kind) {
@@ -213,7 +213,7 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
             return Ok(f);
         }
         let f = i.make_native("", 1, |i, that, a| {
-            Ok(Value::from_string(do_format(i, &that, &arg(a, 0))?))
+            Ok(Value::lstr(do_format(i, &that, &arg(a, 0))?))
         });
         let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
         set_builtin(&o, "#\u{0}dtf_bound", bound.clone());
@@ -265,7 +265,7 @@ fn dtf_pattern_width(pattern: &str, fields: &str) -> Option<usize> {
 fn install_style_components(obj: &Gc, pattern: &str) {
     let put_width = |slot: &str, fields: &str, value: fn(usize) -> &'static str| {
         if let Some(width) = dtf_pattern_width(pattern, fields) {
-            set_builtin(obj, slot, Value::str(value(width)));
+            set_builtin(obj, slot, Value::lstr(value(width)));
         }
     };
     put_width("#\u{0}dtfx_weekday", "Eec", |width| match width {
@@ -324,7 +324,7 @@ fn install_style_components(obj: &Gc, pattern: &str) {
         set_builtin(
             obj,
             "#\u{0}dtfx_tzname",
-            Value::str(if width >= 4 { "long" } else { "short" }),
+            Value::lstr(if width >= 4 { "long" } else { "short" }),
         );
     }
 }
@@ -338,7 +338,7 @@ fn install_resolved_components(obj: &Gc, pattern: &str) {
             set_builtin(
                 obj,
                 "#\u{0}dtf_month",
-                Value::str(match width {
+                Value::lstr(match width {
                     2 => "2-digit",
                     3 => "short",
                     4 => "long",
@@ -608,14 +608,14 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     set_builtin(
         &obj,
         "#\u{0}dtf_locale",
-        Value::from_string(resolved_locale),
+        Value::lstr(resolved_locale),
     );
-    set_builtin(&obj, "#\u{0}dtf_ca", Value::from_string(eff_cal));
-    set_builtin(&obj, "#\u{0}dtf_nu", Value::from_string(nu_final));
-    set_builtin(&obj, "#\u{0}dtf_tz", Value::from_string(time_zone));
+    set_builtin(&obj, "#\u{0}dtf_ca", Value::lstr(eff_cal));
+    set_builtin(&obj, "#\u{0}dtf_nu", Value::lstr(nu_final));
+    set_builtin(&obj, "#\u{0}dtf_tz", Value::lstr(time_zone));
     let put = |obj: &Gc, k: &str, v: &Option<String>| {
         if let Some(v) = v {
-            set_builtin(obj, k, Value::from_string(v.clone()));
+            set_builtin(obj, k, Value::lstr(v.clone()));
         }
     };
     put(&obj, "#\u{0}dtf_weekday", &weekday);
@@ -672,16 +672,16 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
                 .unwrap_or_else(|| locale_hour_cycle.to_string())
         };
         let h12 = matches!(hc.as_str(), "h11" | "h12");
-        set_builtin(&obj, "#\u{0}dtf_hourcycle", Value::from_string(hc));
+        set_builtin(&obj, "#\u{0}dtf_hourcycle", Value::lstr(hc));
         set_builtin(&obj, "#\u{0}dtf_hour12", Value::Bool(h12));
         set_builtin(&obj, "#\u{0}dtf_hourshown", Value::Bool(shows_hour));
     }
     // Default components when nothing was requested: year/month/day numeric. Flagged so a Temporal
     // receiver's compatibility check ignores them (only *explicit* options can conflict).
     if !has_explicit && date_style.is_none() && time_style.is_none() {
-        set_builtin(&obj, "#\u{0}dtf_year", Value::str("numeric"));
-        set_builtin(&obj, "#\u{0}dtf_month", Value::str("numeric"));
-        set_builtin(&obj, "#\u{0}dtf_day", Value::str("numeric"));
+        set_builtin(&obj, "#\u{0}dtf_year", Value::lstr("numeric"));
+        set_builtin(&obj, "#\u{0}dtf_month", Value::lstr("numeric"));
+        set_builtin(&obj, "#\u{0}dtf_day", Value::lstr("numeric"));
         set_builtin(&obj, "#\u{0}dtf_defaults", Value::Bool(true));
     }
     if date_style.is_none() && time_style.is_none() {

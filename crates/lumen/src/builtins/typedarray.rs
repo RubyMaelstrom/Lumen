@@ -85,7 +85,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     if let Some(key) = well_known_key(it, "toStringTag") {
         proto.borrow_mut().props.insert(
             key,
-            Property::data(Value::str("SharedArrayBuffer"), false, false, true),
+            Property::data(Value::lstr("SharedArrayBuffer"), false, false, true),
         );
     }
     it.def_method(&proto, "slice", 2, |i, this, a| {
@@ -1437,7 +1437,7 @@ fn ta_native(
                     out.push_str(&ab(i.to_string(&v))?);
                 }
             }
-            Ok(Value::from_string(out))
+            Ok(Value::lstr(out))
         })()),
         _ => None,
     }
@@ -2014,7 +2014,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
             let s = ab(i.call(tls, v, &[arg(a, 0), arg(a, 1)]))?;
             out.push_str(&ab(i.to_string(&s))?);
         }
-        Ok(Value::from_string(out))
+        Ok(Value::lstr(out))
     });
     // length / byteLength / byteOffset / buffer are accessor getters on %TypedArray.prototype% that
     // brand-check the receiver (calling one on a non-TypedArray is a TypeError).
@@ -2038,7 +2038,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
     if let Some(key) = well_known_key(it, "toStringTag") {
         let g = it.make_native("get [Symbol.toStringTag]", 0, |i, this, _| {
             Ok(match map_ptr(&this).and_then(|p| i.typed_arrays.get(&p)) {
-                Some(info) => Value::str(info.kind.name()),
+                Some(info) => Value::lstr(info.kind.name()),
                 None => Value::Undefined,
             })
         });
@@ -2423,7 +2423,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             s.push(HEX[(b >> 4) as usize] as char);
             s.push(HEX[(b & 0x0f) as usize] as char);
         }
-        Ok(Value::from_string(s))
+        Ok(Value::lstr(s))
     });
     it.def_method(&proto, "toBase64", 0, |i, this, a| {
         // Receiver validation, then options, then the (detachment-sensitive) byte read.
@@ -2436,7 +2436,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             false
         };
         let bytes = u8_bytes(i, &this)?;
-        Ok(Value::from_string(b64_encode(&bytes, url, !omit_padding)))
+        Ok(Value::lstr(b64_encode(&bytes, url, !omit_padding)))
     });
     it.def_method(&ctor, "fromHex", 1, |i, _t, a| {
         let s = match arg(a, 0) {

@@ -76,7 +76,7 @@ pub(super) fn install_globals(it: &mut Interp) {
                 out.push_str(&format!("%u{ch:04X}"));
             }
         }
-        Ok(Value::from_string(out))
+        Ok(Value::lstr(out))
     });
     global_fn(it, "unescape", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
@@ -107,31 +107,31 @@ pub(super) fn install_globals(it: &mut Interp) {
             units.push(input[k]);
             k += 1;
         }
-        Ok(Value::from_string(crate::jstr::from_units(&units)))
+        Ok(Value::lstr(crate::jstr::from_units(&units)))
     });
     global_fn(it, "encodeURIComponent", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
         uri_encode(&s, "")
-            .map(Value::from_string)
+            .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
     global_fn(it, "encodeURI", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
         uri_encode(&s, ";,/?:@&=+$#")
-            .map(Value::from_string)
+            .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
     global_fn(it, "decodeURIComponent", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
         uri_decode(&s, "")
-            .map(Value::from_string)
+            .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
     // decodeURI leaves escapes of the reservedSet (and '#') untouched.
     global_fn(it, "decodeURI", 1, |i, _t, a| {
         let s = ab(i.to_string(&arg(a, 0)))?;
         uri_decode(&s, ";/?:@&=+$,#")
-            .map(Value::from_string)
+            .map(Value::lstr)
             .ok_or_else(|| i.make_error("URIError", "URI malformed"))
     });
 
