@@ -2832,6 +2832,9 @@ pub struct Interp {
     /// Deep direct JIT calls return to Rust before this point so the next committed call can move
     /// to a heap-backed native stack segment when necessary.
     pub(crate) direct_call_depth: u32,
+    /// Trapless Proxy forwards currently nested (`proxy_forward`), bounded by
+    /// `MAX_PROXY_FORWARD_DEPTH`.
+    pub(crate) proxy_forward_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
@@ -3261,6 +3264,7 @@ interp_memory_inventory! {
     regexp_last => "measured",
     depth => "non_owning",
     direct_call_depth => "non_owning",
+    proxy_forward_depth => "non_owning",
     class_info => "measured",
     eval_fn => "measured",
     eval_realm_fns => "measured",
@@ -3391,7 +3395,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 156);
+    assert_eq!(names.len(), 157);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3635,6 +3639,12 @@ const EXECUTION_STACK_SEGMENT: usize = 8 * 1024 * 1024;
 // This also accommodates the existing 4096-call stress case with large unoptimized VM frames.
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_EXECUTION_STACK_SEGMENTS: usize = 64;
+/// The most trapless Proxy forwards that may nest. Each forwards natively, without a JavaScript
+/// frame, so the whole native stack budget would allow hundreds of thousands, and an unbounded
+/// chain (a Proxy on its own target's prototype chain, which fingerprinting scripts probe for
+/// every API they inspect) would take a third of a second to reach its RangeError. Engines stop
+/// near 4,000 (V8), so no working page nests more.
+const MAX_PROXY_FORWARD_DEPTH: u32 = 10_000;
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     // Thread-local so re-entrant Engines/Realms cannot reset the native storage budget.
@@ -4268,6 +4278,7 @@ impl Interp {
             strict: false,
             depth: 0,
             direct_call_depth: MAX_DIRECT_CALL_DEPTH,
+            proxy_forward_depth: 0,
             class_info: Default::default(),
             eval_fn: None,
             eval_realm_fns: Default::default(),
@@ -14654,26 +14665,31 @@ impl Interp {
         self.construct_nt(callee, args, nt)
     }
 
-    /// Like `construct`, but with an explicit `new.target` (for `Reflect.construct`'s third argument
-    /// and a proxy's `[[Construct]]` forwarding, where new.target differs from the callee).
     /// A trapless Proxy forwards the operation to its target (ECMA-262 §10.5), and the target's
     /// prototype chain may lead back to the same Proxy: [[SetPrototypeOf]]'s cycle check stops
-    /// at Proxies. Account each forward like a call, so an unbounded chain throws RangeError
-    /// on the execution-stack limit instead of exhausting the native stack.
+    /// at Proxies. Account each forward like a call, and bound how many forwards may nest, so an
+    /// unbounded chain throws RangeError promptly instead of exhausting the native stack.
     pub(crate) fn proxy_forward<R>(
         &mut self,
         forward: impl FnOnce(&mut Self) -> Result<R, Abrupt>,
     ) -> Result<R, Abrupt> {
+        if self.proxy_forward_depth >= MAX_PROXY_FORWARD_DEPTH {
+            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+        }
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }
+        self.proxy_forward_depth += 1;
         let result = with_execution_stack(self.depth, || forward(self));
+        self.proxy_forward_depth -= 1;
         self.depth -= 1;
         result
     }
 
+    /// Like `construct`, but with an explicit `new.target` (for `Reflect.construct`'s third argument
+    /// and a proxy's `[[Construct]]` forwarding, where new.target differs from the callee).
     pub(crate) fn construct_nt(
         &mut self,
         callee: Value,

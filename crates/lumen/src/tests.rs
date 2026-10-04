@@ -2287,6 +2287,10 @@ fn proxy_prototype_cycles_throw_range_error_instead_of_overflowing() {
             try { const v = f(); r.push(n + ':ok:' + v); } catch (e) { r.push(n + ':' + e.constructor.name); }
         }
         r.push('after:' + (1 + 1));
+        // Nested trapless forwards are bounded well beyond any chain a page can use.
+        const chain = n => { let o = {x: 7}; for (let i = 0; i < n; i++) o = new Proxy(o, {}); return o; };
+        r.push('chain:' + chain(3000).x);
+        try { chain(20000).x; r.push('long:ok'); } catch (e) { r.push('long:' + e.constructor.name); }
         r.join(' ')
     "#;
     for tier in [
@@ -2300,7 +2304,8 @@ fn proxy_prototype_cycles_throw_range_error_instead_of_overflowing() {
         match engine.eval(source, false).expect("parse") {
             Completion::Value(v) => assert_eq!(
                 v,
-                "get:RangeError set:RangeError has:RangeError getOwn:ok:undefined keys:ok: after:2",
+                "get:RangeError set:RangeError has:RangeError getOwn:ok:undefined keys:ok: after:2 \
+                 chain:7 long:RangeError",
                 "{tier:?}"
             ),
             Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
