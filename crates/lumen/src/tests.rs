@@ -20074,6 +20074,37 @@ fn computed_number_keys_use_number_to_string_in_all_tiers() {
 }
 
 #[test]
+fn string_and_integral_keys_reach_own_property_checks_and_sets_in_all_tiers() {
+    // ECMA-262 Object.prototype.hasOwnProperty (ToPropertyKey before ToObject) and computed
+    // PutValue, snapshot e28783d5fc9d: String keys pass through unchanged, Numbers as their
+    // decimal text, and proxy traps observe exactly those keys.
+    let source = r#"
+        var log=[]; var p = new Proxy({a:1, 5:2}, {getOwnPropertyDescriptor(t,k){ log.push(String(k)); return Reflect.getOwnPropertyDescriptor(t,k); }});
+        var h = Object.prototype.hasOwnProperty;
+        var r = [h.call(p, "a"), h.call(p, 5), h.call(p, -0), h.call(p, 1.5), h.call({0:1}, -0), h.call("abc", 1), h.call("abc", "3")];
+        var e1; try { h.call(null, "a"); } catch (e) { e1 = e.constructor.name; }
+        var e2 = []; try { h.call(undefined, {toString(){ e2.push("key"); return "x"; }}); } catch (e) { e2.push(e.constructor.name); }
+        var o = {}; o["k" + 1] = 1; var s = "dyn"; o[s] = 2;
+        var q = new Proxy({}, {set(t,k,v){ log.push("set:" + k); t[k]=v; return true; }}); q["str"] = 1; q[s] = 2;
+        [r.join(","), log.join(","), e1, e2.join(":"), Object.keys(o).join(",")].join("|")
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "true,true,false,false,true,true,false|a,5,0,1.5,set:str,set:dyn|TypeError|key:TypeError|k1,dyn",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn iterator_results_are_fresh_ordered_objects_in_all_tiers() {
     // ECMA-262 CreateIterResultObject, snapshot e28783d5fc9d: a fresh ordinary object of the
     // current Realm with data properties `value` then `done`, all attributes true. Results built

@@ -4066,7 +4066,18 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
 fn install_object(it: &mut Interp) {
     let op = it.object_proto.clone();
     it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
-        let key = ab(i.to_property_key(&arg(args, 0)))?;
+        // ToPropertyKey of a String or an integral Number cannot run author code or fail, so
+        // those keys skip building an owned key string; ToObject still follows it.
+        let key = arg(args, 0);
+        if let Value::Str(key) = &key {
+            let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
+            return has_own_property_trapped(i, &Value::Obj(o), key.as_str()).map(Value::Bool);
+        }
+        if let Some(text) = key.as_num_opt().and_then(crate::value::IntegerKeyText::new) {
+            let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
+            return has_own_property_trapped(i, &Value::Obj(o), text.as_str()).map(Value::Bool);
+        }
+        let key = ab(i.to_property_key(&key))?;
         let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
         has_own_property_trapped(i, &Value::Obj(o), &key).map(Value::Bool)
     });

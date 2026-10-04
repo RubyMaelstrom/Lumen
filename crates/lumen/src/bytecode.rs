@@ -22108,6 +22108,11 @@ fn set_computed_element(
     } else {
         value
     };
+    // ToPropertyKey of a String is itself, and of an integral Number its decimal text: pass
+    // them without building an owned key string.
+    if let Value::Str(key) = key {
+        return i.set_member(object, key.as_str(), value);
+    }
     if let Some(text) = key.as_num_opt().and_then(crate::value::IntegerKeyText::new) {
         return i.set_member(object, text.as_str(), value);
     }
