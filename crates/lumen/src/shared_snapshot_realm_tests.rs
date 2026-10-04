@@ -295,3 +295,103 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         assert_eq!(result, "300/300", "{tier:?}");
     }
 }
+
+/// Unresolvable global references in shared code: a plain read (caught ReferenceError),
+/// `typeof`, and call position, in Script code, a once-run loop body that compiles at entry,
+/// and a function hot enough to tier up.
+const UNRESOLVABLE: &str = r#"
+// A Window-like global: failed lookups walk Window.prototype and a named-properties Proxy
+// whose traps are closures of this shared code (Web IDL #named-properties-object).
+(function () {
+    "use strict";
+    const g = globalThis;
+    function EventTarget() {}
+    function Window() {}
+    let epoch = -1, names = new Map();
+    function refresh() {
+        if (epoch === 1) return;
+        epoch = 1;
+        names = new Map([["namedFrame", g]]);
+    }
+    const target = Object.create(EventTarget.prototype);
+    const windowProperties = new Proxy(target, {
+        has(target, property) {
+            if (typeof property !== "string") return Reflect.has(target, property);
+            refresh();
+            return names.has(property) || Reflect.has(target, property);
+        },
+        get(target, property, receiver) {
+            if (typeof property === "string") {
+                refresh();
+                if (names.has(property)) return names.get(property);
+            }
+            return Reflect.get(target, property, receiver);
+        },
+    });
+    Object.setPrototypeOf(Window.prototype, windowProperties);
+    Object.setPrototypeOf(g, Window.prototype);
+})();
+const scriptKind = typeof NoSuchGlobalForLumenProbe === "function";
+let scriptRead = "unset";
+try { scriptRead = NoSuchGlobalForLumenProbe; } catch (e) { scriptRead = e instanceof ReferenceError; }
+(function () {
+    "use strict";
+    function probeRead() {
+        try { return NoSuchGlobalForLumenProbe; } catch (e) { return e instanceof ReferenceError; }
+    }
+    function probeTypeof() { return typeof NoSuchGlobalForLumenProbe; }
+    function probeCall() {
+        try { return NoSuchGlobalForLumenProbe(); } catch (e) { return e instanceof ReferenceError; }
+    }
+    let results = [];
+    for (let i = 0; i < 300; i++) {
+        results = [probeRead(), probeTypeof(), probeCall(),
+                   typeof NoSuchGlobalForLumenProbe === "function"];
+    }
+    globalThis.unresolvable = results.join() + "|" + scriptKind + "," + scriptRead;
+})();
+"#;
+
+fn unresolvable_snapshot() -> &'static [u8] {
+    static SNAPSHOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    SNAPSHOT.get_or_init(|| crate::compile_host_snapshot(UNRESOLVABLE).expect("source parses"))
+}
+
+/// A Realm that evaluated shared code with unresolvable references is collected once nothing
+/// references it: no cache filled by the failed lookups may own its global, environment or
+/// objects (`AGENTS.md`: compiled code owns no JavaScript objects).
+#[test]
+fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
+    for tier in TIERS {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        let run = |it: &mut Interp| {
+            let body = it
+                .shared_snapshot_program(unresolvable_snapshot())
+                .expect("decodes");
+            if let Err(Abrupt::Throw(error)) = it.run_classic_program(&body) {
+                panic!("snapshot threw: {}", render(it, &error));
+            }
+            eval_string(it, "unresolvable")
+        };
+        let expected = "true,undefined,true,false|false,true";
+        assert_eq!(run(it), expected, "{tier:?} main");
+        let mut addresses = Vec::new();
+        for round in 0..3 {
+            let child = it.create_realm();
+            let Value::Obj(global) = &child else {
+                unreachable!()
+            };
+            addresses.push(Rc::as_ptr(global) as usize);
+            assert_eq!(in_realm(it, &child, run), expected, "{tier:?} child {round}");
+        }
+        it.gc_collect();
+        for (round, address) in addresses.iter().enumerate() {
+            assert!(
+                !it.realms.contains_key(address),
+                "{tier:?}: dropped child Realm {round} is still live"
+            );
+        }
+    }
+}
