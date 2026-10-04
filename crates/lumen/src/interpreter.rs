@@ -15615,7 +15615,7 @@ fn collect_annexb_funcs(
     }
 }
 
-fn type_name(v: &Value) -> &'static str {
+pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Undefined | Value::Empty => "undefined",
         Value::Null => "null",

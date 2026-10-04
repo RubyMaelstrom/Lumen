@@ -51,6 +51,7 @@ mod builtins;
 pub mod bytecode;
 mod cache;
 mod callback;
+mod callee_name;
 #[cfg(test)]
 mod chain_bail_tests;
 #[cfg(test)]
@@ -1344,6 +1345,8 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod call_error_name_tests;
 #[cfg(test)]
 mod call_guard_tests;
 #[cfg(test)]

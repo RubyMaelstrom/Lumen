@@ -3237,6 +3237,13 @@ impl Interp {
             Expr::New { callee, args } => {
                 let c = self.eval(callee, env)?;
                 let argv = self.eval_args(args, env)?;
+                // EvaluateNew step 7: IsConstructor follows ArgumentListEvaluation.
+                if !self.value_is_constructor(&c) {
+                    return Err(self.throw(
+                        "TypeError",
+                        crate::callee_name::not_callable_message(callee, true),
+                    ));
+                }
                 self.construct(c, &argv)
             }
         }
@@ -3665,6 +3672,12 @@ impl Interp {
         for s in subs {
             argv.push(self.eval(s, env)?);
         }
+        if !func.is_callable() {
+            return Err(self.throw(
+                "TypeError",
+                crate::callee_name::not_callable_message(tag, false),
+            ));
+        }
         self.call(func, this, &argv)
     }
 
@@ -3793,7 +3806,10 @@ impl Interp {
         let (func, this) = self.eval_callee_reference(callee, env)?;
         let argv = self.eval_args(args, env)?;
         if !func.is_callable() {
-            return Err(self.throw("TypeError", "callee is not a function"));
+            return Err(self.throw(
+                "TypeError",
+                crate::callee_name::not_callable_message(callee, false),
+            ));
         }
         Ok(Some((func, this, argv)))
     }
@@ -3821,7 +3837,10 @@ impl Interp {
             argv.push(self.eval(s, env)?);
         }
         if !func.is_callable() {
-            return Err(self.throw("TypeError", "tag is not a function"));
+            return Err(self.throw(
+                "TypeError",
+                crate::callee_name::not_callable_message(tag, false),
+            ));
         }
         Ok(Some((func, this, argv)))
     }
@@ -3970,8 +3989,10 @@ impl Interp {
         }
         let argv = self.eval_args(args, env)?;
         if !func.is_callable() {
-            let desc = describe_callee(callee);
-            return Err(self.throw("TypeError", format!("{desc} is not a function")));
+            return Err(self.throw(
+                "TypeError",
+                crate::callee_name::not_callable_message(callee, false),
+            ));
         }
         self.call(func, this, &argv)
     }
@@ -8812,14 +8833,6 @@ fn promise_reject_native(i: &mut Interp, this: Value, args: &[Value]) -> Result<
 
 fn arg_at(args: &[Value], k: usize) -> Value {
     args.get(k).cloned().unwrap_or(Value::Undefined)
-}
-
-fn describe_callee(callee: &Expr) -> String {
-    match callee {
-        Expr::Ident(n) => n.clone(),
-        Expr::Member { prop, .. } => format!("(intermediate value).{prop}"),
-        _ => "expression".to_string(),
-    }
 }
 
 /// Whether an expression is an anonymous function/arrow/class (eligible for NamedEvaluation).

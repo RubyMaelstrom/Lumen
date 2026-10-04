@@ -2057,6 +2057,69 @@ impl LexicalScope {
     }
 }
 
+/// Names of call and `new` targets by operation index (see `crate::callee_name`), read only
+/// when such an operation throws because its target is not callable or not a constructor.
+#[derive(Default)]
+pub(crate) struct CallNames {
+    /// (operation index, end of its name in `text`), in increasing operation order.
+    sites: Vec<(u32, u32)>,
+    text: String,
+}
+
+impl CallNames {
+    fn record(&mut self, pc: usize, name: &str) {
+        debug_assert!(self
+            .sites
+            .last()
+            .is_none_or(|&(last, _)| (last as usize) < pc));
+        self.text.push_str(name);
+        self.sites.push((pc as u32, self.text.len() as u32));
+    }
+
+    /// Forget the names of operations at index `len` and above (a discarded speculation).
+    fn truncate(&mut self, len: usize) {
+        let keep = self.sites.partition_point(|&(pc, _)| (pc as usize) < len);
+        self.sites.truncate(keep);
+        self.text
+            .truncate(self.sites.last().map_or(0, |&(_, end)| end as usize));
+    }
+
+    /// Remove and return the name of operation `pc` if it is the last one recorded.
+    fn take_last(&mut self, pc: usize) -> Option<String> {
+        let &(last, end) = self.sites.last()?;
+        if last as usize != pc {
+            return None;
+        }
+        self.sites.pop();
+        let start = self.sites.last().map_or(0, |&(_, end)| end as usize);
+        let name = self.text[start..end as usize].to_string();
+        self.text.truncate(start);
+        Some(name)
+    }
+
+    fn get(&self, pc: usize) -> Option<&str> {
+        let pc = u32::try_from(pc).ok()?;
+        let index = self.sites.binary_search_by_key(&pc, |&(op, _)| op).ok()?;
+        let start = index.checked_sub(1).map_or(0, |prior| self.sites[prior].1);
+        self.text.get(start as usize..self.sites[index].1 as usize)
+    }
+
+    fn into_table(mut self) -> Option<Box<CallNames>> {
+        if self.sites.is_empty() {
+            return None;
+        }
+        self.sites.shrink_to_fit();
+        self.text.shrink_to_fit();
+        Some(Box::new(self))
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.sites.capacity() * std::mem::size_of::<(u32, u32)>()
+            + self.text.capacity()
+    }
+}
+
 pub struct Chunk {
     /// The caller must complete FunctionDeclarationInstantiation before running this body.
     /// The existing activation, including mapped arguments and parameter-expression scopes,
@@ -2215,6 +2278,8 @@ pub struct Chunk {
     regexp_literals: Vec<std::cell::OnceCell<Rc<crate::regex::Regex>>>,
     /// One [`CallSite`] per `Call`/`CallWithThis` site (the JIT→JIT fast call's callee cache).
     call_caches: Vec<CallSite>,
+    /// Source names of call and `new` targets, for TypeError messages (see [`Chunk::call_name`]).
+    call_names: Option<Box<CallNames>>,
     /// One monomorphic identity cache per `New` site.
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
     /// One [`PrivateSite`] per private-name operation (`Op::GetPrivate` and its siblings).
@@ -2372,6 +2437,11 @@ impl Chunk {
     pub(crate) fn has_tail_calls(&self) -> bool {
         self.has_tail_calls
     }
+
+    /// The source name of the call or `new` target of operation `pc`, such as `x.foo`.
+    pub(crate) fn call_name(&self, pc: usize) -> Option<&str> {
+        self.call_names.as_deref()?.get(pc)
+    }
     /// Scan the directly-owned bytecode/feedback payload. Shared AST nodes, Functions, strings,
     /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
     /// allocation-family visitor for identity deduplication.
@@ -2441,6 +2511,11 @@ impl Chunk {
         }
         bytes = bytes.saturating_add(self.deep_name_cache_bytes());
         bytes = bytes.saturating_add(self.resolution_cache_bytes());
+        bytes = bytes.saturating_add(
+            self.call_names
+                .as_deref()
+                .map_or(0, CallNames::retained_bytes),
+        );
         bytes = bytes.saturating_add(
             self.feedback_shapes
                 .borrow()
@@ -6706,6 +6781,7 @@ fn finish_chunk(
         arguments_forwarder_runtime: std::cell::RefCell::new(None),
         regexp_literals: (0..op_count).map(|_| std::cell::OnceCell::new()).collect(),
         call_caches: c.call_caches,
+        call_names: c.call_names.into_table(),
         construct_caches: c.construct_caches,
         private_sites: (0..c.private_sites).map(|_| PrivateSite::new()).collect(),
         call_pins: std::cell::RefCell::new(c.call_pins),
@@ -7360,6 +7436,10 @@ struct Compiler {
     name_num_valid: Vec<std::cell::Cell<bool>>,
     name_seed_stack: Vec<(Vec<NameSeed>, usize)>,
     call_caches: Vec<CallSite>,
+    /// See [`Chunk::call_name`]; rolled back with `ops`.
+    call_names: CallNames,
+    /// The target name [`Compiler::finish_call`] records for the call it emits.
+    pending_call_name: Option<String>,
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
     /// Number of private-name operation sites (`Chunk::private_sites`).
     private_sites: u32,
@@ -8010,6 +8090,7 @@ impl Compiler {
         );
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
             self.ops.truncate(snap.0);
+            self.call_names.truncate(snap.0);
             self.consts.truncate(snap.1);
             self.truncate_names(snap.2);
             self.caches.truncate(snap.3);
@@ -8705,6 +8786,8 @@ impl Compiler {
     }
 
     fn finish_call(&mut self, args: &[ArrayElem], with_this: bool, allow_inline: bool) -> CResult {
+        // Taken before the arguments compile: their own calls record their own names.
+        let name = self.pending_call_name.take();
         let tail = std::mem::take(&mut self.tail_finish) && ordinary_tail_call_depth() != 0;
         match self.call_args(args)? {
             CallArgsMode::Fixed(argc) => {
@@ -8719,18 +8802,29 @@ impl Compiler {
                 let join = tail.then(|| {
                     self.emit(Op::TailDeep);
                     let shallow = self.emit(Op::JumpIfFalse(0));
-                    self.emit(Op::TailCall(CallArgsMode::Fixed(argc), with_this));
+                    let tail_call = self.emit(Op::TailCall(CallArgsMode::Fixed(argc), with_this));
+                    self.name_call(tail_call, name.as_deref());
                     let join = self.emit(Op::Jump(0));
                     self.patch(shallow);
                     join
                 });
                 match plan_hit {
-                    Some(entry) => self.emit_call_with_inline(entry, argc, cache, with_this),
+                    Some(entry) => {
+                        self.emit_call_with_inline(entry, argc, cache, with_this);
+                        // Every way's guard mismatch ends in this generic call, emitted last.
+                        debug_assert!(matches!(
+                            self.ops.last(),
+                            Some(Op::Call(..) | Op::CallWithThis(..))
+                        ));
+                        self.name_call(self.ops.len() - 1, name.as_deref());
+                    }
                     None if with_this => {
-                        self.emit(Op::CallWithThis(argc, cache));
+                        let call = self.emit(Op::CallWithThis(argc, cache));
+                        self.name_call(call, name.as_deref());
                     }
                     None => {
-                        self.emit(Op::Call(argc, cache));
+                        let call = self.emit(Op::Call(argc, cache));
+                        self.name_call(call, name.as_deref());
                     }
                 }
                 if let Some(join) = join {
@@ -8738,20 +8832,31 @@ impl Compiler {
                     self.tail_lowered = true;
                 }
             }
-            CallArgsMode::FinalSpread(argc) if with_this => {
-                self.emit(Op::CallSpreadThis(argc));
-            }
             CallArgsMode::FinalSpread(argc) => {
-                self.emit(Op::CallSpread(argc));
-            }
-            CallArgsMode::Array if with_this => {
-                self.emit(Op::CallArgsArrayThis);
+                let call = self.emit(if with_this {
+                    Op::CallSpreadThis(argc)
+                } else {
+                    Op::CallSpread(argc)
+                });
+                self.name_call(call, name.as_deref());
             }
             CallArgsMode::Array => {
-                self.emit(Op::CallArgsArray);
+                let call = self.emit(if with_this {
+                    Op::CallArgsArrayThis
+                } else {
+                    Op::CallArgsArray
+                });
+                self.name_call(call, name.as_deref());
             }
         }
         Ok(())
+    }
+
+    /// Record the source name of the target of the call or `new` operation at `pc`.
+    fn name_call(&mut self, pc: usize, name: Option<&str>) {
+        if let Some(name) = name {
+            self.call_names.record(pc, name);
+        }
     }
 
     /// Evaluate a call's Reference, retaining its receiver alongside GetValue's result when
@@ -9054,6 +9159,7 @@ impl Compiler {
                 if *call_opt {
                     self.opt_link(if with_this { 2 } else { 1 }, shorts);
                 }
+                self.pending_call_name = Some(crate::callee_name::callee_name(callee));
                 self.finish_call(args, with_this, allow_inline)
             }
             // The chain's base (before any `?.` link): an ordinary expression.
@@ -9576,12 +9682,15 @@ impl Compiler {
         }
         // The operands stay where the call left them on both paths; a jump to `at` (from the
         // argument list) lands on the depth test, ahead of either form.
+        let name = self.call_names.take_last(at);
         self.ops[at] = Op::TailDeep;
         let shallow = self.emit(Op::JumpIfFalse(0));
-        self.emit(tail);
+        let tail_call = self.emit(tail);
+        self.name_call(tail_call, name.as_deref());
         let join = self.emit(Op::Jump(0));
         self.patch(shallow);
-        self.emit(call);
+        let ordinary = self.emit(call);
+        self.name_call(ordinary, name.as_deref());
         self.patch(join);
         Ok(())
     }
@@ -12774,11 +12883,12 @@ impl Compiler {
                 }
                 let argc = u16::try_from(subs.len() + 1).map_err(|_| Bail)?;
                 let cache = self.new_call_cache();
-                self.emit(if with_this {
+                let call = self.emit(if with_this {
                     Op::CallWithThis(argc, cache)
                 } else {
                     Op::Call(argc, cache)
                 });
+                self.name_call(call, Some(&crate::callee_name::callee_name(tag)));
                 Ok(())
             }
             Expr::OptionalChain(inner) => {
@@ -12837,7 +12947,8 @@ impl Compiler {
                             ArrayElem::Hole => return Err(Bail),
                         }
                     }
-                    self.emit(Op::EvalCallArgsArray);
+                    let call = self.emit(Op::EvalCallArgsArray);
+                    self.name_call(call, Some("eval"));
                     return Ok(());
                 }
                 match &**callee {
@@ -12872,6 +12983,7 @@ impl Compiler {
                         }
                         let (with_this, allow_inline) = self.callee_reference(other)?;
                         self.tail_finish = tail;
+                        self.pending_call_name = Some(crate::callee_name::callee_name(other));
                         self.finish_call(args, with_this, allow_inline)?;
                     }
                 }
@@ -12888,7 +13000,8 @@ impl Compiler {
                         self.expr(expr)?;
                     }
                     let cache = self.new_construct_cache();
-                    self.emit(Op::New(argc, cache));
+                    let construct = self.emit(Op::New(argc, cache));
+                    self.name_call(construct, Some(&crate::callee_name::callee_name(callee)));
                     return Ok(());
                 }
 
@@ -12908,7 +13021,8 @@ impl Compiler {
                         ArrayElem::Hole => return Err(Bail),
                     }
                 }
-                self.emit(Op::NewArgsArray);
+                let construct = self.emit(Op::NewArgsArray);
+                self.name_call(construct, Some(&crate::callee_name::callee_name(callee)));
                 Ok(())
             }
             Expr::Regex { body, flags } => {
@@ -15106,6 +15220,9 @@ fn run_vm_inner<S: StoredValue>(
                 } else {
                     Value::Undefined
                 };
+                if !callee.is_callable() {
+                    return Err(not_callable_error(i, chunk, op_pc, &callee, false));
+                }
                 let v = if chunk.feedback.detailed_enabled() {
                     call_profiled(i, chunk, op_pc, callee, this, &args)?
                 } else {
@@ -15121,6 +15238,9 @@ fn run_vm_inner<S: StoredValue>(
                 } else {
                     Value::Undefined
                 };
+                if !callee.is_callable() {
+                    return Err(not_callable_error(i, chunk, op_pc, &callee, false));
+                }
                 let value = if chunk.feedback.detailed_enabled() {
                     call_profiled(i, chunk, op_pc, callee, this, &args)?
                 } else {
@@ -15132,6 +15252,9 @@ fn run_vm_inner<S: StoredValue>(
                 let args = argument_array_values(i, pop!());
                 let callee = pop!();
                 let receiver = pop!();
+                if !callee.is_callable() {
+                    return Err(not_callable_error(i, chunk, op_pc, &callee, false));
+                }
                 // Only an identifier Reference named eval emits this opcode. A with
                 // Environment Record can supply a receiver without making the
                 // Reference a property Reference (ECMA-262 §13.3.6).
@@ -15617,13 +15740,19 @@ fn run_vm_inner<S: StoredValue>(
             Op::Call(argc, _) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack.read_value(at - 1);
-                let v = stack.with_tail(at, |args| {
+                let v = match stack.with_tail(at, |args| {
                     if chunk.feedback.detailed_enabled() {
                         call_profiled(i, chunk, op_pc, callee, Value::Undefined, args)
                     } else {
                         i.call(callee, Value::Undefined, args)
                     }
-                })?;
+                }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let callee = stack.read_value(at - 1);
+                        return Err(name_call_error(i, chunk, op_pc, &callee, false, error));
+                    }
+                };
                 stack.truncate(at - 1);
                 stack.push(v);
             }
@@ -15667,32 +15796,47 @@ fn run_vm_inner<S: StoredValue>(
                         Err(error) => return Err(Abrupt::Throw(error)),
                     }
                 }
-                let v = stack.with_tail(at, |args| {
+                let v = match stack.with_tail(at, |args| {
                     if chunk.feedback.detailed_enabled() {
                         call_profiled(i, chunk, op_pc, m, this, args)
                     } else {
                         i.call(m, this, args)
                     }
-                })?;
+                }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let method = stack.read_value(at - 1);
+                        return Err(name_call_error(i, chunk, op_pc, &method, false, error));
+                    }
+                };
                 stack.truncate(at - 2);
                 stack.push(v);
             }
             Op::New(argc, _) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack.read_value(at - 1);
-                let v = stack.with_tail(at, |args| {
+                let v = match stack.with_tail(at, |args| {
                     if chunk.feedback.detailed_enabled() {
                         construct_profiled(i, chunk, op_pc, callee, args)
                     } else {
                         i.construct(callee, args)
                     }
-                })?;
+                }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let callee = stack.read_value(at - 1);
+                        return Err(name_call_error(i, chunk, op_pc, &callee, true, error));
+                    }
+                };
                 stack.truncate(at - 1);
                 stack.push(v);
             }
             Op::NewArgsArray => {
                 let args = argument_array_values(i, pop!());
                 let callee = pop!();
+                if !i.value_is_constructor(&callee) {
+                    return Err(not_callable_error(i, chunk, op_pc, &callee, true));
+                }
                 let value = if chunk.feedback.detailed_enabled() {
                     construct_profiled(i, chunk, op_pc, callee, &args)?
                 } else {
@@ -21819,7 +21963,8 @@ pub(crate) unsafe extern "C" fn jit_new(
         let value = match construct_profiled(i, chunk, pc as usize, callee, args) {
             Ok(value) => value,
             Err(abrupt) => {
-                ctx.error = Some(abrupt);
+                let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
+                ctx.error = Some(name_call_error(i, chunk, pc as usize, &callee, true, abrupt));
                 return crate::jit::SpFlag { sp, flag: 1 };
             }
         };
@@ -21839,6 +21984,7 @@ pub(crate) unsafe extern "C" fn jit_new(
             i,
             Some(ctx as *mut crate::jit::JitCtx),
             Some((&*ctx.chunk, cache)),
+            pc as usize,
             argc as usize,
             &mut sp,
         )
@@ -21889,6 +22035,7 @@ unsafe fn jit_new_inner(
     i: &mut Interp,
     caller_ctx: Option<*mut crate::jit::JitCtx>,
     site: Option<(&Chunk, u32)>,
+    pc: usize,
     argc: usize,
     sp: &mut *mut PackedValue,
 ) -> Result<(), Abrupt> {
@@ -21923,7 +22070,13 @@ unsafe fn jit_new_inner(
     let args_values = DecodedArgs::new(unsafe { std::slice::from_raw_parts(args_ptr, argc) });
     let args = &*args_values;
     let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
-    let v = i.construct(callee, args)?;
+    let v = i.construct(callee, args).map_err(|error| match site {
+        Some((chunk, _)) => {
+            let callee = unsafe { (*sp.sub(argc + 1)).unpack() };
+            name_call_error(i, chunk, pc, &callee, true, error)
+        }
+        None => error,
+    })?;
     *sp = unsafe { jit_consume(*sp, argc + 1) };
     unsafe { sp.write(PackedValue::pack(v)) };
     *sp = unsafe { sp.add(1) };
@@ -22339,7 +22492,10 @@ unsafe fn jit_call_inner(
         } else {
             Value::Undefined
         };
-        let value = call_profiled(i, chunk, pc as usize, callee, this, args)?;
+        let value = call_profiled(i, chunk, pc as usize, callee, this, args).map_err(|error| {
+            let callee = (*sp.sub(argc + 1)).unpack();
+            name_call_error(i, chunk, pc as usize, &callee, false, error)
+        })?;
         *sp = jit_consume(*sp, argc + usize::from(with_this) + 1);
         push!(value);
         return Ok(());
@@ -22600,7 +22756,10 @@ unsafe fn jit_call_inner(
     } else {
         Value::Undefined
     };
-    let v = i.call(callee, this, args)?;
+    let v = i.call(callee, this, args).map_err(|error| {
+        let callee = (*sp.sub(argc + 1)).unpack();
+        name_call_error(i, chunk, pc as usize, &callee, false, error)
+    })?;
     *sp = jit_consume(*sp, argc + 1 + with_this as usize);
     push!(v);
     Ok(())
@@ -22874,6 +23033,71 @@ pub(crate) fn ordinary_tail_call_depth() -> u32 {
     })
 }
 
+/// The TypeError for the call (`construct` false) or `new` operation at `pc` when its target
+/// `callee` is not callable or not a constructor, naming the target's source expression where the
+/// compiler recorded one (see `crate::callee_name`). Only an operation that throws comes here.
+#[cold]
+#[inline(never)]
+fn not_callable_error(
+    interpreter: &Interp,
+    chunk: &Chunk,
+    pc: usize,
+    callee: &Value,
+    construct: bool,
+) -> Abrupt {
+    let message = match chunk.call_name(pc) {
+        Some(name) => crate::callee_name::named_message(name, construct),
+        None => crate::callee_name::named_message(
+            crate::interpreter::type_name(callee),
+            construct,
+        ),
+    };
+    interpreter.throw("TypeError", message)
+}
+
+/// Name the target of the call or `new` operation at `pc` in the TypeError its dispatch just
+/// threw because `callee` is not callable or not a constructor. Nothing has run since that
+/// error was created, so its message is not yet observable. Every other abrupt completion,
+/// including errors thrown by a callable target, is returned unchanged.
+#[cold]
+#[inline(never)]
+fn name_call_error(
+    interpreter: &Interp,
+    chunk: &Chunk,
+    pc: usize,
+    callee: &Value,
+    construct: bool,
+    error: Abrupt,
+) -> Abrupt {
+    let rejected = if construct {
+        !interpreter.value_is_constructor(callee)
+    } else {
+        !callee.is_callable()
+    };
+    let (Abrupt::Throw(Value::Obj(object)), true, Some(name)) =
+        (&error, rejected, chunk.call_name(pc))
+    else {
+        return error;
+    };
+    let mut object = object.borrow_mut();
+    let unnamed = matches!(object.exotic, crate::value::Exotic::Error(_))
+        && matches!(
+            object.props.get("message").map(crate::value::Property::value),
+            Some(Value::Str(message))
+                if crate::callee_name::is_unnamed_message(&message, construct)
+        );
+    if unnamed {
+        object.props.insert(
+            "message",
+            crate::value::Property::builtin(Value::lstr(crate::callee_name::named_message(
+                name, construct,
+            ))),
+        );
+    }
+    drop(object);
+    error
+}
+
 fn stage_tail_call(
     interpreter: &mut Interp,
     chunk: &Chunk,
@@ -22883,7 +23107,7 @@ fn stage_tail_call(
     args: Vec<Value>,
 ) -> Result<(), Abrupt> {
     if !callee.is_callable() {
-        return Err(interpreter.throw("TypeError", "value is not a function"));
+        return Err(not_callable_error(interpreter, chunk, pc, &callee, false));
     }
     if chunk.feedback.detailed_enabled() {
         chunk.feedback.observe_call(
@@ -23323,6 +23547,9 @@ unsafe fn jit_exec_inner(
             };
             let mut args = plain;
             i.append_spread_arguments(&spread, &mut args)?;
+            if !callee.is_callable() {
+                return Err(not_callable_error(i, chunk, pc as usize, &callee, false));
+            }
             let v = if chunk.feedback.detailed_enabled() {
                 call_profiled(i, chunk, pc as usize, callee, this, &args)?
             } else {
@@ -23338,6 +23565,9 @@ unsafe fn jit_exec_inner(
             } else {
                 Value::Undefined
             };
+            if !callee.is_callable() {
+                return Err(not_callable_error(i, chunk, pc as usize, &callee, false));
+            }
             if chunk.feedback.detailed_enabled() {
                 push!(call_profiled(i, chunk, pc as usize, callee, this, &args)?);
             } else {
@@ -23634,7 +23864,11 @@ unsafe fn jit_exec_inner(
                 let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
                 let args = &*args_values;
                 let callee = (*sp.sub(argc + 1)).unpack();
-                let value = call_profiled(i, chunk, pc as usize, callee, Value::Undefined, args)?;
+                let value = call_profiled(i, chunk, pc as usize, callee, Value::Undefined, args)
+                    .map_err(|error| {
+                        let callee = (*sp.sub(argc + 1)).unpack();
+                        name_call_error(i, chunk, pc as usize, &callee, false, error)
+                    })?;
                 *sp = jit_consume(*sp, argc + 1);
                 push!(value);
                 return Ok(());
@@ -23672,7 +23906,10 @@ unsafe fn jit_exec_inner(
             let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
             let args = &*args_values;
             let callee = (*sp.sub(argc + 1)).unpack();
-            let v = i.call(callee, Value::Undefined, args)?;
+            let v = i.call(callee, Value::Undefined, args).map_err(|error| {
+                let callee = (*sp.sub(argc + 1)).unpack();
+                name_call_error(i, chunk, pc as usize, &callee, false, error)
+            })?;
             *sp = jit_consume(*sp, argc + 1);
             push!(v);
         }
@@ -23698,7 +23935,12 @@ unsafe fn jit_exec_inner(
                 let args = &*args_values;
                 let method = (*sp.sub(argc + 1)).unpack();
                 let this = (*sp.sub(argc + 2)).unpack();
-                let value = call_profiled(i, chunk, pc as usize, method, this, args)?;
+                let value = call_profiled(i, chunk, pc as usize, method, this, args).map_err(
+                    |error| {
+                        let method = (*sp.sub(argc + 1)).unpack();
+                        name_call_error(i, chunk, pc as usize, &method, false, error)
+                    },
+                )?;
                 *sp = jit_consume(*sp, argc + 2);
                 push!(value);
                 return Ok(());
@@ -23731,7 +23973,10 @@ unsafe fn jit_exec_inner(
             let args = &*args_values;
             let m = (*sp.sub(argc + 1)).unpack();
             let this = (*sp.sub(argc + 2)).unpack();
-            let v = i.call(m, this, args)?;
+            let v = i.call(m, this, args).map_err(|error| {
+                let method = (*sp.sub(argc + 1)).unpack();
+                name_call_error(i, chunk, pc as usize, &method, false, error)
+            })?;
             *sp = jit_consume(*sp, argc + 2);
             push!(v);
         }
@@ -23742,16 +23987,24 @@ unsafe fn jit_exec_inner(
                 let callee = (*sp.sub(argc + 1)).unpack();
                 let args_values = DecodedArgs::new(std::slice::from_raw_parts(args_ptr, argc));
                 let args = &*args_values;
-                let value = construct_profiled(i, chunk, pc as usize, callee, args)?;
+                let value = construct_profiled(i, chunk, pc as usize, callee, args).map_err(
+                    |error| {
+                        let callee = (*sp.sub(argc + 1)).unpack();
+                        name_call_error(i, chunk, pc as usize, &callee, true, error)
+                    },
+                )?;
                 *sp = jit_consume(*sp, argc + 1);
                 push!(value);
             } else {
-                unsafe { jit_new_inner(i, None, Some((chunk, cache)), argc, sp) }?;
+                unsafe { jit_new_inner(i, None, Some((chunk, cache)), pc as usize, argc, sp) }?;
             }
         }
         Op::NewArgsArray => {
             let args = argument_array_values(i, pop!());
             let callee = pop!();
+            if !i.value_is_constructor(&callee) {
+                return Err(not_callable_error(i, chunk, pc as usize, &callee, true));
+            }
             if chunk.feedback.detailed_enabled() {
                 push!(construct_profiled(i, chunk, pc as usize, callee, &args)?);
             } else {
