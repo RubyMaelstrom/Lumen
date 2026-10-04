@@ -133,6 +133,8 @@ mod script_tiering_tests;
 mod self_hosted;
 #[cfg(test)]
 mod shared_layout_tests;
+#[cfg(test)]
+mod shared_snapshot_realm_tests;
 mod snapshot;
 mod spread;
 #[cfg(test)]
@@ -905,26 +907,7 @@ impl interpreter::Interp {
             line: error.line,
             at_eof: error.at_eof,
         })?;
-        let directive_strict = matches!(
-            body.first(),
-            Some(ast::Stmt::Expr(ast::Expr::Str(value))) if &**value == "use strict"
-        );
-        let previous_strict = self.strict;
-        self.strict = directive_strict;
-        let result = self.run_program(&body);
-        self.strict = previous_strict;
-        Ok(match result {
-            Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
-            Ok(value) => Ok(value),
-            Err(interpreter::Abrupt::Throw(value)) => {
-                crate::jit::perf_error_escaped();
-                Err(embed::EvalError::Throw(value))
-            }
-            Err(interpreter::Abrupt::Interrupt(reason)) => {
-                Err(embed::EvalError::Interrupted(reason))
-            }
-            Err(_) => Ok(embed::Value::Undefined),
-        })
+        Ok(self.eval_classic_body(&body))
     }
 
     /// Decode and evaluate a precompiled ECMAScript Script Record in the
@@ -941,15 +924,42 @@ impl interpreter::Interp {
             line: 0,
             at_eof: false,
         })?;
-        let directive_strict = matches!(
-            body.first(),
-            Some(ast::Stmt::Expr(ast::Expr::Str(value))) if &**value == "use strict"
-        );
-        let previous_strict = self.strict;
-        self.strict = directive_strict;
-        let result = self.run_program(&body);
-        self.strict = previous_strict;
-        Ok(match result {
+        Ok(self.eval_classic_body(&body))
+    }
+
+    /// [`Self::eval_classic_snapshot_interruptible`] for static host bootstrap code that many
+    /// Realms of this Agent install, such as a browser's Window platform prelude.
+    ///
+    /// The first call decodes the snapshot; the Agent retains the program and every later call
+    /// with the same `&'static` bytes evaluates that same Script body in the active Realm.
+    /// Each evaluation is a separate ScriptEvaluation (ECMA-262 ScriptEvaluation): Global-
+    /// DeclarationInstantiation, function objects, environments and template objects belong to
+    /// the Realm that runs it, as when the source is parsed for that Realm. What is shared is
+    /// implementation work cached on the immutable AST: hoisting plans, bytecode and native
+    /// code. Compiled code owns no JavaScript objects, and each of its caches is validated
+    /// against the live receiver, environment or Realm before it is used.
+    ///
+    /// Because the Parse Nodes are shared, evaluating the same snapshot twice in one Realm
+    /// behaves like evaluating one Script twice rather than parsing its source again: tagged
+    /// templates reuse that Realm's template objects (GetTemplateObject keys the Realm's
+    /// [[TemplateMap]] by Parse Node). Different Realms always get their own.
+    pub fn eval_shared_classic_snapshot_interruptible(
+        &mut self,
+        bytes: &'static [u8],
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        let body = self
+            .shared_snapshot_program(bytes)
+            .map_err(|message| ParseError {
+                message,
+                line: 0,
+                at_eof: false,
+            })?;
+        Ok(self.eval_classic_body(&body))
+    }
+
+    /// Evaluate a parsed or decoded Script body as one ScriptEvaluation in the active Realm.
+    fn eval_classic_body(&mut self, body: &[ast::Stmt]) -> Result<embed::Value, embed::EvalError> {
+        match self.run_classic_program(body) {
             Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {
@@ -960,7 +970,7 @@ impl interpreter::Interp {
                 Err(embed::EvalError::Interrupted(reason))
             }
             Err(_) => Ok(embed::Value::Undefined),
-        })
+        }
     }
 }
 
@@ -1098,6 +1108,23 @@ impl Engine {
         bytes: &[u8],
     ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
         let result = self.interp.eval_classic_snapshot_interruptible(bytes)?;
+        if matches!(&result, Err(embed::EvalError::Interrupted(_))) {
+            self.interp.gc_task_boundary();
+        }
+        self.interp.clear_kept_objects();
+        Ok(result)
+    }
+
+    /// [`Self::eval_snapshot_value_interruptible`] through the Agent's shared program table:
+    /// see [`embed::Ctx::eval_shared_classic_snapshot_interruptible`]. Later Realms that
+    /// evaluate the same static snapshot reuse this decode and the code compiled for it.
+    pub fn eval_shared_snapshot_value_interruptible(
+        &mut self,
+        bytes: &'static [u8],
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        let result = self
+            .interp
+            .eval_shared_classic_snapshot_interruptible(bytes)?;
         if matches!(&result, Err(embed::EvalError::Interrupted(_))) {
             self.interp.gc_task_boundary();
         }

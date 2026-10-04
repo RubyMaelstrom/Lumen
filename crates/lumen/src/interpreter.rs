@@ -2873,6 +2873,12 @@ pub struct Interp {
     /// The parsed self-hosted built-in source, shared by every Realm this interpreter creates
     /// (see `crate::self_hosted`).
     pub(crate) self_hosted: std::cell::OnceCell<Rc<crate::self_hosted::SelfHostedSource>>,
+    /// Programs decoded from static host snapshots, shared by every Realm of this Agent that
+    /// evaluates the same snapshot (see `Interp::eval_shared_classic_snapshot_interruptible`).
+    /// Keyed by the `&'static` snapshot's address and length: static bytes are immutable and
+    /// never reused, so the key identifies the content. The AST and the compiled code its
+    /// functions cache belong to this Agent's heap and never cross to another interpreter.
+    pub(crate) shared_snapshots: Vec<SharedSnapshot>,
     /// Small ordered key layouts learned from successful ordinary construction, keyed and
     /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
@@ -3261,6 +3267,7 @@ interp_memory_inventory! {
     native_callback_cache => "measured",
     proxy_trap_caches => "measured",
     self_hosted => "measured",
+    shared_snapshots => "measured",
     construct_capacity_hints => "measured",
     iterator_sym => "measured",
     wk_syms => "measured",
@@ -3379,7 +3386,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 154);
+    assert_eq!(names.len(), 155);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3730,6 +3737,18 @@ pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
 pub(crate) struct HostSettingsState {
     pub(crate) global_env: Env,
     pub(crate) global_var_names: Rc<RefCell<std::collections::HashSet<String>>>,
+}
+
+/// One decoded static host snapshot (see `Interp::shared_snapshots`). Every evaluation runs a
+/// fresh ScriptEvaluation of the same Script body in the then-active Realm: function objects,
+/// environments and template objects are created anew per Realm, while the immutable AST and
+/// the bytecode/machine code cached on its functions are shared. Compiled code holds no object
+/// owners; its caches are validated against live receivers, environments and Realms.
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+pub(crate) struct SharedSnapshot {
+    pub(crate) address: usize,
+    pub(crate) len: usize,
+    pub(crate) body: Rc<Vec<Stmt>>,
 }
 
 /// A realm's intrinsics: the global object, its environment, and the per-realm prototypes/constructors
@@ -4225,6 +4244,7 @@ impl Interp {
             native_callback_cache: None,
             proxy_trap_caches: None,
             self_hosted: std::cell::OnceCell::new(),
+            shared_snapshots: Vec::new(),
             construct_capacity_hints: Default::default(),
             iterator_sym: None,
             wk_syms: Vec::new(),
@@ -14793,6 +14813,50 @@ impl Interp {
 
     pub(crate) fn run_program(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
         self.with_script_entry(|this| this.run_program_body(body))
+    }
+
+    /// ScriptEvaluation of a classic Script body in the active Realm: its own directive
+    /// prologue decides strictness, and the caller's mode is restored afterwards.
+    #[cfg(any(feature = "embed", test))]
+    pub(crate) fn run_classic_program(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
+        let directive_strict = matches!(
+            body.first(),
+            Some(Stmt::Expr(Expr::Str(value))) if &**value == "use strict"
+        );
+        let previous_strict = std::mem::replace(&mut self.strict, directive_strict);
+        let result = self.run_program(body);
+        self.strict = previous_strict;
+        result
+    }
+
+    /// The Script body of a static host snapshot, decoded on first use and then shared by every
+    /// Realm of this Agent that evaluates it (see [`Interp::shared_snapshots`]).
+    #[cfg(any(feature = "embed", test))]
+    pub(crate) fn shared_snapshot_program(
+        &mut self,
+        bytes: &'static [u8],
+    ) -> Result<Rc<Vec<Stmt>>, String> {
+        let (address, len) = (bytes.as_ptr() as usize, bytes.len());
+        if let Some(entry) = self
+            .shared_snapshots
+            .iter()
+            .find(|entry| entry.address == address && entry.len == len)
+        {
+            return Ok(entry.body.clone());
+        }
+        let body = Rc::new(crate::snapshot::decode(bytes)?);
+        // Embedders install a handful of distinct bootstraps; keep the table bounded if one
+        // instead passes many different static snapshots.
+        const MAX_SHARED_SNAPSHOTS: usize = 8;
+        if self.shared_snapshots.len() == MAX_SHARED_SNAPSHOTS {
+            self.shared_snapshots.remove(0);
+        }
+        self.shared_snapshots.push(SharedSnapshot {
+            address,
+            len,
+            body: body.clone(),
+        });
+        Ok(body)
     }
 
     fn run_program_body(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {

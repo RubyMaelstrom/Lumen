@@ -1919,6 +1919,16 @@ fn scan_realm(
             .engine_caches
             .add(source.scan_retained_memory(visitor));
     }
+    totals.engine_caches.add(
+        interp
+            .shared_snapshots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<crate::interpreter::SharedSnapshot>()),
+    );
+    for snapshot in &interp.shared_snapshots {
+        // Identity-deduplicated with the Function/Class allocations closures retain.
+        visitor.stmt_body(&snapshot.body);
+    }
     totals
         .engine_caches
         .add(interp.fragment_cache.scan_retained_memory(visitor));
