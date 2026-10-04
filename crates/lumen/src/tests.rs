@@ -2270,6 +2270,93 @@ fn nested_default_constructors_restore_super_forwarding() {
     }
 }
 
+/// ECMA-262 §10.2.2 [[Construct]] allocates only for a base constructor, and the default
+/// derived constructor (ClassDefinitionEvaluation step 14.a) is a built-in closure. Expected
+/// values come from Node 24.
+#[test]
+fn derived_construction_follows_base_allocation_and_default_constructor_steps() {
+    let source = r#"
+        const log = [];
+        class A { constructor(...a) { log.push('A:' + a.join() + ':' + (new.target && new.target.name)); this.a = 1; } }
+        class B extends A { b = (log.push('B field:' + this.a), 2); }
+        class C extends B { c = (log.push('C field:' + this.b), 3); }
+        const c = new C(1, 2);
+        log.push([c.a, c.b, c.c, Object.getPrototypeOf(c) === C.prototype].join());
+        // OrdinaryCreateFromConstructor reads new.target's prototype once, at the base.
+        let reads = 0;
+        function NT() {}
+        const NTp = { marker: 1 };
+        const P = new Proxy(NT, { get(t, k, r) { if (k === 'prototype') { reads++; return NTp; } return Reflect.get(t, k, r); } });
+        const viaNT = Reflect.construct(C, [], P);
+        log.push('reads=' + reads + ' proto=' + (Object.getPrototypeOf(viaNT) === NTp));
+        class E2 extends A { constructor() { super(); } }
+        reads = 0; Reflect.construct(E2, [], P); log.push('explicit reads=' + reads);
+        // GetSuperConstructor reads the constructor's current [[Prototype]].
+        class X { constructor() { this.x = 'X'; } }
+        class D extends A {}
+        Object.setPrototypeOf(D, X);
+        log.push('D:' + new D().x + ':' + ('a' in new D()));
+        Object.setPrototypeOf(D, {});
+        try { new D(); } catch (e) { log.push('D bad parent:' + e.constructor.name); }
+        Object.setPrototypeOf(D, null);
+        try { new D(); } catch (e) { log.push('D null parent:' + e.constructor.name); }
+        try { C(); } catch (e) { log.push('call:' + e.constructor.name); }
+        class E extends A { constructor(r) { if (r === 1) return { o: 1 }; if (r === 2) return 5; if (r === 3) return; super(); } }
+        log.push('E1:' + JSON.stringify(new E(1)));
+        for (const r of [2, 3]) { try { new E(r); } catch (e) { log.push('E' + r + ':' + e.constructor.name); } }
+        class MyArr extends Array {} const m = new MyArr(3); log.push('MyArr:' + m.length + ':' + Array.isArray(m) + ':' + (m instanceof MyArr));
+        class MyErr extends Error {} const me = new MyErr('m'); log.push('MyErr:' + me.message + ':' + (me instanceof MyErr) + ':' + me.name);
+        class MyMap extends Map {} const mm = new MyMap([[1, 2]]); log.push('MyMap:' + mm.get(1));
+        function F(v) { this.v = v; } const BF = F.bind(null, 7); BF.prototype = F.prototype;
+        class G extends BF {} log.push('G:' + new G().v + ':' + (new G() instanceof G));
+        class H extends A { #p = 9; get p() { return this.#p; } static has(o) { return #p in o; } }
+        const h = new H(); log.push('H:' + h.p + ':' + H.has(h) + ':' + H.has(new A()));
+        log.join('|')
+    "#;
+    let expected = "A:1,2:C|B field:1|C field:2|1,2,3,true|A::NT|B field:1|C field:2|\
+        reads=1 proto=true|A::NT|explicit reads=1|D:X:false|D bad parent:TypeError|\
+        D null parent:TypeError|call:TypeError|E1:{\"o\":1}|E2:TypeError|E3:ReferenceError|\
+        MyArr:3:true:true|MyErr:m:true:Error|MyMap:2|G:7:true|A::H|A::A|H:9:true:false";
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(v) => assert_eq!(v, expected, "{tier:?}"),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
+/// The native default derived constructor keeps its frame in captured stacks.
+#[test]
+fn default_derived_constructor_frames_remain_in_error_stacks() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = "class S1 { constructor() { this.s = new Error('x').stack; } } \
+            class S2 extends S1 {} class S3 extends S2 { constructor() { super(); } } \
+            JSON.stringify([new S3().s, new S2().s])";
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(v) => assert_eq!(
+                v,
+                r#"["Error: x\n    at S1\n    at S2\n    at S3","Error: x\n    at S1\n    at S2"]"#,
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+        }
+    }
+}
+
 #[test]
 fn instanceof_default_intrinsic_and_override() {
     assert_eq!(

@@ -3956,14 +3956,7 @@ impl Interp {
         // bytecode VM uses the same two helpers with suspension between those phases.
         if matches!(callee, Expr::Super) {
             let (new_target, super_constructor) = self.prepare_super_call(env)?;
-            // The synthesized default constructor forwards the raw argument list to super
-            // (ECMA-262 ClassDefinitionEvaluation): the observable %Symbol.iterator% call of a
-            // written `super(...args)` does not happen. Any other frame falls through to the
-            // full argument evaluation below.
-            let argv = match self.super_forward_args.take() {
-                Some(forward) => Vec::from(&*forward),
-                None => self.eval_args(args, env)?,
-            };
+            let argv = self.eval_args(args, env)?;
             return self.finish_super_call(new_target, super_constructor, &argv, env);
         }
         let (func, this) = self.eval_callee_reference(callee, env)?;
@@ -6370,13 +6363,25 @@ impl Interp {
         Ok(())
     }
 
-    fn init_instance_fields(&mut self, ctor: &Value, this: &Value) -> Result<(), Abrupt> {
+    pub(crate) fn init_instance_fields(
+        &mut self,
+        ctor: &Value,
+        this: &Value,
+    ) -> Result<(), Abrupt> {
         let obj = match ctor {
             Value::Obj(o) => o.clone(),
             _ => return Ok(()),
         };
         let ptr = Rc::as_ptr(&obj) as usize;
         let (fields, field_env, initializers, priv_members) = match self.class_info.get(&ptr) {
+            // InitializeInstanceElements has nothing to add for a class without elements.
+            Some(i)
+                if i.fields.is_empty()
+                    && i.instance_initializers.is_empty()
+                    && i.private_members.is_empty() =>
+            {
+                return Ok(());
+            }
             Some(i) => (
                 i.fields.clone(),
                 i.field_env.clone(),

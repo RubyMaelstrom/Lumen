@@ -15746,18 +15746,6 @@ fn run_vm_inner<S: StoredValue>(
             Op::ArraySpread => {
                 let spread = pop!();
                 let array = stack.last().expect("array builder missing").clone();
-                // Default-constructor super spread forwards the raw argument list (ECMA-262
-                // ClassDefinitionEvaluation) without the observable %Symbol.iterator% call.
-                if let Some(forward) = i.super_forward_args.take() {
-                    for (index, value) in forward.iter().enumerate() {
-                        if index & 255 == 0 {
-                            i.interrupt_poll_force()?;
-                            i.gc_check()?;
-                        }
-                        array_literal_append(i, &array, Some(value.clone()))?;
-                    }
-                    continue;
-                }
                 let prefix = i.array_length(array.as_obj().expect("array builder"));
                 i.expand_spread(&spread, prefix, |i, value| {
                     array_literal_append(i, &array, Some(value))

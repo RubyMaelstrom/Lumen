@@ -492,11 +492,11 @@ pub struct Function {
     /// A function *expression* (`(function f(){})`): its own name binds immutably inside the
     /// function. A declaration's name binds (mutably) in the enclosing scope instead.
     pub is_fn_expr: bool,
-    /// The synthesized default constructor of a class (ECMA-262 ClassDefinitionEvaluation,
-    /// `ClassTail`: default constructors forward the raw argument list to `super` instead of
-    /// performing the observable `%Array.prototype%` iterator evaluation of a written
-    /// `constructor(...args) { super(...args); }`; see `default_constructor`). Always false for
-    /// parsed source; only the class member synthesis sets it.
+    /// The synthesized default constructor of a derived class (ECMA-262
+    /// ClassDefinitionEvaluation step 14.a). `[[Construct]]` runs it as the built-in closure it
+    /// is (`Interp::construct_default_derived`), forwarding the raw argument list without the
+    /// observable `%Array.prototype%` iteration of a written `super(...args)`; the synthesized
+    /// body is never evaluated. Always false for parsed source.
     pub default_ctor: bool,
     /// Part of the engine's self-hosted built-in source (see `crate::self_hosted`): compiled with
     /// that source's intrinsic operations, and rendered as a NativeFunction (it has no `source`).

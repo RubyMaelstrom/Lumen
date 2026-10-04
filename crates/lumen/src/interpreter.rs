@@ -2727,11 +2727,6 @@ pub struct Interp {
     /// arithmetic family and, since the comparison slice, the relational/equality family so long
     /// as both operands are primitive Numbers.
     pub(crate) tagged_arithmetic: bool,
-    /// Raw argument list being forwarded by an active synthesized default constructor to its
-    /// `super(...)` call (ECMA-262 ClassDefinitionEvaluation): present only between a default
-    /// constructor's entry and its single super spread, so the spread forwards values without
-    /// the observable %Array.prototype% iterator evaluation. `None` outside those frames.
-    pub(crate) super_forward_args: Option<Rc<[Value]>>,
     /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
     /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
     pub(crate) vm_pool: Vec<crate::execution_storage::CompactFrame>,
@@ -3238,7 +3233,6 @@ interp_memory_inventory! {
     tier => "non_owning",
     tier_threshold => "non_owning",
     tagged_arithmetic => "non_owning",
-    super_forward_args => "measured",
     vm_pool => "measured",
     native_arg_pool => "measured",
     stub_cache => "measured",
@@ -3395,7 +3389,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 157);
+    assert_eq!(names.len(), 156);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4307,7 +4301,6 @@ impl Interp {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
             tagged_arithmetic: std::env::var_os("LUMEN_TAGGED_ARITHMETIC").is_some(),
-            super_forward_args: None,
             vm_pool: Vec::new(),
             native_arg_pool: Vec::new(),
             stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
@@ -11959,11 +11952,22 @@ impl Interp {
         closure: &Env,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
+        thread_local! {
+            /// The binding names of every derived constructor's Function Environment Record.
+            static NAMES: [Rc<str>; 4] = [
+                Rc::from("%newtarget%"),
+                Rc::from("this"),
+                Rc::from("%supercallok%"),
+                Rc::from("%superpropok%"),
+            ];
+        }
+        let [new_target_name, this_name, super_call_name, super_prop_name] =
+            NAMES.with(|names| names.clone());
         let env = new_var_scope(Some(closure.clone()));
         {
             let mut scope = env.borrow_mut();
             scope.vars.insert(
-                "%newtarget%".to_string(),
+                new_target_name,
                 Binding {
                     value: self.new_target.clone(),
                     mutable: false,
@@ -11975,7 +11979,7 @@ impl Interp {
                 },
             );
             scope.vars.insert(
-                "this".to_string(),
+                this_name,
                 Binding {
                     value: Value::Undefined,
                     mutable: false,
@@ -11987,11 +11991,11 @@ impl Interp {
                 },
             );
             scope.vars.insert(
-                "%supercallok%".to_string(),
+                super_call_name,
                 Binding::data(Value::Bool(true), false, true),
             );
             scope.vars.insert(
-                "%superpropok%".to_string(),
+                super_prop_name,
                 Binding::data(Value::Bool(true), false, true),
             );
         }
@@ -12085,19 +12089,7 @@ impl Interp {
             strict: func.is_strict,
             extra: None,
         });
-        // A synthesized default constructor forwards its raw argument list to `super(...)`
-        // (ECMA-262 ClassDefinitionEvaluation); restore any outer forward so nested default
-        // constructors inside field initializers do not leak theirs across frames.
-        let saved_forward = std::mem::replace(
-            &mut self.super_forward_args,
-            if func.default_ctor {
-                Some(Rc::from(args))
-            } else {
-                None
-            },
-        );
         let r = self.call_user_inner(func, closure, this, args, is_construct, fn_obj);
-        self.super_forward_args = saved_forward;
         self.fn_frames.pop();
         r
     }
@@ -14771,6 +14763,21 @@ impl Interp {
                 {
                     return Err(self.throw("TypeError", "this function is not a constructor"));
                 }
+                let ctor_key = Rc::as_ptr(&obj) as usize;
+                // ECMA-262 §10.2.2 [[Construct]] step 3 allocates only for a base constructor. A
+                // derived constructor's `this` is bound by super(), whose base constructor reads
+                // new.target's `prototype` exactly once for the whole chain.
+                if self
+                    .class_info
+                    .get(&ctor_key)
+                    .is_some_and(|class| class.derived)
+                {
+                    if user.func.default_ctor {
+                        return self.construct_default_derived(&obj, args, new_target);
+                    }
+                    self.pending_new_target = new_target;
+                    return self.run_constructor_on(&callee, &Value::Undefined, args);
+                }
                 // OrdinaryCreateFromConstructor: the new instance's prototype comes from
                 // new.target; a non-object `prototype` falls back to new.target's realm's
                 // %Object.prototype% (GetFunctionRealm).
@@ -14786,7 +14793,6 @@ impl Interp {
                             .or_else(|| Some(self.object_proto.clone()))
                     }
                 };
-                let ctor_key = Rc::as_ptr(&obj) as usize;
                 let layout = self.learned_construct_layout(&obj);
                 let capacity = layout.as_ref().map_or(0, |keys| keys.len());
                 let this = Object::new_with_parts(
@@ -14796,8 +14802,8 @@ impl Interp {
                 );
                 let this_val = Value::Obj(this.clone());
                 self.pending_new_target = new_target.clone();
-                // Class constructors run field initializers (and, when derived, defer `this` setup
-                // to `super()`); plain function constructors just run their body.
+                // Base class constructors run their field initializers before the body; plain
+                // function constructors just run their body.
                 let ret = if self.class_info.contains_key(&ctor_key) {
                     self.run_constructor_on(&callee, &this_val, args)?
                 } else {
@@ -14815,8 +14821,7 @@ impl Interp {
                 // spare capacity for the machine-code creation caches. The hint changes only
                 // allocation size; all writes still perform their normal live semantic guards.
                 self.observe_construct_capacity(&obj, &this);
-                // A constructor explicitly returning an object overrides the instance;
-                // derived-constructor return/`this` validation already happened in call_user.
+                // A constructor explicitly returning an object overrides the instance.
                 Ok(match ret {
                     Value::Obj(_) => ret,
                     _ => this_val,
@@ -14842,6 +14847,38 @@ impl Interp {
             | Callable::PropGet(_)
             | Callable::PropSet(_) => Err(self.throw("TypeError", "value is not a constructor")),
         }
+    }
+
+    /// The default constructor of a derived class (ECMA-262 ClassDefinitionEvaluation, step
+    /// 14.a): Construct(F.[[GetPrototypeOf]](), args, NewTarget), then
+    /// InitializeInstanceElements(result, F). It is a built-in abstract closure, so it creates
+    /// no Function Environment Record and its argument forwarding iterates nothing. The frame
+    /// remains visible to stack capture like the synthesized body it replaces.
+    fn construct_default_derived(
+        &mut self,
+        ctor: &Gc,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Abrupt> {
+        self.fn_frames.push(FnFrame {
+            fn_ptr: Rc::as_ptr(ctor) as usize,
+            coro: self.cur_coro,
+            strict: true,
+            extra: None,
+        });
+        let result = (|| {
+            // GetSuperConstructor, exactly as a written super() call performs it.
+            let parent = crate::builtins::js_get_prototype_of(self, &Value::Obj(ctor.clone()))
+                .map_err(Abrupt::Throw)?;
+            if !self.value_is_constructor(&parent) {
+                return Err(self.throw("TypeError", "super constructor is not a constructor"));
+            }
+            let result = self.construct_nt(parent, args, new_target)?;
+            self.init_instance_fields(&Value::Obj(ctor.clone()), &result)?;
+            Ok(result)
+        })();
+        self.fn_frames.pop();
+        result
     }
 
     // ----- program / statement execution ------------------------------------------------------
