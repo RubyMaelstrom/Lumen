@@ -3,6 +3,7 @@
 
 use crate::ast::*;
 use crate::lexer::tokenize_with_source;
+use crate::stack_trace::{ScriptSource, SourceKind, SourceOrigin, NO_POSITION};
 use crate::token::{Tok, Token, TplPart};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,51 +29,70 @@ pub struct ParseError {
 /// Parse a complete script. `strict` seeds strict mode (e.g. for the strict test262 variant); a
 /// `"use strict"` directive prologue also turns it on.
 pub fn parse_script(src: &str, strict: bool) -> Result<Vec<Stmt>, ParseError> {
-    parse_script_eval(src, strict, false, false, &[])
+    parse_script_from(src, strict, SourceKind::Script, None).map(|(body, _)| body)
+}
+
+/// Parse a script whose stack frames report `origin` (see [`crate::stack_trace`]), returning
+/// the source record its positions index; `kind` says whether it is a script or the source text
+/// of a dynamic function.
+pub(crate) fn parse_script_from(
+    src: &str,
+    strict: bool,
+    kind: SourceKind,
+    origin: Option<&SourceOrigin<'_>>,
+) -> Result<(Vec<Stmt>, Rc<ScriptSource>), ParseError> {
+    let (body, source) = parse_script_with(src, strict, false, false, &[], Some((kind, origin)))?;
+    Ok((body, source.expect("parsed with a source record")))
 }
 
 /// Parse eval code. Like [`parse_script`], but `allow_new_target` permits a top-level `new.target`
-/// (a direct eval whose caller is inside a function).
+/// (a direct eval whose caller is inside a function). Returns the source record too.
 pub fn parse_script_eval(
     src: &str,
     strict: bool,
     allow_new_target: bool,
     allow_super: bool,
     private_names: &[String],
-) -> Result<Vec<Stmt>, ParseError> {
-    parse_script_with(
+) -> Result<(Vec<Stmt>, Rc<ScriptSource>), ParseError> {
+    let (body, source) = parse_script_with(
         src,
         strict,
         allow_new_target,
         allow_super,
         private_names,
-        false,
-    )
+        Some((SourceKind::Eval, None)),
+    )?;
+    Ok((body, source.expect("parsed with a source record")))
 }
 
 /// Parse the engine's self-hosted built-in source (strict script code; see
 /// `crate::self_hosted`). Every function it contains is marked [`Function::self_hosted`] and
 /// retains no source text.
 pub(crate) fn parse_self_hosted(src: &str) -> Result<Vec<Stmt>, ParseError> {
-    parse_script_with(src, true, false, false, &[], true)
+    parse_script_with(src, true, false, false, &[], None).map(|(body, _)| body)
 }
 
+/// `source` is the kind and origin of the text, or None for self-hosted built-in source, which
+/// has no positions. Returns the source record created for the text.
 fn parse_script_with(
     src: &str,
     strict: bool,
     allow_new_target: bool,
     allow_super: bool,
     private_names: &[String],
-    self_hosted: bool,
-) -> Result<Vec<Stmt>, ParseError> {
+    source: Option<(SourceKind, Option<&SourceOrigin<'_>>)>,
+) -> Result<(Vec<Stmt>, Option<Rc<ScriptSource>>), ParseError> {
     let lexed = tokenize_with_source(src).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
         at_eof: e.at_eof,
     })?;
+    let self_hosted = source.is_none();
     let mut p = Parser {
         toks: lexed.tokens,
         pos: 0,
+        script: source.map(|(kind, origin)| ScriptSource::new(lexed.source.clone(), kind, origin)),
+        base: 0,
         src: lexed.source,
         strict,
         depth: 0,
@@ -141,12 +161,22 @@ fn parse_script_with(
             });
         }
     }
-    Ok(body)
+    Ok((body, p.script))
 }
 
 /// Parse a module (always strict; `import`/`export` are allowed only here). Modules permit top-level
 /// `await`, so `await` is treated as a keyword at the module's top level.
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
+    parse_module_from(src, None).map(|(body, _)| body)
+}
+
+/// [`parse_module`] for a module whose stack frames report `origin`, returning the source
+/// record its positions index.
+pub(crate) fn parse_module_from(
+    src: &str,
+    origin: Option<&SourceOrigin<'_>>,
+) -> Result<(Vec<Stmt>, Rc<ScriptSource>), ParseError> {
     let lexed = crate::lexer::tokenize_goal_with_source(src, false).map_err(|e| ParseError {
         at_eof: e.at_eof,
         message: e.message,
@@ -155,6 +185,12 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
     let mut p = Parser {
         toks: lexed.tokens,
         pos: 0,
+        script: Some(ScriptSource::new(
+            lexed.source.clone(),
+            SourceKind::Module,
+            origin,
+        )),
+        base: 0,
         src: lexed.source,
         strict: true,
         depth: 0,
@@ -204,7 +240,8 @@ pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
         message,
         line: 0,
     })?;
-    Ok(body)
+    let source = p.script.expect("modules have a source record");
+    Ok((body, source))
 }
 
 /// Module-level early errors: ExportedNames must be unique, top-level lexical+import bindings must be
@@ -371,6 +408,10 @@ struct Parser {
     pos: usize,
     /// The source text, for slicing function source text by token (byte) offsets.
     src: Rc<str>,
+    /// The whole parsed text, which AST positions index (None for self-hosted source).
+    script: Option<Rc<ScriptSource>>,
+    /// Byte offset of `src` within `script`: nonzero for a template substitution's sub-parser.
+    base: u32,
     strict: bool,
     depth: u32,
     /// Whether the body currently being parsed is a generator / async function — controls whether
@@ -455,6 +496,23 @@ struct DeclScope {
 }
 
 impl Parser {
+    /// Byte offset of token `index` in the whole parsed text (an AST position).
+    fn tok_pos(&self, index: usize) -> u32 {
+        self.base + self.toks[index].start
+    }
+    /// The AST position of the current token.
+    fn cur_pos(&self) -> u32 {
+        self.tok_pos(self.pos)
+    }
+    /// V8's position for a call whose `(` is the current token: the callee's last token when
+    /// it is an identifier or `super` (`f()`, `o.method()`), else the parenthesis.
+    fn call_pos(&self) -> u32 {
+        match self.pos.checked_sub(1).map(|prev| &self.toks[prev].kind) {
+            Some(Tok::Ident(name)) if !name.starts_with('#') => self.tok_pos(self.pos - 1),
+            Some(Tok::Keyword("super")) => self.tok_pos(self.pos - 1),
+            _ => self.cur_pos(),
+        }
+    }
     fn cur_start(&self) -> u32 {
         self.toks.get(self.pos).map(|t| t.start).unwrap_or(0)
     }
@@ -1536,7 +1594,7 @@ impl Parser {
             if of
                 && !is_await
                 && bare_async_head
-                && matches!(&init_expr, Expr::Ident(n) if n == "async")
+                && matches!(&init_expr, Expr::Ident(n, _) if n == "async")
             {
                 return Err(ParseError {
                     at_eof: false,
@@ -2169,15 +2227,16 @@ impl Parser {
                 // `undefined` is an ordinary identifier as an assignment target: the write fails
                 // at runtime (strict TypeError on the non-writable global), not at parse.
                 if matches!(left, Expr::Undefined) {
-                    left = Expr::Ident("undefined".to_string());
+                    left = Expr::Ident("undefined".to_string(), NO_POSITION);
                 }
+                let pos = self.cur_pos();
                 self.advance();
                 let mut value = self.parse_assign()?;
                 // NamedEvaluation applies only to an IdentifierReference target: `(x) = fn` does
                 // not name the function. A transparent one-element Seq hides the anonymity.
                 if matches!(op, "=" | "&&=" | "||=" | "??=")
                     && left_paren
-                    && matches!(left, Expr::Ident(_))
+                    && matches!(left, Expr::Ident(_, _))
                     && (matches!(&value, Expr::Func(f) if f.name.is_none())
                         || matches!(&value, Expr::Class(c) if c.name.is_none()))
                 {
@@ -2215,7 +2274,7 @@ impl Parser {
                 }
                 // Assigning to `eval`/`arguments` is a SyntaxError in strict mode.
                 if self.strict {
-                    if let Expr::Ident(n) = &left {
+                    if let Expr::Ident(n, _) = &left {
                         if n == "eval" || n == "arguments" {
                             return self
                                 .err("cannot assign to 'eval' or 'arguments' in strict mode");
@@ -2226,6 +2285,7 @@ impl Parser {
                     op,
                     target: Box::new(left),
                     value: Box::new(value),
+                    pos,
                 });
             }
         }
@@ -2317,10 +2377,10 @@ impl Parser {
             } else if op == "in" {
                 // `#field in obj` is the ergonomic brand check, not a normal `in`; the RHS
                 // itself may not be a bare private name (`#f in #f in x` is a SyntaxError).
-                if matches!(&right, Expr::Ident(r) if r.starts_with('#')) {
+                if matches!(&right, Expr::Ident(r, _) if r.starts_with('#')) {
                     return self.err("a private name may only appear to the left of 'in'");
                 }
-                if let Expr::Ident(n) = &left {
+                if let Expr::Ident(n, _) = &left {
                     if n.starts_with('#') {
                         left = Expr::PrivateIn {
                             name: n.clone(),
@@ -2420,10 +2480,10 @@ impl Parser {
             // `undefined` is an ordinary identifier reference as a delete operand (the global
             // property is non-configurable, so the delete evaluates to false).
             if op == "delete" && matches!(arg, Expr::Undefined) {
-                arg = Expr::Ident("undefined".to_string());
+                arg = Expr::Ident("undefined".to_string(), NO_POSITION);
             }
             // Deleting a bare variable reference is a SyntaxError in strict mode.
-            if op == "delete" && self.strict && matches!(arg, Expr::Ident(_)) {
+            if op == "delete" && self.strict && matches!(arg, Expr::Ident(_, _)) {
                 return self.err("delete of an unqualified identifier in strict mode");
             }
             // Deleting a private member (`delete obj.#x`) is always a SyntaxError.
@@ -2457,7 +2517,7 @@ impl Parser {
     fn check_strict_update_target(&self, arg: &Expr) -> Result<(), ParseError> {
         // The operand of `++`/`--` must be a simple assignment target (Identifier or member access).
         match arg {
-            Expr::Ident(n) => {
+            Expr::Ident(n, _) => {
                 if self.strict && (n == "eval" || n == "arguments") {
                     return self
                         .err("cannot increment/decrement 'eval' or 'arguments' in strict mode");
@@ -2491,13 +2551,16 @@ impl Parser {
         let mut had_optional = false;
         loop {
             if self.is_punct("(") {
+                let pos = self.call_pos();
                 let args = self.parse_args()?;
                 expr = Expr::Call {
                     callee: Box::new(expr),
                     args,
                     optional: false,
+                    pos,
                 };
             } else if self.eat_punct(".") {
+                let pos = self.cur_pos();
                 let name = self.parse_property_name_ident()?;
                 // `super.#x` is an early SyntaxError.
                 if name.starts_with('#') && matches!(expr, Expr::Super) {
@@ -2507,14 +2570,18 @@ impl Parser {
                     obj: Box::new(expr),
                     prop: name,
                     optional: false,
+                    pos,
                 };
-            } else if self.eat_punct("[") {
+            } else if self.is_punct("[") {
+                let pos = self.cur_pos();
+                self.advance();
                 let index = self.parse_expr_allow_in()?;
                 self.expect_punct("]")?;
                 expr = Expr::Index {
                     obj: Box::new(expr),
                     index: Box::new(index),
                     optional: false,
+                    pos,
                 };
             } else if let Tok::Template(parts) = self.cur().clone() {
                 if had_optional {
@@ -2526,26 +2593,33 @@ impl Parser {
             } else if self.eat_punct("?.") {
                 had_optional = true;
                 if self.is_punct("(") {
+                    let pos = self.call_pos();
                     let args = self.parse_args()?;
                     expr = Expr::Call {
                         callee: Box::new(expr),
                         args,
                         optional: true,
+                        pos,
                     };
-                } else if self.eat_punct("[") {
+                } else if self.is_punct("[") {
+                    let pos = self.cur_pos();
+                    self.advance();
                     let index = self.parse_expr_allow_in()?;
                     self.expect_punct("]")?;
                     expr = Expr::Index {
                         obj: Box::new(expr),
                         index: Box::new(index),
                         optional: true,
+                        pos,
                     };
                 } else {
+                    let pos = self.cur_pos();
                     let name = self.parse_property_name_ident()?;
                     expr = Expr::Member {
                         obj: Box::new(expr),
                         prop: name,
                         optional: true,
+                        pos,
                     };
                 }
             } else {
@@ -2562,6 +2636,7 @@ impl Parser {
     /// MemberExpression without trailing calls — handles `new` and `.`/`[]` member tails.
     fn parse_member_expr(&mut self) -> Result<Expr, ParseError> {
         let mut base = if self.is_kw("new") {
+            let new_pos = self.cur_pos();
             let new_escaped = self.cur_escaped();
             if new_escaped {
                 return self.err("'new' must not contain escape sequences");
@@ -2611,6 +2686,7 @@ impl Parser {
                 Expr::New {
                     callee: Box::new(callee),
                     args,
+                    pos: new_pos,
                 }
             }
         } else {
@@ -2618,6 +2694,7 @@ impl Parser {
         };
         loop {
             if self.eat_punct(".") {
+                let pos = self.cur_pos();
                 let name = self.parse_property_name_ident()?;
                 // `super.#x` is an early SyntaxError.
                 if name.starts_with('#') && matches!(base, Expr::Super) {
@@ -2627,19 +2704,23 @@ impl Parser {
                     obj: Box::new(base),
                     prop: name,
                     optional: false,
+                    pos,
                 };
             } else if let Tok::Template(parts) = self.cur().clone() {
                 // A tagged template is itself a MemberExpression: `new tag\`t\`` invokes the
                 // tag and constructs its result.
                 self.advance();
                 base = self.build_tagged_template(base, parts)?;
-            } else if self.eat_punct("[") {
+            } else if self.is_punct("[") {
+                let pos = self.cur_pos();
+                self.advance();
                 let index = self.parse_expr_allow_in()?;
                 self.expect_punct("]")?;
                 base = Expr::Index {
                     obj: Box::new(base),
                     index: Box::new(index),
                     optional: false,
+                    pos,
                 };
             } else {
                 break;
@@ -2827,6 +2908,7 @@ impl Parser {
                 Ok(Expr::Func(Rc::new(f)))
             }
             Tok::Ident(name) => {
+                let pos = self.cur_pos();
                 self.advance();
                 // A strict-mode future-reserved word (yield, let, static, implements, …) cannot be
                 // used as an identifier reference — but eval/arguments are only restricted as
@@ -2850,7 +2932,7 @@ impl Parser {
                 }
                 match name.as_str() {
                     "undefined" => Ok(Expr::Undefined),
-                    _ => Ok(Expr::Ident(name)),
+                    _ => Ok(Expr::Ident(name, pos)),
                 }
             }
             Tok::Punct("(") => {
@@ -2882,6 +2964,54 @@ impl Parser {
         }
     }
 
+    /// A parser for the expression in a template substitution: `src` starts at byte `start` of
+    /// this parser's text and inherits its context.
+    fn sub_parser(&self, src: &str, start: u32) -> Result<Parser, ParseError> {
+        let lexed =
+            crate::lexer::tokenize_goal_with_source(src, !self.module).map_err(|e| ParseError {
+                at_eof: false,
+                message: e.message,
+                line: e.line,
+            })?;
+        Ok(Parser {
+            toks: lexed.tokens,
+            pos: 0,
+            src: lexed.source,
+            script: self.script.clone(),
+            base: self.base + start,
+            strict: self.strict,
+            depth: self.depth,
+            in_generator: self.in_generator,
+            in_async: self.in_async,
+            in_params: self.in_params,
+            no_in: false,
+            module: self.module,
+            fn_depth: self.fn_depth,
+            nonarrow_fn_depth: self.nonarrow_fn_depth,
+            iter_depth: self.iter_depth,
+            switch_depth: self.switch_depth,
+            labels: Vec::new(),
+            iter_labels: Vec::new(),
+            decl_scopes: vec![DeclScope {
+                fn_boundary: true,
+                ..Default::default()
+            }],
+            next_scope_is_fn_boundary: false,
+            allow_new_target: self.allow_new_target,
+            top_level: false,
+            super_prop_ok: self.super_prop_ok,
+            super_call_ok: self.super_call_ok,
+            in_derived_class: false,
+            in_case_clause: false,
+            no_arguments_refs: false,
+            proto_dups: Vec::new(),
+            last_paren: false,
+            single_stmt: false,
+            in_static_block: false,
+            self_hosted: self.self_hosted,
+        })
+    }
+
     /// Desugar a template literal into a string concatenation: cooked chunks become string
     /// literals, `${...}` holes are sub-parsed as expressions. Starting from a string literal makes
     /// every `+` a string concatenation (which ToString-coerces each substitution).
@@ -2896,48 +3026,8 @@ impl Parser {
                         return self.err("invalid escape sequence in template literal");
                     }
                 },
-                TplPart::Sub(src) => {
-                    let lexed = crate::lexer::tokenize_goal_with_source(&src, !self.module)
-                        .map_err(|e| ParseError {
-                            at_eof: false,
-                            message: e.message,
-                            line: e.line,
-                        })?;
-                    let mut sub = Parser {
-                        toks: lexed.tokens,
-                        pos: 0,
-                        src: lexed.source,
-                        strict: self.strict,
-                        depth: self.depth,
-                        in_generator: self.in_generator,
-                        in_async: self.in_async,
-                        in_params: self.in_params,
-                        no_in: false,
-                        module: self.module,
-                        fn_depth: self.fn_depth,
-                        nonarrow_fn_depth: self.nonarrow_fn_depth,
-                        iter_depth: self.iter_depth,
-                        switch_depth: self.switch_depth,
-                        labels: Vec::new(),
-                        iter_labels: Vec::new(),
-                        decl_scopes: vec![DeclScope {
-                            fn_boundary: true,
-                            ..Default::default()
-                        }],
-                        next_scope_is_fn_boundary: false,
-                        allow_new_target: self.allow_new_target,
-                        top_level: false,
-                        super_prop_ok: self.super_prop_ok,
-                        super_call_ok: self.super_call_ok,
-                        in_derived_class: false,
-                        in_case_clause: false,
-                        no_arguments_refs: false,
-                        proto_dups: Vec::new(),
-                        last_paren: false,
-                        single_stmt: false,
-                        in_static_block: false,
-                        self_hosted: self.self_hosted,
-                    };
+                TplPart::Sub(src, start) => {
+                    let mut sub = self.sub_parser(&src, start)?;
                     // A substitution is ToString'd (string hint), not concatenated raw.
                     let e = sub.parse_expr()?;
                     self.proto_dups.append(&mut sub.proto_dups);
@@ -2961,53 +3051,15 @@ impl Parser {
         tag: Expr,
         parts: Vec<TplPart>,
     ) -> Result<Expr, ParseError> {
+        // Called just after the template token, which is where V8 places the tag's call.
+        let pos = self.tok_pos(self.pos - 1);
         let mut quasis = Vec::new();
         let mut subs = Vec::new();
         for part in parts {
             match part {
                 TplPart::Str { cooked, raw } => quasis.push((cooked, raw)),
-                TplPart::Sub(src) => {
-                    let lexed = crate::lexer::tokenize_goal_with_source(&src, !self.module)
-                        .map_err(|e| ParseError {
-                            at_eof: false,
-                            message: e.message,
-                            line: e.line,
-                        })?;
-                    let mut sub = Parser {
-                        toks: lexed.tokens,
-                        pos: 0,
-                        src: lexed.source,
-                        strict: self.strict,
-                        depth: self.depth,
-                        in_generator: self.in_generator,
-                        in_async: self.in_async,
-                        in_params: self.in_params,
-                        no_in: false,
-                        module: self.module,
-                        fn_depth: self.fn_depth,
-                        nonarrow_fn_depth: self.nonarrow_fn_depth,
-                        iter_depth: self.iter_depth,
-                        switch_depth: self.switch_depth,
-                        labels: Vec::new(),
-                        iter_labels: Vec::new(),
-                        decl_scopes: vec![DeclScope {
-                            fn_boundary: true,
-                            ..Default::default()
-                        }],
-                        next_scope_is_fn_boundary: false,
-                        allow_new_target: self.allow_new_target,
-                        top_level: false,
-                        super_prop_ok: self.super_prop_ok,
-                        super_call_ok: self.super_call_ok,
-                        in_derived_class: false,
-                        in_case_clause: false,
-                        no_arguments_refs: false,
-                        proto_dups: Vec::new(),
-                        last_paren: false,
-                        single_stmt: false,
-                        in_static_block: false,
-                        self_hosted: self.self_hosted,
-                    };
+                TplPart::Sub(src, start) => {
+                    let mut sub = self.sub_parser(&src, start)?;
                     let e = sub.parse_expr()?;
                     self.proto_dups.append(&mut sub.proto_dups);
                     subs.push(e);
@@ -3018,7 +3070,8 @@ impl Parser {
             tag: Box::new(tag),
             site: next_template_site_id(),
             quasis,
-            subs,
+            subs: subs.into_boxed_slice(),
+            pos,
         })
     }
 
@@ -3189,8 +3242,10 @@ impl Parser {
                 match &key {
                     PropKey::Ident(name) => {
                         self.check_shorthand_ident(name)?;
-                        let ident = Expr::Ident(name.clone());
-                        let value = if self.eat_punct("=") {
+                        let ident = Expr::Ident(name.clone(), self.tok_pos(self.pos - 1));
+                        let value = if self.is_punct("=") {
+                            let pos = self.cur_pos();
+                            self.advance();
                             // CoverInitializedName: only valid when the literal is reinterpreted
                             // as a destructuring pattern; as a plain literal it is a SyntaxError
                             // (deferred exactly like duplicate `__proto__`).
@@ -3204,6 +3259,7 @@ impl Parser {
                                 op: "=",
                                 target: Box::new(ident),
                                 value: Box::new(default),
+                                pos,
                             };
                             props.push(PropDef::Cover { key, value });
                             if !self.eat_punct(",") {
@@ -3370,6 +3426,8 @@ impl Parser {
             default_ctor: false,
             self_hosted: self.self_hosted,
             source: self.src_slice(start, self.prev_end()),
+            script: self.script.clone(),
+            start: self.base + start,
         };
         // A function declaration/expression is never a derived constructor, so a `super(...)` call
         // in its body or parameters is an early SyntaxError.
@@ -3400,6 +3458,7 @@ impl Parser {
             self.expect_punct(")")?;
             return Ok(e);
         }
+        let pos = self.cur_pos();
         let name = match self.cur().clone() {
             Tok::Ident(n) => {
                 self.advance();
@@ -3411,21 +3470,25 @@ impl Parser {
             }
             _ => return self.err("expected a decorator expression after '@'"),
         };
-        let mut expr = Expr::Ident(name);
+        let mut expr = Expr::Ident(name, pos);
         while self.eat_punct(".") {
+            let pos = self.cur_pos();
             let prop = self.parse_property_name_ident()?;
             expr = Expr::Member {
                 obj: Box::new(expr),
                 prop,
                 optional: false,
+                pos,
             };
         }
         if self.is_punct("(") {
+            let pos = self.call_pos();
             let args = self.parse_args()?;
             expr = Expr::Call {
                 callee: Box::new(expr),
                 args,
                 optional: false,
+                pos,
             };
         }
         Ok(expr)
@@ -3502,6 +3565,8 @@ impl Parser {
             members,
             decorators,
             source: self.src_slice(class_start, self.prev_end()),
+            script: self.script.clone(),
+            start: self.base + class_start,
         })
     }
 
@@ -3529,6 +3594,7 @@ impl Parser {
         // where `new.target` is valid (evaluates to undefined).
         // (get/set before a `*` is a *field* named get/set followed by a generator method.)
         if is_static && self.is_punct("{") {
+            let block_start = self.cur_pos();
             self.advance();
             let ssuper = std::mem::replace(&mut self.super_prop_ok, true);
             let scall = std::mem::replace(&mut self.super_call_ok, false);
@@ -3577,6 +3643,8 @@ impl Parser {
                 default_ctor: false,
                 self_hosted: self.self_hosted,
                 source: None,
+                script: self.script.clone(),
+                start: block_start,
             };
             return Ok(vec![ClassMember {
                 key: PropKey::Ident(String::new()),
@@ -3757,6 +3825,8 @@ impl Parser {
             default_ctor: false,
             self_hosted: self.self_hosted,
             source: self.src_slice(start, self.prev_end()),
+            script: self.script.clone(),
+            start: self.base + start,
         })
     }
 
@@ -4002,6 +4072,8 @@ impl Parser {
                 default_ctor: false,
                 self_hosted: self.self_hosted,
                 source: self.src_slice(start, self.prev_end()),
+                script: self.script.clone(),
+                start: self.base + start,
             }
         } else {
             let expr = self.parse_assign()?;
@@ -4026,6 +4098,8 @@ impl Parser {
                 default_ctor: false,
                 self_hosted: self.self_hosted,
                 source: self.src_slice(start, self.prev_end()),
+                script: self.script.clone(),
+                start: self.base + start,
             }
         };
         self.in_async = sa;
@@ -4077,7 +4151,10 @@ fn is_assign_op(op: &str) -> bool {
 }
 
 fn is_valid_assign_target(e: &Expr) -> bool {
-    matches!(e, Expr::Ident(_) | Expr::Member { .. } | Expr::Index { .. })
+    matches!(
+        e,
+        Expr::Ident(_, _) | Expr::Member { .. } | Expr::Index { .. }
+    )
 }
 
 /// Whether an array/object literal is a valid *destructuring assignment* pattern. Unlike a binding
@@ -4088,7 +4165,7 @@ fn valid_assignment_pattern(e: &Expr) -> bool {
     fn simple(e: &Expr) -> bool {
         matches!(
             e,
-            Expr::Ident(_)
+            Expr::Ident(_, _)
                 | Expr::Member {
                     optional: false,
                     ..
@@ -4139,7 +4216,7 @@ fn valid_assignment_pattern(e: &Expr) -> bool {
 fn pattern_strict_banned(e: &Expr) -> bool {
     let banned = |n: &str| n == "eval" || n == "arguments";
     match e {
-        Expr::Ident(n) => banned(n),
+        Expr::Ident(n, _) => banned(n),
         Expr::Array(elems) => elems.iter().any(|el| match el {
             ArrayElem::Hole => false,
             ArrayElem::Spread(t) => pattern_strict_banned(t),
@@ -4198,6 +4275,7 @@ fn pattern_has_stray_cover(e: &Expr) -> bool {
                 op: "=",
                 target: t,
                 value,
+                ..
             }) => target(t) || generic(value),
             ArrayElem::Item(t) => target(t),
         }),
@@ -4208,6 +4286,7 @@ fn pattern_has_stray_cover(e: &Expr) -> bool {
                         op: "=",
                         target: t,
                         value,
+                        ..
                     },
                 ..
             }
@@ -4217,6 +4296,7 @@ fn pattern_has_stray_cover(e: &Expr) -> bool {
                         op: "=",
                         target: t,
                         value,
+                        ..
                     },
                 ..
             }
@@ -4224,6 +4304,7 @@ fn pattern_has_stray_cover(e: &Expr) -> bool {
                 op: "=",
                 target: t,
                 value,
+                ..
             }) => target(t) || generic(value),
             PropDef::KeyValue { value, .. } | PropDef::Proto(value) => target(value),
             PropDef::Spread(t) => target(t),
@@ -4235,7 +4316,7 @@ fn pattern_has_stray_cover(e: &Expr) -> bool {
 
 fn is_valid_assign_pattern(e: &Expr) -> bool {
     match e {
-        Expr::Ident(_) => true,
+        Expr::Ident(_, _) => true,
         Expr::Member {
             optional: false, ..
         }
@@ -4585,7 +4666,7 @@ fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
     match expr {
         // A bare private name is only grammatical as `#x in obj` (parsed as PrivateIn); anywhere
         // else — `#x`, `!#x`, `1 + #x` — it is a SyntaxError.
-        Expr::Ident(n) if n.starts_with('#') => {
+        Expr::Ident(n, _) if n.starts_with('#') => {
             return Err(format!(
                 "private name '{n}' may only be used in a member access or 'in' expression"
             ));
@@ -4636,7 +4717,7 @@ fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
             pn_expr(callee, st)?;
             pn_args(args, st)?;
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, .. } => {
             pn_expr(callee, st)?;
             pn_args(args, st)?;
         }
@@ -4794,8 +4875,8 @@ fn is_strict_reserved_binding(name: &str) -> bool {
 fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
     match e {
         // A bare private name is never an assignment target.
-        Expr::Ident(name) if name.starts_with('#') => None,
-        Expr::Ident(name) => Some(Pattern::Ident(name.clone())),
+        Expr::Ident(name, _) if name.starts_with('#') => None,
+        Expr::Ident(name, _) => Some(Pattern::Ident(name.clone())),
         Expr::Array(elems) => {
             let mut out = Vec::new();
             for (idx, el) in elems.iter().enumerate() {
@@ -4812,6 +4893,7 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                         op: "=",
                         target,
                         value,
+                        ..
                     }) => out.push(ArrayPatElem::Elem {
                         pattern: expr_to_pattern(target)?,
                         default: Some((**value).clone()),
@@ -4837,6 +4919,7 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                                 op: "=",
                                 target,
                                 value: d,
+                                ..
                             } => (expr_to_pattern(target)?, Some((**d).clone())),
                             v => (expr_to_pattern(v)?, None),
                         };
@@ -4853,6 +4936,7 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                                 op: "=",
                                 target,
                                 value: d,
+                                ..
                             } => (expr_to_pattern(target)?, Some((**d).clone())),
                             v => (expr_to_pattern(v)?, None),
                         };
@@ -4862,7 +4946,7 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                             default,
                         });
                     }
-                    PropDef::Spread(Expr::Ident(name)) => pat.rest = Some(name.clone()),
+                    PropDef::Spread(Expr::Ident(name, _)) => pat.rest = Some(name.clone()),
                     _ => return None,
                 }
             }

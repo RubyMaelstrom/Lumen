@@ -142,6 +142,7 @@ mod shared_layout_tests;
 mod shared_snapshot_realm_tests;
 mod snapshot;
 mod spread;
+mod stack_trace;
 #[cfg(test)]
 mod string_concat_tests;
 #[cfg(test)]
@@ -210,6 +211,7 @@ use std::time::{Duration, Instant};
 use value::Value;
 
 pub use interrupt::{InterruptReason, RuntimeInterrupt};
+pub use stack_trace::SourceOrigin;
 
 /// Unstable, opt-in process JIT/collector and per-Agent managed-memory diagnostics for Lumen's
 /// own benchmark tooling.
@@ -396,6 +398,25 @@ fn parse_host_script(src: &str, strict: bool) -> Result<Vec<ast::Stmt>, parser::
     parser::parse_script(&jstr::from_text(src), strict)
 }
 
+/// Parse an embedder's script whose stack frames report `origin` (`<anonymous>` when None).
+fn parse_host_script_from(
+    src: &str,
+    strict: bool,
+    origin: Option<&SourceOrigin<'_>>,
+) -> Result<(Vec<ast::Stmt>, std::rc::Rc<stack_trace::ScriptSource>), ParseError> {
+    parser::parse_script_from(
+        &jstr::from_text(src),
+        strict,
+        stack_trace::SourceKind::Script,
+        origin,
+    )
+    .map_err(|error| ParseError {
+        message: error.message,
+        line: error.line,
+        at_eof: error.at_eof,
+    })
+}
+
 /// Parse `src` as a script and encode its AST to a snapshot blob — a build-time helper (used
 /// from op crates' `build.rs`) so static JS glue is parsed once at build and decoded, not
 /// re-parsed, on every boot. Decode it at runtime with [`Engine::eval_snapshot`]. `Err` is a
@@ -545,18 +566,26 @@ impl Engine {
         src: &str,
         strict: bool,
     ) -> Result<ExecutionOutcome, ParseError> {
-        let body = parse_host_script(src, strict).map_err(|e| ParseError {
-            message: e.message,
-            line: e.line,
-            at_eof: e.at_eof,
-        })?;
+        self.eval_interruptible_with_origin(src, strict, None)
+    }
+
+    /// [`Engine::eval_interruptible`] for a script whose `Error.prototype.stack` frames report
+    /// `origin` (a file path or URL, with the text's starting line and column), or
+    /// `<anonymous>` when None.
+    pub fn eval_interruptible_with_origin(
+        &mut self,
+        src: &str,
+        strict: bool,
+        origin: Option<&SourceOrigin<'_>>,
+    ) -> Result<ExecutionOutcome, ParseError> {
+        let (body, source) = parse_host_script_from(src, strict, origin)?;
         // A top-level `"use strict"` directive prologue turns on strict mode for the whole script.
         let directive_strict = matches!(
             body.first(),
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
         self.interp.strict = strict || directive_strict;
-        let result = self.interp.run_program(&body);
+        let result = self.interp.run_program_from(&body, Some(source));
         match result {
             Ok(v) => {
                 // Run queued promise reactions (the microtask checkpoint after the script).
@@ -934,12 +963,19 @@ impl interpreter::Interp {
         &mut self,
         src: &str,
     ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        let body = parse_host_script(src, false).map_err(|error| ParseError {
-            message: error.message,
-            line: error.line,
-            at_eof: error.at_eof,
-        })?;
-        Ok(self.eval_classic_body(&body))
+        self.eval_classic_script_interruptible_with_origin(src, None)
+    }
+
+    /// [`Self::eval_classic_script_interruptible`] for a script whose `Error.prototype.stack`
+    /// frames report `origin`: the script's URL or, for an inline `<script>`, its document's
+    /// URL with the element's starting line and column (`<anonymous>` when None).
+    pub fn eval_classic_script_interruptible_with_origin(
+        &mut self,
+        src: &str,
+        origin: Option<&SourceOrigin<'_>>,
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        let (body, source) = parse_host_script_from(src, false, origin)?;
+        Ok(self.eval_classic_body(&body, Some(source)))
     }
 
     /// Decode and evaluate a precompiled ECMAScript Script Record in the
@@ -956,7 +992,7 @@ impl interpreter::Interp {
             line: 0,
             at_eof: false,
         })?;
-        Ok(self.eval_classic_body(&body))
+        Ok(self.eval_classic_body(&body, None))
     }
 
     /// [`Self::eval_classic_snapshot_interruptible`] for static host bootstrap code that many
@@ -986,12 +1022,16 @@ impl interpreter::Interp {
                 line: 0,
                 at_eof: false,
             })?;
-        Ok(self.eval_classic_body(&body))
+        Ok(self.eval_classic_body(&body, None))
     }
 
     /// Evaluate a parsed or decoded Script body as one ScriptEvaluation in the active Realm.
-    fn eval_classic_body(&mut self, body: &[ast::Stmt]) -> Result<embed::Value, embed::EvalError> {
-        match self.run_classic_program(body) {
+    fn eval_classic_body(
+        &mut self,
+        body: &[ast::Stmt],
+        source: Option<std::rc::Rc<stack_trace::ScriptSource>>,
+    ) -> Result<embed::Value, embed::EvalError> {
+        match self.run_classic_program(body, source) {
             Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {
@@ -1103,17 +1143,23 @@ impl Engine {
         &mut self,
         src: &str,
     ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        let body = parse_host_script(src, false).map_err(|e| ParseError {
-            message: e.message,
-            line: e.line,
-            at_eof: e.at_eof,
-        })?;
+        self.eval_value_interruptible_with_origin(src, None)
+    }
+
+    /// [`Engine::eval_value_interruptible`] for a script whose `Error.prototype.stack` frames
+    /// report `origin` (`<anonymous>` when None).
+    pub fn eval_value_interruptible_with_origin(
+        &mut self,
+        src: &str,
+        origin: Option<&SourceOrigin<'_>>,
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        let (body, source) = parse_host_script_from(src, false, origin)?;
         let directive_strict = matches!(
             body.first(),
             Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
         );
         self.interp.strict = directive_strict;
-        let result = match self.interp.run_program(&body) {
+        let result = match self.interp.run_program_from(&body, Some(source)) {
             Ok(Value::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {

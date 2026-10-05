@@ -20,6 +20,7 @@ use std::rc::Rc;
 
 use crate::ast::*;
 use crate::bigint::JsBigInt;
+use crate::stack_trace::NO_POSITION;
 use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
@@ -778,7 +779,7 @@ fn enc_expr_inner(w: &mut Writer, e: &Expr) {
         }
         Expr::Null => w.u8(6),
         Expr::Undefined => w.u8(7),
-        Expr::Ident(n) => {
+        Expr::Ident(n, _) => {
             w.u8(8);
             w.str(n);
         }
@@ -846,7 +847,9 @@ fn enc_expr_inner(w: &mut Writer, e: &Expr) {
             enc_expr(w, left);
             enc_expr(w, right);
         }
-        Expr::Assign { op, target, value } => {
+        Expr::Assign {
+            op, target, value, ..
+        } => {
             w.u8(22);
             w.str(op);
             enc_expr(w, target);
@@ -862,13 +865,14 @@ fn enc_expr_inner(w: &mut Writer, e: &Expr) {
             callee,
             args,
             optional,
+            ..
         } => {
             w.u8(24);
             enc_expr(w, callee);
             enc_array_elems(w, args);
             w.bool(*optional);
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, .. } => {
             w.u8(25);
             enc_expr(w, callee);
             enc_array_elems(w, args);
@@ -877,6 +881,7 @@ fn enc_expr_inner(w: &mut Writer, e: &Expr) {
             obj,
             prop,
             optional,
+            ..
         } => {
             w.u8(26);
             enc_expr(w, obj);
@@ -887,6 +892,7 @@ fn enc_expr_inner(w: &mut Writer, e: &Expr) {
             obj,
             index,
             optional,
+            ..
         } => {
             w.u8(27);
             enc_expr(w, obj);
@@ -902,6 +908,7 @@ fn enc_expr_inner(w: &mut Writer, e: &Expr) {
             site: _,
             quasis,
             subs,
+            ..
         } => {
             w.u8(29);
             enc_expr(w, tag);
@@ -968,7 +975,7 @@ fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
         5 => Expr::Bool(r.bool()?),
         6 => Expr::Null,
         7 => Expr::Undefined,
-        8 => Expr::Ident(r.str()?),
+        8 => Expr::Ident(r.str()?, NO_POSITION),
         9 => Expr::This,
         10 => Expr::Regex {
             body: r.rcstr()?,
@@ -1018,6 +1025,7 @@ fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
             op: intern_op(&r.str()?)?,
             target: dec_boxed_expr(r)?,
             value: dec_boxed_expr(r)?,
+            pos: NO_POSITION,
         },
         23 => Expr::Cond {
             test: dec_boxed_expr(r)?,
@@ -1028,20 +1036,24 @@ fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
             callee: dec_boxed_expr(r)?,
             args: dec_array_elems(r)?,
             optional: r.bool()?,
+            pos: NO_POSITION,
         },
         25 => Expr::New {
             callee: dec_boxed_expr(r)?,
             args: dec_array_elems(r)?,
+            pos: NO_POSITION,
         },
         26 => Expr::Member {
             obj: dec_boxed_expr(r)?,
             prop: r.str()?,
             optional: r.bool()?,
+            pos: NO_POSITION,
         },
         27 => Expr::Index {
             obj: dec_boxed_expr(r)?,
             index: dec_boxed_expr(r)?,
             optional: r.bool()?,
+            pos: NO_POSITION,
         },
         28 => Expr::Seq(dec_exprs(r)?),
         29 => {
@@ -1057,7 +1069,8 @@ fn dec_expr_inner(r: &mut Reader) -> R<Expr> {
                 tag,
                 site,
                 quasis,
-                subs: dec_exprs(r)?,
+                subs: dec_exprs(r)?.into_boxed_slice(),
+                pos: NO_POSITION,
             }
         }
         30 => Expr::OptionalChain(dec_boxed_expr(r)?),
@@ -1368,6 +1381,9 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         default_ctor: flags & 128 != 0,
         self_hosted,
         source,
+        // A snapshot keeps no source positions: its frames print like built-ins (or not at all).
+        script: None,
+        start: 0,
         // Lazy runtime caches — start empty, exactly as the parser leaves them.
         scan: Cell::new(0),
         hoist: OnceCell::new(),
@@ -1472,6 +1488,8 @@ fn dec_class_inner(r: &mut Reader) -> R<Class> {
         members,
         decorators: dec_exprs(r)?,
         source: dec_opt_rcstr(r)?,
+        script: None,
+        start: 0,
     })
 }
 
@@ -1740,7 +1758,7 @@ mod tests {
             function.body = vec![function_stmt];
             function_stmt = Stmt::FuncDecl(Rc::new(function));
         }
-        let mut class_expr = Expr::Ident("Object".into());
+        let mut class_expr = Expr::Ident("Object".into(), crate::stack_trace::NO_POSITION);
         for _ in 0..40 {
             class_expr = Expr::Class(Rc::new(Class {
                 name: None,
@@ -1748,6 +1766,8 @@ mod tests {
                 members: Vec::new(),
                 decorators: Vec::new(),
                 source: None,
+                script: None,
+                start: 0,
             }));
         }
         let programs = [

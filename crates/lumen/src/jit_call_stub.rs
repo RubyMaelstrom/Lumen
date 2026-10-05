@@ -280,6 +280,8 @@ mod native {
             throw,
             normal,
             finish,
+            // Shared by every site of an arity: the caller's frame shows its function start.
+            jit::DirectCallSite::Position(crate::stack_trace::NO_POSITION),
         ) {
             return None;
         }

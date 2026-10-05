@@ -2356,8 +2356,9 @@ mod layout_asserts {
     const _: () = assert!(std::mem::offset_of!(JitCtx, interp) == 72);
     // The asm frame push writes FnFrame fields by fixed offset.
     const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, fn_ptr) == 0);
-    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, coro) == 8);
+    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, call_site) == 8);
     const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, strict) == 12);
+    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, construct) == 13);
     const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, extra) == 16);
     const _: () = assert!(std::mem::size_of::<crate::interpreter::FnFrame>() == 24);
     // The direct-call sequence reads the callee's code/pc_offsets straight from its JitCode.
@@ -2471,6 +2472,12 @@ mod asm {
         }
         fn emit(&mut self, i: u32) {
             self.buf.push(i);
+        }
+        /// A data word in the instruction stream, placed where execution never reaches it (after
+        /// an unconditional branch). Branch relaxation inserts only after conditional branches
+        /// it widens, so the word keeps its offset from the instructions before it.
+        pub fn word(&mut self, value: u32) {
+            self.emit(value);
         }
 
         /// Best-effort hot-code alignment before branch relaxation. Padding executes only on
@@ -2628,9 +2635,10 @@ mod asm {
             debug_assert!(imm < 4096);
             self.emit(0x3900_0000 | (imm << 10) | (rn << 5) | rt);
         }
-        /// sturb wt, [xn, #simm9]
-        pub fn sturb(&mut self, rt: u32, rn: u32, simm9: i32) {
-            self.emit(0x3800_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
+        /// sturh wt, [xn, #simm9] (unscaled)
+        pub fn sturh(&mut self, rt: u32, rn: u32, simm9: i32) {
+            debug_assert!((-256..256).contains(&simm9));
+            self.emit(0x7800_0000 | (((simm9 as u32) & 0x1FF) << 12) | (rn << 5) | rt);
         }
         /// ldurb wt, [xn, #simm9]
         pub fn ldurb(&mut self, rt: u32, rn: u32, simm9: i32) {
@@ -6222,6 +6230,10 @@ fn emit_call_inline(
                     const _: () = assert!(DIRECT_CALL_RETURNED == 0);
                     a.cbnz(9, false, not_returned);
                     a.b(done);
+                    // Never executed: the stub reads the call's position two instructions past
+                    // its return address (see `DirectCallSite::AfterReturn`). Neither branch
+                    // above can widen: both targets are in range.
+                    a.word(chunk.call_position(*c));
                     a.bind(not_returned);
                     a.cmp_imm_w(9, DIRECT_CALL_THREW);
                     a.b_cond(C_EQ, l_unwind);
@@ -6240,6 +6252,7 @@ fn emit_call_inline(
                         l_unwind,
                         done,
                         l_direct_finish,
+                        DirectCallSite::Position(chunk.call_position(*c)),
                     );
                 }
             }
@@ -6956,7 +6969,6 @@ fn direct_call_supported(
         && fits4(il.direct_call_depth)
         && fits4(il.gc_tick)
         && fits8(il.gc_next)
-        && fits4(il.cur_coro)
         && fits8(il.new_target)
         && fits8(il.fn_frames + il.fnf_ptr_word)
         && fits8(il.fn_frames + il.fnf_len_word)
@@ -6972,6 +6984,22 @@ fn direct_call_supported(
         && attempted_off < 4096
         && fits4(runs_off)
         && fits4(retry_off)
+}
+
+/// The source of a direct call's position (see `crate::stack_trace`), which the sequence stores
+/// in the callee's `FnFrame::call_site`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+pub(crate) enum DirectCallSite {
+    /// The sequence is emitted for one call site: its position is a constant.
+    Position(u32),
+    /// The sequence is a shared stub: each site places its position word two instructions past
+    /// the stub's return address, after the unconditional branch that leaves the site (see
+    /// `Asm::word`). Returning to the unmodified address keeps return prediction intact.
+    AfterReturn,
 }
 
 /// The direct (shared-ctx) JIT→JIT call sequence, emitted after a guarded cache hit when the
@@ -7012,6 +7040,8 @@ fn emit_direct_call(
     done: usize,
     // Label of the chunk's shared direct-finish stub (`emit_direct_finish_stub`).
     finish_stub: usize,
+    // Where the call's source position comes from (the callee's `FnFrame::call_site`).
+    call_site: DirectCallSite,
 ) -> bool {
     use std::mem::offset_of;
     if !direct_call_supported(ilayout, layout, attempted_off, runs_off, retry_off, argc) {
@@ -7158,10 +7188,19 @@ fn emit_direct_call(
     a.madd(6, 16, 5, 6);
     a.add_imm(4, 10, gc_data_off as u32);
     a.stur(4, 6, 0); // fn_ptr = the callee's as_ptr identity
-    a.ldr_w_imm(5, 14, il.cur_coro as u32);
-    a.str_w_imm(5, 6, 8); // coro
+    match call_site {
+        DirectCallSite::Position(position) => {
+            a.movz(5, position & 0xffff, 0);
+            if position >> 16 != 0 {
+                a.movk(5, position >> 16, 1);
+            }
+        }
+        // Nothing has called out of this sequence yet: x30 is still the site's return address.
+        DirectCallSite::AfterReturn => a.ldr_w_imm(5, 30, 8),
+    }
+    a.str_w_imm(5, 6, 8); // call_site
     a.ldrb_imm(5, 12, IC_STRICT);
-    a.sturb(5, 6, 12); // strict
+    a.sturh(5, 6, 12); // strict, and construct = false (w5 is 0 or 1)
     a.stur(31, 6, 16); // extra = None (xzr)
     a.add_imm(16, 16, 1);
     a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
@@ -7748,10 +7787,11 @@ mod direct_call_tests {
                 std::mem::offset_of!(crate::bytecode::Chunk, jit_runs),
                 std::mem::offset_of!(crate::bytecode::Chunk, inline_retry_at), 1, false,
                 hit_slow, unwind, done, finish,
+                super::DirectCallSite::Position(crate::stack_trace::NO_POSITION),
             ),
-            "direct calls silently disabled: valid={}, depth={}, direct_depth={}, gc_tick={}, gc_next={}, coro={}, constructing={}, new_target={}, frames={}, pool={}, attempted={}",
+            "direct calls silently disabled: valid={}, depth={}, direct_depth={}, gc_tick={}, gc_next={}, call_site={}, constructing={}, new_target={}, frames={}, pool={}, attempted={}",
             layout.valid, layout.depth, layout.direct_call_depth, layout.gc_tick,
-            layout.gc_next, layout.cur_coro, layout.constructing, layout.new_target,
+            layout.gc_next, layout.call_site, layout.constructing, layout.new_target,
             layout.fn_frames, layout.frame_pool, attempted,
         );
     }
@@ -10417,6 +10457,7 @@ impl SharedStub {
                     threw,
                     returned,
                     direct.finish_stub,
+                    DirectCallSite::AfterReturn,
                 );
                 assert!(emitted, "sites request the stub only when it is supported");
                 for (landing, status) in [

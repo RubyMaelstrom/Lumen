@@ -938,7 +938,7 @@ impl ProxyTrapCaches {
 /// arguments object materializes lazily: a body that never names `arguments` skips building it,
 /// and `lazy` keeps what a later reflective read needs to conjure it on demand.
 /// `repr(C)`: the asm call sequence (arc 3b) pushes frames from machine code — fn_ptr@0,
-/// coro@8, strict@12, extra@16, size 24 (asserted in jit.rs).
+/// call_site@8, strict@12, construct@13, extra@16, size 24 (asserted in jit.rs).
 #[repr(C)]
 pub struct FnFrame {
     /// `Rc::as_ptr` of the callee. No strong handle is kept: every frame is pushed while its
@@ -946,10 +946,13 @@ pub struct FnFrame {
     /// the dispatch chain for the whole call), so the rare reflective reads reconstruct one via
     /// [`FnFrame::callee`] instead of paying a refcount round-trip on every call.
     pub fn_ptr: usize,
-    /// Reserved execution-owner tag. Heap VM continuations finish each interpreter call slice
-    /// before parking, so this remains zero; retaining the field preserves the JIT frame ABI.
-    pub coro: u32,
+    /// Where the caller was: [`Interp::call_site`] when this frame was pushed, the byte
+    /// position of the call in the caller's source (see `crate::stack_trace`). Popping the frame
+    /// restores it.
+    pub call_site: u32,
     pub strict: bool,
+    /// The frame runs a `[[Construct]]` (stack traces print `new name`).
+    pub construct: bool,
     /// The rare per-frame state (a live `arguments` object, or what a reflective `fn.arguments`
     /// read needs to conjure one). Boxed so the common frame stays 24 bytes — frames are pushed
     /// and popped on EVERY call, and the pop's copy-out and drop-check of a fat frame was a
@@ -2570,7 +2573,7 @@ pub(crate) struct InterpLayout {
     pub gc_tick: usize,
     pub gc_next: usize,
     pub interrupt_poll_tick: usize,
-    pub cur_coro: usize,
+    pub call_site: usize,
     pub constructing: usize,
     /// Ambient mode used by semantic helpers; every native function body saves/restores it.
     pub strict: usize,
@@ -2627,8 +2630,9 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
     for k in 0..3 {
         i.fn_frames.push(FnFrame {
             fn_ptr: 0x1000 + k,
-            coro: 0,
+            call_site: 0,
             strict: false,
+            construct: false,
             extra: None,
         });
     }
@@ -2652,7 +2656,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         gc_tick: off(&i.gc_tick as *const _ as usize),
         gc_next: off(&i.gc_next as *const _ as usize),
         interrupt_poll_tick: off(&i.interrupt_poll_tick as *const _ as usize),
-        cur_coro: off(&i.cur_coro as *const _ as usize),
+        call_site: off(&i.call_site as *const _ as usize),
         constructing: off(&i.constructing as *const _ as usize),
         strict: off(&i.strict as *const _ as usize),
         new_target: off(&i.new_target as *const _ as usize),
@@ -2783,9 +2787,13 @@ pub struct Interp {
     /// address raw, so its allocation header must not be recycled while the cache survives. A
     /// strong `Env` here would make every realm touched by JIT code immortal.
     pub(crate) global_env_pins: Vec<std::rc::Weak<RefCell<Scope>>>,
-    /// Reserved execution-owner tag paired with `FnFrame::coro`; source continuations no longer
-    /// transfer the interpreter to a worker thread.
-    pub(crate) cur_coro: u32,
+    /// The byte position of the explicit call (or `new`, `super()`, tagged template) the
+    /// innermost execution context is making, or [`crate::stack_trace::NO_POSITION`] outside one.
+    /// Pushing a function frame moves it into [`FnFrame::call_site`]; popping restores it (see
+    /// `crate::stack_trace`).
+    pub(crate) call_site: u32,
+    /// Script, module and eval contexts, interleaved with `fn_frames` for stack traces.
+    pub(crate) code_frames: Vec<crate::stack_trace::CodeFrame>,
     /// The JIT's helper function table, built once (a stable address the machine code indexes
     /// through x21) instead of re-materialized on every call.
     pub(crate) jit_helpers: [usize; crate::jit::N_HELPERS],
@@ -3252,7 +3260,8 @@ interp_memory_inventory! {
     frame_pool => "measured",
     creation_pins => "measured",
     global_env_pins => "measured",
-    cur_coro => "non_owning",
+    call_site => "non_owning",
+    code_frames => "measured",
     jit_helpers => "non_owning",
     jit_layout => "non_owning",
     interp_layout => "non_owning",
@@ -3395,7 +3404,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 157);
+    assert_eq!(names.len(), 158);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4328,7 +4337,8 @@ impl Interp {
             frame_pool: FramePool(Vec::new()),
             creation_pins: Default::default(),
             global_env_pins: Vec::new(),
-            cur_coro: 0,
+            call_site: crate::stack_trace::NO_POSITION,
+            code_frames: Vec::new(),
             jit_helpers: crate::jit::helper_table(),
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
@@ -4467,6 +4477,17 @@ impl Interp {
     // ----- error helpers ----------------------------------------------------------------------
 
     pub fn make_error(&self, kind: &str, message: impl Into<String>) -> Value {
+        self.make_error_skipping(kind, message, crate::stack_trace::Skip::None)
+    }
+
+    /// [`Interp::make_error`] whose stack trace leaves out the frames `skip` names (an Error
+    /// constructor run for a subclass leaves out the subclass constructors, as V8 does).
+    pub(crate) fn make_error_skipping(
+        &self,
+        kind: &str,
+        message: impl Into<String>,
+        skip: crate::stack_trace::Skip,
+    ) -> Value {
         crate::jit::perf_error_construction();
         let proto = self
             .error_protos
@@ -4477,7 +4498,7 @@ impl Interp {
         let obj = Object::new(Some(proto));
         crate::jit::perf_error_object_end(object_started);
         let stack_started = crate::jit::perf_stage_start();
-        let stack = self.capture_stack();
+        let stack = self.capture_stack_trace(skip);
         crate::jit::perf_error_stack_capture_end(stack_started);
         obj.borrow_mut().exotic = Exotic::error(stack);
         let message_started = crate::jit::perf_stage_start();
@@ -4540,27 +4561,6 @@ impl Interp {
             }
         }
         value
-    }
-    /// Snapshot the current call stack as the `\n    at <fn>` lines for an error's `stack`.
-    /// Innermost frame first (Node order). We are a tree-walker without per-call source spans, so
-    /// frames carry the function name only (`<anonymous>` when unnamed); the `stack` getter adds
-    /// the `name: message` head. These are only the currently live frames, not a cumulative log.
-    fn capture_stack(&self) -> Rc<str> {
-        let mut out = String::new();
-        for frame in self.fn_frames.iter().rev() {
-            let callee = frame.callee();
-            let name = {
-                let b = callee.borrow();
-                match b.props.get("name").map(|p| p.value()) {
-                    Some(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
-                    _ => None,
-                }
-            }
-            .unwrap_or_else(|| "<anonymous>".to_string());
-            out.push_str("\n    at ");
-            out.push_str(&name);
-        }
-        Rc::from(out.as_str())
     }
 
     pub fn throw(&self, kind: &str, message: impl Into<String>) -> Abrupt {
@@ -5466,7 +5466,7 @@ impl Interp {
     /// inspected. Non-Errors (including proxies around Errors) return None.
     pub fn error_diagnostic(&self, value: &Value) -> Option<String> {
         let object = value.as_obj()?.try_borrow().ok()?;
-        let Exotic::Error(stack) = &object.exotic else {
+        let Exotic::Error(trace) = &object.exotic else {
             return None;
         };
         let message = match object.props.get("message") {
@@ -5477,7 +5477,13 @@ impl Interp {
             Some(_) => "<accessor message>".to_owned(),
             None => "<no own message>".to_owned(),
         };
-        let stack: String = stack.chars().take(2048).collect();
+        let stack: String = trace
+            .as_deref()
+            .map(crate::stack_trace::StackTrace::formatted)
+            .unwrap_or_default()
+            .chars()
+            .take(2048)
+            .collect();
         Some(format!("Error: {message}{stack}"))
     }
 
@@ -10440,7 +10446,9 @@ impl Interp {
                 self.vm_pool.iter().map(|(slots, stack)| slots.len() + stack.len()).sum::<usize>()
                     + self.native_arg_pool.iter().map(Vec::len).sum::<usize>(),
             );
-            eprintln!("[gc-dump-stack] {}", self.capture_stack());
+            if let Some(trace) = self.capture_stack_trace(crate::stack_trace::Skip::None) {
+                eprintln!("[gc-dump-stack] {}", trace.formatted());
+            }
             let root_limit = std::env::var("LUMEN_GC_DUMP_ROOT_LIMIT")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -12115,12 +12123,13 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         self.fn_frames.push(FnFrame {
             fn_ptr: Rc::as_ptr(fn_obj) as usize,
-            coro: self.cur_coro,
+            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
             strict: func.is_strict,
+            construct: is_construct,
             extra: None,
         });
         let r = self.call_user_inner(func, closure, this, args, is_construct, fn_obj);
-        self.fn_frames.pop();
+        self.pop_fn_frame();
         r
     }
 
@@ -12365,8 +12374,9 @@ impl Interp {
         };
         self.fn_frames.push(FnFrame {
             fn_ptr: ic.callee,
-            coro: self.cur_coro,
+            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
             strict: ic.strict,
+            construct: false,
             extra: None,
         });
         // Same non-owning env borrow as the moved path: the callee object on the caller's
@@ -12400,7 +12410,7 @@ impl Interp {
                 (ic.n_params as usize, ic.n_slots as usize),
             )
         });
-        self.fn_frames.pop();
+        self.pop_fn_frame();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         while r.is_ok() {
@@ -12570,8 +12580,9 @@ impl Interp {
         };
         self.fn_frames.push(FnFrame {
             fn_ptr: ic.callee,
-            coro: self.cur_coro,
+            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
             strict: ic.strict,
+            construct: false,
             extra: None,
         });
         // Borrow the env without touching its refcount: it stays alive for the whole call
@@ -12607,7 +12618,7 @@ impl Interp {
                 (ic.n_params as usize, ic.n_slots as usize),
             )
         });
-        self.fn_frames.pop();
+        self.pop_fn_frame();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         // Proper-tail-call trampoline, exactly like `call`.
@@ -13295,8 +13306,9 @@ impl Interp {
         let saved_nt = std::mem::replace(&mut self.new_target, callee.clone());
         self.fn_frames.push(FnFrame {
             fn_ptr: key,
-            coro: self.cur_coro,
+            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
             strict: ic.strict,
+            construct: true,
             extra: None,
         });
         let env = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(ic.env) });
@@ -13358,7 +13370,7 @@ impl Interp {
                 }
             }
         });
-        self.fn_frames.pop();
+        self.pop_fn_frame();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         while r.is_ok() {
@@ -13675,8 +13687,9 @@ impl Interp {
         };
         self.fn_frames.push(FnFrame {
             fn_ptr: Rc::as_ptr(o) as usize,
-            coro: self.cur_coro,
+            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
             strict: func.is_strict,
+            construct: false,
             extra: None,
         });
         let this_val = self.bind_compiled_this(
@@ -13715,7 +13728,7 @@ impl Interp {
             }
             .map(PackedValue::into_value)
         });
-        self.fn_frames.pop();
+        self.pop_fn_frame();
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         // Proper-tail-call trampoline, exactly like `call`.
@@ -14216,7 +14229,7 @@ impl Interp {
                 Value::Undefined
             };
             let params = self.coroutine_parameter_values(func, scope)?;
-            let vm = if func.is_async {
+            let mut vm = if func.is_async {
                 crate::bytecode::VmCoro::new_async_generator(
                     self,
                     chunk.clone(),
@@ -14235,6 +14248,7 @@ impl Interp {
                     args,
                 )
             };
+            vm.frame = self.resumed_frame(func);
             crate::coroutine::Coroutine::Vm(Box::new(vm))
         } else {
             if std::env::var_os("LUMEN_TIER_LOG").is_some() {
@@ -14310,14 +14324,10 @@ impl Interp {
                 Value::Undefined
             };
             let params = self.coroutine_parameter_values(func, scope)?;
-            crate::coroutine::Coroutine::Vm(Box::new(crate::bytecode::VmCoro::new(
-                self,
-                chunk,
-                scope.clone(),
-                this_val,
-                &params,
-                args,
-            )))
+            let mut vm =
+                crate::bytecode::VmCoro::new(self, chunk, scope.clone(), this_val, &params, args);
+            vm.frame = self.resumed_frame(func);
+            crate::coroutine::Coroutine::Vm(Box::new(vm))
         } else {
             if std::env::var_os("LUMEN_TIER_LOG").is_some() {
                 let source = func.source.as_deref().unwrap_or("<no source>");
@@ -14915,8 +14925,9 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         self.fn_frames.push(FnFrame {
             fn_ptr: Rc::as_ptr(ctor) as usize,
-            coro: self.cur_coro,
+            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
             strict: true,
+            construct: true,
             extra: None,
         });
         let result = (|| {
@@ -14930,7 +14941,7 @@ impl Interp {
             self.init_instance_fields(&Value::Obj(ctor.clone()), &result)?;
             Ok(result)
         })();
-        self.fn_frames.pop();
+        self.pop_fn_frame();
         result
     }
 
@@ -15013,19 +15024,35 @@ impl Interp {
     }
 
     pub(crate) fn run_program(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
-        self.with_script_entry(|this| this.run_program_body(body))
+        self.run_program_from(body, None)
+    }
+
+    /// [`Interp::run_program`] for a body parsed from `source`, whose top-level code then shows
+    /// in stack traces (code without a source, such as a host snapshot, does not).
+    pub(crate) fn run_program_from(
+        &mut self,
+        body: &[Stmt],
+        source: Option<Rc<crate::stack_trace::ScriptSource>>,
+    ) -> Result<Value, Abrupt> {
+        self.in_code(source, |this| {
+            this.with_script_entry(|this| this.run_program_body(body))
+        })
     }
 
     /// ScriptEvaluation of a classic Script body in the active Realm: its own directive
     /// prologue decides strictness, and the caller's mode is restored afterwards.
     #[cfg(any(feature = "embed", test))]
-    pub(crate) fn run_classic_program(&mut self, body: &[Stmt]) -> Result<Value, Abrupt> {
+    pub(crate) fn run_classic_program(
+        &mut self,
+        body: &[Stmt],
+        source: Option<Rc<crate::stack_trace::ScriptSource>>,
+    ) -> Result<Value, Abrupt> {
         let directive_strict = matches!(
             body.first(),
             Some(Stmt::Expr(Expr::Str(value))) if &**value == "use strict"
         );
         let previous_strict = std::mem::replace(&mut self.strict, directive_strict);
-        let result = self.run_program(body);
+        let result = self.run_program_from(body, source);
         self.strict = previous_strict;
         result
     }

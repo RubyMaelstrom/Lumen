@@ -25,6 +25,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::execution_storage::{CallArgs, DecodedArgs, SlotAccess, StoredValue, ValueStack};
 use crate::interpreter::{Abrupt, Env, Interp};
+use crate::stack_trace::NO_POSITION;
 use crate::value::{PackedValue, Value};
 
 #[path = "bytecode_activation.rs"]
@@ -2120,6 +2121,42 @@ impl CallNames {
     }
 }
 
+/// The source position of each operation (see `crate::stack_trace`): the byte offset of the
+/// innermost call, `new`, property-access, tagged-template or assignment node it was compiled
+/// for, or [`NO_POSITION`]. Stored as runs of operations sharing a position, in increasing
+/// operation order; read only when a call records its position or an operation throws.
+#[derive(Default)]
+pub(crate) struct SourcePositions {
+    /// (first operation, position): each run lasts until the next one starts.
+    runs: Vec<(u32, u32)>,
+}
+
+impl SourcePositions {
+    fn record(&mut self, pc: usize, position: u32) {
+        if self.runs.last().map_or(NO_POSITION, |&(_, last)| last) != position {
+            self.runs.push((pc as u32, position));
+        }
+    }
+
+    /// Forget the operations at index `len` and above (a discarded speculation).
+    fn truncate(&mut self, len: usize) {
+        let keep = self.runs.partition_point(|&(pc, _)| (pc as usize) < len);
+        self.runs.truncate(keep);
+    }
+
+    fn at(&self, pc: usize) -> u32 {
+        let run = self
+            .runs
+            .partition_point(|&(start, _)| start as usize <= pc);
+        run.checked_sub(1)
+            .map_or(NO_POSITION, |run| self.runs[run].1)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.runs.capacity() * std::mem::size_of::<(u32, u32)>()
+    }
+}
+
 pub struct Chunk {
     /// The caller must complete FunctionDeclarationInstantiation before running this body.
     /// The existing activation, including mapped arguments and parameter-expression scopes,
@@ -2280,6 +2317,12 @@ pub struct Chunk {
     call_caches: Vec<CallSite>,
     /// Source names of call and `new` targets, for TypeError messages (see [`Chunk::call_name`]).
     call_names: Option<Box<CallNames>>,
+    /// Source positions of the operations (see [`Chunk::position`]).
+    positions: SourcePositions,
+    /// The position of each call cache's `Call`/`CallWithThis` and each construct cache's
+    /// `New`, so those calls record their position without a search.
+    call_positions: Box<[u32]>,
+    construct_positions: Box<[u32]>,
     /// One monomorphic identity cache per `New` site.
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
     /// One [`PrivateSite`] per private-name operation (`Op::GetPrivate` and its siblings).
@@ -2442,6 +2485,29 @@ impl Chunk {
     pub(crate) fn call_name(&self, pc: usize) -> Option<&str> {
         self.call_names.as_deref()?.get(pc)
     }
+
+    /// The source position of operation `pc` (see [`SourcePositions`]).
+    pub(crate) fn position(&self, pc: usize) -> u32 {
+        self.positions.at(pc)
+    }
+
+    /// The position of the call made through call cache `cache`.
+    #[inline]
+    pub(crate) fn call_position(&self, cache: u32) -> u32 {
+        self.call_positions
+            .get(cache as usize)
+            .copied()
+            .unwrap_or(NO_POSITION)
+    }
+
+    /// The position of the `new` made through construct cache `cache`.
+    #[inline]
+    pub(crate) fn construct_position(&self, cache: u32) -> u32 {
+        self.construct_positions
+            .get(cache as usize)
+            .copied()
+            .unwrap_or(NO_POSITION)
+    }
     /// Scan the directly-owned bytecode/feedback payload. Shared AST nodes, Functions, strings,
     /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
     /// allocation-family visitor for identity deduplication.
@@ -2515,6 +2581,11 @@ impl Chunk {
             self.call_names
                 .as_deref()
                 .map_or(0, CallNames::retained_bytes),
+        );
+        bytes = bytes.saturating_add(self.positions.retained_bytes());
+        bytes = bytes.saturating_add(
+            (self.call_positions.len() + self.construct_positions.len())
+                * std::mem::size_of::<u32>(),
         );
         bytes = bytes.saturating_add(
             self.feedback_shapes
@@ -4069,7 +4140,7 @@ impl CaptureScan {
                 }
                 Some(())
             }
-            Expr::Ident(n) => {
+            Expr::Ident(n, _) => {
                 self.reference(n);
                 Some(())
             }
@@ -4142,8 +4213,9 @@ impl CaptureScan {
                 callee,
                 args,
                 optional,
+                ..
             } => {
-                if !optional && matches!(&**callee, Expr::Ident(n) if n == "eval") {
+                if !optional && matches!(&**callee, Expr::Ident(n, _) if n == "eval") {
                     if !self.allow_direct_eval {
                         return None;
                     }
@@ -4165,7 +4237,7 @@ impl CaptureScan {
                 }
                 Some(())
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 self.expr(callee)?;
                 for a in args {
                     match a {
@@ -5871,6 +5943,8 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         default_ctor: false,
         self_hosted: false,
         source: None,
+        script: None,
+        start: 0,
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
         calls: std::cell::Cell::new(0),
@@ -5913,6 +5987,8 @@ pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
         default_ctor: false,
         self_hosted: false,
         source: None,
+        script: None,
+        start: 0,
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
         calls: std::cell::Cell::new(0),
@@ -6660,6 +6736,21 @@ fn finish_chunk(
     });
     let cap_cache_len = c.names.len();
     let op_count = c.ops.len();
+    c.positions.runs.shrink_to_fit();
+    let mut call_positions = vec![NO_POSITION; c.call_caches.len()].into_boxed_slice();
+    let mut construct_positions = vec![NO_POSITION; c.construct_caches.len()].into_boxed_slice();
+    for (pc, op) in c.ops.iter().enumerate() {
+        let slot = match *op {
+            Op::Call(_, cache) | Op::CallWithThis(_, cache) => {
+                call_positions.get_mut(cache as usize)
+            }
+            Op::New(_, cache) => construct_positions.get_mut(cache as usize),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            *slot = c.positions.at(pc);
+        }
+    }
     let feedback = if let Some(chunk) = hot {
         // The transformed/inlined bytecode has different PCs. Retain the baseline schema without
         // guessing new runtime bindings; the original chunk remains the current-shape adapter.
@@ -6785,6 +6876,9 @@ fn finish_chunk(
         regexp_literals: (0..op_count).map(|_| std::cell::OnceCell::new()).collect(),
         call_caches: c.call_caches,
         call_names: c.call_names.into_table(),
+        positions: c.positions,
+        call_positions,
+        construct_positions,
         construct_caches: c.construct_caches,
         private_sites: (0..c.private_sites).map(|_| PrivateSite::new()).collect(),
         call_pins: std::cell::RefCell::new(c.call_pins),
@@ -7349,6 +7443,15 @@ fn integer_switch_cases(cases: &[SwitchCase]) -> Option<Vec<(i32, usize)>> {
     (values.len() >= 8).then(|| values.into_iter().collect())
 }
 
+/// The position [`Compiler::emit`] records, [`NO_POSITION`] outside every position-bearing node.
+struct CompilePosition(u32);
+
+impl Default for CompilePosition {
+    fn default() -> Self {
+        CompilePosition(NO_POSITION)
+    }
+}
+
 #[derive(Default)]
 struct Compiler {
     /// Compiling a body of the engine's self-hosted built-in source (see `crate::self_hosted`):
@@ -7441,6 +7544,10 @@ struct Compiler {
     call_caches: Vec<CallSite>,
     /// See [`Chunk::call_name`]; rolled back with `ops`.
     call_names: CallNames,
+    /// See [`Chunk::position`]; rolled back with `ops`.
+    positions: SourcePositions,
+    /// The position recorded for operations emitted now (see [`Compiler::at_position`]).
+    position: CompilePosition,
     /// The target name [`Compiler::finish_call`] records for the call it emits.
     pending_call_name: Option<String>,
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
@@ -7813,7 +7920,7 @@ fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool 
         | Expr::Undefined
         | Expr::This
         | Expr::Regex { .. } => true,
-        Expr::Ident(n) => !banned.contains(n.as_str()),
+        Expr::Ident(n, _) => !banned.contains(n.as_str()),
         Expr::Paren(x) | Expr::ToStr(x) | Expr::Unary { arg: x, .. } => {
             default_expr_safe(x, banned)
         }
@@ -7830,7 +7937,7 @@ fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool 
         Expr::Index { obj, index, .. } => {
             default_expr_safe(obj, banned) && default_expr_safe(index, banned)
         }
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+        Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
             default_expr_safe(callee, banned)
                 && args.iter().all(|a| match a {
                     ArrayElem::Item(x) | ArrayElem::Spread(x) => default_expr_safe(x, banned),
@@ -7864,20 +7971,20 @@ fn no_assign_to(e: &Expr, name: &str) -> bool {
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Undefined
-        | Expr::Ident(_)
+        | Expr::Ident(_, _)
         | Expr::This
         | Expr::Regex { .. }
         | Expr::Func(_) => true,
         Expr::Paren(x) | Expr::ToStr(x) | Expr::Unary { arg: x, .. } => no_assign_to(x, name),
         Expr::Update { arg, .. } => match &**arg {
-            Expr::Ident(n) => n != name,
+            Expr::Ident(n, _) => n != name,
             Expr::Member { obj, .. } => no_assign_to(obj, name),
             Expr::Index { obj, index, .. } => no_assign_to(obj, name) && no_assign_to(index, name),
             _ => false,
         },
         Expr::Assign { target, value, .. } => {
             let target_ok = match &**target {
-                Expr::Ident(n) => n != name,
+                Expr::Ident(n, _) => n != name,
                 Expr::Member { obj, .. } => no_assign_to(obj, name),
                 Expr::Index { obj, index, .. } => {
                     no_assign_to(obj, name) && no_assign_to(index, name)
@@ -7894,7 +8001,7 @@ fn no_assign_to(e: &Expr, name: &str) -> bool {
         }
         Expr::Member { obj, .. } => no_assign_to(obj, name),
         Expr::Index { obj, index, .. } => no_assign_to(obj, name) && no_assign_to(index, name),
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+        Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
             no_assign_to(callee, name)
                 && args.iter().all(|a| match a {
                     ArrayElem::Item(e) | ArrayElem::Spread(e) => no_assign_to(e, name),
@@ -7915,8 +8022,22 @@ impl Compiler {
             Some(&target) => self.inline_env_op(op, target),
             None => op,
         };
+        self.positions.record(self.ops.len(), self.position.0);
         self.ops.push(op);
         self.ops.len() - 1
+    }
+
+    /// Compile with the operations attributed to the AST node at source `position`, as the
+    /// tree-walker attributes an error raised while it evaluates that node. A spliced callee
+    /// keeps its call site's position: its own positions index another function's source.
+    fn at_position<T>(&mut self, position: u32, compile: impl FnOnce(&mut Self) -> T) -> T {
+        if self.inline_depth > 0 || position == NO_POSITION {
+            return compile(self);
+        }
+        let saved = std::mem::replace(&mut self.position.0, position);
+        let result = compile(self);
+        self.position.0 = saved;
+        result
     }
     /// Inside a splice, the callee's free-name reads resolve from its own [[Environment]], not
     /// the caller's running one. Anything else that observes the running environment has no
@@ -8094,6 +8215,7 @@ impl Compiler {
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
             self.ops.truncate(snap.0);
             self.call_names.truncate(snap.0);
+            self.positions.truncate(snap.0);
             self.consts.truncate(snap.1);
             self.truncate_names(snap.2);
             self.caches.truncate(snap.3);
@@ -8734,7 +8856,7 @@ impl Compiler {
         if !self.self_hosted {
             return Ok(false);
         }
-        let Expr::Ident(name) = callee else {
+        let Expr::Ident(name, _) = callee else {
             return Ok(false);
         };
         if self.home(name).is_some() {
@@ -8895,6 +9017,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_named_reference(prop);
                 self.emit(Op::SuperGetMethod);
@@ -8904,6 +9027,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_computed_reference(index)?;
                 self.emit(Op::SuperGetMethod);
@@ -8913,6 +9037,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.opt_chain(obj, shorts)?;
                 if *optional {
@@ -8933,6 +9058,7 @@ impl Compiler {
                 obj,
                 index,
                 optional,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.opt_chain(obj, shorts)?;
                 if *optional {
@@ -8942,7 +9068,7 @@ impl Compiler {
                 self.emit(Op::GetMethodElem);
                 Ok((true, true))
             }
-            Expr::Ident(name) if self.home(name).is_none() => {
+            Expr::Ident(name, _) if self.home(name).is_none() => {
                 let name = self.name_idx(name);
                 let cache = self.new_name_cache(name);
                 self.emit(Op::LoadNameForCall(name, cache));
@@ -8962,7 +9088,7 @@ impl Compiler {
         match arg {
             Expr::Paren(inner) => self.delete_expr(inner),
             Expr::OptionalChain(inner) => self.delete_optional_chain(inner),
-            Expr::Ident(name) => {
+            Expr::Ident(name, _) => {
                 if self.home(name).is_some() {
                     // Function/lexical declarations represented by slots or activation bindings
                     // are never deletable. Only a free name needs the full environment/global
@@ -8991,6 +9117,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 // The computed expression evaluates, but Delete throws before ToPropertyKey.
                 self.emit_super_this();
@@ -9004,6 +9131,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 let n = self.name_idx(prop);
@@ -9014,6 +9142,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.expr(obj)?;
                 self.expr(index)?;
@@ -9039,6 +9168,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.opt_chain(obj, &mut shorts)?;
                 if *optional {
@@ -9051,6 +9181,7 @@ impl Compiler {
                 obj,
                 index,
                 optional,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.opt_chain(obj, &mut shorts)?;
                 if *optional {
@@ -9100,6 +9231,13 @@ impl Compiler {
     /// optional callees preserve their distinct receiver rules, including private method
     /// receivers and super References. Optional `delete` retains its separate path.
     fn opt_chain(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
+        match e.position() {
+            Some(position) => self.at_position(position, |c| c.opt_chain_link(e, shorts)),
+            None => self.opt_chain_link(e, shorts),
+        }
+    }
+
+    fn opt_chain_link(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
         if !Self::has_open_optional_chain(e) {
             // Preserve ordinary expression specializations (GetPropThis/GetPropLocal,
             // element fusions, etc.) before the first optional link. Besides avoiding extra
@@ -9111,6 +9249,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.opt_chain(obj, shorts)?;
                 if *optional {
@@ -9125,6 +9264,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional,
+                ..
             } if !matches!(**obj, Expr::Super) && prop.starts_with('#') => {
                 self.opt_chain(obj, shorts)?;
                 if *optional {
@@ -9139,6 +9279,7 @@ impl Compiler {
                 obj,
                 index,
                 optional,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.opt_chain(obj, shorts)?;
                 if *optional {
@@ -9152,6 +9293,7 @@ impl Compiler {
                 callee,
                 args,
                 optional: call_opt,
+                ..
             } => {
                 // A SuperCall may be the base of `super()?.x`. Evaluate it through the
                 // constructor continuation, not as an ordinary call to an Expr::Super value.
@@ -9189,7 +9331,9 @@ impl Compiler {
     /// only an explicit assignment/update in the key/value expressions themselves could, and
     /// `no_assign_to` rejects those).
     fn fused_elem_slot(&self, obj: &Expr, deps: &[&Expr]) -> Option<u16> {
-        let Expr::Ident(name) = obj else { return None };
+        let Expr::Ident(name, _) = obj else {
+            return None;
+        };
         let Some(Home::Slot(slot, _)) = self.home(name) else {
             return None;
         };
@@ -9657,7 +9801,8 @@ impl Compiler {
                 if std::mem::take(&mut self.tail_lowered) {
                     return Ok(());
                 }
-                self.transfer_last_call()
+                let position = expression.position().unwrap_or(NO_POSITION);
+                self.at_position(position, Self::transfer_last_call)
             }
             other => self.expr(other),
         }
@@ -9741,7 +9886,7 @@ impl Compiler {
                     .contains(&(Rc::as_ptr(function) as usize))
                 {
                     let name = function.name.as_ref().ok_or(Bail)?;
-                    self.expr(&Expr::Ident(name.clone()))?;
+                    self.expr(&Expr::Ident(name.clone(), NO_POSITION))?;
                     let name = self.name_idx(name);
                     self.emit(Op::StoreGlobalName(name));
                     return Ok(());
@@ -9754,7 +9899,7 @@ impl Compiler {
                     return Ok(());
                 };
                 let name = function.name.as_ref().ok_or(Bail)?;
-                self.expr(&Expr::Ident(name.clone()))?;
+                self.expr(&Expr::Ident(name.clone(), NO_POSITION))?;
                 match target {
                     Home::Slot(slot, false) => self.emit(Op::StoreLocal(slot)),
                     Home::Env(false) => {
@@ -10831,6 +10976,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 self.emit(Op::LoadLocal(value_slot));
@@ -10843,6 +10989,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.expr(obj)?;
                 self.expr(index)?;
@@ -10963,6 +11110,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_named_reference(prop);
                 Ok(self.save_assignment_super_reference())
@@ -10971,6 +11119,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_computed_reference(index)?;
                 Ok(self.save_assignment_super_reference())
@@ -10979,6 +11128,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
                 let base = self.fresh_slot("%assignment-private-base%");
@@ -10986,11 +11136,12 @@ impl Compiler {
                 let name = self.name_idx(prop);
                 Ok(PreparedAssignmentRef::Private { base, name })
             }
-            Expr::Ident(name) => self.prepare_identifier_reference(name),
+            Expr::Ident(name, _) => self.prepare_identifier_reference(name),
             Expr::Member {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 let base = self.fresh_slot("%assignment-base%");
@@ -11003,6 +11154,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.expr(obj)?;
                 self.expr(index)?;
@@ -11125,7 +11277,7 @@ impl Compiler {
         self.emit(Op::StrictEq);
         let present = self.emit(Op::JumpIfFalse(0));
         self.emit(Op::Pop);
-        if let Expr::Ident(name) = core {
+        if let Expr::Ident(name, _) = core {
             self.named_expr(default, name)?;
         } else {
             self.expr(default)?;
@@ -11198,6 +11350,7 @@ impl Compiler {
                             op: "=",
                             target,
                             value,
+                            ..
                         } => (&**target, Some(&**value)),
                         _ => (element, None),
                     };
@@ -11273,6 +11426,7 @@ impl Compiler {
                             op: "=",
                             target,
                             value,
+                            ..
                         } => (&**target, Some(&**value)),
                         _ => (value, None),
                     };
@@ -12077,8 +12231,13 @@ impl Compiler {
                 };
                 return self.update_target(arg, kind);
             }
-            Expr::Assign { op, target, value } => {
-                return self.assign_discard(op, target, value);
+            Expr::Assign {
+                op,
+                target,
+                value,
+                pos,
+            } => {
+                return self.at_position(*pos, |c| c.assign_discard(op, target, value));
             }
             _ => {}
         }
@@ -12109,7 +12268,7 @@ impl Compiler {
             return Ok(false);
         }
         match target {
-            Expr::Ident(name) => match self.home(name) {
+            Expr::Ident(name, _) => match self.home(name) {
                 Some(Home::Slot(slot, is_const)) => {
                     if is_const {
                         self.immutable_assignment(Home::Slot(slot, true), name, op, value)?;
@@ -12179,11 +12338,12 @@ impl Compiler {
                 obj: mobj,
                 prop,
                 optional: false,
+                ..
             } if op == "="
                 && !prop.starts_with('#')
                 && match &**mobj {
                     Expr::This => !self.lexical_this && !self.derived_constructor,
-                    Expr::Ident(name) => {
+                    Expr::Ident(name, _) => {
                         matches!(self.home(name), Some(Home::Slot(..))) && no_assign_to(value, name)
                     }
                     _ => false,
@@ -12206,7 +12366,7 @@ impl Compiler {
                             self.emit(Op::SetPropThisDrop(i, c));
                         }
                     }
-                    Expr::Ident(name) => {
+                    Expr::Ident(name, _) => {
                         let Some(Home::Slot(slot, _)) = self.home(name) else {
                             unreachable!()
                         };
@@ -12220,6 +12380,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 let i = self.name_idx(prop);
@@ -12252,6 +12413,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 if let Some(slot) = self.fused_elem_slot(obj, &[index.as_ref(), value]) {
                     self.expr(index)?;
@@ -12443,6 +12605,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.expr(obj)?;
                 let name = self.name_idx(prop);
@@ -12514,6 +12677,22 @@ impl Compiler {
     }
 
     fn expr(&mut self, e: &Expr) -> CResult {
+        match e.position() {
+            Some(position) if !self.cannot_fail(e) => {
+                self.at_position(position, |c| c.expr_node(e))
+            }
+            _ => self.expr_node(e),
+        }
+    }
+
+    /// A read of a frame slot outside its temporal dead zone can neither throw nor call: its
+    /// position is never observed, so it need not split the chunk's position runs.
+    fn cannot_fail(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Ident(name, _)
+            if matches!(self.home(name), Some(Home::Slot(slot, _)) if !self.tdz_slots.contains(&slot)))
+    }
+
+    fn expr_node(&mut self, e: &Expr) -> CResult {
         match e {
             Expr::Func(f) => self.emit_closure(f, None),
             Expr::Class(class) if crate::eval::expr_has_own_suspension(e) => {
@@ -12548,7 +12727,7 @@ impl Compiler {
                 self.emit(Op::Const(i));
                 Ok(())
             }
-            Expr::Ident(name) => {
+            Expr::Ident(name, _) => {
                 match self.home(name) {
                     Some(Home::Slot(slot, _)) => {
                         self.emit(Op::LoadLocal(slot));
@@ -12609,6 +12788,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 // Receiver-direct forms: `this.x` and `slotlocal.x` skip the operand-stack
                 // round trip (push + refcount bump + drop) entirely.
@@ -12629,7 +12809,7 @@ impl Compiler {
                         self.emit(Op::GetPropThis(i, c));
                         return Ok(());
                     }
-                    Expr::Ident(name) => {
+                    Expr::Ident(name, _) => {
                         if let Some(Home::Slot(slot, _)) = self.home(name) {
                             let i = self.name_idx(prop);
                             let c = self.new_cache(i);
@@ -12649,6 +12829,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_named_reference(prop);
                 self.emit(Op::SuperGet);
@@ -12658,6 +12839,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
                 let name = self.name_idx(prop);
@@ -12669,6 +12851,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 if let Some(slot) = self.fused_elem_slot(obj, &[index.as_ref()]) {
                     self.expr(index)?;
@@ -12684,6 +12867,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_computed_reference(index)?;
                 self.emit(Op::SuperGet);
@@ -12701,7 +12885,8 @@ impl Compiler {
                     if let Some((argument, literal)) = pair {
                         // An unknown identifier needs typeof's unresolvable-reference
                         // exception. Its existing TypeofName operation remains authoritative.
-                        if !matches!(&**argument, Expr::Ident(name) if self.home(name).is_none()) {
+                        if !matches!(&**argument, Expr::Ident(name, _) if self.home(name).is_none())
+                        {
                             self.expr(argument)?;
                             self.emit(Op::TypeofIs(
                                 crate::value::TypeofTest::from_literal(literal),
@@ -12789,7 +12974,7 @@ impl Compiler {
                         self.emit(Op::Void);
                     }
                     "typeof" => {
-                        if let Expr::Ident(n) = &**arg {
+                        if let Expr::Ident(n, _) = &**arg {
                             if self.home(n).is_none() {
                                 let name = self.name_idx(n);
                                 self.emit(Op::TypeofName(name));
@@ -12820,7 +13005,7 @@ impl Compiler {
             }
             Expr::Update { op, prefix, arg } => {
                 if !self.with_scope_floors.is_empty()
-                    && matches!(&**arg, Expr::Ident(name) if self.home(name).is_none())
+                    && matches!(&**arg, Expr::Ident(name, _) if self.home(name).is_none())
                 {
                     // UpdateExpression retains one Environment Reference across GetValue,
                     // ToNumeric (which may run user code), and PutValue. Re-resolving a name
@@ -12836,7 +13021,9 @@ impl Compiler {
                 };
                 self.update_target(arg, kind)
             }
-            Expr::Assign { op, target, value } => self.assign(op, target, value),
+            Expr::Assign {
+                op, target, value, ..
+            } => self.assign(op, target, value),
             Expr::ToStr(inner) => {
                 self.expr(inner)?;
                 self.emit(Op::ToStr);
@@ -12874,6 +13061,7 @@ impl Compiler {
                 site: site_id,
                 quasis,
                 subs,
+                ..
             } => {
                 // Evaluation retains the Reference receiver. EvaluateCall checks IsCallable
                 // only after TemplateLiteral ArgumentListEvaluation, including substitutions.
@@ -12912,11 +13100,12 @@ impl Compiler {
                 callee,
                 args,
                 optional: false,
+                ..
             } => {
                 if self.self_hosted_intrinsic(callee, args)? {
                     return Ok(());
                 }
-                if matches!(&**callee, Expr::Ident(n) if n == "eval") {
+                if matches!(&**callee, Expr::Ident(n, _) if n == "eval") {
                     if !self.direct_eval {
                         return Err(Bail);
                     }
@@ -12992,7 +13181,7 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 self.expr(callee)?;
                 if args.iter().all(|arg| matches!(arg, ArrayElem::Item(_))) {
                     let argc = u16::try_from(args.len()).map_err(|_| Bail)?;
@@ -13201,7 +13390,7 @@ impl Compiler {
     fn update_target(&mut self, arg: &Expr, kind: UpdKind) -> CResult {
         match arg {
             Expr::Paren(inner) => self.update_target(inner, kind),
-            Expr::Ident(name) => match self.home(name) {
+            Expr::Ident(name, _) => match self.home(name) {
                 Some(Home::Slot(slot, false)) => {
                     self.emit(Op::UpdateLocal(slot, kind));
                     Ok(())
@@ -13232,6 +13421,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_named_reference(prop);
                 self.emit(Op::SuperUpdate(kind));
@@ -13241,6 +13431,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_computed_reference(index)?;
                 self.emit(Op::SuperUpdate(kind));
@@ -13250,6 +13441,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
                 let name = self.name_idx(prop);
@@ -13260,6 +13452,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 let i = self.name_idx(prop);
@@ -13271,6 +13464,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 self.expr(obj)?;
                 self.expr(index)?;
@@ -13298,7 +13492,7 @@ impl Compiler {
             return Ok(());
         }
         match target {
-            Expr::Ident(name) => match self.home(name) {
+            Expr::Ident(name, _) => match self.home(name) {
                 Some(Home::Slot(slot, is_const)) => {
                     if is_const {
                         return self.immutable_assignment(Home::Slot(slot, true), name, op, value);
@@ -13365,6 +13559,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_named_reference(prop);
                 if op == "=" {
@@ -13381,6 +13576,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_computed_reference(index)?;
                 if op == "=" {
@@ -13397,6 +13593,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
                 let name = self.name_idx(prop);
@@ -13416,6 +13613,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 let i = self.name_idx(prop);
@@ -13437,6 +13635,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 if let Some(slot) = self.fused_elem_slot(obj, &[index.as_ref(), value]) {
                     self.expr(index)?;
@@ -13514,7 +13713,7 @@ impl Compiler {
 
         match target {
             Expr::Paren(inner) => self.logical_assign(op, inner, value),
-            Expr::Ident(name) => match self.home(name) {
+            Expr::Ident(name, _) => match self.home(name) {
                 Some(Home::Slot(slot, false)) => {
                     self.emit(Op::LoadLocal(slot));
                     let done = short_jump(self, op)?;
@@ -13587,6 +13786,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_named_reference(prop);
                 self.logical_super_assign(op, value)
@@ -13595,6 +13795,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if matches!(**obj, Expr::Super) => {
                 self.super_computed_reference(index)?;
                 self.logical_super_assign(op, value)
@@ -13603,6 +13804,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if prop.starts_with('#') => {
                 let base = self.fresh_slot("%logical-private-base%");
                 self.expr(obj)?;
@@ -13624,6 +13826,7 @@ impl Compiler {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 let base_slot = self.fresh_slot("%logical-base%");
                 self.expr(obj)?;
@@ -13644,6 +13847,7 @@ impl Compiler {
                 obj,
                 index,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 let base_slot = self.fresh_slot("%logical-base%");
                 let key_slot = self.fresh_slot("%logical-key%");
@@ -14081,7 +14285,9 @@ fn drive_vm(
                         | HandlerTarget::Iterator { throw_pc, .. } => throw_pc,
                     };
                     stack.truncate(handler.stack_depth);
-                    stack.push(error.take().expect("throw completion consumed once"));
+                    let error = error.take().expect("throw completion consumed once");
+                    i.settle_caught(&error);
+                    stack.push(error);
                     *pc = throw_pc;
                 }
                 if let Some(error) = error {
@@ -14282,7 +14488,7 @@ fn retained_expr_names(e: &Expr, out: &mut crate::fasthash::FastSet<String>) -> 
         }
     }
     match e {
-        Expr::Ident(name) => {
+        Expr::Ident(name, _) => {
             out.insert(name.clone());
             true
         }
@@ -14344,11 +14550,11 @@ fn retained_expr_names(e: &Expr, out: &mut crate::fasthash::FastSet<String>) -> 
                 && retained_expr_names(alt, out)
         }
         Expr::Call { callee, args, .. } => {
-            !matches!(&**callee, Expr::Ident(name) if name == "eval")
+            !matches!(&**callee, Expr::Ident(name, _) if name == "eval")
                 && retained_expr_names(callee, out)
                 && elems(args, out)
         }
-        Expr::New { callee, args } => retained_expr_names(callee, out) && elems(args, out),
+        Expr::New { callee, args, .. } => retained_expr_names(callee, out) && elems(args, out),
         Expr::Member { obj, .. } => retained_expr_names(obj, out),
         Expr::Index { obj, index, .. } => {
             retained_expr_names(obj, out) && retained_expr_names(index, out)
@@ -14436,7 +14642,7 @@ fn run_vm<S: StoredValue>(
     tiering: Option<&mut crate::tiering::VmTiering>,
 ) -> Result<VmRunExit, Abrupt> {
     let mut requested = false;
-    let step = run_vm_inner(
+    let step = match run_vm_inner(
         i,
         chunk,
         env,
@@ -14452,12 +14658,27 @@ fn run_vm<S: StoredValue>(
         stop_at,
         tiering,
         &mut requested,
-    )?;
+    ) {
+        Ok(step) => step,
+        Err(error) => {
+            place_vm_thrown(i, chunk, *pc, &error);
+            return Err(error);
+        }
+    };
     Ok(if requested {
         VmRunExit::TierRequest
     } else {
         VmRunExit::Step(step)
     })
+}
+
+/// Place the error the VM operation before `pc` threw (see [`Interp::place_thrown`]). An
+/// operation that throws has already advanced `pc` past itself: only jumps move it elsewhere,
+/// and they do so after anything that can fail. Out of line, so the VM's entry stays small.
+#[cold]
+#[inline(never)]
+fn place_vm_thrown(i: &Interp, chunk: &Chunk, pc: usize, error: &Abrupt) {
+    i.place_thrown(error, chunk.position(pc.saturating_sub(1)));
 }
 
 /// Tier requests are driver events, never ECMAScript completions. The inner VM
@@ -15226,11 +15447,13 @@ fn run_vm_inner<S: StoredValue>(
                 if !callee.is_callable() {
                     return Err(not_callable_error(i, chunk, op_pc, &callee, false));
                 }
-                let v = if chunk.feedback.detailed_enabled() {
-                    call_profiled(i, chunk, op_pc, callee, this, &args)?
-                } else {
-                    i.call(callee, this, &args)?
-                };
+                let v = explicit_call(i, chunk.position(op_pc), |i| {
+                    if chunk.feedback.detailed_enabled() {
+                        call_profiled(i, chunk, op_pc, callee, this, &args)
+                    } else {
+                        i.call(callee, this, &args)
+                    }
+                })?;
                 stack.push(v);
             }
             Op::CallArgsArray | Op::CallArgsArrayThis => {
@@ -15244,11 +15467,13 @@ fn run_vm_inner<S: StoredValue>(
                 if !callee.is_callable() {
                     return Err(not_callable_error(i, chunk, op_pc, &callee, false));
                 }
-                let value = if chunk.feedback.detailed_enabled() {
-                    call_profiled(i, chunk, op_pc, callee, this, &args)?
-                } else {
-                    i.call(callee, this, &args)?
-                };
+                let value = explicit_call(i, chunk.position(op_pc), |i| {
+                    if chunk.feedback.detailed_enabled() {
+                        call_profiled(i, chunk, op_pc, callee, this, &args)
+                    } else {
+                        i.call(callee, this, &args)
+                    }
+                })?;
                 stack.push(value);
             }
             Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => {
@@ -15280,7 +15505,9 @@ fn run_vm_inner<S: StoredValue>(
                             environment,
                         );
                     }
-                    let value = i.direct_eval(args.first(), env)?;
+                    let value = explicit_call(i, chunk.position(op_pc), |i| {
+                        i.direct_eval(args.first(), env)
+                    })?;
                     if chunk.feedback.detailed_enabled() {
                         if let Some(class) = arithmetic_value_class(&value) {
                             chunk.feedback.observe_value_class(
@@ -15291,10 +15518,14 @@ fn run_vm_inner<S: StoredValue>(
                         }
                     }
                     value
-                } else if chunk.feedback.detailed_enabled() {
-                    call_profiled(i, chunk, op_pc, callee, receiver, &args)?
                 } else {
-                    i.call(callee, receiver, &args)?
+                    explicit_call(i, chunk.position(op_pc), |i| {
+                        if chunk.feedback.detailed_enabled() {
+                            call_profiled(i, chunk, op_pc, callee, receiver, &args)
+                        } else {
+                            i.call(callee, receiver, &args)
+                        }
+                    })?
                 };
                 stack.push(value);
             }
@@ -15740,15 +15971,17 @@ fn run_vm_inner<S: StoredValue>(
             // The callee/receiver slots below the window are cloned out first, then the whole
             // region is truncated away after the call. On a throw the stack is left long, which is
             // fine: the handler unwind (or function exit) truncates it.
-            Op::Call(argc, _) => {
+            Op::Call(argc, cache) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack.read_value(at - 1);
-                let v = match stack.with_tail(at, |args| {
-                    if chunk.feedback.detailed_enabled() {
-                        call_profiled(i, chunk, op_pc, callee, Value::Undefined, args)
-                    } else {
-                        i.call(callee, Value::Undefined, args)
-                    }
+                let v = match explicit_call(i, chunk.call_position(cache), |i| {
+                    stack.with_tail(at, |args| {
+                        if chunk.feedback.detailed_enabled() {
+                            call_profiled(i, chunk, op_pc, callee, Value::Undefined, args)
+                        } else {
+                            i.call(callee, Value::Undefined, args)
+                        }
+                    })
                 }) {
                     Ok(value) => value,
                     Err(error) => {
@@ -15774,7 +16007,7 @@ fn run_vm_inner<S: StoredValue>(
                     stack.push(callee);
                 }
             }
-            Op::CallWithThis(argc, _) => {
+            Op::CallWithThis(argc, cache) => {
                 let at = stack.len() - argc as usize;
                 let m = stack.read_value(at - 1);
                 let this = stack.read_value(at - 2);
@@ -15799,12 +16032,14 @@ fn run_vm_inner<S: StoredValue>(
                         Err(error) => return Err(Abrupt::Throw(error)),
                     }
                 }
-                let v = match stack.with_tail(at, |args| {
-                    if chunk.feedback.detailed_enabled() {
-                        call_profiled(i, chunk, op_pc, m, this, args)
-                    } else {
-                        i.call(m, this, args)
-                    }
+                let v = match explicit_call(i, chunk.call_position(cache), |i| {
+                    stack.with_tail(at, |args| {
+                        if chunk.feedback.detailed_enabled() {
+                            call_profiled(i, chunk, op_pc, m, this, args)
+                        } else {
+                            i.call(m, this, args)
+                        }
+                    })
                 }) {
                     Ok(value) => value,
                     Err(error) => {
@@ -15815,15 +16050,17 @@ fn run_vm_inner<S: StoredValue>(
                 stack.truncate(at - 2);
                 stack.push(v);
             }
-            Op::New(argc, _) => {
+            Op::New(argc, cache) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack.read_value(at - 1);
-                let v = match stack.with_tail(at, |args| {
-                    if chunk.feedback.detailed_enabled() {
-                        construct_profiled(i, chunk, op_pc, callee, args)
-                    } else {
-                        i.construct(callee, args)
-                    }
+                let v = match explicit_call(i, chunk.construct_position(cache), |i| {
+                    stack.with_tail(at, |args| {
+                        if chunk.feedback.detailed_enabled() {
+                            construct_profiled(i, chunk, op_pc, callee, args)
+                        } else {
+                            i.construct(callee, args)
+                        }
+                    })
                 }) {
                     Ok(value) => value,
                     Err(error) => {
@@ -15840,11 +16077,13 @@ fn run_vm_inner<S: StoredValue>(
                 if !i.value_is_constructor(&callee) {
                     return Err(not_callable_error(i, chunk, op_pc, &callee, true));
                 }
-                let value = if chunk.feedback.detailed_enabled() {
-                    construct_profiled(i, chunk, op_pc, callee, &args)?
-                } else {
-                    i.construct(callee, &args)?
-                };
+                let value = explicit_call(i, chunk.position(op_pc), |i| {
+                    if chunk.feedback.detailed_enabled() {
+                        construct_profiled(i, chunk, op_pc, callee, &args)
+                    } else {
+                        i.construct(callee, &args)
+                    }
+                })?;
                 stack.push(value);
             }
             Op::MakeRegExp(body, flags) => {
@@ -16097,7 +16336,13 @@ fn run_vm_inner<S: StoredValue>(
                         call_arity_kind(args.len()),
                         environment,
                     );
-                    let value = i.finish_super_call(new_target, super_constructor, &args, env)?;
+                    let value = i.finish_super_call(
+                        new_target,
+                        super_constructor,
+                        &args,
+                        chunk.position(op_pc),
+                        env,
+                    )?;
                     if let Some(class) = arithmetic_value_class(&value) {
                         chunk.feedback.observe_value_class(
                             op_pc,
@@ -16107,7 +16352,13 @@ fn run_vm_inner<S: StoredValue>(
                     }
                     value
                 } else {
-                    i.finish_super_call(new_target, super_constructor, &args, env)?
+                    i.finish_super_call(
+                        new_target,
+                        super_constructor,
+                        &args,
+                        chunk.position(op_pc),
+                        env,
+                    )?
                 };
                 stack.push(value);
             }
@@ -17119,6 +17370,8 @@ pub struct VmCoro {
     disposal: Option<VmDispose>,
     pub done: bool,
     pub started: bool,
+    /// What the body reports in stack traces while it runs after resuming.
+    pub(crate) frame: Option<Box<crate::stack_trace::ResumedFrame>>,
 }
 
 impl VmCoro {
@@ -17163,6 +17416,7 @@ impl VmCoro {
             disposal,
             done: _,
             started: _,
+            frame: _,
         } = self;
         edges.object(realm);
         edges.scope(cap_env);
@@ -17377,6 +17631,7 @@ impl VmCoro {
             disposal: None,
             done: false,
             started: false,
+            frame: None,
         }
     }
 
@@ -17420,9 +17675,12 @@ impl VmCoro {
         // This local owner remains an external GC root while the driver has
         // temporarily removed the continuation from its owner's internal slot.
         let realm = self.realm.clone();
-        i.with_suspended_context(&realm, self.host_job_context, |i| {
-            self.resume_active(i, signal)
-        })
+        let frame = self.frame.take();
+        let suspend = i.with_suspended_context(&realm, self.host_job_context, |i| {
+            i.in_resumed(frame.as_deref(), |i| self.resume_active(i, signal))
+        });
+        self.frame = frame;
+        suspend
     }
 
     fn resume_active(
@@ -19678,7 +19936,7 @@ unsafe fn jit_continuation_operation(
         }
         Ok(_) => unreachable!("only slice exit operations may suspend or return"),
         Err(error) => {
-            ctx.error = Some(error);
+            ctx.throw_at(pc, error);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -19780,7 +20038,7 @@ pub(crate) unsafe extern "C" fn jit_reference_op(
     match result {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(error) => {
-            ctx.error = Some(error);
+            ctx.throw_at(pc, error);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -20002,7 +20260,7 @@ unsafe fn jit_vm_operation(
     match result {
         Ok(VmStep::Done(_)) => crate::jit::SpFlag { sp, flag: 0 },
         Err(error) => {
-            ctx.error = Some(error);
+            ctx.throw_at(pc, error);
             crate::jit::SpFlag { sp, flag: 1 }
         }
         _ => unreachable!("native one-op bridge cannot suspend or return"),
@@ -20100,7 +20358,7 @@ pub(crate) unsafe extern "C" fn jit_exec(
         return match jit_private_op_inner(ctx, pc, &mut sp) {
             Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
             Err(error) => {
-                ctx.error = Some(error);
+                ctx.throw_at(pc, error);
                 crate::jit::SpFlag { sp, flag: 1 }
             }
         };
@@ -20138,10 +20396,18 @@ pub(crate) unsafe extern "C" fn jit_exec(
     }
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
-    match jit_exec_inner(ctx, pc, &mut sp) {
+    let result = if makes_explicit_call(&chunk.ops[pc as usize]) {
+        let i = &mut *ctx.interp;
+        explicit_call(i, call_op_position(chunk, pc as usize), |_| {
+            jit_exec_inner(ctx, pc, &mut sp)
+        })
+    } else {
+        jit_exec_inner(ctx, pc, &mut sp)
+    };
+    match result {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(pc, ab);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -20224,7 +20490,7 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
             }
         }
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(pc, abrupt);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -20255,7 +20521,8 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     if left.len().saturating_add(right.len()) > crate::interpreter::MAX_STR_LEN {
         let ctx = unsafe { &mut *ctx };
         let i = unsafe { &mut *ctx.interp };
-        ctx.error = Some(i.throw("RangeError", "Invalid string length"));
+        let error = i.throw("RangeError", "Invalid string length");
+        unsafe { ctx.throw_at(pc, error) };
         return crate::jit::SpFlag { sp: base, flag: 1 };
     }
 
@@ -20298,7 +20565,21 @@ thread_local! {
 /// Emitted guards keep string/property intrinsics on non-coercing cases. Function#apply performs
 /// its own dense-list guards; Array push/pop transfer ownership directly between the operand
 /// stack and dense storage. Every guard miss invokes the exact builtin implementation.
+/// [`jit_intrinsic_inner`] as the explicit call it is: the callee records the call's position.
 pub(crate) unsafe extern "C" fn jit_intrinsic(
+    ctx: *mut crate::jit::JitCtx,
+    packed: u32,
+    sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let site = (packed & 0xFFFF) as usize;
+    let i = unsafe { &mut *(*ctx).interp };
+    let position = call_op_position(unsafe { &*(*ctx).chunk }, site);
+    explicit_call(i, position, |_| unsafe {
+        jit_intrinsic_inner(ctx, packed, sp)
+    })
+}
+
+unsafe fn jit_intrinsic_inner(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
     sp: *mut PackedValue,
@@ -20692,7 +20973,7 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
             }
         }
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(packed & 0xFFFF, ab);
             crate::jit::SpFlag { sp: base, flag: 1 }
         }
     }
@@ -20760,14 +21041,14 @@ pub(crate) unsafe extern "C" fn jit_regexp_exec_loop(
     let regexp = match chunk.load_name_ic(i, &env, *re_name, *re_cache) {
         Ok(v) => v,
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(head, ab);
             return 2;
         }
     };
     let strings = match chunk.load_name_ic(i, &env, *array_name, *array_cache) {
         Ok(v) => v,
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(head, ab);
             return 2;
         }
     };
@@ -20920,7 +21201,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_exec_discard(
             let array_value = match chunk.load_name_ic(i, &env, array, array_cache) {
                 Ok(value) => value,
                 Err(abrupt) => {
-                    ctx.error = Some(abrupt);
+                    ctx.throw_at(literal_pc, abrupt);
                     return 2;
                 }
             };
@@ -20958,14 +21239,14 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_exec_discard(
     let re = match chunk.compiled_regexp_literal(i, pc, body, flags) {
         Ok(re) => re,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(literal_pc, abrupt);
             return 2;
         }
     };
     match crate::builtins::regexp_literal_exec_discard(i, &re, &subject) {
         Ok(()) => 1,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(literal_pc, abrupt);
             2
         }
     }
@@ -21011,7 +21292,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_replace_discard(
     let array_value = match chunk.load_name_ic(i, &env, *array, *array_cache) {
         Ok(value) => value,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(start_pc, abrupt);
             return 2;
         }
     };
@@ -21053,14 +21334,14 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_replace_discard(
     let re = match chunk.compiled_regexp_literal(i, pc + 4, *body, *flags) {
         Ok(re) => re,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(start_pc, abrupt);
             return 2;
         }
     };
     match crate::builtins::regexp_literal_replace_discard(i, &re, &subject) {
         Ok(()) => 1,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(start_pc, abrupt);
             2
         }
     }
@@ -21104,7 +21385,7 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
     let array_value = match chunk.load_name_ic(i, &env, *array, *array_cache) {
         Ok(value) => value,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(start_pc, abrupt);
             return 2;
         }
     };
@@ -21143,14 +21424,14 @@ pub(crate) unsafe extern "C" fn jit_regexp_literal_match_discard(
     let re = match chunk.compiled_regexp_literal(i, pc + 4, *body, *flags) {
         Ok(re) => re,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(start_pc, abrupt);
             return 2;
         }
     };
     match crate::builtins::regexp_literal_match_discard(i, &re, &subject) {
         Ok(()) => 1,
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(start_pc, abrupt);
             2
         }
     }
@@ -21200,10 +21481,12 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     // Returning from inside a try bypasses the lexical PopHandler; `release` also discards the
     // callee's own handler records (ECMA-262 14.10.1 and 14.15.3) and its `this` binding.
     crate::jit::JitFrame::release(i, record);
-    // FnFrame pop (the asm pushed it; a materialized `extra` drops here).
+    // FnFrame pop (the asm pushed it; a materialized `extra` drops here). The caller's direct
+    // call never set `call_site`, so no explicit call is in progress once it returns.
     if let Some(f) = i.fn_frames.pop() {
         drop(f.extra);
     }
+    i.call_site = crate::stack_trace::NO_POSITION;
     // Proper-tail-call trampoline, exactly like the layered paths.
     if !threw {
         while let Some(bx) = i.pending_tail.take() {
@@ -21325,7 +21608,19 @@ fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
     Some(values)
 }
 
+/// [`jit_call_hit_inner`] as the explicit call it is: the callee records the call's position.
 pub(crate) unsafe extern "C" fn jit_call_hit(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let site = (pc & 0xFFFF) as usize;
+    let i = unsafe { &mut *(*ctx).interp };
+    let position = call_op_position(unsafe { &*(*ctx).chunk }, site);
+    explicit_call(i, position, |_| unsafe { jit_call_hit_inner(ctx, pc, sp) })
+}
+
+unsafe fn jit_call_hit_inner(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
     mut sp: *mut PackedValue,
@@ -21560,7 +21855,7 @@ pub(crate) unsafe extern "C" fn jit_object_literal(
     match jit_object_literal_inner(ctx, pc, &mut sp) {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(pc, ab);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -21848,7 +22143,7 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
     match result {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(pc, abrupt);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -21870,7 +22165,7 @@ pub(crate) unsafe extern "C" fn jit_abstract_operation(
     match jit_abstract_operation_inner(ctx, operation, &mut sp) {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(pc, abrupt);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -21942,7 +22237,19 @@ unsafe fn jit_abstract_operation_inner(
 
 /// Dedicated `Op::New` entry (same contract as [`jit_exec`]): enters the identity-cached
 /// JIT-to-JIT constructor path without decoding the full opcode family.
+/// [`jit_new_site`] as the explicit call it is: the callee records the call's position.
 pub(crate) unsafe extern "C" fn jit_new(
+    ctx: *mut crate::jit::JitCtx,
+    packed: u32,
+    sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let site = (packed & 0xFFFF) as usize;
+    let i = unsafe { &mut *(*ctx).interp };
+    let position = call_op_position(unsafe { &*(*ctx).chunk }, site);
+    explicit_call(i, position, |_| unsafe { jit_new_site(ctx, packed, sp) })
+}
+
+unsafe fn jit_new_site(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
     mut sp: *mut PackedValue,
@@ -22035,7 +22342,7 @@ pub(crate) unsafe extern "C" fn jit_instanceof(
             }
         }
         Err(abrupt) => {
-            ctx.error = Some(abrupt);
+            ctx.throw_at(pc, abrupt);
             crate::jit::SpFlag { sp: base, flag: 1 }
         }
     }
@@ -22191,7 +22498,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     match r {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(pc, ab);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -22320,13 +22627,14 @@ pub(crate) unsafe extern "C" fn jit_get_element(
             // Clone before a coercion/getter can reenter and overwrite the canonical slot.
             let object = unsafe { ctx.clone_slot(slot as usize) };
             if matches!(object, Value::Empty) {
-                ctx.error = Some(unsafe { &mut *ctx.interp }.throw(
+                let error = unsafe { &mut *ctx.interp }.throw(
                     "ReferenceError",
                     format!(
                         "cannot access '{}' before initialization",
                         chunk.slot_names[slot as usize]
                     ),
-                ));
+                );
+                unsafe { ctx.throw_at(pc, error) };
                 return crate::jit::SpFlag { sp: base, flag: 1 };
             }
             (base, object, key, false)
@@ -22353,7 +22661,7 @@ pub(crate) unsafe extern "C" fn jit_get_element(
             }
         }
         Err(error) => {
-            ctx.error = Some(error);
+            ctx.throw_at(pc, error);
             crate::jit::SpFlag { sp: base, flag: 1 }
         }
     }
@@ -22449,7 +22757,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
     match r {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(pc, ab);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -22465,10 +22773,12 @@ pub(crate) unsafe extern "C" fn jit_call(
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
-    match jit_call_inner(ctx, pc, &mut sp) {
+    let i = &mut *ctx.interp;
+    let position = call_op_position(&*ctx.chunk, pc as usize);
+    match explicit_call(i, position, |_| jit_call_inner(ctx, pc, &mut sp)) {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
-            ctx.error = Some(ab);
+            ctx.throw_at(pc, ab);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -23041,6 +23351,54 @@ pub(crate) fn ordinary_tail_call_depth() -> u32 {
             .and_then(|value| value.parse().ok())
             .unwrap_or(1024)
     })
+}
+
+/// The source position of the call or `new` operation at `pc`; the cached call forms answer
+/// without a search.
+#[inline]
+fn call_op_position(chunk: &Chunk, pc: usize) -> u32 {
+    match chunk.ops.get(pc) {
+        Some(Op::Call(_, cache) | Op::CallWithThis(_, cache)) => chunk.call_position(*cache),
+        Some(Op::New(_, cache)) => chunk.construct_position(*cache),
+        _ => chunk.position(pc),
+    }
+}
+
+/// Whether the operation makes an explicit call (or `new`) whose callee records its position.
+fn makes_explicit_call(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Call(..)
+            | Op::CallWithThis(..)
+            | Op::CallSpread(_)
+            | Op::CallSpreadThis(_)
+            | Op::CallArgsArray
+            | Op::CallArgsArrayThis
+            | Op::EvalCallArgsArray
+            | Op::TailEvalCallArgsArray
+            | Op::New(..)
+            | Op::NewArgsArray
+    )
+}
+
+impl crate::jit::JitCtx {
+    /// Hand `error`, thrown by the operation at `pc`, to the generated code's unwind path,
+    /// placing the error's pending stack frame at that operation (see [`Interp::place_thrown`]).
+    #[cold]
+    pub(crate) unsafe fn throw_at(&mut self, pc: u32, error: Abrupt) {
+        unsafe { (*self.interp).place_thrown(&error, (*self.chunk).position(pc as usize)) };
+        self.error = Some(error);
+    }
+}
+
+/// Run `call`, the explicit call (or `new`) at source `position` of the running context: the
+/// callee's frame records it as its caller's location (see `crate::stack_trace`).
+#[inline(always)]
+fn explicit_call<T>(i: &mut Interp, position: u32, call: impl FnOnce(&mut Interp) -> T) -> T {
+    i.call_site = position;
+    let result = call(i);
+    i.call_site = NO_POSITION;
+    result
 }
 
 /// The TypeError for the call (`construct` false) or `new` operation at `pc` when its target
@@ -24500,6 +24858,7 @@ unsafe fn jit_unwind_target(
             let Some(Abrupt::Throw(exc)) = ctx.error.take() else {
                 unreachable!()
             };
+            (*ctx.interp).settle_caught(&exc);
             target.write(PackedValue::pack(exc));
             NativeCompletionTarget {
                 sp: target.add(1),

@@ -523,6 +523,17 @@ impl Visitor {
         }
     }
 
+    /// A shared source record: its own bytes and the text it keeps alive, once per record.
+    pub(crate) fn script_source(&mut self, source: &Rc<crate::stack_trace::ScriptSource>) {
+        let identity = Rc::as_ptr(source) as usize;
+        if self.rc_strs.insert(identity) {
+            self.strings_symbols_bigints = self
+                .strings_symbols_bigints
+                .saturating_add(source.owned_bytes());
+            self.rc_str(source.text());
+        }
+    }
+
     pub(crate) fn rc_str(&mut self, value: &Rc<str>) {
         let identity = Rc::as_ptr(value) as *const () as usize;
         if self.rc_strs.insert(identity) {
@@ -986,7 +997,11 @@ impl Visitor {
             Exotic::StrWrap(value) => self.value(&Value::Str((**value).clone())),
             Exotic::SymWrap(value) => self.symbol(value),
             Exotic::BigIntWrap(value) => self.value(&Value::BigInt((**value).clone())),
-            Exotic::Error(value) => self.rc_str(value),
+            Exotic::Error(trace) => {
+                internal_bytes += trace
+                    .as_deref()
+                    .map_or(0, crate::stack_trace::StackTrace::retained_bytes);
+            }
             Exotic::ArrayIterator(state) => {
                 internal_bytes += std::mem::size_of_val(&**state);
                 self.value(&state.target);
@@ -1715,6 +1730,12 @@ fn scan_realm(
             .fn_frames
             .capacity()
             .saturating_mul(size_of::<crate::interpreter::FnFrame>())
+            .saturating_add(
+                interp
+                    .code_frames
+                    .capacity()
+                    .saturating_mul(size_of::<crate::stack_trace::CodeFrame>()),
+            )
             .saturating_add(interp.pending_fn_name.as_ref().map_or(0, String::capacity))
             .saturating_add(
                 interp
@@ -3334,8 +3355,9 @@ mod tests {
         engine.interp.fn_frames.reserve(3);
         engine.interp.fn_frames.push(crate::interpreter::FnFrame {
             fn_ptr: 0,
-            coro: 0,
+            call_site: 0,
             strict: false,
+            construct: false,
             extra: Some(Box::new(crate::interpreter::FrameExtra {
                 args_obj: Value::lstr("materialized frame arguments"),
                 lazy: None,

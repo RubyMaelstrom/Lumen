@@ -51,11 +51,10 @@ pub enum Tok {
 pub enum TplPart {
     /// A literal chunk. `cooked` is None when the chunk contains an invalid escape sequence —
     /// legal only in a *tagged* template (the cooked value is undefined there).
-    Str {
-        cooked: Option<String>,
-        raw: String,
-    },
-    Sub(String),
+    Str { cooked: Option<String>, raw: String },
+    /// The `${...}` hole's source text and the byte offset at which it starts in the lexed
+    /// source, so positions inside it index the whole text.
+    Sub(String, u32),
 }
 
 /// The *always-reserved* words. The lexer hands these back as `Keyword` tokens so `var`/`function`/

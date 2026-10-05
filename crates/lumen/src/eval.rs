@@ -3,6 +3,7 @@
 
 use crate::ast::*;
 use crate::interpreter::*;
+use crate::stack_trace::NO_POSITION;
 use crate::value::*;
 use std::rc::Rc;
 
@@ -775,8 +776,10 @@ impl Interp {
                                     if matches!(e, Expr::Class(c) if c.name.is_none()) {
                                         self.pending_fn_name = Some(n.clone());
                                     }
-                                    let mut lref =
-                                        self.resolve_reference(&Expr::Ident(n.clone()), env)?;
+                                    let mut lref = self.resolve_reference(
+                                        &Expr::Ident(n.clone(), NO_POSITION),
+                                        env,
+                                    )?;
                                     let value = self.eval(e, env)?;
                                     self.pending_fn_name = None;
                                     if is_anonymous_fn(e) {
@@ -843,12 +846,12 @@ impl Interp {
                             // A shallow tail call runs as an ordinary call; deep or unbounded
                             // tail recursion still retires this frame first, as compiled code
                             // does (see `bytecode::Op::TailDeep`).
-                            TailEval::Tail(f, t, a)
+                            TailEval::Tail(f, t, a, position)
                                 if self.depth < crate::bytecode::ordinary_tail_call_depth() =>
                             {
-                                Err(Abrupt::Return(self.call(f, t, &a)?))
+                                Err(Abrupt::Return(self.call_at(position, f, t, &a)?))
                             }
-                            TailEval::Tail(f, t, a) => {
+                            TailEval::Tail(f, t, a, _) => {
                                 self.pending_tail = Some(Box::new((f, t, a)));
                                 Err(Abrupt::Return(Value::Undefined))
                             }
@@ -1254,8 +1257,10 @@ impl Interp {
                             if matches!(initializer, Expr::Class(class) if class.name.is_none()) {
                                 self.pending_fn_name = Some(name.clone());
                             }
-                            let mut reference =
-                                self.resolve_reference(&Expr::Ident(name.clone()), loop_env)?;
+                            let mut reference = self.resolve_reference(
+                                &Expr::Ident(name.clone(), NO_POSITION),
+                                loop_env,
+                            )?;
                             let value = self.eval(initializer, loop_env)?;
                             self.pending_fn_name = None;
                             if is_anonymous_fn(initializer) {
@@ -2238,6 +2243,7 @@ impl Interp {
         self.tco_ok = saved_tco;
         let after_catch = match result {
             Err(Abrupt::Throw(ex)) => {
+                self.settle_caught(&ex);
                 if let Some((param, body)) = handler {
                     crate::jit::perf_error_caught();
                     // The catch parameter lives in its own environment (flagged so a sloppy `eval`'s
@@ -3022,7 +3028,10 @@ impl Interp {
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
-            Expr::Ident(name) => self.get_var(name, env),
+            Expr::Ident(name, pos) => {
+                let result = self.get_var(name, env);
+                self.placed(result, *pos)
+            }
             Expr::This => self.resolve_this_binding(env),
             Expr::Regex { body, flags } => self.make_regexp(body, flags),
             Expr::Array(elems) => self.eval_array(elems, env),
@@ -3113,7 +3122,15 @@ impl Interp {
                 self.binary(op, l, r)
             }
             Expr::Paren(inner) => self.eval(inner, env),
-            Expr::Assign { op, target, value } => self.eval_assign(op, target, value, env),
+            Expr::Assign {
+                op,
+                target,
+                value,
+                pos,
+            } => {
+                let result = self.eval_assign(op, target, value, env);
+                self.placed(result, *pos)
+            }
             Expr::ImportMeta => Ok(self.import_meta_vm(env)),
             Expr::NewTarget => Ok(self.new_target_vm(env)),
             Expr::ImportCall {
@@ -3150,103 +3167,185 @@ impl Interp {
                 obj,
                 prop,
                 optional,
+                pos,
             } => {
-                if matches!(**obj, Expr::Super) {
-                    // GetThisBinding first (TDZ ReferenceError), then Get(base, key, actualThis):
-                    // a getter on the super prototype sees the current `this`.
-                    let this = self.get_var("this", env)?;
-                    let home = self.super_base(env)?;
-                    if matches!(home, Value::Undefined | Value::Null) {
-                        return Err(self.throw(
-                            "TypeError",
-                            format!("cannot read property '{prop}' of a null super base"),
-                        ));
-                    }
-                    return crate::builtins::reflect_ordinary_get(self, &home, prop, &this)
-                        .map_err(Abrupt::Throw);
-                }
-                let base = self.eval(obj, env)?;
-                if self.short_circuit {
-                    return Ok(Value::Undefined); // an earlier `?.` link short-circuited
-                }
-                if *optional && matches!(base, Value::Undefined | Value::Null) {
-                    self.short_circuit = true;
-                    return Ok(Value::Undefined);
-                }
-                if prop.starts_with('#') {
-                    let k = self.resolve_private(prop, env);
-                    return self.get_private_member(&base, &k);
-                }
-                self.get_member(&base, prop)
+                let result = self.eval_member(obj, prop, *optional, env);
+                self.placed(result, *pos)
             }
             Expr::Index {
                 obj,
                 index,
                 optional,
+                pos,
             } => {
-                if matches!(**obj, Expr::Super) {
-                    // GetThisBinding, the key expression, GetSuperBase, then ToPropertyKey.
-                    let this = self.get_var("this", env)?;
-                    let idx = self.eval(index, env)?;
-                    let home = self.super_base(env)?;
-                    let key = self.to_property_key(&idx)?;
-                    if matches!(home, Value::Undefined | Value::Null) {
-                        return Err(self.throw(
-                            "TypeError",
-                            format!("cannot read property '{key}' of a null super base"),
-                        ));
-                    }
-                    return crate::builtins::reflect_ordinary_get(self, &home, &key, &this)
-                        .map_err(Abrupt::Throw);
-                }
-                let base = self.eval(obj, env)?;
-                if self.short_circuit {
-                    return Ok(Value::Undefined);
-                }
-                if *optional && matches!(base, Value::Undefined | Value::Null) {
-                    self.short_circuit = true;
-                    return Ok(Value::Undefined);
-                }
-                let idx = self.eval(index, env)?;
-                // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
-                if matches!(base, Value::Undefined | Value::Null) {
-                    trace_nullish_property("eval-index", &idx);
-                    return Err(
-                        self.throw("TypeError", "cannot read property of null or undefined")
-                    );
-                }
-                if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
-                    if let Some(v) = self.fast_get_elem(o, *n) {
-                        return Ok(v);
-                    }
-                }
-                let key = self.to_property_key(&idx)?;
-                self.get_member(&base, &key)
+                let result = self.eval_index(obj, index, *optional, env);
+                self.placed(result, *pos)
             }
             Expr::Call {
                 callee,
                 args,
                 optional,
-            } => self.eval_call(callee, args, *optional, env),
+                pos,
+            } => {
+                let result = self.eval_call(callee, args, *optional, *pos, env);
+                self.placed(result, *pos)
+            }
             Expr::TaggedTemplate {
                 tag,
                 site,
                 quasis,
                 subs,
-            } => self.eval_tagged_template(tag, *site, quasis, subs, env),
-            Expr::New { callee, args } => {
-                let c = self.eval(callee, env)?;
-                let argv = self.eval_args(args, env)?;
-                // EvaluateNew step 7: IsConstructor follows ArgumentListEvaluation.
-                if !self.value_is_constructor(&c) {
-                    return Err(self.throw(
-                        "TypeError",
-                        crate::callee_name::not_callable_message(callee, true),
-                    ));
-                }
-                self.construct(c, &argv)
+                pos,
+            } => {
+                let result = self.eval_tagged_template(tag, *site, quasis, subs, *pos, env);
+                self.placed(result, *pos)
+            }
+            Expr::New { callee, args, pos } => {
+                let result = self.eval_new(callee, args, *pos, env);
+                self.placed(result, *pos)
             }
         }
+    }
+
+    /// `new callee(args)` at source `position`; see [`Interp::eval`].
+    fn eval_new(
+        &mut self,
+        callee: &Expr,
+        args: &[ArrayElem],
+        position: u32,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let c = self.eval(callee, env)?;
+        let argv = self.eval_args(args, env)?;
+        // EvaluateNew step 7: IsConstructor follows ArgumentListEvaluation.
+        if !self.value_is_constructor(&c) {
+            return Err(self.throw(
+                "TypeError",
+                crate::callee_name::not_callable_message(callee, true),
+            ));
+        }
+        self.construct_at(position, c, &argv)
+    }
+
+    /// A property read `obj.prop` (or `obj.#prop`); see [`Interp::eval`].
+    fn eval_member(
+        &mut self,
+        obj: &Expr,
+        prop: &str,
+        optional: bool,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        if matches!(obj, Expr::Super) {
+            // GetThisBinding first (TDZ ReferenceError), then Get(base, key, actualThis):
+            // a getter on the super prototype sees the current `this`.
+            let this = self.get_var("this", env)?;
+            let home = self.super_base(env)?;
+            if matches!(home, Value::Undefined | Value::Null) {
+                return Err(self.throw(
+                    "TypeError",
+                    format!("cannot read property '{prop}' of a null super base"),
+                ));
+            }
+            return crate::builtins::reflect_ordinary_get(self, &home, prop, &this)
+                .map_err(Abrupt::Throw);
+        }
+        let base = self.eval(obj, env)?;
+        if self.short_circuit {
+            return Ok(Value::Undefined); // an earlier `?.` link short-circuited
+        }
+        if optional && matches!(base, Value::Undefined | Value::Null) {
+            self.short_circuit = true;
+            return Ok(Value::Undefined);
+        }
+        if prop.starts_with('#') {
+            let k = self.resolve_private(prop, env);
+            return self.get_private_member(&base, &k);
+        }
+        self.get_member(&base, prop)
+    }
+
+    /// A computed property read `obj[index]`; see [`Interp::eval`].
+    fn eval_index(
+        &mut self,
+        obj: &Expr,
+        index: &Expr,
+        optional: bool,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        if matches!(obj, Expr::Super) {
+            // GetThisBinding, the key expression, GetSuperBase, then ToPropertyKey.
+            let this = self.get_var("this", env)?;
+            let idx = self.eval(index, env)?;
+            let home = self.super_base(env)?;
+            let key = self.to_property_key(&idx)?;
+            if matches!(home, Value::Undefined | Value::Null) {
+                return Err(self.throw(
+                    "TypeError",
+                    format!("cannot read property '{key}' of a null super base"),
+                ));
+            }
+            return crate::builtins::reflect_ordinary_get(self, &home, &key, &this)
+                .map_err(Abrupt::Throw);
+        }
+        let base = self.eval(obj, env)?;
+        if self.short_circuit {
+            return Ok(Value::Undefined);
+        }
+        if optional && matches!(base, Value::Undefined | Value::Null) {
+            self.short_circuit = true;
+            return Ok(Value::Undefined);
+        }
+        let idx = self.eval(index, env)?;
+        // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
+        if matches!(base, Value::Undefined | Value::Null) {
+            trace_nullish_property("eval-index", &idx);
+            return Err(self.throw("TypeError", "cannot read property of null or undefined"));
+        }
+        if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
+            if let Some(v) = self.fast_get_elem(o, *n) {
+                return Ok(v);
+            }
+        }
+        let key = self.to_property_key(&idx)?;
+        self.get_member(&base, &key)
+    }
+
+    /// Give a pending error from the node at `position` that position (see
+    /// [`Interp::place_thrown`]); only the error path does any work.
+    #[inline]
+    fn placed(&self, result: Result<Value, Abrupt>, position: u32) -> Result<Value, Abrupt> {
+        if let Err(error) = &result {
+            self.place_thrown(error, position);
+        }
+        result
+    }
+
+    /// Call `func` as the explicit call at source `position`, which the callee's frame records
+    /// as its caller's location (see `crate::stack_trace`).
+    pub(crate) fn call_at(
+        &mut self,
+        position: u32,
+        func: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
+        self.call_site = position;
+        let result = self.call(func, this, args);
+        self.call_site = crate::stack_trace::NO_POSITION;
+        result
+    }
+
+    /// [`Interp::call_at`] for `new`.
+    pub(crate) fn construct_at(
+        &mut self,
+        position: u32,
+        callee: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
+        self.call_site = position;
+        let result = self.construct(callee, args);
+        self.call_site = crate::stack_trace::NO_POSITION;
+        result
     }
 
     /// Meta-property reads used by both the tree-walker and heap bytecode continuations. The
@@ -3662,6 +3761,7 @@ impl Interp {
         site_id: u64,
         quasis: &[(Option<String>, String)],
         subs: &[Expr],
+        position: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
         let (func, this) = self.eval_callee_reference(tag, env)?;
@@ -3678,7 +3778,7 @@ impl Interp {
                 crate::callee_name::not_callable_message(tag, false),
             ));
         }
-        self.call(func, this, &argv)
+        self.call_at(position, func, this, &argv)
     }
 
     /// GetTemplateObject: one frozen strings array (with a frozen `.raw`) per template *site* —
@@ -3730,22 +3830,30 @@ impl Interp {
                 callee,
                 args,
                 optional: false,
-            } if matches!(&**callee, Expr::Ident(name) if name == "eval") => {
+                pos,
+            } if matches!(&**callee, Expr::Ident(name, _) if name == "eval") => {
                 // Resolve once: even testing whether this is direct eval can invoke a
                 // with-object getter. A shadowing ordinary function still gets a tail call.
-                self.eval_named_eval_call(args, env, true)
-            }
-            Expr::Call { .. } => {
-                if let Some((f, t, a)) = self.eval_tail_call(e, env)? {
-                    return Ok(TailEval::Tail(f, t, a));
+                let result = self.eval_named_eval_call(args, *pos, env, true);
+                if let Err(error) = &result {
+                    self.place_thrown(error, *pos);
                 }
-                Ok(TailEval::Val(self.eval(e, env)?))
+                result
             }
-            Expr::TaggedTemplate { .. } => {
-                if let Some((f, t, a)) = self.eval_tail_tagged(e, env)? {
-                    return Ok(TailEval::Tail(f, t, a));
+            Expr::Call { pos, .. } | Expr::TaggedTemplate { pos, .. } => {
+                let tail = if matches!(e, Expr::Call { .. }) {
+                    self.eval_tail_call(e, env)
+                } else {
+                    self.eval_tail_tagged(e, env)
+                };
+                match tail {
+                    Ok(Some((f, t, a))) => Ok(TailEval::Tail(f, t, a, *pos)),
+                    Ok(None) => Ok(TailEval::Val(self.eval(e, env)?)),
+                    Err(error) => {
+                        self.place_thrown(&error, *pos);
+                        Err(error)
+                    }
                 }
-                Ok(TailEval::Val(self.eval(e, env)?))
             }
             Expr::Cond { test, cons, alt } => {
                 let tv = self.eval(test, env)?;
@@ -3790,12 +3898,13 @@ impl Interp {
             callee,
             args,
             optional: false,
+            ..
         } = e
         else {
             return Ok(None);
         };
         if matches!(&**callee, Expr::Super)
-            || matches!(&**callee, Expr::Ident(name) if name == "eval")
+            || matches!(&**callee, Expr::Ident(name, _) if name == "eval")
         {
             // Constructor continuation and direct eval retain their dedicated evaluation.
             return Ok(None);
@@ -3823,6 +3932,7 @@ impl Interp {
             site,
             quasis,
             subs,
+            ..
         } = e
         else {
             return Ok(None);
@@ -3885,6 +3995,7 @@ impl Interp {
         new_target: Value,
         super_constructor: Value,
         args: &[Value],
+        position: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
         // IsConstructor follows ArgumentListEvaluation, even when the retained value is null or
@@ -3892,7 +4003,10 @@ impl Interp {
         if !self.value_is_constructor(&super_constructor) {
             return Err(self.throw("TypeError", "super constructor is not a constructor"));
         }
-        let result = self.construct_nt(super_constructor, args, new_target)?;
+        self.call_site = position;
+        let result = self.construct_nt(super_constructor, args, new_target);
+        self.call_site = crate::stack_trace::NO_POSITION;
+        let result = result?;
 
         // GetThisEnvironment and BindThisValue occur after Construct. A second super() therefore
         // still constructs its parent before the already-initialized binding raises ReferenceError.
@@ -3929,6 +4043,7 @@ impl Interp {
     fn eval_named_eval_call(
         &mut self,
         args: &[ArrayElem],
+        position: u32,
         env: &Env,
         tail: bool,
     ) -> Result<TailEval, Abrupt> {
@@ -3942,16 +4057,20 @@ impl Interp {
         );
         let argv = self.eval_args(args, env)?;
         if direct {
-            return self.direct_eval(argv.first(), env).map(TailEval::Val);
+            self.call_site = position;
+            let result = self.direct_eval(argv.first(), env);
+            self.call_site = crate::stack_trace::NO_POSITION;
+            return result.map(TailEval::Val);
         }
         if !func.is_callable() {
             return Err(self.throw("TypeError", "eval is not a function"));
         }
         let receiver = receiver.unwrap_or(Value::Undefined);
         if tail {
-            Ok(TailEval::Tail(func, receiver, argv))
+            Ok(TailEval::Tail(func, receiver, argv, position))
         } else {
-            self.call(func, receiver, &argv).map(TailEval::Val)
+            self.call_at(position, func, receiver, &argv)
+                .map(TailEval::Val)
         }
     }
 
@@ -3960,10 +4079,11 @@ impl Interp {
         callee: &Expr,
         args: &[ArrayElem],
         optional: bool,
+        position: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        if !optional && matches!(callee, Expr::Ident(name) if name == "eval") {
-            match self.eval_named_eval_call(args, env, false)? {
+        if !optional && matches!(callee, Expr::Ident(name, _) if name == "eval") {
+            match self.eval_named_eval_call(args, position, env, false)? {
                 TailEval::Val(value) => return Ok(value),
                 TailEval::Tail(..) => unreachable!("non-tail eval call"),
             }
@@ -3973,7 +4093,7 @@ impl Interp {
         if matches!(callee, Expr::Super) {
             let (new_target, super_constructor) = self.prepare_super_call(env)?;
             let argv = self.eval_args(args, env)?;
-            return self.finish_super_call(new_target, super_constructor, &argv, env);
+            return self.finish_super_call(new_target, super_constructor, &argv, position, env);
         }
         let (func, this) = self.eval_callee_reference(callee, env)?;
         if self.short_circuit {
@@ -3991,7 +4111,7 @@ impl Interp {
                 crate::callee_name::not_callable_message(callee, false),
             ));
         }
-        self.call(func, this, &argv)
+        self.call_at(position, func, this, &argv)
     }
 
     /// Evaluate a callee once while retaining GetThisValue/WithBaseObject. Parentheses retain
@@ -4016,7 +4136,7 @@ impl Interp {
                     }
                 });
             }
-            Expr::Ident(name) => {
+            Expr::Ident(name, _) => {
                 let (f, recv) = self.get_var_with(name, env)?;
                 (f, recv.unwrap_or(Value::Undefined))
             }
@@ -4024,6 +4144,7 @@ impl Interp {
                 obj,
                 prop,
                 optional,
+                ..
             } => {
                 if matches!(**obj, Expr::Super) {
                     let receiver = self.get_var("this", env)?;
@@ -4055,6 +4176,7 @@ impl Interp {
                 obj,
                 index,
                 optional,
+                ..
             } => {
                 if matches!(**obj, Expr::Super) {
                     let receiver = self.get_var("this", env)?;
@@ -4822,7 +4944,7 @@ impl Interp {
         let allow_super = direct
             && (self.peek_binding("%homeobject%", caller_env).is_some()
                 || self.peek_binding("%superproto%", caller_env).is_some());
-        let body = crate::parser::parse_script_eval(
+        let (body, source) = crate::parser::parse_script_eval(
             code,
             base_strict,
             allow_new_target,
@@ -4918,13 +5040,14 @@ impl Interp {
             )
         };
 
-        self.eval_declaration_instantiation(&body, &var_env, &lex_env, strict)?;
-
-        let saved = self.strict;
-        self.strict = strict;
-        let result = self.run_eval_body(&body, &lex_env);
-        self.strict = saved;
-        result
+        self.in_code(Some(source), |this| {
+            this.eval_declaration_instantiation(&body, &var_env, &lex_env, strict)?;
+            let saved = this.strict;
+            this.strict = strict;
+            let result = this.run_eval_body(&body, &lex_env);
+            this.strict = saved;
+            result
+        })
     }
 
     /// EvalDeclarationInstantiation: validate the eval body's `var`/function declarations against the
@@ -5305,6 +5428,7 @@ impl Interp {
                 obj,
                 prop,
                 optional: false,
+                ..
             } if !matches!(**obj, Expr::Super) => {
                 let this_value = self.eval(obj, env)?;
                 let callback = if prop.starts_with('#') {
@@ -5405,7 +5529,7 @@ impl Interp {
             .iter()
             .find(|m| m.kind == MemberKind::Constructor)
             .and_then(|m| m.func.clone())
-            .unwrap_or_else(|| Rc::new(default_constructor(derived)));
+            .unwrap_or_else(|| Rc::new(default_constructor(derived, class)));
         let ctor_func = if class.source.is_some() {
             let mut f = (*ctor_func).clone();
             f.source = class.source.clone();
@@ -6538,7 +6662,7 @@ impl Interp {
         v: Value,
         env: &Env,
     ) -> Result<(), Abrupt> {
-        let target = Expr::Ident(name.to_string());
+        let target = Expr::Ident(name.to_string(), NO_POSITION);
         let mut r = self.resolve_reference(&target, env)?;
         self.put_reference(&mut r, v)
     }
@@ -6618,7 +6742,7 @@ impl Interp {
     fn eval_unary(&mut self, op: &str, arg: &Expr, env: &Env) -> Result<Value, Abrupt> {
         if op == "typeof" {
             // typeof on an unresolved identifier yields "undefined" rather than throwing.
-            if let Expr::Ident(name) = arg {
+            if let Expr::Ident(name, _) = arg {
                 return self.typeof_name_vm(name, env);
             }
             let v = self.eval(arg, env)?;
@@ -6687,6 +6811,7 @@ impl Interp {
                 obj,
                 prop,
                 optional,
+                ..
             } if *optional => {
                 let base = self.eval(obj, env)?;
                 if self.short_circuit {
@@ -6702,6 +6827,7 @@ impl Interp {
                 obj,
                 index,
                 optional,
+                ..
             } if *optional => {
                 let base = self.eval(obj, env)?;
                 if self.short_circuit {
@@ -6759,7 +6885,7 @@ impl Interp {
             }
             // A parenthesized reference still deletes.
             Expr::Paren(inner) => self.eval_delete(inner, env),
-            Expr::Ident(name) => self.delete_ident(name, env),
+            Expr::Ident(name, _) => self.delete_ident(name, env),
             // Any other operand evaluates (for its side effects) and deletes to `true`.
             other => {
                 self.eval(other, env)?;
@@ -7028,7 +7154,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         // Numeric update of an ordinary binding: read and write it in place (one scope walk, no
         // Reference allocation) — the ubiquitous `i++` of every loop.
-        if let Expr::Ident(name) = arg {
+        if let Expr::Ident(name, _) = arg {
             if let Some(scope) = self.plain_binding_scope(name, env) {
                 let old = scope
                     .borrow()
@@ -7081,7 +7207,7 @@ impl Interp {
         // the one scope found up front. Logical forms short-circuit and are excluded. If the RHS
         // deleted the binding (direct eval tricks), PutValue falls back to the Reference path.
         if op != "=" && !matches!(op, "&&=" | "||=" | "??=") {
-            if let Expr::Ident(name) = target {
+            if let Expr::Ident(name, _) = target {
                 if let Some(scope) = self.plain_binding_scope(name, env) {
                     let strict = self.strict;
                     let old = scope
@@ -7121,7 +7247,7 @@ impl Interp {
             // A simple target evaluates its Reference (base + computed key expression) BEFORE the
             // RHS; ToPropertyKey and the base's RequireObjectCoercible are deferred to PutValue.
             let mut lref = self.resolve_reference(target, env)?;
-            if let Expr::Ident(n) = target {
+            if let Expr::Ident(n, _) = target {
                 if matches!(value, Expr::Class(c) if c.name.is_none()) {
                     self.pending_fn_name = Some(n.clone());
                 }
@@ -7129,7 +7255,7 @@ impl Interp {
             let v = self.eval(value, env)?;
             self.pending_fn_name = None;
             // `f = function(){}` names the anonymous function after the target identifier.
-            if let Expr::Ident(n) = target {
+            if let Expr::Ident(n, _) = target {
                 if is_anonymous_fn(value) {
                     self.set_fn_name(&v, n);
                 }
@@ -7154,7 +7280,7 @@ impl Interp {
             }
             let v = self.eval(value, env)?;
             // `x ||= function(){}` names the anonymous function after an identifier target.
-            if let Expr::Ident(n) = target {
+            if let Expr::Ident(n, _) = target {
                 if is_anonymous_fn(value) {
                     self.set_fn_name(&v, n);
                 }
@@ -7178,7 +7304,7 @@ impl Interp {
         env: &Env,
     ) -> Result<(), Abrupt> {
         match target {
-            Expr::Ident(name) => self.assign_var(name, value, env),
+            Expr::Ident(name, _) => self.assign_var(name, value, env),
             Expr::Member { obj, prop, .. } => {
                 // `super.x = v` resolves the super base for invariant checks but writes through the
                 // `this` receiver (CreateDataProperty on the actual object), per [[Set]] semantics.
@@ -7271,6 +7397,7 @@ impl Interp {
                                         op: "=",
                                         target,
                                         value,
+                                        ..
                                     } => (&**target, Some(&**value)),
                                     _ => (t, None),
                                 };
@@ -7288,7 +7415,7 @@ impl Interp {
                                     if matches!(v, Value::Undefined) {
                                         if let Some(d) = default {
                                             v = me.eval(d, env)?;
-                                            if let (Expr::Ident(n), true) =
+                                            if let (Expr::Ident(n, _), true) =
                                                 (core, is_anonymous_fn(d))
                                             {
                                                 me.set_fn_name(&v, n);
@@ -7354,6 +7481,7 @@ impl Interp {
                                     op: "=",
                                     target,
                                     value,
+                                    ..
                                 } => (&**target, Some(&**value)),
                                 _ => (t, None),
                             };
@@ -7371,7 +7499,9 @@ impl Interp {
                                 if matches!(v, Value::Undefined) {
                                     if let Some(d) = default {
                                         v = self.eval(d, env)?;
-                                        if let (Expr::Ident(n), true) = (core, is_anonymous_fn(d)) {
+                                        if let (Expr::Ident(n, _), true) =
+                                            (core, is_anonymous_fn(d))
+                                        {
                                             self.set_fn_name(&v, n);
                                         }
                                     }
@@ -8408,13 +8538,17 @@ fn opt_obj(o: &Option<Gc>) -> Value {
 }
 
 /// The synthesized default class constructor. Derived: `constructor(...args) { super(...args); }`;
-/// base: `constructor() {}`.
-fn default_constructor(derived: bool) -> Function {
+/// base: `constructor() {}`. Its stack frames report the class's position.
+fn default_constructor(derived: bool, class: &Class) -> Function {
     let body = if derived {
         vec![Stmt::Expr(Expr::Call {
             callee: Box::new(Expr::Super),
-            args: vec![ArrayElem::Spread(Expr::Ident("args".to_string()))],
+            args: vec![ArrayElem::Spread(Expr::Ident(
+                "args".to_string(),
+                NO_POSITION,
+            ))],
             optional: false,
+            pos: NO_POSITION,
         })]
     } else {
         Vec::new()
@@ -8449,6 +8583,8 @@ fn default_constructor(derived: bool) -> Function {
         default_ctor: derived,
         self_hosted: false,
         source: None,
+        script: class.script.clone(),
+        start: class.start,
     }
 }
 
@@ -8555,7 +8691,7 @@ fn expr_contains_impl(x: &Expr, pred: fn(&Expr) -> bool, descend_arrows: bool) -
     };
     match x {
         Expr::Call { callee, args, .. } => e(callee) || array(args),
-        Expr::New { callee, args } => e(callee) || array(args),
+        Expr::New { callee, args, .. } => e(callee) || array(args),
         Expr::Unary { arg, .. }
         | Expr::Update { arg, .. }
         | Expr::Await(arg)
@@ -8616,7 +8752,10 @@ fn stmts_have_super_prop(stmts: &[Stmt]) -> bool {
 
 /// ContainsArguments: an `arguments` identifier reference (arrow-descending, like `Contains`).
 fn stmts_have_arguments_ref(stmts: &[Stmt]) -> bool {
-    stmts_contain(stmts, |e| matches!(e, Expr::Ident(n) if n == "arguments"))
+    stmts_contain(
+        stmts,
+        |e| matches!(e, Expr::Ident(n, _) if n == "arguments"),
+    )
 }
 
 /// A class field initializer (or computed field name) may not contain `arguments` or a `super(...)`
@@ -8655,7 +8794,7 @@ pub(crate) fn method_super_call_error_full(func: &crate::ast::Function) -> Optio
 /// `args` also flags `arguments` (a field-initializer rule); methods omit it since they may use it.
 fn fi_expr(e: &Expr, args: bool) -> Option<&'static str> {
     match e {
-        Expr::Ident(n) if args && n == "arguments" => {
+        Expr::Ident(n, _) if args && n == "arguments" => {
             Some("'arguments' is not allowed in a class field initializer")
         }
         Expr::Call {
@@ -8666,7 +8805,9 @@ fn fi_expr(e: &Expr, args: bool) -> Option<&'static str> {
             }
             fi_expr(callee, args).or_else(|| fi_arr(a, args))
         }
-        Expr::New { callee, args: a } => fi_expr(callee, args).or_else(|| fi_arr(a, args)),
+        Expr::New {
+            callee, args: a, ..
+        } => fi_expr(callee, args).or_else(|| fi_arr(a, args)),
         Expr::Unary { arg, .. } | Expr::Update { arg, .. } | Expr::Await(arg) => fi_expr(arg, args),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
             fi_expr(left, args).or_else(|| fi_expr(right, args))
@@ -8991,7 +9132,7 @@ impl Interp {
     /// for member/index targets, its property key).
     fn resolve_reference(&mut self, target: &Expr, env: &Env) -> Result<Reference, Abrupt> {
         match target {
-            Expr::Ident(name) => self.prepare_name_reference(name, env).map(Reference::Var),
+            Expr::Ident(name, _) => self.prepare_name_reference(name, env).map(Reference::Var),
             Expr::Member { obj, prop, .. } => {
                 if matches!(**obj, Expr::Super) {
                     let proto = self.super_base(env)?;
@@ -9171,6 +9312,7 @@ fn string_to_bigint(s: &str) -> Option<crate::bigint::JsBigInt> {
 
 /// The outcome of evaluating a `return` operand: a pending proper tail call, or a plain value.
 enum TailEval {
-    Tail(Value, Value, Vec<Value>),
+    /// A call in tail position: callee, `this`, arguments and the call's source position.
+    Tail(Value, Value, Vec<Value>, u32),
     Val(Value),
 }

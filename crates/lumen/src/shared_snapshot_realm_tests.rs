@@ -98,7 +98,7 @@ fn run_shared(it: &mut Interp) {
     let body = it
         .shared_snapshot_program(bootstrap_snapshot())
         .expect("snapshot decodes");
-    match it.run_classic_program(&body) {
+    match it.run_classic_program(&body, None) {
         Ok(_) => {}
         Err(Abrupt::Throw(error)) => panic!("bootstrap threw: {}", render(it, &error)),
         Err(_) => panic!("bootstrap completed abruptly"),
@@ -255,7 +255,7 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         let main = Value::Obj(it.global.clone());
         let run = |it: &mut Interp| {
             let body = it.shared_snapshot_program(snapshot).expect("decodes");
-            assert!(it.run_classic_program(&body).is_ok());
+            assert!(it.run_classic_program(&body, None).is_ok());
         };
         run(it);
         // Warm the caller with this Realm's callee until a second-stage compile inlines it,
@@ -370,7 +370,7 @@ fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
             let body = it
                 .shared_snapshot_program(unresolvable_snapshot())
                 .expect("decodes");
-            if let Err(Abrupt::Throw(error)) = it.run_classic_program(&body) {
+            if let Err(Abrupt::Throw(error)) = it.run_classic_program(&body, None) {
                 panic!("snapshot threw: {}", render(it, &error));
             }
             eval_string(it, "unresolvable")

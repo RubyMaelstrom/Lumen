@@ -85,7 +85,7 @@ fn write(expr: &Expr, out: &mut String, depth: usize) -> bool {
     }
     match expr {
         Expr::Paren(inner) | Expr::OptionalChain(inner) => write(inner, out, depth),
-        Expr::Ident(name) => {
+        Expr::Ident(name, _) => {
             out.push_str(name);
             true
         }
@@ -101,6 +101,7 @@ fn write(expr: &Expr, out: &mut String, depth: usize) -> bool {
             obj,
             prop,
             optional,
+            ..
         } => {
             write_base(obj, out, depth);
             out.push_str(if *optional { "?." } else { "." });
@@ -111,6 +112,7 @@ fn write(expr: &Expr, out: &mut String, depth: usize) -> bool {
             obj,
             index,
             optional,
+            ..
         } => {
             write_base(obj, out, depth);
             match &**index {
@@ -178,7 +180,7 @@ fn write_key(key: &Expr, out: &mut String, depth: usize) {
             out.push('"');
             true
         }
-        Expr::Ident(_) | Expr::This | Expr::Member { .. } | Expr::Index { .. } => {
+        Expr::Ident(_, _) | Expr::This | Expr::Member { .. } | Expr::Index { .. } => {
             write(key, out, depth + 1)
         }
         _ => false,

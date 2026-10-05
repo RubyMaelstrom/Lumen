@@ -213,6 +213,22 @@ TypeErrors for non-callable call or `new` targets name the target's source expre
 (`callee_name.rs`). Compiled chunks keep these names in a side table read only when such
 an error is thrown; every tier must produce the same message.
 
+`Error.prototype.stack` prints V8-style frames with source positions (`stack_trace.rs`):
+`at name (url:line:column)`, `at url:line:column` for anonymous functions and top-level
+code, `at new name (…)` for constructors, `at eval (<anonymous>:line:column)` for eval code
+and `at name (<anonymous>)` for self-hosted built-ins; host-snapshot platform functions are
+left out. Columns count UTF-16 units. Embedders name scripts with `SourceOrigin`
+(`*_with_origin` entry points; module keys name modules); code without one reports
+`<anonymous>`. Positions are byte offsets on call, `new`, property-access, tagged-template
+and assignment nodes; compiled chunks map operations to them (`SourcePositions`). Nothing is
+recorded on fast paths: an explicit call stores its position in `Interp::call_site` only for
+the duration of the call (the JIT's direct call writes it into the callee's `FnFrame`), a
+frame push moves it into `FnFrame::call_site` and the pop restores it, and an error the engine
+creates is positioned by the innermost positioned node or operation it propagates through
+(`Interp::place_thrown`). A new call path must keep that discipline, and a compiler change
+must attribute operations to the same nodes the tree-walker positions, or tiers diverge.
+`Error.stackTraceLimit` (default 10) follows V8.
+
 The default-on `intl` feature supplies ECMA-402 and CLDR data. For the engine,
 `--no-default-features` removes `Intl` and gives `toLocale*` methods their
 locale-independent behavior. The `embed` feature exposes the host API; `bench`

@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::stack_trace::Skip;
 
 pub(super) fn install_errors(it: &mut Interp) {
     // Base Error first (its prototype's proto is Object.prototype).
@@ -40,15 +41,17 @@ pub(super) fn install_errors(it: &mut Interp) {
             crate::lstr::LStr::concat3(&name, ": ", &msg)
         }))
     });
-    // Error.prototype.stack accessor (error-stack-accessor proposal). The frames are snapshotted
-    // at construction (Exotic::Error); the getter formats V8-style: `Name: message` followed by the
-    // `\n    at <fn>` lines. get stack: non-object → TypeError; an object without [[ErrorData]] →
-    // undefined; an Error instance → the formatted (implementation-defined) trace. The setter
-    // shadows this with an own data property, so `err.stack = x` caches as usual.
+    // Error.prototype.stack accessor (error-stack-accessor proposal). The frames are captured
+    // at construction (Exotic::Error, see crate::stack_trace); the getter formats V8-style:
+    // `Name: message` followed by the `\n    at name (url:line:column)` lines. get stack:
+    // non-object → TypeError; an object without [[ErrorData]] → undefined; an Error instance →
+    // the formatted (implementation-defined) trace, or undefined when `Error.stackTraceLimit`
+    // was not a Number at construction. The setter shadows this with an own data property, so
+    // `err.stack = x` caches as usual.
     let get_stack = it.make_native("get stack", 0, |i, this, _| {
-        let frames = match &this {
-            Value::Obj(o) => match &o.borrow().exotic {
-                Exotic::Error(frames) => frames.clone(),
+        let lines = match &this {
+            Value::Obj(o) => match &mut o.borrow_mut().exotic {
+                Exotic::Error(Some(trace)) => trace.lines(),
                 _ => return Ok(Value::Undefined),
             },
             _ => {
@@ -58,24 +61,7 @@ pub(super) fn install_errors(it: &mut Interp) {
                 ))
             }
         };
-        let perf_started = crate::jit::perf_stage_start();
-        let name = match ab(i.get_member(&this, "name"))? {
-            Value::Undefined => "Error".to_string(),
-            v => ab(i.to_string(&v))?.to_string(),
-        };
-        let msg = match ab(i.get_member(&this, "message"))? {
-            Value::Undefined => String::new(),
-            v => ab(i.to_string(&v))?.to_string(),
-        };
-        let head = if msg.is_empty() {
-            name
-        } else if name.is_empty() {
-            msg
-        } else {
-            format!("{name}: {msg}")
-        };
-        crate::jit::perf_error_stack_format_end(perf_started);
-        Ok(Value::lstr(format!("{head}{frames}")))
+        stack_string(i, &this, &lines)
     });
     // set stack: SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v).
     let set_stack = it.make_native("set stack", 1, |i, this, a| {
@@ -186,6 +172,18 @@ pub(super) fn install_errors(it: &mut Interp) {
                     matches!(arg(a, 0), Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Error(_))),
                 ))
             });
+            // V8's stack-trace depth control, which libraries feature-test. Captures read it
+            // from this Realm's %Error% (see crate::stack_trace).
+            ctor.borrow_mut().props.insert(
+                "stackTraceLimit",
+                Property::data(
+                    Value::Num(crate::stack_trace::DEFAULT_STACK_TRACE_LIMIT),
+                    true,
+                    true,
+                    true,
+                ),
+            );
+            Rc::make_mut(&mut it.extra_protos).insert("%ErrorCtor%", ctor.clone());
             error_ctor = Some(ctor.clone());
         } else if let Some(ec) = &error_ctor {
             // A native error subtype's [[Prototype]] is the Error constructor (it subclasses Error).
@@ -208,7 +206,7 @@ pub(super) fn install_errors(it: &mut Interp) {
     set_builtin(&agg_proto, "message", Value::lstr(""));
     Rc::make_mut(&mut it.error_protos).insert("AggregateError", agg_proto.clone());
     let agg_ctor = it.make_native("AggregateError", 2, |i, _t, a| {
-        let err = i.make_error("AggregateError", "");
+        let err = i.make_error_skipping("AggregateError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
         if matches!(i.new_target, Value::Obj(_)) {
             let nt = i.new_target.clone();
@@ -261,7 +259,7 @@ pub(super) fn install_errors(it: &mut Interp) {
     set_builtin(&sup_proto, "message", Value::lstr(""));
     Rc::make_mut(&mut it.error_protos).insert("SuppressedError", sup_proto.clone());
     let sup_ctor = it.make_native("SuppressedError", 3, |i, _t, a| {
-        let err = i.make_error("SuppressedError", "");
+        let err = i.make_error_skipping("SuppressedError", "", constructor_skip(i));
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
         if matches!(i.new_target, Value::Obj(_)) {
             let nt = i.new_target.clone();
@@ -308,8 +306,43 @@ pub(super) fn install_errors(it: &mut Interp) {
     set_builtin(&it.global, "SuppressedError", Value::Obj(sup_ctor));
 }
 
+/// The frames an Error constructor leaves out of its stack trace: V8 skips every frame up to and
+/// including the innermost call of new.target when that is a JavaScript function, so a
+/// subclass's constructors (and its `super()` chain) do not appear in its errors' stacks.
+fn constructor_skip(i: &Interp) -> Skip {
+    match &i.new_target {
+        Value::Obj(target) if matches!(target.borrow().call, Callable::User(_)) => {
+            Skip::UntilSeen(Rc::as_ptr(target) as usize)
+        }
+        _ => Skip::None,
+    }
+}
+
+/// `Name: message` (read from `error` like Error.prototype.toString, defaulting the name to
+/// "Error") followed by the formatted frame `lines`.
+fn stack_string(i: &mut Interp, error: &Value, lines: &str) -> Result<Value, Value> {
+    let perf_started = crate::jit::perf_stage_start();
+    let name = match ab(i.get_member(error, "name"))? {
+        Value::Undefined => "Error".to_string(),
+        v => ab(i.to_string(&v))?.to_string(),
+    };
+    let msg = match ab(i.get_member(error, "message"))? {
+        Value::Undefined => String::new(),
+        v => ab(i.to_string(&v))?.to_string(),
+    };
+    let head = if msg.is_empty() {
+        name
+    } else if name.is_empty() {
+        msg
+    } else {
+        format!("{name}: {msg}")
+    };
+    crate::jit::perf_error_stack_format_end(perf_started);
+    Ok(Value::lstr(format!("{head}{lines}")))
+}
+
 fn make_err(i: &mut Interp, kind: &str, args: &[Value]) -> Result<Value, Value> {
-    let err = i.make_error(kind, "");
+    let err = i.make_error_skipping(kind, "", constructor_skip(i));
     // OrdinaryCreateFromConstructor: a subclass / Reflect.construct new.target sets the prototype.
     if matches!(i.new_target, Value::Obj(_)) {
         let nt = i.new_target.clone();

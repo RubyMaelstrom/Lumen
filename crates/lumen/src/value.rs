@@ -1662,12 +1662,12 @@ pub enum Exotic {
     StrWrap(Box<crate::lstr::LStr>),
     SymWrap(Rc<SymbolData>),
     BigIntWrap(Box<crate::bigint::JsBigInt>),
-    /// An error object. Carries the captured call-stack frames as a preformatted string (the
-    /// `\n    at <fn>` lines, empty when thrown at top level), snapshotted at construction; the
-    /// `Error.prototype.stack` getter prepends the live `name: message` head. name/message live as
-    /// ordinary properties, and the tag lets `Error.prototype.toString` / the test262 runner
-    /// recognise an error cheaply.
-    Error(Box<Rc<str>>),
+    /// An error object. Carries the stack frames captured at construction (see
+    /// `crate::stack_trace`), None when `Error.stackTraceLimit` was not a Number then; the
+    /// `Error.prototype.stack` getter formats them after the live `name: message` head.
+    /// name/message live as ordinary properties, and the tag lets `Error.prototype.toString` /
+    /// the test262 runner recognise an error cheaply.
+    Error(Option<Box<crate::stack_trace::StackTrace>>),
     /// An `arguments` exotic object (mapped index/parameter aliasing lives in
     /// `Interp::mapped_arguments`).
     Arguments,
@@ -1684,8 +1684,8 @@ impl Exotic {
         Exotic::BigIntWrap(Box::new(value))
     }
 
-    pub(crate) fn error(stack: Rc<str>) -> Exotic {
-        Exotic::Error(Box::new(stack))
+    pub(crate) fn error(stack: Option<Box<crate::stack_trace::StackTrace>>) -> Exotic {
+        Exotic::Error(stack)
     }
 }
 

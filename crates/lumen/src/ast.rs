@@ -193,6 +193,10 @@ pub struct Class {
     pub decorators: Vec<Expr>,
     /// The class's source text (what the constructor's `toString` returns).
     pub source: Option<Rc<str>>,
+    /// The source the class was parsed from and the byte offset of its first token, which a
+    /// synthesized default constructor's stack frames report (see [`Function::script`]).
+    pub(crate) script: Option<Rc<crate::stack_trace::ScriptSource>>,
+    pub(crate) start: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -300,7 +304,9 @@ pub enum Expr {
     Bool(bool),
     Null,
     Undefined,
-    Ident(String),
+    /// An identifier reference and the byte offset of its token (V8's position for a
+    /// ReferenceError); see `crate::stack_trace`.
+    Ident(String, u32),
     This,
     Regex {
         body: Rc<str>,
@@ -342,6 +348,8 @@ pub enum Expr {
         op: &'static str,
         target: P<Expr>,
         value: P<Expr>,
+        /// Byte offset of the operator (V8's position for a setter call or a failed store).
+        pos: u32,
     },
     Cond {
         test: P<Expr>,
@@ -352,20 +360,29 @@ pub enum Expr {
         callee: P<Expr>,
         args: Vec<ArrayElem>,
         optional: bool,
+        /// Byte offset V8 reports for the call: the callee's last token when that is an
+        /// identifier (`f()`, `o.method()`, `super()`), else the `(`.
+        pos: u32,
     },
     New {
         callee: P<Expr>,
         args: Vec<ArrayElem>,
+        /// Byte offset of the `new` keyword.
+        pos: u32,
     },
     Member {
         obj: P<Expr>,
         prop: String,
         optional: bool,
+        /// Byte offset of the property name.
+        pos: u32,
     },
     Index {
         obj: P<Expr>,
         index: P<Expr>,
         optional: bool,
+        /// Byte offset of the `[`.
+        pos: u32,
     },
     Seq(Vec<Expr>),
     /// `tag\`a${x}b\`` — `quasis` are (cooked, raw) chunks (one more than `subs`).
@@ -374,7 +391,9 @@ pub enum Expr {
         /// Stable Parse Node identity for ECMA-262's per-Realm [[TemplateMap]].
         site: u64,
         quasis: Vec<(Option<String>, String)>,
-        subs: Vec<Expr>,
+        subs: Box<[Expr]>,
+        /// Byte offset of the template, where the tag is called.
+        pos: u32,
     },
     /// An optional chain (`a?.b.c`): evaluates the inner LHS, short-circuiting to `undefined` if any
     /// `?.` link sees a nullish base.
@@ -504,6 +523,12 @@ pub struct Function {
     pub self_hosted: bool,
     /// The source text this function was parsed from, for `Function.prototype.toString`.
     pub source: Option<Rc<str>>,
+    /// The script, module, eval or `Function` source the function was parsed from, which its
+    /// AST positions index (see `crate::stack_trace`). None for self-hosted and snapshot code.
+    pub(crate) script: Option<Rc<crate::stack_trace::ScriptSource>>,
+    /// Byte offset of the function's first token in `script`: the position its stack frames
+    /// report when the current operation has none.
+    pub start: u32,
     /// Lazily-computed body facts (see [`Function::scan_flags`]): bit 0 = scanned, bit 1 =
     /// references `arguments`, bit 2 = references `new.target`, bit 3 = references `this`.
     /// A direct `eval` sets all three (it can reach any of them dynamically).
@@ -799,7 +824,7 @@ impl RetainedAst<'_> {
             | Expr::NewTarget => {}
             Expr::BigInt(value) => self.visitor.bigint(value),
             Expr::Str(value) => self.rc_str(value),
-            Expr::Ident(name) => self.string(name),
+            Expr::Ident(name, _) => self.string(name),
             Expr::Regex { body, flags } => {
                 self.rc_str(body);
                 self.rc_str(flags);
@@ -835,6 +860,7 @@ impl RetainedAst<'_> {
                 op: _,
                 target: left,
                 value: right,
+                ..
             } => {
                 self.boxed_expr(left);
                 self.boxed_expr(right);
@@ -848,8 +874,13 @@ impl RetainedAst<'_> {
                 callee,
                 args,
                 optional: _,
+                pos: _,
             }
-            | Expr::New { callee, args } => {
+            | Expr::New {
+                callee,
+                args,
+                pos: _,
+            } => {
                 self.boxed_expr(callee);
                 self.vec(args);
                 for argument in args {
@@ -860,6 +891,7 @@ impl RetainedAst<'_> {
                 obj,
                 prop,
                 optional: _,
+                pos: _,
             } => {
                 self.boxed_expr(obj);
                 self.string(prop);
@@ -868,6 +900,7 @@ impl RetainedAst<'_> {
                 obj,
                 index,
                 optional: _,
+                pos: _,
             } => {
                 self.boxed_expr(obj);
                 self.boxed_expr(index);
@@ -883,6 +916,7 @@ impl RetainedAst<'_> {
                 site: _,
                 quasis,
                 subs,
+                ..
             } => {
                 self.boxed_expr(tag);
                 self.vec(quasis);
@@ -892,8 +926,8 @@ impl RetainedAst<'_> {
                     }
                     self.string(raw);
                 }
-                self.vec(subs);
-                for substitution in subs {
+                self.add(std::mem::size_of_val::<[Expr]>(subs));
+                for substitution in subs.iter() {
                     self.expr(substitution);
                 }
             }
@@ -1001,6 +1035,9 @@ pub(crate) fn scan_function_retained_memory(
     scan.stmt_vec(&function.body);
     if let Some(source) = &function.source {
         scan.rc_str(source);
+    }
+    if let Some(script) = &function.script {
+        scan.visitor.script_source(script);
     }
     scan.bytes
 }
@@ -1125,6 +1162,22 @@ pub(crate) fn statement_list_has_own_loop(body: &[Stmt]) -> bool {
             return false;
         };
         current = next;
+    }
+}
+
+impl Expr {
+    /// The source position of a node that records one (see `crate::stack_trace`).
+    pub(crate) fn position(&self) -> Option<u32> {
+        match self {
+            Expr::Call { pos, .. }
+            | Expr::New { pos, .. }
+            | Expr::Member { pos, .. }
+            | Expr::Index { pos, .. }
+            | Expr::TaggedTemplate { pos, .. }
+            | Expr::Assign { pos, .. }
+            | Expr::Ident(_, pos) => Some(*pos),
+            _ => None,
+        }
     }
 }
 
@@ -1339,7 +1392,7 @@ pub(crate) fn expr_scan_flags(e: &Expr) -> u8 {
 
 fn scan_expr(e: &Expr, flags: &mut u8) {
     match e {
-        Expr::Ident(n) => {
+        Expr::Ident(n, _) => {
             if n == "arguments" {
                 *flags |= SCAN_ARGUMENTS;
             }
@@ -1413,6 +1466,7 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
             op: _,
             target,
             value,
+            ..
         } => {
             scan_expr(target, flags);
             scan_expr(value, flags);
@@ -1426,10 +1480,11 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
             callee,
             args,
             optional: _,
+            pos: _,
         } => {
             // A direct `eval` can name any of the three dynamically, and its code may contain a
             // SuperProperty when the caller is method code (PerformEval's `inMethod`).
-            if matches!(&**callee, Expr::Ident(n) if n == "eval") {
+            if matches!(&**callee, Expr::Ident(n, _) if n == "eval") {
                 *flags |= SCAN_ARGUMENTS | SCAN_NEW_TARGET | SCAN_THIS | SCAN_HOME;
             }
             // SuperCall begins with GetNewTarget. An arrow is transparent to that lookup, so a
@@ -1446,7 +1501,11 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
                 }
             }
         }
-        Expr::New { callee, args } => {
+        Expr::New {
+            callee,
+            args,
+            pos: _,
+        } => {
             scan_expr(callee, flags);
             for a in args {
                 match a {
@@ -1459,11 +1518,13 @@ fn scan_expr(e: &Expr, flags: &mut u8) {
             obj,
             prop: _,
             optional: _,
+            pos: _,
         } => scan_expr(obj, flags),
         Expr::Index {
             obj,
             index,
             optional: _,
+            pos: _,
         } => {
             scan_expr(obj, flags);
             scan_expr(index, flags);

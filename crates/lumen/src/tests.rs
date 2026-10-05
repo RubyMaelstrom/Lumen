@@ -2389,7 +2389,12 @@ fn default_derived_constructor_frames_remain_in_error_stacks() {
         match engine.eval(source, false).expect("parse") {
             Completion::Value(v) => assert_eq!(
                 v,
-                r#"["Error: x\n    at S1\n    at S2\n    at S3","Error: x\n    at S1\n    at S2"]"#,
+                concat!(
+                    r#"["Error: x\n    at new S1 (<anonymous>:1:37)\n    at new S2 (<anonymous>:1:63)"#,
+                    r#"\n    at new S3 (<anonymous>:1:124)\n    at <anonymous>:1:153","#,
+                    r#""Error: x\n    at new S1 (<anonymous>:1:37)\n    at new S2 (<anonymous>:1:63)"#,
+                    r#"\n    at <anonymous>:1:165"]"#
+                ),
                 "{tier:?}"
             ),
             Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
@@ -26599,7 +26604,7 @@ fn interp_layout_probes() {
         l.depth,
         l.gc_tick,
         l.gc_next,
-        l.cur_coro,
+        l.call_site,
         l.constructing,
         l.new_target,
         l.pending_tail,
@@ -27657,4 +27662,426 @@ for (var round = 0; round < 20; round++) {
             );
         }
     }
+}
+
+// ---- Error.prototype.stack source positions (see crate::stack_trace) ----------------------
+//
+// Expected strings come from Node 24 (V8) running the same source as
+// `vm.runInNewContext(source, {}, { filename: URL })`, with these documented differences:
+// method frames omit V8's receiver type (`at m`, not `at Object.m`), built-ins implemented in
+// JavaScript print without it (`at map (<anonymous>)`, not `at Array.map (<anonymous>)`), native
+// built-ins have no frame (V8's `at JSON.parse (<anonymous>)`, `at gen.next (<anonymous>)`),
+// eval code prints `at eval (<anonymous>:line:column)` without V8's `eval at` origin, and a
+// `new Function` body is the function `anonymous`. A frame that entered its callee through an
+// implicit call (a getter, valueOf, an iterator step) reports its function's start unless an
+// error thrown by that callee propagates through it.
+
+const STACK_URL: &str = "https://example.com/a.js";
+
+/// Evaluate `source` as [`STACK_URL`] on every tier (compiling on first call) and return its
+/// completion value, which every tier must produce identically.
+fn stack_on_every_tier(source: &str) -> String {
+    let origin = crate::SourceOrigin::new(STACK_URL);
+    let mut results = Vec::new();
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        match engine
+            .eval_interruptible_with_origin(source, false, Some(&origin))
+            .expect("parse")
+        {
+            ExecutionOutcome::Value(value) => results.push((tier, value)),
+            ExecutionOutcome::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+            ExecutionOutcome::Interrupted { reason } => panic!("{tier:?}: {reason:?}"),
+        }
+    }
+    for (tier, value) in &results[1..] {
+        assert_eq!(
+            value, &results[0].1,
+            "{tier:?} disagrees with the tree-walker"
+        );
+    }
+    results.swap_remove(0).1
+}
+
+/// `lines` joined with newlines, each `at` line indented like a frame.
+fn frames(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("at ") {
+                format!("    {line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn stack_positions_of_nested_calls_and_top_level_code() {
+    let source = r#"function inner() { return new Error("x"); }
+function outer() { return inner(); }
+var result = outer().stack + "|" + new Error("top").stack;
+result"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "Error: x",
+            "at inner (https://example.com/a.js:1:27)",
+            "at outer (https://example.com/a.js:2:27)",
+            "at https://example.com/a.js:3:14|Error: top",
+            "at https://example.com/a.js:3:36",
+        ])
+    );
+}
+
+#[test]
+fn stack_positions_of_anonymous_arrow_and_built_in_frames() {
+    let source = r#"var f = function () { return new Error("a"); };
+var g = [function () { return new Error("b"); }][0];
+const named = () => new Error("n");
+const mapped = [1].map(() => new Error("m"))[0];
+var result = [g().stack, (0, f)().stack, named().stack, mapped.stack].join("|");
+result"#;
+    // V8 names the second function `g` by its own inference.
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "Error: b",
+            "at https://example.com/a.js:2:31",
+            "at https://example.com/a.js:5:15|Error: a",
+            "at f (https://example.com/a.js:1:30)",
+            "at https://example.com/a.js:5:32|Error: n",
+            "at named (https://example.com/a.js:3:21)",
+            "at https://example.com/a.js:5:42|Error: m",
+            "at https://example.com/a.js:4:30",
+            "at map (<anonymous>)",
+            "at https://example.com/a.js:4:20",
+        ])
+    );
+}
+
+#[test]
+fn stack_positions_of_methods_and_constructors() {
+    let source = r#"var o = { m() { return new Error("m"); } };
+class K { static s() { return new Error("s"); } i() { return new Error("i"); } }
+class C { constructor() { this.e = new Error("c"); } }
+function F() { this.e = new Error("f"); }
+var result = [o.m().stack, K.s().stack, new K().i().stack, new C().e.stack, new F().e.stack];
+result.join("|")"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "Error: m",
+            "at m (https://example.com/a.js:1:24)",
+            "at https://example.com/a.js:5:17|Error: s",
+            "at s (https://example.com/a.js:2:31)",
+            "at https://example.com/a.js:5:30|Error: i",
+            "at i (https://example.com/a.js:2:62)",
+            "at https://example.com/a.js:5:49|Error: c",
+            "at new C (https://example.com/a.js:3:36)",
+            "at https://example.com/a.js:5:60|Error: f",
+            "at new F (https://example.com/a.js:4:25)",
+            "at https://example.com/a.js:5:77",
+        ])
+    );
+}
+
+#[test]
+fn stack_positions_of_thrown_and_engine_errors() {
+    let source = r#"function thrower() { throw new TypeError("t"); }
+function nf() { var a = null; return a.f(); }
+var r = [];
+try { thrower(); } catch (e) { r.push(e.stack); }
+try { nf(); } catch (e) { r.push(e.stack.replace(/^.*\n/, "")); }
+try { undefinedFn(); } catch (e) { r.push(e.stack); }
+try { JSON.parse("{"); } catch (e) { r.push(e.stack.replace(/^.*\n/, "")); }
+r.join("|")"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "TypeError: t",
+            "at thrower (https://example.com/a.js:1:28)",
+            "at https://example.com/a.js:4:7|    at nf (https://example.com/a.js:2:40)",
+            "at https://example.com/a.js:5:7|ReferenceError: undefinedFn is not defined",
+            "at https://example.com/a.js:6:7|    at https://example.com/a.js:7:12",
+        ])
+    );
+}
+
+#[test]
+fn stack_positions_through_getters_and_setters() {
+    let source = r#"var o = { get g() { return new Error("g"); }, get t() { throw new Error("t"); }, set s(v) { throw new Error("s"); } };
+function read() { return o.g; }
+function readThrow() { return o.t; }
+function write() { o.s = 1; }
+var result = read().stack;
+try { readThrow(); } catch (e) { result += "|" + e.stack; }
+try { write(); } catch (e) { result += "|" + e.stack; }
+result"#;
+    // V8 reports `read (…:2:28)` for the error a getter only creates; the implicit call records
+    // no position for its caller (see the comment above).
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "Error: g",
+            "at get g (https://example.com/a.js:1:28)",
+            "at read (https://example.com/a.js:2:1)",
+            "at https://example.com/a.js:5:14|Error: t",
+            "at get t (https://example.com/a.js:1:63)",
+            "at readThrow (https://example.com/a.js:3:33)",
+            "at https://example.com/a.js:6:7|Error: s",
+            "at set s (https://example.com/a.js:1:99)",
+            "at write (https://example.com/a.js:4:24)",
+            "at https://example.com/a.js:7:7",
+        ])
+    );
+}
+
+#[test]
+fn stack_trace_limit_truncates_recursion() {
+    let source = r#"function rec(n) { return n ? rec(n - 1) : new Error("deep"); }
+var d = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+var result = [d.value, d.writable, d.enumerable, d.configurable].join() + "|";
+Error.stackTraceLimit = 3;
+result += rec(10).stack;
+Error.stackTraceLimit = 0;
+result += "|" + rec(2).stack;
+Error.stackTraceLimit = 2.7;
+result += "|" + rec(2).stack.split("\n").length;
+Error.stackTraceLimit = undefined;
+result += "|" + rec(2).stack;
+delete Error.stackTraceLimit;
+result += "|" + rec(2).stack;
+Error.stackTraceLimit = Infinity;
+result += "|" + rec(20).stack.split("\n").length;
+result"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "10,true,true,true|Error: deep",
+            "at rec (https://example.com/a.js:1:43)",
+            "at rec (https://example.com/a.js:1:30)",
+            "at rec (https://example.com/a.js:1:30)|Error: deep|3|undefined|undefined|23",
+        ])
+    );
+}
+
+#[test]
+fn stack_positions_of_eval_and_function_constructor_code() {
+    let source = r#"function ev() { return eval("\n  new Error('e')"); }
+var mk = new Function("a", "return new Error(a)");
+var result = ev().stack + "|" + mk("f").stack;
+result"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "Error: e",
+            "at eval (<anonymous>:2:3)",
+            "at ev (https://example.com/a.js:1:24)",
+            "at https://example.com/a.js:3:14|Error: f",
+            "at anonymous (<anonymous>:3:8)",
+            "at https://example.com/a.js:3:33",
+        ])
+    );
+}
+
+#[test]
+fn error_subclass_constructors_stay_out_of_their_stacks() {
+    // V8 leaves out every frame up to the innermost call of new.target; when new.target is not
+    // on the stack, nothing remains.
+    let source = r#"class MyError extends Error { constructor(m) { super(m); this.name = "MyError"; } }
+class Plain extends Error {}
+function make() { return new MyError("sub"); }
+var viaReflect = Reflect.construct(Error, ["r"], function Absent() {});
+var stack = Object.getOwnPropertyDescriptor(Error.prototype, "stack").get;
+var result = [make().stack, new Plain("p").stack, stack.call(viaReflect)].join("|");
+result"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "MyError: sub",
+            "at make (https://example.com/a.js:3:26)",
+            "at https://example.com/a.js:6:15|Error: p",
+            "at https://example.com/a.js:6:29|Error: r",
+        ])
+    );
+}
+
+#[test]
+fn stack_columns_count_utf16_units_and_template_positions() {
+    let source =
+        "var s = \"αβγ😀\"; function u() { return new Error(\"u\"); } var t = s + u().stack;\n\
+        function tag() { return new Error(\"t\"); }\n\
+        var result = t + \"|\" + `${tag().stack}` + \"|\" + tag`x`.stack;\n\
+        result";
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "αβγ😀Error: u",
+            "at u (https://example.com/a.js:1:40)",
+            "at https://example.com/a.js:1:70|Error: t",
+            "at tag (https://example.com/a.js:2:25)",
+            "at https://example.com/a.js:3:27|Error: t",
+            "at tag (https://example.com/a.js:2:25)",
+            "at https://example.com/a.js:3:52",
+        ])
+    );
+}
+
+#[test]
+fn stack_frames_of_resumed_generators_and_async_functions() {
+    let source = r#"function* gen() { yield new Error("g"); }
+function callsGen() { return gen().next().value; }
+async function before() { return new Error("before").stack; }
+async function after() { await null; return new Error("after").stack; }
+async function outer() { return await after(); }
+var result = callsGen().stack;
+before().then(s => { result += "|" + s; });
+outer().then(s => { result += "|" + s; });
+result"#;
+    let origin = crate::SourceOrigin::new(STACK_URL);
+    let mut outputs = Vec::new();
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert!(matches!(
+            engine.eval_interruptible_with_origin(source, false, Some(&origin)),
+            Ok(ExecutionOutcome::Value(_))
+        ));
+        // The script's microtask checkpoint has run both reactions.
+        outputs.push(run_in(&mut engine, "result"));
+    }
+    // V8 also prints `at gen.next (<anonymous>)` and, after the await, the awaiting caller as
+    // `at async outer (…)`; a resumed body here shows only its own frame.
+    let expected = frames(&[
+        "Error: g",
+        "at gen (https://example.com/a.js:1:25)",
+        "at callsGen (https://example.com/a.js:2:36)",
+        "at https://example.com/a.js:6:14|Error: before",
+        "at before (https://example.com/a.js:3:34)",
+        "at https://example.com/a.js:7:1|Error: after",
+        "at after (https://example.com/a.js:4:45)",
+    ]);
+    for output in outputs {
+        assert_eq!(output, expected);
+    }
+}
+
+#[test]
+fn stack_frames_honor_the_script_origin_offsets() {
+    let mut engine = Engine::new();
+    let origin = crate::SourceOrigin {
+        url: "https://example.com/page.html",
+        line: 11,
+        column: 8,
+    };
+    let source = "function f() { return new Error('x'); }\nvar result = f().stack;";
+    assert!(matches!(
+        engine.eval_interruptible_with_origin(source, false, Some(&origin)),
+        Ok(ExecutionOutcome::Value(_))
+    ));
+    assert_eq!(
+        run_in(&mut engine, "result"),
+        frames(&[
+            "Error: x",
+            "at f (https://example.com/page.html:12:31)",
+            "at https://example.com/page.html:13:14",
+        ])
+    );
+    // Without an origin, frames report V8's `<anonymous>` location.
+    assert_eq!(
+        run_in(&mut engine, "new Error('y').stack"),
+        frames(&["Error: y", "at <anonymous>:1:1"])
+    );
+}
+
+#[test]
+fn stack_positions_stay_with_the_frame_that_throws() {
+    // A pending position is placed by the innermost node or operation the error passes
+    // through, in the frame that created it; a caught error keeps what it has.
+    let source = r#"function a(o) { return o.p.q; }
+function b() { return a({}); }
+var r = [];
+try { b(); } catch (e) { r.push(e.stack.replace(/^.*\n/, "")); }
+function c() { try { null.x; } catch (e) { return e; } }
+function d() { throw c(); }
+try { d(); } catch (e) { r.push(e.stack.replace(/^.*\n/, "")); }
+r.join("|")"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "at a (https://example.com/a.js:1:28)",
+            "at b (https://example.com/a.js:2:23)",
+            "at https://example.com/a.js:4:7|    at c (https://example.com/a.js:5:27)",
+            "at d (https://example.com/a.js:6:22)",
+            "at https://example.com/a.js:7:7",
+        ])
+    );
+}
+
+#[test]
+fn module_frames_report_the_module_key() {
+    let mut engine = Engine::new();
+    let source = "export const s = new Error('m').stack; globalThis.moduleStack = s;";
+    assert!(matches!(
+        engine.eval_module(source, "https://example.com/m.js", |_, _| None),
+        Ok(Completion::Value(_))
+    ));
+    assert_eq!(
+        run_in(&mut engine, "moduleStack"),
+        frames(&["Error: m", "at https://example.com/m.js:1:18"])
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedded_scripts_report_their_origin_in_stack_frames() {
+    let mut engine = Engine::new();
+    // An inline script whose text starts on line 5, column 13 of its document.
+    let origin = crate::SourceOrigin {
+        url: "https://example.com/",
+        line: 4,
+        column: 12,
+    };
+    let stack = engine
+        .ctx()
+        .eval_classic_script_interruptible_with_origin("\nnew Error('i').stack", Some(&origin))
+        .expect("parse")
+        .unwrap_or_else(|_| panic!("script threw"));
+    assert_eq!(
+        engine
+            .ctx()
+            .coerce_string(&stack)
+            .unwrap_or_else(|_| panic!("stack is not a string"))
+            .to_string(),
+        frames(&["Error: i", "at https://example.com/:6:1"])
+    );
+    let stack = engine
+        .eval_value_interruptible_with_origin(
+            "new Error('v').stack",
+            Some(&crate::SourceOrigin::new("https://example.com/v.js")),
+        )
+        .expect("parse")
+        .unwrap_or_else(|_| panic!("script threw"));
+    assert_eq!(
+        engine
+            .ctx()
+            .coerce_string(&stack)
+            .unwrap_or_else(|_| panic!("stack is not a string"))
+            .to_string(),
+        frames(&["Error: v", "at https://example.com/v.js:1:1"])
+    );
 }

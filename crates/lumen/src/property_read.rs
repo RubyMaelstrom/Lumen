@@ -167,7 +167,7 @@ impl Interp {
         if !f.params.is_empty() || f.is_generator || f.is_async || f.body.len() != 1 {
             return None;
         }
-        let Stmt::Return(Some(Expr::Ident(name))) = &f.body[0] else {
+        let Stmt::Return(Some(Expr::Ident(name, _))) = &f.body[0] else {
             return None;
         };
         if name == "arguments" {

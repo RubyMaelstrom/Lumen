@@ -65,6 +65,8 @@ pub enum NsBinding {
 /// evaluation status. Keyed by canonical specifier in `Interp::module_recs`.
 pub(crate) struct ModuleRec {
     body: Rc<Vec<Stmt>>,
+    /// The module's source record, for its top-level frame in stack traces.
+    source: Rc<crate::stack_trace::ScriptSource>,
     env: Env,
     pub ns: Value,
     meta: Value,
@@ -449,8 +451,10 @@ impl Interp {
         };
         // Module source text comes from the host (its loaders and entry points): Rust text, in
         // which a character of the engine's lone-surrogate range is a real character.
-        let body = crate::parser::parse_module(&crate::jstr::from_text(&src))
-            .map_err(|e| self.throw("SyntaxError", e.message))?;
+        let origin = crate::stack_trace::SourceOrigin::new(key);
+        let (body, source) =
+            crate::parser::parse_module_from(&crate::jstr::from_text(&src), Some(&origin))
+                .map_err(|e| self.throw("SyntaxError", e.message))?;
         let body = Rc::new(body);
 
         // Resolve every dependency specifier to a canonical key up front (fetching its source), so
@@ -535,6 +539,7 @@ impl Interp {
             key.to_string(),
             ModuleRec {
                 body: body.clone(),
+                source,
                 env: env.clone(),
                 ns,
                 meta,
@@ -1183,15 +1188,22 @@ impl Interp {
             }
         }
 
-        let (body, env, meta) = {
+        let (body, env, meta, source) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone())
+            (
+                rec.body.clone(),
+                rec.env.clone(),
+                rec.meta.clone(),
+                rec.source.clone(),
+            )
         };
         let saved_meta = self.import_meta.take();
         let saved_strict = self.strict;
         self.import_meta = Some(meta);
         self.strict = true;
-        let result = self.with_script_entry(|this| this.run_stmt_list(&body, &env));
+        let result = self.in_code(Some(source), |this| {
+            this.with_script_entry(|this| this.run_stmt_list(&body, &env))
+        });
         self.import_meta = saved_meta;
         self.strict = saved_strict;
 
@@ -1466,9 +1478,14 @@ impl Interp {
     /// completion runs the ancestor cascade; a synchronous body runs now.
     fn module_execute_async(&mut self, key: &str) {
         let top = self.module_recs[key].top_promise.clone();
-        let (body, env, meta) = {
+        let (body, env, meta, source) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone())
+            (
+                rec.body.clone(),
+                rec.env.clone(),
+                rec.meta.clone(),
+                rec.source.clone(),
+            )
         };
         if body_has_tla(&body) {
             self.module_recs.get_mut(key).unwrap().evaluating = true;
@@ -1492,7 +1509,7 @@ impl Interp {
                 .map(|(name, binding)| (name.to_string(), !binding.mutable))
                 .collect();
             let coro = if let Some(chunk) = crate::bytecode::compile_module(&body, &bindings) {
-                let vm = crate::bytecode::VmCoro::new(
+                let mut vm = crate::bytecode::VmCoro::new(
                     self,
                     chunk,
                     env.clone(),
@@ -1500,6 +1517,7 @@ impl Interp {
                     &[],
                     &[],
                 );
+                vm.frame = Some(Interp::resumed_module_frame(source.clone()));
                 crate::coroutine::Coroutine::Module(Box::new(ModuleCoro::new(vm, module_key)))
             } else {
                 // Compiler coverage is a prerequisite for AsyncBlock execution. Contain a future
@@ -1532,7 +1550,9 @@ impl Interp {
         self.import_meta = Some(meta);
         self.strict = true;
         self.module_recs.get_mut(key).unwrap().evaluating = true;
-        let result = self.with_script_entry(|this| this.run_stmt_list(&body, &env));
+        let result = self.in_code(Some(source), |this| {
+            this.with_script_entry(|this| this.run_stmt_list(&body, &env))
+        });
         self.import_meta = saved_meta;
         self.strict = saved_strict;
         self.module_recs.get_mut(key).unwrap().evaluating = false;
@@ -2094,7 +2114,7 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
                         _ => false,
                     })
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 expr(callee)
                     || args.iter().any(|a| match a {
                         crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => {

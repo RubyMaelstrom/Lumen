@@ -280,8 +280,13 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
             .map_err(|e| i.make_error("SyntaxError", e.message))?;
     }
     let src = format!("{prefix} anonymous({params}\n) {{\n{body}\n}}");
-    let program = crate::parser::parse_script(&src, false)
-        .map_err(|e| i.make_error("SyntaxError", e.message))?;
+    let (program, _) = crate::parser::parse_script_from(
+        &src,
+        false,
+        crate::stack_trace::SourceKind::Function,
+        None,
+    )
+    .map_err(|e| i.make_error("SyntaxError", e.message))?;
     match program.into_iter().next() {
         Some(crate::ast::Stmt::FuncDecl(f)) => {
             let env = i.global_env.clone();

@@ -683,7 +683,11 @@ impl Lexer<'_> {
                     cooked.clear();
                     self.bump(); // '$'
                     self.bump(); // '{'
-                    parts.push(TplPart::Sub(self.read_template_sub()?));
+                    let start = self.pos;
+                    let sub = self.read_template_sub()?;
+                    // The hole is copied verbatim, so offsets within it map back one-to-one.
+                    debug_assert_eq!(self.src.get(start..start + sub.len()), Some(sub.as_str()));
+                    parts.push(TplPart::Sub(sub, start as u32));
                     raw_start = self.pos;
                 }
                 Some('\\') => {

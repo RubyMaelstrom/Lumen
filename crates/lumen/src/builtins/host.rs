@@ -42,11 +42,16 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         if let Value::Obj(_) = &rg {
             return ab(i.eval_in_realm(&rg, &code));
         }
-        let body = crate::parser::parse_script(&code, false)
-            .map_err(|e| i.make_error("SyntaxError", e.message))?;
+        let (body, source) = crate::parser::parse_script_from(
+            &code,
+            false,
+            crate::stack_trace::SourceKind::Script,
+            None,
+        )
+        .map_err(|e| i.make_error("SyntaxError", e.message))?;
         // A script runs with full GlobalDeclarationInstantiation (clash checks, global-object
         // own properties for var/function declarations).
-        match i.run_program(&body) {
+        match i.run_program_from(&body, Some(source)) {
             Ok(value) => Ok(value),
             Err(Abrupt::Throw(value)) => Err(value),
             Err(Abrupt::Interrupt(reason)) => {

@@ -60,8 +60,13 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
         }
     };
     // A parse failure is a SyntaxError of the *calling* realm (not wrapped).
-    let body = match crate::parser::parse_script(&src, false) {
-        Ok(b) => b,
+    let (body, source) = match crate::parser::parse_script_from(
+        &src,
+        false,
+        crate::stack_trace::SourceKind::Eval,
+        None,
+    ) {
+        Ok(parsed) => parsed,
         Err(e) => return Err(i.make_error("SyntaxError", e.message)),
     };
     let subptr = &mut **i.shadow_realms.get_mut(&ptr).unwrap() as *mut Interp;
@@ -79,10 +84,12 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
         let scope = crate::interpreter::new_scope(Some(genv.clone()));
         sub.hoist(&body, &genv, &[]);
         sub.declare_block_lexicals(&body, &scope, false);
-        let r = sub.run_stmt_list(&body, &scope).map(|v| match v {
-            Value::Empty => Value::Undefined,
-            other => other,
-        });
+        let r = sub
+            .in_code(Some(source), |sub| sub.run_stmt_list(&body, &scope))
+            .map(|v| match v {
+                Value::Empty => Value::Undefined,
+                other => other,
+            });
         sub.drain_microtasks();
         r
     };
