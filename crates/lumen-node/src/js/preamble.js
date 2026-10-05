@@ -22,15 +22,14 @@ if (typeof globalThis.global === "undefined") {
   globalThis.global = globalThis;
 }
 
-// V8's `Error.captureStackTrace` / `Error.prepareStackTrace` / CallSite API. The engine does not
-// implement these (grep confirms: no such symbol), and this preamble runs once — so we define them
-// outright rather than guarding on `typeof`. They are pervasive in the Node ecosystem: http-errors
-// and depd build Error subclasses with captureStackTrace, and depd reads *structured* frames
-// (a `prepareStackTrace` hook receiving CallSite objects it calls `.getFileName()`/`.getLineNumber()`
-// on). lumen has no per-frame source info, so we hand back placeholder CallSites — enough that the
-// deprecation machinery runs (with a `<lumen>` location) instead of crashing. `.stack` stays a
-// normal string when no custom `prepareStackTrace` hook is installed.
-Error.stackTraceLimit = 10;
+// V8's `Error.prepareStackTrace` / CallSite API on top of the engine's `Error.captureStackTrace`
+// and `Error.stackTraceLimit`. They are pervasive in the Node ecosystem: http-errors and depd build
+// Error subclasses with captureStackTrace, and depd reads *structured* frames (a
+// `prepareStackTrace` hook receiving CallSite objects it calls `.getFileName()`/`.getLineNumber()`
+// on). The engine formats `.stack` itself but has no CallSite objects, so while such a hook is
+// installed we hand back placeholder CallSites — enough that the deprecation machinery runs (with
+// a `<lumen>` location) instead of crashing. Without a hook the engine's own capture runs.
+const nativeCaptureStackTrace = Error.captureStackTrace;
 const makeCallSite = () => ({
   getThis: () => undefined,
   getTypeName: () => null,
@@ -48,13 +47,18 @@ const makeCallSite = () => ({
   isAsync: () => false,
   toString: () => "<lumen>:0:0",
 });
-Error.captureStackTrace = function (target, _ctorOpt) {
+Error.captureStackTrace = function captureStackTrace(target, ctorOpt) {
+  const prepare = Error.prepareStackTrace;
+  if (typeof prepare !== "function") {
+    // Leave this wrapper out of the captured frames.
+    return nativeCaptureStackTrace(target, ctorOpt || captureStackTrace);
+  }
   const sites = Array.from({ length: Error.stackTraceLimit || 10 }, makeCallSite);
   Object.defineProperty(target, "stack", {
     configurable: true,
     get() {
-      const prepare = Error.prepareStackTrace;
-      if (typeof prepare === "function") return prepare(target, sites);
+      const hook = Error.prepareStackTrace;
+      if (typeof hook === "function") return hook(target, sites);
       return `${target.name || "Error"}: ${target.message || ""}\n    at <lumen>:0:0`;
     },
     set(value) {

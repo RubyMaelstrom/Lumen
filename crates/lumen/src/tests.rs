@@ -27916,6 +27916,32 @@ result"#;
 }
 
 #[test]
+fn capture_stack_trace_skips_frames_and_formats_lazily() {
+    let source = r#"function a() { return b(); }
+function b() { return c(); }
+function c() { var o = {}; Error.captureStackTrace(o, b); return o.stack; }
+function d() { var o = { name: "N", message: "msg" }; Error.captureStackTrace(o); o.message = "late"; return o.stack; }
+var o = {}; Error.captureStackTrace(o, function absent() {});
+var desc = Object.getOwnPropertyDescriptor(o, "stack");
+var shape = [typeof desc.get, typeof desc.set, desc.enumerable, desc.configurable, Error.captureStackTrace.length];
+o.stack = "replaced";
+var frozen; try { Error.captureStackTrace(Object.freeze({})); } catch (e) { frozen = e.constructor.name; }
+var result = [a(), d(), JSON.stringify(o.stack), shape.join(), frozen].join("|");
+result"#;
+    // V8 keeps the accessor after an assignment; here it becomes a data property.
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "Error",
+            "at a (https://example.com/a.js:1:23)",
+            "at https://example.com/a.js:10:15|N: late",
+            "at d (https://example.com/a.js:4:61)",
+            "at https://example.com/a.js:10:20|\"replaced\"|function,function,false,true,2|TypeError",
+        ])
+    );
+}
+
+#[test]
 fn stack_columns_count_utf16_units_and_template_positions() {
     let source =
         "var s = \"αβγ😀\"; function u() { return new Error(\"u\"); } var t = s + u().stack;\n\

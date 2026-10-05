@@ -172,8 +172,9 @@ pub(super) fn install_errors(it: &mut Interp) {
                     matches!(arg(a, 0), Value::Obj(o) if matches!(o.borrow().exotic, Exotic::Error(_))),
                 ))
             });
-            // V8's stack-trace depth control, which libraries feature-test. Captures read it
+            // V8's stack-trace controls, which libraries feature-test. Captures read the limit
             // from this Realm's %Error% (see crate::stack_trace).
+            it.def_method(&ctor, "captureStackTrace", 2, capture_stack_trace);
             ctor.borrow_mut().props.insert(
                 "stackTraceLimit",
                 Property::data(
@@ -339,6 +340,78 @@ fn stack_string(i: &mut Interp, error: &Value, lines: &str) -> Result<Value, Val
     };
     crate::jit::perf_error_stack_format_end(perf_started);
     Ok(Value::lstr(format!("{head}{lines}")))
+}
+
+/// `Error.captureStackTrace(target[, constructorOpt])` (V8, now a TC39 proposal): capture the
+/// current stack, leaving out every frame up to and including the innermost call of
+/// `constructorOpt` when given (everything if it is not on the stack), and install it as an own
+/// accessor `stack` on `target` that formats it with `target`'s current name and message.
+fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let Value::Obj(target) = arg(args, 0) else {
+        return Err(i.make_error("TypeError", "Error.captureStackTrace requires an object"));
+    };
+    let skip = match arg(args, 1) {
+        Value::Obj(function) if arg(args, 1).is_callable() => {
+            Skip::UntilSeen(Rc::as_ptr(&function) as usize)
+        }
+        _ => Skip::None,
+    };
+    let trace = std::cell::RefCell::new(i.capture_stack_trace(skip));
+    // The getter answers only for the object it was installed on, which it must not keep alive.
+    let holder = Rc::downgrade(&target);
+    let getter = i.make_native_closure(
+        "",
+        0,
+        Rc::new(move |i: &mut Interp, this: Value, _: &[Value]| {
+            let installed = matches!(&this, Value::Obj(object)
+                if std::ptr::eq(Rc::as_ptr(object), holder.as_ptr()));
+            let lines = match trace.borrow_mut().as_deref_mut() {
+                Some(trace) if installed => trace.lines(),
+                _ => return Ok(Value::Undefined),
+            };
+            stack_string(i, &this, &lines)
+        }),
+    );
+    // Assignment replaces the accessor with an ordinary data property.
+    let setter = i.make_native_closure(
+        "",
+        1,
+        Rc::new(|i: &mut Interp, this: Value, args: &[Value]| {
+            if let Value::Obj(object) = &this {
+                let desc = data_descriptor(i, arg(args, 0));
+                ab(define_own_property(i, object, "stack", &desc))?;
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    let desc = i.new_object();
+    set_data(&desc, "get", Value::Obj(getter));
+    set_data(&desc, "set", Value::Obj(setter));
+    set_data(&desc, "enumerable", Value::Bool(false));
+    set_data(&desc, "configurable", Value::Bool(true));
+    let target_value = Value::Obj(target.clone());
+    let defined = if let Some((t, h)) = proxy_pair(i, &target_value) {
+        ab(proxy_define_property(i, &t, &h, "stack", &Value::Obj(desc)))?
+    } else {
+        ab(define_own_property(i, &target, "stack", &Value::Obj(desc)))?
+    };
+    if !defined {
+        return Err(i.make_error(
+            "TypeError",
+            "Cannot define property stack, object is not extensible",
+        ));
+    }
+    Ok(Value::Undefined)
+}
+
+/// A writable, configurable, non-enumerable data descriptor object for `value`.
+fn data_descriptor(i: &Interp, value: Value) -> Value {
+    let desc = i.new_object();
+    set_data(&desc, "value", value);
+    set_data(&desc, "writable", Value::Bool(true));
+    set_data(&desc, "enumerable", Value::Bool(false));
+    set_data(&desc, "configurable", Value::Bool(true));
+    Value::Obj(desc)
 }
 
 fn make_err(i: &mut Interp, kind: &str, args: &[Value]) -> Result<Value, Value> {

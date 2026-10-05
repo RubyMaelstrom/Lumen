@@ -227,7 +227,7 @@ frame push moves it into `FnFrame::call_site` and the pop restores it, and an er
 creates is positioned by the innermost positioned node or operation it propagates through
 (`Interp::place_thrown`). A new call path must keep that discipline, and a compiler change
 must attribute operations to the same nodes the tree-walker positions, or tiers diverge.
-`Error.stackTraceLimit` (default 10) follows V8.
+`Error.stackTraceLimit` (default 10) and `Error.captureStackTrace` follow V8.
 
 The default-on `intl` feature supplies ECMA-402 and CLDR data. For the engine,
 `--no-default-features` removes `Intl` and gives `toLocale*` methods their
