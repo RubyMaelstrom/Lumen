@@ -30,9 +30,14 @@ impl CachedForInKeys {
         self.layouts.iter().flatten().fold(0usize, |bytes, layout| {
             // Conservatively charge duplicates and unused predicted suffixes. The census below
             // instead de-duplicates shared allocations across objects, hints and cache entries.
-            let storage = std::mem::size_of::<Vec<Rc<str>>>()
+            let storage = std::mem::size_of::<PropertyLayoutData>()
                 + 2 * std::mem::size_of::<usize>()
                 + layout.capacity() * std::mem::size_of::<Rc<str>>();
+            let storage = layout.index_capacity().map_or(storage, |capacity| {
+                storage
+                    .saturating_add(std::mem::size_of::<crate::fasthash::FastMap<Rc<str>, usize>>())
+                    .saturating_add(capacity * std::mem::size_of::<(Rc<str>, usize)>())
+            });
             layout
                 .iter()
                 .fold(bytes.saturating_add(storage), |bytes, key| {

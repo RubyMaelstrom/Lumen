@@ -4,6 +4,7 @@ use super::*;
 use crate::bytecode::{IcState, Tier, IC_ACCESSOR, IC_ARR_KEYCHK, IC_EMPTY, PROP_IC_WAYS};
 use crate::{Completion, Engine};
 use std::cell::Cell;
+use std::rc::Rc;
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
     match engine
@@ -46,6 +47,103 @@ fn check(source: &str, expected: &str) {
             assert_eq!(evaluate(&mut engine, "1+2"), "3");
         }
     }
+}
+
+fn global_user_callable(engine: &mut Engine, name: &str) -> Rc<crate::value::UserCallable> {
+    let env = engine.interp.global_env.clone();
+    let value = engine
+        .interp
+        .get_var(name, &env)
+        .unwrap_or_else(|_| panic!("missing global {name}"));
+    let object = value
+        .as_obj()
+        .unwrap_or_else(|| panic!("{name} is not an object"));
+    let borrowed = object.borrow();
+    let crate::value::Callable::User(user) = &borrowed.call else {
+        panic!("{name} is not an ordinary function")
+    };
+    user.clone()
+}
+
+fn has_binding_getter_cache(user: &crate::value::UserCallable) -> bool {
+    let cache = user.binding_getter_cache.take();
+    let cached = cache.is_some();
+    user.binding_getter_cache.set(cache);
+    cached
+}
+
+#[test]
+fn binding_getter_cache_is_per_closure_and_reads_live_values() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
+                function makeReader(value) {
+                    return { get value() { return value; }, set value(next) { value = next; } };
+                }
+                var left = makeReader(1), right = makeReader(2);
+                var leftGetter = Object.getOwnPropertyDescriptor(left, 'value').get;
+                var rightGetter = Object.getOwnPropertyDescriptor(right, 'value').get;
+                for (var n = 0; n < 4; n++) { left.value; right.value; }
+                [left.value, right.value].join(',')
+            "#
+            ),
+            "1,2",
+            "{tier:?}"
+        );
+        let left = global_user_callable(&mut engine, "leftGetter");
+        let right = global_user_callable(&mut engine, "rightGetter");
+        assert!(
+            has_binding_getter_cache(&left),
+            "{tier:?}: left cache filled"
+        );
+        assert!(
+            has_binding_getter_cache(&right),
+            "{tier:?}: right cache filled"
+        );
+        assert!(Rc::ptr_eq(&left.func, &right.func), "{tier:?}: shared AST");
+        assert!(
+            !Rc::ptr_eq(&left, &right),
+            "{tier:?}: closure state is separate"
+        );
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                "left.value = 7; right.value = 8; [left.value, right.value].join(',')"
+            ),
+            "7,8",
+            "{tier:?}: in-place binding writes stay live"
+        );
+    }
+}
+
+#[test]
+fn binding_getter_cache_re_resolves_after_eval_insert_and_delete() {
+    check(
+        r#"
+        function changeBinding() {
+            let delayed = 1;
+            function make() {
+                var object = { get value() { return delayed; } };
+                var before = object.value;
+                eval('var delayed = 2');
+                var shadow = object.value;
+                for (var n = 0; n < 48; n++) eval('var filler' + n + ' = ' + n);
+                var afterGrowth = object.value;
+                var removed = eval('delete delayed');
+                var afterDelete = object.value;
+                return [before, shadow, afterGrowth, removed, afterDelete].join('|');
+            }
+            return make();
+        }
+        changeBinding()
+    "#,
+        "1|2|2|true|1",
+    );
 }
 
 #[test]

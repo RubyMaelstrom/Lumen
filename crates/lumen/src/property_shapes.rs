@@ -159,7 +159,7 @@ mod tests {
     fn shape_layout_cache_tags_collisions_and_releases_evicted_pins() {
         let mut layouts = ShapeLayouts::default();
         assert_eq!(layouts.allocated_bytes(), 0);
-        let keys = Rc::new(vec![Rc::from("first")]);
+        let keys = crate::value::new_property_layout(vec![Rc::from("first")]);
         let weak = Rc::downgrade(&keys);
         layouts.insert(17, keys);
         assert_eq!(layouts.allocated_bytes(), std::mem::size_of::<LayoutPage>());
@@ -167,12 +167,18 @@ mod tests {
         let collision = 17 + SHAPE_LAYOUT_CACHE_LIMIT as u32;
         assert!(layouts.get(collision).is_none());
         assert!(layouts.get_mut(collision).is_none());
-        layouts.insert(collision, Rc::new(vec![Rc::from("second")]));
+        layouts.insert(
+            collision,
+            crate::value::new_property_layout(vec![Rc::from("second")]),
+        );
         assert_eq!(layouts.len(), 1);
         assert!(layouts.get(17).is_none());
         assert!(weak.upgrade().is_none());
         assert_eq!(&*layouts.get(collision).unwrap()[0], "second");
-        layouts.insert(SHAPE_UNCACHEABLE, Rc::new(vec![Rc::from("untracked")]));
+        layouts.insert(
+            SHAPE_UNCACHEABLE,
+            crate::value::new_property_layout(vec![Rc::from("untracked")]),
+        );
         assert!(layouts.get(SHAPE_UNCACHEABLE).is_none());
         assert_eq!(layouts.len(), 1);
     }
@@ -181,7 +187,7 @@ mod tests {
     fn shape_layout_cache_has_a_fixed_live_storage_bound() {
         let mut layouts = ShapeLayouts::default();
         for id in 1..=(SHAPE_LAYOUT_CACHE_LIMIT as u32 * 3) {
-            layouts.insert(id, Rc::new(vec![Rc::from("key")]));
+            layouts.insert(id, crate::value::new_property_layout(vec![Rc::from("key")]));
         }
         assert_eq!(layouts.len(), SHAPE_LAYOUT_CACHE_LIMIT);
         assert_eq!(layouts.iter().count(), SHAPE_LAYOUT_CACHE_LIMIT);

@@ -113,7 +113,7 @@ fn predicted_object(layout: &crate::value::PropertyLayout, count: usize) -> Valu
 #[test]
 fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
     let mut engine = Engine::new();
-    let layout = Rc::new(vec![Rc::from("a"), Rc::from("b")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
     let weak_layout = Rc::downgrade(&layout);
     let a = predicted_object(&layout, 1);
     let b = predicted_object(&layout, 2);
@@ -145,7 +145,7 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
         "live cache entries own layout proof"
     );
     for index in 0..400 {
-        let layout = Rc::new(vec![Rc::from(format!("fresh{index}"))]);
+        let layout = crate::value::new_property_layout(vec![Rc::from(format!("fresh{index}"))]);
         backing(&mut engine, &predicted_object(&layout, 1));
     }
     assert!(
@@ -164,7 +164,8 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
 #[test]
 fn for_in_cache_accounts_unused_predictions_and_detaches_on_mutation() {
     let mut engine = Engine::new();
-    let layout = Rc::new(vec![Rc::from("a"), Rc::from("x".repeat((1 << 20) + 1))]);
+    let layout =
+        crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("x".repeat((1 << 20) + 1))]);
     let source = predicted_object(&layout, 1);
     let before = engine.interp.enumeration_keys.stats();
     assert_eq!(key_at(&backing(&mut engine, &source), 0), "a");
@@ -180,7 +181,7 @@ fn for_in_cache_accounts_unused_predictions_and_detaches_on_mutation() {
         before.0 + 1,
         "empty prefix does not need to pin an unused layout"
     );
-    let layout = Rc::new(vec![Rc::from("a"), Rc::from("b")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
     let source = predicted_object(&layout, 2);
     let original = backing(&mut engine, &source);
     let old_layout = Rc::downgrade(&layout);

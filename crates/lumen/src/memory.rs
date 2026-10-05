@@ -630,6 +630,13 @@ impl Visitor {
                     self.callable_metadata = self
                         .callable_metadata
                         .saturating_add(size_of_val(value.as_ref()));
+                    if let Some(cache) = value.binding_getter_cache.take() {
+                        self.callable_metadata = self
+                            .callable_metadata
+                            .saturating_add(cache.retained_requested_storage_bytes());
+                        self.rc_str(&cache.name);
+                        value.binding_getter_cache.set(Some(cache));
+                    }
                 }
                 self.function(&value.func);
             }
@@ -932,11 +939,21 @@ impl Visitor {
 
     pub(crate) fn property_layout(&mut self, layout: &crate::value::PropertyLayout) {
         if self.property_layouts.insert(Rc::as_ptr(layout) as usize) {
-            // Requested payload, like the other Rc-backed categories: one Vec header and key
-            // buffer per layout, not private allocator/refcount headers or one copy per instance.
+            // Requested payload, like the other Rc-backed categories: one layout body and key
+            // buffer per shared layout, not private allocator/refcount headers or one copy per
+            // instance. The optional standard HashMap has a known entry-capacity lower bound;
+            // Rust does not expose its exact bucket allocation.
             self.detached_property_storage = self.detached_property_storage.saturating_add(
-                size_of::<Vec<Rc<str>>>() + layout.capacity() * size_of::<Rc<str>>(),
+                size_of::<crate::value::PropertyLayoutData>()
+                    + layout.capacity() * size_of::<Rc<str>>(),
             );
+            if let Some(capacity) = layout.index_capacity() {
+                self.detached_property_storage = self
+                    .detached_property_storage
+                    .saturating_add(size_of::<crate::fasthash::FastMap<Rc<str>, usize>>())
+                    .saturating_add(capacity * size_of::<(Rc<str>, usize)>());
+                self.detached_property_storage_opaque = true;
+            }
             for key in layout.iter() {
                 self.rc_str(key);
             }
@@ -2454,7 +2471,11 @@ mod tests {
 
     #[test]
     fn shared_property_layouts_are_counted_once_including_unused_predictions() {
-        let layout = Rc::new(vec![Rc::from("a"), Rc::from("b"), Rc::from("unused")]);
+        let layout = crate::value::new_property_layout(vec![
+            Rc::from("a"),
+            Rc::from("b"),
+            Rc::from("unused"),
+        ]);
         let mut a = Props::with_layout(1, Some(layout.clone()));
         let mut b = Props::with_layout(2, Some(layout.clone()));
         a.insert("a", crate::value::Property::plain(Value::Undefined));
@@ -2469,8 +2490,59 @@ mod tests {
         assert_eq!(
             visitor.detached_property_storage,
             3 * size_of::<crate::value::Property>()
-                + size_of::<Vec<Rc<str>>>()
+                + size_of::<crate::value::PropertyLayoutData>()
                 + layout.capacity() * size_of::<Rc<str>>()
+        );
+    }
+
+    #[test]
+    fn shared_ordinary_lookup_index_is_counted_once_per_layout() {
+        let mut engine = crate::Engine::new();
+        engine.interp.activate_gc_heap();
+        engine
+            .eval(
+                "function make(){var o={};for(var i=0;i<12;i++)o['field'+i]=i;return o}var a=make(),b=make();",
+                false,
+            )
+            .expect("layout fixture parses");
+        let env = engine.interp.global_env.clone();
+        let Value::Obj(a) = engine
+            .interp
+            .get_var("a", &env)
+            .ok()
+            .expect("a is initialized")
+        else {
+            panic!("a is an object")
+        };
+        let Value::Obj(b) = engine
+            .interp
+            .get_var("b", &env)
+            .ok()
+            .expect("b is initialized")
+        else {
+            panic!("b is an object")
+        };
+        let a = a.borrow().props.clone();
+        let b = b.borrow().props.clone();
+        let layout = a.shared_layout().expect("shared layout");
+        assert!(layout.has_index());
+        assert!(Rc::ptr_eq(layout, b.shared_layout().expect("b layout")));
+
+        let expected_layout = size_of::<crate::value::PropertyLayoutData>()
+            + layout.capacity() * size_of::<Rc<str>>()
+            + size_of::<crate::fasthash::FastMap<Rc<str>, usize>>()
+            + layout.index_capacity().unwrap() * size_of::<(Rc<str>, usize)>();
+        let mut visitor = Visitor::default();
+        visitor.props(&a);
+        visitor.props(&b);
+        assert_eq!(visitor.property_layouts.len(), 1);
+        assert_eq!(
+            visitor.detached_property_storage,
+            24 * size_of::<crate::value::Property>() + expected_layout
+        );
+        assert!(
+            visitor.detached_property_storage_opaque,
+            "HashMap bucket bytes remain a documented lower bound"
         );
     }
 
@@ -2478,10 +2550,13 @@ mod tests {
     fn for_in_cache_layout_pins_are_censused_once_after_source_dies() {
         let mut engine = crate::Engine::new();
         engine.interp.activate_gc_heap();
-        let layout = Rc::new(vec![Rc::from("live"), Rc::from("unused prediction")]);
+        let layout = crate::value::new_property_layout(vec![
+            Rc::from("live"),
+            Rc::from("unused prediction"),
+        ]);
         let weak_layout = Rc::downgrade(&layout);
-        let expected_layout_bytes =
-            size_of::<Vec<Rc<str>>>() + layout.capacity() * size_of::<Rc<str>>();
+        let expected_layout_bytes = size_of::<crate::value::PropertyLayoutData>()
+            + layout.capacity() * size_of::<Rc<str>>();
         let mut props = Props::with_layout(1, Some(layout.clone()));
         props.append_initialized_field(&layout[0], crate::value::Property::plain(Value::Undefined));
         let source = Value::Obj(crate::value::Object::new_with_parts(

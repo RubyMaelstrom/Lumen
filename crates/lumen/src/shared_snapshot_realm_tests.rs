@@ -29,6 +29,7 @@ const BOOTSTRAP: &str = r#"(function () {
     }
     function makeArray() { return [1, 2, 3]; }
     function makeObject() { return { a: 1, b: 2 }; }
+    function makeReader(value) { return { get value() { return value; } }; }
     function makeRegExp() { return /a+/g; }
     function tag(strings) { return strings; }
     function template() { return tag`x${1}y`; }
@@ -45,7 +46,7 @@ const BOOTSTRAP: &str = r#"(function () {
         return sum;
     }
     globalThis.probe = {
-        Base, Derived, makeArray, makeObject, makeRegExp, template, makeTypeError,
+        Base, Derived, makeArray, makeObject, makeReader, makeRegExp, template, makeTypeError,
         makeRangeError, readGlobal, makeClosure, hot,
     };
 })();
@@ -134,6 +135,28 @@ fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
         panic!("probe.{name} is an ordinary function");
     };
     user.func.clone()
+}
+
+fn global_user_callable(it: &mut Interp, name: &str) -> Rc<crate::value::UserCallable> {
+    let env = it.global_env.clone();
+    let value = it
+        .get_var(name, &env)
+        .unwrap_or_else(|_| panic!("missing global {name}"));
+    let Value::Obj(object) = value else {
+        panic!("{name} is not an object")
+    };
+    let borrowed = object.borrow();
+    let Callable::User(user) = &borrowed.call else {
+        panic!("{name} is not an ordinary function")
+    };
+    user.clone()
+}
+
+fn has_binding_getter_cache(user: &crate::value::UserCallable) -> bool {
+    let cache = user.binding_getter_cache.take();
+    let cached = cache.is_some();
+    user.binding_getter_cache.set(cache);
+    cached
 }
 
 #[test]
@@ -226,6 +249,63 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
             )
         });
         assert_eq!(calls, "800", "{tier:?} alternating Realm calls");
+    }
+}
+
+#[test]
+fn shared_snapshot_binding_getters_cache_each_realms_live_closure() {
+    for tier in TIERS {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        let child = it.create_realm();
+        run_shared(it);
+        assert_eq!(
+            eval_string(
+                it,
+                r#"
+                var reader = probe.makeReader('main');
+                var readerGetter = Object.getOwnPropertyDescriptor(reader, 'value').get;
+                for (var n = 0; n < 4; n++) reader.value;
+                reader.value
+            "#,
+            ),
+            "main"
+        );
+        let main_getter = global_user_callable(it, "readerGetter");
+        assert!(
+            has_binding_getter_cache(&main_getter),
+            "{tier:?}: main cache"
+        );
+
+        in_realm(it, &child, |it| {
+            run_shared(it);
+            assert_eq!(
+                eval_string(
+                    it,
+                    r#"
+                    var reader = probe.makeReader('child');
+                    var readerGetter = Object.getOwnPropertyDescriptor(reader, 'value').get;
+                    for (var n = 0; n < 4; n++) reader.value;
+                    reader.value
+                "#,
+                ),
+                "child"
+            );
+            let child_getter = global_user_callable(it, "readerGetter");
+            assert!(
+                has_binding_getter_cache(&child_getter),
+                "{tier:?}: child cache"
+            );
+            assert!(
+                Rc::ptr_eq(&main_getter.func, &child_getter.func),
+                "{tier:?}: snapshot AST is shared"
+            );
+            assert!(
+                !Rc::ptr_eq(&main_getter, &child_getter),
+                "{tier:?}: cached environments are closure-local"
+            );
+        });
     }
 }
 

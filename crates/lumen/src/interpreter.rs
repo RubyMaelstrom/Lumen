@@ -2066,6 +2066,37 @@ pub struct Binding {
     pub strict_immutable: bool,
 }
 
+/// A bounded, environment-specific proof used by trivial accessor functions whose whole body is
+/// `return <identifier>`. Weak pins describe the live path from the function's captured
+/// environment through the binding's scope, prevent scope-allocation ABA, and retain no scope or
+/// value. Each structural generation validates the cached Binding pointer.
+#[derive(Clone)]
+pub(crate) struct BindingGetterScopeGuard {
+    pub(crate) pin: std::rc::Weak<std::cell::RefCell<Scope>>,
+    pub(crate) generation: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct BindingGetterCache {
+    pub(crate) name: Rc<str>,
+    pub(crate) scopes: Vec<BindingGetterScopeGuard>,
+    pub(crate) binding: *const Binding,
+}
+
+impl BindingGetterCache {
+    pub(crate) fn retained_requested_storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            self.scopes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<BindingGetterScopeGuard>()),
+        )
+    }
+}
+
+/// Keep getter binding caches shallow and deterministic in size; deeper lexical chains retain
+/// the ordinary Call path.
+pub(crate) const MAX_BINDING_GETTER_SCOPES: usize = 16;
+
 impl Binding {
     #[cfg(test)]
     pub(crate) fn set_import_reference(&mut self, reference: Option<(Env, String)>) {
@@ -7048,6 +7079,55 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> Result<Value, Abrupt> {
         self.get_prop_ic_impl(base, name, cache, true, None)
+    }
+
+    /// Compact execution-storage form of OrdinaryGet. Cache resolution borrows
+    /// the receiver only while no author code can run, and snapshots the live
+    /// descriptor's owned value/getter. Data hits never widen either owner. A
+    /// getter or exotic path first roots a separate receiver, since it may replace
+    /// the caller's local/operand slot while running.
+    ///
+    /// # Safety
+    /// `base` must point to an initialized, rooted execution slot at entry. Its
+    /// borrow ends before any JS call: keep the pointer raw at this boundary so
+    /// reentry can replace the slot without a protected Rust reference to it.
+    pub(crate) unsafe fn get_prop_ic_packed(
+        &mut self,
+        base: *const PackedValue,
+        name: &str,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Result<PackedValue, Abrupt> {
+        // Preserve the named-read String length shortcut without widening or
+        // retaining a temporary string, including when GetProp moved its operand.
+        if name == "length" {
+            if let Some(length) = unsafe { &*base }.with_string(|text| self.str_len(text)) {
+                return Ok(PackedValue::pack(Value::Num(length as f64)));
+            }
+        }
+        let read =
+            unsafe { &*base }.with_object(|object| self.try_ic_get(object, name, cache, true));
+        match read {
+            Some(Some(read)) => match read.packed_data() {
+                Ok(value) => Ok(value),
+                Err(read) => {
+                    let receiver = unsafe { &*base }.unpack();
+                    self.finish_cached_get(read, &receiver, None)
+                        .map(PackedValue::pack)
+                }
+            },
+            Some(None) => {
+                // The object IC already declined. Do not repeat its probes before
+                // the full exotic/prototype algorithm.
+                let receiver = unsafe { &*base }.unpack();
+                self.get_member_recv_impl(&receiver, name, receiver.clone(), None)
+                    .map(PackedValue::pack)
+            }
+            None => {
+                let receiver = unsafe { &*base }.unpack();
+                self.get_prop_ic(&receiver, name, cache)
+                    .map(PackedValue::pack)
+            }
+        }
     }
 
     /// Profile-enabled form of [`Self::get_prop_ic`]. Slow paths fill `trace` at the exact
@@ -12505,9 +12585,10 @@ impl Interp {
     /// A native-entry IC hit: invoke the builtin straight from the cache — no receiver borrow,
     /// no `Callable` dispatch, no re-probe. Replicates the observable effects of the
     /// plain-native fast call (depth guard, amortized gc tick, constructing/new.target
-    /// save-clear-restore, defensive tail drain). Ownership matches
-    /// [`Interp::call_jit_committed`]: the arguments and `*this_slot` are consumed
-    /// unconditionally (the native borrows them during the call; they drop after it).
+    /// save-clear-restore, defensive tail drain). The arguments and `*this_slot` are consumed
+    /// unconditionally. Argument owners move into wide temporaries that remain rooted through
+    /// the post-call interrupt poll and pending-tail drain; the receiver keeps its existing
+    /// packed owner until that same boundary completes.
     ///
     /// # Safety
     /// Same contract as `call_jit_committed`.
@@ -12537,20 +12618,42 @@ impl Interp {
         }
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
         let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
-        let args_ref = unsafe { std::slice::from_raw_parts(args, argc) };
         let native_result = match self.interrupt_poll_force() {
-            Ok(()) => with_execution_stack(self.depth, || {
-                let perf_started = crate::jit::perf_stage_start();
-                let result = PackedValue::with_values(args_ref, |arguments| {
-                    nf(self, unsafe { &*this_slot }.unpack(), arguments)
-                });
-                crate::jit::perf_native_end(
-                    perf_started,
-                    result.is_ok(),
-                    crate::jit::NativeLabelSrc::Addr(nf as usize),
-                );
-                result
-            }),
+            Ok(()) => unsafe {
+                crate::execution_storage::with_moved_values(args, argc, |arguments| {
+                    let native_result = with_execution_stack(self.depth, || {
+                        let perf_started = crate::jit::perf_stage_start();
+                        let result = nf(self, (&*this_slot).unpack(), arguments);
+                        crate::jit::perf_native_end(
+                            perf_started,
+                            result.is_ok(),
+                            crate::jit::NativeLabelSrc::Addr(nf as usize),
+                        );
+                        result
+                    });
+                    let mut r = match self.interrupt_poll_force() {
+                        Ok(()) => native_result.map_err(Abrupt::Throw),
+                        Err(interrupt) => Err(interrupt),
+                    };
+                    self.constructing = saved_ctor;
+                    self.new_target = saved_nt;
+                    while r.is_ok() {
+                        match self.pending_tail.take() {
+                            Some(bx) => {
+                                let (f, t, a) = *bx;
+                                if let Err(e) = self.gc_check_amortized() {
+                                    r = Err(e);
+                                    break;
+                                }
+                                r = self.call_tail(f, t, &a);
+                            }
+                            None => break,
+                        }
+                    }
+                    self.depth -= 1;
+                    r
+                })
+            },
             Err(interrupt) => {
                 self.constructing = saved_ctor;
                 self.new_target = saved_nt;
@@ -12559,28 +12662,10 @@ impl Interp {
                 return Err(interrupt);
             }
         };
-        let mut r = match self.interrupt_poll_force() {
-            Ok(()) => native_result.map_err(Abrupt::Throw),
-            Err(interrupt) => Err(interrupt),
-        };
-        self.constructing = saved_ctor;
-        self.new_target = saved_nt;
-        while r.is_ok() {
-            match self.pending_tail.take() {
-                Some(bx) => {
-                    let (f, t, a) = *bx;
-                    if let Err(e) = self.gc_check_amortized() {
-                        r = Err(e);
-                        break;
-                    }
-                    r = self.call_tail(f, t, &a);
-                }
-                None => break,
-            }
-        }
-        self.depth -= 1;
-        drop_operands();
-        r
+        // `with_moved_values` consumed the arguments; the receiver stays in its original slot so
+        // its strong owner and the existing `unpack()` clone keep their established lifetimes.
+        unsafe { std::ptr::drop_in_place(this_slot.cast_mut()) };
+        native_result
     }
 
     /// [`Interp::call_jit_cached`]'s committed tail, split out so the asm call thunk can enter

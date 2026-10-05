@@ -6785,7 +6785,7 @@ fn finish_chunk(
         );
     }
     let instance_layout = (instance_capacity_hint != 0).then(|| {
-        Rc::new(
+        crate::value::new_shared_indexed_property_layout(
             instance_names[..instance_capacity_hint as usize]
                 .iter()
                 .map(|&name| c.names[name as usize].clone())
@@ -18088,6 +18088,22 @@ fn get_named_property(
 }
 
 #[inline]
+unsafe fn get_named_property_packed(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    base: *const PackedValue,
+    name: &str,
+    cache: &std::cell::Cell<IcState>,
+) -> Result<PackedValue, Abrupt> {
+    if !chunk.feedback.detailed_enabled() {
+        return unsafe { i.get_prop_ic_packed(base, name, cache) };
+    }
+    let receiver = unsafe { &*base }.unpack();
+    get_named_property(i, chunk, pc, &receiver, name, cache).map(PackedValue::pack)
+}
+
+#[inline]
 fn set_named_property(
     i: &mut Interp,
     chunk: &Chunk,
@@ -22671,6 +22687,10 @@ pub(crate) unsafe extern "C" fn jit_get_element(
 #[path = "bytecode_computed_read_tests.rs"]
 mod computed_read_helper_tests;
 
+#[cfg(test)]
+#[path = "bytecode_named_read_tests.rs"]
+mod named_read_helper_tests;
+
 /// Dedicated property-read entry (same contract as [`jit_exec`]): straight into
 /// [`crate::interpreter::Interp::get_prop_ic`] for the four read shapes, skipping the generic
 /// op decode.
@@ -22687,8 +22707,8 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
         match chunk.ops[pc as usize] {
             Op::GetProp(n, c) => {
                 sp = sp.sub(1);
-                let obj = sp.read().into_value();
-                let v = get_named_property(
+                let obj = sp.read();
+                let v = get_named_property_packed(
                     i,
                     chunk,
                     pc as usize,
@@ -22696,7 +22716,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
-                sp.write(PackedValue::pack(v));
+                sp.write(v);
                 sp = sp.add(1);
                 Ok(())
             }
@@ -22715,8 +22735,9 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                 Ok(())
             }
             Op::GetPropLocal(s, n, c) => {
-                let obj = ctx.clone_slot(s as usize);
-                if matches!(obj, Value::Empty) {
+                debug_assert!((s as usize) < ctx.n_slots);
+                let obj = ctx.slots.add(s as usize);
+                if (*obj).is_empty() {
                     return Err(i.throw(
                         "ReferenceError",
                         format!(
@@ -22725,21 +22746,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         ),
                     ));
                 }
-                let v = get_named_property(
-                    i,
-                    chunk,
-                    pc as usize,
-                    &obj,
-                    &chunk.names[n as usize],
-                    &chunk.caches[c as usize],
-                )?;
-                sp.write(PackedValue::pack(v));
-                sp = sp.add(1);
-                Ok(())
-            }
-            Op::GetMethod(n, c) => {
-                let obj = &(*sp.sub(1)).unpack(); // receiver stays on the stack
-                let m = get_named_property(
+                let v = get_named_property_packed(
                     i,
                     chunk,
                     pc as usize,
@@ -22747,7 +22754,21 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                 )?;
-                sp.write(PackedValue::pack(m));
+                sp.write(v);
+                sp = sp.add(1);
+                Ok(())
+            }
+            Op::GetMethod(n, c) => {
+                let obj = sp.sub(1); // receiver stays on the stack
+                let m = get_named_property_packed(
+                    i,
+                    chunk,
+                    pc as usize,
+                    obj,
+                    &chunk.names[n as usize],
+                    &chunk.caches[c as usize],
+                )?;
+                sp.write(m);
                 sp = sp.add(1);
                 Ok(())
             }

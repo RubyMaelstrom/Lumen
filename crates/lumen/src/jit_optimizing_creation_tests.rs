@@ -170,7 +170,7 @@ fn native_creation_covers_all_receivers_results_and_value_owners() {
         );
         let (mut engine, code) = setup(&source);
         let target = object(&mut engine, "target");
-        let layout = Rc::new(
+        let layout = crate::value::new_shared_indexed_property_layout(
             ["alpha", "beta", "gamma", "delta"]
                 .map(Rc::<str>::from)
                 .to_vec(),
@@ -219,7 +219,7 @@ fn creation_predictions_compare_equal_unicode_empty_long_and_special_names() {
     ] {
         let (mut engine, code) = static_name_fixture(&name);
         let target = object(&mut engine, "target");
-        let layout = Rc::new(vec![Rc::<str>::from(name.as_str())]);
+        let layout = crate::value::new_property_layout(vec![Rc::<str>::from(name.as_str())]);
         let (result, counts) = measured(&mut engine, &code, "subject()", |_| {
             target.borrow_mut().props = Props::with_layout(1, Some(layout.clone()));
         });
@@ -242,7 +242,8 @@ fn creation_adopts_shared_layouts_but_destroys_private_last_owners_in_rust() {
     let (mut engine, code) = setup("function subject(){target.alpha=held;target.beta=held;return target.beta===held;}var target={},held={};");
     let target = object(&mut engine, "target");
     for shared in [false, true] {
-        let previous = Rc::new(vec![Rc::from("wrong"), Rc::from("unused")]);
+        let previous =
+            crate::value::new_property_layout(vec![Rc::from("wrong"), Rc::from("unused")]);
         let (result, counts) = measured(&mut engine, &code, "subject()", |_| {
             target.borrow_mut().props = if shared {
                 Props::with_layout(3, Some(previous.clone()))
@@ -255,7 +256,10 @@ fn creation_adopts_shared_layouts_but_destroys_private_last_owners_in_rust() {
         assert_eq!(Rc::strong_count(&previous), 1);
     }
     let (result, counts) = measured(&mut engine, &code, "subject()", |_| {
-        target.borrow_mut().props = Props::with_layout(3, Some(Rc::new(vec![Rc::from("private")])));
+        target.borrow_mut().props = Props::with_layout(
+            3,
+            Some(crate::value::new_property_layout(vec![Rc::from("private")])),
+        );
     });
     assert_eq!(result, "true");
     assert_eq!(counts, [if disabled() { 2 } else { 1 }, 0, 0]);
@@ -275,7 +279,7 @@ fn native_creation_probes_all_four_polymorphic_before_shapes() {
                 .map(|n| Rc::from(format!("prefix{n}")))
                 .collect();
             keys.push(Rc::from("created"));
-            Rc::new(keys)
+            crate::value::new_shared_indexed_property_layout(keys)
         })
         .collect();
     let (result, counts) = measured(
@@ -308,7 +312,7 @@ fn native_creation_preserves_the_small_map_boundary_and_reserved_capacity() {
             .map(|i| Rc::from(format!("prefix{i}")))
             .collect();
         keys.push(Rc::from("created"));
-        let layout = Rc::new(keys);
+        let layout = crate::value::new_shared_indexed_property_layout(keys);
         for reserved in [false, true] {
             let (result, counts) = measured(&mut engine, &code, "subject()", |_| {
                 let mut props =
@@ -339,7 +343,7 @@ fn native_creation_preserves_the_small_map_boundary_and_reserved_capacity() {
 fn warmed_creation_rechecks_prototype_descriptors_identity_and_extensibility() {
     let (mut engine, code) = setup("function subject(){'use strict';return target.field=held;}var proto={field:1},target=Object.create(proto),held={},trace=[];");
     let target = object(&mut engine, "target");
-    let layout = Rc::new(vec![Rc::from("field")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("field")]);
     let fresh = || Props::with_layout(1, Some(layout.clone()));
     let (_, counts) = measured(&mut engine, &code, "subject()===held", |_| {
         target.borrow_mut().props = fresh()
@@ -366,7 +370,7 @@ fn warmed_creation_rechecks_prototype_descriptors_identity_and_extensibility() {
 fn creation_on_a_prototype_invalidates_descendant_proofs_and_preserves_order() {
     let (mut engine, code) = setup("function subject(){target.field=held;return target.field===held;}var target={},held={},child=Object.create(target);");
     let target = object(&mut engine, "target");
-    let layout = Rc::new(vec![Rc::from("field")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("field")]);
     // First prove that this exact function can take its native path.
     let (result, counts) = measured(&mut engine, &code, "subject()", |_| {
         target.borrow_mut().props = Props::with_layout(2, Some(layout.clone()));
@@ -416,7 +420,7 @@ fn creation_keeps_rhs_effects_and_reentrant_collection_before_setter_or_rejectio
             Ok(JsValue::Undefined)
         });
     let target = object(&mut engine, "target");
-    let layout = Rc::new(vec![Rc::from("field")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("field")]);
     let (_, counts) = measured(&mut engine, &code, "subject(0)", |_| {
         target.borrow_mut().props = Props::with_layout(1, Some(layout.clone()));
     });
@@ -446,7 +450,7 @@ fn creation_keeps_rhs_effects_and_reentrant_collection_before_setter_or_rejectio
 fn warmed_creation_does_not_bypass_proxy_traps_or_primitive_rejection() {
     let (mut engine, code) = setup("function subject(){'use strict';target.field=held;return true;}var target={},held={},trace=[];");
     let target = object(&mut engine, "target");
-    let layout = Rc::new(vec![Rc::from("field")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("field")]);
     let (_, counts) = measured(&mut engine, &code, "subject()", |_| {
         target.borrow_mut().props = Props::with_layout(1, Some(layout.clone()));
     });

@@ -17,6 +17,14 @@ enum ReadKind {
     MissingGetter,
 }
 
+enum BindingGetterProbe {
+    Value(Value),
+    /// The structural proof still holds, but the live binding remains in its TDZ or is an import.
+    UninitializedOrImport,
+    /// A scope identity or structural generation changed; re-resolve the cached identifier.
+    Stale,
+}
+
 /// One owned value plus lookup metadata fits in the same two words as `Value`.
 /// The kind's unused discriminants also keep `Option<CachedGet>` at two words.
 /// In particular, a successful data read must not acquire an out-of-line getter
@@ -54,6 +62,17 @@ impl CachedGet {
             Some(self.value.into_value())
         } else {
             None
+        }
+    }
+
+    /// Preserve the compact owner on a data hit. An accessor still needs its
+    /// original receiver rooted across Call, so return the complete read on a miss.
+    #[inline(always)]
+    pub(super) fn packed_data(self) -> Result<PackedValue, Self> {
+        if self.kind == ReadKind::Data {
+            Ok(self.value)
+        } else {
+            Err(self)
         }
     }
 }
@@ -158,11 +177,40 @@ impl Interp {
     pub(crate) fn try_binding_getter(&self, getter: &Value) -> Option<Value> {
         use crate::ast::{Expr, Stmt};
         use crate::value::Callable;
-        let getter = getter.as_obj()?;
-        let getter = getter.borrow();
-        let Callable::User(user) = &getter.call else {
+        let getter_object = getter.as_obj()?;
+        let getter_object = getter_object.borrow();
+        let Callable::User(user) = &getter_object.call else {
             return None;
         };
+
+        // The first successful proof retains the identifier and a bounded structural proof for
+        // this closure's own environment. The AST is shared by closures and Realms, so dynamic
+        // binding state belongs on UserCallable and is guarded by the live environment chain.
+        if let Some(cache) = user.binding_getter_cache.take() {
+            match self.probe_binding_getter_cache(&user.env, &cache) {
+                BindingGetterProbe::Value(value) => {
+                    user.binding_getter_cache.set(Some(cache));
+                    return Some(value);
+                }
+                BindingGetterProbe::UninitializedOrImport => {
+                    // The structural proof still holds. Read TDZ/import state live on every
+                    // access, and retain the cache so a later ordinary binding write can hit.
+                    user.binding_getter_cache.set(Some(cache));
+                    return None;
+                }
+                BindingGetterProbe::Stale => {
+                    if let Some((next, value)) =
+                        self.resolve_binding_getter(&user.env, cache.name.as_ref())
+                    {
+                        user.binding_getter_cache.set(Some(Box::new(next)));
+                        return Some(value);
+                    }
+                    user.binding_getter_cache.set(None);
+                    return None;
+                }
+            }
+        }
+
         let f = &user.func;
         if !f.params.is_empty() || f.is_generator || f.is_async || f.body.len() != 1 {
             return None;
@@ -173,23 +221,144 @@ impl Interp {
         if name == "arguments" {
             return None;
         }
-        // Every scope on the chain is kept alive by the getter's [[Environment]].
-        let mut scope: *const std::cell::RefCell<crate::interpreter::Scope> =
-            std::rc::Rc::as_ptr(&user.env);
-        loop {
-            let record = unsafe { &*scope }.borrow();
-            // A global Environment Record's object part (and any `with` object) may run code.
-            if record.parent.is_none() || record.with_obj.is_some() || record.under_with {
+        let (cache, value) = self.resolve_binding_getter(&user.env, name)?;
+        user.binding_getter_cache.set(Some(Box::new(cache)));
+        Some(value)
+    }
+
+    /// A cache is a bounded proof of the full resolution path. Parent links are followed live,
+    /// every scope identity is compared, and every VarMap generation is checked before the raw
+    /// Binding pointer is read. The closure's [[Environment]] owns the first scope and each live
+    /// parent link owns the next; the pointer cannot outlive or move within the guarded map.
+    fn probe_binding_getter_cache(
+        &self,
+        start: &crate::interpreter::Env,
+        cache: &crate::interpreter::BindingGetterCache,
+    ) -> BindingGetterProbe {
+        use crate::interpreter::MAX_BINDING_GETTER_SCOPES;
+        use std::rc::Rc;
+
+        if cache.scopes.is_empty() || cache.scopes.len() > MAX_BINDING_GETTER_SCOPES {
+            return BindingGetterProbe::Stale;
+        }
+        let mut scope_ptr = Rc::as_ptr(start);
+        for (index, guard) in cache.scopes.iter().enumerate() {
+            if scope_ptr != guard.pin.as_ptr() {
+                return BindingGetterProbe::Stale;
+            }
+            // SAFETY: the called UserCallable owns `start`, and each parent link owns the next
+            // scope. No JS or GC operation runs in this guarded walk, so those links stay live.
+            let scope = unsafe { &*scope_ptr }.borrow();
+            // The previous optimization deliberately excludes global and with environments.
+            // Rechecking the live parent and with state also covers scope-chain edits.
+            if scope.parent.is_none()
+                || scope.with_obj.is_some()
+                || scope.under_with
+                || !scope.vars.matches_generation(guard.generation)
+            {
+                return BindingGetterProbe::Stale;
+            }
+            if index + 1 == cache.scopes.len() {
+                // SAFETY: resolution installed this pointer from this scope's VarMap. The live
+                // identity and unchanged non-saturated generation above prove no structural
+                // mutation has moved or removed it. In-place binding changes are inspected live.
+                let binding = unsafe { &*cache.binding };
+                return if binding.initialized && !binding.imported && binding.import_ref.is_none() {
+                    BindingGetterProbe::Value(binding.value.clone())
+                } else {
+                    BindingGetterProbe::UninitializedOrImport
+                };
+            }
+            let Some(parent) = scope.parent.as_ref() else {
+                return BindingGetterProbe::Stale;
+            };
+            scope_ptr = Rc::as_ptr(parent);
+        }
+        BindingGetterProbe::Stale
+    }
+
+    /// Cold resolution performs ordinary lexical lookup once, then stores only scope identities,
+    /// generations, the immutable name and the selected Binding address. Dynamic binding values
+    /// and TDZ/import flags are never cached. Deep or observable environments retain Call.
+    fn resolve_binding_getter(
+        &self,
+        start: &crate::interpreter::Env,
+        name: &str,
+    ) -> Option<(crate::interpreter::BindingGetterCache, Value)> {
+        use crate::interpreter::{BindingGetterCache, BindingGetterScopeGuard};
+        use std::rc::Rc;
+
+        // Failed proofs are common for module imports and globals. Resolve with raw
+        // pointers first so those getters keep the allocation-free Call fallback. The
+        // captured environment owns the first scope and every live parent link owns the
+        // next; no JavaScript or GC boundary occurs during this bounded walk.
+        let mut scope_ptr = Rc::as_ptr(start);
+        let mut scope_count = None;
+        for depth in 1..=crate::interpreter::MAX_BINDING_GETTER_SCOPES {
+            // SAFETY: `start` and each traversed scope's parent keep this chain alive for
+            // the duration of the walk; the function invokes no user code or collector.
+            let scope = unsafe { &*scope_ptr }.borrow();
+            // A global Environment Record's object part and with environments may run code.
+            // Saturated generations cannot validate a stable Binding address.
+            if scope.parent.is_none()
+                || scope.with_obj.is_some()
+                || scope.under_with
+                || scope.vars.generation() == u32::MAX
+            {
                 return None;
             }
-            if let Some(binding) = record.vars.get(name.as_str()) {
+            if let Some(binding) = scope.vars.get(name) {
                 if !binding.initialized || binding.imported || binding.import_ref.is_some() {
                     return None;
                 }
-                return Some(binding.value.clone());
+                scope_count = Some(depth);
+                break;
             }
-            scope = std::rc::Rc::as_ptr(record.parent.as_ref()?);
+            scope_ptr = Rc::as_ptr(scope.parent.as_ref()?);
         }
+        let scope_count = scope_count?;
+
+        // Only a successful initialized ordinary binding justifies owning cache metadata.
+        // Rewalk the proven path to take weak guards and the live Binding/value snapshot;
+        // there is still no callout or possible mutation between the two traversals.
+        let mut scopes = Vec::with_capacity(scope_count);
+        let mut env = start.clone();
+        let mut binding_ptr = std::ptr::null();
+        let mut value = None;
+        for index in 0..scope_count {
+            let scope = env.borrow();
+            if scope.parent.is_none()
+                || scope.with_obj.is_some()
+                || scope.under_with
+                || scope.vars.generation() == u32::MAX
+            {
+                return None;
+            }
+            scopes.push(BindingGetterScopeGuard {
+                pin: Rc::downgrade(&env),
+                generation: scope.vars.generation(),
+            });
+            if index + 1 == scope_count {
+                let binding = scope.vars.get(name)?;
+                if !binding.initialized || binding.imported || binding.import_ref.is_some() {
+                    return None;
+                }
+                binding_ptr = binding as *const crate::interpreter::Binding;
+                value = Some(binding.value.clone());
+                break;
+            }
+            let parent = scope.parent.as_ref()?.clone();
+            drop(scope);
+            env = parent;
+        }
+        Some((
+            BindingGetterCache {
+                name: Rc::<str>::from(name),
+                scopes,
+                binding: binding_ptr,
+            },
+            value?,
+        ))
     }
 
     /// Resolve the live getter first, then prove its complete body and every

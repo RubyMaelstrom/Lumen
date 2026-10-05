@@ -486,7 +486,7 @@ fn fresh_fields(interp: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Val
     let object = interp.new_object();
     object.borrow_mut().props = crate::value::Props::with_layout(
         3,
-        Some(Rc::new(vec![
+        Some(crate::value::new_property_layout(vec![
             Rc::from("first"),
             Rc::from("second"),
             Rc::from("third"),

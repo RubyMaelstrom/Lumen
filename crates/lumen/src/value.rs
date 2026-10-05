@@ -218,6 +218,30 @@ impl PackedValue {
         self.0.get() == PACK_UNDEFINED
     }
 
+    /// Lend an already materialized object without creating another owner. The
+    /// callback must finish its borrowed inspection before an observer can change
+    /// the source slot; property lookup uses this only to take an owned snapshot.
+    /// Deferred prototypes deliberately retain their ordinary materializing path.
+    #[inline]
+    pub(crate) fn with_object<R>(&self, f: impl FnOnce(&Gc) -> R) -> Option<R> {
+        if self.tag() != PACK_OBJ {
+            return None;
+        }
+        let object = std::mem::ManuallyDrop::new(unsafe { self.read_word::<Gc>() });
+        Some(f(&object))
+    }
+
+    /// Borrow string text for an observer-free primitive operation, retaining the
+    /// compact slot's owner. As with `with_object`, do not lend frame slots to JS.
+    #[inline]
+    pub(crate) fn with_string<R>(&self, f: impl FnOnce(&crate::lstr::LStr) -> R) -> Option<R> {
+        if self.tag() != PACK_STR {
+            return None;
+        }
+        let string = std::mem::ManuallyDrop::new(unsafe { self.read_word::<crate::lstr::LStr>() });
+        Some(f(&string))
+    }
+
     /// A non-owning class observation; does not unpack a heap owner or lazy value.
     #[cfg(feature = "optimizing-jit")]
     #[inline]
@@ -1124,16 +1148,23 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let vec_cap_off = vwords.iter().position(|&w| w == 3).map(|i| i * 8);
     let mut keys = Vec::with_capacity(3);
     keys.push(Rc::<str>::from("key"));
-    let key_ptr = keys.as_ptr() as usize;
-    let key_words =
-        unsafe { std::slice::from_raw_parts(&keys as *const Vec<Rc<str>> as *const usize, 3) };
+    let key_layout = Some(Rc::new(PropertyLayoutData::new(keys)));
+    let key_vec = &key_layout.as_ref().unwrap().keys;
+    let key_ptr = key_vec.as_ptr() as usize;
+    let key_words = unsafe {
+        std::slice::from_raw_parts(
+            key_vec as *const Vec<Rc<str>> as *const usize,
+            std::mem::size_of::<Vec<Rc<str>>>() / 8,
+        )
+    };
     let key_vec_ok = vec_ptr_off.is_some_and(|o| key_words[o / 8] == key_ptr)
         && vec_len_off.is_some_and(|o| key_words[o / 8] == 1)
         && vec_cap_off.is_some_and(|o| key_words[o / 8] == 3);
-    let key_layout = Some(Rc::new(keys));
     let layout_word = unsafe { *(&key_layout as *const Option<PropertyLayout> as *const usize) };
-    let layout_data_off =
-        (Rc::as_ptr(key_layout.as_ref().unwrap()) as usize).wrapping_sub(layout_word);
+    // Generated creation code follows the stored Rc to the live PropertyLayoutData and then to
+    // its first-field key Vec. Measure this path instead of relying on the Rust struct layout.
+    let layout_data_off = (&key_layout.as_ref().unwrap().keys as *const Vec<Rc<str>> as usize)
+        .wrapping_sub(layout_word);
     let empty_layout: Option<PropertyLayout> = None;
     let layout_ok = layout_data_off < 256
         && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
@@ -1583,7 +1614,6 @@ pub(crate) enum NativeCallableBody {
 
 /// `repr(C)`: the JIT's code-keyed call probe reads `func`, `env` and `realm` at fixed offsets
 /// from the `Rc<UserCallable>` data (see `JitLayout::user_func`).
-#[derive(Clone)]
 #[repr(C)]
 pub struct UserCallable {
     pub(crate) func: Rc<Function>,
@@ -1592,6 +1622,23 @@ pub struct UserCallable {
     /// function. Cross-Realm calls must temporarily activate that Realm so
     /// intrinsics and host settings follow the function's [[Realm]].
     pub(crate) realm: usize,
+    /// A lazily allocated proof for a getter body that returns one captured binding. Kept after
+    /// the JIT-visible prefix so ordinary call probes retain their established field offsets;
+    /// most functions pay only this nullable pointer and allocate no cache.
+    pub(crate) binding_getter_cache: Cell<Option<Box<crate::interpreter::BindingGetterCache>>>,
+}
+
+impl Clone for UserCallable {
+    fn clone(&self) -> Self {
+        Self {
+            func: self.func.clone(),
+            env: self.env.clone(),
+            realm: self.realm,
+            // A cloned callable starts without a resolution proof. Its new owner can refill a
+            // cache against the same live environment when it is first used.
+            binding_getter_cache: Cell::new(None),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1609,7 +1656,12 @@ pub struct WrappedCrossCallable {
 
 impl Callable {
     pub(crate) fn user(func: Rc<Function>, env: Env, realm: usize) -> Callable {
-        Callable::User(Rc::new(UserCallable { func, env, realm }))
+        Callable::User(Rc::new(UserCallable {
+            func,
+            env,
+            realm,
+            binding_getter_cache: Cell::new(None),
+        }))
     }
 
     pub(crate) fn wrapped_shadow(realm: usize, target: Value) -> Callable {
@@ -3298,8 +3350,10 @@ impl DenseStorage {
             d.mirror.clear();
         }
     }
-    fn iter_mut(&mut self) -> std::slice::IterMut<'_, u32> {
-        self.buffers_mut().elems.iter_mut()
+    fn iter_mut(&mut self) -> Option<std::slice::IterMut<'_, u32>> {
+        self.0
+            .as_deref_mut()
+            .map(|buffers| buffers.elems.iter_mut())
     }
 
     fn mirror_reserve_exact(&mut self, additional: usize) {
@@ -3347,8 +3401,93 @@ impl std::ops::IndexMut<usize> for DenseStorage {
 
 /// Shared ordered keys, independent of instance values and descriptor attributes. A constructor
 /// may reserve a longer layout than its live prefix; only `NamedEntries::fields.len()` keys are
-/// observable. Layouts contain no JS values, prototypes, or SymbolData ownership.
-pub(crate) type PropertyLayout = Rc<Vec<Rc<str>>>;
+/// observable. The immutable name index is built once with the layout and shared by every object
+/// with that ordered key sequence. Layouts contain no JS values, prototypes, or SymbolData
+/// ownership.
+#[derive(Clone)]
+#[repr(C)]
+pub(crate) struct PropertyLayoutData {
+    /// Keep the key vector first: the native creation paths probe this field's live offset and
+    /// use it to compare a constructor's predicted next key.
+    keys: Vec<Rc<str>>,
+    /// Read-only after publication. A structural mutation first detaches the Rc layout, updates
+    /// `keys`, then rebuilds this table on that private copy.
+    index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
+}
+
+pub(crate) type PropertyLayout = Rc<PropertyLayoutData>;
+
+impl PropertyLayoutData {
+    pub(crate) fn new(keys: Vec<Rc<str>>) -> Self {
+        Self { keys, index: None }
+    }
+
+    fn with_shared_index(keys: Vec<Rc<str>>) -> Self {
+        let mut layout = Self::new(keys);
+        if layout.keys.len() > INDEX_THRESHOLD && layout.keys.len() <= SHARED_LAYOUT_MAX_FIELDS {
+            layout.index = Some(layout.build_index());
+        }
+        layout
+    }
+
+    fn rebuild_index(&mut self) {
+        if self.index.is_none() {
+            return;
+        }
+        if self.keys.len() <= INDEX_THRESHOLD || self.keys.len() > SHARED_LAYOUT_MAX_FIELDS {
+            self.index = None;
+        } else {
+            self.index = Some(self.build_index());
+        }
+    }
+
+    fn build_index(&self) -> Box<crate::fasthash::FastMap<Rc<str>, usize>> {
+        let mut index = Box::<crate::fasthash::FastMap<Rc<str>, usize>>::default();
+        index.reserve(self.keys.len());
+        for (slot, key) in self.keys.iter().enumerate() {
+            index.insert(key.clone(), slot);
+        }
+        index
+    }
+
+    fn indexed_slot(&self, key: &str) -> Option<usize> {
+        self.index.as_ref()?.get(key).copied()
+    }
+
+    pub(crate) fn has_index(&self) -> bool {
+        self.index.is_some()
+    }
+
+    pub(crate) fn index_capacity(&self) -> Option<usize> {
+        self.index.as_ref().map(|index| index.capacity())
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.keys.capacity()
+    }
+
+    fn as_slice(&self) -> &[Rc<str>] {
+        &self.keys
+    }
+}
+
+impl std::ops::Deref for PropertyLayoutData {
+    type Target = [Rc<str>];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+pub(crate) fn new_property_layout(keys: Vec<Rc<str>>) -> PropertyLayout {
+    Rc::new(PropertyLayoutData::new(keys))
+}
+
+/// Build an immutable layout index for a bounded shape/constructor key sequence. Longer maps
+/// retain the existing per-object index and its incremental insertion behavior.
+pub(crate) fn new_shared_indexed_property_layout(keys: Vec<Rc<str>>) -> PropertyLayout {
+    Rc::new(PropertyLayoutData::with_shared_index(keys))
+}
 
 #[derive(Clone, Default)]
 struct NamedEntries {
@@ -3403,9 +3542,13 @@ impl NamedEntries {
                 // too; element slots remain in their existing independent dense representation.
                 self.layout = Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone));
             } else {
-                let keys = Rc::make_mut(self.layout.get_or_insert_with(|| Rc::new(Vec::new())));
-                keys.truncate(len);
-                keys.push(key);
+                let layout = Rc::make_mut(
+                    self.layout
+                        .get_or_insert_with(|| new_property_layout(Vec::new())),
+                );
+                layout.keys.truncate(len);
+                layout.keys.push(key);
+                layout.rebuild_index();
             }
         }
         self.fields.push(property);
@@ -3419,37 +3562,40 @@ impl NamedEntries {
         let key = self.keys().last()?.clone();
         let property = self.fields.pop()?;
         // Do not retain the tail of large, shrinking arrays through an unused prediction.
-        if let Some(keys) = self.layout.as_mut().and_then(Rc::get_mut) {
-            keys.truncate(self.fields.len());
+        if let Some(layout) = self.layout.as_mut().and_then(Rc::get_mut) {
+            layout.keys.truncate(self.fields.len());
+            layout.rebuild_index();
         }
         Some((key, property))
     }
     fn remove(&mut self, slot: usize) {
         let len = self.len();
-        let keys = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
-        keys.truncate(len);
-        keys.remove(slot);
+        let layout = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
+        layout.keys.truncate(len);
+        layout.keys.remove(slot);
         self.fields.remove(slot);
+        layout.rebuild_index();
     }
     fn retain(&mut self, mut keep: impl FnMut((&Rc<str>, &Property)) -> bool) {
         let len = self.len();
         if len == 0 {
             return;
         }
-        let keys = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
-        keys.truncate(len);
+        let layout = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
+        layout.keys.truncate(len);
         let mut slot = 0;
         let mut retained = 0;
         self.fields.retain(|property| {
-            let yes = keep((&keys[slot], property));
+            let yes = keep((&layout.keys[slot], property));
             if yes {
-                keys.swap(retained, slot);
+                layout.keys.swap(retained, slot);
                 retained += 1;
             }
             slot += 1;
             yes
         });
-        keys.truncate(retained);
+        layout.keys.truncate(retained);
+        layout.rebuild_index();
     }
     fn clear(&mut self) {
         self.fields.clear();
@@ -3697,7 +3843,7 @@ fn shape_transition(
         let mut names = Vec::with_capacity(prefix.len() + 1);
         names.extend_from_slice(prefix);
         names.push(key.clone());
-        let layout = Rc::new(names);
+        let layout = new_shared_indexed_property_layout(names);
         shapes.layouts.insert(id, layout.clone());
         // Cold transition learning: a previously seen prefix can predict the rest of this
         // ordered insertion chain. Existing instances retain their pinned layout; subsequent
@@ -3747,7 +3893,7 @@ thread_local! {
         Rc::from("constructor"),
     ];
     /// Key-only layout has no Agent identities or JS values, like FN_KEYS itself.
-    static ARRAY_LENGTH_LAYOUT: PropertyLayout = Rc::new(vec![fn_key(0)]);
+    static ARRAY_LENGTH_LAYOUT: PropertyLayout = new_property_layout(vec![fn_key(0)]);
 }
 
 /// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals create
@@ -4091,9 +4237,7 @@ impl Props {
             self.shape = source.shape;
             self.len_slot.set(source.len_slot.get());
             self.proto_slot.set(source.proto_slot.get());
-            if self.entries.len() > INDEX_THRESHOLD {
-                self.build_index();
-            }
+            self.ensure_fallback_index();
         } else {
             for (key, property) in source.entries.iter() {
                 self.insert(
@@ -4824,11 +4968,11 @@ impl Props {
 
     /// Whether adding `key` should create the string-key hash index. Dense array elements already
     /// have O(1) lookup through `elems`, so counting them toward the generic-map threshold creates
-    /// a redundant hash table for every modest-sized array. Only named properties count toward
-    /// the threshold on arrays; once an index exists we continue maintaining all of its entries.
+    /// a redundant hash table for every modest-sized array. Ordinary maps select a shared layout
+    /// index or a per-object fallback in `ensure_fallback_index` after the insertion.
     fn should_build_index(&self, key: &str) -> bool {
         if !self.elem_mode.get() {
-            return self.entries.len() + 1 > INDEX_THRESHOLD;
+            return false;
         }
         if canonical_index(key).is_some() {
             return false;
@@ -5185,6 +5329,36 @@ impl Props {
         {
             return None;
         }
+        // An ordinary map's immutable key layout owns a shared index once its live key sequence
+        // crosses INDEX_THRESHOLD. The table may include predicted tail keys; a slot beyond the
+        // field vector is not an own property. This miss is conclusive because layout keys are
+        // always the exact live prefix followed only by predictions.
+        if !self.elem_mode.get() && self.entries.len() > INDEX_THRESHOLD {
+            if let Some(layout) = self
+                .entries
+                .layout
+                .as_ref()
+                .filter(|layout| layout.has_index())
+            {
+                let slot = layout
+                    .indexed_slot(key)
+                    .filter(|slot| *slot < self.entries.len());
+                if let Some(slot) = slot {
+                    debug_assert!(matches!(
+                        self.entries.get(slot),
+                        Some((stored, _)) if &**stored == key
+                    ));
+                }
+                if let Some(slot) = slot {
+                    if key == "length" {
+                        self.len_slot.set(slot as u32);
+                    } else if key == "prototype" {
+                        self.proto_slot.set(slot as u32);
+                    }
+                }
+                return slot;
+            }
+        }
         let found = if self.elems.index.is_none() {
             self.entries.iter().position(|(k, _)| &**k == key)
         } else {
@@ -5209,6 +5383,25 @@ impl Props {
             index.insert(k.clone(), j);
         }
         self.elems.set_index(Some(index));
+    }
+
+    /// Recover the generic lookup table if a non-array map reached the indexed size without a
+    /// usable layout index (for example shape-identity exhaustion). Common shaped objects keep
+    /// the one index on their shared layout instead of one duplicate per receiver.
+    fn ensure_fallback_index(&mut self) {
+        if self.elem_mode.get() {
+            return;
+        }
+        if self
+            .entries
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.has_index())
+        {
+            self.elems.set_index(None);
+        } else if self.entries.len() > INDEX_THRESHOLD && self.elems.index.is_none() {
+            self.build_index();
+        }
     }
     pub(crate) fn get(&self, key: &str) -> Option<&Property> {
         if let Some(n) = canonical_index(key) {
@@ -5361,6 +5554,7 @@ impl Props {
         self.reserve_entry();
         self.entries.push((key, prop));
         self.note_inserted(slot);
+        self.ensure_fallback_index();
     }
 
     /// Build the named-property prefix of a brand-new ordinary object after creation ICs proved
@@ -5385,7 +5579,12 @@ impl Props {
     pub(crate) fn append_initialized_field(&mut self, key: &Rc<str>, prop: Property) {
         debug_assert!(self.entries.predicts(key));
         self.elems.retain_symbol_key(key);
+        let slot = self.entries.len();
+        if let Some(index) = self.elems.index_mut() {
+            index.insert(key.clone(), slot);
+        }
         self.entries.fields.push(prop);
+        self.ensure_fallback_index();
     }
 
     pub(crate) fn finish_proven_plain_shape(&mut self, shape: u32) {
@@ -5471,6 +5670,7 @@ impl Props {
             self.reserve_entry();
             self.entries.push((key, prop));
             self.note_inserted(slot);
+            self.ensure_fallback_index();
         }
     }
     /// Remove every canonical-index key `>= from` in one pass — array truncation
@@ -5496,7 +5696,14 @@ impl Props {
         self.len_slot.set(NO_SLOT);
         self.proto_slot.set(NO_SLOT);
         self.elems.set_index(None);
-        if self.entries.len() > INDEX_THRESHOLD {
+        if self.entries.len() > INDEX_THRESHOLD
+            && (self.elem_mode.get()
+                || !self
+                    .entries
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.has_index()))
+        {
             self.build_index();
         }
         self.elems.clear_elems();
@@ -5547,6 +5754,15 @@ impl Props {
                 }
             }
         }
+        if !self.elem_mode.get()
+            && self
+                .entries
+                .layout
+                .as_ref()
+                .is_some_and(|layout| layout.has_index())
+        {
+            self.elems.set_index(None);
+        }
         if self.mirror_flags & MIRROR_OK != 0 {
             match canonical_index(key) {
                 Some(n) if (n as usize) < self.elems.mirror_len() => {
@@ -5561,14 +5777,16 @@ impl Props {
             }
         }
         // Dense slots shift down past the removed entry; the removed key's own slot holes.
-        for e in self.elems.iter_mut() {
-            if *e == NO_SLOT {
-                continue;
-            }
-            match (*e as usize).cmp(&i) {
-                std::cmp::Ordering::Equal => *e = NO_SLOT,
-                std::cmp::Ordering::Greater => *e -= 1,
-                std::cmp::Ordering::Less => {}
+        if let Some(elements) = self.elems.iter_mut() {
+            for e in elements {
+                if *e == NO_SLOT {
+                    continue;
+                }
+                match (*e as usize).cmp(&i) {
+                    std::cmp::Ordering::Equal => *e = NO_SLOT,
+                    std::cmp::Ordering::Greater => *e -= 1,
+                    std::cmp::Ordering::Less => {}
+                }
             }
         }
         self.elems.release_symbol_key(key);

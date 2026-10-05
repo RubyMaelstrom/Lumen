@@ -102,6 +102,103 @@ fn templates_share_keys_but_not_values_or_descriptors() {
 }
 
 #[test]
+fn ordinary_shared_index_respects_live_prefix_and_mutation() {
+    let mut template = Props::new();
+    for i in 0..12 {
+        template.insert(format!("field{i}"), Property::plain(Value::Num(i as f64)));
+    }
+    let layout = template.shared_layout().unwrap().clone();
+    assert!(layout.has_index());
+
+    let mut short = Props::with_layout(layout.len(), Some(layout.clone()));
+    for (slot, key) in layout.iter().take(9).enumerate() {
+        short.append_initialized_field(key, Property::plain(Value::Num(slot as f64)));
+    }
+    assert!(short.contains("field8"));
+    assert!(
+        !short.contains("field9"),
+        "predictions are not own properties"
+    );
+    short.append_initialized_field(&layout[9], Property::plain(Value::Num(9.0)));
+    assert_eq!(short.get("field9").unwrap().value().as_num_opt(), Some(9.0));
+
+    let mut other = Props::with_layout(layout.len(), Some(layout.clone()));
+    for (slot, key) in layout.iter().enumerate() {
+        other.append_initialized_field(key, Property::plain(Value::Num((100 + slot) as f64)));
+    }
+    assert!(Rc::ptr_eq(
+        short.shared_layout().unwrap(),
+        other.shared_layout().unwrap()
+    ));
+    assert_eq!(
+        short.retained_requested_storage_bytes(),
+        (12 * std::mem::size_of::<Property>(), true)
+    );
+
+    short.remove("field2");
+    short.insert("field2", Property::plain(Value::Num(222.0)));
+    assert_eq!(
+        short.get("field2").unwrap().value().as_num_opt(),
+        Some(222.0)
+    );
+    assert_eq!(
+        other.get("field2").unwrap().value().as_num_opt(),
+        Some(102.0)
+    );
+    assert!(!Rc::ptr_eq(
+        short.shared_layout().unwrap(),
+        other.shared_layout().unwrap()
+    ));
+    assert!(short.shared_layout().unwrap().has_index());
+    assert_eq!(
+        short.retained_requested_storage_bytes(),
+        (12 * std::mem::size_of::<Property>(), true)
+    );
+
+    let private = crate::value::new_property_layout(
+        (0..20).map(|i| Rc::from(format!("private{i}"))).collect(),
+    );
+    assert!(
+        !private.has_index(),
+        "long/private layouts use the instance table"
+    );
+    let mut long = Props::with_layout(private.len(), Some(private.clone()));
+    for (slot, key) in private.iter().enumerate() {
+        long.append_initialized_field(key, Property::plain(Value::Num(slot as f64)));
+    }
+    assert_eq!(
+        long.get("private8").unwrap().value().as_num_opt(),
+        Some(8.0)
+    );
+    assert_eq!(
+        long.get("private19").unwrap().value().as_num_opt(),
+        Some(19.0)
+    );
+}
+
+#[test]
+fn javascript_property_index_sharing_preserves_order_and_descriptors_in_all_tiers() {
+    check(
+        r#"
+        function make(seed) {
+            var object = {};
+            for (var i = 0; i < 12; i++) object["field" + i] = seed + i;
+            return object;
+        }
+        var a = make(1), b = make(100);
+        delete a.field2;
+        a.field2 = 222;
+        Object.defineProperty(a, "field8", { writable: false });
+        var rejected = false;
+        try { a.field8 = 999; } catch (error) { rejected = true; }
+        [a.field0, a.field2, a.field8, b.field2, rejected,
+         Object.keys(a).join(","), Object.keys(b).join(",")].join("|");
+        "#,
+        "1|222|9|102|false|field0,field1,field3,field4,field5,field6,field7,field8,field9,field10,field11,field2|field0,field1,field2,field3,field4,field5,field6,field7,field8,field9,field10,field11",
+    );
+}
+
+#[test]
 fn ordinary_dynamic_and_json_objects_share_keys_across_creation_sites() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
@@ -139,7 +236,7 @@ fn ordinary_dynamic_and_json_objects_share_keys_across_creation_sites() {
 
 #[test]
 fn reserved_layout_prefix_is_not_an_own_property() {
-    let layout = Rc::new(vec![Rc::from("x"), Rc::from("y")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("x"), Rc::from("y")]);
     let mut props = Props::with_layout(2, Some(layout.clone()));
     assert!(props.keys().is_empty());
     assert!(!props.contains("x"));
@@ -288,7 +385,7 @@ fn native_creation_accepts_equal_keys_from_distinct_allocations() {
     let target = object(&mut engine, "target");
     // These strings are deliberately not compiler/AST atoms. This models a layout learned
     // before tier-up or shared from an independent creation site.
-    let layout = Rc::new(vec![Rc::from("alpha"), Rc::from("beta")]);
+    let layout = crate::value::new_property_layout(vec![Rc::from("alpha"), Rc::from("beta")]);
     for _ in 0..100 {
         target.borrow_mut().props = Props::with_layout(2, Some(layout.clone()));
         eval(&mut engine, "write()");
@@ -369,7 +466,8 @@ fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
         eval(&mut engine, "write()");
     }
     for shared in [false, true] {
-        let previous = Rc::new(vec![Rc::from("wrong"), Rc::from("unused")]);
+        let previous =
+            crate::value::new_property_layout(vec![Rc::from("wrong"), Rc::from("unused")]);
         assert_eq!(
             measured_creation_write(&mut engine, &target, || {
                 if shared {
@@ -395,7 +493,10 @@ fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
     }
     assert!(
         measured_creation_write(&mut engine, &target, || {
-            Props::with_layout(3, Some(Rc::new(vec![Rc::from("private")])))
+            Props::with_layout(
+                3,
+                Some(crate::value::new_property_layout(vec![Rc::from("private")])),
+            )
         }) > 0,
         "Rust must release a last-owned old layout"
     );

@@ -265,7 +265,93 @@ impl std::ops::Deref for DecodedArgs {
 mod tests {
     use super::*;
     use crate::{bytecode::Tier, Completion, Engine};
+    use std::cell::RefCell;
     use std::rc::Rc;
+
+    thread_local! {
+        static BOUNDARY_KEY_WEAK: RefCell<Option<std::rc::Weak<RefCell<crate::value::Object>>>> = const {
+            RefCell::new(None)
+        };
+        static BOUNDARY_RECEIVER_WEAK: RefCell<Option<std::rc::Weak<RefCell<crate::value::Object>>>> = const {
+            RefCell::new(None)
+        };
+    }
+
+    fn boundary_gc_then_call(
+        interp: &mut crate::interpreter::Interp,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Value> {
+        let Value::Obj(receiver) = &this else {
+            panic!("native receiver owner")
+        };
+        assert_eq!(
+            Rc::strong_count(receiver),
+            2,
+            "packed receiver plus native value"
+        );
+        let Value::Obj(key) = &args[1] else {
+            panic!("native argument owner")
+        };
+        assert_eq!(
+            Rc::strong_count(key),
+            1,
+            "argument moved without a second owner"
+        );
+        interp.gc_collect();
+        assert_eq!(Rc::strong_count(key), 1, "argument remains a GC root");
+        match interp.call(args[0].clone(), Value::Undefined, &[args[1].clone()]) {
+            Ok(value) => Ok(value),
+            Err(crate::interpreter::Abrupt::Throw(error)) => Err(error),
+            Err(_) => panic!("callback produced a non-throw completion"),
+        }
+    }
+
+    fn boundary_tail_probe(
+        _interp: &mut crate::interpreter::Interp,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
+        let key_count = BOUNDARY_KEY_WEAK.with(|weak| {
+            weak.borrow()
+                .as_ref()
+                .expect("key weak handle")
+                .strong_count()
+        });
+        let receiver_count = BOUNDARY_RECEIVER_WEAK.with(|weak| {
+            weak.borrow()
+                .as_ref()
+                .expect("receiver weak handle")
+                .strong_count()
+        });
+        assert_eq!(
+            key_count, 1,
+            "moved argument stays rooted through tail drain"
+        );
+        assert_eq!(
+            receiver_count, 1,
+            "original receiver owner stays through tail drain"
+        );
+        Ok(Value::Undefined)
+    }
+
+    fn boundary_enqueue_tail(
+        interp: &mut crate::interpreter::Interp,
+        _this: Value,
+        args: &[Value],
+    ) -> Result<Value, Value> {
+        let Value::Obj(key) = &args[0] else {
+            panic!("native argument owner")
+        };
+        assert_eq!(
+            Rc::strong_count(key),
+            1,
+            "argument moved without a second owner"
+        );
+        let tail = Value::Obj(interp.make_native("boundaryTailProbe", 0, boundary_tail_probe));
+        interp.pending_tail = Some(Box::new((tail, Value::Undefined, Vec::new())));
+        Ok(Value::Undefined)
+    }
 
     fn eval(engine: &mut Engine, source: &str) -> String {
         match engine.eval(source, false).expect("storage fixture parses") {
@@ -336,6 +422,153 @@ mod tests {
             drop(packed);
             assert_eq!(Rc::strong_count(&object), baseline);
         }
+    }
+
+    #[test]
+    fn compact_native_arguments_move_without_refcount_churn_and_stay_live_for_the_call() {
+        let object = crate::value::Object::new(None);
+        let weak = Rc::downgrade(&object);
+        let baseline = weak.strong_count();
+        for count in [0, 1, 4, 5, 9] {
+            let mut packed: Vec<_> = (0..count)
+                .map(|_| PackedValue::pack(Value::Obj(object.clone())))
+                .collect();
+            assert_eq!(weak.strong_count(), baseline + count);
+            unsafe {
+                with_moved_values(packed.as_mut_ptr(), count, |arguments| {
+                    assert_eq!(arguments.len(), count);
+                    assert_eq!(weak.strong_count(), baseline + count);
+                    assert!(arguments.iter().all(
+                        |value| matches!(value, Value::Obj(actual) if Rc::ptr_eq(actual, &object))
+                    ));
+                });
+                // The packed words were moved out; the helper's unsafe contract transfers
+                // responsibility for shortening the source slice back to this caller.
+                packed.set_len(0);
+            }
+            assert_eq!(weak.strong_count(), baseline);
+        }
+    }
+
+    #[test]
+    fn moved_native_arguments_survive_collection_callbacks_and_abrupt_results_in_all_tiers() {
+        let source = r#"
+            function exercise(count) {
+                var result;
+                for (var run = 0; run < count; run++) {
+                    var key = {}, weak = new WeakMap(), map = new Map([[key, 1]]), trace = [];
+                    weak.set(key, 1);
+                    var callbackError;
+                    try {
+                        map.forEach(function (value, entryKey, receiver) {
+                            if (receiver !== map) throw 'callback receiver';
+                            trace.push(value);
+                            weak.set(entryKey, value + 1);
+                            if (value === 1) receiver.set({}, 2);
+                            if (value === 2) throw 'callback-error';
+                        });
+                    } catch (error) { callbackError = error; }
+                    result = [weak.get(key), weak.has(key), callbackError, trace.join(',')].join(':');
+                }
+                return result;
+            }
+            exercise(120)
+        "#;
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            assert_eq!(
+                eval(&mut engine, source),
+                "2:true:callback-error:1,2",
+                "tier {tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_native_arguments_remain_rooted_across_collection_callback_throw_and_tail() {
+        let mut interp = crate::interpreter::Interp::new();
+        let realm = Value::Obj(interp.global.clone());
+        interp
+            .eval_in_realm(
+                &realm,
+                "globalThis.boundaryCallback = function (key) { throw 'callback-error'; };",
+            )
+            .ok()
+            .expect("callback fixture evaluates");
+        let callback = interp
+            .global
+            .borrow()
+            .props
+            .get("boundaryCallback")
+            .expect("callback global")
+            .value();
+        let receiver = interp.new_object();
+        let receiver_weak = Rc::downgrade(&receiver);
+        let this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Obj(receiver)));
+        let key = interp.new_object();
+        let key_weak = Rc::downgrade(&key);
+        let mut args = vec![
+            PackedValue::pack(callback),
+            PackedValue::pack(Value::Obj(key)),
+        ];
+        assert_eq!(key_weak.strong_count(), 1);
+        let result = unsafe {
+            interp.call_native_committed(
+                boundary_gc_then_call,
+                &*this_slot,
+                args.as_mut_ptr(),
+                args.len(),
+            )
+        };
+        unsafe { args.set_len(0) };
+        assert!(matches!(
+            result,
+            Err(crate::interpreter::Abrupt::Throw(Value::Str(ref value)))
+                if &**value == "callback-error"
+        ));
+        assert_eq!(
+            key_weak.strong_count(),
+            0,
+            "throw path releases moved argument"
+        );
+        assert_eq!(
+            receiver_weak.strong_count(),
+            0,
+            "throw path releases receiver"
+        );
+
+        let key = interp.new_object();
+        let key_weak = Rc::downgrade(&key);
+        BOUNDARY_KEY_WEAK.with(|weak| *weak.borrow_mut() = Some(key_weak.clone()));
+        let receiver = interp.new_object();
+        let receiver_weak = Rc::downgrade(&receiver);
+        BOUNDARY_RECEIVER_WEAK.with(|weak| *weak.borrow_mut() = Some(receiver_weak.clone()));
+        let this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Obj(receiver)));
+        let mut args = vec![PackedValue::pack(Value::Obj(key))];
+        let result = unsafe {
+            interp.call_native_committed(
+                boundary_enqueue_tail,
+                &*this_slot,
+                args.as_mut_ptr(),
+                args.len(),
+            )
+        };
+        unsafe { args.set_len(0) };
+        assert!(matches!(result, Ok(Value::Undefined)));
+        assert_eq!(
+            key_weak.strong_count(),
+            0,
+            "tail path releases moved argument"
+        );
+        assert_eq!(
+            receiver_weak.strong_count(),
+            0,
+            "tail path releases receiver after draining"
+        );
+        BOUNDARY_KEY_WEAK.with(|weak| *weak.borrow_mut() = None);
+        BOUNDARY_RECEIVER_WEAK.with(|weak| *weak.borrow_mut() = None);
     }
 
     #[test]

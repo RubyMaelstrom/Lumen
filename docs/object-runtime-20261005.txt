@@ -1,0 +1,169 @@
+Object/value runtime — first implementation batch, 5 October 2026
+================================================================
+
+This batch removes repeated work in the existing object and value runtime.
+The measured application-component gains are modest: about 2.6% less time in
+Vue reactivity, 2.4% in Djot conversion and 0.7% in the EJS solver. React's
+reducer is unchanged within the comparison interval. Correctness and the
+repository's component regression gates pass, so the source experiment is
+retained. It does not establish the requested major engine improvement or an
+8–10x overall speedup; that investigation continues.
+
+Implementation
+--------------
+
+1. Keep packed owners through named reads and native argument transfer.
+
+   The native named-property helper reads ordinary cached data directly into
+   a PackedValue. It borrows the receiver only during the non-observable IC
+   probe, then releases that borrow before any getter or exotic operation.
+   Those paths first acquire an independent receiver owner, so reentry can
+   replace the caller's slot. Deferred function prototypes retain ordinary
+   materialization. The String length shortcut also avoids widening.
+
+   General cached native calls move argument owners into the builtin's wide
+   interface instead of cloning them. Those owners remain live through the
+   post-call interrupt poll and pending-tail drain. The receiver retains its
+   established lifetime. Tests cover last owners, callbacks, collection,
+   exceptions, pending tails, method receivers and all packed value families.
+
+2. Share the bounded ordinary-object lookup index with the key layout.
+
+   PropertyLayoutData owns the ordered keys and an optional immutable lookup
+   table for 9–16-field shapes and constructor predictions. Instances sharing
+   that layout no longer build duplicate tables. Only the initialized prefix
+   is visible; copy-on-write mutation keeps keys and the table consistent.
+   Longer/private maps keep their incremental per-object fallback, and arrays
+   retain their existing element representation. Native creation measures the
+   live key-vector offset rather than assuming the old Rust layout.
+
+   Ordinary property removal also avoids allocating an empty dense-element
+   sidecar merely to visit it. Memory accounting deduplicates shared layouts
+   and records the new index's known capacity as a lower bound.
+
+3. Preserve successful lexical resolution in simple binding getters.
+
+   An eligible `return identifier` getter caches a bounded proof on its own
+   UserCallable, never on a shared AST. Every scope identity and structural
+   generation is checked before reading the live Binding. Weak scope pins
+   prevent allocation-address reuse without retaining JavaScript values.
+   With/global/import/TDZ/deep cases use ordinary Call. Failed proofs allocate
+   no cache metadata; the cold path constructs it only after a successful
+   lookup. Tests exercise distinct closures and Realms, eval-driven insertion,
+   growth, shadowing and deletion, and live value changes.
+
+The three directions have begun; this is not a complete representation
+migration. Ordinary fields still occupy 16-byte Property records, and generic
+runtime, proxy and callback interfaces still use the wide Value enum.
+
+Measured result
+---------------
+
+Starting revision: c899ed44e827b74245d138acb9e588ff0f1d4988.
+Final source patch SHA256:
+65f20fdb40b56acc86a3d4791a96010b45291e5c2928870d19c37b9fd4a0877e.
+Baseline binary SHA256:
+6083ec20315fb68ab2fdfbf17e9978d0a928b7631c9edb21c23d6b9fc5467a78.
+Candidate binary SHA256:
+64578e16c341c6ce99b8bef31dc1f90cd926a0cd3ea8064aa674f48e1896da96.
+
+Machine: crystal, aarch64 Linux 7.2.7-crystal, CPU 5 affinity. Rust 1.99.0
+b940084d7, LLVM 23.1.1; release opt-level 3, fat LTO, one codegen unit,
+panic=abort, default intl plus embed, ordinary JIT. The optimizing backend is
+off. No owned build, test or profiler overlapped timing; unrelated desktop
+applications remained active.
+
+Six alternating fresh-process pairs per main workload, twenty startup pairs.
+Every output checksum matched. The first three rows below use the driver's
+internal duration; EJS uses Linux wait4-helper process wall time because the
+actual solver does not emit an internal timer. Ratios are the median of
+paired candidate/baseline durations, with 10,000-resample bootstrap 95%
+intervals. They need not equal the ratio of the two standalone medians.
+
+Workload                 Baseline median  Candidate median  Paired ratio / 95% CI
+React reducer, 600 passes      1966 ms         1963.5 ms      0.99924 [0.99721, 1.01346]
+Vue, 150000 updates           8689 ms         8468.5 ms      0.97420 [0.97175, 0.97919]
+Djot, 120 passes             2070.5 ms        2021 ms        0.97589 [0.97199, 0.98135]
+EJS solver                  6.04911 s        6.00519 s       0.99343 [0.99036, 0.99656]
+
+Whole-process CPU ratios are respectively 1.00000, 0.97431, 0.97613 and
+0.99345. Startup process time is 11.138/10.884 ms, paired ratio 0.97963
+[0.96126, 0.99550]. The renderer-shaped CPU controls complete all eleven
+kernels, each with five internal samples per process. Typed-array set takes
+about 4.6% less time, paired ratio 0.95410 [0.93174, 0.97325]; computed reads
+improve about 0.8%. No control crosses the 3% regression gate. These kernels
+contain no WebGL/browser work and do not predict scene frame rate.
+
+Vue peak RSS increases by a paired median 1.45%, interval [0.11%, 2.12%], below
+the declared 3% gate. Other peak-memory intervals include parity. There is no
+general memory-saving claim. Post-GC requested-memory observations include
+real added layout/cache metadata and more complete index-capacity accounting;
+their delta is not a like-for-like physical-memory estimate. Raw observations
+and their lower-bound qualifications are preserved in the benchmark record.
+
+Separate LUMEN_PERF_METRICS runs record compilation, generated code and GC.
+Compilation counts are unchanged; generated-code totals differ by at most
+472 bytes across these workloads. Single diagnostic durations do not establish
+a compilation-latency or GC-pause improvement. The engine executable grows by
+22,488 bytes (about 0.09%); its text section grows by 20,968 bytes (about 0.12%).
+
+Verification
+------------
+
+Final source:
+- cargo test -p lumen --features embed --lib: 1799 pass, 0 fail, 3 ignored
+  measurement-only tests.
+- cargo test -p lumen-runtime: 179 pass, 0 fail, 1 existing ignore.
+- cargo test -p lumen --features 'embed optimizing-jit' --lib creation_tests:::
+  10 pass, 0 fail; native creation/layout guards exercised.
+- cargo check --workspace --all-targets and the release build: pass.
+- Differential seeds 1..2000 plus regression-corpus replay: 1859 agree,
+  141 budget skips, 0 divergences across interpreter, bytecode and JIT.
+- Focused default-JIT Test262: 6541 pass, 0 fail, 0 skip,
+  all_executed_passed=true. Suite revision
+  d86b2294eb0a17eaa281ff12c73c473ec864c72f. Scope: Object, Reflect, Proxy, Map,
+  WeakMap, Function; with statements and eval code; property-accessors,
+  member-expression, object and call expressions. The full uncapped report is
+  retained, independently of console samples.
+- New JavaScript regression fixtures were checked against Node 24.21.0.
+  Formatting and git diff --check pass. Five existing Atomic::fetch_update
+  deprecation warnings from this toolchain remain in build logs.
+
+This is native ARM64 validation, not fresh x86-64 or wasm32 execution. The
+ARM64 layout consumers and x86-64 shared helper paths were inspected. The
+optional optimizer is covered by the focused creation tests, not a new full
+optimizer or performance acceptance campaign.
+
+Semantics were checked against the local ECMA-262 snapshot
+e28783d5fc9dc12b3de905961e2c71410b38a202, fetched 2026-09-06:
+/big/web-standards/repositories/tc39/ecma262/spec.html, OrdinaryGet,
+OrdinarySetWithOwnDescriptor, GetIdentifierReference, GetBindingValue and
+ordinary calls/execution contexts. This does not claim current-upstream
+verification.
+
+Continuation and evidence
+-------------------------
+
+The next investigation addresses complete proxy/callback call paths and their
+value ownership, argument transfer, environment and frame work. The actual Vue
+fixture repeatedly calls a Proxy setter and its reactive effect; ordinary own
+data reads cover only part of that work. Existing shapes, call caches and frame
+pools must be accounted for before adding another mechanism. Keeping values
+packed through a whole operation and carrying already-validated call information
+through its helpers are concrete candidates. A later descriptor/field layout
+change needs its own evidence and native-backend correctness gates.
+
+An exploratory profile of the preceding candidate left 3602 of 17491 samples
+unresolved, versus zero of 17772 baseline samples. Its raw aggregate artifact
+cannot recover missing instruction addresses. No precise category-speedup claim
+is based on that comparison; the next profiler preserves address/mapping data.
+Inclusive proxy/callback stacks are not treated as exclusive time or added
+together. No major-gain claim follows from the current few-percent results.
+
+Tracked measurements, exact source/binary identities, all samples, diagnostic
+qualifications and test records: benchmarks/object-runtime-2026-10-05.json.
+Complete local evidence and the earlier candidate are preserved under
+benchmark-results/object-runtime-20261005-7eac91/; final artifacts are in final/.
+Those investigation tools and binaries are local, ignored artifacts. Builds and
+contributor workflows do not depend on them. No installed artifact is promoted
+by this source experiment.
