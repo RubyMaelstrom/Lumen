@@ -490,3 +490,82 @@ fn self_hosted_result_appends_stay_native() {
         "{entries} checked appends for 30 results of up to 64 elements"
     );
 }
+
+#[test]
+fn html_all_collection_is_a_live_falsy_callable_platform_object() {
+    // HTML #the-htmlallcollection-interface with ECMA-262 Annex B.3.6: one
+    // [[IsHTMLDDA]] object with the interface prototype, live read-only
+    // indexed and unenumerable named properties, and a legacy caller.
+    fn length(_: &crate::interpreter::Interp, state: &Value) -> u32 {
+        match state {
+            Value::Num(count) => *count as u32,
+            _ => 0,
+        }
+    }
+    fn names(_: &crate::interpreter::Interp, _: &Value) -> Vec<String> {
+        vec![String::from("foo")]
+    }
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = prepared(
+            tier,
+            r#"
+            var P = {get length() { return 3; }, [Symbol.toStringTag]: 'HTMLAllCollection'};
+            var item = function (index) { return 'item' + index; };
+            var named = function (name) { return 'named:' + name; };
+            var caller = function () { return 'called:' + Array.prototype.join.call(arguments); };
+            function probe(v) { return typeof v + (v ? 'T' : 'F') + (v == null); }
+            for (var warm = 0; warm < 64; warm++) probe({});
+        "#,
+        );
+        let global = |engine: &mut crate::Engine, name: &str| {
+            engine
+                .interp
+                .global
+                .borrow()
+                .props
+                .get(name)
+                .map(|property| property.value())
+                .unwrap()
+        };
+        let (prototype, item, named, caller) = (
+            global(&mut engine, "P"),
+            global(&mut engine, "item"),
+            global(&mut engine, "named"),
+            global(&mut engine, "caller"),
+        );
+        let all = engine
+            .interp
+            .make_html_all_collection(
+                &prototype,
+                Value::Num(3.0),
+                length,
+                item,
+                (names, named),
+                caller,
+            )
+            .unwrap_or_else(|_| panic!("HTMLAllCollection construction"));
+        engine
+            .interp
+            .global
+            .borrow_mut()
+            .props
+            .insert("all", crate::value::Property::plain(all));
+        let script = r#"
+            [probe(all), all !== null, Object.getPrototypeOf(all) === P, String(all),
+             Object.prototype.toString.call(all), all.length, Object.hasOwn(all, 'length'),
+             all[0], all[2], all[3], '1' in all, '3' in all, Object.keys(all).join(),
+             Object.getOwnPropertyNames(all).join(), all.foo, 'foo' in all, all.bar,
+             all('x', 1), Reflect.defineProperty(all, '0', {value: 1}), all[0]].join('|')
+        "#;
+        let expected = "undefinedFtrue|true|true|[object HTMLAllCollection]|\
+            [object HTMLAllCollection]|3|false|item0|item2||true|false|0,1,2|0,1,2,foo|\
+            named:foo|true||called:x,1|false|item0";
+        assert_eq!(evaluate(&mut engine, script), expected, "{tier:?}");
+        engine.interp.gc_collect();
+        assert_eq!(
+            evaluate(&mut engine, script),
+            expected,
+            "{tier:?} after collection"
+        );
+    }
+}

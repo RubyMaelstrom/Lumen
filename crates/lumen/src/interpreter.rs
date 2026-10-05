@@ -6060,6 +6060,78 @@ impl Interp {
         Value::Obj(dda)
     }
 
+    /// The web platform's `HTMLAllCollection` (HTML #the-htmlallcollection-interface): the
+    /// `[[IsHTMLDDA]]` object (Annex B.3.6) that a Document's `all` attribute returns, as a
+    /// complete legacy platform object rather than a bare falsy callable.
+    ///
+    /// - Its [[Prototype]] is `prototype` (the embedder's `HTMLAllCollection.prototype`); it has
+    ///   no own `length` or `name`, so the interface's attributes apply.
+    /// - Its read-only indexed and unenumerable named properties are live, read through `state`
+    ///   by the pure native `length`/`names` views and produced by `getter`/the named getter,
+    ///   exactly as for [`Self::install_live_readonly_indexed_properties`].
+    /// - Its [[Call]], HTML's legacy caller operation, invokes `call` with the call's receiver
+    ///   and arguments.
+    pub fn make_html_all_collection(
+        &mut self,
+        prototype: &Value,
+        state: Value,
+        length: fn(&Interp, &Value) -> u32,
+        getter: Value,
+        named: (fn(&Interp, &Value) -> Vec<String>, Value),
+        call: Value,
+    ) -> Result<Value, Value> {
+        let Some(prototype) = prototype.as_obj().cloned() else {
+            return Err(
+                self.make_error("TypeError", "HTMLAllCollection prototype must be an object")
+            );
+        };
+        let (names, named_getter) = named;
+        if !getter.is_callable() || !named_getter.is_callable() || !call.is_callable() {
+            return Err(self.make_error(
+                "TypeError",
+                "HTMLAllCollection getters and legacy caller must be callable",
+            ));
+        }
+        fn legacy_caller(
+            interp: &mut Interp,
+            this: Value,
+            args: &[Value],
+            captures: &[Value],
+        ) -> Result<Value, Value> {
+            interp
+                .call_callback(captures[0].clone(), this, args)
+                .map_err(abrupt_value)
+        }
+        let collection = self.new_native_fn_with_captures("", 0, legacy_caller, vec![call]);
+        let object = collection.as_obj().expect("native function object").clone();
+        {
+            let mut borrowed = object.borrow_mut();
+            borrowed.props.remove("length");
+            borrowed.props.remove("name");
+            borrowed.proto = Some(prototype);
+        }
+        let ptr = Rc::as_ptr(&object) as usize;
+        self.htmldda.insert(ptr, Rc::downgrade(&object));
+        // Every JIT object fast path assumes an ordinary, truthy object without platform
+        // internal methods. Route this one through the checked helpers.
+        object.borrow().ic_plain.set(false);
+        self.gc_pin(&object);
+        self.host_indexed.insert(
+            ptr,
+            HostIndexedProperties {
+                length: 0,
+                getter,
+                live: Some(Rc::new(HostIndexedLive {
+                    state,
+                    length,
+                    names: Some(names),
+                    named_getter: Some(named_getter),
+                })),
+            },
+        );
+        Ok(collection)
+    }
+
     /// Define a native method on `target` (non-enumerable, as built-ins are).
     pub fn def_method(&self, target: &Gc, name: &str, len: usize, f: NativeFn) {
         let func = self.make_native(name, len, f);
