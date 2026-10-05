@@ -496,8 +496,12 @@ struct DeclScope {
 }
 
 impl Parser {
-    /// Byte offset of token `index` in the whole parsed text (an AST position).
+    /// Byte offset of token `index` in the whole parsed text (an AST position). Self-hosted
+    /// source records none: its frames print without a location.
     fn tok_pos(&self, index: usize) -> u32 {
+        if self.script.is_none() {
+            return NO_POSITION;
+        }
         self.base + self.toks[index].start
     }
     /// The AST position of the current token.

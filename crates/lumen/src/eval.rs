@@ -3028,10 +3028,10 @@ impl Interp {
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
-            Expr::Ident(name, pos) => {
-                let result = self.get_var(name, env);
-                self.placed(result, *pos)
-            }
+            Expr::Ident(name, pos) => self
+                .get_var_with(name, env)
+                .map(|(value, _)| value)
+                .map_err(|error| self.placed_error(error, *pos)),
             Expr::This => self.resolve_this_binding(env),
             Expr::Regex { body, flags } => self.make_regexp(body, flags),
             Expr::Array(elems) => self.eval_array(elems, env),
@@ -3127,10 +3127,7 @@ impl Interp {
                 target,
                 value,
                 pos,
-            } => {
-                let result = self.eval_assign(op, target, value, env);
-                self.placed(result, *pos)
-            }
+            } => self.eval_assign(op, target, value, *pos, env),
             Expr::ImportMeta => Ok(self.import_meta_vm(env)),
             Expr::NewTarget => Ok(self.new_target_vm(env)),
             Expr::ImportCall {
@@ -3168,46 +3165,39 @@ impl Interp {
                 prop,
                 optional,
                 pos,
-            } => {
-                let result = self.eval_member(obj, prop, *optional, env);
-                self.placed(result, *pos)
-            }
+            } => self.eval_member(obj, prop, *optional, *pos, env),
             Expr::Index {
                 obj,
                 index,
                 optional,
                 pos,
-            } => {
-                let result = self.eval_index(obj, index, *optional, env);
-                self.placed(result, *pos)
-            }
+            } => self.eval_index(obj, index, *optional, *pos, env),
             Expr::Call {
                 callee,
                 args,
                 optional,
                 pos,
-            } => {
-                let result = self.eval_call(callee, args, *optional, *pos, env);
-                self.placed(result, *pos)
-            }
+            } => self.eval_call(callee, args, *optional, *pos, env),
             Expr::TaggedTemplate {
                 tag,
                 site,
                 quasis,
                 subs,
                 pos,
-            } => {
-                let result = self.eval_tagged_template(tag, *site, quasis, subs, *pos, env);
-                self.placed(result, *pos)
-            }
-            Expr::New { callee, args, pos } => {
-                let result = self.eval_new(callee, args, *pos, env);
-                self.placed(result, *pos)
-            }
+            } => self.eval_tagged_template(tag, *site, quasis, subs, *pos, env),
+            Expr::New { callee, args, pos } => self.eval_new(callee, args, *pos, env),
         }
     }
 
-    /// `new callee(args)` at source `position`; see [`Interp::eval`].
+    // `eval` evaluates each node that has a source position through one of these functions,
+    // which give that position to errors thrown while the node is evaluated (see
+    // [`Interp::placed_error`]). They map errors by value (`map_err`, or the error branch of a
+    // test the evaluation already makes) instead of inspecting a finished completion by
+    // reference, which kept every completion in a temporary and copied it on this recursive
+    // path, stalling store-to-load forwarding. An explicit call's own errors need no placing:
+    // the frame was given the call's position when it called.
+
+    /// `new callee(args)` whose `new` is at source `position`.
     fn eval_new(
         &mut self,
         callee: &Expr,
@@ -3215,41 +3205,40 @@ impl Interp {
         position: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        let c = self.eval(callee, env)?;
-        let argv = self.eval_args(args, env)?;
+        let c = self
+            .eval(callee, env)
+            .map_err(|error| self.placed_error(error, position))?;
+        let argv = self
+            .eval_args(args, env)
+            .map_err(|error| self.placed_error(error, position))?;
         // EvaluateNew step 7: IsConstructor follows ArgumentListEvaluation.
         if !self.value_is_constructor(&c) {
-            return Err(self.throw(
+            let error = self.throw(
                 "TypeError",
                 crate::callee_name::not_callable_message(callee, true),
-            ));
+            );
+            return Err(self.placed_error(error, position));
         }
         self.construct_at(position, c, &argv)
     }
 
-    /// A property read `obj.prop` (or `obj.#prop`); see [`Interp::eval`].
+    /// A property read `obj.prop` (or `obj.#prop`) whose name is at source `position`.
     fn eval_member(
         &mut self,
         obj: &Expr,
         prop: &str,
         optional: bool,
+        position: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
         if matches!(obj, Expr::Super) {
-            // GetThisBinding first (TDZ ReferenceError), then Get(base, key, actualThis):
-            // a getter on the super prototype sees the current `this`.
-            let this = self.get_var("this", env)?;
-            let home = self.super_base(env)?;
-            if matches!(home, Value::Undefined | Value::Null) {
-                return Err(self.throw(
-                    "TypeError",
-                    format!("cannot read property '{prop}' of a null super base"),
-                ));
-            }
-            return crate::builtins::reflect_ordinary_get(self, &home, prop, &this)
-                .map_err(Abrupt::Throw);
+            return self
+                .read_super_member(prop, env)
+                .map_err(|error| self.placed_error(error, position));
         }
-        let base = self.eval(obj, env)?;
+        let base = self
+            .eval(obj, env)
+            .map_err(|error| self.placed_error(error, position))?;
         if self.short_circuit {
             return Ok(Value::Undefined); // an earlier `?.` link short-circuited
         }
@@ -3259,35 +3248,46 @@ impl Interp {
         }
         if prop.starts_with('#') {
             let k = self.resolve_private(prop, env);
-            return self.get_private_member(&base, &k);
+            return self
+                .get_private_member(&base, &k)
+                .map_err(|error| self.placed_error(error, position));
         }
         self.get_member(&base, prop)
+            .map_err(|error| self.placed_error(error, position))
     }
 
-    /// A computed property read `obj[index]`; see [`Interp::eval`].
+    /// `super.prop`.
+    fn read_super_member(&mut self, prop: &str, env: &Env) -> Result<Value, Abrupt> {
+        // GetThisBinding first (TDZ ReferenceError), then Get(base, key, actualThis):
+        // a getter on the super prototype sees the current `this`.
+        let this = self.get_var("this", env)?;
+        let home = self.super_base(env)?;
+        if matches!(home, Value::Undefined | Value::Null) {
+            return Err(self.throw(
+                "TypeError",
+                format!("cannot read property '{prop}' of a null super base"),
+            ));
+        }
+        crate::builtins::reflect_ordinary_get(self, &home, prop, &this).map_err(Abrupt::Throw)
+    }
+
+    /// A computed property read `obj[index]` whose `[` is at source `position`.
     fn eval_index(
         &mut self,
         obj: &Expr,
         index: &Expr,
         optional: bool,
+        position: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
         if matches!(obj, Expr::Super) {
-            // GetThisBinding, the key expression, GetSuperBase, then ToPropertyKey.
-            let this = self.get_var("this", env)?;
-            let idx = self.eval(index, env)?;
-            let home = self.super_base(env)?;
-            let key = self.to_property_key(&idx)?;
-            if matches!(home, Value::Undefined | Value::Null) {
-                return Err(self.throw(
-                    "TypeError",
-                    format!("cannot read property '{key}' of a null super base"),
-                ));
-            }
-            return crate::builtins::reflect_ordinary_get(self, &home, &key, &this)
-                .map_err(Abrupt::Throw);
+            return self
+                .read_super_index(index, env)
+                .map_err(|error| self.placed_error(error, position));
         }
-        let base = self.eval(obj, env)?;
+        let base = self
+            .eval(obj, env)
+            .map_err(|error| self.placed_error(error, position))?;
         if self.short_circuit {
             return Ok(Value::Undefined);
         }
@@ -3295,29 +3295,50 @@ impl Interp {
             self.short_circuit = true;
             return Ok(Value::Undefined);
         }
-        let idx = self.eval(index, env)?;
+        let idx = self
+            .eval(index, env)
+            .map_err(|error| self.placed_error(error, position))?;
         // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
         if matches!(base, Value::Undefined | Value::Null) {
             trace_nullish_property("eval-index", &idx);
-            return Err(self.throw("TypeError", "cannot read property of null or undefined"));
+            let error = self.throw("TypeError", "cannot read property of null or undefined");
+            return Err(self.placed_error(error, position));
         }
         if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
             if let Some(v) = self.fast_get_elem(o, *n) {
                 return Ok(v);
             }
         }
-        let key = self.to_property_key(&idx)?;
+        let key = self
+            .to_property_key(&idx)
+            .map_err(|error| self.placed_error(error, position))?;
         self.get_member(&base, &key)
+            .map_err(|error| self.placed_error(error, position))
     }
 
-    /// Give a pending error from the node at `position` that position (see
-    /// [`Interp::place_thrown`]); only the error path does any work.
-    #[inline]
-    fn placed(&self, result: Result<Value, Abrupt>, position: u32) -> Result<Value, Abrupt> {
-        if let Err(error) = &result {
-            self.place_thrown(error, position);
+    /// `super[index]`.
+    fn read_super_index(&mut self, index: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        // GetThisBinding, the key expression, GetSuperBase, then ToPropertyKey.
+        let this = self.get_var("this", env)?;
+        let idx = self.eval(index, env)?;
+        let home = self.super_base(env)?;
+        let key = self.to_property_key(&idx)?;
+        if matches!(home, Value::Undefined | Value::Null) {
+            return Err(self.throw(
+                "TypeError",
+                format!("cannot read property '{key}' of a null super base"),
+            ));
         }
-        result
+        crate::builtins::reflect_ordinary_get(self, &home, &key, &this).map_err(Abrupt::Throw)
+    }
+
+    /// `error`, thrown while the node at source `position` was evaluated, once given that
+    /// position (see [`Interp::place_thrown`]).
+    #[cold]
+    #[inline(never)]
+    fn placed_error(&self, error: Abrupt, position: u32) -> Abrupt {
+        self.place_thrown(&error, position);
+        error
     }
 
     /// Call `func` as the explicit call at source `position`, which the callee's frame records
@@ -3764,19 +3785,27 @@ impl Interp {
         position: u32,
         env: &Env,
     ) -> Result<Value, Abrupt> {
-        let (func, this) = self.eval_callee_reference(tag, env)?;
+        let (func, this) = self
+            .eval_callee_reference(tag, env)
+            .map_err(|error| self.placed_error(error, position))?;
         // TaggedTemplate delegates to EvaluateCall: GetValue precedes ArgumentListEvaluation,
         // but IsCallable follows every substitution (§§13.3.11.1, 13.3.6.2).
-        let strings = self.template_object(site_id, quasis)?;
+        let strings = self
+            .template_object(site_id, quasis)
+            .map_err(|error| self.placed_error(error, position))?;
         let mut argv = vec![strings];
         for s in subs {
-            argv.push(self.eval(s, env)?);
+            let value = self
+                .eval(s, env)
+                .map_err(|error| self.placed_error(error, position))?;
+            argv.push(value);
         }
         if !func.is_callable() {
-            return Err(self.throw(
+            let error = self.throw(
                 "TypeError",
                 crate::callee_name::not_callable_message(tag, false),
-            ));
+            );
+            return Err(self.placed_error(error, position));
         }
         self.call_at(position, func, this, &argv)
     }
@@ -4083,19 +4112,22 @@ impl Interp {
         env: &Env,
     ) -> Result<Value, Abrupt> {
         if !optional && matches!(callee, Expr::Ident(name, _) if name == "eval") {
-            match self.eval_named_eval_call(args, position, env, false)? {
-                TailEval::Val(value) => return Ok(value),
-                TailEval::Tail(..) => unreachable!("non-tail eval call"),
-            }
+            return match self.eval_named_eval_call(args, position, env, false) {
+                Ok(TailEval::Val(value)) => Ok(value),
+                Ok(TailEval::Tail(..)) => unreachable!("non-tail eval call"),
+                Err(error) => Err(self.placed_error(error, position)),
+            };
         }
         // SuperCall deliberately stages GetNewTarget/GetSuperConstructor before arguments; the
         // bytecode VM uses the same two helpers with suspension between those phases.
         if matches!(callee, Expr::Super) {
-            let (new_target, super_constructor) = self.prepare_super_call(env)?;
-            let argv = self.eval_args(args, env)?;
-            return self.finish_super_call(new_target, super_constructor, &argv, position, env);
+            return self
+                .eval_super_call(args, position, env)
+                .map_err(|error| self.placed_error(error, position));
         }
-        let (func, this) = self.eval_callee_reference(callee, env)?;
+        let (func, this) = self
+            .eval_callee_reference(callee, env)
+            .map_err(|error| self.placed_error(error, position))?;
         if self.short_circuit {
             return Ok(Value::Undefined);
         }
@@ -4104,14 +4136,29 @@ impl Interp {
             self.short_circuit = true;
             return Ok(Value::Undefined);
         }
-        let argv = self.eval_args(args, env)?;
+        let argv = self
+            .eval_args(args, env)
+            .map_err(|error| self.placed_error(error, position))?;
         if !func.is_callable() {
-            return Err(self.throw(
+            let error = self.throw(
                 "TypeError",
                 crate::callee_name::not_callable_message(callee, false),
-            ));
+            );
+            return Err(self.placed_error(error, position));
         }
         self.call_at(position, func, this, &argv)
+    }
+
+    /// `super(args)` at source `position`.
+    fn eval_super_call(
+        &mut self,
+        args: &[ArrayElem],
+        position: u32,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let (new_target, super_constructor) = self.prepare_super_call(env)?;
+        let argv = self.eval_args(args, env)?;
+        self.finish_super_call(new_target, super_constructor, &argv, position, env)
     }
 
     /// Evaluate a callee once while retaining GetThisValue/WithBaseObject. Parentheses retain
@@ -7196,7 +7243,20 @@ impl Interp {
         }
     }
 
+    /// An assignment whose operator is at source `position`.
     fn eval_assign(
+        &mut self,
+        op: &str,
+        target: &Expr,
+        value: &Expr,
+        position: u32,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        self.assign(op, target, value, env)
+            .map_err(|error| self.placed_error(error, position))
+    }
+
+    fn assign(
         &mut self,
         op: &str,
         target: &Expr,

@@ -27674,7 +27674,8 @@ for (var round = 0; round < 20; round++) {
 // eval code prints `at eval (<anonymous>:line:column)` without V8's `eval at` origin, and a
 // `new Function` body is the function `anonymous`. A frame that entered its callee through an
 // implicit call (a getter, valueOf, an iterator step) reports its function's start unless an
-// error thrown by that callee propagates through it.
+// error thrown by that callee propagates through it. It then reports the innermost call,
+// property access or assignment around the implicit call (V8 reports an operator itself).
 
 const STACK_URL: &str = "https://example.com/a.js";
 
@@ -27841,6 +27842,40 @@ result"#;
             "at set s (https://example.com/a.js:1:99)",
             "at write (https://example.com/a.js:4:24)",
             "at https://example.com/a.js:7:7",
+        ])
+    );
+}
+
+#[test]
+fn stack_positions_of_errors_before_a_call() {
+    let source = r#"var v = { valueOf() { throw new Error("v"); } };
+function f() {}
+function args() { f(0,
+  1 + v); }
+function notCallable() { var g = 1; g(2); }
+function notConstructor() { new Math.max(1); }
+function template() { f`a${1 + v}`; }
+var result = "";
+try { args(); } catch (e) { result += e.stack; }
+try { notCallable(); } catch (e) { result += "|" + e.stack; }
+try { notConstructor(); } catch (e) { result += "|" + e.stack; }
+try { template(); } catch (e) { result += "|" + e.stack; }
+result"#;
+    // V8 places `args` at the `+` (4:5) and `template` at its `+` (7:30).
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "Error: v",
+            "at valueOf (https://example.com/a.js:1:29)",
+            "at args (https://example.com/a.js:3:19)",
+            "at https://example.com/a.js:9:7|TypeError: g is not a function",
+            "at notCallable (https://example.com/a.js:5:37)",
+            "at https://example.com/a.js:10:7|TypeError: Math.max is not a constructor",
+            "at notConstructor (https://example.com/a.js:6:29)",
+            "at https://example.com/a.js:11:7|Error: v",
+            "at valueOf (https://example.com/a.js:1:29)",
+            "at template (https://example.com/a.js:7:24)",
+            "at https://example.com/a.js:12:7",
         ])
     );
 }
