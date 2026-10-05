@@ -136,6 +136,24 @@ mod loop_latch_tests;
 #[path = "jit_regions.rs"]
 mod regions;
 
+#[cfg(test)]
+pub(crate) fn test_local_array_fusion_hits() -> [u64; 5] {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        regions::local_array_hits()
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )))]
+    {
+        [0, 0, 0, 0, 0]
+    }
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -4257,6 +4275,9 @@ fn compile_entry(
                     l_unwind,
                     ElemLocalKind::Get,
                     key,
+                    None,
+                    0,
+                    None,
                 );
                 skip = 1;
                 continue;
@@ -4802,6 +4823,13 @@ mod exec_memory_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
 #[path = "jit_call_epoch_tests.rs"]
 mod call_epoch_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "native_array_local_tests.rs"]
+mod native_array_local_tests;
 #[cfg(test)]
 #[path = "jit_numeric_array_tests.rs"]
 mod numeric_array_tests;
@@ -11569,6 +11597,57 @@ fn emit_packed_element_store(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_in_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, l_unwind: usize) {
+    emit_in_keyed(a, layout, None, KeySrc::Stack, &[pc], l_unwind, None, None);
+}
+
+/// Local-source form used by loop regions for `LoadLocal(key); LoadLocal(receiver); In`.
+/// Both local reads remain non-owning on a hit; the checked miss publishes all private
+/// numeric homes and replays the three original operations in source order.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_in_local_inline(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    receiver_off: u32,
+    key: KeySrc,
+    pcs: &[u32],
+    l_unwind: usize,
+    slow_plan: &regions::Plan,
+    slow_reload_fail: usize,
+    fast_event: Option<u64>,
+) {
+    emit_in_keyed(
+        a,
+        layout,
+        Some(receiver_off),
+        key,
+        pcs,
+        l_unwind,
+        Some((slow_plan, slow_reload_fail)),
+        fast_event,
+    );
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_in_keyed(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    receiver_slot: Option<u32>,
+    key: KeySrc,
+    pcs: &[u32],
+    l_unwind: usize,
+    slow_plan: Option<(&regions::Plan, usize)>,
+    fast_event: Option<u64>,
+) {
+    #[cfg(not(test))]
+    let _ = fast_event;
+    let stack_receiver = receiver_slot.is_none();
+    debug_assert!(stack_receiver == matches!(key, KeySrc::Stack));
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
@@ -11579,24 +11658,44 @@ fn emit_in_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, l
     let slow = a.new_label();
     let present = a.new_label();
     let done = a.new_label();
-    // 1. stack: [lval @ -16, rval @ -8]; rval must be an Object, lval a Number that is exactly a
-    //    u32 (NaN, negative, fractional and huge values fail the round trip; 2^32 − 1, which is
-    //    not an array index, fails every bounds check below).
-    emit_exec_word_load(a, 9, 20, -8);
+    // 1. The receiver must be an Object; the key must be a Number that is exactly a u32.
+    //    NaN, negative, fractional and huge values fail the round trip; 2^32 − 1, which is not
+    //    an array index, fails every bounds check below.
+    if let Some(slot) = receiver_slot {
+        emit_exec_word_load(a, 9, 22, slot as i32);
+    } else {
+        emit_exec_word_load(a, 9, 20, -8);
+    }
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
-    emit_exec_word_load(a, 9, 20, -16);
-    emit_exec_number_guard(a, 9, 0, 11, slow);
-    a.ldur_d(0, 20, -16);
+    match key {
+        KeySrc::Stack => {
+            emit_exec_word_load(a, 9, 20, -16);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
+            a.ldur_d(0, 20, -16);
+        }
+        KeySrc::Slot(slot) => {
+            emit_exec_word_load(a, 9, 22, slot as i32);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
+        }
+        KeySrc::DReg(reg) => a.fmov_d_d(0, reg),
+        KeySrc::SlotPre(..) => unreachable!("In does not use a deferred local update"),
+    }
     a.fcvtzu_w_d(9, 0);
     a.ucvtf_d_w(1, 9);
     a.fcmp(0, 1);
     a.b_cond(C_NE, slow);
-    // 2. receiver refcount > 1, so popping it below never frees.
-    emit_exec_word_load(a, 10, 20, -8);
-    emit_exec_payload(a, 10, 10);
-    a.ldur(11, 10, strong);
-    a.cmp_imm_x(11, 1);
-    a.b_cond(C_LS, slow);
+    // A stack receiver is popped on the commit path, so it must not be its last owner.
+    // Local-source regions do not pop or decrement the receiver at all.
+    if stack_receiver {
+        emit_exec_word_load(a, 10, 20, -8);
+        emit_exec_payload(a, 10, 10);
+        a.ldur(11, 10, strong);
+        a.cmp_imm_x(11, 1);
+        a.b_cond(C_LS, slow);
+    } else {
+        emit_exec_word_load(a, 10, 22, receiver_slot.unwrap() as i32);
+        emit_exec_payload(a, 10, 10);
+    }
     // 3. object base; exotic None or Array, and plain (no side-table internal methods).
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
@@ -11634,17 +11733,42 @@ fn emit_in_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, l
     a.ldr_w_imm(13, 12, 0);
     a.cmn_imm_w(13, 1);
     a.b_cond(C_EQ, slow);
-    // --- commit: drop the receiver (strong was > 1); [lval, rval] → [true] ---
+    // --- commit: present own element means [[HasProperty]] is true, with no observable
+    // prototype walk, key coercion or getter. Local-source form pushes the result without
+    // creating or dropping operand owners. ---
     a.bind(present);
-    a.ldur(9, 10, strong);
-    a.sub_imm(9, 9, 1);
-    a.stur(9, 10, strong);
+    if stack_receiver {
+        a.ldur(9, 10, strong);
+        a.sub_imm(9, 9, 1);
+        a.stur(9, 10, strong);
+    }
     a.mov_imm64(9, crate::value::PACK_BOOL | 1);
-    emit_exec_word_store(a, 9, 20, -16);
-    a.sub_imm(20, 20, 8);
+    if stack_receiver {
+        emit_exec_word_store(a, 9, 20, -16);
+        a.sub_imm(20, 20, 8);
+    } else {
+        emit_exec_word_store(a, 9, 20, 0);
+        a.add_imm(20, 20, 8);
+    }
+    #[cfg(test)]
+    if let Some(function) = fast_event {
+        regions::emit_lowering_event(a, function);
+    }
     a.b(done);
     a.bind(slow);
-    emit_op_helper(a, H_EXEC, pc, l_unwind);
+    if let Some((plan, _)) = slow_plan {
+        plan.flush_locals(a);
+    }
+    for (index, &pc) in pcs.iter().enumerate() {
+        if index + 1 == pcs.len() {
+            emit_op_helper(a, H_EXEC, pc, l_unwind);
+        } else {
+            emit_exec(a, pc, l_unwind);
+        }
+    }
+    if let Some((plan, fail)) = slow_plan {
+        plan.reload(a, fail);
+    }
     a.bind(done);
 }
 
@@ -11903,6 +12027,9 @@ enum KeySrc {
     Stack,
     /// Read straight from a local slot (peephole-fused `LoadLocal k; GetElemLocal x`).
     Slot(u32),
+    /// A numeric local already held in one of the region's callee-saved FP homes.
+    /// The slow path publishes all homes before re-running the original bytecodes.
+    DReg(u32),
     /// Pre-increment/-decrement a numeric local slot in place and use the new value
     /// (peephole-fused `UpdateLocal(k, Pre*); GetElemLocal x`). The slot store is deferred to
     /// the commit point so a slow-path re-run never sees a half-applied update.
@@ -11968,7 +12095,18 @@ fn emit_elem_local_inline(
     l_unwind: usize,
     kind: ElemLocalKind,
 ) {
-    emit_elem_local_keyed(a, layout, slot_off, &[pc], l_unwind, kind, KeySrc::Stack);
+    emit_elem_local_keyed(
+        a,
+        layout,
+        slot_off,
+        &[pc],
+        l_unwind,
+        kind,
+        KeySrc::Stack,
+        None,
+        0,
+        None,
+    );
 }
 
 /// [`emit_elem_local_inline`] parameterized on the key source (see [`KeySrc`]) — the peephole
@@ -11987,7 +12125,12 @@ fn emit_elem_local_keyed(
     l_unwind: usize,
     kind: ElemLocalKind,
     key: KeySrc,
+    slow_plan: Option<&regions::Plan>,
+    slow_reload_fail: usize,
+    fast_event: Option<u64>,
 ) {
+    #[cfg(not(test))]
+    let _ = fast_event;
     if kind != ElemLocalKind::Get && layout.entry_accessor != layout.entry_value + 8 {
         for &pc in pcs {
             emit_op_helper(a, H_SET_ELEM, pc, l_unwind);
@@ -12031,6 +12174,7 @@ fn emit_elem_local_keyed(
             emit_exec_word_load(a, 9, 22, k_off as i32);
             emit_exec_number_guard(a, 9, 0, 11, slow);
         }
+        KeySrc::DReg(reg) => a.fmov_d_d(0, reg),
         KeySrc::SlotPre(k_off, dec) => {
             emit_exec_word_load(a, 9, 22, k_off as i32);
             emit_exec_number_guard(a, 9, 0, 11, slow);
@@ -12143,7 +12287,7 @@ fn emit_elem_local_keyed(
                 // pop key, push value → result replaces the key slot
                 emit_exec_word_store(a, 12, 20, -8);
             }
-            KeySrc::Slot(_) | KeySrc::SlotPre(..) => {
+            KeySrc::Slot(_) | KeySrc::DReg(_) | KeySrc::SlotPre(..) => {
                 if let KeySrc::SlotPre(k_off, _) = key {
                     a.str_d_imm(0, 22, k_off); // commit the deferred ±1 to the slot
                 }
@@ -12191,6 +12335,10 @@ fn emit_elem_local_keyed(
             a.sub_imm(20, 20, 16);
         }
     }
+    #[cfg(test)]
+    if let Some(function) = fast_event {
+        regions::emit_lowering_event(a, function);
+    }
     a.b(done);
     a.bind(typed);
     if get {
@@ -12215,12 +12363,23 @@ fn emit_elem_local_keyed(
         a.b(done);
     }
     a.bind(slow);
+    if let Some(plan) = slow_plan {
+        // The checked operation may call user code. Publish every numeric home before
+        // replaying the original source operations, and route throws through the ordinary
+        // unwinder instead of a private-home flush (the callback may have changed a home).
+        plan.flush_locals(a);
+    }
     for (index, &p) in pcs.iter().enumerate() {
         if index + 1 == pcs.len() {
             emit_op_helper(a, if get { H_GET_ELEM } else { H_SET_ELEM }, p, l_unwind);
         } else {
             emit_exec(a, p, l_unwind);
         }
+    }
+    if let Some(plan) = slow_plan {
+        // A successful checked operation can re-enter and mutate bindings. Re-guard homes
+        // from their canonical post-call slots before execution continues in the region.
+        plan.reload(a, slow_reload_fail);
     }
     a.bind(done);
 }

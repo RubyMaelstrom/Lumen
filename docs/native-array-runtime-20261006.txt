@@ -1,0 +1,145 @@
+Local array operations — 6 October 2026
+======================================
+
+The ARM64 template tier now reads a local array receiver and numeric index
+without first manufacturing temporary owning operand-stack values. This removes
+repeated object/value runtime work in the two hot array-iteration regions of
+the React-derived reducer fixture. The standalone candidate takes 6.6% less
+time there. Smaller application gains and all measured regression gates pass;
+the source experiment is retained. This remains far short of the requested
+8–10x overall improvement, and the investigation continues.
+
+Implementation and boundaries
+-----------------------------
+
+Recognize LoadLocal(receiver), LoadLocal(key), GetElem and
+LoadLocal(key), LoadLocal(receiver), In inside a numeric region. The canonical
+local remains the receiver owner; a numeric key home can supply the index
+directly. Successful own-element paths preserve the other numeric homes. The
+older two-operation GetElemLocal path uses the same cold-miss discipline.
+
+Live layout, exotic, descriptor, bounds and index guards remain in place.
+The In shortcut answers only true for an existing own dense element. Holes,
+inherited properties, proxies, key coercion, unusual indices and uncertain
+receivers replay the original operations after publishing numeric homes.
+The helper may execute author code, so the return reloads and revalidates the
+homes. A failed reload resumes after the consumed operations without flushing
+stale registers over canonical slots changed by reentry. Numeric-home receiver
+slots are excluded. No collector or default representation changes are made.
+
+Six new fixtures exercise actual three-operation/D-register admission using
+test-only counters, plus holes, inherited getters, prototype mutation, GC,
+proxy traps, coercion order, special keys, thrown values and TDZ behavior.
+Counters compile out of production. The x86-64 emitter is unchanged.
+
+Measured comparison
+-------------------
+
+Base revision: 42bf867d1ebabbd229e2c239675a355e4da8a418.
+Measured source patch SHA256:
+c1ce9d61b2d9b4ee87f4c7f9bb24541704c46162606597e179d6750394a8485e.
+Baseline executable SHA256:
+64578e16c341c6ce99b8bef31dc1f90cd926a0cd3ea8064aa674f48e1896da96.
+Candidate executable SHA256:
+d30ea74b4e9aa3bf41ebfa42461c9c5b9e37e316ad47405fb06a7c6a62daeb3e.
+
+Machine: crystal, aarch64 Linux 7.2.7-crystal, CPU 5 affinity. Rust 1.99.0
+b940084d7 / LLVM 23.1.1; release opt-level 3, fat LTO, one codegen unit,
+panic=abort, default intl plus embed. Ordinary JIT, optimizing backend off.
+No owned build, test or profiler overlapped acceptance timing. Desktop
+applications remained active. Measurements ran 5 October UTC / 6 October
+Europe/Berlin. Earlier exploratory combined candidates are not pooled here.
+
+Six balanced fresh-process pairs per application/control, sixty startup pairs
+fixed in advance. Every output checksum matched. Intervals use 10,000 paired
+bootstrap resamples of candidate/baseline ratios. The first three rows use
+internal driver durations; EJS uses direct child-process wall time.
+
+Workload                 Baseline median  Candidate median  Paired ratio / 95% CI
+React reducer, 600 passes      1967 ms         1839 ms        0.93442 [0.92292, 0.93755]
+Vue, 150000 updates          8613.5 ms         8452 ms        0.98352 [0.97787, 0.98737]
+Djot, 120 passes             2049.5 ms         2027 ms        0.98834 [0.98443, 0.99339]
+EJS solver                  6.05505 s        6.01465 s       0.99318 [0.99041, 0.99841]
+
+CPU and whole-process timings also improve. The renderer-shaped controls
+complete all eleven kernels, with five internal samples per process. Array
+copy/compare takes 4.3% less time: ratio 0.95652 [0.95480, 0.95841]. No kernel
+crosses the provisional 3% regression threshold. These are engine workloads,
+not browser rendering or scene-frame measurements.
+
+Startup child wall time is 11.256/9.813 ms, ratio 0.86914
+[0.86252, 0.87552]. This fixture compiles no native bodies; its timing change
+is not attributed to the array fast path. Startup peak RSS is 20780/21124 KiB,
+paired ratio 1.02187 [1.00708, 1.03482]: a measured 2.2% increase, below the
+declared median-loss gate. Other peak-RSS intervals include parity. Post-GC
+requested-memory observations differ by less than 0.05%; they are lower-bound
+accounting, not physical-memory measurements. No general memory-saving claim
+is made.
+
+Separate performance-metrics runs have unchanged compilation counts. React's
+generated-code total falls from 280232 to 276404 bytes; Vue, Djot and EJS also
+shrink slightly, while the control suite grows by 1672 bytes. Single diagnostic
+compile and GC durations do not establish latency or pause improvements.
+The executable grows 4280 bytes (0.016%): text +3704, data +264, bss -3944.
+
+Profiling that motivated this change preserved all sampled instruction
+addresses and live JIT mappings: 0 lost/unresolved samples in the accepted
+baseline React capture. Two array-iteration spans account for 1777/3993 samples
+(44.5%); only 21 of those samples land on element-payload reads. Most land on
+guards, metadata, stack/local transfer and owner handling. This is sampled
+attribution with skid and broad bytecode spans, not a claim that every guard
+can be removed. An exploratory combined-candidate capture confirms reduced
+stack work, but is not the source or artifact used for the acceptance table.
+
+Validation and source identity
+------------------------------
+
+- Six focused native-array tests pass; all six JavaScript fixtures also match
+  Node 24.21.0. The Rust checks run every execution tier and assert native
+  three-operation GetElem and In paths were actually entered on ARM64.
+- Engine: 1805 pass, 0 fail, 3 measurement-only ignores. Runtime: 179 pass,
+  0 fail, 1 existing ignore. Workspace all-target check and release build pass.
+- Optional embed + optimizing-jit compile check passes; this is not optional
+  optimizer execution or performance acceptance.
+- Differential seeds 1..2000 plus regression replay: 1859 agree, 141 budget
+  skips, 0 divergences among completed cases.
+- Test262 default JIT: 6151 pass, 0 fail, 1 skip, all_executed_passed=true.
+  Suite d86b2294eb0a17eaa281ff12c73c473ec864c72f; scope Array, TypedArray,
+  Proxy, in, property-accessors, member-expression, for, for-in and for-of.
+  Existing harness skip: built-ins/TypedArray/prototype/slice/
+  speciesctor-return-same-buffer-with-offset.js (upstream: missing immutable
+  exclusion). Full uncapped failure/skip report is preserved.
+- Formatting and git diff --check pass. After validation/build, rustfmt's
+  module-order check was satisfied by moving one cfg(test) module declaration.
+  The committed source differs from the measured snapshot only by that test
+  declaration order; source hashes and the exact qualification are recorded.
+  No production source changed after the measured build.
+
+Validation is native ARM64, not fresh x86-64 or wasm32 execution. Five existing
+Atomic::fetch_update deprecation warnings remain. Semantic references are the
+local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202, fetched
+2026-09-06, /big/web-standards/repositories/tc39/ecma262/spec.html:
+GetValue, HasProperty, the in operator, Array.prototype.map/filter and
+OrdinaryGet. This does not assert current-upstream verification.
+
+Disposition and continuation
+----------------------------
+
+A separate PropertyKey/Reflect/RegExp experiment is parked and absent from
+this source. Its few-percent gains did not justify a reproducible startup-RSS
+regression: all 80 fixed pairs pooled gave ratio 1.04225, interval
+[1.02591, 1.05462]. Its patch, binaries and passing semantic checks remain
+under benchmark-results/object-runtime-followup-20261005-93yqcva9/. It was
+not accepted or committed. The array experiment was rebuilt independently.
+
+Next candidates address repeated local-state publication around lexical slot
+clears and warmed property reads that retain generic probes. They need their
+own correctness and performance evidence. The current result does not settle
+the object/value architecture investigation.
+
+Tracked samples, manifests, checks, diagnostics and qualifications:
+benchmarks/native-array-runtime-2026-10-06.json. Local frozen source/builds:
+benchmark-results/native-array-runtime-20261006-9nhn0ka9/. Timing artifacts:
+benchmark-results/object-runtime-20261005-7eac91/native-array-final-20261006/.
+Local investigation artifacts are not required for builds or contributor
+workflows. No installed artifact is promoted by this source commit.

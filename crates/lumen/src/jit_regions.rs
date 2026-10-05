@@ -15,6 +15,9 @@ thread_local! {
     static GUARDED_REGIONS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static FUSED_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static REUSED_CHAINS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Fast local-source own-element results: three-op GetElem DReg/slot, In DReg/slot,
+    // then the older two-op local GetElem region fusion.
+    static LOCAL_ARRAY_HITS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
     // Native data hit, native absence hit, checked property fallback, region property
     // continuation, numeric result, post-result miss, scalar prefix/local reuse.
     static PROPERTY_PATHS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
@@ -89,7 +92,46 @@ extern "C" fn record_reused_chain() {
 }
 
 #[cfg(test)]
-fn emit_lowering_event(a: &mut asm::Asm, function: u64) {
+pub(super) extern "C" fn record_local_array_hit(kind: usize) {
+    LOCAL_ARRAY_HITS.with(|counts| {
+        let mut current = counts.get();
+        current[kind] += 1;
+        counts.set(current);
+    });
+}
+
+#[cfg(test)]
+pub(super) extern "C" fn record_local_array_get() {
+    record_local_array_hit(0);
+}
+
+#[cfg(test)]
+pub(super) extern "C" fn record_local_array_get_slot() {
+    record_local_array_hit(1);
+}
+
+#[cfg(test)]
+pub(super) extern "C" fn record_local_array_in() {
+    record_local_array_hit(2);
+}
+
+#[cfg(test)]
+pub(super) extern "C" fn record_local_array_in_slot() {
+    record_local_array_hit(3);
+}
+
+#[cfg(test)]
+pub(super) extern "C" fn record_local_array_legacy_get() {
+    record_local_array_hit(4);
+}
+
+#[cfg(test)]
+pub(super) fn local_array_hits() -> [u64; 5] {
+    LOCAL_ARRAY_HITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn emit_lowering_event(a: &mut asm::Asm, function: u64) {
     // Record before computing the predicate; a C call clobbers NZCV and volatile GPRs.
     a.sub_imm(31, 31, 128);
     for index in (16..32).step_by(2) {
@@ -449,7 +491,7 @@ impl Plan {
             .map(|index| 8 + self.homes.len() as u32 + index as u32)
     }
 
-    fn flush_locals(&self, a: &mut asm::Asm) {
+    pub(super) fn flush_locals(&self, a: &mut asm::Asm) {
         for (index, slot) in self.homes.iter().enumerate() {
             emit_exec_number_store(a, 8 + index as u32, 22, *slot as i32 * 8, 9);
         }
@@ -461,7 +503,7 @@ impl Plan {
         }
     }
 
-    fn reload(&self, a: &mut asm::Asm, fail: usize) {
+    pub(super) fn reload(&self, a: &mut asm::Asm, fail: usize) {
         // Never write canonical memory while reloading. Failed post-effect guards resume
         // without flushing these registers, preserving locals that now hold object owners.
         for (index, slot) in self.homes.iter().enumerate() {
@@ -1379,26 +1421,158 @@ pub(super) fn emit(
                         continue;
                     }
                 }
+                // Local-source array reads avoid materializing the receiver and key as
+                // owning stack Values. Numeric index homes stay live on the dense own-data
+                // hit; every other case flushes and replays from the first LoadLocal.
+                if fast & 1024 != 0 && get_elem_inlinable(layout) && pc + 2 < end {
+                    if let (Op::LoadLocal(receiver), Op::LoadLocal(key), Op::GetElem) =
+                        (&ops[pc], &ops[pc + 1], &ops[pc + 2])
+                    {
+                        let receiver_off = *receiver as u32 * 8;
+                        let key_off = *key as u32 * 8;
+                        if receiver_off + 8 < 4096
+                            && key_off + 8 < 4096
+                            // A numeric home may have changed since its canonical slot
+                            // was last published. Such a slot cannot be the current receiver.
+                            && plan.reg(*receiver).is_none()
+                            && !source_targets[pc + 1]
+                            && !source_targets[pc + 2]
+                        {
+                            own_facts.clear();
+                            numeric_locals.clear();
+                            let before = stack.clone();
+                            materialize(a, layout, &stack, physical);
+                            physical = stack.len();
+                            stack.fill(Operand::Canonical);
+                            let slow_reload_fail = a.new_label();
+                            bails.push((slow_reload_fail, pc + 3, Vec::new(), 0, false));
+                            let key_src =
+                                plan.reg(*key).map_or(KeySrc::Slot(key_off), KeySrc::DReg);
+                            #[cfg(test)]
+                            let event = Some(if matches!(key_src, KeySrc::DReg(_)) {
+                                record_local_array_get as *const () as u64
+                            } else {
+                                record_local_array_get_slot as *const () as u64
+                            });
+                            #[cfg(not(test))]
+                            let event = None;
+                            emit_elem_local_keyed(
+                                a,
+                                layout,
+                                receiver_off,
+                                &[pc as u32, pc as u32 + 1, pc as u32 + 2],
+                                unwind,
+                                ElemLocalKind::Get,
+                                key_src,
+                                Some(plan),
+                                slow_reload_fail,
+                                event,
+                            );
+                            physical += 1;
+                            stack.push(Operand::Canonical);
+                            preserve_scalar_prefix(a, &before, &mut stack, physical);
+                            propagate_checked_result(
+                                a,
+                                plan,
+                                pc + 2,
+                                &mut stack,
+                                physical,
+                                &mut bails,
+                                &mut result_misses,
+                            );
+                            consumed = 2;
+                            continue;
+                        }
+                    }
+                }
+                // `in` is true without a key coercion or prototype walk only when a plain
+                // own dense element is present. Holes and every uncertain form replay the
+                // complete source sequence, retaining ToPropertyKey/HasProperty semantics.
+                if fast & 1024 != 0 && get_elem_inlinable(layout) && pc + 2 < end {
+                    if let (Op::LoadLocal(key), Op::LoadLocal(receiver), Op::In) =
+                        (&ops[pc], &ops[pc + 1], &ops[pc + 2])
+                    {
+                        let key_off = *key as u32 * 8;
+                        let receiver_off = *receiver as u32 * 8;
+                        if receiver_off + 8 < 4096
+                            && key_off + 8 < 4096
+                            && plan.reg(*receiver).is_none()
+                            && !source_targets[pc + 1]
+                            && !source_targets[pc + 2]
+                        {
+                            own_facts.clear();
+                            numeric_locals.clear();
+                            let before = stack.clone();
+                            materialize(a, layout, &stack, physical);
+                            physical = stack.len();
+                            stack.fill(Operand::Canonical);
+                            let slow_reload_fail = a.new_label();
+                            bails.push((slow_reload_fail, pc + 3, Vec::new(), 0, false));
+                            let key_src =
+                                plan.reg(*key).map_or(KeySrc::Slot(key_off), KeySrc::DReg);
+                            #[cfg(test)]
+                            let event = Some(if matches!(key_src, KeySrc::DReg(_)) {
+                                record_local_array_in as *const () as u64
+                            } else {
+                                record_local_array_in_slot as *const () as u64
+                            });
+                            #[cfg(not(test))]
+                            let event = None;
+                            emit_in_local_inline(
+                                a,
+                                layout,
+                                receiver_off,
+                                key_src,
+                                &[pc as u32, pc as u32 + 1, pc as u32 + 2],
+                                unwind,
+                                plan,
+                                slow_reload_fail,
+                                event,
+                            );
+                            physical += 1;
+                            stack.push(Operand::Canonical);
+                            preserve_scalar_prefix(a, &before, &mut stack, physical);
+                            consumed = 2;
+                            continue;
+                        }
+                    }
+                }
                 if fast & 1024 != 0 && get_elem_inlinable(layout) {
                     if let (Op::LoadLocal(key), Op::GetElemLocal(receiver)) =
                         (&ops[pc], &ops[pc + 1])
                     {
-                        if *key as u32 * 8 + 8 < 4096 && *receiver as u32 * 8 + 8 < 4096 {
+                        if *key as u32 * 8 + 8 < 4096
+                            && *receiver as u32 * 8 + 8 < 4096
+                            && plan.reg(*receiver).is_none()
+                        {
                             own_facts.clear();
+                            numeric_locals.clear();
                             let before = stack.clone();
                             materialize(a, layout, &stack, physical);
-                            plan.flush_local(a, *key);
-                            plan.flush_local(a, *receiver);
+                            physical = stack.len();
+                            stack.fill(Operand::Canonical);
+                            let slow_reload_fail = a.new_label();
+                            bails.push((slow_reload_fail, pc + 2, Vec::new(), 0, false));
+                            let key_off = *key as u32 * 8;
+                            let key_src =
+                                plan.reg(*key).map_or(KeySrc::Slot(key_off), KeySrc::DReg);
+                            #[cfg(test)]
+                            let event = Some(record_local_array_legacy_get as *const () as u64);
+                            #[cfg(not(test))]
+                            let event = None;
                             emit_elem_local_keyed(
                                 a,
                                 layout,
                                 *receiver as u32 * 8,
                                 &[pc as u32, pc as u32 + 1],
-                                private_unwind,
+                                unwind,
                                 ElemLocalKind::Get,
-                                KeySrc::Slot(*key as u32 * 8),
+                                key_src,
+                                Some(plan),
+                                slow_reload_fail,
+                                event,
                             );
-                            physical = stack.len() + 1;
+                            physical += 1;
                             stack = vec![Operand::Canonical; physical];
                             preserve_scalar_prefix(a, &before, &mut stack, physical);
                             propagate_checked_result(
