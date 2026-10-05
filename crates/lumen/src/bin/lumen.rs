@@ -13,7 +13,7 @@
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use lumen::{Completion, Engine};
+use lumen::{Completion, Engine, ExecutionOutcome};
 
 #[cfg(not(target_arch = "wasm32"))]
 #[global_allocator]
@@ -99,7 +99,20 @@ fn main() {
                 .into_owned();
             engine.eval_module(&src, &key, load_module)
         } else {
-            engine.eval(&src, false)
+            // Stack frames name the file, like Node's.
+            let origin = lumen::SourceOrigin::new(path);
+            engine
+                .eval_interruptible_with_origin(&src, false, Some(&origin))
+                .map(|outcome| match outcome {
+                    ExecutionOutcome::Value(value) => Completion::Value(value),
+                    ExecutionOutcome::Throw { name, message } => {
+                        Completion::Throw { name, message }
+                    }
+                    ExecutionOutcome::Interrupted { reason } => Completion::Throw {
+                        name: String::new(),
+                        message: reason.message().to_string(),
+                    },
+                })
         };
         for line in engine.take_console() {
             println!("{line}");
