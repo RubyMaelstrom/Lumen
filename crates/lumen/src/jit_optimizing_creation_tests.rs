@@ -66,6 +66,7 @@ fn static_name_fixture(name: &str) -> (Engine, Rc<JitCode>) {
         obj,
         index,
         optional: false,
+        pos,
     } = &**target
     else {
         panic!("literal reference")
@@ -75,6 +76,7 @@ fn static_name_fixture(name: &str) -> (Engine, Rc<JitCode>) {
         obj: obj.clone(),
         prop: name.to_owned(),
         optional: false,
+        pos: *pos,
     };
     let chunk = bytecode::compile(&syntax).expect("static-name bytecode");
     assert!(chunk
