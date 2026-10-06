@@ -11185,7 +11185,76 @@
     "Warm filesystem-cache startup measurements; no installed-artifact promotion.",
     "No new x86-64 or wasm32 execution evidence.",
     "Application throughput remains near parity; number lookup/construction has a small measured cost.",
-    "This result does not establish an 8–10x overall engine gain.",
+    "This result does not establish an 8\u201310x overall engine gain.",
     "Other runtime experiments remain held separately; their speedups are not included."
-  ]
+  ],
+  "measurement_provenance_revalidation": {
+    "matched_preparation_limit": "Hashes and allocation metadata were recorded; filefrag contained delalloc/unknown_loc entries, so physical extents were not confirmed settled.",
+    "historical_first_pass_gate_flags": [
+      {
+        "binary_sha256": "5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9",
+        "workload": "numbers_warm",
+        "metric": "user_seconds",
+        "ratio": 1.0301429557602604,
+        "ci95": [
+          1.0196305724659958,
+          1.0393691029593928
+        ],
+        "preserve": true
+      },
+      {
+        "binary_sha256": "031ced2ac3cc9b3cba67f0c856d7070d778ecab0c56987fbfb872c31c1d3c4aa",
+        "baseline_binary_sha256": "5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9",
+        "workload": "ejs",
+        "metric": "system_seconds",
+        "ratio": 1.104046937562834,
+        "ci95": [
+          1.0101368668556057,
+          1.1213415720444284
+        ],
+        "preserve": true
+      }
+    ],
+    "number_proof_candidate_vs_dates": {
+      "baseline_binary_sha256": "e20d0eb0d09fb027242061b8b02b16c1e40db654f56fd5e36466ab08f1af58a0",
+      "candidate_binary_sha256": "031ced2ac3cc9b3cba67f0c856d7070d778ecab0c56987fbfb872c31c1d3c4aa",
+      "numbers_warm_pairs": 12,
+      "numbers_warm_time_wall_ratio": 1.007885537121425,
+      "numbers_warm_time_wall_ci95": [
+        1.0019001339104545,
+        1.0108521926107557
+      ],
+      "numbers_warm_user_seconds_ratio": 1.0078919519361509,
+      "numbers_warm_user_seconds_ci95": [
+        1.002731426015945,
+        1.0120218807028754
+      ],
+      "current_gate_crossings": []
+    },
+    "number_proof_ejs_confirmation": {
+      "pairs_original_plus_confirmation": 26,
+      "system_seconds_ratio": 1.0115879758325308,
+      "system_seconds_ci95": [
+        0.9746220920740122,
+        1.0418412222013798
+      ],
+      "matched_copy_aa_pairs": 12,
+      "aa_binary_sha256": "5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9",
+      "current_gate_crossings": []
+    },
+    "direct_cumulative_startup_native_array_to_number_proof": {
+      "result_ref": "intl_and_number_proof_revalidation.new_direct_cumulative_startup",
+      "child_time_ratio": 0.6473937857732253,
+      "child_time_ci95": [
+        0.6353140217115647,
+        0.6595355698269435
+      ],
+      "max_rss_ratio": 0.6091167025508156,
+      "max_rss_ci95": [
+        0.5991445181739075,
+        0.6204813712435304
+      ],
+      "derivation": "direct paired result; do not multiply separate stage ratios"
+    }
+  }
 }

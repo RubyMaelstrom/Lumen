@@ -1,6 +1,36 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
+#[test]
+fn cldr_text_range_proof_rejects_overflow_bounds_and_utf8_splits() {
+    let bytes = "aéz".as_bytes();
+
+    assert!(cldr_text_range_is_valid(bytes, 1, 2));
+    assert!(cldr_text_range_is_valid(bytes, 0, bytes.len()));
+    assert!(!cldr_text_range_is_valid(bytes, usize::MAX, 1));
+    assert!(!cldr_text_range_is_valid(bytes, 1, 1));
+    assert!(!cldr_text_range_is_valid(bytes, 2, 1));
+    assert!(!cldr_text_range_is_valid(bytes, 3, 2));
+}
+
+#[test]
+fn every_cldr_ref_satisfies_the_unchecked_slice_proof() {
+    assert!(cldr_refs_are_valid(CLDR_STRINGS.as_bytes(), &CLDR_REFS));
+    for (index, &(offset, len)) in CLDR_REFS.iter().enumerate() {
+        assert!(
+            cldr_text_range_is_valid(CLDR_STRINGS.as_bytes(), offset as usize, len as usize),
+            "invalid range at text id {index}: ({offset}, {len})"
+        );
+    }
+}
+
+#[test]
+fn cldr_ref_table_proof_rejects_an_invalid_entry() {
+    let bytes = "é".as_bytes();
+    assert!(!cldr_refs_are_valid(bytes, &[(0, 1)]));
+    assert!(!cldr_refs_are_valid(bytes, &[(u32::MAX, 1)]));
+}
+
 fn check_id(id: TextId, seen: &mut HashSet<TextId>, values: &mut HashMap<&'static str, TextId>) {
     assert!(
         (id as usize) < CLDR_REFS.len(),

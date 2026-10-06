@@ -40,7 +40,7 @@ struct CurrencyIds {
 }
 
 #[rustfmt::skip]
-static CLDR_REFS: [(u32, u32); 11132] = [
+const CLDR_REFS_SOURCE: [(u32, u32); 11132] = [
     (0, 2),
     (2, 4),
     (6, 2),
@@ -11175,12 +11175,52 @@ static CLDR_REFS: [(u32, u32); 11132] = [
     (260527, 6),
 ];
 
+// `CLDR_REFS_SOURCE` is used only during const evaluation; keep one shared runtime array so
+// indexing this large directory does not risk materialization at each `text` call site.
+static CLDR_REFS: [(u32, u32); 11132] = CLDR_REFS_SOURCE;
+
+const fn cldr_text_range_is_valid(bytes: &[u8], start: usize, len: usize) -> bool {
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return false,
+    };
+    if end > bytes.len() {
+        return false;
+    }
+
+    // `include_str!` already guarantees valid UTF-8. In valid UTF-8, a byte offset is a
+    // character boundary exactly when it is the end of the string or is not a continuation byte.
+    let start_is_boundary = start == bytes.len() || bytes[start] & 0b1100_0000 != 0b1000_0000;
+    let end_is_boundary = end == bytes.len() || bytes[end] & 0b1100_0000 != 0b1000_0000;
+    start_is_boundary && end_is_boundary
+}
+
+const fn cldr_refs_are_valid(bytes: &[u8], refs: &[(u32, u32)]) -> bool {
+    let mut index = 0;
+    while index < refs.len() {
+        let (offset, len) = refs[index];
+        if !cldr_text_range_is_valid(bytes, offset as usize, len as usize) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    cldr_refs_are_valid(CLDR_STRINGS.as_bytes(), &CLDR_REFS_SOURCE),
+    "generated CLDR number text ranges must be in-bounds UTF-8 slices"
+);
+
 #[inline]
 fn text(id: TextId) -> &'static str {
     let (offset, len) = CLDR_REFS[id as usize];
     let start = offset as usize;
     let end = start + len as usize;
-    &CLDR_STRINGS[start..end]
+    // SAFETY: the ID lookup above remains bounds-checked. CLDR_REFS is initialized from
+    // CLDR_REFS_SOURCE, and the compile-time assertion validates every source range for checked
+    // addition, blob bounds, and UTF-8 boundaries before this unchecked slice is reachable.
+    unsafe { CLDR_STRINGS.get_unchecked(start..end) }
 }
 
 #[derive(Clone, Copy)]

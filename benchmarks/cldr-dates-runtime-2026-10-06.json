@@ -1942,5 +1942,33 @@
       "path": "benchmarks/intl-dates-construct.js",
       "sha256": "219379e6298710b9219167b4462b6e3795ddcae4fd26517a055095a6db37f1d3"
     }
-  ]
+  ],
+  "measurement_provenance_revalidation": {
+    "matched_preparation_limit": "Hashes and allocation metadata were recorded; filefrag contained delalloc/unknown_loc entries, so physical extents were not confirmed settled.",
+    "historical_first_pass_gate_flags": [
+      {
+        "workload": "ejs",
+        "metric": "system_seconds",
+        "ratio": 1.0979654519486357,
+        "ci95": [
+          1.0722116371767392,
+          1.1347260945694457
+        ],
+        "preserve": true
+      }
+    ],
+    "confirmation_analysis_ref": "source_records.confirmation_analysis",
+    "predeclared_confirmation": {
+      "pairs_original_plus_confirmation": 26,
+      "ejs_system_seconds_ratio": 0.9940224477334536,
+      "ejs_system_seconds_ci95": [
+        0.9432717168235754,
+        1.0799731922257454
+      ],
+      "matched_copy_aa_pairs": 12,
+      "aa_binary_sha256": "5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9",
+      "current_gate_crossings": [],
+      "resolution": "The historical first-six flag is retained; the predeclared combined result does not cross the unchanged gate."
+    }
+  }
 }

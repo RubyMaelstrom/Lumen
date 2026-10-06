@@ -1,0 +1,88 @@
+CLDR number text validation — 6 October 2026
+==========================================
+
+Validate the generated NumberFormat text directory at compile time instead
+of repeating string-range checks at every runtime access. The warmed formatting
+fixture takes about 0.9% less time than the compact-Intl baseline. This repair
+reduces the earlier table-compaction cost; it is not a broad engine speedup.
+
+All 11132 offset/length pairs are checked for addition overflow, blob bounds
+and UTF-8 boundaries. include_str! validates the blob's encoding. The runtime
+ID array lookup remains bounds-checked, and one shared static directory
+supplies a documented unchecked string slice. The generator emits the same
+proof. IDs, all reference pairs and the 260533-byte blob are unchanged. No
+runtime cache or allocation is added, and no author-visible option is assumed
+immutable. These are constant-time boundary checks, not a string search.
+
+The standalone source is based on 8988b37c9c6064d00d62e1e5b76bb39d9851fc83,
+patch affe5fae9f1a2db78c4015afdc4be9911ffc00d5b383225d5ff46095564b8648.
+Candidate engine SHA256:
+031ced2ac3cc9b3cba67f0c856d7070d778ecab0c56987fbfb872c31c1d3c4aa.
+Baseline engine SHA256:
+5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9.
+Executable sizes are 17343120 and 17346000 bytes respectively.
+
+Measured repair and limits
+--------------------------
+
+Native ARM64 Linux 7.2.7-crystal, CPU 5, Rust 1.99.0 b940084d7 / LLVM 23.1.1.
+Release opt-level 3, fat LTO, one codegen unit, panic=abort, default intl + embed;
+ordinary JIT and uninstrumented acceptance timings. Six balanced fresh-process
+pairs per application/control and sixty startup pairs; paired 10000-resample
+95% bootstrap intervals. Outputs matched and no owned builds, tests or profilers
+overlapped the timing windows. Ratios below are candidate/baseline; wall time
+means wait4 direct-child time, separately from Python/taskset/helper overhead.
+
+Against the compact-Intl baseline, NumberFormat warm wall time is .990850
+[.983585, .996842]. Other application/control primary timers stay near parity.
+The first six EJS system-CPU pairs flagged 1.104047 [1.010137, 1.121342]. The
+predeclared twenty-pair confirmation is .994962 [.948775, 1.029035]; all 26
+pairs give 1.011588 [.974622, 1.041841]. The separate twelve-pair identical-byte
+control is retained. The combined evidence has no crossing of the unchanged
+per-metric >3% median / confidence-interval regression rule. The first flag
+and all original samples remain recorded; no A/A subtraction is applied.
+
+A separate twelve-pair comparison directly against the date-only baseline
+tests the earlier NumberFormat regression. Warm wall time is 1.007886
+[1.001900, 1.010852], and user CPU is 1.007892 [1.002731, 1.012022]. That is
+about 0.8% residual cost, below the 3% gate, not parity or full cost removal.
+Construction wall time is .999731 [.996361, 1.001655]. This result applies to
+the revised candidate; the previous compact-table binary retains its recorded
+3.014% warm user-CPU flag.
+
+A direct sixty-pair comparison from the native-array baseline to this proof
+candidate measures the cumulative table changes: startup child wall .647394
+[.635314, .659536] and peak RSS .609117 [.599145, .620481], reductions of 35.3%
+and 39.1%. Python-parent wall is separately .699237. This is a direct comparison,
+not multiplied stage ratios, and it excludes the later array-pair optimization.
+The proof alone did not produce those cumulative startup gains.
+
+Fresh non-reflink copies were prepared once with hashes and allocation metadata
+recorded. Some filefrag extents remained delalloc/unknown_loc; settled physical
+allocation is not established. Additive provenance corrections in the date/Intl
+records preserve the earlier same-byte artifact-preparation confound and the
+new matched comparisons without rewriting history.
+
+Validation
+----------
+
+All five focused proof/table tests pass on the standalone source and again
+on main with the array-pair change present. The standalone release engine and
+Test262 runner build passed. The integrated source also passes all 13 focused
+array checks, workspace/all-target checks, formatting and generator syntax.
+NumberFormat Test262: 249 pass, 0 fail, 0 skip,
+all_executed_passed=true, default JIT; suite revision
+d86b2294eb0a17eaa281ff12c73c473ec864c72f. The first launch aborted while writing
+a temporary path list under /tmp (EDQUOT); the same runner passed with TMPDIR
+under /big. Both launch records and the full conformance report are preserved.
+
+The 11132 references and blob were audited unchanged, and the generator's
+proof/accessor emission was checked against the generated source. Raw CLDR
+inputs were not re-fetched and full generation was not rerun for this change.
+No fresh x86-64 or wasm32 execution is claimed. Standalone performance results
+are not measurements of the later combined array+proof integration.
+
+Exact source identities, timing samples and validation/provenance records:
+benchmarks/cldr-number-text-proof-2026-10-06.json. Local frozen candidate:
+benchmark-results/cldr-number-text-proof-20261006/artifacts. This source
+acceptance does not promote or install a release artifact.

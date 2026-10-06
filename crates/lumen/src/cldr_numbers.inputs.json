@@ -9,7 +9,7 @@
   "currency_unit_record_count": 27,
   "distinct_input_count": 49,
   "generator": "scripts/gen-cldr-numbers.py",
-  "generator_sha256": "909c6cc07a65ace3afde754985ffdab4889b27efc68dc55df1f9e818208eb3f1",
+  "generator_sha256": "3171ddced7afe0d88d1e141d1127f085b6da4e57dadc0310e86ec284c8d40c2d",
   "input_url_base": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json",
   "inputs": [
     {
@@ -214,7 +214,7 @@
     "path": "crates/lumen/src/cldr_numbers.rs",
     "sha256": "57064f5dadeeea45a051ed5ef87c45a90af50f8679ac15a5d65deba24badc0a4"
   },
-  "packed_source_sha256": "6b7f23538bd5fab777211839f16740cc437559d7099ff317d0022a388d076599",
+  "packed_source_sha256": "a5df9c002fc4de5aae72791f7d145662930b2ea72111eeb6a3d02d9ac75ea096",
   "pattern_record_count": 203,
   "string_blob_bytes": 260533,
   "string_blob_path": "crates/lumen/src/cldr_numbers.data",
