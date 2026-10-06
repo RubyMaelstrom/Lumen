@@ -26,7 +26,8 @@ fn sql_sqlite_adapter_binds_templates_helpers_and_transactions() {
     });
     let source = r#"
       (async () => {
-        const fs = require("node:fs"), queryPath = `/tmp/lumen-sql-query-${process.pid}.sql`;
+        const fs = require("node:fs");
+        const queryPath = require("node:path").join(require("node:os").tmpdir(), `lumen-sql-query-${process.pid}.sql`);
         const sql = Bun.SQL("sqlite://:memory:");
         console.log("shape", sql instanceof Bun.SQL, typeof sql, sql.options.adapter, typeof Bun.postgres, Bun.postgres.options.adapter);
         await sql.unsafe("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)");
