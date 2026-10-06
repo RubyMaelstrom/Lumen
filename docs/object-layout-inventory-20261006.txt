@@ -1,0 +1,88 @@
+Live property inventory diagnostic
+==================================
+
+Validated diagnostic infrastructure, 2026-10-06. Ordinary builds compile it out.
+
+Purpose
+-------
+The `architecture-diagnostics` feature can emit a bounded live property inventory from the
+engine's existing Rc heap. This is diagnostic instrumentation for object-layout analysis, not
+an optimization and not a performance result. It measures the current 16-byte `Property`
+representation, including named `Props.entries` and the inline/heap dense-property storage;
+those slots are not 8-byte packed values in this source revision.
+
+For each successfully borrowed live object, the inventory counts named descriptors and classic
+indexed descriptors separately, data/accessor flags, holes and lazy function-prototype values,
+physical vector capacities, and populations eligible for a compact default-data representation.
+It also records length histograms for nonempty all-default W/E/C entry vectors and for dense
+inline active prefixes. Dense eligibility allows the existing `PACK_EMPTY` hole representation.
+The vector histograms report map/sidecar populations, initialized live length and reserved slot
+capacity; reserved capacity is not allocated object count or total process memory.
+
+This census eligibility is only an upper bound on a possible representation change, not the
+compact prototype's admission count. The current prototype has narrower guards: it excludes
+canonical-index entries, symbol-sidecar objects, and arrays, and initially admits only plain
+templates. The diagnostic's `holes` count means slots tagged internally as `Value::Empty`; it
+does not establish that every such slot is semantically an absent property (classic-index reads
+can retain a descriptor). For dense sidecars, inline-length bucket 0 also includes values moved
+to heap storage; it is not a count of empty JavaScript arrays.
+
+The report runs at the completed-GC-generation boundary. Each sample is a snapshot of the live
+registry at that point. “Maximum observed” means the largest value among these discrete samples,
+not a peak between collections; the cumulative allocation ordinal is a different counter and
+must not be presented as live residency or cumulative live property bytes. Any property-layout
+proposal still needs allocation, GC, object-body, allocator, and RSS measurements before making
+a savings claim.
+
+The probe records counters and static Rust allocation locations, not JavaScript owners. Its
+tracking is bounded: at most 256 `(file, line, initial exotic family)` birth sites are retained,
+and birth records are indexed only for registry slots below 262,144. Live family totals and
+property inventories include every successfully borrowed scanned object even when its birth
+site is unavailable. `untracked_birth_sites` marks incomplete site attribution; do not derive
+total populations or site shares from the tracked site list. A failed object borrow is reported
+separately in `unavailable_borrows`.
+
+Validation and provenance
+-------------------------
+Validated in isolated source worktree `/big/Code/Lumen/benchmark-results/property-inventory-20261006-worktree-63f2`
+on base revision `63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2`. The instrumentation change is only
+`crates/lumen/src/allocation_diagnostics.rs`; its full patch remains in the local investigation directory named below.
+
+The following checks passed in that isolated tree:
+
+- `cargo test -p lumen --lib --features architecture-diagnostics allocation_diagnostics::tests::` — 5 passed, 0 failed.
+- `cargo check -p lumen --features architecture-diagnostics` — passed.
+- `cargo check -p lumen --no-default-features --features architecture-diagnostics` — passed.
+- `CARGO_BUILD_JOBS=3 cargo build --release -p lumen --features embed,architecture-diagnostics --bin lumen` — passed.
+
+The frozen release binary was run at `--tier=jit` on the recorded React, Vue, Djot, and EJS
+inputs. All four commands exited 0. Their exact input/log paths and SHA-256 hashes are in
+`benchmarks/object-layout-inventory-2026-10-06.json`; raw logs are preserved in `runs-v2/`. The binary and
+source hashes are included there as well. These diagnostic runs are not acceptance timings and
+make no speed, memory, or optimization-gain claim.
+
+EJS collection 10 example
+-------------------------
+The EJS run produced 11 post-GC samples. Collection 10 is the largest scanned sample:
+1,012,508 objects were successfully borrowed, with zero unavailable borrows and 750,364 objects
+without a tracked birth-site label. Collection 11, the final sample, scanned only 1,686 objects;
+it is not a substitute for collection 10. The complete collection-10 histogram and population
+counts are recorded exactly in the JSON manifest.
+
+At collection 10, 897,146 nonempty entry vectors met the all-default W/E/C data rule. They held
+2,657,840 initialized entries and had capacity for 2,660,275 `Property` slots. This is current
+reserved slot capacity (42,564,400 bytes at 16 bytes per `Property`), not projected savings.
+It is census eligibility, not the number of maps the narrower compact prototype would convert.
+The length distribution is concentrated at 2-entry maps (501,567), followed by 4-entry maps
+(167,700), then 5–8 entries (160,774). The dense inline census found 92,039 sidecars reserving
+920,390 slots total; 90,955 met the all-default-data-or-hole rule, with 177,613 active inline
+entries. A separate histogram shows the active-length distribution, including 597 sidecars at
+length 9–10.
+
+EJS's total/family inventory includes all scanned objects, but its 750,364 untracked birth sites
+make site-level attribution incomplete. The collection-10 total describes one observed live
+sample only. It does not establish the composition at other times, a peak, an allocation-rate
+distribution, or the cause of any performance or memory result.
+
+Full detailed samples, metricwise summaries, source diff, release binary, and raw diagnostic
+logs remain under `/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/`.

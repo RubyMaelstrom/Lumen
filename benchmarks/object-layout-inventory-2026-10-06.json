@@ -1,0 +1,551 @@
+{
+  "artifact": "Live property inventory diagnostic",
+  "status": "validated diagnostic infrastructure; not a performance acceptance",
+  "purpose": "Bounded post-GC census of live object property storage and compact-layout eligibility. Not a performance result or optimization claim.",
+  "source": {
+    "base_revision": "63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2",
+    "source_head": "63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2",
+    "isolated_worktree": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-worktree-63f2",
+    "changed_file": "crates/lumen/src/allocation_diagnostics.rs",
+    "changed_file_sha256": "8f1c32b5872f2a339e8d29553115d51e572d0f3dd2d962227f2bd828b785e522",
+    "patch": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/property-inventory-final.patch",
+    "patch_sha256": "ccede774c662c733d5e910a5b56cea3a7e81101d845efcdcb39dbf192030c3d1"
+  },
+  "instrumentation": {
+    "feature": "architecture-diagnostics",
+    "feature_gated": true,
+    "report_boundary": "immediately after each completed GC generation",
+    "retention": "Counters, allocation ordinals, static Rust source locations, and family labels only; no JavaScript objects or owners are retained.",
+    "family_taxonomy": [
+      "ordinary",
+      "callable",
+      "array",
+      "arguments",
+      "error",
+      "wrapper",
+      "side_table"
+    ],
+    "caps": {
+      "site_keys": 256,
+      "site_key": "(file, line, initial exotic family)",
+      "birth_records_registry_slots": 262144,
+      "overflow_behavior": "Objects remain in total/family inventories when successfully borrowed; site attribution is marked untracked when no birth label is available."
+    },
+    "descriptor_masks": {
+      "data_wec_bits": {
+        "writable": 1,
+        "enumerable": 2,
+        "configurable": 4
+      },
+      "accessor_attribute_bits": {
+        "enumerable": 1,
+        "configurable": 2
+      },
+      "accessor_endpoint_bits": {
+        "getter": 1,
+        "setter": 2
+      },
+      "default_data_rule": "writable, enumerable, configurable data property; holes and accessors are excluded for named entry vectors.",
+      "dense_default_or_hole_rule": "writable, enumerable, configurable data properties or existing PACK_EMPTY holes.",
+      "hole_interpretation": "The diagnostic holes counter counts slots whose internal value tag is Value::Empty; it does not prove semantic property absence for every backing (classic-index reads can retain a descriptor)."
+    },
+    "storage_representation": {
+      "property_size_bytes": 16,
+      "named_entries": "Vec<Property> capacity; key spelling is classified separately as named or classic-index entry.",
+      "dense_inline": "10 inline Property slots per dense sidecar.",
+      "dense_heap": "Vec<Property> capacity.",
+      "interpretation": "Reported eligible slot bytes are current reserved capacity times 16 bytes per Property, not projected savings."
+    },
+    "histogram_buckets": {
+      "eligible_entry_vectors": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          8
+        ],
+        [
+          9,
+          16
+        ],
+        [
+          17,
+          32
+        ],
+        [
+          33,
+          null
+        ]
+      ],
+      "dense_inline_active_prefix": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          8
+        ],
+        [
+          9,
+          10
+        ]
+      ],
+      "histogram_fields": [
+        "populations",
+        "live_length",
+        "reserved_capacity"
+      ],
+      "dense_inline_active_prefix_semantics": "Bucket 0 includes sidecars whose active values are heap-spilled and therefore have an empty inline prefix; it does not count empty JavaScript arrays."
+    },
+    "prototype_admission": {
+      "relationship_to_census": "All-default-map census eligibility is an upper bound, not the compact prototype actual conversion/admission count.",
+      "current_narrower_scope": "The current prototype excludes canonical-index entries, symbol-sidecar objects, and arrays; initial admission is limited to plain templates."
+    }
+  },
+  "validation": {
+    "checks": [
+      {
+        "command": "cargo test -p lumen --lib --features architecture-diagnostics allocation_diagnostics::tests::",
+        "result": "5 passed, 0 failed"
+      },
+      {
+        "command": "cargo check -p lumen --features architecture-diagnostics",
+        "result": "passed"
+      },
+      {
+        "command": "cargo check -p lumen --no-default-features --features architecture-diagnostics",
+        "result": "passed"
+      },
+      {
+        "command": "CARGO_BUILD_JOBS=3 cargo build --release -p lumen --features embed,architecture-diagnostics --bin lumen",
+        "result": "passed"
+      }
+    ],
+    "release_build_command": "CARGO_BUILD_JOBS=3 cargo build --release -p lumen --features embed,architecture-diagnostics --bin lumen",
+    "private_build_paths": {
+      "CARGO_TARGET_DIR": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/target",
+      "TMPDIR": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/tmp"
+    },
+    "release_binary": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/target/release/lumen",
+    "release_binary_sha256": "d50f55ab3fe106157ed2182bba4e43084523f2f8f870c1775ebaba00417a00fe",
+    "diagnostic_command_template": "target/release/lumen --tier=jit INPUT (stdout and stderr captured to runs-v2/*.log)"
+  },
+  "workloads": {
+    "react": {
+      "input_path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
+      "input_sha256": "c28e971ed3bdec660b0983351fc5b276032e9ad8ce9da35510dd4fe3021184f1",
+      "tier": "jit",
+      "exit_status": 0,
+      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/react.log",
+      "raw_log_sha256": "31be0dd550e4f9b763c780d7f910c80f5d07ea8b5427e56d988028737149cabf",
+      "post_gc_samples": 1,
+      "final_sample": {
+        "collection": 1,
+        "scanned_objects": 1014,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 0
+      },
+      "max_scanned_sample": {
+        "collection": 1,
+        "scanned_objects": 1014,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 0
+      }
+    },
+    "vue": {
+      "input_path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
+      "input_sha256": "3cdd03b33caf362f3541bbc2d7a5bcd4c8daa6f48dce627c0e30bd35cc8589b5",
+      "tier": "jit",
+      "exit_status": 0,
+      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/vue.log",
+      "raw_log_sha256": "c83fa95e1c1e4c95c093b8769e5c2a86d79283eaa816331eab45e026381b6c95",
+      "post_gc_samples": 3,
+      "final_sample": {
+        "collection": 3,
+        "scanned_objects": 20460,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 0
+      },
+      "max_scanned_sample": {
+        "collection": 3,
+        "scanned_objects": 20460,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 0
+      }
+    },
+    "djot": {
+      "input_path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
+      "input_sha256": "63036f9ffa08b57d3fad97c170762eb39cb7a4220fc01f7b9bf616185667875b",
+      "tier": "jit",
+      "exit_status": 0,
+      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/djot.log",
+      "raw_log_sha256": "f1f5afb38fca8d94a4da75accdea82a7766d6cf39ef8391952473491a2054011",
+      "post_gc_samples": 4,
+      "final_sample": {
+        "collection": 4,
+        "scanned_objects": 8034,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 0
+      },
+      "max_scanned_sample": {
+        "collection": 4,
+        "scanned_objects": 8034,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 0
+      }
+    },
+    "ejs": {
+      "input_path": "/big/Code/Lumen/examples/ejs/code.js",
+      "input_sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c",
+      "tier": "jit",
+      "exit_status": 0,
+      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/ejs.log",
+      "raw_log_sha256": "469536adac418856c4f8396f631c7c675ae91cdc8c4b978311a224e08b5b0d89",
+      "post_gc_samples": 11,
+      "final_sample": {
+        "collection": 11,
+        "scanned_objects": 1686,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 168
+      },
+      "max_scanned_sample": {
+        "collection": 10,
+        "scanned_objects": 1012508,
+        "unavailable_borrows": 0,
+        "untracked_birth_sites": 750364
+      }
+    }
+  },
+  "ejs_max_scanned_collection_10": {
+    "collection": 10,
+    "allocations_cumulative_at_sample": 3483617,
+    "scanned_objects": 1012508,
+    "unavailable_borrows": 0,
+    "untracked_birth_sites": 750364,
+    "family_live_objects": {
+      "ordinary": 897472,
+      "callable": 1166,
+      "array": 113865,
+      "arguments": 0,
+      "error": 0,
+      "wrapper": 3,
+      "side_table": 2
+    },
+    "total_inventory": {
+      "live_objects": 1012508,
+      "entries_len": 2775664,
+      "entries_capacity": 2785628,
+      "entries_unused_capacity": 9964,
+      "entries_capacity_bytes": 44570048,
+      "named_entries": {
+        "slots": 2775447,
+        "data": 2775266,
+        "default_wec_data": 2657627,
+        "exceptional_data_mask_counts_0_to_7": [
+          136,
+          114249,
+          0,
+          2,
+          2393,
+          859,
+          0,
+          0
+        ],
+        "accessors": 181,
+        "accessor_enumerable_configurable_mask_counts_0_to_3": [
+          0,
+          0,
+          181,
+          0
+        ],
+        "accessor_getter_setter_mask_counts_0_to_3": [
+          0,
+          173,
+          0,
+          8
+        ],
+        "holes": 0,
+        "lazy_prototype_values": 157
+      },
+      "classic_index_entries": {
+        "slots": 217,
+        "data": 217,
+        "default_wec_data": 217,
+        "exceptional_data_mask_counts_0_to_7": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "accessors": 0,
+        "accessor_enumerable_configurable_mask_counts_0_to_3": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "accessor_getter_setter_mask_counts_0_to_3": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "holes": 0,
+        "lazy_prototype_values": 0
+      },
+      "entry_vec_eligibility": {
+        "vecs": 1012508,
+        "empty_vecs": 11,
+        "empty_reserved_capacity": 0,
+        "empty_reserved_property_bytes": 0,
+        "nonempty_vecs": 1012497,
+        "nonempty_all_default_wec_data_vecs": 897146,
+        "eligible_live_length": 2657840,
+        "eligible_reserved_capacity": 2660275,
+        "eligible_reserved_property_bytes": 42564400,
+        "eligible_length_histogram": [
+          {
+            "min_len": 1,
+            "max_len": 1,
+            "populations": 33383,
+            "live_length": 33383,
+            "reserved_capacity": 33439
+          },
+          {
+            "min_len": 2,
+            "max_len": 2,
+            "populations": 501567,
+            "live_length": 1003134,
+            "reserved_capacity": 1003293
+          },
+          {
+            "min_len": 3,
+            "max_len": 3,
+            "populations": 33712,
+            "live_length": 101136,
+            "reserved_capacity": 101200
+          },
+          {
+            "min_len": 4,
+            "max_len": 4,
+            "populations": 167700,
+            "live_length": 670800,
+            "reserved_capacity": 670800
+          },
+          {
+            "min_len": 5,
+            "max_len": 8,
+            "populations": 160774,
+            "live_length": 846823,
+            "reserved_capacity": 846823
+          },
+          {
+            "min_len": 9,
+            "max_len": 16,
+            "populations": 1,
+            "live_length": 16,
+            "reserved_capacity": 16
+          },
+          {
+            "min_len": 17,
+            "max_len": 32,
+            "populations": 5,
+            "live_length": 121,
+            "reserved_capacity": 160
+          },
+          {
+            "min_len": 33,
+            "max_len": null,
+            "populations": 4,
+            "live_length": 2427,
+            "reserved_capacity": 4544
+          }
+        ],
+        "eligibility_rule": "nonempty; every initialized entry must be non-hole default WEC data"
+      },
+      "dense_sidecars": 92039,
+      "dense_sidecar_body_bytes_excluding_inline_property_storage": 7363120,
+      "dense_inline_reserved_property_slots": 920390,
+      "dense_inline_reserved_unused_property_slots": 742777,
+      "dense_inline_reserved_property_bytes": 14726240,
+      "dense_inline_packed_len": 177613,
+      "dense_heap_packed_len": 40729,
+      "dense_heap_packed_vectors": 1002,
+      "dense_heap_packed_vector_header_bytes": 24048,
+      "dense_heap_packed_capacity": 57940,
+      "dense_heap_packed_unused_capacity": 17211,
+      "dense_heap_packed_capacity_bytes": 927040,
+      "packed_dense_fields": {
+        "slots": 218342,
+        "data": 218342,
+        "default_wec_data": 218342,
+        "exceptional_data_mask_counts_0_to_7": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "accessors": 0,
+        "accessor_enumerable_configurable_mask_counts_0_to_3": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "accessor_getter_setter_mask_counts_0_to_3": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "holes": 0,
+        "lazy_prototype_values": 0
+      },
+      "dense_eligibility": {
+        "inline_populations": 90955,
+        "inline_all_default_data_or_holes": 90955,
+        "inline_eligible_live_length": 177613,
+        "inline_eligible_reserved_capacity": 909550,
+        "inline_eligible_reserved_property_bytes": 14552800,
+        "inline_eligible_holes": 0,
+        "inline_sidecar_active_length_histogram": [
+          {
+            "min_len": 0,
+            "max_len": 0,
+            "populations": 1084,
+            "live_length": 0,
+            "reserved_capacity": 10840
+          },
+          {
+            "min_len": 1,
+            "max_len": 1,
+            "populations": 44676,
+            "live_length": 44676,
+            "reserved_capacity": 446760
+          },
+          {
+            "min_len": 2,
+            "max_len": 2,
+            "populations": 26405,
+            "live_length": 52810,
+            "reserved_capacity": 264050
+          },
+          {
+            "min_len": 3,
+            "max_len": 3,
+            "populations": 10788,
+            "live_length": 32364,
+            "reserved_capacity": 107880
+          },
+          {
+            "min_len": 4,
+            "max_len": 4,
+            "populations": 4274,
+            "live_length": 17096,
+            "reserved_capacity": 42740
+          },
+          {
+            "min_len": 5,
+            "max_len": 8,
+            "populations": 4215,
+            "live_length": 25066,
+            "reserved_capacity": 42150
+          },
+          {
+            "min_len": 9,
+            "max_len": 10,
+            "populations": 597,
+            "live_length": 5601,
+            "reserved_capacity": 5970
+          }
+        ],
+        "heap_vectors": 1002,
+        "heap_empty_vectors": 0,
+        "heap_empty_reserved_capacity": 0,
+        "heap_empty_reserved_property_bytes": 0,
+        "heap_all_default_data_or_holes": 1002,
+        "heap_eligible_live_length": 40729,
+        "heap_eligible_reserved_capacity": 57940,
+        "heap_eligible_reserved_property_bytes": 927040,
+        "heap_eligible_holes": 0,
+        "eligibility_rule": "nonempty; every initialized slot is default WEC data or PACK_EMPTY hole"
+      },
+      "dense_index_directory_len": 470,
+      "dense_index_directory_capacity": 772,
+      "dense_index_directory_capacity_bytes": 3088,
+      "dense_numeric_mirror_len": 672,
+      "dense_numeric_mirror_capacity": 768,
+      "dense_numeric_mirror_capacity_bytes": 6144,
+      "dense_string_index_capacity": 5068,
+      "dense_symbol_sidecar_capacity": 208
+    }
+  },
+  "caveats": [
+    "Each result is one discrete post-GC live-registry sample. Max-scanned/max-observed means the largest recorded sample, not a true peak between collections.",
+    "allocations_cumulative_at_sample is an allocation ordinal, not live residency, allocated bytes, or an allocation-rate measure.",
+    "Total and family inventories count successfully borrowed scanned objects. untracked_birth_sites limits source-site interpretation; do not infer that tracked birth sites cover all globals or attribute every untracked object to one specific cap.",
+    "unavailable_borrows are reported separately and are not included as successfully inventoried objects.",
+    "Vector reserved capacity and capacity-bytes do not measure allocator overhead, total heap, RSS, or achievable savings. Eligibility is a census condition, not a prediction that a compact representation is semantically or operationally safe.",
+    "Diagnostic runs exited successfully but are not acceptance timings and establish no speed or memory improvement.",
+    "Census eligibility is not prototype admission: the current compact prototype excludes canonical-index entries, symbol-sidecar objects, and arrays, and initially admits only plain templates.",
+    "The diagnostic holes count is an internal Value::Empty-tag count, not proof of semantic property absence for every backing; classic-index reads can retain a descriptor.",
+    "Dense inline active-prefix bucket 0 includes sidecars with values moved to heap storage and is not a count of empty JavaScript arrays."
+  ],
+  "source_artifacts": {
+    "raw_summary_json": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/inventory-summary-histogram.json",
+    "raw_summary_json_sha256": "60f85e00f89a73142b406fb01193afd468451edf919e0301a3ddc97398c6fbf8",
+    "histogram_summary_markdown": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/inventory-histogram-summary.md",
+    "histogram_summary_markdown_sha256": "d72685dc75ec7dcfb424dd583217e7b5607b4a9e9fb5515dd4dea26c75e661ad",
+    "human_draft": "benchmark-results/property-inventory-20261006-validation/object-layout-inventory-20261006.txt"
+  },
+  "machine": {
+    "platform": "Linux-7.2.7-crystal-aarch64-with-glibc2.44",
+    "machine": "aarch64",
+    "hostname": "crystal",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1"
+  },
+  "integration": {
+    "source_hash_verified": true,
+    "base_revision": "63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2",
+    "ordinary_execution": "the architecture-diagnostics module is feature-gated out; no ordinary runtime path changes"
+  }
+}
