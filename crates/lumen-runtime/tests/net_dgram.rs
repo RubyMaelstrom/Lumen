@@ -334,6 +334,8 @@ fn net_address_math_still_real() {
 #[cfg(unix)]
 #[test]
 fn net_unix_path_accept_and_cleanup() {
+    // Start the peer's connect deadline only after the runtime has been initialized.
+    let (mut rt, out) = test_runtime();
     let path = std::env::temp_dir().join(format!(
         "lumen-net-{}-{}.sock",
         std::process::id(),
@@ -354,7 +356,6 @@ fn net_unix_path_accept_and_cleanup() {
         }
         panic!("connect to lumen Unix server at {}", peer_path.display());
     });
-    let (mut rt, out) = test_runtime();
     eval_ok(
         &mut rt,
         &format!(
