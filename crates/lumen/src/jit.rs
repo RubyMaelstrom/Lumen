@@ -154,6 +154,42 @@ pub(crate) fn test_local_array_fusion_hits() -> [u64; 5] {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_tdz_array_pair_hits() -> [u64; 2] {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        regions::tdz_array_pair_hits()
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )))]
+    {
+        [0, 0]
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_tdz_effect_paths() -> [u64; 5] {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        regions::tdz_effect_paths()
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )))]
+    {
+        [0, 0, 0, 0, 0]
+    }
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -12381,6 +12417,246 @@ fn emit_elem_local_keyed(
         // from their canonical post-call slots before execution continues in the region.
         plan.reload(a, slow_reload_fail);
     }
+    a.bind(done);
+}
+
+/// Guard the one-iteration `HasProperty`/`Get` pair used by self-hosted array methods.
+/// On success, x12 contains a cloneable own data value (borrowed from the rooted array);
+/// no owner is acquired and no frame state is changed. Every failure happens before the
+/// caller runs either TDZ clear, so it can replay both local loads and the original `In`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_local_own_dense_data_guard(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    receiver_off: u32,
+    key: KeySrc,
+    slow: usize,
+) {
+    let rcv = layout.obj_from_rc as u32;
+    let ex = layout.obj_exotic as u32;
+    let plain = layout.obj_ic_plain as u32;
+    let el = (layout.obj_props + layout.props_elems) as u32;
+    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
+    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
+    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
+    let ev = layout.entry_value as i32;
+    let ea = layout.entry_accessor as u32;
+    let es = layout.entry_size as u64;
+    let none_tag = layout.exotic_none_tag as u32;
+    let arr_tag = layout.exotic_array_tag as u32;
+
+    // In source order the key local is loaded before the receiver local. Merely probing
+    // either canonical slot is non-observable; any TDZ value misses to the original PC,
+    // which performs the reads and throws in the specified order.
+    emit_exec_word_load(a, 9, 22, receiver_off as i32);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    match key {
+        KeySrc::Slot(offset) => {
+            emit_exec_word_load(a, 9, 22, offset as i32);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
+        }
+        KeySrc::DReg(reg) => a.fmov_d_d(0, reg),
+        KeySrc::Stack | KeySrc::SlotPre(..) => {
+            unreachable!("the TDZ array pair has a local, non-updating key")
+        }
+    }
+    // Only a Number which is exactly a u32 can name the guarded dense slot. This also
+    // rejects fractional, negative, NaN, infinite, and out-of-range keys without invoking
+    // ToPropertyKey; all of those replay the original operation before either TDZ clear.
+    a.fcvtzu_w_d(9, 0);
+    a.ucvtf_d_w(1, 9);
+    a.fcmp(0, 1);
+    a.b_cond(C_NE, slow);
+
+    emit_exec_word_load(a, 10, 22, receiver_off as i32);
+    emit_exec_payload(a, 10, 10);
+    a.add_imm(11, 10, rcv);
+    a.ldrb_imm(12, 11, ex);
+    let exotic_ok = a.new_label();
+    a.cmp_imm_w(12, none_tag);
+    a.b_cond(C_EQ, exotic_ok);
+    a.cmp_imm_w(12, arr_tag);
+    a.b_cond(C_NE, slow);
+    a.bind(exotic_ok);
+    // `ic_plain` excludes proxies and all objects whose property lookup can invoke an
+    // exotic internal method. Array's indexed exotic behavior is already represented by
+    // its live dense sidecar, while this flag rules out any other side-table behavior.
+    a.ldrb_imm(12, 11, plain);
+    a.cbz(12, false, slow);
+    a.ldr_imm(12, 11, el);
+    a.cbz(12, true, slow);
+
+    let classic_dense = a.new_label();
+    let entry_ready = a.new_label();
+    if packed_elem_inlinable(layout) {
+        // Current packed element words place the descriptor flags beside its value.
+        // The legacy branch below covers dense buffers without packed element storage.
+        emit_packed_elements_base(a, layout, classic_dense);
+        a.cmp_reg_x(9, 14);
+        a.b_cond(C_HS, slow);
+        a.add_shifted(15, 15, 9, 4);
+        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
+        a.ldur(12, 15, layout.property_value as i32);
+        a.b(entry_ready);
+    }
+    a.bind(classic_dense);
+    // A classic dense index names an entry slot; NO_SLOT is a hole. Inherited values are
+    // deliberately not accepted here: the checked HasProperty path handles them.
+    a.ldr_imm(14, 12, evl);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, slow);
+    a.ldr_imm(12, 12, evp);
+    a.add_shifted(12, 12, 9, 2);
+    a.ldr_w_imm(13, 12, 0);
+    a.cmn_imm_w(13, 1);
+    a.b_cond(C_EQ, slow);
+    a.ldr_imm(15, 11, en);
+    a.mov_imm64(16, es);
+    a.madd(15, 13, 16, 15);
+    guard_prop_data(a, 14, 15, ea, slow);
+    if layout.entry_accessor == layout.entry_value + 8 {
+        a.ldur(12, 15, ev);
+    } else {
+        a.ldur(9, 15, ev);
+        a.ldur(13, 15, ev + 8);
+        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 1, slow);
+    }
+    a.bind(entry_ready);
+    // PackedValue's Empty word is the deleted-slot marker, not a language value. BigInt
+    // remains valid for ordinary Get but the existing native clone template deliberately
+    // uses its checked destructor path, so leave it to the original sequence too.
+    a.mov_imm64(14, crate::value::PACK_EMPTY);
+    a.cmp_reg_x(12, 14);
+    a.b_cond(C_EQ, slow);
+    emit_exec_kind(a, 12, 13, 14, slow);
+    a.cmp_imm_w(13, 5); // Value::BigInt's compact execution kind.
+    a.b_cond(C_EQ, slow);
+}
+
+/// After the two TDZ releases, reconstruct the already-guarded descriptor address from
+/// the still-rooted receiver and unchanged numeric key. The immediately preceding
+/// nonfinal-owner guard excludes Object/closure destruction; remaining non-Object drops
+/// cannot run author code or mutate descriptors. Repeat only address derivation, and do
+/// not keep a raw pointer/value across either release. x12 receives the borrowed word.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_local_assumed_dense_data_value(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    receiver_off: u32,
+    key: KeySrc,
+    slow: usize,
+) {
+    let rcv = layout.obj_from_rc as u32;
+    let el = (layout.obj_props + layout.props_elems) as u32;
+    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
+    let ev = layout.entry_value as i32;
+    let es = layout.entry_size as u64;
+    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
+
+    match key {
+        KeySrc::Slot(offset) => {
+            emit_exec_word_load(a, 9, 22, offset as i32);
+            a.fmov_d_x(0, 9);
+        }
+        KeySrc::DReg(reg) => a.fmov_d_d(0, reg),
+        KeySrc::Stack | KeySrc::SlotPre(..) => {
+            unreachable!("the TDZ array pair has a local, non-updating key")
+        }
+    }
+    // These conversions are guard-free because the pre-effect arm proved an exact u32 and
+    // no author code/re-entrant operation can modify an unexposed numeric home or slot.
+    a.fcvtzu_w_d(9, 0);
+    emit_exec_word_load(a, 10, 22, receiver_off as i32);
+    emit_exec_payload(a, 10, 10);
+    a.add_imm(11, 10, rcv);
+    a.ldr_imm(12, 11, el);
+
+    let classic_dense = a.new_label();
+    let entry_ready = a.new_label();
+    if packed_elem_inlinable(layout) {
+        emit_packed_elements_base(a, layout, classic_dense);
+        a.add_shifted(15, 15, 9, 4);
+        a.ldur(12, 15, layout.property_value as i32);
+        a.b(entry_ready);
+    }
+    a.bind(classic_dense);
+    a.ldr_imm(12, 12, evp);
+    a.add_shifted(12, 12, 9, 2);
+    a.ldr_w_imm(13, 12, 0);
+    a.ldr_imm(15, 11, en);
+    a.mov_imm64(16, es);
+    a.madd(15, 13, 16, 15);
+    if layout.entry_accessor == layout.entry_value + 8 {
+        a.ldur(12, 15, ev);
+    } else {
+        a.ldur(9, 15, ev);
+        a.ldur(13, 15, ev + 8);
+        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 1, slow);
+    }
+    a.bind(entry_ready);
+}
+
+/// Prove that clearing these two locals cannot destroy an Object. Object destruction can
+/// drop host closures, whose Rust destructors may use a foreign `Ctx` to mutate another live
+/// heap object. Refuse the fused path if either release could be final; if both slots own the
+/// same object, one additional owner beyond those two is required.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(super) fn emit_tdz_objects_nonfinal(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    first_off: u32,
+    second_off: u32,
+    slow: usize,
+) {
+    let first_not_object = a.new_label();
+    let done = a.new_label();
+    let strong = layout.rc_strong_off as i32;
+    let object_tag = (crate::value::PACK_OBJ >> 48) as u32;
+
+    emit_exec_word_load(a, 9, 22, first_off as i32);
+    a.lsr_imm(13, 9, 48);
+    a.movz(14, object_tag, 0);
+    a.cmp_reg_x(13, 14);
+    a.b_cond(C_HI, slow); // reject property-only tags such as PACK_LAZY_PROTO.
+    a.b_cond(C_NE, first_not_object);
+    emit_exec_payload(a, 9, 10);
+    a.ldur(11, 10, strong);
+    a.cmp_imm_x(11, 1);
+    a.b_cond(C_LS, slow);
+
+    // If both locals are the same Object owner, dropping the first leaves the second as
+    // sole owner. Require one more live owner before permitting the second ordered clear.
+    emit_exec_word_load(a, 12, 22, second_off as i32);
+    a.lsr_imm(13, 12, 48);
+    a.cmp_reg_x(13, 14);
+    a.b_cond(C_HI, slow);
+    a.b_cond(C_NE, first_not_object);
+    emit_exec_payload(a, 12, 12);
+    a.cmp_reg_x(12, 10);
+    a.b_cond(C_NE, first_not_object);
+    a.cmp_imm_x(11, 2);
+    a.b_cond(C_LS, slow);
+
+    a.bind(first_not_object);
+    emit_exec_word_load(a, 9, 22, second_off as i32);
+    a.lsr_imm(13, 9, 48);
+    a.movz(14, object_tag, 0);
+    a.cmp_reg_x(13, 14);
+    a.b_cond(C_HI, slow);
+    a.b_cond(C_NE, done);
+    emit_exec_payload(a, 9, 10);
+    a.ldur(11, 10, strong);
+    a.cmp_imm_x(11, 1);
+    a.b_cond(C_LS, slow);
     a.bind(done);
 }
 

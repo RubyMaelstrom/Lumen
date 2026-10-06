@@ -18,6 +18,16 @@ thread_local! {
     // Fast local-source own-element results: three-op GetElem DReg/slot, In DReg/slot,
     // then the older two-op local GetElem region fusion.
     static LOCAL_ARRAY_HITS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+    // Actual successful cross-block HasProperty/TDZ/Get admission, split by numeric-home key.
+    static TDZ_ARRAY_PAIR_HITS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+    // Actual region executions of Tdz grouped by effect/home contract:
+    // tagged Write with another numeric home, tagged Write without one, untagged Write,
+    // numeric-home Full, other Full.
+    static TDZ_EFFECT_PATHS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+    // In / CreateDataPropertyOrThrow sites emitted as frame-independent while this
+    // region carries numeric homes.
+    static INDEPENDENT_EFFECT_LIVE_HOMES: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
     // Native data hit, native absence hit, checked property fallback, region property
     // continuation, numeric result, post-result miss, scalar prefix/local reuse.
     static PROPERTY_PATHS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
@@ -131,6 +141,113 @@ pub(super) fn local_array_hits() -> [u64; 5] {
 }
 
 #[cfg(test)]
+extern "C" fn record_tdz_array_pair_hit(kind: usize) {
+    TDZ_ARRAY_PAIR_HITS.with(|counts| {
+        let mut current = counts.get();
+        current[kind] += 1;
+        counts.set(current);
+    });
+}
+
+#[cfg(test)]
+extern "C" fn record_tdz_array_pair_dreg() {
+    record_tdz_array_pair_hit(0);
+}
+
+#[cfg(test)]
+extern "C" fn record_tdz_array_pair_slot() {
+    record_tdz_array_pair_hit(1);
+}
+
+#[cfg(test)]
+pub(super) fn tdz_array_pair_hits() -> [u64; 2] {
+    TDZ_ARRAY_PAIR_HITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+extern "C" fn record_tdz_effect_path(kind: usize) {
+    TDZ_EFFECT_PATHS.with(|counts| {
+        let mut current = counts.get();
+        current[kind] += 1;
+        counts.set(current);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn tdz_effect_paths() -> [u64; 5] {
+    TDZ_EFFECT_PATHS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn emit_tdz_effect_event(a: &mut asm::Asm, kind: usize) {
+    // The diagnostic callback preserves the registers live across an operation:
+    // a Tdz can occur with both a live operand prefix and numeric/tagged local homes.
+    // d8-d15 are preserved by the AAPCS64 callee; d16-d31 and x0-x17 are saved here.
+    // The d0-d7 scratch registers have no live values at this boundary.
+    const GPR_BYTES: i32 = 144;
+    const FP_BYTES: i32 = 128;
+    const SAVE_BYTES: i32 = GPR_BYTES + FP_BYTES;
+    a.sub_imm(31, 31, SAVE_BYTES as u32);
+    for index in (0..18).step_by(2) {
+        a.stp_off(index, index + 1, index as i32 * 8);
+    }
+    for index in (16..32).step_by(2) {
+        a.stp_d_off(index, index + 1, GPR_BYTES + (index - 16) as i32 * 8);
+    }
+    a.mov_imm64(0, kind as u64);
+    a.mov_imm64(16, record_tdz_effect_path as *const () as u64);
+    a.blr(16);
+    for index in (16..32).step_by(2).rev() {
+        a.ldp_d_off(index, index + 1, GPR_BYTES + (index - 16) as i32 * 8);
+    }
+    for index in (0..18).step_by(2).rev() {
+        a.ldp_off(index, index + 1, index as i32 * 8);
+    }
+    a.add_imm(31, 31, SAVE_BYTES as u32);
+}
+
+#[cfg(test)]
+extern "C" fn record_independent_effect_live_home(kind: usize) {
+    INDEPENDENT_EFFECT_LIVE_HOMES.with(|counts| {
+        let mut current = counts.get();
+        current[kind] += 1;
+        counts.set(current);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn independent_effect_live_home_paths() -> [u64; 2] {
+    INDEPENDENT_EFFECT_LIVE_HOMES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn emit_independent_effect_live_home_event(a: &mut asm::Asm, kind: usize) {
+    // This test-only event runs at an Independent In/CreateDataProperty site with
+    // numeric homes still resident in ABI-preserved D registers. Preserve the
+    // rest of the live machine state across the diagnostic callback.
+    const GPR_BYTES: i32 = 144;
+    const FP_BYTES: i32 = 128;
+    const SAVE_BYTES: i32 = GPR_BYTES + FP_BYTES;
+    a.sub_imm(31, 31, SAVE_BYTES as u32);
+    for index in (0..18).step_by(2) {
+        a.stp_off(index, index + 1, index as i32 * 8);
+    }
+    for index in (16..32).step_by(2) {
+        a.stp_d_off(index, index + 1, GPR_BYTES + (index - 16) as i32 * 8);
+    }
+    a.mov_imm64(0, kind as u64);
+    a.mov_imm64(16, record_independent_effect_live_home as *const () as u64);
+    a.blr(16);
+    for index in (16..32).step_by(2).rev() {
+        a.ldp_d_off(index, index + 1, GPR_BYTES + (index - 16) as i32 * 8);
+    }
+    for index in (0..18).step_by(2).rev() {
+        a.ldp_off(index, index + 1, index as i32 * 8);
+    }
+    a.add_imm(31, 31, SAVE_BYTES as u32);
+}
+
+#[cfg(test)]
 pub(super) fn emit_lowering_event(a: &mut asm::Asm, function: u64) {
     // Record before computing the predicate; a C call clobbers NZCV and volatile GPRs.
     a.sub_imm(31, 31, 128);
@@ -165,6 +282,162 @@ pub(super) struct Plan {
     /// producer executes first and guards its actual result at the post-effect PC.
     numeric_results: crate::fasthash::FastSet<usize>,
     borrowed_methods: crate::fasthash::FastSet<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct TdzArrayPair {
+    key: u16,
+    receiver: u16,
+    value: u16,
+    mapped: u16,
+    continuation: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TdzArrayEmission {
+    pattern: TdzArrayPair,
+    pre_fail: usize,
+    post_fail: usize,
+    continuation: usize,
+}
+
+/// The self-hosted map/filter loop has a HasProperty branch followed by two iteration-local
+/// TDZ clears and a GetElem. Fuse only the exact source/CFG shape: misses before either clear
+/// replay the two local loads and In from their first source PC; no landing or side entry may
+/// enter the clear/read sequence; and its true edge is the body's sole predecessor. The emitter
+/// later provides a private post-StoreLocal join.
+fn tdz_array_pair_at(
+    ops: &[Op],
+    cfg: &Cfg,
+    plan: &Plan,
+    source_targets: &[bool],
+    pc: usize,
+) -> Option<TdzArrayPair> {
+    let end = pc.checked_add(10)?;
+    if end >= ops.len() || end >= source_targets.len() {
+        return None;
+    }
+    let (
+        Op::LoadLocal(key),
+        Op::LoadLocal(receiver),
+        Op::In,
+        Op::JumpIfFalse(false_target),
+        Op::Tdz(value),
+        Op::Tdz(mapped),
+        Op::LoadLocal(body_receiver),
+        Op::LoadLocal(body_key),
+        Op::GetElem,
+        Op::StoreLocal(body_value),
+    ) = (
+        &ops[pc],
+        &ops[pc + 1],
+        &ops[pc + 2],
+        &ops[pc + 3],
+        &ops[pc + 4],
+        &ops[pc + 5],
+        &ops[pc + 6],
+        &ops[pc + 7],
+        &ops[pc + 8],
+        &ops[pc + 9],
+    )
+    else {
+        return None;
+    };
+    if receiver != body_receiver
+        || key != body_key
+        || value != body_value
+        || receiver == key
+        || receiver == value
+        || receiver == mapped
+        || key == value
+        || key == mapped
+        || value == mapped
+    {
+        return None;
+    }
+
+    let key_off = *key as u32 * 8;
+    let receiver_off = *receiver as u32 * 8;
+    if key_off + 8 >= 4096 || receiver_off + 8 >= 4096 {
+        return None;
+    }
+    // The two Tdz targets cannot retain a stale DReg when cleared. The receiver likewise
+    // must remain the canonical GC root; a numeric key home is safe and is preserved through
+    // the release-only Tdz helpers. Checked numeric-result recovery after GetElem is a
+    // separate continuation shape, so leave those sites to the established emitter.
+    if plan.reg(*receiver).is_some()
+        || plan.reg(*value).is_some()
+        || plan.reg(*mapped).is_some()
+        || plan.numeric_results.contains(&(pc + 8))
+    {
+        return None;
+    }
+    for slot in [*value, *mapped] {
+        if (slot as u32) * 8 + 8 >= 4096 || plan.reg(slot).is_some() {
+            return None;
+        }
+    }
+
+    let continuation = pc + 10;
+    let false_target = *false_target as usize;
+    if (pc + 4..continuation).contains(&false_target) {
+        return None;
+    }
+    // Each of the first four ops is one block ending at its conditional branch; the true
+    // fallthrough body is one block through StoreLocal. Its only normal predecessor is that
+    // branch. Handler/resume/OSR entries and bytecode targets cannot land in an interior op.
+    let in_block = cfg.block_at(pc)?;
+    let body_block = cfg.block_at(pc + 4)?;
+    let in_cfg = cfg.blocks().get(in_block.0 as usize)?;
+    let body_cfg = cfg.blocks().get(body_block.0 as usize)?;
+    if in_cfg.end != pc + 4
+        || cfg.block_at(pc + 3) != Some(in_block)
+        || body_cfg.start != pc + 4
+        || body_cfg.end < continuation
+        || cfg.block_at(pc + 9) != Some(body_block)
+        || body_cfg.predecessors.as_slice() != [in_block]
+        || plan.head == body_cfg.start
+        || cfg.block_at(false_target) == Some(body_block)
+    {
+        return None;
+    }
+    if (pc + 4..continuation).any(|target| source_targets[target])
+        || cfg
+            .handler_roots()
+            .iter()
+            .any(|root| root.target == body_block)
+        || cfg
+            .resume_roots()
+            .iter()
+            .any(|root| root.target == body_block)
+        || cfg.osr_entry_depth(pc + 4).is_some()
+    {
+        return None;
+    }
+    let expected_depths = [0, 1, 2, 1, 0, 0, 0, 1, 2, 1, 0];
+    if expected_depths
+        .iter()
+        .enumerate()
+        .any(|(offset, depth)| cfg.stack_depth_at(pc + offset) != Some(*depth))
+    {
+        return None;
+    }
+    let in_plan = |at: usize| {
+        plan.blocks
+            .iter()
+            .any(|&(start, end)| start <= at && at < end)
+    };
+    if !(pc..=continuation).all(in_plan) {
+        return None;
+    }
+
+    Some(TdzArrayPair {
+        key: *key,
+        receiver: *receiver,
+        value: *value,
+        mapped: *mapped,
+        continuation,
+    })
 }
 
 fn checked_numeric_result(op: &Op) -> bool {
@@ -625,6 +898,11 @@ fn frame_effect(op: &Op) -> FrameEffect {
         | Op::StoreNameCached(..)
         | Op::LoadCap(..)
         | Op::StoreCap(..)
+        // These may invoke author code (proxy traps, coercion, or species
+        // constructors), but consume only stack operands and never inspect a
+        // caller's private slots. Their heap effects still clear own_facts.
+        | Op::In
+        | Op::Abstract(..)
         | Op::MakeObject(..)
         | Op::MakeArray(..)
         | Op::MakeRegExp(..)
@@ -651,6 +929,17 @@ fn frame_effect(op: &Op) -> FrameEffect {
         | Op::ToPropKeyLocal(slot) => FrameEffect::Read(slot),
         Op::StoreLocal(slot) | Op::UpdateLocal(slot, _) => FrameEffect::Write(slot),
         _ => FrameEffect::Full,
+    }
+}
+
+/// Tdz changes only its target local. Keep the full barrier when that local is a
+/// numeric register home: writing Empty would invalidate the DReg proof, so the
+/// established full reload must deopt at the post-Tdz boundary. Tagged homes are
+/// refreshed by the ordinary Write postlude after the canonical owner is released.
+fn region_frame_effect(op: &Op, plan: &Plan) -> FrameEffect {
+    match *op {
+        Op::Tdz(slot) if plan.reg(slot).is_none() => FrameEffect::Write(slot),
+        _ => frame_effect(op),
     }
 }
 
@@ -1283,6 +1572,48 @@ pub(super) fn emit(
     let mut edges = CanonicalEdges::new(&labels);
     let mut guard_misses = Vec::new();
     let mut result_misses = Vec::new();
+    let mut tdz_array_pairs = HashMap::<usize, TdzArrayEmission>::new();
+    let mut tdz_array_skips = crate::fasthash::FastSet::default();
+    let mut tdz_array_exit_blocks = crate::fasthash::FastSet::default();
+    let mut tdz_array_continuations = HashMap::<usize, Vec<usize>>::new();
+    if fast & (16 | 1024) == (16 | 1024) && elem_inlinable(layout) {
+        for &(start, end) in &plan.blocks {
+            for pc in start..end {
+                if tdz_array_skips.contains(&pc) {
+                    continue;
+                }
+                let Some(pattern) =
+                    tdz_array_pair_at(chunk.jit_ops(), cfg, plan, source_targets, pc)
+                else {
+                    continue;
+                };
+                let Some(block_id) = cfg.block_at(pc) else {
+                    continue;
+                };
+                let block_start = cfg.blocks()[block_id.0 as usize].start;
+                let pre_fail = a.new_label();
+                let post_fail = a.new_label();
+                let continuation = a.new_label();
+                bails.push((pre_fail, pc, Vec::new(), 0, true));
+                bails.push((post_fail, pc + 6, Vec::new(), 0, true));
+                tdz_array_exit_blocks.insert(block_start);
+                tdz_array_skips.extend(pc + 1..pattern.continuation);
+                tdz_array_continuations
+                    .entry(pattern.continuation)
+                    .or_default()
+                    .push(continuation);
+                tdz_array_pairs.insert(
+                    pc,
+                    TdzArrayEmission {
+                        pattern,
+                        pre_fail,
+                        post_fail,
+                        continuation,
+                    },
+                );
+            }
+        }
+    }
     // A frame-independent helper can throw after consuming operands. Its exact
     // operand pointer is already updated by the ordinary template; only private
     // numeric homes need materializing before the shared handler unwinder runs.
@@ -1333,8 +1664,90 @@ pub(super) fn emit(
         // activation mirrors must invalidate these facts after author effects.
         let mut numeric_locals = crate::fasthash::FastSet::default();
         for pc in start..end {
+            if let Some(labels) = tdz_array_continuations.get(&pc) {
+                for &label in labels {
+                    a.bind(label);
+                }
+            }
+            if tdz_array_skips.contains(&pc) {
+                continue;
+            }
             if consumed != 0 {
                 consumed -= 1;
+                continue;
+            }
+            if let Some(candidate) = tdz_array_pairs.get(&pc).copied() {
+                let pattern = candidate.pattern;
+                debug_assert!(stack.is_empty());
+                debug_assert_eq!(physical, 0);
+                // Avoid two owning local loads, operand/condition traffic, and the
+                // repeated receiver/index/descriptor proof across HasProperty and Get.
+                saved_work += 8;
+                own_facts.clear();
+                numeric_locals.remove(&pattern.value);
+                numeric_locals.remove(&pattern.mapped);
+
+                let key_off = pattern.key as u32 * 8;
+                let receiver_off = pattern.receiver as u32 * 8;
+                let key_src = plan
+                    .reg(pattern.key)
+                    .map_or(KeySrc::Slot(key_off), KeySrc::DReg);
+                emit_local_own_dense_data_guard(
+                    a,
+                    layout,
+                    receiver_off,
+                    key_src,
+                    candidate.pre_fail,
+                );
+                emit_tdz_objects_nonfinal(
+                    a,
+                    layout,
+                    pattern.value as u32 * 8,
+                    pattern.mapped as u32 * 8,
+                    candidate.pre_fail,
+                );
+
+                // The helper on a last-owner packed drop may clobber every caller-saved
+                // register. No borrowed descriptor or object pointer may survive either
+                // ordered release; the rooted receiver and preserved numeric key are
+                // reloaded only after both TDZ stores below.
+                for register in 9..=17 {
+                    a.movz(register, 0, 0);
+                }
+                for slot in [pattern.value, pattern.mapped] {
+                    let offset = slot as i32 * 8;
+                    emit_exec_release_word(a, layout, 22, offset);
+                    a.mov_imm64(9, crate::value::PACK_EMPTY);
+                    emit_exec_word_store(a, 9, 22, offset);
+                    if let Some(home) = plan.tagged_reg(slot) {
+                        a.ldr_d_imm(home, 22, slot as u32 * 8);
+                    }
+                }
+
+                emit_local_assumed_dense_data_value(
+                    a,
+                    layout,
+                    receiver_off,
+                    key_src,
+                    candidate.post_fail,
+                );
+                emit_exec_clone(a, layout, 12, 13, 16, candidate.post_fail);
+                // The first Tdz made this destination Empty, so the cloned result can be
+                // transferred directly into its canonical owner slot.
+                emit_exec_word_store(a, 12, 22, pattern.value as i32 * 8);
+                if let Some(home) = plan.tagged_reg(pattern.value) {
+                    a.ldr_d_imm(home, 22, pattern.value as u32 * 8);
+                }
+                #[cfg(test)]
+                emit_lowering_event(
+                    a,
+                    if matches!(key_src, KeySrc::DReg(_)) {
+                        record_tdz_array_pair_dreg as *const () as u64
+                    } else {
+                        record_tdz_array_pair_slot as *const () as u64
+                    },
+                );
+                a.b(candidate.continuation);
                 continue;
             }
             // A region keeps its private CFG, but does not discard the baseline's
@@ -2076,13 +2489,38 @@ pub(super) fn emit(
                     own_facts.clear();
                     let before = stack.clone();
                     materialize(a, layout, &stack, physical);
-                    let effect = frame_effect(&ops[pc]);
+                    let effect = region_frame_effect(&ops[pc], &plan);
                     match effect {
                         FrameEffect::Independent => {}
                         FrameEffect::Read(slot) | FrameEffect::Write(slot) => {
                             plan.flush_local(a, slot)
                         }
                         FrameEffect::Full => plan.flush_locals(a),
+                    }
+                    #[cfg(test)]
+                    if let Op::Tdz(slot) = ops[pc] {
+                        let path = match effect {
+                            FrameEffect::Write(slot)
+                                if plan.tagged_reg(slot).is_some() && !plan.homes.is_empty() =>
+                            {
+                                0
+                            }
+                            FrameEffect::Write(slot) if plan.tagged_reg(slot).is_some() => 1,
+                            FrameEffect::Write(_) => 2,
+                            FrameEffect::Full if plan.reg(slot).is_some() => 3,
+                            _ => 4,
+                        };
+                        emit_tdz_effect_event(a, path);
+                    }
+                    #[cfg(test)]
+                    if effect == FrameEffect::Independent && !plan.homes.is_empty() {
+                        match ops[pc] {
+                            Op::In => emit_independent_effect_live_home_event(a, 0),
+                            Op::Abstract(
+                                crate::bytecode::AbstractOp::CreateDataPropertyOrThrow,
+                            ) => emit_independent_effect_live_home_event(a, 1),
+                            _ => {}
+                        }
                     }
                     emit_effect(
                         a,
@@ -2146,6 +2584,11 @@ pub(super) fn emit(
                     }
                 }
             }
+        }
+        if tdz_array_exit_blocks.contains(&start) {
+            // The fused branch above either deoptimizes at the original In or jumps
+            // directly to the post-StoreLocal continuation. It owns both CFG edges.
+            continue;
         }
         let guarded_fallthrough = matches!(ops[end - 1], Op::InlineGuard(..))
             && plan
@@ -2611,6 +3054,10 @@ mod scalar_tests;
 #[cfg(test)]
 #[path = "jit_region_edge_tests.rs"]
 mod edge_tests;
+
+#[cfg(test)]
+#[path = "jit_region_effect_tests.rs"]
+mod effect_tests;
 
 #[cfg(test)]
 mod tests {

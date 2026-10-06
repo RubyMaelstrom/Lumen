@@ -1269,6 +1269,11 @@ impl Cfg {
     }
 
     #[inline]
+    pub(crate) fn resume_roots(&self) -> &[HandlerRoot] {
+        &self.resume_roots
+    }
+
+    #[inline]
     pub(crate) fn rpo(&self) -> &[BlockId] {
         &self.rpo
     }

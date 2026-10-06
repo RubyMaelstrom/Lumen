@@ -1,0 +1,99 @@
+Array HasProperty/Get fusion — 6 October 2026
+============================================
+
+The ARM64 template tier now combines the guarded own-element HasProperty/Get
+sequence in self-hosted array iteration. The React-derived reducer takes 6.2%
+less time than the compact-Intl baseline. This is a further component gain,
+not a measured cumulative speedup or the requested 8–10x overall improvement.
+
+The fast path removes repeated receiver/index/descriptor checks and temporary
+owners across the exact In/branch/TDZ/Get/Store sequence. It admits only existing
+own data elements with an exact numeric index. Holes, inherited accessors,
+proxies, key coercion and unusual indices retain the checked path. CFG checks
+exclude interior entries, handler/resume roots and incompatible numeric homes.
+TDZ writes retain ordered owner releases. If either release might destroy an
+object, including two locals sharing its final two owners, execution falls
+back before the sequence. No borrowed pointer survives a release. This keeps
+host-destructor reentry and callback mutation observable in their original order.
+
+The accompanying local-effect classification keeps private numeric homes live
+across In/Abstract operations and clears only a TDZ target that is not a numeric
+home. Heap facts are still invalidated; numeric TDZ targets retain full recovery.
+
+Measurement
+-----------
+
+Native ARM64 Linux 7.2.7-crystal, CPU 5; Rust 1.99.0 b940084d7 / LLVM 23.1.1.
+Release opt-level 3, fat LTO, one codegen unit, panic=abort, default intl + embed;
+ordinary JIT, optimizer and diagnostic instrumentation off during timings.
+Six balanced fresh-process pairs per workload, sixty startup pairs, unchanged
+10,000-resample paired bootstrap. Every output checksum matched. Owned builds,
+tests and profilers were excluded from the timing window.
+
+Workload       Baseline median   Candidate median    Ratio / 95% interval
+React reducer        1838 ms           1721.5 ms       .93789 [.93223, .93934]
+Vue updates        8469.5 ms             8369 ms       .98896 [.98046, .99626]
+Djot parser          2026 ms           2018.5 ms       .99803 [.98847, 1.00074]
+EJS solver        6.00757 s           5.97360 s        .99596 [.99008, .99789]
+
+The first three use internal driver durations; EJS uses wait4 child wall time.
+The complete matrix also includes eleven renderer-shaped kernels, startup and
+warm/construction controls for dates, numbers and display names.
+
+The original six WebGL peak-RSS pairs crossed the provisional regression gate:
+1.03952 [1.00760, 1.08563]. A predeclared twenty-pair confirmation measured
+.99343 [.96436, 1.02546]; all 26 pairs give 1.00595 [.97334, 1.03825]. The
+separate twelve-pair identical-byte control has no material gate crossing in
+either direction. Its system-CPU ratio is unavailable because a baseline
+sample was zero. The remaining per-metric and kernel gates pass. No samples,
+original flags or previous artifact-confounded results were discarded; no
+A/A subtraction or retrospective noise threshold was used.
+
+Fresh non-reflink copies were prepared once, with hashes checked and allocation
+metadata recorded. Some filefrag extents were still delalloc/unknown_loc;
+physical allocation identity is not claimed. This qualification applies to
+the matched runs, and the separate A/A observations remain in the record.
+
+Separate diagnostic runs show unchanged compile and GC counts. React native
+code falls from 276404 to 268620 bytes; all five application/control code totals
+fall slightly. These single diagnostic runs do not establish compile-time or
+GC-pause improvements. The executable grows from 17346000 to 17369936 bytes.
+This change makes no general memory-saving claim.
+
+Source and validation
+---------------------
+
+Measured source base: 63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2.
+Measured patch: bfea0382ff01f7836c41390edcaa0819100995ff4b769ee16b0755bdd1881323.
+Baseline engine: 5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9.
+Candidate engine: 0a421fb4189c7b6d13f633b6af626b28babfbf988eba2c163339bf915ac3a247.
+Integration parent: 8988b37c9c6064d00d62e1e5b76bb39d9851fc83. The intervening
+architecture-diagnostics feature compiles out of ordinary builds. All five
+changed source files match the measured and originally validated hashes.
+
+The earlier source on 1084161 passed 1813 engine library tests (3 existing
+ignores), workspace/all-target and optional optimizer compile checks, and
+2000 differential seeds: 1859 agreements, 141 budget skips, no divergences.
+Its runtime library first hit /tmp quota errors; the /big TMPDIR retry passed
+107 tests with one existing ignore. These are library-only counts. Default-JIT
+Test262 passed 5254, failed 0, skipped 0, all_executed_passed=true, at suite
+d86b2294eb0a17eaa281ff12c73c473ec864c72f; exact scope and uncapped totals are
+recorded in the manifest. These are inherited checks, not new rebase runs.
+
+The compact-Intl rebase and final integration each freshly pass all 13 focused
+array tests across tiers, including native-hit assertions, TDZ, accessors,
+proxy/coercion ordering, GC and host-destructor reentry. The rebase release
+build passed. No fresh x86-64 or wasm32 execution is claimed.
+
+Semantic reference: ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
+fetched 2026-09-06, /big/web-standards/repositories/tc39/ecma262/spec.html:
+Array.prototype.filter (line 40915), Array.prototype.map (41269), and the in
+operator (20891). Official clauses: https://tc39.es/ecma262/#sec-array.prototype.filter,
+https://tc39.es/ecma262/#sec-array.prototype.map, and
+https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation.
+
+Exact source identities, samples, confidence intervals and diagnostic records:
+benchmarks/array-pair-runtime-2026-10-06.json. Local artifacts remain under
+benchmark-results/array-pair-compact-intl-rebase-20261006 and
+benchmark-results/ejs-system-revalidation-20261006. This source acceptance
+does not promote or install a release artifact.
