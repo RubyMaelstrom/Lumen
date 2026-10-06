@@ -1,0 +1,79 @@
+Compact CLDR number and display-name tables — 2026-10-06
+
+NumberFormat and DisplayNames now use deduplicated static text blobs, u16
+string IDs, and u32 offset/length directories. This extends the accepted date
+table representation. Public lookup results remain borrowed static strings;
+table contents, ordering, fallback behavior and locale coverage are unchanged.
+There is no runtime allocation, unsafe code, dependency or locale-data update
+in this storage change.
+
+Both generators pin CLDR JSON 48.0.0 at
+4d06be52b51bb2f75688d0abe55c52a66afed790. Input manifests preserve URL, status
+and content hashes, including five expected missing DisplayNames inputs.
+The old generators first reproduced the prior generated sources. Exhaustive
+comparison preserved all 53 number tables / 13,743 records and all 218
+display-name tables / 27,743 records plus 22 locale patterns. The number blob
+has 11,132 distinct strings in 260,533 bytes; the display-name blob has 24,546
+strings in 431,315 bytes. Tests validate every directory entry and table order.
+
+ECMA-402 PartitionNumberPattern and DisplayNames.prototype.of require the
+selected localized strings and specified fallback behavior to survive this
+change. Consulted local snapshot b1c961988b9a07894b1dc3dc2b5626ea48387d61,
+fetched 2026-09-06:
+  /big/web-standards/repositories/tc39/ecma402/spec/numberformat.html:736
+  https://tc39.es/ecma402/#sec-partitionnumberpattern
+  /big/web-standards/repositories/tc39/ecma402/spec/displaynames.html:176
+  https://tc39.es/ecma402/#sec-Intl.DisplayNames.prototype.of
+
+The frozen combined candidate was measured against compact-date commit
+4be60d028b95e50733f9449d9948345effc5f6c8 on Crystal, ARM64 Linux, CPU 5.
+Both used default template JIT, default Intl plus embed, release optimization
+level 3, fat LTO and one codegen unit. No extra Rust/linker flags were added.
+Six balanced fresh-process pairs cover React, Vue, Djot, EJS, eleven renderer
+kernels, warmed date/number/name lookups and formatter construction. Startup
+uses 60 pairs. All 252 timed samples matched their expected output checksums.
+No owned build, test or profiler overlapped the timings.
+
+Paired candidate/baseline median ratios and bootstrap 95% intervals:
+
+  startup child wall          0.77797 [0.76084, 0.78398]
+  startup peak RSS            0.73984 [0.73894, 0.74925]
+  React execution            1.00027 [0.99702, 1.00163]
+  Vue execution              1.00562 [0.99889, 1.01179]
+  Djot execution             0.99926 [0.99580, 1.00348]
+  EJS child wall             1.00393 [0.99712, 1.00708]
+  WebGL kernel child wall    0.99346 [0.98756, 1.00086]
+  warmed number formatting   1.01676 [0.99992, 1.03173]
+  number construction        1.01433 [1.00747, 1.01985]
+  warmed display names       1.00923 [0.99989, 1.01622]
+  display-name construction  0.99364 [0.98045, 1.00727]
+
+Startup medians were 8.301 ms and 6.433 ms. The executable shrank from
+21,665,320 to 17,346,000 bytes, and relative ELF relocations fell from 197,067
+to 90,778. Warm number formatting and construction retain small measured
+costs; neither crosses the documented regression gate. No application,
+individual kernel, startup, CPU or peak-memory component crossed that gate.
+Separate diagnostics show matching compilation and collection counts,
+essentially unchanged managed post-GC memory and generated-code sizes.
+Those 24 instrumented samples do not establish compilation or pause timing
+significance and are excluded from the performance distributions.
+
+Combined engine library tests passed 1,813 cases, with zero failures and
+three ignored tests. Formatting and the no-default-features check passed.
+Default-JIT Test262 passed all 550 NumberFormat, DisplayNames and
+DateTimeFormat cases with zero failures or skips; all_executed_passed is true.
+Suite revision: d86b2294eb0a17eaa281ff12c73c473ec864c72f. Every integrated source
+file was compared byte-for-byte with the validated isolated worktree.
+
+The complete source/build identity, workload hashes, raw samples, component
+intervals, diagnostics and conformance report are retained in
+benchmarks/cldr-intl-runtime-2026-10-06.json. The four added benchmark scripts
+preserve the exact measured number/name workloads. Raw local evidence is in
+benchmark-results/cldr-intl-packed-combined-20261006 and
+benchmark-results/object-runtime-20261005-7eac91/intl-combined-final-20261006.
+
+This is a startup and footprint improvement; general application execution
+remains near parity. It does not establish an 8–10x overall engine gain.
+The held array and lexical/IsArray experiments are excluded from this build.
+Startup uses warm filesystem caches. There is no new x86-64 or wasm32
+execution evidence and no installed-artifact promotion.

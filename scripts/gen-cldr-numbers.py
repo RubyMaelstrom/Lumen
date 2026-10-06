@@ -3,16 +3,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
+import re
 import urllib.request
 
 
 TAG = "48.0.0"
+SOURCE_COMMIT = "4d06be52b51bb2f75688d0abe55c52a66afed790"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "crates/lumen/src/cldr_numbers.rs"
+BLOB_OUTPUT = ROOT / "crates/lumen/src/cldr_numbers.data"
+MANIFEST_OUTPUT = ROOT / "crates/lumen/src/cldr_numbers.inputs.json"
+REPOSITORY = "https://github.com/unicode-org/cldr-json"
 BASE = (
-    f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/"
+    f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}/"
     "cldr-json"
 )
 LOCALES = [
@@ -20,6 +26,7 @@ LOCALES = [
     "zh", "zh-Hant", "ko", "ru", "ar", "sr", "th", "gv", "sl", "pl",
     "si", "ln", "sv", "hi",
 ]
+INPUT_HASHES: dict[str, str] = {}
 
 
 def download(package: str, locale: str, file: str) -> dict:
@@ -28,7 +35,19 @@ def download(package: str, locale: str, file: str) -> dict:
         url, headers={"User-Agent": "Lumen CLDR NumberFormat generator"}
     )
     with urllib.request.urlopen(request) as response:
-        return json.load(response)["main"][locale]
+        payload = response.read()
+    INPUT_HASHES[url] = hashlib.sha256(payload).hexdigest()
+    return json.loads(payload)["main"][locale]
+
+
+def download_url(url: str) -> dict:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Lumen CLDR NumberFormat generator"}
+    )
+    with urllib.request.urlopen(request) as response:
+        payload = response.read()
+    INPUT_HASHES[url] = hashlib.sha256(payload).hexdigest()
+    return json.loads(payload)
 
 
 def rust_string(value: str) -> str:
@@ -37,6 +56,405 @@ def rust_string(value: str) -> str:
     for character in ("\u200b", "\u2060", "\ufeff"):
         rendered = rendered.replace(character, f"\\u{{{ord(character):x}}}")
     return rendered
+
+
+class StringPool:
+    """Stable, allocation-free-at-runtime storage for generated CLDR text."""
+
+    U16_MAX = (1 << 16) - 1
+    U32_MAX = (1 << 32) - 1
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.refs: dict[str, tuple[int, int, int]] = {}
+
+    def intern(self, value: str) -> int:
+        found = self.refs.get(value)
+        if found is not None:
+            return found[0]
+        string_id = len(self.refs)
+        if string_id > self.U16_MAX:
+            raise ValueError("CLDR string count exceeds the u16 id format")
+        encoded = value.encode("utf-8")
+        offset = len(self.data)
+        end = offset + len(encoded)
+        if end > self.U32_MAX:
+            raise ValueError("CLDR string blob exceeds the u32 offset format")
+        self.data.extend(encoded)
+        self.refs[value] = (string_id, offset, len(encoded))
+        return string_id
+
+
+RUST_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def decode_rust_string(literal: str) -> str:
+    """Decode the JSON-compatible Rust literals emitted by `rust_string`."""
+    body = literal[1:-1]
+    body = re.sub(
+        r"\\u\{([0-9a-fA-F]+)\}",
+        lambda match: "\\u" + f"{int(match.group(1), 16):04x}",
+        body,
+    )
+    return json.loads('"' + body + '"')
+
+
+def pack_generated_source(source: str) -> tuple[str, bytes, int]:
+    """Pack every string-valued CLDR table field while retaining lookup APIs.
+
+    The existing generator first builds a canonical source representation from its
+    parsed CLDR rows. This deterministic final pass converts only table literals;
+    code constants such as currency digits and locale fallback arms stay ordinary
+    Rust literals.
+    """
+    pool = StringPool()
+    output: list[str] = []
+    active: str | None = None
+    table_count = 0
+    declaration_types = {
+        "SYMBOLS": "static SYMBOLS: &[(TextId, TextId, SymbolsIds)] = &[",
+        "PATTERNS": "static PATTERNS: &[(TextId, TextId, TextId, PatternIds)] = &[",
+        "COMPACT": "static COMPACT: &[(TextId, TextId, TextId, u8, TextId, CompactIds)] = &[",
+        "COMPACT_MAX": "static COMPACT_MAX: &[(TextId, TextId, TextId, u8)] = &[",
+        "CURRENCY_UNITS": "static CURRENCY_UNITS: &[(TextId, TextId, TextId)] = &[",
+    }
+
+    for line in source.splitlines():
+        if line.startswith("static "):
+            name = line[7:].split(":", 1)[0]
+            if name in declaration_types:
+                active = name
+            elif name.startswith("C_"):
+                active = "CURRENCY"
+                line = line.replace(
+                    "&[(&str, Currency)] = &[",
+                    "&[(TextId, CurrencyIds)] = &[",
+                )
+            elif name.startswith("CN_"):
+                active = "CURRENCY_NAMES"
+                line = line.replace(
+                    "&[(&str, &str, &str)] = &[",
+                    "&[(TextId, TextId, TextId)] = &[",
+                )
+            if name in declaration_types:
+                line = declaration_types[name]
+            if active is not None:
+                table_count += int(line.startswith("static "))
+                if line.startswith("static "):
+                    output.append("#[rustfmt::skip]")
+
+        if active is not None and not line.startswith("static "):
+            if line.strip() == "];":
+                output.append(line)
+                active = None
+                continue
+            if line.strip():
+                def to_id(match: re.Match[str]) -> str:
+                    return str(pool.intern(decode_rust_string(match.group(0))))
+
+                line = RUST_STRING.sub(to_id, line)
+                if active == "SYMBOLS":
+                    line = line.replace("Symbols {", "SymbolsIds {")
+                elif active == "PATTERNS":
+                    line = line.replace("Pattern {", "PatternIds {")
+                elif active == "COMPACT":
+                    line = line.replace("Compact {", "CompactIds {")
+                elif active == "CURRENCY":
+                    line = line.replace("Currency {", "CurrencyIds {")
+        output.append(line)
+
+    expected_tables = 4 + len(LOCALES) * 2 + 1
+    if table_count != expected_tables:
+        raise ValueError(
+            f"expected {expected_tables} CLDR number tables, transformed {table_count}"
+        )
+    if active is not None:
+        raise ValueError(f"unterminated CLDR table: {active}")
+
+    pool_source = [
+        "const CLDR_STRINGS: &str = include_str!(\"cldr_numbers.data\");",
+        "type TextId = u16;",
+        "",
+        "#[derive(Clone, Copy)]",
+        "struct SymbolsIds {",
+        "    decimal: TextId,",
+        "    group: TextId,",
+        "    percent: TextId,",
+        "    plus: TextId,",
+        "    minus: TextId,",
+        "    approximately: TextId,",
+        "    exponential: TextId,",
+        "    infinity: TextId,",
+        "    nan: TextId,",
+        "    primary_group: usize,",
+        "    secondary_group: usize,",
+        "    minimum_grouping: usize,",
+        "}",
+        "#[derive(Clone, Copy)]",
+        "struct PatternIds {",
+        "    positive_prefix: TextId,",
+        "    positive_suffix: TextId,",
+        "    negative_prefix: TextId,",
+        "    negative_suffix: TextId,",
+        "}",
+        "#[derive(Clone, Copy)]",
+        "struct CompactIds {",
+        "    exponent: i32,",
+        "    has_number: bool,",
+        "    prefix: TextId,",
+        "    suffix: TextId,",
+        "}",
+        "#[derive(Clone, Copy)]",
+        "struct CurrencyIds {",
+        "    name: TextId,",
+        "    symbol: TextId,",
+        "    narrow: TextId,",
+        "}",
+        "",
+        "#[rustfmt::skip]",
+        f"static CLDR_REFS: [(u32, u32); {len(pool.refs)}] = [",
+    ]
+    pool_source.extend(f"    ({offset}, {length})," for _, offset, length in pool.refs.values())
+    pool_source.extend(
+        [
+            "];",
+            "",
+            "#[inline]",
+            "fn text(id: TextId) -> &'static str {",
+            "    let (offset, len) = CLDR_REFS[id as usize];",
+            "    let start = offset as usize;",
+            "    let end = start + len as usize;",
+            "    &CLDR_STRINGS[start..end]",
+            "}",
+            "",
+        ]
+    )
+    result = "\n".join(output)
+    header = "\n".join(pool_source)
+    first_newline = result.find("\n")
+    result = result[: first_newline + 1] + "\n" + header + result[first_newline + 1 :]
+
+    def replace_function(start: str, end: str, replacement: str) -> None:
+        nonlocal result
+        begin = result.index(start)
+        finish = result.index(end, begin)
+        result = result[:begin] + replacement + "\n\n" + result[finish:]
+
+    replace_function(
+        "pub(crate) fn symbols(",
+        "pub(crate) fn pattern(",
+        '''pub(crate) fn symbols(loc: &str, nu: &str) -> Symbols {
+    let find = |locale: &str, system: &str| {
+        SYMBOLS
+            .binary_search_by(|row| {
+                text(row.0)
+                    .cmp(locale)
+                    .then_with(|| text(row.1).cmp(system))
+            })
+            .ok()
+            .map(|index| {
+                let value = SYMBOLS[index].2;
+                Symbols {
+                    decimal: text(value.decimal),
+                    group: text(value.group),
+                    percent: text(value.percent),
+                    plus: text(value.plus),
+                    minus: text(value.minus),
+                    approximately: text(value.approximately),
+                    exponential: text(value.exponential),
+                    infinity: text(value.infinity),
+                    nan: text(value.nan),
+                    primary_group: value.primary_group,
+                    secondary_group: value.secondary_group,
+                    minimum_grouping: value.minimum_grouping,
+                }
+            })
+    };
+    let system_fallback = match nu {
+        "arab" | "arabext" => find("ar", "arab"),
+        "deva" => find("hi", "deva"),
+        _ => None,
+    };
+    find(loc, nu)
+        .or(system_fallback)
+        .or_else(|| find(loc, "latn"))
+        .or_else(|| find("en", "latn"))
+        .expect("generated English number symbols")
+}''',
+    )
+    replace_function(
+        "pub(crate) fn pattern(",
+        "fn compact_find(",
+        '''pub(crate) fn pattern(loc: &str, nu: &str, kind: &str) -> Pattern {
+    let find = |locale: &str, system: &str| {
+        PATTERNS
+            .binary_search_by(|row| {
+                text(row.0)
+                    .cmp(locale)
+                    .then_with(|| text(row.1).cmp(system))
+                    .then_with(|| text(row.2).cmp(kind))
+            })
+            .ok()
+            .map(|index| {
+                let value = PATTERNS[index].3;
+                Pattern {
+                    positive_prefix: text(value.positive_prefix),
+                    positive_suffix: text(value.positive_suffix),
+                    negative_prefix: text(value.negative_prefix),
+                    negative_suffix: text(value.negative_suffix),
+                }
+            })
+    };
+    find(loc, nu)
+        .or_else(|| find(loc, "latn"))
+        .or_else(|| find("en", "latn"))
+        .expect("generated English number pattern")
+}''',
+    )
+    replace_function(
+        "fn compact_find(",
+        "fn compact_max(",
+        '''fn compact_find(
+    loc: &str,
+    nu: &str,
+    display: &str,
+    magnitude: u8,
+    selector: &str,
+) -> Option<Compact> {
+    COMPACT
+        .binary_search_by(|row| {
+            text(row.0)
+                .cmp(loc)
+                .then_with(|| text(row.1).cmp(nu))
+                .then_with(|| text(row.2).cmp(display))
+                .then_with(|| row.3.cmp(&magnitude))
+                .then_with(|| text(row.4).cmp(selector))
+        })
+        .ok()
+        .map(|index| {
+            let value = COMPACT[index].5;
+            Compact {
+                exponent: value.exponent,
+                has_number: value.has_number,
+                prefix: text(value.prefix),
+                suffix: text(value.suffix),
+            }
+        })
+}''',
+    )
+    replace_function(
+        "fn compact_max(",
+        "pub(crate) fn compact(",
+        '''fn compact_max(loc: &str, nu: &str, display: &str) -> Option<u8> {
+    let find = |system: &str| {
+        COMPACT_MAX
+            .binary_search_by(|row| {
+                text(row.0)
+                    .cmp(loc)
+                    .then_with(|| text(row.1).cmp(system))
+                    .then_with(|| text(row.2).cmp(display))
+            })
+            .ok()
+            .map(|index| COMPACT_MAX[index].3)
+    };
+    find(nu).or_else(|| find("latn"))
+}''',
+    )
+    replace_function(
+        "pub(crate) fn compact(",
+        "fn currency_rows(",
+        '''pub(crate) fn compact(
+    loc: &str,
+    nu: &str,
+    display: &str,
+    magnitude: u8,
+    category: &str,
+    exact_one: bool,
+) -> Option<Compact> {
+    // ComputeExponentForMagnitude caps an out-of-range magnitude at the largest
+    // available compact pattern before deriving that pattern's exponent.
+    let magnitude = magnitude.min(compact_max(loc, nu, display)?);
+    let get = |locale: &str, system: &str, selector: &str| {
+        compact_find(locale, system, display, magnitude, selector)
+    };
+    if exact_one {
+        if let Some(value) = get(loc, nu, "1").or_else(|| get(loc, "latn", "1")) {
+            return Some(value);
+        }
+    }
+    for selector in [category, "other"] {
+        if let Some(value) = get(loc, nu, selector).or_else(|| get(loc, "latn", selector)) {
+            return Some(value);
+        }
+    }
+    None
+}''',
+    )
+    result = result.replace(
+        "fn currency_rows(loc: &str) -> &'static [(&'static str, Currency)] {",
+        "fn currency_rows(loc: &str) -> &'static [(TextId, CurrencyIds)] {",
+    )
+    result = result.replace(
+        "    C_EN.iter().map(|row| row.0)",
+        "    C_EN.iter().map(|row| text(row.0))",
+    )
+    result = result.replace(
+        "fn currency_name_rows(loc: &str) -> &'static [(&'static str, &'static str, &'static str)] {",
+        "fn currency_name_rows(loc: &str) -> &'static [(TextId, TextId, TextId)] {",
+    )
+    replace_function(
+        "pub(crate) fn currency(loc:",
+        "static CURRENCY_UNITS:",
+        '''pub(crate) fn currency(loc: &str, code: &str, category: &str) -> Option<Currency> {
+    let rows = currency_rows(loc);
+    let index = rows.binary_search_by(|row| text(row.0).cmp(code)).ok()?;
+    let packed = rows[index].1;
+    let mut value = Currency {
+        name: text(packed.name),
+        symbol: text(packed.symbol),
+        narrow: text(packed.narrow),
+    };
+    let names = currency_name_rows(loc);
+    if let Ok(index) = names.binary_search_by(|row| {
+        text(row.0)
+            .cmp(code)
+            .then_with(|| text(row.1).cmp(category))
+    }) {
+        value.name = text(names[index].2);
+    }
+    Some(value)
+}''',
+    )
+    replace_function(
+        "pub(crate) fn currency_unit(",
+        "pub(crate) fn currency_digits(",
+        '''pub(crate) fn currency_unit(loc: &str, category: &str) -> &'static str {
+    CURRENCY_UNITS
+        .binary_search_by(|row| text(row.0).cmp(loc).then_with(|| text(row.1).cmp(category)))
+        .ok()
+        .map(|index| text(CURRENCY_UNITS[index].2))
+        .or_else(|| {
+            CURRENCY_UNITS
+                .binary_search_by(|row| text(row.0).cmp(loc).then_with(|| text(row.1).cmp("other")))
+                .ok()
+                .map(|index| text(CURRENCY_UNITS[index].2))
+        })
+        .unwrap_or("{0} {1}")
+}''',
+    )
+
+    result += "\n#[cfg(test)]\nconst GENERATED_LOCALES: &[&str] = &[\n"
+    locale_line = "    "
+    for locale in LOCALES:
+        entry = f'"{locale}", '
+        if len(locale_line) + len(entry) > 100:
+            result += locale_line.rstrip() + "\n"
+            locale_line = "    "
+        locale_line += entry
+    if locale_line.strip():
+        result += locale_line.rstrip() + "\n"
+    result += "];\n\n#[cfg(test)]\n#[path = \"cldr_numbers_packed_tests.rs\"]\nmod packed_tests;\n"
+    return result, bytes(pool.data), len(pool.refs)
 
 
 def split_subpatterns(pattern: str) -> list[str]:
@@ -139,6 +557,7 @@ def ident(prefix: str, *parts: str) -> str:
 
 
 def main() -> None:
+    INPUT_HASHES.clear()
     symbols_rows: list[tuple] = []
     pattern_rows: list[tuple] = []
     compact_rows: list[tuple] = []
@@ -286,8 +705,8 @@ def main() -> None:
                     (locale, key.removeprefix("unitPattern-count-"), value)
                 )
 
-    currency_data = json.load(
-        urllib.request.urlopen(f"{BASE}/cldr-core/supplemental/currencyData.json")
+    currency_data = download_url(
+        f"{BASE}/cldr-core/supplemental/currencyData.json"
     )["supplemental"]["currencyData"]["fractions"]
     default_digits = int(currency_data["DEFAULT"]["_digits"])
     fraction_rows = sorted(
@@ -587,10 +1006,57 @@ def main() -> None:
         ]
     )
 
-    OUTPUT.write_text("\n".join(output), encoding="utf-8")
+    generated = "\n".join(output)
+    packed_source, string_blob, string_count = pack_generated_source(generated)
+    OUTPUT.write_text(packed_source, encoding="utf-8")
+    BLOB_OUTPUT.write_bytes(string_blob)
+    generator_hash = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+    manifest = {
+        "cldr_json_repository": REPOSITORY,
+        "cldr_json_tag": TAG,
+        "cldr_json_commit": SOURCE_COMMIT,
+        "input_url_base": BASE,
+        "distinct_input_count": len(INPUT_HASHES),
+        "inputs": [
+            {"url": url, "sha256": INPUT_HASHES[url]} for url in sorted(INPUT_HASHES)
+        ],
+        "generator": "scripts/gen-cldr-numbers.py",
+        "generator_sha256": generator_hash,
+        "original_generated_snapshot": {
+            "commit": "1084161475e2e35b50a73eb06fd6885e66de9239",
+            "path": "crates/lumen/src/cldr_numbers.rs",
+            "sha256": "57064f5dadeeea45a051ed5ef87c45a90af50f8679ac15a5d65deba24badc0a4",
+        },
+        "packed_source_sha256": hashlib.sha256(packed_source.encode("utf-8")).hexdigest(),
+        "string_blob_path": "crates/lumen/src/cldr_numbers.data",
+        "string_blob_sha256": hashlib.sha256(string_blob).hexdigest(),
+        "string_blob_bytes": len(string_blob),
+        "unique_string_count": string_count,
+        "symbol_record_count": len(symbols_rows),
+        "pattern_record_count": len(pattern_rows),
+        "compact_record_count": len(compact_rows),
+        "compact_max_record_count": len(compact_max_rows),
+        "currency_record_count": sum(map(len, currency_base.values())),
+        "currency_name_record_count": sum(map(len, currency_names.values())),
+        "currency_unit_record_count": len(currency_unit_rows),
+        "text_reference_count": (
+            len(symbols_rows) * 11
+            + len(pattern_rows) * 7
+            + len(compact_rows) * 6
+            + len(compact_max_rows) * 3
+            + sum(map(len, currency_base.values())) * 4
+            + sum(map(len, currency_names.values())) * 3
+            + len(currency_unit_rows) * 3
+        ),
+    }
+    MANIFEST_OUTPUT.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     print(
         f"wrote {OUTPUT.relative_to(ROOT)} ({len(symbols_rows)} symbol sets, "
-        f"{len(pattern_rows)} affix patterns, {len(compact_rows)} compact patterns)"
+        f"{len(pattern_rows)} affix patterns, {len(compact_rows)} compact patterns, "
+        f"{string_count} interned strings, {len(string_blob)} UTF-8 bytes)"
     )
 
 

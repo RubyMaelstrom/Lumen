@@ -23122,6 +23122,66 @@ fn display_names_cldr_locales_styles_and_language_composition() {
 
 #[cfg(feature = "intl")]
 #[test]
+fn display_names_tables_agree_across_all_tiers() {
+    let source = r#"
+        const locales = [
+            'en', 'de', 'fr', 'es', 'it', 'pt', 'nl', 'ja', 'zh', 'ko', 'ru',
+            'ar', 'sr', 'th', 'gv', 'sl', 'pl', 'si', 'ln', 'sv', 'hi'
+        ];
+        const groups = [
+            ['language', ['fr', 'en-GB', 'en-Latn-GB', 'qz'], ['long', 'short']],
+            ['region', ['US', 'GB', '419', 'qz'], ['long', 'short', 'narrow']],
+            ['script', ['Latn', 'Hans', 'Cyrl', 'Zzzz'], ['long', 'short']],
+            ['currency', ['USD', 'EUR', 'JPY', 'xyz'], ['long']],
+            ['calendar', ['gregory', 'islamic-civil', 'japanese', 'ABC'], ['long']],
+            ['dateTimeField', ['month', 'year', 'timeZoneName', 'hour'], ['long', 'short', 'narrow']]
+        ];
+        let hash = 2166136261;
+        for (let localeIndex = 0; localeIndex < locales.length; localeIndex++) {
+            const locale = locales[localeIndex];
+            for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+                const [type, codes, styles] = groups[groupIndex];
+                for (let styleIndex = 0; styleIndex < styles.length; styleIndex++) {
+                    const options = {
+                        type,
+                        style: styles[styleIndex],
+                        fallback: (localeIndex + groupIndex + styleIndex) % 2 ? 'none' : 'code'
+                    };
+                    if (type === 'language')
+                        options.languageDisplay = (localeIndex + styleIndex) % 2 ? 'standard' : 'dialect';
+                    const names = new Intl.DisplayNames(locale, options);
+                    for (const code of codes) {
+                        const value = names.of(code);
+                        const text = value === undefined ? '<undefined>' : value;
+                        for (let index = 0; index < text.length; index++)
+                            hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+                        hash = Math.imul(hash ^ 255, 16777619);
+                    }
+                }
+            }
+        }
+        hash >>> 0;
+    "#;
+    let mut expected = None;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let actual = run_in(&mut engine, source);
+        if let Some(expected_value) = expected.as_ref() {
+            assert_eq!(&actual, expected_value, "tier {tier:?}");
+        } else {
+            expected = Some(actual);
+        }
+    }
+}
+
+#[cfg(feature = "intl")]
+#[test]
 fn segmenter_unicode_boundaries_and_containing() {
     // ECMA-402 Intl.Segmenter delegates its boundary decisions to locale-sensitive
     // segmentation. These exercise the Unicode 17 UAX #29 defaults exposed through the public
