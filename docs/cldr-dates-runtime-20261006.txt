@@ -1,0 +1,69 @@
+Compact CLDR date tables — 2026-10-06
+
+Date tables now store deduplicated UTF-8 text in one static blob and use u16
+string IDs in their rows. A directory of u32 offsets and lengths replaces
+repeated static string pointers. Lookup still compares string contents in the
+same sorted order and returns borrowed static strings. There is no runtime
+allocation, unsafe code, new dependency, or locale-data update in this change.
+
+The generator pins CLDR JSON 48.0.0 at
+4d06be52b51bb2f75688d0abe55c52a66afed790 and records 384 input hashes beside the
+generated source. Before conversion, the original generator reproduced the
+previous checked-in source byte for byte. An exhaustive comparison found all
+32,616 month/era records unchanged across 48 tables. The compact blob contains
+4,489 distinct strings in 68,955 bytes. Tests check all references for bounds,
+UTF-8 boundaries and deduplication, plus lookup and fallback behavior.
+
+The ECMA-402 FormatDateTimePattern algorithm requires the selected localized
+representations and format widths to survive this storage change. Consulted
+snapshot: b1c961988b9a07894b1dc3dc2b5626ea48387d61, fetched 2026-09-06;
+/big/web-standards/repositories/tc39/ecma402/spec/datetimeformat.html:1342;
+https://tc39.es/ecma402/#sec-formatdatetimepattern .
+
+Measured against 1084161475e2e35b50a73eb06fd6885e66de9239 on Crystal, ARM64 Linux,
+CPU 5, default template JIT, release opt-level 3/fat LTO/one codegen unit,
+default Intl plus embed. The optimizing backend was disabled. Existing linker
+configuration was unchanged. Six balanced fresh-process pairs cover React,
+Vue, Djot, EJS, eleven WebGL-shaped kernels, warmed date formatting and date
+formatter construction; startup uses 60 pairs. No owned build, test or profiler
+overlapped timings. Every output checksum matched.
+
+Paired candidate/baseline median ratios and bootstrap 95% intervals:
+
+  startup child wall       0.82589 [0.81513, 0.83207]
+  startup peak RSS         0.78063 [0.76468, 0.79526]
+  React execution          1.00218 [0.99892, 1.00653]
+  Vue execution            1.00006 [0.98960, 1.00267]
+  Djot execution           1.00423 [0.99877, 1.01040]
+  EJS child wall           0.99966 [0.99310, 1.00260]
+  WebGL kernel child wall  1.00504 [1.00235, 1.00697]
+  warmed formatting wall   1.00031 [0.99831, 1.00164]
+  construction child wall  0.99569 [0.98698, 1.00069]
+
+Startup medians were 10.063 ms and 8.253 ms. The executable shrank from
+26,108,888 to 21,665,320 bytes; ELF relative relocations fell from 310,333 to
+197,067. App peak RSS fell approximately 0.7% to 19.6%, depending on workload.
+No component crossed the documented 3% regression gate. Separate diagnostics
+showed matching compilation/collection counts and essentially unchanged
+managed post-GC memory and generated code. Individual instrumented compilation
+and pause times are not stable comparison distributions.
+
+Full engine tests: 1,807 passed, zero failed, three ignored. Workspace/all-target
+check, no-default-features engine check and formatting check passed. Test262
+intl402/DateTimeFormat passed 244 tests with zero failures or skips on the
+default JIT tier, suite d86b2294eb0a17eaa281ff12c73c473ec864c72f. The runner's
+all_executed_passed flag is true and the full report is preserved.
+
+The measured binary came from an isolated date-only worktree. The coordinator
+still had a held array experiment while running the comparison; it was not part
+of this binary. Integration checked every changed source hash against the
+frozen date build. The complete manifest, source identity, checksums, workload
+hashes, diagnostics and comparison intervals are in
+benchmarks/cldr-dates-runtime-2026-10-06.json. Raw local evidence is under
+benchmark-results/cldr-date-packed-build and
+benchmark-results/object-runtime-20261005-7eac91/cldr-dates-final-20261006.
+
+This is a measured startup and footprint improvement. General application
+throughput remains at parity, and this does not establish an 8–10x engine gain.
+The startup samples use warm filesystem caches; there is no new x86-64/wasm32
+execution evidence or installed-artifact promotion.

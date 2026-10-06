@@ -1,0 +1,1560 @@
+{
+  "cldr_json_commit": "4d06be52b51bb2f75688d0abe55c52a66afed790",
+  "cldr_json_repository": "https://github.com/unicode-org/cldr-json",
+  "cldr_json_tag": "48.0.0",
+  "distinct_input_count": 384,
+  "era_record_count": 18504,
+  "generator": "scripts/gen-cldr-dates.py",
+  "generator_sha256": "1d89f8f76e538ec0dc1387a4105a10c3d35d4554f359f9d6e26cb6297f79f52c",
+  "input_url_base": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json",
+  "inputs": [
+    {
+      "sha256": "5778a6eae729c79c6b52205127943e8b83bf2ed328d6d8b9b6bdfcb5d1511d99",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/ar/ca-buddhist.json"
+    },
+    {
+      "sha256": "f45a438a5f306abf83cbb61479cd38008e712e220b9278eeecd9aa7feda2d38a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/de/ca-buddhist.json"
+    },
+    {
+      "sha256": "721d2c61b0bddc3e7a3425a6358272787d300e5a680ecb539c5c0615b6e536c0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/en-IN/ca-buddhist.json"
+    },
+    {
+      "sha256": "9e142712f508b93f3ac593f9e5c66c40d34fe3fe3df5c03fe94584e25676a169",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/en/ca-buddhist.json"
+    },
+    {
+      "sha256": "a1cb08d2fb1e570132fab7569b01bcdac8d319aa54d3dc774f7620eb43b6d63d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/es/ca-buddhist.json"
+    },
+    {
+      "sha256": "86fda77a5389fc681a5583c3cb649eb066c38c2542549496e2cd7674dcc13978",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/fr/ca-buddhist.json"
+    },
+    {
+      "sha256": "b76934100dbce54ae8ff674dccdfe8ece62000bd04184c214f886262c7baa356",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/gv/ca-buddhist.json"
+    },
+    {
+      "sha256": "c67d060aac47a39e7554bfdef8f6393788099de2fabc4373ea07dbf46c6b37fa",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/hi/ca-buddhist.json"
+    },
+    {
+      "sha256": "a4d3301b77db1de5fde2ef800af21f3ce6842744ed84279cef189f94db41b85f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/it/ca-buddhist.json"
+    },
+    {
+      "sha256": "1002bde603dd158e9dda00dc84ab637562c878a1a068fd7d8dfe75e5ed621365",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/ja/ca-buddhist.json"
+    },
+    {
+      "sha256": "9c5b9d90236620baf885662119396d4e815a1293a642d89aca8abc493bb5e215",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/ko/ca-buddhist.json"
+    },
+    {
+      "sha256": "d6ea61ba818e291b07f6ed8e9036f316d97e122e09d6da2ef7729db117edcad9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/ln/ca-buddhist.json"
+    },
+    {
+      "sha256": "56bb088f089dd635aadb0c02301e4f06de155d6de70c0ee449738afaa1da38f9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/nl/ca-buddhist.json"
+    },
+    {
+      "sha256": "252d063a0a3644e431e19f33ab0b90aa4e18651c6b255609519970bacd2c9ec5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/pl/ca-buddhist.json"
+    },
+    {
+      "sha256": "6808d38fa70eaed9a8586558ba204d8b52c0693218d5055ec9a14e382fceb590",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/pt-PT/ca-buddhist.json"
+    },
+    {
+      "sha256": "97be28c45231bf881d7f892678a97b8dd34f3ac90a01fe6089f668fc08ad0c86",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/pt/ca-buddhist.json"
+    },
+    {
+      "sha256": "025afb8a10fa2a6134ec550804ac05ee557418f24dded7d44b24177453aad8b8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/ru/ca-buddhist.json"
+    },
+    {
+      "sha256": "fb28e38b4ebd424b938d52a87740fdd78072c890ea67837dd7b0285901918813",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/si/ca-buddhist.json"
+    },
+    {
+      "sha256": "600a3b92610f970a5dc5983edbd76d16198199eb97e2e25f49d93074d9c68fc4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/sl/ca-buddhist.json"
+    },
+    {
+      "sha256": "5cdff4a328db358e7e491ddb80f76c3046fb7fe372e91b0a0df806f212955d97",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/sr/ca-buddhist.json"
+    },
+    {
+      "sha256": "2c124fb365a7965e881aef9cc78cae044d5eb2db7332eb419e0c9e6354baff02",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/sv/ca-buddhist.json"
+    },
+    {
+      "sha256": "c7cc0d71d52055afc094ac1cb5c606870d16aa8e98e28a8be03b8cde7e8ce106",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/th/ca-buddhist.json"
+    },
+    {
+      "sha256": "9d6aa0fdf5d863e2c2f3f4f2f97f0f9a3041f213fdc653c0f5ff1e73d61d4d78",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/zh-Hant/ca-buddhist.json"
+    },
+    {
+      "sha256": "aaf51b34dfc7e74124c5e6d68fe900470d3485b7894c767b49afd36c526c54e8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-buddhist-full/main/zh/ca-buddhist.json"
+    },
+    {
+      "sha256": "4db7db607c449d02713cb2df061bb2223e5d2b0db8b846ecf250278ec3f02224",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/ar/ca-chinese.json"
+    },
+    {
+      "sha256": "c58a46eba3cd76208293eb414efef28a04d86c0d6145e8ba69ab3b45a5e59070",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/de/ca-chinese.json"
+    },
+    {
+      "sha256": "960bc2bef04c2506bcafdf4aa341157e9ca4460456ee780679bff9c6a6a1a861",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/en-IN/ca-chinese.json"
+    },
+    {
+      "sha256": "a4e3c106c87cd2daa3be27ae5cafc0ee520705fb37b16c1a3bb2122365517e50",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/en/ca-chinese.json"
+    },
+    {
+      "sha256": "a06607cce24d9e8e84e5a8c941f2c9e7ba995390b7252814ebf31796640dd2d2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/es/ca-chinese.json"
+    },
+    {
+      "sha256": "54d022df6e78092d2c41586e05e3bb0cb8fa0d2f949a07a912e8f30e44a0994d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/fr/ca-chinese.json"
+    },
+    {
+      "sha256": "8c6836f868ba97a1259b7dc777eb45a5bd59190c17f34a4caa000e4c7ff1ec88",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/gv/ca-chinese.json"
+    },
+    {
+      "sha256": "c0794e79887947e02d905e1b8d283013fef6f488a1245351f9680ebd1da592bd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/hi/ca-chinese.json"
+    },
+    {
+      "sha256": "0b75b030fad6994b0d58ab1f7337e0521da8df1f95ae3034d6a8780ea37fbf99",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/it/ca-chinese.json"
+    },
+    {
+      "sha256": "3e8112c3cbababe8a0ac3037d07c91f897bbe3044b0cb1f89c165caf4983f5fc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/ja/ca-chinese.json"
+    },
+    {
+      "sha256": "df06f0a771b95bdddf0e88cd256b5d0a37da713380a0d61d79225756577e2370",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/ko/ca-chinese.json"
+    },
+    {
+      "sha256": "68df861e18653bc2976a9411ada5a95a82a46047bcdd7743e5e94315a5495675",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/ln/ca-chinese.json"
+    },
+    {
+      "sha256": "56586db847a3ee89a549ad1d55a70dc13a78bd0adc57994c41401ab92086eb93",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/nl/ca-chinese.json"
+    },
+    {
+      "sha256": "c779b863d3a21cb4e1edf25db5cd18864894245d3af521902f9b6d12142c4969",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/pl/ca-chinese.json"
+    },
+    {
+      "sha256": "15204dd10ce240507d97db3160995c7857a7297d5ba4cad9796840071a95256a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/pt-PT/ca-chinese.json"
+    },
+    {
+      "sha256": "884a2387d43a442143d2ec45a83784422ec8fc792f133031c7f34419c9fea018",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/pt/ca-chinese.json"
+    },
+    {
+      "sha256": "75ade72bb0d15b789beba5c2425de40218a4e7052804639274e6201d351159d7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/ru/ca-chinese.json"
+    },
+    {
+      "sha256": "606561a90c7b8c2adf101477d7a8fbc7fbdfb7107fbe74115168d2377663f1f6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/si/ca-chinese.json"
+    },
+    {
+      "sha256": "dcab23ae0e5897f783646b4df1571ccb0e77e6f5338e6849627a6fa2af91c92b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/sl/ca-chinese.json"
+    },
+    {
+      "sha256": "37b8d832b560ce03b3cb39a15f6217562ce1fbffb3282180db5a3d8e4e801b3c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/sr/ca-chinese.json"
+    },
+    {
+      "sha256": "dd6c9259de9f41322a92d18880686cf0b87aef7c1da0b4eb85d1b00e2732642b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/sv/ca-chinese.json"
+    },
+    {
+      "sha256": "8364ec20aea9c6f7e4c6fb0256c22f13211bff2ef61abc83f2b2a3a36e7cd005",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/th/ca-chinese.json"
+    },
+    {
+      "sha256": "1ca2d3fe7b8ea02ffc7a75adda9a748dd4178c50a38a1e67b79f3ce21278842b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/zh-Hant/ca-chinese.json"
+    },
+    {
+      "sha256": "827c8e9a1d9600059308077cd3b3cd52246f0a3e0bdd1c7d692a248d4bffc8b0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-chinese-full/main/zh/ca-chinese.json"
+    },
+    {
+      "sha256": "8ec438bf0a7bf157542294d25e5a6943044b095cf376c41ddff2ebaff1d9bc68",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/ar/ca-coptic.json"
+    },
+    {
+      "sha256": "6a5cd41bfb9be9d453038d0e58f202fa666ebde373e965a46ac078568abcbb4e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/de/ca-coptic.json"
+    },
+    {
+      "sha256": "6098bd9298ad3a49703df532c1e1a522f01eb756e64feff1dfbd945e2652406f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/en-IN/ca-coptic.json"
+    },
+    {
+      "sha256": "5bce3c8e5d5eeed7a42c5434d630808cb2d477bde440691e0e588575eca44fb9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/en/ca-coptic.json"
+    },
+    {
+      "sha256": "b79e51aa6a16ada5d08a4d53fbaed9f4d531384ea7ec852766004ce5b6b357f4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/es/ca-coptic.json"
+    },
+    {
+      "sha256": "906a6af7a0105538c1e141501f61f46513c952c31fe593b04e14388b9ba0ca3d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/fr/ca-coptic.json"
+    },
+    {
+      "sha256": "3a8ef965c3dc58ac18b9a614ac1778baa0d5e8a5c496f10cf699bff5cd13b0f4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/gv/ca-coptic.json"
+    },
+    {
+      "sha256": "31d10f7c7f0f093574054a65126234acdd60ca6a831d2a5a26323e15ca9d5fda",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/hi/ca-coptic.json"
+    },
+    {
+      "sha256": "bb5002518f75316132ef734794c3ed5bd1d1c49b84bd0edd4b0ef9e4da49df95",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/it/ca-coptic.json"
+    },
+    {
+      "sha256": "10620bb1508062ddf08838f5d240a7e926b9b25f3a3c065ade6155df5217591d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/ja/ca-coptic.json"
+    },
+    {
+      "sha256": "89e9cbb5a3b6f00a7cffc5f1c2738e5941ba04a96562b2309c223bd8a5d20548",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/ko/ca-coptic.json"
+    },
+    {
+      "sha256": "f4b03dd54a2e10bff3cf8c71076279939dcfef0a0a9fb1d13003a8341af5268a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/ln/ca-coptic.json"
+    },
+    {
+      "sha256": "12328deba28eb8fa6e4893f3a73a0ff275ba29b76d07e6957c91d2f6e4aca3c4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/nl/ca-coptic.json"
+    },
+    {
+      "sha256": "2307e57a87ef9afd20e09015c8c8c78e4afa5286ebd31907db9d2fa4139c3cbe",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/pl/ca-coptic.json"
+    },
+    {
+      "sha256": "6903dcb957f02127bf29becb5009aff123e2bdb9cc344520365bc030a2260a33",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/pt-PT/ca-coptic.json"
+    },
+    {
+      "sha256": "c438f9136d9730e49515225af1f3d2131c9ba5731ed4485505c77239f67531d1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/pt/ca-coptic.json"
+    },
+    {
+      "sha256": "3661f4ed84a85af054dc5774dbcf5d2fe2eb5f2c18ed921a7788597fe5a7a52a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/ru/ca-coptic.json"
+    },
+    {
+      "sha256": "6ce3e01df0ebdd821329b9b924efed6cb8f2fedd5b1184e4ce393dc3b5a5bc58",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/si/ca-coptic.json"
+    },
+    {
+      "sha256": "d763c53a6258704f140adb6c37be5aa89c9b1c79e809084908c3a21c60cad088",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/sl/ca-coptic.json"
+    },
+    {
+      "sha256": "fc9f4e544eb077d22e0237df5c0ec4027e5bf75aeef03c876054168440edcb7c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/sr/ca-coptic.json"
+    },
+    {
+      "sha256": "1fb9a82b25b156818f0f71959d0092bbc2a3eadf5d7e9bffb9d6549b787a11e8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/sv/ca-coptic.json"
+    },
+    {
+      "sha256": "e256a8878566068c123816dc2bf9ecff95eedc92b7aa0c4117da08f75f0f8147",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/th/ca-coptic.json"
+    },
+    {
+      "sha256": "6ccab7864db0f71ce460d8e20134db07eb787ff6c07dee9f82db93c2cf657774",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/zh-Hant/ca-coptic.json"
+    },
+    {
+      "sha256": "ea9498610dafe667d4c4502a23f261e09f53aed4e876a299ec5178fd41821af0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-coptic-full/main/zh/ca-coptic.json"
+    },
+    {
+      "sha256": "c2f78e8e9bf6b68afc485863ea1ea14dbf2dc6be4633aa4490412865d0372767",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/ar/ca-dangi.json"
+    },
+    {
+      "sha256": "f656383193aa5df734fd495c67d6d9fc56945593c5f3345a0b9415858112c8a1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/de/ca-dangi.json"
+    },
+    {
+      "sha256": "4e54324da1a39dbdeecee60ad35cf827f00c1d8683525172680791d016a76fab",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/en-IN/ca-dangi.json"
+    },
+    {
+      "sha256": "da94512e26653af5531f7603e3301bf00dde205a5bf0a97eb2dbf03a4e6a3f7b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/en/ca-dangi.json"
+    },
+    {
+      "sha256": "ee2f69d124be429d54a6dbdf49802bc65af70ed45de88218fdbb4a887e54adb0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/es/ca-dangi.json"
+    },
+    {
+      "sha256": "2ac709abf71007fda4fd28dcfe90bd3e0c2d5e505cc0b6a08b0e20b859ee97ee",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/fr/ca-dangi.json"
+    },
+    {
+      "sha256": "ade118f4315814004a8e104858f338850d064a7aefa4e9cf39a333f10e260521",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/gv/ca-dangi.json"
+    },
+    {
+      "sha256": "f85fb4955e8bb3b115c191824f2902880e4af0475151ce1afff0438d2d54f8d0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/hi/ca-dangi.json"
+    },
+    {
+      "sha256": "c66f291449c5b69c67c65e179da4a3dce1285e0f82853438fc43e63d8438bbb6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/it/ca-dangi.json"
+    },
+    {
+      "sha256": "3f0e56be8fed1ea4f3b9ff2cc7ebdf10659e86db2898993a03f491292d173c67",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/ja/ca-dangi.json"
+    },
+    {
+      "sha256": "023ee0fbc463d83c4725ac4d3119794926377cdb086e2674d54c0eb5fdfb068d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/ko/ca-dangi.json"
+    },
+    {
+      "sha256": "2889cc3295438956d314e4a7208a5565d4273711c1f0e240a319a0e5d2376547",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/ln/ca-dangi.json"
+    },
+    {
+      "sha256": "e748acc3a0501ab68799caf3cb92672094c73a2cdf8bd779520100fa158f2300",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/nl/ca-dangi.json"
+    },
+    {
+      "sha256": "ea66a4507af3104b02fc30da21a51654c0b655f9fedb115a606045f02a65a482",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/pl/ca-dangi.json"
+    },
+    {
+      "sha256": "97fb9908faa7ed65c6a449322829bdf5fe12c018c786a428eb366d4241968536",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/pt-PT/ca-dangi.json"
+    },
+    {
+      "sha256": "f7f45657b93732d70cf62d1e8c8914c7da495d22719dc0f39c650fa5801e4a30",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/pt/ca-dangi.json"
+    },
+    {
+      "sha256": "ee45c004f9e48e0fc7271fc9d8154c792e7313f250e77217868a005633ec6a1d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/ru/ca-dangi.json"
+    },
+    {
+      "sha256": "34f7a0903dec2f2319be40c19cee0a588086ee7f386521aeeb40ac469c70f6d9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/si/ca-dangi.json"
+    },
+    {
+      "sha256": "947c394fe65d9411f2b7d347535bc5f7f22d3e751f2dd41de739beb6d90e971d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/sl/ca-dangi.json"
+    },
+    {
+      "sha256": "d42c20bb4ced8cfe2cb3f5a77d06e51fe539067ef28920a4f39b348f052af9de",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/sr/ca-dangi.json"
+    },
+    {
+      "sha256": "0a2dde4071cce290c54bbd46d58c0805044520e72155b91553cfc5a208a83e0b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/sv/ca-dangi.json"
+    },
+    {
+      "sha256": "db91a188e313498ae7e4f8292f9579fcec667043c16de79360b7d4717c0eaa42",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/th/ca-dangi.json"
+    },
+    {
+      "sha256": "5c13b8fcb66caa75751775b95370767a2f32d552ff39173cde09ce89b8829ab8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/zh-Hant/ca-dangi.json"
+    },
+    {
+      "sha256": "58856f2f5611c80bd6b0c8c2320356276a599065c078acb84d5a5e5e237c05b2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-dangi-full/main/zh/ca-dangi.json"
+    },
+    {
+      "sha256": "84eae8c88ccbba6804e19b7ece1f829a05308226b70cde806c611c16dddebd07",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ar/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "b6fadc6b03a4c26add6dfe7078e08da6522a49b77db1a99e7d73c099f2cff9cf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ar/ca-ethiopic.json"
+    },
+    {
+      "sha256": "49800978d0b5e19a0062cbff36555518794140bbbc5258a9998eadb9b68abd9c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/de/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "23fa292eb6afc40df2a960c8a0450f92fb3635ae913f3dba4fb9788e55ed8d91",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/de/ca-ethiopic.json"
+    },
+    {
+      "sha256": "70613ba4e4b416d7fe712614d84eae95104d20e536e5a6f74c346b658ce385ac",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/en-IN/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "a229853b5d3082abee78ac230ad2197ddca66f28c4cb980bdaa03647cede01a9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/en-IN/ca-ethiopic.json"
+    },
+    {
+      "sha256": "750623dd7217f7edffefb1e27d3b8673ac6206ea159f0aebee4c3afa03217fd4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/en/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "0ff51a53810013ac9a1b271cfb246f6b83d7981bbe9cb993f4b93db8be9c07f2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/en/ca-ethiopic.json"
+    },
+    {
+      "sha256": "27880c43f5a63e60a8c55a925d8a31351640c51efb6868a159554f47bd989c85",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/es/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "a66f0e039c0f31afc981cb450c6792f5fe4943883ecfaea8c53f1d1bad33c681",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/es/ca-ethiopic.json"
+    },
+    {
+      "sha256": "78c6d597e59c762b850a55449db9547c5b76a2d6794d4586acfb820e7c4fe922",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/fr/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "3f1c3caedac0a7d2bf7a1be4d68e4ac6bb988d0aa6b2f90fa22f5b708543bdf1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/fr/ca-ethiopic.json"
+    },
+    {
+      "sha256": "0ca16bc370004e69fafa7832a8ece056aa3185fd4486d50c3f00be2fddf42ddc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/gv/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "d6e343b89d945e89bc35bbb03ee4db707c72f833f801477aa2f511eeaf5a6b6a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/gv/ca-ethiopic.json"
+    },
+    {
+      "sha256": "99b8bbce5df2169c79ad402c0a7c9f7e56fecdaee16cf65767b57f66e7aa5a23",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/hi/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "d7f21da513a1d2c81fc48b2889950221999c174992dd67f25913c9c85fdcbcd2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/hi/ca-ethiopic.json"
+    },
+    {
+      "sha256": "3313823f88d1a1e6aa0be514dd925e81c2b737efa81b2e5dc8bf4a8026559e68",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/it/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "afc95d58b7fbe4aac3dce4883052a7f2225130468f9752f0327fd94281b2ec63",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/it/ca-ethiopic.json"
+    },
+    {
+      "sha256": "25e936ec81ec46f0822d65a05cfa7b466cae1a1f1f5fc63d1c6b269f722a060d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ja/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "71dcd057bd8a9dc66c99e8716e217263f154d7ea6365e5110560bb6f59f3c063",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ja/ca-ethiopic.json"
+    },
+    {
+      "sha256": "e711850a15dffab51045772eaf470290da9ebeab7a186c15803989ff1ef6aa8f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ko/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "72a36d1a6f87ec51dc771898497707e6121418396c20c77cdc7bc09511b70b87",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ko/ca-ethiopic.json"
+    },
+    {
+      "sha256": "9688e307c95405f8b13bf4595848db5749ee09d592f34333c92e5afc1aa72f31",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ln/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "3fea2c6716ca88fc62d86948b93d51d921eb94a5563b7e88b931e0c9867d774b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ln/ca-ethiopic.json"
+    },
+    {
+      "sha256": "1ad1f4602d3fc641e927f507f147b2291707896a24c8739ea99c5ea6efa243f7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/nl/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "603cb1770b45f4fc4fb43fe98fa670cfbc0ede6d0c1aa78c732c5d5d33b6dedf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/nl/ca-ethiopic.json"
+    },
+    {
+      "sha256": "d6baafcdcc7619caa58393fe02a53adaf0aeaa884578c5fb098fd89dc943de5a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/pl/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "68ff3d17c11d99828c1942370dca29d257016aedcdc536c0cf77b362c000abe6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/pl/ca-ethiopic.json"
+    },
+    {
+      "sha256": "3c3987a044bc9ec246b9c542a8dfb848249ee79f159099e60a21eddd0e7e21b4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/pt-PT/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "92781bf1520a8c92b85c4c0f313892accec0f2ee3941fc7c95b4ea9059d7dc61",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/pt-PT/ca-ethiopic.json"
+    },
+    {
+      "sha256": "c4a2713b08651e7a316f7ad1b2e0f6f04e182c838cd7ab985e3f016cf7c7532c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/pt/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "e0de7e868184e0df092a5ca6a6168b19b92c696b39688c91db985728dc1339f7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/pt/ca-ethiopic.json"
+    },
+    {
+      "sha256": "afdf198bf83d9a9ed5ab9b03c6fff6b0ca72ce53f4b7d93e566dbb2d7c6010c9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ru/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "0e51a4afb764490f813d238c00e9010fdd1be14de471b407eba6b82d8118dd27",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/ru/ca-ethiopic.json"
+    },
+    {
+      "sha256": "bd40002b4851aa124c70d1b7fe7272717e407defcc269a53dad21314052b9bc8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/si/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "e46fce7b0d4835956c1a4119b16af24a35648cdfd1d7b7c7a1034c3b9b7028e1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/si/ca-ethiopic.json"
+    },
+    {
+      "sha256": "5e64257e956b337dc5a243fa7f597398fd7ddc9072574424ba7b9a30941ff806",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/sl/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "2e52ceda80d31c7012f050ae6ba41a6ae16157b00b2cc75bb0a747d31332b143",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/sl/ca-ethiopic.json"
+    },
+    {
+      "sha256": "f423741e68c2f07e9cd39ce782b5c77cb023874b8de5df7a137ee02cfa3a3530",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/sr/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "ad39bec8a5196e064d6c7a973890d011b98082dd79c7b4fc33a5991a7402ce2e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/sr/ca-ethiopic.json"
+    },
+    {
+      "sha256": "4b32d40e59f6e7da907d98ef44f84d7ef30665ad6788f3cab37b85eea49b4dc8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/sv/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "e0fb26ec6ace2bd71ebceb721113ae4423f69e7562ff26eef3064caa9a3df52d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/sv/ca-ethiopic.json"
+    },
+    {
+      "sha256": "ce296ec9a3433832d759bdf755b13b86610474c7cc550c1c540e29985d8d85f5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/th/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "7494b69228dd51f1ae7e16b4b5f728dff2b9a7c8d592b19c20ded613b1d30a93",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/th/ca-ethiopic.json"
+    },
+    {
+      "sha256": "b0309fb6eefac9444efdf75ebbd96b883ee7b5224d088c911668a9a399c774d4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/zh-Hant/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "b6972f9eafebb0d6396bb2e92b72ff66c0e8580de32c67171b5ac49eb4cd002e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/zh-Hant/ca-ethiopic.json"
+    },
+    {
+      "sha256": "9f4c1ae745f6fb8cd7fae8a3ae7b1b84ba8aafc209698ac4c953ec5c122da807",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/zh/ca-ethiopic-amete-alem.json"
+    },
+    {
+      "sha256": "2f395fad4a6e585645acabcacc2fa477c25290d74dd026dead1602250f508b17",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-ethiopic-full/main/zh/ca-ethiopic.json"
+    },
+    {
+      "sha256": "3aee972c6b84dc7a1d5dc8e32302f7a8b2edc0e1b5385b0b5109fdeeec0f471a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/ar/ca-hebrew.json"
+    },
+    {
+      "sha256": "2b4bf7fd34760ef1bba31c65526bfe6ede96efb80c330db47253633d01f0985b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/de/ca-hebrew.json"
+    },
+    {
+      "sha256": "578bd6d0e9ca6cf5b91f25d8b05bd10bf408c98743419d7af8b2cd7164a77b92",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/en-IN/ca-hebrew.json"
+    },
+    {
+      "sha256": "8cb8f019347f92fba8afc8ae8c24ac8f65a8e5027124fd55329d80fbb4bc13f9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/en/ca-hebrew.json"
+    },
+    {
+      "sha256": "af2b12a40b94a2bb2f24a4864e38cd70ea613c1c7e82faa911200cbfc0e41314",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/es/ca-hebrew.json"
+    },
+    {
+      "sha256": "5f13ffea058540a6046046eacfd74444962c218407a57ea20550c408a3712409",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/fr/ca-hebrew.json"
+    },
+    {
+      "sha256": "d23a161cae867db8dc831dd36bae7377cb245844b53a9b0c8504433aa53a0786",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/gv/ca-hebrew.json"
+    },
+    {
+      "sha256": "0b315daf909377861d7cbd95b13f20abe549902f00195d05fbc02933f0373176",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/hi/ca-hebrew.json"
+    },
+    {
+      "sha256": "0b598625b868b4cf2a7d161ac61b37bbdf01b06c17a7c61f85702c4194579c81",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/it/ca-hebrew.json"
+    },
+    {
+      "sha256": "f3d4e3a46693a6279dffbdc9f4812978021032bd3547b69eea6095b68fb05f09",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/ja/ca-hebrew.json"
+    },
+    {
+      "sha256": "4173ac6e639492aaf6de40febf7bb6e050452abeb91e1b95c4fe21b037a6699d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/ko/ca-hebrew.json"
+    },
+    {
+      "sha256": "0454cdffa9a38df39902c017d5cf09c5a16f9d24b3709c2bfdfcc29e69c29eaf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/ln/ca-hebrew.json"
+    },
+    {
+      "sha256": "d23f39f98d4a521b74f882a3de839b4673a2e53268ba994a5596c86081f86841",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/nl/ca-hebrew.json"
+    },
+    {
+      "sha256": "101d6bfb443f0abb8f6761278e4a0fcb3de1f9d555701dee3f6eebbaf934a021",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/pl/ca-hebrew.json"
+    },
+    {
+      "sha256": "c1c7de64586ccd1dd95beebfe7cb1f17a835cacc9ef6d18a1ea36fc5ed070058",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/pt-PT/ca-hebrew.json"
+    },
+    {
+      "sha256": "e2af3d6cea30028f11bb99917d44bc8f8f1df59792b0b78a69bf50c6045c785a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/pt/ca-hebrew.json"
+    },
+    {
+      "sha256": "da28ef633acfac2bcf9a16f9ae0d0ff63dbc768b60a8821b85c0900177e4b3dc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/ru/ca-hebrew.json"
+    },
+    {
+      "sha256": "fd0730ebeee5a30d466421701c8c92fae557279deb25be39b2012dba80afbfcc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/si/ca-hebrew.json"
+    },
+    {
+      "sha256": "5381fe1f1fe670d1b5a54d133203d4ce8e8b4f0111b0db32353ce7ddc4336f0c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/sl/ca-hebrew.json"
+    },
+    {
+      "sha256": "b92d4f0d6d83350f18ed5544a2866c6f8deff988c08e759e8f839e523514f6c5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/sr/ca-hebrew.json"
+    },
+    {
+      "sha256": "219553ba07afd7fba73aa64f3341620047052ba94df07ec935d19cafb9ca4a40",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/sv/ca-hebrew.json"
+    },
+    {
+      "sha256": "d872a30426f6f90a1653b318c5d07ed70e59c08304d63791b235af7cc736358c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/th/ca-hebrew.json"
+    },
+    {
+      "sha256": "df396d3c5c49081d4f0407fdf18aabdc7b7da86fb439efb80bcf7cdde2050f19",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/zh-Hant/ca-hebrew.json"
+    },
+    {
+      "sha256": "38d70140c4a18a8a1e30162eb1a18a5a6cd570f429754f6b23bbdcd61aae63c2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-hebrew-full/main/zh/ca-hebrew.json"
+    },
+    {
+      "sha256": "d777613be621ed1ad46feb0c07bc7de53248de7ee89b5b5678ef51ab02a89231",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/ar/ca-indian.json"
+    },
+    {
+      "sha256": "58a4a4d609bc2f1877f28201b6fd307005abbca427eb7a230fba1840a7ae6f32",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/de/ca-indian.json"
+    },
+    {
+      "sha256": "57de7d84240ea3e5e1c76e92da5a8a0c15c76151cbd14e5237912eb10dc01345",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/en-IN/ca-indian.json"
+    },
+    {
+      "sha256": "dc12fdf7ed713adc3a1140b915a924069a8f5c11b83e8b566c9d406a86d43858",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/en/ca-indian.json"
+    },
+    {
+      "sha256": "7bfd3e0b16b1a0013deeb3f5a1f919d1be38902b2a3dd22909a5e4cb8e8e1726",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/es/ca-indian.json"
+    },
+    {
+      "sha256": "9de0ceef84c785a954ae8fd9aeee914b01590a72546606d1650eca3f46fdf6e8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/fr/ca-indian.json"
+    },
+    {
+      "sha256": "c8bc08ca834d5aae14ba281eaf37ab9dc1c0807c2f5be897b29d5757dd0742b3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/gv/ca-indian.json"
+    },
+    {
+      "sha256": "62fd7675453bf52c89d9600fd0a1cc1d74ba24bdba9911679b37f6c6c46d864e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/hi/ca-indian.json"
+    },
+    {
+      "sha256": "a42d3125f05f011140fd324e0c13d0d6b325c46ee2504dbd1a7ed25f4deed082",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/it/ca-indian.json"
+    },
+    {
+      "sha256": "65503209e2b486c3d5734ea63c14dc5d7aa3d0bfdb93064c7cd568dfb8092cc9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/ja/ca-indian.json"
+    },
+    {
+      "sha256": "45e2f758b0a0e17200ba5f61aa8a89479aa60791f99a70227a6e866c01121311",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/ko/ca-indian.json"
+    },
+    {
+      "sha256": "6b9d49bd2bc0ebee62e2e407c93e44994f0d5c704489096af1d2ec304cc37f90",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/ln/ca-indian.json"
+    },
+    {
+      "sha256": "b5ce761d6e3fb1c74c7106211a547da5b5917b05a770cf4b558238ab11029c66",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/nl/ca-indian.json"
+    },
+    {
+      "sha256": "dabffb0fce4ef1458d78a15a236a800c8ce32dd590feabf754369133c2fde582",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/pl/ca-indian.json"
+    },
+    {
+      "sha256": "74be36cdecde3c8eaa5447826e16ffb3e682520f966ee867dc7aacddd81c69c3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/pt-PT/ca-indian.json"
+    },
+    {
+      "sha256": "ce02048fb50ef21c84b7caea5edc4c0e57962bed50d232fcc2ed2f3016ed7b7a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/pt/ca-indian.json"
+    },
+    {
+      "sha256": "823fd0aec94c8327b06b98d25894290042c8286c16d300a7bb0a39ccde4f1207",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/ru/ca-indian.json"
+    },
+    {
+      "sha256": "dd5122769868ad0e717e471114fb8bd0456a41d95c52c49a8b796e3620d33a01",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/si/ca-indian.json"
+    },
+    {
+      "sha256": "b682362c91893a6b440a0ec3135f4531e215d1121d04aaa7bbe74a7d38961619",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/sl/ca-indian.json"
+    },
+    {
+      "sha256": "ae3196b5dce2a4682afdfa312749479f74576a6f233e24affd5f58e1d802ac1d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/sr/ca-indian.json"
+    },
+    {
+      "sha256": "0d19180223ed9ef0e5b37c91740b8916f9b95d987b1026e604dd5f8e8807bb14",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/sv/ca-indian.json"
+    },
+    {
+      "sha256": "1c8159546764313f11f82b8acdd29c53dd971d94355f9df7dbfe0c03d10d30d3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/th/ca-indian.json"
+    },
+    {
+      "sha256": "db3d8293e1c527de9e7f085735707f9534eb4d00212880221381e4e18cabe76a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/zh-Hant/ca-indian.json"
+    },
+    {
+      "sha256": "2e8182e438a76521ab7a1a5c4f50724eb27999b2e1a381aae3ac5aaca2c887b6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-indian-full/main/zh/ca-indian.json"
+    },
+    {
+      "sha256": "6feac3ebce0f034a8c6ac50b7f47b0f53f165baa8c9d2e86eddc687e61afd4af",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ar/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "3d4e1a96782d14b265f7ccf9f254be2a8c16dbcdab3392f98ecd3e3b15d41e36",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ar/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "ae27159578dc7d71f4173ccba067ce4637f4abfe96c47c8467d3ff30dc08c439",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ar/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "086afc6d1d9d67df3112f5dc8d39fd7a94eb638d68d3f6aad0bb045a397004f3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ar/ca-islamic.json"
+    },
+    {
+      "sha256": "dc5a9d02308250da9bfeb1904429a9cb1f5be101e1ae8bdcd60728f97993a879",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/de/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "e0e2547d0ced2c133df317406bda5ae98573a71a31f62ec15905f94c487762e0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/de/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "38aa8e75d10b2f25e77504ddfca3a9033db08aebab6a606a6eb1d51d1c9f4554",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/de/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "1c398f84d901b1733e0c2c84f269e92aacb42e28db483d4d8c17573ed4e54ca8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/de/ca-islamic.json"
+    },
+    {
+      "sha256": "8507a2538be39661312e0399c32509827fd97398ae94895c305d266530542a26",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en-IN/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "6bbfb05e72ee5f98eb2283d826ea8fca800ff7952955d1b5e7a7a1f9fe14caea",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en-IN/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "3a8334e668a718ccd90b17558dc679b5c4663759ac66121425543fa4dde35529",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en-IN/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "0948e4fd0c0747ca7d6f8d01d2f7a1b48cbfb4309bfecb972a598d6e8daa149d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en-IN/ca-islamic.json"
+    },
+    {
+      "sha256": "969546a90747cbdd0cbd1dc4a89f33930801d022a056fc1505836894d85e2ffd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "fc3c5d00e7f0442c7628595fd22d0cbac5d9e696abf287f0ebf3947b4cdc451b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "72072c1fc0b7600f5158aca9c9a80994cacecf0c64bc8c701e0db1a6aed7f869",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "358461f02d24b8af545c12e2175a5d0076a570c36a899883dd5fabd68252ea3b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/en/ca-islamic.json"
+    },
+    {
+      "sha256": "a965a60c4d3560ec99cb0f02c75247bf7e66defa2c710b3971a5c37a3e93509e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/es/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "664039551f6e930670b76b5291b3c53738e7f1621d933d5d0c231b14ba68bbd9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/es/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "2ad7a169f9d2fd9f1c64b62db550717f488911582a57252ca9f8f0b847b25651",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/es/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "87c0a122b6caba5470f732a8fc51aa8d9c1cab511fa64cb1aae1158dc398f1c0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/es/ca-islamic.json"
+    },
+    {
+      "sha256": "14ca7805a7b3d37b316e2ca5ef3bfd0e438e7a8e98d374c3c83463dcbdd8e643",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/fr/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "9325d411b9bfb98a4238d2adc174be46710984578bcb5fdc04bf86fc28ecbda5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/fr/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "ae57251f4637b8b09b5e9e785da3c53ff0e5b38367a2dcbcf2600c00db17ffc3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/fr/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "9e3162c2318de99c0fd3cdf5cafa94a047cd8200c639fd5dd484c04c7bdc8296",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/fr/ca-islamic.json"
+    },
+    {
+      "sha256": "88c18c14fa8c07b3c25bbe00b5128e83687edfd1c6d299a337db339c3cafb1d5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/gv/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "14bb5aff368937be1dee2cbafcb4a79a563108bb3815918d9dbf3e6bca275db8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/gv/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "7eca53324c63854067ce50bcfaa9b93ba0acb02d80bd3457fb95ecdff01a6992",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/gv/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "9b70b9f47f2ad9f292ec13de7925bcb244ce157ac4685b19dd091d4aba2ba1bb",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/gv/ca-islamic.json"
+    },
+    {
+      "sha256": "c0959e94700691de05788577df5febb3b4e5616aff0821cbfed5317bacc47261",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/hi/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "6fc7ab2a036410fb6f10471499acb13e22e3da5e287a86b9e15216a53bb8232a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/hi/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "e9b0e5897a3d9a16b29fc05048976ff6e2a10eab9a6c808ac1497819c0e0129b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/hi/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "0f3a716e049ee4228fb601a2aa8df1cb8a35e800905c2f824c6ea04a6a649962",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/hi/ca-islamic.json"
+    },
+    {
+      "sha256": "950d1c1649a409bc1f8d1312d706e7bd6ad08e750ce011581c17ce545b967b38",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/it/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "0227673da2077c908e3e81a3022287a9cb0e27f831ee347ca92f75daeb6b6d9a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/it/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "b6b36fb264928ed1f907044f53503b8b7815045acb293d079ae0ba0bbb7e5627",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/it/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "d36cc3ebd4fd053e57e856540eb260f9098b5dc05a2f0af253d5c694ae992948",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/it/ca-islamic.json"
+    },
+    {
+      "sha256": "62e212e065df749e680203978df6cbea723d91aa521850a4dd14545e53294143",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ja/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "3692729bf8f7eabe7468993f853c6b8e7eb15fbc6b08df2b3b0515a1fc47a7a9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ja/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "e1617020b90e9c83c178b8c0eb5f8aade620f4ebff129557b747f8797cc41a17",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ja/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "da529fea40030cc2099023d0b119f1d13aa5721c606d9d27df9c140b62ba15e3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ja/ca-islamic.json"
+    },
+    {
+      "sha256": "5fadf88bdaf1adc3bd38bda8d0a13c0fc2ecf223a285e06465ce5dcf9592968f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ko/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "6ed1c3a1c308ee6e14192b747b72599fd0604315dc50e68777c9ae33091453e2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ko/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "d4c1cb56aaef914ef25eb3d6674210b33db0b679e7b62cc19e26b6a3a53599cd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ko/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "e808ffe14a0deb252a3df00e4aa0564fcc82cb45853e543eec87f3f5adb1ec93",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ko/ca-islamic.json"
+    },
+    {
+      "sha256": "f3d76dd8c8e570c9a52aa49357ce6aeede941992d3cf3e91096e4530bcffe4f8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ln/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "8ad72fd2b3b3ef6167fb44c6796bdcee7f1b0204b189e9af51cf2125dba9aa17",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ln/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "ccb351b2ce6c6a40e8bd29c19922dd4f0d307cc8d46a398c5ce7c1d3e91831a3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ln/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "34d65f6e0ef4a6aad1995d24eaad8bcfa64fcd4f8d8ad1208d4cf86fd167582e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ln/ca-islamic.json"
+    },
+    {
+      "sha256": "956b154c1c558b46ed7c905b9bcb8f937c26168023542783a41ae29e2488688a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/nl/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "13d17a7a0d2d7a5ec15c19cb0a1f30f3c28f1ed71aa49cf0cb4de35c0b7f5296",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/nl/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "91ffb452d04c20fc9c6bba1098ae5478e427a0624cf88965e4269fb8613324d4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/nl/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "b8d51060c5fdcd7ed336280be43e70e8fc0ba31a015d2ada371d3496443e2f00",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/nl/ca-islamic.json"
+    },
+    {
+      "sha256": "c3b913ee7937bf92238ed65407d3c4c353c8f9f9159f1e12d4fbab6d67a9d278",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pl/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "1a157d77b11bc05ebb34656794f424b031ccf35b7eaf0cd1628bc8f2007f1bc7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pl/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "8cdfdd863be241827e211639afa2a68c784fb450cf0084c3c6596e555471a71e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pl/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "84463bdb8f4671f31dcbb330de82c064a291a99df102210a3a1ae30cf8c430ca",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pl/ca-islamic.json"
+    },
+    {
+      "sha256": "208775acd8d1c8e885332f32628f591c7e7e653572cf9f6f7ca7cc3fe7161330",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt-PT/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "3bc1e9e001d4e5e494a09c2b2936a037f7c5e04884d226ecaa0c655293719165",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt-PT/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "d47427e5bec8096f5b78cffca79d6a0d5ccebd0cece77e98e96695133695141b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt-PT/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "f032feaaab8927f10fe9f6baa21561d68ec84c5e9d3cdf6e4f7840110276d767",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt-PT/ca-islamic.json"
+    },
+    {
+      "sha256": "4fbb4ae91e6adc9376246122aa18a270f52a570128eaa026c22039d8515a7ec0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "cc87959bf8d6a7fc7e3f15aefeba4c3402675db41dc48c4b3bf3516194f5711e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "185ff786cca8226daf039779ac361ca67a1e0e583389173a4ad2b0c1a7323418",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "d7b63671bd24ba2f53238a2bc80ce8f23eace356fbff36cfac6a0999fafd450b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/pt/ca-islamic.json"
+    },
+    {
+      "sha256": "89d77222c592ecda10167c9be1860d0febc1d33702ade05ae6d7e081edd8bfd2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ru/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "2c08d1d23eb2e680920d44e847b2147b8bd26e4c676bc8f411bf9853ecc12064",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ru/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "5a4042a75c39a5bd3320434cd4ead6b5164f484094625e4881342f2a259de068",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ru/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "ed1b9a70821297142a693a28653d2c7630b2ca0c1077c641a96abade0416841c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/ru/ca-islamic.json"
+    },
+    {
+      "sha256": "fa7ec9b8a9a8288f63e0a80669a71ab4fc41689b802cf48d7dec6d8f2ab5f472",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/si/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "33583ffdf51a86e3812035c6b9cf4c125c43f6d4311894eafcdce2db41b0ccf1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/si/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "1b82e6fdddb76e4c26d6841b3d7dda5d8bd73fe41d4412b40adc155ab22cbecd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/si/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "2653bfc39a8a67eb7355773c16fecdbfe955144e51540d2ad68a1fc8624d639f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/si/ca-islamic.json"
+    },
+    {
+      "sha256": "2a392e3a0f22c30bb03a4a08505d2aacb497071dc44aa70490f5dd475ac21459",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sl/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "387846f8c61f492302fea802e1ca3a79ea3d8d3fba8e5ff139e777d1474e83ca",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sl/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "bf358916aa66630df1c2773f9936e8c722b6e72dae387e7601184f9c011918e3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sl/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "e496ca986dde1e1262c828f65b3dd41ca75caaae00b51e712e0e228a29db973e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sl/ca-islamic.json"
+    },
+    {
+      "sha256": "7865d7e421ea91801e4b2c0eae9642bbc1272b8eba7a2d44f66c4a5a4b4955d0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sr/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "be54da4113aef486a426694e2169ed814988bc4d4e258f826c46ada5867f609e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sr/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "0fda09b27ef75401e286ec66040d778c8e77f448eba88e9ac416c22633418984",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sr/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "9f8e8cf6862a82313ca38d05f9e3e61f00a31adc6bbe042bb70f93df1aaf7482",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sr/ca-islamic.json"
+    },
+    {
+      "sha256": "9daa596cab8e7ae42ddaad2317e004e991252aae53f62019b83c29d02169a1ae",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sv/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "69c7f04cb983d108165d88c9a4fe7411567822184db468226c48255c3c649aee",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sv/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "a30ef444d82f406d54f09ad68453f9bf7da5b8761a5b94a7acc309d7445d164f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sv/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "11a6f9c127fb6c2abf7bb232523bf7cabfff76250175023a7e3e9b69304e51d8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/sv/ca-islamic.json"
+    },
+    {
+      "sha256": "784ac1fd8b2b074158d50aa8b75ab44ba912a74cf66cce10ab10dc0bb338c83a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/th/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "1e3a85376018b584bd6db85a8b70a2b99f01efb5cfdcb56d0cd86b9823b428e6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/th/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "95bd53a3c71fb467fab7987813338aed262c1c8d952839192990d76562277af1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/th/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "bea96445e27483af314bdf0e7ea3e45cc79cce0e6e0c0a509c3c449e5a053a52",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/th/ca-islamic.json"
+    },
+    {
+      "sha256": "772263cb8eaba1559b813a04fbbdedd761f377f9cf0215d23d22b5bbc4dc7cb8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh-Hant/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "f119aaa756922ab9b079cbd711359e0878644b401dc30a777ab7401f5c7994c5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh-Hant/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "8752d7128c82aa2da6ad3696c45c79fdb8a13b4c4fb5f46fe0375279fa2e22f0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh-Hant/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "e767fe63e9f38cab12070b136cc1baf9038711753461c5a998232791d34ca20d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh-Hant/ca-islamic.json"
+    },
+    {
+      "sha256": "72573d09d3d14c950ec7d9f2b2be528f4bad82240a91206cd400bbd10bb00729",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh/ca-islamic-civil.json"
+    },
+    {
+      "sha256": "cf08d990df72051e1f3a8a85fe6884f89fae816ad85f3e2cd4e583d31d2bd37f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh/ca-islamic-tbla.json"
+    },
+    {
+      "sha256": "bb86cf1630ab0000aff2209fe3bdb58a961fa814362eeadc93fe810bb00745df",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh/ca-islamic-umalqura.json"
+    },
+    {
+      "sha256": "8a16b3564611f2f0ccb50f3413f6b6283a3a5748cad5cddb8dafec09942eb88d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-islamic-full/main/zh/ca-islamic.json"
+    },
+    {
+      "sha256": "8f68a01e8e3a14baeea00eb6f0daca8a494276e74dc63c8594a87ca68cb17058",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/ar/ca-japanese.json"
+    },
+    {
+      "sha256": "ab52e47d85f2e348ea5d682f8c12d4ff3bf6536357530ac4541d1fca40ffd851",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/de/ca-japanese.json"
+    },
+    {
+      "sha256": "d1e12bc21743c1b6e4cee97725d48a6f401f516453bae8429302788f3aa1e3db",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/en-IN/ca-japanese.json"
+    },
+    {
+      "sha256": "b0cf5300e307716c6b367c4c30e8361cccca7f2a3313b07e798ab4b30595eb78",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/en/ca-japanese.json"
+    },
+    {
+      "sha256": "d71562732773bc3fd7ef4691b7274ac6fa953081d72950d785885dded26e6bd8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/es/ca-japanese.json"
+    },
+    {
+      "sha256": "532461ae9b4b7da11cacc1613e5e5d9caef83fbc01f98b22ee5a50a530279923",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/fr/ca-japanese.json"
+    },
+    {
+      "sha256": "b5442db7c035eda6a400c01eee369db61f020d6ab4cdc3ff0a5cef07a9ad2a3c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/gv/ca-japanese.json"
+    },
+    {
+      "sha256": "2de224cf32c2f783baae3606df1d3a010530e64adb6f41274badedef95940937",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/hi/ca-japanese.json"
+    },
+    {
+      "sha256": "8d761f4de6ab280569d3828f1aad502d89d1aa76ecf97031a998e636224d53a0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/it/ca-japanese.json"
+    },
+    {
+      "sha256": "052e664226977f51689c2dad4b8c2604c824731177ac375958ac3123a2f63977",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/ja/ca-japanese.json"
+    },
+    {
+      "sha256": "81e7362561076e600d41a62099b43c1b9be33591035da4f4ec69afbac0f9be3d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/ko/ca-japanese.json"
+    },
+    {
+      "sha256": "dc2bb0003db4eb54e63535b9020f6ec433f6e9e2ea7549c57e0df103ece7a301",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/ln/ca-japanese.json"
+    },
+    {
+      "sha256": "4f94e561b93a1a6efbec348f7d5602d26a1411b94860f0748d96b4e342c95cf0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/nl/ca-japanese.json"
+    },
+    {
+      "sha256": "4d943340108087dd241dde5c3014c467ff62248e4682f430d99307bf69fc5537",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/pl/ca-japanese.json"
+    },
+    {
+      "sha256": "0a3bff4bb0724a31c3df0e3fd190478564801627faed5bb327ff63d18b0c1a07",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/pt-PT/ca-japanese.json"
+    },
+    {
+      "sha256": "24dacf431568685000c6407454f750619c1cf2bd51b110b63ba29494ac74473d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/pt/ca-japanese.json"
+    },
+    {
+      "sha256": "8292ae6e6e1d541b6b71b1dc7747fc51e7811d232e241415d2e5204744e8c409",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/ru/ca-japanese.json"
+    },
+    {
+      "sha256": "ee1db46050f5b67a78428401a57302eb09c48df484435aacba22bec850947515",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/si/ca-japanese.json"
+    },
+    {
+      "sha256": "ba177e256e47622a182150ac4b8b4d5d6c9ef1e9a602e9f15c194f40ecad00d7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/sl/ca-japanese.json"
+    },
+    {
+      "sha256": "a5cd46d5b57e6f5dbbfdbf9109ca619cb439618efb3eb354c4550c53faf9167d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/sr/ca-japanese.json"
+    },
+    {
+      "sha256": "fe66622881218a3f68e9fd69a5ea35f3f329b2dc93acf0ad017c9fb6827a8e25",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/sv/ca-japanese.json"
+    },
+    {
+      "sha256": "f7c4b9020ae077a59ce4409308ef99c3206e2e06459247ab7de990f753fddc7b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/th/ca-japanese.json"
+    },
+    {
+      "sha256": "5e15d122e4dfd8cc769e44895e49df67d2f890809e51dbf08d6c59b47bf3eec9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/zh-Hant/ca-japanese.json"
+    },
+    {
+      "sha256": "46a360978008502f77dc9d048fec783493c275d5e9f2ef0a76913d1221635788",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-japanese-full/main/zh/ca-japanese.json"
+    },
+    {
+      "sha256": "1998bb31b900614f471ad99d5daf7876a1137519711f29f868c686ec4c7bc23b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/ar/ca-persian.json"
+    },
+    {
+      "sha256": "59ca685fbf5941ea6d7f15c750f11e68ebc04de6f09de0f16a18d14a8722e857",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/de/ca-persian.json"
+    },
+    {
+      "sha256": "434f438a0f318012b5b76df007f55fa08e64aff7c322f8e71d24fa39eeb87b46",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/en-IN/ca-persian.json"
+    },
+    {
+      "sha256": "15089e30baf126d9b801f6e8aae8eda064b20ef142b97d6fd2793f8adc6076b4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/en/ca-persian.json"
+    },
+    {
+      "sha256": "07b74f2d6f3d0150cffba7a2ade0bd2103139a0f4523c240074aa137e6a460a5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/es/ca-persian.json"
+    },
+    {
+      "sha256": "03e24affbcc19a8f4c9a0a0d8097b4b0b98c814fb18174105a45220cd2d852f8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/fr/ca-persian.json"
+    },
+    {
+      "sha256": "69f1547df48e1a9e0e87c241ff0a704515139fdffca3ecc3e1127a9dcf121db2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/gv/ca-persian.json"
+    },
+    {
+      "sha256": "a64bbe81434b19a9f5b8c4970b8d39a1e4306ab8887f15ad72c522bbeaee3489",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/hi/ca-persian.json"
+    },
+    {
+      "sha256": "51f11101f150f379602ebbea37faa90ed668ad6d5f62e2bb4948d05be2917900",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/it/ca-persian.json"
+    },
+    {
+      "sha256": "d9c28acedd9354a081bbb9e5f7db037275891d6d5693e58b1bf00feede5126ad",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/ja/ca-persian.json"
+    },
+    {
+      "sha256": "102e58e9a8635851694e703876af9168247bb92940cdf853b96445b8c9a30845",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/ko/ca-persian.json"
+    },
+    {
+      "sha256": "0f4cc4f697e1fed11c1d7ed6b903004f64d2d7f5d300cd75bd21d9b18eb161f6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/ln/ca-persian.json"
+    },
+    {
+      "sha256": "4b31d39b3a2d525c2b073d64ee3ba626a0f7ce27f03bd984633e7709b53d1526",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/nl/ca-persian.json"
+    },
+    {
+      "sha256": "9e58db30fff2db18a277c3e59259296fb8beac5fa7f7fcc0544bf26e21d17b11",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/pl/ca-persian.json"
+    },
+    {
+      "sha256": "d818f6df47bafbfada47baf7eaaf83899e5bbfc98620f8a6668ebc313839ec3a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/pt-PT/ca-persian.json"
+    },
+    {
+      "sha256": "fcee844c1860cdd8bc29f41ae970fb64e7a36eaf1980c0f00da45fa917421b33",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/pt/ca-persian.json"
+    },
+    {
+      "sha256": "20a1ae64d22bf15b79fb8a16784ae37a5bcf5826032a9164e3774cd766c5cba6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/ru/ca-persian.json"
+    },
+    {
+      "sha256": "07fc4eba591a821316d4b16915a12fceee366e0a1902e619753325ed2b81ffe7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/si/ca-persian.json"
+    },
+    {
+      "sha256": "965be3502fa4e5ae14eecb6b3056f12f81800e57a02789b9cc90b057770b4186",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/sl/ca-persian.json"
+    },
+    {
+      "sha256": "04af018d93ed22c98b0fb6954c30edce86516ae21473f17b4b3b84f74b11100f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/sr/ca-persian.json"
+    },
+    {
+      "sha256": "9f2af61fd47f2dcd0bf61c016e2302c34bd39f22c7afc9750b82eaf917202868",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/sv/ca-persian.json"
+    },
+    {
+      "sha256": "a2fca7a45498f9dc6a0330555a25b0348b2981853c6fcd40426a8b3b6fba7c68",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/th/ca-persian.json"
+    },
+    {
+      "sha256": "de4b245fc54c49b089cbe028a91b755d47883c11a8340bf73a67cc2694ff9686",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/zh-Hant/ca-persian.json"
+    },
+    {
+      "sha256": "8075535f1d3f4dce53c78015c4b4fcac877f2922a4caba1030bbedf5c4d94aa6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-persian-full/main/zh/ca-persian.json"
+    },
+    {
+      "sha256": "25f9f067246abc10e66ac420f51824063c3598b3162d8efb9c16d1ec0cd7250c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/ar/ca-roc.json"
+    },
+    {
+      "sha256": "bddcde263f61d20846388d26ed97f6434eb3122398b0d7a0019353edee47a807",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/de/ca-roc.json"
+    },
+    {
+      "sha256": "ec188d6380eb99ae7550f857d4bae663c25e734bfe48103a2dfc51581a537d3d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/en-IN/ca-roc.json"
+    },
+    {
+      "sha256": "628dee5d6245a5db56f22dd381357d1c0a1749d0c0b6ed286560bde74d1cb3c8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/en/ca-roc.json"
+    },
+    {
+      "sha256": "6621ccc981da7747299def3969076563c52fc8644b58c80e2be2c7948f41953f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/es/ca-roc.json"
+    },
+    {
+      "sha256": "c64be1d76f26dad37b23bba2c68e93b65a8d7881237200fc6189d8d4170a1e94",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/fr/ca-roc.json"
+    },
+    {
+      "sha256": "c02bfe57a9677ef8ec63ef40bec7df0f3ee3f415951b7f9429c377fc7c06f9b4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/gv/ca-roc.json"
+    },
+    {
+      "sha256": "ae65a512886c3d819b7ed3c9e05fbcf8a5d8a10849a59976e7e4c058778fb0d1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/hi/ca-roc.json"
+    },
+    {
+      "sha256": "91e8917c19119798b332e9543672d8a41c26f686d34ff187a9ea4876e9ac3181",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/it/ca-roc.json"
+    },
+    {
+      "sha256": "09f7a8d87d628192ec6f45d73161e07cd8487cfb724ec69fedbfbdb038c5e82d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/ja/ca-roc.json"
+    },
+    {
+      "sha256": "cff92b14d8e6fc793a880b9a214ec3a2f2571384f3c508c60605b9750afb418f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/ko/ca-roc.json"
+    },
+    {
+      "sha256": "8326ff1e45561946ef430d3b92dfb6fb7c17d8dd49e161f56c8d26b2bc71eb7b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/ln/ca-roc.json"
+    },
+    {
+      "sha256": "6d1980378cf1f3f79c53cd4177c54a7933f8f11edb51207a14267af90d1dcff1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/nl/ca-roc.json"
+    },
+    {
+      "sha256": "7f2afee903e62bd8142323deb77a476974d4ecbfe6b074be4d06980388e50e7a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/pl/ca-roc.json"
+    },
+    {
+      "sha256": "a5eac17b71933f2abc0aa7c90530e3c74378cb85a6f5b9e973a0068f808216ce",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/pt-PT/ca-roc.json"
+    },
+    {
+      "sha256": "b280974cdb1f439cd2cf2b1a0de44e92faef6b4804f775a7605fbad3491df1cd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/pt/ca-roc.json"
+    },
+    {
+      "sha256": "faeee79f1e56c56ecfdc67132a2c84ae2508f310ac6b10635f4d908501685fa2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/ru/ca-roc.json"
+    },
+    {
+      "sha256": "495862847e68a9f36e84241d889ac2b409ff2c88900b132942b93566e173c6ff",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/si/ca-roc.json"
+    },
+    {
+      "sha256": "0223656ef9056e216f74c417d2a797cb576106a9bb7b60bd6e56df5f25e6425e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/sl/ca-roc.json"
+    },
+    {
+      "sha256": "87281160828bea38d3fabf1069481681a8019fc5909234dfda351428b97814e8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/sr/ca-roc.json"
+    },
+    {
+      "sha256": "aca2e95976664de8360386e50f63ab0b85c9fb5eef731fb95e2ddcf7df0ae569",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/sv/ca-roc.json"
+    },
+    {
+      "sha256": "0fb0dee4e2f1c5e346cc7bad487c930a466837f2e7fe05a8ca4c4f77e58737b2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/th/ca-roc.json"
+    },
+    {
+      "sha256": "3add93591a369b264e4152386c56bd1dcdcbe07ac5b19e112c7910d884865a0b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/zh-Hant/ca-roc.json"
+    },
+    {
+      "sha256": "f3baf3581f0ce6910dd85f07dac29d9117e7a7e07a71bdda964748cf6f669e8f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-cal-roc-full/main/zh/ca-roc.json"
+    },
+    {
+      "sha256": "9335ee0d20cee9bacd2a2fc81ec5e65eb16b1432a6848d4f8cc9539c8b350499",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/ar/ca-gregorian.json"
+    },
+    {
+      "sha256": "e1b30072cdaa0e511b92d1e1dcf556ff46b5174d41250c071198e5e0797e61d9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/de/ca-gregorian.json"
+    },
+    {
+      "sha256": "e755d2a30be06957d9d75f7a1a344026048aeaecfd0e09ac51c7e1e08ec1007a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/en-IN/ca-gregorian.json"
+    },
+    {
+      "sha256": "22fe41db0ac6d90d92c709c6aa5cca8f15bdb20e10200cbdb92b1fbe6532eca3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/en/ca-gregorian.json"
+    },
+    {
+      "sha256": "d012a3768036f8df3c30093f60daef41c1267bb73fcd710d39e8b2debfd5c68d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/es/ca-gregorian.json"
+    },
+    {
+      "sha256": "0a82c7914d023e375888e914d63be846cb9815c03db25308ae303c1ce3d8bace",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/fr/ca-gregorian.json"
+    },
+    {
+      "sha256": "ff4ef6a09444adb51bdbcc4bb3463f13f35cf31a0eaf8fc4930eb773adc8c829",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/gv/ca-gregorian.json"
+    },
+    {
+      "sha256": "56fd075c8cac8efe28598dbd3ce10885b03360d7f3d07655d741682454d297a4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/hi/ca-gregorian.json"
+    },
+    {
+      "sha256": "a26e266420d0e6964b2dcfe92866b1c0a7c492ce3543ba9a079866a45f1315ee",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/it/ca-gregorian.json"
+    },
+    {
+      "sha256": "9f0137537ad7e6ecee54ba086ab6dac7dfe166b7268417910d105854bfec7923",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/ja/ca-gregorian.json"
+    },
+    {
+      "sha256": "19b560c3d10f856f0d104bc3e184feb7f6beb07626a3dfa7530f96bd75434183",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/ko/ca-gregorian.json"
+    },
+    {
+      "sha256": "f21498e58b09f23f067d8740c7dbe1c2b01c91a4d45797b45d9942b7f975bfe8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/ln/ca-gregorian.json"
+    },
+    {
+      "sha256": "f16915e27186ee8b6e0eb4394576cdfa770c4b16670fad061be70cdb4b8dc8d5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/nl/ca-gregorian.json"
+    },
+    {
+      "sha256": "2fe4676a2a6b7647de734c1c54529b17719fb59f2119e08f2f211ff955a34db1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/pl/ca-gregorian.json"
+    },
+    {
+      "sha256": "c3022fd8556ffc714c9b15724d6521eb1bb6fc9af12608d9e7578da81609c44e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/pt-PT/ca-gregorian.json"
+    },
+    {
+      "sha256": "2a83b7f6f427939b21ce24b99ff6b3b317a9a547e0b56c4c337f1e3224aaef49",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/pt/ca-gregorian.json"
+    },
+    {
+      "sha256": "3edacf158d2ae8e2ffdda73b95899b72caf23db10e06daa807ec3d32bf0eb5fa",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/ru/ca-gregorian.json"
+    },
+    {
+      "sha256": "bfe99d58b339e6e88acf50bc534407fe98f6d9b38d75b2ffbdf3982f1f30758c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/si/ca-gregorian.json"
+    },
+    {
+      "sha256": "40c9c2ef4ea7caa1b49c9628cae20c850c52107633c24fcf88951101b1089b94",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/sl/ca-gregorian.json"
+    },
+    {
+      "sha256": "d6a856db9405440ed3d2948d17c61aeaeb0031093e19b23de2fd55b2d5fbcedc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/sr/ca-gregorian.json"
+    },
+    {
+      "sha256": "83e5140ecdca9c30f7f423f678eb7698627030cd07717a81fe783f357f9aa67b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/sv/ca-gregorian.json"
+    },
+    {
+      "sha256": "84daa66b1f269eb8233565c936d968ea6bf05f3000b89041fc92ed2adc2a1bf7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/th/ca-gregorian.json"
+    },
+    {
+      "sha256": "320e9a6189975be0fb0f7a6f0d34eff5e071057e72a756d74a53374d5a0e954f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/zh-Hant/ca-gregorian.json"
+    },
+    {
+      "sha256": "ccfd1009195d19925e7543b2757b0d957a061550de99852e477d9a016a810023",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/zh/ca-gregorian.json"
+    }
+  ],
+  "month_record_count": 14112,
+  "original_generated_snapshot": {
+    "commit": "1084161475e2e35b50a73eb06fd6885e66de9239",
+    "path": "crates/lumen/src/cldr_dates.rs",
+    "sha256": "7a0198abceba5fe084e7747fffcbb9525e6158b0bf2ec00a87e6e019c218e53b"
+  },
+  "packed_source_sha256": "485e9f0132d124a8dcdb67a7a29ff31f668fb7b2f44703f59c70dd99fa688a67",
+  "string_blob_bytes": 68955,
+  "string_blob_path": "crates/lumen/src/cldr_dates.data",
+  "string_blob_sha256": "413e041a163667cc76ad7c2b37fb36b9bcf43ad67439e12afb36b6345d4587f9",
+  "text_reference_count": 116352,
+  "unique_string_count": 4489
+}

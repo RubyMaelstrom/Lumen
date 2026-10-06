@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""Generate localized calendar month and era names for Intl.DateTimeFormat.
+"""Generate localized calendar names from pinned CLDR JSON inputs.
 
-The tables cover every locale advertised by Lumen and every calendar accepted by its
-DateTimeFormat implementation. Data is partitioned by locale so lookups stay logarithmic within a
-small slice instead of scanning one global table.
+The generated Rust tables refer into one deduplicated UTF-8 blob. The generator
+also writes a provenance manifest containing the hash of each distinct input.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import pathlib
 import urllib.request
 
 
 TAG = "48.0.0"
+SOURCE_COMMIT = "4d06be52b51bb2f75688d0abe55c52a66afed790"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "crates/lumen/src/cldr_dates.rs"
-RAW = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/cldr-json"
+BLOB_OUTPUT = ROOT / "crates/lumen/src/cldr_dates.data"
+MANIFEST_OUTPUT = ROOT / "crates/lumen/src/cldr_dates.inputs.json"
+RAW = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}/cldr-json"
+REPOSITORY = "https://github.com/unicode-org/cldr-json"
 LOCALES = [
     "en", "en-IN", "de", "fr", "es", "it", "pt", "pt-PT", "nl", "ja",
     "zh", "zh-Hant", "ko", "ru", "ar", "sr", "th", "gv", "sl", "pl",
@@ -42,13 +46,31 @@ CALENDARS = [
     ("persian", "cldr-cal-persian-full", "persian", "persian"),
     ("roc", "cldr-cal-roc-full", "roc", "roc"),
 ]
+U16_MAX = (1 << 16) - 1
+U32_MAX = (1 << 32) - 1
 
 
-def rust_string(value: str) -> str:
-    rendered = json.dumps(value, ensure_ascii=False)
-    for character in ("\u200b", "\u2060", "\ufeff"):
-        rendered = rendered.replace(character, f"\\u{{{ord(character):x}}}")
-    return rendered
+class StringPool:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.refs: dict[str, tuple[int, int, int]] = {}
+
+    def intern(self, value: str) -> int:
+        existing = self.refs.get(value)
+        if existing is not None:
+            return existing[0]
+        string_id = len(self.refs)
+        if string_id > U16_MAX:
+            raise ValueError("CLDR string count exceeds the u16 id format")
+        encoded = value.encode("utf-8")
+        offset = len(self.data)
+        end = offset + len(encoded)
+        if end > U32_MAX:
+            raise ValueError("CLDR string blob exceeds the u32 offset format")
+        self.data.extend(encoded)
+        result = (string_id, offset, len(encoded))
+        self.refs[value] = result
+        return string_id
 
 
 def ident(prefix: str, locale: str) -> str:
@@ -57,15 +79,22 @@ def ident(prefix: str, locale: str) -> str:
     )
 
 
-def download(task: tuple[str, tuple[str, str, str, str]]) -> tuple[str, str, dict]:
+def download(
+    task: tuple[str, tuple[str, str, str, str]],
+) -> tuple[str, str, dict, str, str]:
     locale, (calendar, package, file_id, data_key) = task
     url = f"{RAW}/{package}/main/{locale}/ca-{file_id}.json"
     request = urllib.request.Request(
         url, headers={"User-Agent": "Lumen CLDR calendar-name generator"}
     )
     with urllib.request.urlopen(request) as response:
-        root = json.load(response)["main"][locale]["dates"]["calendars"]
-    return locale, calendar, root[data_key]
+        payload = response.read()
+    root = json.loads(payload)["main"][locale]["dates"]["calendars"]
+    return locale, calendar, root[data_key], url, hashlib.sha256(payload).hexdigest()
+
+
+def rust_ref(value: str, strings: StringPool) -> str:
+    return str(strings.intern(value))
 
 
 def main() -> None:
@@ -74,7 +103,11 @@ def main() -> None:
     tasks = [(locale, calendar) for locale in LOCALES for calendar in CALENDARS]
     with ThreadPoolExecutor(max_workers=16) as pool:
         results = list(pool.map(download, tasks))
-    for locale, calendar, data in results:
+    input_hashes: dict[str, str] = {}
+    for locale, calendar, data, url, digest in results:
+        old_digest = input_hashes.setdefault(url, digest)
+        if old_digest != digest:
+            raise ValueError(f"same input URL returned differing content: {url}")
         month_data = data.get("months", {}).get("format", {})
         for width, cldr_width in (("long", "wide"), ("short", "abbreviated"), ("narrow", "narrow")):
             for month, value in month_data.get(cldr_width, {}).items():
@@ -86,63 +119,150 @@ def main() -> None:
                 if isinstance(value, str) and "-alt-" not in era:
                     eras[locale].append((calendar, width, era, value))
 
+    month_tables = {locale: sorted(set(months[locale])) for locale in LOCALES}
+    era_tables = {locale: sorted(set(eras[locale])) for locale in LOCALES}
+    strings = StringPool()
+    for locale in LOCALES:
+        for calendar, width, _, value in month_tables[locale]:
+            strings.intern(calendar)
+            strings.intern(width)
+            strings.intern(value)
+        for calendar, width, era, value in era_tables[locale]:
+            strings.intern(calendar)
+            strings.intern(width)
+            strings.intern(era)
+            strings.intern(value)
     output = [
         "//! GENERATED by scripts/gen-cldr-dates.py from CLDR 48. Do not edit.",
         "",
+        "const CLDR_STRINGS: &str = include_str!(\"cldr_dates.data\");",
+        "",
+        "type TextId = u16;",
+        "type MonthRow = (TextId, TextId, u8, TextId);",
+        "type EraRow = (TextId, TextId, TextId, TextId);",
+        "",
+        "#[rustfmt::skip]",
+        f"static CLDR_REFS: [(u32, u32); {len(strings.refs)}] = [",
     ]
+    for _, offset, length in strings.refs.values():
+        output.append(f"    ({offset}, {length}),")
+    output.extend([
+        "];",
+        "",
+        "#[inline]",
+        "fn text(id: TextId) -> &'static str {",
+        "    let (offset, len) = CLDR_REFS[id as usize];",
+        "    let start = offset as usize;",
+        "    let end = start + len as usize;",
+        "    &CLDR_STRINGS[start..end]",
+        "}",
+        "",
+    ])
+
+    total_month_rows = 0
+    total_era_rows = 0
     for locale in LOCALES:
-        month_rows = sorted(set(months[locale]))
-        era_rows = sorted(set(eras[locale]))
+        month_rows = month_tables[locale]
+        era_rows = era_tables[locale]
+        total_month_rows += len(month_rows)
+        total_era_rows += len(era_rows)
         output.extend([
             "#[rustfmt::skip]",
-            f"static {ident('MO', locale)}: &[(&str, &str, u8, &str)] = &[",
+            f"static {ident('MO', locale)}: [MonthRow; {len(month_rows)}] = [",
         ])
         for calendar, width, month, value in month_rows:
             output.append(
-                f"    ({rust_string(calendar)}, {rust_string(width)}, {month}, {rust_string(value)}),"
+                f"    ({rust_ref(calendar, strings)}, {rust_ref(width, strings)}, {month}, {rust_ref(value, strings)}),"
             )
         output.extend([
             "];",
             "#[rustfmt::skip]",
-            f"static {ident('ER', locale)}: &[(&str, &str, &str, &str)] = &[",
+            f"static {ident('ER', locale)}: [EraRow; {len(era_rows)}] = [",
         ])
         for calendar, width, era, value in era_rows:
             output.append(
-                f"    ({rust_string(calendar)}, {rust_string(width)}, {rust_string(era)}, {rust_string(value)}),"
+                f"    ({rust_ref(calendar, strings)}, {rust_ref(width, strings)}, {rust_ref(era, strings)}, {rust_ref(value, strings)}),"
             )
         output.extend(["];", ""])
 
     output.extend([
-        "fn month_rows(locale: &str) -> &'static [(&'static str, &'static str, u8, &'static str)] {",
+        "fn month_rows(locale: &str) -> &'static [MonthRow] {",
         "    match locale {",
     ])
     for locale in LOCALES:
-        output.append(f'        "{locale}" => {ident("MO", locale)},')
-    output.extend(["        _ => MO_EN,", "    }", "}", ""])
+        output.append(f'        "{locale}" => &{ident("MO", locale)},')
+    output.extend(["        _ => &MO_EN,", "    }", "}", ""])
     output.extend([
-        "fn era_rows(locale: &str) -> &'static [(&'static str, &'static str, &'static str, &'static str)] {",
+        "fn era_rows(locale: &str) -> &'static [EraRow] {",
         "    match locale {",
     ])
     for locale in LOCALES:
-        output.append(f'        "{locale}" => {ident("ER", locale)},')
-    output.extend(["        _ => ER_EN,", "    }", "}", ""])
+        output.append(f'        "{locale}" => &{ident("ER", locale)},')
+    output.extend(["        _ => &ER_EN,", "    }", "}", ""])
     output.extend([
         "/// The month name (1-based) for a locale/calendar/width, if shipped.",
         "pub fn month_name(locale: &str, calendar: &str, width: &str, month: u8) -> Option<&'static str> {",
         "    let rows = month_rows(locale);",
-        "    rows.binary_search_by(|row| (row.0, row.1, row.2).cmp(&(calendar, width, month)))",
-        "        .ok().map(|index| rows[index].3)",
+        "    rows.binary_search_by(|row| (text(row.0), text(row.1), row.2).cmp(&(calendar, width, month)))",
+        "        .ok().map(|index| text(rows[index].3))",
         "}",
         "",
         "/// The era name for a locale/calendar/width/era-key, if shipped.",
         "pub fn era_name(locale: &str, calendar: &str, width: &str, era: &str) -> Option<&'static str> {",
         "    let rows = era_rows(locale);",
-        "    rows.binary_search_by(|row| (row.0, row.1, row.2).cmp(&(calendar, width, era)))",
-        "        .ok().map(|index| rows[index].3)",
+        "    rows.binary_search_by(|row| (text(row.0), text(row.1), text(row.2)).cmp(&(calendar, width, era)))",
+        "        .ok().map(|index| text(rows[index].3))",
         "}",
         "",
+        "#[cfg(test)]",
+        "const GENERATED_LOCALES: &[&str] = &[",
     ])
-    OUTPUT.write_text("\n".join(output), encoding="utf-8")
+    for locale in LOCALES:
+        output.append(f"    \"{locale}\",")
+    output.extend([
+        "];",
+        "",
+        "#[cfg(test)]",
+        '#[path = "cldr_dates_packed_tests.rs"]',
+        "mod packed_tests;",
+        "",
+    ])
+
+    rust_source = "\n".join(output).encode("utf-8")
+    blob = bytes(strings.data)
+    OUTPUT.write_bytes(rust_source)
+    BLOB_OUTPUT.write_bytes(blob)
+    generator_hash = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+    manifest = {
+        "cldr_json_repository": REPOSITORY,
+        "cldr_json_tag": TAG,
+        "cldr_json_commit": SOURCE_COMMIT,
+        "input_url_base": RAW,
+        "distinct_input_count": len(input_hashes),
+        "inputs": [
+            {"url": url, "sha256": input_hashes[url]}
+            for url in sorted(input_hashes)
+        ],
+        "generator": "scripts/gen-cldr-dates.py",
+        "generator_sha256": generator_hash,
+        "original_generated_snapshot": {
+            "commit": "1084161475e2e35b50a73eb06fd6885e66de9239",
+            "path": "crates/lumen/src/cldr_dates.rs",
+            "sha256": "7a0198abceba5fe084e7747fffcbb9525e6158b0bf2ec00a87e6e019c218e53b",
+        },
+        "packed_source_sha256": hashlib.sha256(rust_source).hexdigest(),
+        "string_blob_path": "crates/lumen/src/cldr_dates.data",
+        "string_blob_sha256": hashlib.sha256(blob).hexdigest(),
+        "string_blob_bytes": len(blob),
+        "unique_string_count": len(strings.refs),
+        "month_record_count": total_month_rows,
+        "era_record_count": total_era_rows,
+        "text_reference_count": total_month_rows * 3 + total_era_rows * 4,
+    }
+    MANIFEST_OUTPUT.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
