@@ -1,0 +1,167 @@
+Runtime optimization phase closure — 6 October 2026
+=========================================================
+
+Scope: finish the existing inline2-v4, ObjectBehavior header112 and header104
+experiments. All three final candidates are rejected and remain outside main.
+The previously accepted changes below remain committed. This phase is closed;
+no new source optimization follows this batch.
+
+Retained source changes in this phase
+------------------------------------
+
+42bf867  Reduce object lookup and value ownership overhead.
+1084161  Keep local array operations inside native regions.
+4be60d0  Compact CLDR date tables.
+63f2d40  Compact CLDR number and display-name tables.
+8916823  Fuse guarded array presence and value reads.
+596d826  Validate packed number-table text ranges at compile time.
+
+The two array changes separately reduced the React-derived fixture's duration
+by 6.6% and 6.2% against their respective baselines. These are standalone
+comparisons and are not multiplied into an overall speedup. The first runtime
+batch reduced Vue and Djot duration by about 2.6% and 2.4% respectively.
+
+The direct cumulative Intl-table comparison reduced startup child wall time
+by 35.3% and peak RSS by 39.1% relative to the native-array baseline. This
+comparison excludes the later array-pair change. The number-text proof fixes
+most of the earlier warm NumberFormat penalty; about 0.8% remains against the
+date-only baseline, below the unchanged 3% component regression gate.
+
+The requested 8–10x overall improvement has not been achieved. The recorded
+gains belong to specific workloads and comparisons, not a whole-engine score.
+
+Final candidates
+----------------
+
+inline2-v4: reject. EJS peak RSS ratio .929834 (about 7.0% less), but Djot
+internal time ratio 1.050520 and EJS child wall ratio 1.043103, with both
+confidence intervals wholly slower. The emitter-sharing repair did not remove
+the throughput regressions. The source and frozen binary remain local.
+
+header112: reject. Vue internal time ratio 1.051272 and computed-read kernel
+ratio 1.031008, with intervals wholly slower. Startup confirmation passes.
+No source application to main, and no new refinement is started.
+
+header104: reject. EJS peak RSS ratio .940816 [.939244, .942422] saves about
+5.9%, but Vue internal time ratio 1.037385 [1.028665, 1.047282] exceeds the
+unchanged regression gate. Startup child wall ratio is 1.020830, below the 3%
+median gate; no startup component triggers the combined median/interval rule.
+This variant uses the same behavior compaction plus moving the numeric-mirror
+hole count into existing dense storage padding. Object is 104 bytes;
+RefCell<Object> is 112 bytes and the Rc allocation request is 128 bytes on this
+ARM64 build. Requested layout sizes are distinct from whole-process savings.
+
+The inline2 baseline is compact-Intl commit 63f2d40. Both header candidates use
+accepted engine source 596d826, which also includes array-pair fusion and the
+number-text proof. The memory savings do not waive the throughput gates.
+Remaining Intl/control acceptance checks and source integration are unnecessary
+once these candidates fail the component gate. Their patches, builds, passing
+correctness results and failed performance comparisons remain available locally.
+
+Measurement correction and confirmation
+--------------------------------------
+
+All fifteen executable replicas were prepared once by full writes, fsync,
+hash checks and allocation inspection; no reflinks or cache manipulation.
+The initial A/A queue used 60 startup pairs and six EJS pairs per artifact.
+Its assessor incorrectly treated an empty kernel-results container as a
+required scalar metric. Corrected analysis uses deep copies and retains all
+real scalar flags. The original report, source and samples remain immutable.
+
+The accepted baseline also had a 3.205% reverse-role wrapper-wall flag and a
+zero user-CPU observation; inline2-v4 and header112 had zero baseline system
+CPU observations. These millisecond startup CPU ratios could not all be
+evaluated. This was not an engine correctness failure.
+
+After the user's explicit offer to retry in the quiet window, one fixed
+confirmation was frozen before collecting new samples: all five unchanged
+artifacts, 60 disjoint groups of ten balanced fresh-process pairs each. Wall
+time, child wall and RSS use all 600 raw paired observations. User/system
+CPU use the ratio of summed raw CPU within each group, with 60 group ratios.
+Both A/A directions use separate 10000-resample median bootstraps with the
+existing metric seed. The 3%/95% rule is unchanged. No A/A normalization,
+discarded samples, second confirmation, or source change is used.
+
+All five confirmation controls pass; original six-pair EJS controls have no
+detected asymmetry under the rule. This does not prove equivalence. Existing
+candidate screens then ran with the same sources, binaries and fixtures.
+The header112 and header104 startup comparisons use the same grouped protocol;
+inline2v4's application screen omitted startup. Diagnostic executions are
+separate and instrumented; they do not contribute acceptance timings.
+
+Correctness and limits
+----------------------
+
+The header104 source has 1835 passing engine library tests, three existing
+ignores, and 179 passing runtime tests with one existing ignore. Workspace,
+no-default-features and optional optimizer/architecture compile checks pass.
+Full default-JIT Test262 on suite d86b2294eb0a17eaa281ff12c73c473ec864c72f:
+53574 pass, zero failures, four existing upstream skips; all_executed_passed
+is true. Differential seeds 1..2000: 1859 agreements, 141 budget skips, zero
+divergences. These results describe this candidate, not a new full-suite run
+on the unchanged main branch or the other final candidates.
+
+Header112 has 1834 passing engine tests and a passing full runtime run plus
+the recorded feature checks; it has no new full Test262/differential run.
+Inline2-v4 has focused 16 compact-storage, 21 borrowing, and two update tests;
+the preceding v3 broad checks are inherited and are not reported as v4 reruns.
+
+Independent final source reviews found no blocker in ownership, Combined
+behavior tracing/destruction, native behavior-tag guards, or live layout
+probes. Native execution validation is ARM64; no new x86-64/wasm32 execution
+is claimed.
+
+The runtime networking tests exposed timing/order assumptions during candidate
+validation. Commits 0ce5db2 and 3cee14c make them wait for write completion and
+start peer deadlines after Runtime initialization. Final networking tests
+pass 16/16 on main and the candidate, and the Unix/UDP fixtures pass Node's
+default and jitless modes. Original failures and terminated runs are retained.
+72fc499 separately honors TMPDIR in the SQL integration fixture. These are
+test repairs; 8988b37 is diagnostic infrastructure, not a speedup.
+
+Separate diagnostics and interrupted runs
+----------------------------------------
+
+All 30 separately instrumented diagnostic executions complete with matching
+outputs. Compilation and GC collection counts match between each candidate and
+its baseline. Inline2-v4 still increases generated code from 6205324 to 6653560
+bytes in Djot and from 32191620 to 34467128 bytes in EJS (about 7.2% and 7.1%).
+These counts do not establish the cause of the measured slowdown. Single
+instrumented compile/GC durations do not establish latency or pause gains.
+
+Managed requested bytes describe only the final post-GC lower-bound snapshot.
+For EJS, header112 and header104 ratios there are .999494 and .999178; these
+small retained-memory deltas are not substitutes for the separately measured
+peak-RSS savings. Diagnostic process RSS is instrumentation-enabled and is not
+used in acceptance timings. No object-count-to-RSS estimate is made.
+
+A C++ compiler interrupted the first header104 application run at 08:13:45 UTC.
+A separate Cargo/rustc build interrupted its replacement at 08:22:11 UTC. Both
+partial runs are wholly excluded from acceptance and preserved without pooling
+selected pairs. During the user's file-compression pause, root stopped only
+its own preparatory quiet check before it launched any replacement measurement.
+After renewed coordination, the final complete header104 run used the same six
+pairs and grouped-startup protocol, with no detected build/profile overlap.
+The preceding controls and completed inline2/header112 screens were not rerun.
+
+The diagnostic runner's first invocation failed on a timeout-key mismatch before
+executing any engine. The corrected plan supplies the same 240-second timeout;
+worker output is written to files to avoid unconsumed-pipe backpressure. The
+zero-engine failure and both runner versions remain alongside the successful
+30-run record. No failed experiment or measurement history is overwritten.
+
+Evidence and disposition
+------------------------
+
+benchmarks/runtime-optimization-phase-2026-10-06.json retains exact source and
+binary identities, all paired metric distributions, original and corrected
+control assessments, fixed-confirmation results, diagnostic summaries, validation
+scope and hashes of the full local records. Detailed accepted-change reports
+remain in docs/object-runtime-20261005.txt, docs/native-array-runtime-20261006.txt,
+docs/cldr-dates-runtime-20261006.txt, docs/cldr-intl-runtime-20261006.txt,
+docs/array-pair-runtime-20261006.txt and docs/cldr-number-text-proof-20261006.txt.
+
+Local prototypes and uncapped logs remain under benchmark-results/. These are
+ignored investigation artifacts, not dependencies for builds or contributors.
+None of the three rejected source patches was applied to main. No installed
+release artifact is promoted. The quiet measurement window has been released.
