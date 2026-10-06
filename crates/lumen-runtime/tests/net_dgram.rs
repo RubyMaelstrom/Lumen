@@ -251,6 +251,8 @@ fn net_lumen_client_against_std_server() {
 #[test]
 fn net_std_client_against_lumen_server() {
     use std::io::{Read, Write};
+    // Runtime initialization can exceed the client's connect deadline under parallel test load.
+    let (mut rt, out) = test_runtime();
     // Pre-bind a port for the lumen server so the std client knows where to go.
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -275,7 +277,6 @@ fn net_std_client_against_lumen_server() {
         s.read_to_end(&mut buf).expect("read");
         String::from_utf8(buf).expect("utf8")
     });
-    let (mut rt, out) = test_runtime();
     eval_ok(
         &mut rt,
         &format!(
@@ -413,8 +414,8 @@ fn net_unix_path_client_writes_to_std_peer() {
       const client = new net.Socket({{ _deferRead: true }});
       client.connect({path:?}, () => {{
         console.log("connected", client.remoteAddress === undefined);
-        client.write("ping");
-        setTimeout(() => client.destroy(), 20);
+        // A timer can destroy the socket before its queued write completes.
+        client.write("ping", () => client.destroy());
       }});
     "#
         ),
@@ -489,10 +490,12 @@ fn dgram_connected_mode_and_offsets() {
         });
         "#,
     );
-    assert_eq!(
-        out.lines(),
-        ["remote: 127.0.0.1 IPv4 number", "err: null", "got: HELLO",]
-    );
+    let lines = out.lines();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], "remote: 127.0.0.1 IPv4 number");
+    // Send completion and the peer's independently queued receive have no relative order.
+    assert!(lines.iter().any(|line| line == "err: null"));
+    assert!(lines.iter().any(|line| line == "got: HELLO"));
 }
 
 #[test]
