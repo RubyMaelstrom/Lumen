@@ -72,7 +72,7 @@ pub(crate) fn base64(data: &[u8]) -> String {
 /// keys must decode to exactly 16 bytes (RFC 6455 §4.2.1 item 5); keeping this decoder local
 /// avoids making the JavaScript `atob()` implementation part of a wire-protocol trust boundary.
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
-    if input.is_empty() || input.len() % 4 != 0 {
+    if input.is_empty() || !input.len().is_multiple_of(4) {
         return None;
     }
     let value = |byte: u8| match byte {
@@ -83,10 +83,10 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
         b'/' => Some(63),
         _ => None,
     };
-    let chunks = input.as_bytes().chunks_exact(4);
+    let (chunks, _) = input.as_bytes().as_chunks::<4>();
     let chunk_count = chunks.len();
     let mut out = Vec::with_capacity(chunk_count * 3);
-    for (index, chunk) in chunks.enumerate() {
+    for (index, chunk) in chunks.iter().enumerate() {
         let last = index + 1 == chunk_count;
         let a = value(chunk[0])?;
         let b = value(chunk[1])?;

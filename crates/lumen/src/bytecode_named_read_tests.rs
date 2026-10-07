@@ -219,11 +219,7 @@ fn invoke(
 }
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
-    match engine
-        .eval(source, false)
-        .ok()
-        .expect("fixture source parses")
-    {
+    match engine.eval(source, false).expect("fixture source parses") {
         Completion::Value(value) => value,
         Completion::Throw { name, message } => panic!("{name}: {message}"),
     }

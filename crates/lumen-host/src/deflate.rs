@@ -1244,7 +1244,9 @@ mod tests {
     fn unhex(input: &str) -> Vec<u8> {
         input
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let digit = |byte| match byte {
                     b'0'..=b'9' => byte - b'0',

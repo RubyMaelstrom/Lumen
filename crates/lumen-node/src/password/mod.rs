@@ -36,10 +36,10 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
         msg.push(0);
     }
     msg.extend_from_slice(&((data.len() as u128) * 8).to_be_bytes());
-    for block in msg.chunks_exact(128) {
+    for block in msg.as_chunks::<128>().0 {
         let mut w = [0u64; 80];
-        for (i, c) in block.chunks_exact(8).enumerate() {
-            w[i] = u64::from_be_bytes(c.try_into().unwrap());
+        for (i, c) in block.as_chunks::<8>().0.iter().enumerate() {
+            w[i] = u64::from_be_bytes(*c);
         }
         for i in 16..80 {
             let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
@@ -75,8 +75,8 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
         }
     }
     let mut out = [0u8; 64];
-    for (o, v) in out.chunks_exact_mut(8).zip(h) {
-        o.copy_from_slice(&v.to_be_bytes());
+    for (o, v) in out.as_chunks_mut::<8>().0.iter_mut().zip(h) {
+        *o = v.to_be_bytes();
     }
     out
 }
@@ -158,8 +158,8 @@ impl Blake2b {
 
     fn compress(&mut self, block: &[u8; 128], last: bool) {
         let mut m = [0u64; 16];
-        for (i, c) in block.chunks_exact(8).enumerate() {
-            m[i] = u64::from_le_bytes(c.try_into().unwrap());
+        for (i, c) in block.as_chunks::<8>().0.iter().enumerate() {
+            m[i] = u64::from_le_bytes(*c);
         }
         let mut v = [0u64; 16];
         v[..8].copy_from_slice(&self.h);
@@ -260,15 +260,15 @@ impl Block {
     fn from_bytes(bytes: &[u8]) -> Block {
         debug_assert_eq!(bytes.len(), 1024);
         let mut b = Block::ZERO;
-        for (w, c) in b.0.iter_mut().zip(bytes.chunks_exact(8)) {
-            *w = u64::from_le_bytes(c.try_into().unwrap());
+        for (w, c) in b.0.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            *w = u64::from_le_bytes(*c);
         }
         b
     }
     fn to_bytes(self) -> [u8; 1024] {
         let mut out = [0u8; 1024];
-        for (c, w) in out.chunks_exact_mut(8).zip(self.0) {
-            c.copy_from_slice(&w.to_le_bytes());
+        for (c, w) in out.as_chunks_mut::<8>().0.iter_mut().zip(self.0) {
+            *c = w.to_le_bytes();
         }
         out
     }
@@ -396,7 +396,7 @@ impl Argon2Instance<'_> {
         }
         for i in start..self.seg_len {
             let curr = lane * self.lane_len + slice * self.seg_len + i;
-            let prev = if curr % self.lane_len == 0 {
+            let prev = if curr.is_multiple_of(self.lane_len) {
                 curr + self.lane_len - 1
             } else {
                 curr - 1
@@ -635,8 +635,8 @@ pub fn bcrypt_raw(password: &[u8], salt: &[u8; 16], cost: u32) -> [u8; 23] {
         }
     }
     let mut full = [0u8; 24];
-    for (chunk, w) in full.chunks_exact_mut(4).zip(cdata) {
-        chunk.copy_from_slice(&w.to_be_bytes());
+    for (chunk, w) in full.as_chunks_mut::<4>().0.iter_mut().zip(cdata) {
+        *chunk = w.to_be_bytes();
     }
     let mut out = [0u8; 23];
     out.copy_from_slice(&full[..23]);

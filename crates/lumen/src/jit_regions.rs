@@ -2489,7 +2489,7 @@ pub(super) fn emit(
                     own_facts.clear();
                     let before = stack.clone();
                     materialize(a, layout, &stack, physical);
-                    let effect = region_frame_effect(&ops[pc], &plan);
+                    let effect = region_frame_effect(&ops[pc], plan);
                     match effect {
                         FrameEffect::Independent => {}
                         FrameEffect::Read(slot) | FrameEffect::Write(slot) => {

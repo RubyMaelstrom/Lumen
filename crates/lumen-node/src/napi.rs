@@ -1023,7 +1023,7 @@ pub unsafe extern "C" fn napi_open_handle_scope(
     let _ = env;
     if !result.is_null() {
         // A non-null token; addons only compare it, they don't dereference it.
-        *result = 1 as *mut c_void;
+        *result = std::ptr::dangling_mut::<c_void>();
     }
     NAPI_OK
 }

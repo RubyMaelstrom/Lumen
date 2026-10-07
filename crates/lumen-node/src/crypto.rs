@@ -236,9 +236,8 @@ fn inv_mix_columns(b: &mut [u8; 16]) {
 
 fn ecb(aes: &Aes, data: &[u8], encrypt: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(16) {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(chunk);
+    for chunk in data.as_chunks::<16>().0 {
+        let mut block = *chunk;
         if encrypt {
             aes.encrypt_block(&mut block);
         } else {
@@ -252,9 +251,8 @@ fn ecb(aes: &Aes, data: &[u8], encrypt: bool) -> Vec<u8> {
 fn cbc(aes: &Aes, iv: &[u8; 16], data: &[u8], encrypt: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut prev = *iv;
-    for chunk in data.chunks_exact(16) {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(chunk);
+    for chunk in data.as_chunks::<16>().0 {
+        let mut block = *chunk;
         if encrypt {
             for i in 0..16 {
                 block[i] ^= prev[i];
@@ -586,9 +584,9 @@ fn sha512_core(data: &[u8], init: &[u64; 8], out_len: usize) -> Vec<u8> {
     msg.extend_from_slice(&bitlen.to_be_bytes());
 
     let mut w = [0u64; 80];
-    for block in msg.chunks_exact(128) {
-        for (i, word) in block.chunks_exact(8).enumerate() {
-            w[i] = u64::from_be_bytes(word.try_into().unwrap());
+    for block in msg.as_chunks::<128>().0 {
+        for (i, word) in block.as_chunks::<8>().0.iter().enumerate() {
+            w[i] = u64::from_be_bytes(*word);
         }
         for i in 16..80 {
             let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);

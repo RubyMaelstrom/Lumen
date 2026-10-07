@@ -8678,8 +8678,8 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
     let e = |x: &Expr| expr_contains(x, pred);
     match s {
         Stmt::Expr(x) | Stmt::Throw(x) => e(x),
-        Stmt::Return(x) => x.as_ref().is_some_and(&e),
-        Stmt::VarDecl { decls, .. } => decls.iter().any(|(_, init)| init.as_ref().is_some_and(&e)),
+        Stmt::Return(x) => x.as_ref().is_some_and(e),
+        Stmt::VarDecl { decls, .. } => decls.iter().any(|(_, init)| init.as_ref().is_some_and(e)),
         Stmt::If { test, cons, alt } => {
             e(test)
                 || stmt_contains(cons, pred)
@@ -8699,10 +8699,10 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
             init.as_deref().is_some_and(|i| match i {
                 ForInit::Expr(x) => e(x),
                 ForInit::VarDecl { decls, .. } => {
-                    decls.iter().any(|(_, x)| x.as_ref().is_some_and(&e))
+                    decls.iter().any(|(_, x)| x.as_ref().is_some_and(e))
                 }
-            }) || test.as_ref().is_some_and(&e)
-                || update.as_ref().is_some_and(&e)
+            }) || test.as_ref().is_some_and(e)
+                || update.as_ref().is_some_and(e)
                 || stmt_contains(body, pred)
         }
         Stmt::ForInOf { right, body, .. } => e(right) || stmt_contains(body, pred),
@@ -8721,7 +8721,7 @@ fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
             e(disc)
                 || cases
                     .iter()
-                    .any(|c| c.test.as_ref().is_some_and(&e) || stmts_contain(&c.body, pred))
+                    .any(|c| c.test.as_ref().is_some_and(e) || stmts_contain(&c.body, pred))
         }
         Stmt::Labeled { body, .. } | Stmt::With { body, .. } => stmt_contains(body, pred),
         // A (non-arrow) function or class declaration opens its own context.
@@ -8793,7 +8793,7 @@ fn expr_contains_impl(x: &Expr, pred: fn(&Expr) -> bool, descend_arrows: bool) -
         }
         // `Contains` descends into arrow functions; an ordinary function/class does not.
         Expr::Func(f) if descend_arrows && f.is_arrow => {
-            f.params.iter().any(|p| p.default.as_ref().is_some_and(&e))
+            f.params.iter().any(|p| p.default.as_ref().is_some_and(e))
                 || stmts_contain(&f.body, pred)
         }
         _ => false,
