@@ -40,7 +40,7 @@ struct CurrencyIds {
 }
 
 #[rustfmt::skip]
-const CLDR_REFS_SOURCE: [(u32, u32); 11132] = [
+static CLDR_REFS: [(u32, u32); 11132] = [
     (0, 2),
     (2, 4),
     (6, 2),
@@ -11175,10 +11175,6 @@ const CLDR_REFS_SOURCE: [(u32, u32); 11132] = [
     (260527, 6),
 ];
 
-// `CLDR_REFS_SOURCE` is used only during const evaluation; keep one shared runtime array so
-// indexing this large directory does not risk materialization at each `text` call site.
-static CLDR_REFS: [(u32, u32); 11132] = CLDR_REFS_SOURCE;
-
 const fn cldr_text_range_is_valid(bytes: &[u8], start: usize, len: usize) -> bool {
     let end = match start.checked_add(len) {
         Some(end) => end,
@@ -11208,7 +11204,7 @@ const fn cldr_refs_are_valid(bytes: &[u8], refs: &[(u32, u32)]) -> bool {
 }
 
 const _: () = assert!(
-    cldr_refs_are_valid(CLDR_STRINGS.as_bytes(), &CLDR_REFS_SOURCE),
+    cldr_refs_are_valid(CLDR_STRINGS.as_bytes(), &CLDR_REFS),
     "generated CLDR number text ranges must be in-bounds UTF-8 slices"
 );
 
@@ -11217,9 +11213,9 @@ fn text(id: TextId) -> &'static str {
     let (offset, len) = CLDR_REFS[id as usize];
     let start = offset as usize;
     let end = start + len as usize;
-    // SAFETY: the ID lookup above remains bounds-checked. CLDR_REFS is initialized from
-    // CLDR_REFS_SOURCE, and the compile-time assertion validates every source range for checked
-    // addition, blob bounds, and UTF-8 boundaries before this unchecked slice is reachable.
+    // SAFETY: the ID lookup above remains bounds-checked. The compile-time assertion reads
+    // CLDR_REFS itself and validates every range for checked addition, blob bounds, and UTF-8
+    // boundaries before this unchecked slice is reachable.
     unsafe { CLDR_STRINGS.get_unchecked(start..end) }
 }
 
