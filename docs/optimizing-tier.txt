@@ -56,7 +56,7 @@ The analyzed release desktop SHA-256 is
 
 Reuse and boundaries
 --------------------
-TRust already uses Cranelift 0.135.2 in its owned Wasmi hot-region compiler. Lumen's optional
+TRust already uses Cranelift 0.136.2 in its owned Wasmi hot-region compiler. Lumen's optional
 optimizing-jit feature adds direct codegen/frontend/native dependencies at that version; it
 does not add a Wasmtime execution runtime or use WebAssembly as a JavaScript intermediate.
 Cranelift provides machine-level SSA optimization, register allocation, ARM64/x64 lowering
@@ -887,6 +887,6 @@ https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator
 https://tc39.es/ecma262/#sec-weakref-processing-model
 
 The pinned Cranelift crate sources and official API documentation govern the backend API:
-https://docs.rs/cranelift-codegen/0.135.2/cranelift_codegen/
-https://docs.rs/cranelift-frontend/0.135.2/cranelift_frontend/
+https://docs.rs/cranelift-codegen/0.136.2/cranelift_codegen/
+https://docs.rs/cranelift-frontend/0.136.2/cranelift_frontend/
 GC boundary explanation: https://bytecodealliance.org/articles/new-stack-maps-for-wasmtime

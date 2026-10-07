@@ -13,14 +13,14 @@ license.workspace = true
 [dependencies]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-stacker = "0.1.24"
+stacker = "0.1.25"
 
 [target.'cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
-# Keep these in lockstep with TRust/vendor/wasmi-1.1.0. This opt-in feature requires Rust 1.95;
+# Keep these in lockstep with TRust/vendor/wasmi-2.0.0. This opt-in feature requires Rust 1.96;
 # it does not add a Wasmtime runtime or replace Lumen's GC, JS semantics, or W^X code ownership.
-cranelift-codegen = { version = "=0.135.2", optional = true }
-cranelift-frontend = { version = "=0.135.2", optional = true }
-cranelift-native = { version = "=0.135.2", optional = true }
+cranelift-codegen = { version = "=0.136.2", optional = true }
+cranelift-frontend = { version = "=0.136.2", optional = true }
+cranelift-native = { version = "=0.136.2", optional = true }
 
 [features]
 default = ["intl"]

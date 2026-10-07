@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 lumen-web = { path = "../lumen-web" }
-wast = { version = "=246.0.2", default-features = false, features = ["wasm-module"] }
+wast = { version = "=261.0.0", default-features = false, features = ["wasm-module"] }
 
 [lints]
 workspace = true

@@ -79,8 +79,8 @@ The default tier is JIT. Useful diagnostic controls:
   loads a profiler library. Keep it disabled for uninstrumented timing comparisons.
 
 The optional `optimizing-jit` feature adds an in-development whole-function Cranelift backend
-on native ARM64/x86-64. It uses Cranelift 0.135.2, matching TRust's owned Wasmi integration,
-and requires Rust 1.95 or newer when enabled. `LUMEN_OPT_JIT=1` explicitly selects this
+on native ARM64/x86-64. It uses Cranelift 0.136.2, matching TRust's owned Wasmi integration,
+and requires Rust 1.96 or newer when enabled. `LUMEN_OPT_JIT=1` explicitly selects this
 development backend for eligible ordinary functions; unsupported entries retain the template
 JIT/VM. `LUMEN_OPT_JIT=hot` instead starts with template code and admits frequently called
 ordinary functions using four bounded entry samples, guarded Number/Boolean input facts,

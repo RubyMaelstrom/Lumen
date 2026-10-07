@@ -294,6 +294,16 @@ impl SpecRunner {
                 Ok(bytes) if !wasm::validate(&bytes) => Ok(()),
                 Ok(_) => Err("module unexpectedly decoded and validated".into()),
             },
+            // Core custom sections never affect decoding or validation, so a module whose only
+            // fault is in a custom section must still compile (WebAssembly/spec
+            // test/harness/sync_index.js `assert_invalid_custom`). Text the encoder rejects
+            // leaves nothing for the engine to check.
+            WastDirective::AssertMalformedCustom { module, .. }
+            | WastDirective::AssertInvalidCustom { module, .. } => match module.encode() {
+                Err(_) => Ok(()),
+                Ok(bytes) if wasm::validate(&bytes) => Ok(()),
+                Ok(_) => Err("custom-section error made the module fail to compile".into()),
+            },
             WastDirective::Register { name, module, .. } => {
                 let instance = self.module_instance(*module)?;
                 self.registered.insert((*name).to_string(), instance);
