@@ -1762,6 +1762,68 @@ fn compiled_destructuring_parameters_bind_in_order() {
     }
 }
 
+/// ECMA-262 FunctionDeclarationInstantiation (step 26, IteratorBindingInitialization) evaluates a
+/// parameter's initializer only for an undefined argument, left to right, before the body. A
+/// closure in the body captures the initialized binding. Such functions compile; all tiers agree.
+#[test]
+fn compiled_captured_default_parameters_bind_their_initialized_value() {
+    fn compiles(src: &str) -> bool {
+        let stmts = crate::parser::parse_script(src, false).ok().expect("parse");
+        let func = stmts
+            .iter()
+            .find_map(|s| match s {
+                crate::ast::Stmt::FuncDecl(f) => Some(f.clone()),
+                _ => None,
+            })
+            .expect("a function declaration");
+        crate::bytecode::compile(&func).is_some()
+    }
+    assert!(compiles("function f(a, b = 1) { return () => a + b; }"));
+    assert!(compiles(
+        "function g(a = 2, b = a * 3) { return () => [a, b]; }"
+    ));
+    assert!(compiles(
+        "function h(x = 10) { const inc = () => ++x; inc(); return x; }"
+    ));
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = r#"
+            var out = [];
+            function f(a, b = 1) { return () => a + b; }
+            function g(a = 2, b = a * 3) { return () => [a, b].join(","); }
+            function h(x = 10) { const inc = () => ++x; inc(); return x; }
+            var log = [];
+            function k(a = (log.push("a"), 1), b = (log.push("b"), 2)) { return () => a + b; }
+            function m(a = 1) { const get = () => a; a = 9; return [arguments.length, arguments[0], get()].join(","); }
+            function v(x = 1) { var x; return () => x; }
+            function w(x = 1) { var x = 2; return () => x; }
+            class T { constructor(data = "", token = undefined) { this.f = () => data + (token === undefined ? "" : token); } }
+            var acc = 0;
+            for (var i = 0; i < 300; i++) acc += f(i)() + f(i, 2)() + h() + h(i);
+            out.push(acc, f(1, undefined)(), f(1, null)(), g()(), g(4)(), g(undefined, 1)());
+            out.push(k(undefined, 5)(), log.join(""));
+            out.push(m(3), m(), v()(), v(4)(), w()());
+            out.push(new T().f(), new T("q").f(), new T("q", "!").f());
+            try { (function (a = b, b = 1) { return () => a; })(); out.push("no error"); }
+            catch (err) { out.push(err instanceof ReferenceError); }
+            out.join("|")
+        "#;
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(
+                value, "139050|2|1|2,6|4,12|2,1|6|a|1,3,9|0,,9|1|4|2||q|q!|true",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
 /// ECMA-262 FunctionDeclarationInstantiation binds a trailing rest parameter to a fresh Array of
 /// the remaining arguments, for every entry path: direct and cached calls, apply/spread, native
 /// callbacks, constructors, methods and arrows, captured or not, with and without defaults.

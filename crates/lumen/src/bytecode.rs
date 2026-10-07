@@ -6408,9 +6408,12 @@ fn compile_inner(
             // (defaults, pattern defaults, computed keys) are admitted only when they cannot
             // observe this or a later parameter's binding and create no closure (see
             // `default_expr_safe`), which makes the specification's separate parameter scope
-            // unobservable.
+            // unobservable. A defaulted parameter that a closure captures lives in the
+            // activation environment, seeded from its argument at entry; its initializer stores
+            // there instead of the argument slot, before any later initializer or the body runs.
             enum ParamInit<'a> {
                 Default(u16, &'a Expr),
+                CapturedDefault(&'a str, &'a Expr),
                 Pattern(u16, &'a Pattern, Option<&'a Expr>),
             }
             let bound: Vec<Vec<String>> = func
@@ -6450,17 +6453,14 @@ fn compile_inner(
                 match &p.pattern {
                     Pattern::Ident(name) => {
                         if let Some(d) = &p.default {
-                            if captured.contains(name) {
-                                log_bail("params", "captured defaulted parameter");
-                                return None;
-                            }
                             if !default_expr_safe(d, &banned_from(k)) {
                                 log_bail("params", "unsafe default expression");
                                 return None;
                             }
                         }
                         let slot = c.fresh_slot(name);
-                        if captured.contains(name) {
+                        let is_captured = captured.contains(name);
+                        if is_captured {
                             c.cap_inits
                                 .push(CapInit::Param(k as u16, Rc::from(name.as_str())));
                             c.env_bind(name, false);
@@ -6468,7 +6468,11 @@ fn compile_inner(
                             c.scope_bind(name, slot, false);
                         }
                         if let Some(d) = &p.default {
-                            inits.push(ParamInit::Default(slot, d));
+                            inits.push(if is_captured {
+                                ParamInit::CapturedDefault(name, d)
+                            } else {
+                                ParamInit::Default(slot, d)
+                            });
                         }
                     }
                     pattern @ (Pattern::Object(_) | Pattern::Array(_)) => {
@@ -6513,6 +6517,17 @@ fn compile_inner(
             for init in inits {
                 let (slot, default) = match init {
                     ParamInit::Default(slot, d) => (slot, Some(d)),
+                    ParamInit::CapturedDefault(name, d) => {
+                        let name = c.name_idx(name);
+                        c.emit(Op::LoadCap(name));
+                        c.emit(Op::Undef);
+                        c.emit(Op::StrictEq);
+                        let jf = c.emit(Op::JumpIfFalse(0));
+                        c.expr(d).ok()?;
+                        c.emit(Op::StoreCap(name));
+                        c.patch(jf);
+                        continue;
+                    }
                     ParamInit::Pattern(slot, _, d) => (slot, d),
                 };
                 if let Some(d) = default {
