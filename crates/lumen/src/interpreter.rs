@@ -6353,24 +6353,16 @@ impl Interp {
             .map(|buffer| buffer.borrow().clone())
     }
 
-    /// A fresh fixed-length `ArrayBuffer` initialized with `bytes`, constructed through the
-    /// realm's own intrinsic constructor. The returned buffer has ordinary ECMAScript storage;
-    /// embedders that mirror external memory can update it with [`Self::array_buffer_set_bytes`].
+    /// A fresh fixed-length `ArrayBuffer` initialized with `bytes`, with the realm's intrinsic
+    /// %ArrayBuffer.prototype%. Creating it runs no author code: a replaced `globalThis.ArrayBuffer`
+    /// cannot observe or substitute host-created buffers. The buffer has ordinary ECMAScript
+    /// storage; embedders that mirror external memory can update it with
+    /// [`Self::array_buffer_set_bytes`].
     pub fn make_array_buffer(&mut self, bytes: &[u8]) -> Result<Value, Value> {
-        let global = Value::Obj(self.global.clone());
-        let ctor = self
-            .get_member(&global, "ArrayBuffer")
-            .map_err(abrupt_value)?;
-        let buffer = self
-            .construct(ctor, &[Value::Num(bytes.len() as f64)])
-            .map_err(abrupt_value)?;
-        if !self.array_buffer_set_bytes(&buffer, bytes) {
-            return Err(self.make_error(
-                "TypeError",
-                "ArrayBuffer constructor did not create an ordinary buffer",
-            ));
-        }
-        Ok(buffer)
+        Ok(
+            crate::builtins::array_buffer_with_storage(self, Rc::new(RefCell::new(bytes.to_vec())))
+                .0,
+        )
     }
 
     /// A fresh fixed-length `ArrayBuffer` with an embedder detach key. Author JavaScript cannot
@@ -6383,26 +6375,14 @@ impl Interp {
     /// Create a fixed-length host-keyed `ArrayBuffer` identified with an existing Data Block.
     /// The WebAssembly JS API §4.1 requires writes through either side to update the other side;
     /// retaining the `Rc` here implements that identity without a mirror or synchronization pass.
+    /// Like [`Self::make_array_buffer`] it uses the intrinsic prototype ("create a fixed length
+    /// memory buffer" makes a new ArrayBuffer directly), so no author code runs and no
+    /// placeholder Data Block is allocated.
     pub fn make_host_keyed_array_buffer_from_storage(
         &mut self,
         storage: ArrayBufferBytes,
     ) -> Result<Value, Value> {
-        let len = storage.borrow().len();
-        let global = Value::Obj(self.global.clone());
-        let ctor = self
-            .get_member(&global, "ArrayBuffer")
-            .map_err(abrupt_value)?;
-        let buffer = self
-            .construct(ctor, &[Value::Num(len as f64)])
-            .map_err(abrupt_value)?;
-        let Some(obj) = buffer.as_obj() else {
-            return Err(self.make_error("TypeError", "ArrayBuffer construction failed"));
-        };
-        let ptr = Rc::as_ptr(obj) as usize;
-        // A replaced constructor can return a buffer whose views already exist. Those views
-        // must stop using the previous Data Block before the embedder installs this storage.
-        self.invalidate_native_buffer(ptr);
-        self.array_buffers.insert(ptr, storage);
+        let (buffer, ptr) = crate::builtins::array_buffer_with_storage(self, storage);
         self.host_keyed_buffers.insert(ptr);
         Ok(buffer)
     }

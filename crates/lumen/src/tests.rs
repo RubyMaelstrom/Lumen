@@ -4116,6 +4116,46 @@ fn embedder_keyed_array_buffer_rejects_script_transfer() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn embedder_array_buffers_never_run_author_code() {
+    // A replaced global ArrayBuffer neither observes nor substitutes host-created buffers.
+    let mut engine = Engine::new();
+    engine
+        .eval_value_interruptible(
+            "globalThis.calls = 0; globalThis.ArrayBuffer = function () { calls++; return {}; };",
+        )
+        .expect("replacement parses")
+        .unwrap_or_else(|_| panic!("replace ArrayBuffer"));
+    let plain = engine
+        .ctx()
+        .make_array_buffer(&[1, 2, 3])
+        .unwrap_or_else(|_| panic!("make ArrayBuffer"));
+    let keyed = engine
+        .ctx()
+        .make_host_keyed_array_buffer(&[4, 5])
+        .unwrap_or_else(|_| panic!("make keyed ArrayBuffer"));
+    let global = engine.global_this();
+    for (name, buffer) in [("plain", plain.clone()), ("keyed", keyed.clone())] {
+        engine
+            .ctx()
+            .member_set(&global, name, buffer)
+            .unwrap_or_else(|_| panic!("install buffer"));
+    }
+    let result = engine
+        .eval_value_interruptible(
+            "calls + ',' + new Uint8Array(plain).join('') + ',' + new Uint8Array(keyed).join('') + ',' +\
+             (Object.getPrototypeOf(plain) === Object.getPrototypeOf(keyed)) + ',' + keyed.resizable",
+        )
+        .expect("probe parses")
+        .unwrap_or(Value::Undefined);
+    assert_eq!(result.as_text().as_deref(), Some("0,123,45,true,false"));
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&keyed, false),
+        Some(vec![4, 5])
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn embedder_bigint_i64_bridge_runs_to_bigint() {
     let mut engine = Engine::new();
     let global = engine.global_this();
@@ -7332,6 +7372,84 @@ fn resizable_arraybuffer() {
     assert_eq!(
         run("var b=new ArrayBuffer(4); var c=b.transfer(); b.detached+','+c.byteLength"),
         "true,4"
+    );
+}
+
+#[test]
+fn array_buffer_resizability_comes_from_internal_slots() {
+    // ECMA-262 #sec-arraybuffer.prototype.resize and #sec-sharedarraybuffer.prototype.grow:
+    // RequireInternalSlot(O, [[ArrayBufferMaxByteLength]]) precedes ToIndex, and neither reads
+    // the author-visible `resizable`/`growable`/`maxByteLength` accessors.
+    let forge = "Object.defineProperty(ArrayBuffer.prototype,'resizable',{get(){return true}});\
+        Object.defineProperty(ArrayBuffer.prototype,'maxByteLength',{get(){return 1e6}});\
+        Object.defineProperty(SharedArrayBuffer.prototype,'growable',{get(){return true}});\
+        Object.defineProperty(SharedArrayBuffer.prototype,'maxByteLength',{get(){return 1e6}});";
+    assert_eq!(
+        run(&format!(
+            "{forge} var b=new ArrayBuffer(4), coerced=false, err;\
+             try {{ b.resize({{valueOf(){{coerced=true;return 64}}}}); }} catch(e) {{ err=e.name; }}\
+             err+','+coerced+','+b.byteLength"
+        )),
+        "TypeError,false,4"
+    );
+    assert_eq!(
+        run(&format!(
+            "{forge} var b=new ArrayBuffer(4,{{maxByteLength:8}}), err;\
+             try {{ b.resize(16); }} catch(e) {{ err=e.name; }} b.resize(8); err+','+b.byteLength"
+        )),
+        "RangeError,8"
+    );
+    assert_eq!(
+        run(&format!(
+            "{forge} var t=new ArrayBuffer(4).transfer(), err;\
+             try {{ t.resize(8); }} catch(e) {{ err=e.name; }} err+','+t.byteLength"
+        )),
+        "TypeError,4"
+    );
+    assert_eq!(
+        run("var r=new ArrayBuffer(2,{maxByteLength:8}).transfer(4); r.resize(8); r.byteLength"),
+        "8"
+    );
+    assert_eq!(
+        run(&format!(
+            "{forge} var s=new SharedArrayBuffer(4), err;\
+             try {{ s.grow(8); }} catch(e) {{ err=e.name; }} err+','+s.byteLength"
+        )),
+        "TypeError,4"
+    );
+    assert_eq!(
+        run(
+            "var z=new SharedArrayBuffer(0,{maxByteLength:8}); z.grow(NaN);\
+             var s=new SharedArrayBuffer(4,{maxByteLength:8}); s.grow(4);\
+             var a=s.byteLength; s.grow(8); var err; try { s.grow(4); } catch(e) { err=e.name; }\
+             z.byteLength+','+a+','+s.byteLength+','+err"
+        ),
+        "0,4,8,RangeError"
+    );
+    assert_eq!(
+        throws("new ArrayBuffer(4,{maxByteLength:8}).resize(-1)"),
+        "RangeError"
+    );
+    assert_eq!(
+        throws("ArrayBuffer.prototype.resize.call(new SharedArrayBuffer(4,{maxByteLength:8}),4)"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn array_buffer_slice_copies_its_range() {
+    assert_eq!(
+        run("var b=new Uint8Array([1,2,3,4,5,6]).buffer;\
+             [...new Uint8Array(b.slice(1,4))].join()+'|'+[...new Uint8Array(b.slice(-2))].join()+'|'+\
+             b.slice(4,2).byteLength"),
+        "2,3,4|5,6|0"
+    );
+    // The species constructor may shrink the source: only the bytes still present are copied.
+    assert_eq!(
+        run("var src=new ArrayBuffer(6,{maxByteLength:6}); new Uint8Array(src).set([1,2,3,4,5,6]);\
+             src.constructor={[Symbol.species]:function(n){ src.resize(3); return new ArrayBuffer(n); }};\
+             [...new Uint8Array(src.slice(1,5))].join()"),
+        "2,3,0,0"
     );
 }
 

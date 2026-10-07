@@ -34,6 +34,7 @@ mod reflect;
 mod regexp;
 mod shadowrealm;
 mod typedarray;
+pub(crate) use typedarray::array_buffer_with_storage;
 mod weakrefs;
 
 #[cfg(test)]

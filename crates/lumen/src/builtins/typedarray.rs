@@ -56,28 +56,28 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     });
     // grow(newLength): only allowed for a growable buffer and only to a larger size.
     it.def_method(&proto, "grow", 1, |i, this, a| {
-        let o = this
-            .as_obj()
-            .cloned()
-            .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))?;
-        let growable = ab(i.get_member(&this, "growable"))?;
-        if !i.to_boolean(&growable) {
-            return Err(i.make_error("TypeError", "SharedArrayBuffer is not growable"));
+        // ECMA-262 #sec-sharedarraybuffer.prototype.grow: RequireInternalSlot(O,
+        // [[ArrayBufferMaxByteLength]]), IsSharedArrayBuffer(O), then ToIndex(newLength).
+        let max = resizable_max_byte_length(&this)
+            .ok_or_else(|| i.make_error("TypeError", "SharedArrayBuffer is not growable"))?;
+        let ptr = this.as_obj().map(|o| Rc::as_ptr(o) as usize).unwrap_or(0);
+        if !i.shared_buffers.contains_key(&ptr) {
+            return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
         }
-        let mv = ab(i.get_member(&this, "maxByteLength"))?;
-        let max = ab(i.to_number(&mv))? as usize;
-        let new_len = ab(i.to_number(&arg(a, 0)))?;
-        let ptr = Rc::as_ptr(&o) as usize;
+        let new_len = to_index(i, &arg(a, 0))?;
         let cur = i
             .array_buffers
             .get(&ptr)
             .map(|b| b.borrow().len())
             .unwrap_or(0);
-        if !new_len.is_finite() || new_len < cur as f64 || new_len as usize > max {
+        if new_len == cur {
+            return Ok(Value::Undefined);
+        }
+        if new_len < cur || new_len > max {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
         if let Some(buf) = i.array_buffers.get(&ptr) {
-            buf.borrow_mut().resize(new_len as usize, 0);
+            buf.borrow_mut().resize(new_len, 0);
             i.mark_array_buffer_dirty(ptr);
         }
         Ok(Value::Undefined)
@@ -266,12 +266,9 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
         return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
     }
     let new_len = new_len.unwrap_or_else(|| i.array_buffers[&ptr].borrow().len());
-    // transfer() preserves the source's resizability; transferToFixedLength() is always fixed.
-    let src_resizable = matches!(i.get_member(&this, "resizable"), Ok(Value::Bool(true)));
-    let src_max = match i.get_member(&this, "maxByteLength") {
-        Ok(Value::Num(n)) => n as usize,
-        _ => new_len,
-    };
+    // ArrayBufferCopyAndDetach: transfer() preserves the source's resizability (its
+    // [[ArrayBufferMaxByteLength]] slot); transferToFixedLength() is always fixed.
+    let src_max = resizable_max_byte_length(&this);
     // Transfer ownership of the Vec rather than cloning it. This is the engine primitive behind
     // HTML structured transfer; same-length transfers must remain O(1) in backing-store bytes.
     i.invalidate_native_buffer(ptr);
@@ -282,7 +279,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     bytes.borrow_mut().resize(new_len, 0);
     let (bv, bp) = make_array_buffer(i, new_len);
     i.array_buffers.insert(bp, bytes);
-    if !fixed && src_resizable {
+    if let (false, Some(src_max)) = (fixed, src_max) {
         if let Value::Obj(nb) = &bv {
             set_internal(nb, "#\u{0}abMaxByteLength", Value::Num(src_max as f64));
             set_internal(nb, "#\u{0}abResizable", Value::Bool(true));
@@ -292,16 +289,54 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     Ok(bv)
 }
 
+/// The [[ArrayBufferMaxByteLength]] internal slot of a resizable ArrayBuffer or growable
+/// SharedArrayBuffer; `None` for a fixed-length buffer (which lacks the slot) or another value.
+/// Read from the hidden internal properties, never through the author-visible `resizable` /
+/// `growable` / `maxByteLength` accessors, which a page can shadow or redefine.
+fn resizable_max_byte_length(this: &Value) -> Option<usize> {
+    let o = this.as_obj()?.borrow();
+    if !matches!(
+        o.props.get("#\u{0}abResizable").map(|p| p.value()),
+        Some(Value::Bool(true))
+    ) {
+        return None;
+    }
+    match o.props.get("#\u{0}abMaxByteLength").map(|p| p.value()) {
+        Some(Value::Num(max)) => Some(max as usize),
+        _ => None,
+    }
+}
+
+/// ECMA-262 #sec-toindex for the resize/grow length argument.
+fn to_index(i: &mut Interp, value: &Value) -> Result<usize, Value> {
+    let n = ab(i.to_number(value))?;
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    if !(0.0..=9_007_199_254_740_991.0).contains(&n) {
+        return Err(i.make_error("RangeError", "length out of range"));
+    }
+    Ok(n as usize)
+}
+
 fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
     make_array_buffer_from_bytes(i, vec![0u8; byte_len])
 }
 
 fn make_array_buffer_from_bytes(i: &mut Interp, bytes: Vec<u8>) -> (Value, usize) {
-    let byte_len = bytes.len();
+    array_buffer_with_storage(i, Rc::new(RefCell::new(bytes)))
+}
+
+/// A fresh fixed-length ArrayBuffer whose [[ArrayBufferData]] is `storage`, with this realm's
+/// intrinsic %ArrayBuffer.prototype%. It runs no author code: unlike `new globalThis.ArrayBuffer`,
+/// a replaced global binding or species constructor cannot observe or substitute the buffer.
+pub(crate) fn array_buffer_with_storage(
+    i: &mut Interp,
+    storage: crate::interpreter::ArrayBufferBytes,
+) -> (Value, usize) {
+    let byte_len = storage.borrow().len();
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, Rc::new(RefCell::new(bytes)));
+    i.array_buffers.insert(p, storage);
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
     // behind the `__ab*` prefix and surfaced through prototype accessor getters.
     set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(byte_len as f64));
@@ -457,51 +492,58 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if !i.array_buffers.contains_key(&ptr) {
             return Err(i.make_error("TypeError", "source ArrayBuffer was detached during slice"));
         }
-        let src = i.array_buffers[&ptr].borrow().clone();
-        let (begin, end) = (begin.min(src.len() as i64), end.min(src.len() as i64));
-        if begin < end {
-            let slice = src[begin as usize..end as usize].to_vec();
-            if let Some(buf) = i.array_buffers.get(&nptr) {
-                buf.borrow_mut()[..slice.len()].copy_from_slice(&slice);
+        // CopyDataBlockBytes(toBuf, 0, fromBuf, first, min(newLength, currentLength - first)):
+        // copy just that range. Two buffer objects can share one host Data Block (the embedder
+        // API identifies storage), so a shared block copies within itself instead of borrowing
+        // it twice.
+        let (Some(src), Some(dst)) = (
+            i.array_buffers.get(&ptr).cloned(),
+            i.array_buffers.get(&nptr).cloned(),
+        ) else {
+            return Ok(new_buf);
+        };
+        if Rc::ptr_eq(&src, &dst) {
+            let mut bytes = src.borrow_mut();
+            let len = bytes.len() as i64;
+            let (begin, end) = (begin.min(len), end.min(len));
+            if begin < end {
+                bytes.copy_within(begin as usize..end as usize, 0);
+            }
+        } else {
+            let src = src.borrow();
+            let (begin, end) = (begin.min(src.len() as i64), end.min(src.len() as i64));
+            if begin < end {
+                let range = &src[begin as usize..end as usize];
+                dst.borrow_mut()[..range.len()].copy_from_slice(range);
             }
         }
         Ok(new_buf)
     });
     it.def_method(&proto, "resize", 1, |i, this, a| {
+        // ECMA-262 #sec-arraybuffer.prototype.resize: RequireInternalSlot(O,
+        // [[ArrayBufferMaxByteLength]]) — a fixed-length buffer lacks it — before any coercion.
         let o = this
             .as_obj()
+            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
             .cloned()
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
-        let rv = ab(i.get_member(&this, "resizable"))?;
-        if !i.to_boolean(&rv) {
-            return Err(i.make_error("TypeError", "ArrayBuffer is not resizable"));
+        let ptr = Rc::as_ptr(&o) as usize;
+        let max = resizable_max_byte_length(&this)
+            .ok_or_else(|| i.make_error("TypeError", "ArrayBuffer is not resizable"))?;
+        if i.shared_buffers.contains_key(&ptr) {
+            return Err(i.make_error("TypeError", "resize requires a non-shared ArrayBuffer"));
         }
-        let mv = ab(i.get_member(&this, "maxByteLength"))?;
-        let max = ab(i.to_number(&mv))? as usize;
-        let new_len = ab(i.to_number(&arg(a, 0)))?;
-        let new_len = if new_len.is_nan() {
-            0.0
-        } else {
-            new_len.trunc()
-        };
-        if !new_len.is_finite() || new_len < 0.0 {
-            return Err(i.make_error("RangeError", "ArrayBuffer resize out of range"));
-        }
-        // The coercion may have detached the buffer — that is a TypeError, checked before the
-        // max-length RangeError.
-        if !i.array_buffers.contains_key(&(Rc::as_ptr(&o) as usize)) {
+        let new_len = to_index(i, &arg(a, 0))?;
+        // ToIndex may have detached the buffer: a TypeError, before the max-length RangeError.
+        if !i.array_buffers.contains_key(&ptr) {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
         }
-        if new_len as usize > max {
+        if new_len > max {
             return Err(i.make_error("RangeError", "ArrayBuffer resize out of range"));
         }
-        let n = new_len as usize;
-        if i.immutable_buffers.contains(&(Rc::as_ptr(&o) as usize)) {
-            return Err(i.make_error("TypeError", "ArrayBuffer is immutable"));
-        }
-        if let Some(buf) = i.array_buffers.get(&(Rc::as_ptr(&o) as usize)) {
-            buf.borrow_mut().resize(n, 0);
-            i.mark_array_buffer_dirty(Rc::as_ptr(&o) as usize);
+        if let Some(buf) = i.array_buffers.get(&ptr) {
+            buf.borrow_mut().resize(new_len, 0);
+            i.mark_array_buffer_dirty(ptr);
         }
         // byteLength derives from the backing store length, which the resize above updated.
         Ok(Value::Undefined)
