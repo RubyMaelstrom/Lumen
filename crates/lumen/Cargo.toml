@@ -3,6 +3,7 @@ name = "lumen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 # A from-scratch JavaScript engine. Native segmented stack switching keeps ordinary ECMAScript
 # execution contexts independent of the Rust thread stack. The optional whole-function backend
