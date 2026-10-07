@@ -949,7 +949,9 @@ pub(crate) fn invalidate_call_caches() {
     #[cfg(feature = "architecture-diagnostics")]
     call_cache_diagnostics::invalidate();
     use std::sync::atomic::Ordering::Relaxed;
-    let _ = CALL_IC_EPOCH.fetch_update(Relaxed, Relaxed, |epoch| epoch.checked_add(1));
+    let _ = crate::atomic_compat::try_update_u32(&CALL_IC_EPOCH, Relaxed, Relaxed, |epoch| {
+        epoch.checked_add(1)
+    });
 }
 
 /// One private-name operation site's cache (`Op::GetPrivate` and its siblings index

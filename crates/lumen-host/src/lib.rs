@@ -462,6 +462,27 @@ struct DedicatedState {
     shutting_down: AtomicBool,
 }
 
+impl DedicatedState {
+    /// Count one more active thread unless `max_threads` are already running. This is the
+    /// compare-exchange loop of `AtomicUsize::try_update` (stable since Rust 1.95, above the
+    /// workspace MSRV), which replaces the deprecated `fetch_update`.
+    fn try_acquire_thread(&self) -> bool {
+        let mut active = self.active.load(Ordering::Acquire);
+        while active < self.max_threads {
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => active = current,
+            }
+        }
+        false
+    }
+}
+
 /// Owner for bounded, one-thread-per-operation work that may wait indefinitely. It isolates live
 /// sockets/listeners/children from the finite shared pool without permitting unbounded threads.
 pub struct DedicatedExecutor {
@@ -509,13 +530,7 @@ impl CompletionSender {
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
         let cancelled = self.state.canceller.register(id);
-        let acquired = self
-            .state
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.state.max_threads).then_some(active + 1)
-            })
-            .is_ok();
+        let acquired = self.state.try_acquire_thread();
         if self.state.shutting_down.load(Ordering::Acquire) || !acquired {
             self.state.canceller.finish(id);
             let message = if acquired {

@@ -1316,11 +1316,13 @@ impl FeedbackVector {
         if current != 0 {
             return current;
         }
-        let assigned = NEXT_PROFILE_VECTOR_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-            .expect("feedback profile vector identity space exhausted");
+        let assigned = crate::atomic_compat::try_update_u64(
+            &NEXT_PROFILE_VECTOR_ID,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |next| next.checked_add(1),
+        )
+        .expect("feedback profile vector identity space exhausted");
         self.profile_vector_id.set(assigned);
         assigned
     }

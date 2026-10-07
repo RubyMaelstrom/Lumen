@@ -20,8 +20,10 @@ pub(crate) fn is_cacheable_shape(shape: u32) -> bool {
 }
 
 fn allocate_from(next: &AtomicU32) -> u32 {
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .unwrap_or(SHAPE_UNCACHEABLE)
+    crate::atomic_compat::try_update_u32(next, Ordering::Relaxed, Ordering::Relaxed, |id| {
+        id.checked_add(1)
+    })
+    .unwrap_or(SHAPE_UNCACHEABLE)
 }
 
 pub(super) fn fresh_shape() -> u32 {

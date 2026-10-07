@@ -1143,7 +1143,7 @@ pub(crate) fn new_binding_layout_id() -> u32 {
 
 fn allocate_binding_layout_id(next: &std::sync::atomic::AtomicU32) -> u32 {
     use std::sync::atomic::Ordering::Relaxed;
-    next.fetch_update(Relaxed, Relaxed, |id| id.checked_add(1))
+    crate::atomic_compat::try_update_u32(next, Relaxed, Relaxed, |id| id.checked_add(1))
         .unwrap_or(0)
 }
 

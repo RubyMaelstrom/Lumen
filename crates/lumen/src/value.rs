@@ -3733,7 +3733,8 @@ pub(crate) fn proto_epoch_ptr() -> *const u32 {
 
 /// Invalidate every property-creation inline cache (see [`PROTO_EPOCH`]).
 pub(crate) fn bump_proto_epoch() {
-    let _ = PROTO_EPOCH.fetch_update(
+    let _ = crate::atomic_compat::try_update_u32(
+        &PROTO_EPOCH,
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |v| Some(v.saturating_add(1)),
