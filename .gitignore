@@ -50,5 +50,6 @@ benchmarks/regexp-corpus/generated-harness.js
 /scripts/gen-regexp-corpus.py
 /scripts/gen-regexp-native-harness.py
 /scripts/run-wpt.py
+/scripts/wpt-shell.js
 /scripts/summarize-engine-report.py
 /scripts/summarize-engine-report.test.py
