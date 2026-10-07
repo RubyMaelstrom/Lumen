@@ -4036,6 +4036,60 @@ fn embedder_buffer_source_bytes_honor_views_detachment_and_shared_opt_in() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn embedder_buffer_source_bytes_follow_data_view_bounds() {
+    // A DataView's bytes are its own range of the current backing store: length-tracking views
+    // follow resizes, a fixed view past the shrunk end is out of bounds, and a shared view needs
+    // [AllowShared].
+    let mut engine = Engine::new();
+    let evaluated = engine
+        .eval_value_interruptible(
+            "globalThis.rb = new ArrayBuffer(8, {maxByteLength: 16});\
+             new Uint8Array(rb).set([0, 1, 2, 3, 4, 5, 6, 7]);\
+             globalThis.tracking = new DataView(rb, 5);\
+             globalThis.fixed = new DataView(rb, 4, 3);\
+             globalThis.sdv = new DataView(new SharedArrayBuffer(4), 1, 2);\
+             sdv.setUint8(0, 9); sdv.setUint8(1, 8);",
+        )
+        .expect("parse");
+    assert!(evaluated.is_ok(), "DataView setup threw");
+    let global = engine.global_this();
+    let get = |engine: &mut Engine, name: &str| {
+        engine
+            .ctx()
+            .member_get(&global, name)
+            .unwrap_or_else(|_| panic!("read {name}"))
+    };
+    let (tracking, fixed, sdv) = (
+        get(&mut engine, "tracking"),
+        get(&mut engine, "fixed"),
+        get(&mut engine, "sdv"),
+    );
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&tracking, false),
+        Some(vec![5, 6, 7])
+    );
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&fixed, false),
+        Some(vec![4, 5, 6])
+    );
+    assert_eq!(engine.ctx().buffer_source_bytes(&sdv, false), None);
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&sdv, true),
+        Some(vec![9, 8])
+    );
+    assert!(engine
+        .eval_value_interruptible("rb.resize(6)")
+        .expect("resize parses")
+        .is_ok());
+    assert_eq!(
+        engine.ctx().buffer_source_bytes(&tracking, false),
+        Some(vec![5])
+    );
+    assert_eq!(engine.ctx().buffer_source_bytes(&fixed, false), None);
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn embedder_can_mirror_and_detach_an_array_buffer() {
     let mut engine = Engine::new();
     let buffer = engine

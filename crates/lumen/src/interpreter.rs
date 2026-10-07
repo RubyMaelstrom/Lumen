@@ -6329,17 +6329,20 @@ impl Interp {
             if shared.is_some() && !allow_shared {
                 return None;
             }
-            let bytes = match shared {
-                Some(id) => shared_mem_get(id)?.lock().unwrap().clone(),
-                None => self.array_buffers.get(&buffer)?.borrow().clone(),
+            // Copy only the view's bytes, not the whole backing store.
+            let view = |bytes: &[u8]| {
+                let len = if length_tracking {
+                    bytes.len().checked_sub(offset)?
+                } else {
+                    let end = offset.checked_add(fixed_len)?;
+                    (end <= bytes.len()).then_some(fixed_len)?
+                };
+                Some(bytes[offset..offset + len].to_vec())
             };
-            let len = if length_tracking {
-                bytes.len().checked_sub(offset)?
-            } else {
-                let end = offset.checked_add(fixed_len)?;
-                (end <= bytes.len()).then_some(fixed_len)?
+            return match shared {
+                Some(id) => view(&shared_mem_get(id)?.lock().unwrap()),
+                None => view(&self.array_buffers.get(&buffer)?.borrow()),
             };
-            return Some(bytes[offset..offset + len].to_vec());
         }
 
         if let Some(&id) = self.shared_buffers.get(&ptr) {
