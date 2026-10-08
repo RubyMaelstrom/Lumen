@@ -10792,6 +10792,10 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
     Some(address)
 }
 
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 fn emit_name_ic_value_ptr(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
@@ -10828,6 +10832,10 @@ fn emit_name_ic_value_ptr_body(
 }
 
 /// Where a free-name cache probe starts its Environment Record walk.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NameEnv {
     /// The running environment (`ctx.env_raw`).

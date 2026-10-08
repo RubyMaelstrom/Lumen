@@ -19,9 +19,16 @@ use property_shapes::SHAPE_LAYOUT_CACHE_LIMIT;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) use property_shapes::SHAPE_LAYOUT_PAGE_BITS;
-pub(crate) use property_shapes::{
-    is_cacheable_shape, SHAPE_LAYOUT_PAGE_COUNT, SHAPE_LAYOUT_PAGE_SIZE, SHAPE_UNCACHEABLE,
-};
+#[cfg(any(
+    test,
+    feature = "optimizing-jit",
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
+pub(crate) use property_shapes::SHAPE_LAYOUT_PAGE_COUNT;
+pub(crate) use property_shapes::{is_cacheable_shape, SHAPE_LAYOUT_PAGE_SIZE, SHAPE_UNCACHEABLE};
 use property_shapes::{LayoutEntry, LayoutPage, ShapeLayouts};
 
 #[cfg(all(test, feature = "embed"))]
