@@ -409,7 +409,7 @@ impl PropertyInventory {
             ..Self::default()
         };
         result.entry_vec_eligibility.vecs = 1;
-        if props.entries.len() == 0 {
+        if props.entries.is_empty() {
             result.entry_vec_eligibility.empty_vecs = 1;
             result.entry_vec_eligibility.empty_reserved_capacity = props.entries.capacity() as u64;
             result.entry_vec_eligibility.empty_reserved_property_bytes = props
@@ -420,7 +420,7 @@ impl PropertyInventory {
         } else {
             result.entry_vec_eligibility.nonempty_vecs = 1;
         }
-        let mut entry_vec_all_default_wec_data = props.entries.len() != 0;
+        let mut entry_vec_all_default_wec_data = !props.entries.is_empty();
         for (key, property) in props.entries.iter() {
             entry_vec_all_default_wec_data &= !property.is_empty()
                 && !property.accessor()
