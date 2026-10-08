@@ -22,6 +22,8 @@ node_modules/
 /browser-replay-fixtures/
 # Machine-readable local performance reports.
 /benchmark-results/
+# Local debugger stack dumps.
+/stack.txt
 # Machine-specific installed production artifact record.
 /benchmarks/accepted-production.json
 # Local documentation and investigation notes; keep READMEs and agent guidance available.
